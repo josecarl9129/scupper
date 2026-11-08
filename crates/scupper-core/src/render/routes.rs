@@ -49,7 +49,11 @@ pub fn desired_routes(
 ) -> [(Family, RouteTarget); 2] {
     let v4 = site
         .gateway(gateway)
-        .and_then(|gw| gw.exits().iter().find(|exit| Some(exit.id()) == selection))
+        .and_then(|gw| {
+            gw.exits()
+                .iter()
+                .find(|exit| exit.enabled() && Some(exit.id()) == selection)
+        })
         .map_or(RouteTarget::Unreachable, |exit| {
             RouteTarget::Exit(exit.ifname().clone())
         });

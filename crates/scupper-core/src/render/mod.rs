@@ -9,7 +9,7 @@ mod sysctls;
 
 pub use netns::render_netns;
 pub use routes::{Family, RouteTarget, desired_routes, route_argv};
-pub use sysctls::{Sysctl, desired_sysctls};
+pub use sysctls::{Scope, Sysctl, SysctlFamily, SysctlKey, desired_sysctls};
 
 /// Configuration identity supplied by the caller, without observing a clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

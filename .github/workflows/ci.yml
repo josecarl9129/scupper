@@ -59,12 +59,15 @@ jobs:
       - name: Check nftables goldens without tunnel links
         run: |
           if ! command -v nft >/dev/null; then
-            sudo apt-get update
-            sudo apt-get install -y nftables
+            sudo timeout 300 apt-get update
+            sudo timeout 300 apt-get install -y nftables
           fi
-          while IFS= read -r -d '' ruleset; do
-            sudo unshare --net -- nft -c -f "$ruleset"
-          done < <(find crates/*/tests/golden/ -type f \( -name '*.nft' -o -name '*.golden' \) -print0)
+          mapfile -d '' files < <(find crates/*/tests/golden -type f \( -name '*.nft' -o -name '*.golden' \) -print0 | sort -z)
+          (( ${#files[@]} >= 2 ))
+          for f in "${files[@]}"; do
+            printf '%s\n' "$f"
+            sudo timeout 30 unshare --net -- nft -c -f "$f"
+          done
 
       - name: Doc
         run: timeout 600 cargo doc --workspace --no-deps --locked
@@ -99,8 +102,8 @@ jobs:
 
       - name: Install musl toolchain
         run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
+          sudo timeout 300 apt-get update
+          sudo timeout 300 apt-get install -y musl-tools
           rustup target add x86_64-unknown-linux-musl
 
       - name: Build musl release
@@ -137,13 +140,22 @@ jobs:
 
       - name: Install lab tools
         run: |
-          sudo apt-get update
-          sudo apt-get install -y wireguard-tools nftables iproute2 util-linux curl iptables tcpdump iputils-ping
+          sudo timeout 300 apt-get update
+          sudo timeout 300 apt-get install -y wireguard-tools nftables iproute2 util-linux curl iptables tcpdump iputils-ping
 
       - uses: actions/download-artifact@v4
         with:
           name: scupper-x86_64-linux-musl
           path: lab-bin
+
+      - name: Check nftables goldens without tunnel links
+        run: |
+          mapfile -d '' files < <(find crates/*/tests/golden -type f \( -name '*.nft' -o -name '*.golden' \) -print0 | sort -z)
+          (( ${#files[@]} >= 2 ))
+          for f in "${files[@]}"; do
+            printf '%s\n' "$f"
+            sudo timeout 30 unshare --net -- nft -c -f "$f"
+          done
 
       - name: Run namespace lab
         run: |

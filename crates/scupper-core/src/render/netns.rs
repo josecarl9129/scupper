@@ -1,6 +1,6 @@
 //! M2 kill switch: only client-to-exit and directional return forwarding.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, fmt::Display};
 
 use crate::config::{GatewayId, ValidatedSite};
 
@@ -55,29 +55,40 @@ pub fn render_netns(
         "ifname",
         gw.exits()
             .iter()
+            .filter(|exit| exit.enabled())
             .map(|exit| format!("\"{}\"", exit.ifname())),
     ));
-    output.push_str(&set("exit_ifaces_v6", "ifname", []));
+    output.push_str(&set::<String>("exit_ifaces_v6", "ifname", []));
     output.push_str(&set(
         "client_nets4",
         "ipv4_addr; flags interval",
         site.devices()
             .values()
             .filter(|device| device.gateways().contains(gateway))
-            .map(|device| device.address4().to_string()),
+            .map(|device| device.address4().trunc()),
     ));
-    output.push_str(&set("client_nets6", "ipv6_addr; flags interval", []));
+    output.push_str(&set::<ipnet::Ipv6Net>(
+        "client_nets6",
+        "ipv6_addr; flags interval",
+        [],
+    ));
     output.push('\n');
     output.push_str(CHAINS);
     Ok(output)
 }
 
-fn set(name: &str, kind: &str, elements: impl IntoIterator<Item = String>) -> String {
+fn set<T: Ord + Display>(name: &str, kind: &str, elements: impl IntoIterator<Item = T>) -> String {
     let elements: BTreeSet<_> = elements.into_iter().collect();
     let mut text = format!("\tset {name} {{ type {kind};");
     if !elements.is_empty() {
         text.push_str(" elements = { ");
-        text.push_str(&elements.into_iter().collect::<Vec<_>>().join(", "));
+        text.push_str(
+            &elements
+                .into_iter()
+                .map(|element| element.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
         text.push_str(" }");
     }
     text.push_str(" }\n");
@@ -140,3 +151,29 @@ const CHAINS: &str = r#"	counter fwd_dropped { }
 	}
 }
 "#;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // Invalid literal networks must fail the tests.
+mod tests {
+    use super::set;
+
+    #[test]
+    fn elements_sort_by_numeric_address_then_prefix_length() {
+        let networks = ["10.0.0.100/32", "10.0.0.2/32", "10.0.0.0/24", "10.0.0.0/16"]
+            .map(|net| net.parse::<ipnet::Ipv4Net>().unwrap());
+        assert_eq!(
+            set("nets", "ipv4_addr; flags interval", networks),
+            "\tset nets { type ipv4_addr; flags interval; elements = { 10.0.0.0/16, 10.0.0.0/24, 10.0.0.2/32, 10.0.0.100/32 } }\n"
+        );
+        let addresses = ["fd00::10", "fd00::2", "fd00::1"]
+            .map(|addr| addr.parse::<std::net::Ipv6Addr>().unwrap());
+        assert_eq!(
+            set("addresses", "ipv6_addr", addresses),
+            "\tset addresses { type ipv6_addr; elements = { fd00::1, fd00::2, fd00::10 } }\n"
+        );
+        assert_eq!(
+            set("ifaces", "ifname", ["\"wg2\"", "\"wg10\"", "\"wg2\""]),
+            "\tset ifaces { type ifname; elements = { \"wg10\", \"wg2\" } }\n"
+        );
+    }
+}

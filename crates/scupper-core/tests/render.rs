@@ -4,10 +4,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use proptest::prelude::*;
 use scupper_core::{
-    config::{ExitId, GatewayId, PublicKey, SiteConfig, ValidatedSite, parse_site, validate},
+    config::{
+        ExitId, GatewayId, PublicKey, SiteConfig, ValidatedDevice, ValidatedSite, parse_site,
+        validate,
+    },
     render::{
-        Family, RenderError, RouteTarget, Sysctl, VersionStamp, desired_routes, desired_sysctls,
-        render_netns, route_argv,
+        Family, RenderError, RouteTarget, Scope, SysctlFamily, SysctlKey, VersionStamp,
+        desired_routes, desired_sysctls, render_netns, route_argv,
     },
     rules::IfName,
 };
@@ -49,6 +52,87 @@ fn chain<'a>(output: &'a str, name: &str) -> Vec<&'a str> {
         .map(str::trim)
         .filter(|line| !line.starts_with('#'))
         .collect()
+}
+
+// Keep the entire final statement, including reject arguments or named counters.
+fn rule(line: &str) -> Option<(String, String)> {
+    let tokens: Vec<_> = line.split_whitespace().collect();
+    let start = tokens.iter().position(|token| {
+        matches!(
+            *token,
+            "accept" | "drop" | "reject" | "masquerade" | "counter"
+        )
+    })?;
+    Some((tokens[..start].join(" "), tokens[start..].join(" ")))
+}
+
+#[allow(clippy::unwrap_used)] // Malformed set declarations must fail the test.
+fn sets(output: &str) -> BTreeMap<&str, Vec<String>> {
+    let mut sets = BTreeMap::new();
+    for line in output
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("set "))
+    {
+        let name = line.split_whitespace().nth(1).unwrap();
+        let elements = line
+            .split_once("elements = { ")
+            .map_or_else(Vec::new, |(_, rest)| {
+                rest.split_once(" }")
+                    .unwrap()
+                    .0
+                    .split(", ")
+                    .map(str::to_owned)
+                    .collect()
+            });
+        assert!(sets.insert(name, elements).is_none());
+    }
+    sets
+}
+
+#[test]
+fn sysctl_keys_preserve_dotted_link_names() {
+    for (key, path, notation) in [
+        (
+            SysctlKey {
+                family: SysctlFamily::Ipv4,
+                scope: Scope::Link(IfName::new("foo.100").unwrap()),
+                name: "rp_filter",
+            },
+            "/proc/sys/net/ipv4/conf/foo.100/rp_filter",
+            "net.ipv4.conf.foo/100.rp_filter",
+        ),
+        (
+            SysctlKey {
+                family: SysctlFamily::Ipv4,
+                scope: Scope::Global,
+                name: "ip_forward",
+            },
+            "/proc/sys/net/ipv4/ip_forward",
+            "net.ipv4.ip_forward",
+        ),
+        (
+            SysctlKey {
+                family: SysctlFamily::Ipv6,
+                scope: Scope::Default,
+                name: "accept_ra",
+            },
+            "/proc/sys/net/ipv6/conf/default/accept_ra",
+            "net.ipv6.conf.default.accept_ra",
+        ),
+        (
+            SysctlKey {
+                family: SysctlFamily::Netfilter,
+                scope: Scope::Global,
+                name: "nf_conntrack_tcp_loose",
+            },
+            "/proc/sys/net/netfilter/nf_conntrack_tcp_loose",
+            "net.netfilter.nf_conntrack_tcp_loose",
+        ),
+    ] {
+        assert_eq!(key.proc_path(), std::path::Path::new(path));
+        assert_eq!(key.to_string(), notation);
+    }
 }
 
 #[test]
@@ -149,31 +233,26 @@ fn route_selection_is_ipv4_only_and_fails_closed() {
 
 #[test]
 fn sysctls_write_forwarding_before_all_hardening_values() {
-    let site = site();
     // Include a foreign link: the supplied inventory, rather than just config,
     // determines which links need explicit rp_filter settings.
-    let links: Vec<_> = ["wg0", "lo", "ex-ch1", "foreign0", "wg0"]
+    let links: Vec<_> = ["wg0", "lo", "ex-ch1", "foreign0", "foo.100", "wg0"]
         .map(|name| IfName::new(name).unwrap())
         .into();
     for forwarding in [true, false] {
-        let values = desired_sysctls(&site, &gateway(), &links, forwarding);
+        let values = desired_sysctls(&links, forwarding);
         assert_eq!(
-            values[..2],
-            [
-                Sysctl {
-                    key: "net.ipv4.ip_forward".into(),
-                    value: u8::from(forwarding).to_string(),
-                },
-                Sysctl {
-                    key: "net.ipv6.conf.all.forwarding".into(),
-                    value: u8::from(forwarding).to_string(),
-                },
-            ]
+            values[..2]
+                .iter()
+                .map(|value| (value.key.to_string(), value.value.clone()))
+                .collect::<Vec<_>>(),
+            ["net.ipv4.ip_forward", "net.ipv6.conf.all.forwarding"]
+                .map(|key| (key.into(), u8::from(forwarding).to_string()))
         );
         let expected = [
             "net.ipv4.conf.all.rp_filter",
             "net.ipv4.conf.default.rp_filter",
             "net.ipv4.conf.ex-ch1.rp_filter",
+            "net.ipv4.conf.foo/100.rp_filter",
             "net.ipv4.conf.foreign0.rp_filter",
             "net.ipv4.conf.lo.rp_filter",
             "net.ipv4.conf.wg0.rp_filter",
@@ -183,6 +262,21 @@ fn sysctls_write_forwarding_before_all_hardening_values() {
             "net.ipv4.conf.default.accept_redirects",
             "net.ipv4.conf.default.send_redirects",
             "net.ipv4.conf.default.accept_source_route",
+            "net.ipv4.conf.ex-ch1.accept_redirects",
+            "net.ipv4.conf.ex-ch1.send_redirects",
+            "net.ipv4.conf.ex-ch1.accept_source_route",
+            "net.ipv4.conf.foo/100.accept_redirects",
+            "net.ipv4.conf.foo/100.send_redirects",
+            "net.ipv4.conf.foo/100.accept_source_route",
+            "net.ipv4.conf.foreign0.accept_redirects",
+            "net.ipv4.conf.foreign0.send_redirects",
+            "net.ipv4.conf.foreign0.accept_source_route",
+            "net.ipv4.conf.lo.accept_redirects",
+            "net.ipv4.conf.lo.send_redirects",
+            "net.ipv4.conf.lo.accept_source_route",
+            "net.ipv4.conf.wg0.accept_redirects",
+            "net.ipv4.conf.wg0.send_redirects",
+            "net.ipv4.conf.wg0.accept_source_route",
             "net.ipv6.conf.all.accept_ra",
             "net.ipv6.conf.all.accept_redirects",
             "net.ipv6.conf.all.autoconf",
@@ -197,7 +291,7 @@ fn sysctls_write_forwarding_before_all_hardening_values() {
         assert_eq!(
             values[2..]
                 .iter()
-                .map(|value| value.key.as_str())
+                .map(|value| value.key.to_string())
                 .collect::<Vec<_>>(),
             expected
         );
@@ -205,19 +299,16 @@ fn sysctls_write_forwarding_before_all_hardening_values() {
         assert_eq!(
             values
                 .iter()
-                .map(|value| &value.key)
+                .map(|value| value.key.proc_path())
                 .collect::<BTreeSet<_>>()
                 .len(),
             values.len()
         );
         let mut reversed = links.clone();
         reversed.reverse();
-        assert_eq!(
-            values,
-            desired_sysctls(&site, &gateway(), &reversed, forwarding)
-        );
+        assert_eq!(values, desired_sysctls(&reversed, forwarding));
     }
-    let empty = desired_sysctls(&site, &gateway(), &[], false);
+    let empty = desired_sysctls(&[], false);
     assert_eq!(empty.len(), 20);
     assert!(empty.iter().all(|value| value.value == "0"));
 }
@@ -292,25 +383,66 @@ proptest! {
             let expected = format!("type filter hook {name} priority filter; policy drop;");
             prop_assert!(chain(&output, name).contains(&expected.as_str()));
         }
+        let chain_names: Vec<_> = output.lines().map(str::trim)
+            .filter_map(|line| line.strip_prefix("chain "))
+            .map(|line| line.strip_suffix(" {").unwrap()).collect();
+        prop_assert_eq!(&chain_names, &["antispoof", "input", "forward", "postrouting", "output"]);
+        for name in chain_names {
+            for line in chain(&output, name).into_iter().filter(|line| !line.starts_with("type ")) {
+                let tokens: Vec<_> = line.split_whitespace().collect();
+                prop_assert!(!tokens.iter().any(|token| matches!(*token, "jump" | "goto" | "return")));
+                let (matches, verdict) = rule(line).unwrap();
+                prop_assert!(["accept", "drop", "reject with tcp reset", "masquerade", "counter name \"fwd_dropped\" drop"].contains(&verdict.as_str()));
+                if verdict == "accept" {
+                    let allowed: &[&str] = match name {
+                        "input" => &[
+                            "iif \"lo\"",
+                            "ct state established,related",
+                            "iifname @client_ifaces icmp type echo-request limit rate 10/second",
+                            "iifname @client_ifaces icmpv6 type echo-request limit rate 10/second",
+                            "iifname @client_ifaces icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert }",
+                        ],
+                        "forward" => &[
+                            "iifname @client_ifaces meta nfproto ipv4 oifname @exit_ifaces",
+                            "iifname @client_ifaces meta nfproto ipv6 oifname @exit_ifaces_v6",
+                            "iifname @exit_ifaces oifname @client_ifaces ct state established,related",
+                        ],
+                        "output" => &["oif \"lo\"", "oifname @client_ifaces", "oifname @exit_ifaces"],
+                        _ => &[],
+                    };
+                    prop_assert!(allowed.contains(&matches.as_str()));
+                }
+            }
+        }
+        let antispoof = chain(&output, "antispoof");
+        prop_assert_eq!(antispoof.len(), 5); // Hook declaration and exactly four rules.
+        prop_assert_eq!(antispoof, chain(GOLDEN, "antispoof"));
         let forward = chain(&output, "forward");
-        let accepts: Vec<_> = forward.iter().copied().filter(|line| line.ends_with(" accept")).collect();
+        let accepts: Vec<_> = forward.iter().copied()
+            .filter(|line| rule(line).is_some_and(|(_, verdict)| verdict == "accept")).collect();
         prop_assert_eq!(accepts, [
             "iifname @client_ifaces meta nfproto ipv4 oifname @exit_ifaces accept",
             "iifname @client_ifaces meta nfproto ipv6 oifname @exit_ifaces_v6 accept",
             "iifname @exit_ifaces oifname @client_ifaces ct state established,related accept",
         ]);
-        prop_assert_eq!(forward.last().copied(), Some("counter name \"fwd_dropped\" drop"));
+        prop_assert_eq!(chain(&output, "forward").last().copied(), Some("counter name \"fwd_dropped\" drop"));
         let masquerades: Vec<_> = output.lines().map(str::trim).filter(|line| line.contains("masquerade")).collect();
         prop_assert_eq!(masquerades, ["oifname @exit_ifaces masquerade"]);
 
-        let nets = output.lines().find(|line| line.contains("set client_nets4 ")).unwrap();
-        let addresses: Vec<_> = nets.split_once("elements = { ").unwrap().1.split_once(" }").unwrap().0.split(", ").collect();
-        let sorted: BTreeSet<_> = addresses.iter().copied().collect();
-        prop_assert_eq!(&addresses, &sorted.into_iter().collect::<Vec<_>>());
-        prop_assert_eq!(addresses.len(), site.devices().len());
-        for device in site.devices().values() {
-            prop_assert!(addresses.contains(&device.address4().to_string().as_str()));
-        }
+        let mut addresses: Vec<_> = site.devices().values()
+            .filter(|device| device.gateways().contains(&gateway()))
+            .map(ValidatedDevice::address4).collect();
+        addresses.sort_by_key(|net| (net.network(), net.prefix_len()));
+        let mut exits: Vec<_> = gw.exits().iter().map(|exit| format!("\"{}\"", exit.ifname())).collect();
+        exits.sort();
+        let expected = BTreeMap::from([
+            ("client_ifaces", vec![format!("\"{}\"", gw.client_tunnel().ifname())]),
+            ("exit_ifaces", exits),
+            ("exit_ifaces_v6", vec![]),
+            ("client_nets4", addresses.iter().map(ToString::to_string).collect()),
+            ("client_nets6", vec![]),
+        ]);
+        prop_assert_eq!(sets(&output), expected);
     }
 
     #[test]
