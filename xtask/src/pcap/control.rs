@@ -125,7 +125,10 @@ pub(super) fn ndp(policy: &Policy, ip: &Ip<'_>, data: &[u8]) -> Checked<bool> {
     // resolve its router. RS/RA and reports must use a multicast destination.
     let permitted = match kind {
         135 | 136 => source || policy.uplink_addrs.contains(&decode::address6(data, 8)?),
-        131 | 133 | 134 | 143 => (own || link_local) && multicast,
+        131 | 133 | 134 => (own || link_local) && multicast,
+        // RFC 3810 §5.2.13: MLDv2 reports may be sent from the unspecified address while the
+        // interface's link-local address is still tentative (duplicate address detection).
+        143 => (own || link_local || ip.src.is_unspecified()) && multicast,
         _ => false,
     };
     Ok(policy.ndp && permitted)

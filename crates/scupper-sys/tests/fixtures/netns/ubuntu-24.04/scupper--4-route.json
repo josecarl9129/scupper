@@ -1,0 +1,1 @@
+[{"dst":"default","dev":"ex-ch1","scope":"link","flags":[]},{"dst":"10.99.0.0/24","dev":"wg0","protocol":"kernel","scope":"link","prefsrc":"10.99.0.1","flags":[]}]

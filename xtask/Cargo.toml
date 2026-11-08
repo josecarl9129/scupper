@@ -13,6 +13,11 @@ serde_json.workspace = true
 toml.workspace = true
 ipnet.workspace = true
 thiserror.workspace = true
+scupper-core.workspace = true
+sha2.workspace = true
+socket2.workspace = true
+rustix = { workspace = true, features = ["rand"] }
+signal-hook = "0.3"
 
 [dev-dependencies]
 proptest.workspace = true

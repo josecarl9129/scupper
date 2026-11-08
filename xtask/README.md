@@ -159,3 +159,126 @@ incompleteness, IPv4/TCP options, IPv6 extension headers, VLAN/SLL/SLL2, truncat
 headers/captures, byte order/timestamp resolution, strict policy parsing, CLI
 JSON/exit codes, bounded property tests and a golden mixed JSON report.
 `UPDATE_GOLDEN=1 cargo test -p xtask golden_report` regenerates the golden.
+
+# Reference namespace leak lab
+
+On a disposable Linux VM, install `wireguard-tools nftables iproute2 tcpdump
+dnsmasq-base util-linux iputils-ping conntrack`, build `cargo build -p xtask --release --locked`, then:
+
+```console
+sudo timeout 1200 target/release/xtask leaktest --artifacts lab-out --capture-fixtures lab-out/fixtures
+```
+
+`cargo xtask leaktest` is the same runner in a development build. It requires
+root and refuses occupied namespace names, resolver directories, staging links,
+or its randomly named private directory under `/run`. It creates no addresses,
+routes, firewall rules or sysctl changes in the invoking host's network
+namespace. Staging veths briefly exist there before moving; run on a disposable
+host without a network manager that configures unknown links. The M1
+`lab/run.sh` remains independent. This reference builder will be replaced by
+`scupper boot` in M2-2j.
+
+The allocation lives in `src/lab/addresses.rs` (WAN address first):
+
+| Link / network | WAN | Neighbour |
+| --- | --- | --- |
+| wan–gwhost, 198.51.100.0/30 | 198.51.100.1 | 198.51.100.2 |
+| wan–client, 192.0.2.0/30 | 192.0.2.1 | 192.0.2.2 |
+| wan–provA, 203.0.113.0/30 | 203.0.113.1 | 203.0.113.2 |
+| wan–internet, 192.0.2.4/30 | 192.0.2.5 | 192.0.2.6 |
+| temporary wan–scupper bridge, 198.51.100.4/30 | 198.51.100.5 | 198.51.100.6 |
+| internet IPv6, 2001:db8:4::/64 | 2001:db8:4::5 | 2001:db8:4::6 |
+| client tunnel, 10.99.0.0/24 | gateway wg0: 10.99.0.1 | client wg0: 10.99.0.2 |
+| provider tunnel, 10.2.0.0/24 | provider wgp: 10.2.0.1 | ex-ch1: 10.2.0.2 |
+| client IPv6 test, fd00:99::/64 | — | client wg0: fd00:99::2 |
+| client link-local test | — | client wg0: fe80::2 |
+| IPv6 exit control, 2001:db8:2::/64 | provider wgp: 2001:db8:2::1 | ex-ch1: 2001:db8:2::2 |
+| IPv6 provider WAN control, 2001:db8:3::/64 | 2001:db8:3::1 | provA eth0: 2001:db8:3::2 |
+| IPv6 bridge, 2001:db8:5::/64 | 2001:db8:5::5 | scupper: 2001:db8:5::6 |
+
+The client ULA is the explicit negative-test exception to documentation and
+scupper-internal ranges. The validated `lab/site-lab.toml` omits health route-
+probe fields because validation requires public destinations there; those
+defaults are never contacted. The requested `route get 1.1.1.1` fixture is a
+kernel lookup, with no packet sent.
+
+All gwhost commands use `nsenter --net=/run/netns/gwhost -- ...`. WireGuard wg0
+(51820) and ex-ch1 (51821) are born there and then moved to scupper, preserving
+socket ownership. An additional temporary `scupper-verify` namespace loads the
+rendered rules independently; canonical JSON equality gates forwarding. The
+builder uses `render_netns`, `desired_routes` and `desired_sysctls`, reapplies
+hardening after enabling forwarding, and checks all sysctls by read-back. It
+applies forwarding=0 and hardening before moving the down tunnel links, loads
+and verifies the ruleset, then assigns addresses, brings links up, installs
+routes and enables forwarding. All namespaces set IPv4 forwarding explicitly;
+gwhost uses 1, client/internet use 0, and wan/provA use 1. IPv6 forwarding is
+explicit too and enabled on wan/provA only during the IPv6 path controls.
+Private keys exist only in a randomly named mode-0700 `/run` directory outside
+the artifact tree, in mode-0600 files, removed during cleanup. Artifact paths
+that would contain this directory are refused. No command requests WireGuard
+private-key output, `showconf` or `dump`.
+
+Each service check sends four independent markers (128 random bits apiece): TCP
+and UDP by IP and through `<marker>.lab.test`. The probe sends explicit UDP
+A/AAAA queries to 10.2.0.1, without libc/NSS or the host resolver. dnsmasq has
+no upstream and answers only the lab domain. TCP reads a line and echoes it; UDP
+echoes the payload. The runner checks acknowledgments and the sink's JSON-lines
+receipts, requiring exactly one receipt per marker from provA's NAT address.
+Probe logs record the resolved destination and structured outcome after each
+attempt. Forward drops require a timeout/no reply, and scupper output drops
+require EPERM. Bind, routing, resolution, acknowledgment and launcher errors
+fail the case. TCP and UDP use unique source ports; restore flushes scupper
+conntrack before the after-check, preventing earlier permissive flows from
+surviving.
+
+The cases run in this order, with provider service checks before and after:
+
+| Case | Assertion |
+| --- | --- |
+| `baseline` | Service works; full uplink pcap is allowed WireGuard/control traffic. |
+| `client-v6-dropped` | Unfiltered wg0 capture proves ULA TCP/UDP and link-local UDP arrive. nft traces prove antispoof drops both sources; unfiltered ex-ch1/provA captures see no v6. Repeated with routes, WireGuard ACLs and WAN forwarding open, then accept-all must deliver ULA markers through ex-ch1 and provA. Each capture has in-phase IPv4 service liveness. |
+| `bridged-real-ruleset` | IPv4 /32 and IPv6 /128 route lookups must select lab-bridge. In-case ARP and IPv4/IPv6 ping prove capture liveness; forwarded and local canaries must be contained. The temporary IPv6 client set entry allows testing the forward chain beyond antispoof. |
+| `positive-control-permissive` | Accept-all retains exit NAT for DNS and must deliver IPv4/IPv6 bridge markers with client source addresses. Its live capture must flag leaks and contain both scupper-output UDP markers. |
+| `positive-control-uplink` | Exactly three injected packets must violate: one spoofed forbidden-source packet (`ForbiddenAddress`) and DNS plus UDP-payload packets from gwhost to wan (`CanaryMarker`). Tuple, full UDP content, reason and multiplicity must match; any other violation fails. |
+
+Every uplink capture is unfiltered, with `tcpdump -U -s 0 -w` on wan's gwhost
+veth. Its generated policy requires four packets per case marker and both
+WireGuard endpoint pairs, including deliberate controls. Only the oracle decides
+uplink verdicts. Every auxiliary capture is unfiltered. Bridge policies require
+the six packets generated by two ping exchanges and ARP resolution, plus the ARP
+and both ICMP classes. IPv6 capture evidence separately requires IPv4 service
+packets and its expected ingress/egress canaries. Empty captures always fail.
+The marker-only uplink injections exercise marker classification without
+forbidden addresses masking the result. Wan silently drops just those two
+injected tuples after the capture point to prevent ICMP responses adding
+unintended control violations. Capture readiness/process liveness are checked,
+and shutdown must report zero kernel/interface drops.
+
+Commands use argv vectors without a shell. Foreground commands have a 15-second
+GNU timeout (plus a two-second kill escalation), background processes have a
+1050-second timeout, setup has a 180-second deadline, each case has 140 seconds,
+and the whole run has 1000 seconds plus bounded cleanup. Signal handlers for
+INT/TERM/HUP request cancellation; the ownership guard stops process groups and
+removes namespaces, staging veths, temporary keys and owned netns directories.
+Resources are registered only after successful exclusive creation. Failed
+creates never grant ownership; moved/deleted resources are unregistered so
+cleanup cannot claim later replacements at their old names. Bridge captures stop
+before their veth disappears; deletion tolerates the asynchronous disappearance
+of a peer. Cleanup failures fail the run and are recorded in `cleanup.txt`.
+
+Artifacts include pcaps, generated policies and oracle JSON reports, sink and
+probe logs, command argv/stderr diagnostics, `results.tsv`, `results.json`, and
+optional healthy observation fixtures. Fixture output replaces public keys with
+`PUBKEY1` etc. The runner attempts all cases, restores between them and fails at
+the end if any failed; `failure.txt` records the reasons. The `got` column
+records observed packet/violation and receipt counts with the markers actually
+received. No fixtures are committed by this task.
+
+Normal, unprivileged tests cover allocation, configuration validation, generated
+policies and positive evidence, argv wrapping for every external program,
+process deadlines, successful-create/idempotent cleanup, sink log parsing,
+public-key redaction and TSV/JSON results. Regressions cover exact uplink
+injections, missing or extra violations, empty auxiliary captures, v6 on ex-ch1,
+antispoof trace correlation, explicit DNS decoding and local probe errors
+(including an occupied UDP source port through the CLI). The actual namespace
+suite runs in CI on both Ubuntu 24.04 and 22.04; it is not part of `cargo test`.
