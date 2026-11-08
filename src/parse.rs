@@ -1,6 +1,12 @@
 //! Pure parsers for `WireGuard` handshakes and the client route lookup.
 
-use std::{collections::BTreeSet, fmt, net::Ipv4Addr, str::FromStr, time::Duration};
+use std::{
+    collections::BTreeSet,
+    fmt,
+    net::{IpAddr, Ipv4Addr},
+    str::FromStr,
+    time::Duration,
+};
 
 use thiserror::Error;
 
@@ -63,6 +69,24 @@ pub enum ParseError {
     /// The route lookup contains no nonempty line.
     #[error("route lookup is empty; expected a route type or a route containing 'dev <interface>'")]
     EmptyRoute,
+    /// The significant line starts with neither an IP address nor a known route type.
+    #[error("route line {line}: expected an IP destination or a known route type")]
+    InvalidRouteStart {
+        /// The one-based line number of the first nonempty line.
+        line: usize,
+    },
+    /// An explicit unicast route has no valid IP destination.
+    #[error("route line {line}: 'unicast' must be followed by an IP destination")]
+    InvalidRouteDestination {
+        /// The one-based line number of the first nonempty line.
+        line: usize,
+    },
+    /// Multiple device fields or a nexthop field make device selection ambiguous.
+    #[error("route line {line}: multiple 'dev' fields or 'nexthop' make the route ambiguous")]
+    AmbiguousRouteDev {
+        /// The one-based line number of the first nonempty line.
+        line: usize,
+    },
     /// The significant route line contains no device field.
     #[error("route line {line}: missing 'dev <interface>'; check that route lookup succeeded")]
     MissingRouteDev {
@@ -76,7 +100,7 @@ pub enum ParseError {
         line: usize,
     },
     /// The reported route device fails interface-name validation.
-    #[error("route line {line}: invalid device after 'dev': {source}")]
+    #[error("route line {line}: invalid device after 'dev'")]
     InvalidRouteInterface {
         /// The one-based line number of the first nonempty line.
         line: usize,
@@ -251,11 +275,30 @@ pub fn single_peer_handshake(out: &str) -> Result<Handshake, ParseError> {
     }
 }
 
+/// Additional iproute2 route types that cannot identify a unicast output device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteType {
+    /// A route for link-layer broadcast destinations.
+    Broadcast,
+    /// A route for anycast destinations.
+    Anycast,
+    /// A route for multicast destinations.
+    Multicast,
+    /// A legacy network address translation route.
+    Nat,
+    /// A route requiring an external resolver.
+    Xresolve,
+}
+
 /// The route selected for a forwarded client packet, including special types.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteLookup {
     /// A route through the validated output interface.
     Dev(IfName),
+    /// A device token is present but falls outside [`IfName`]'s accepted syntax.
+    OtherDev,
+    /// A recognized route type that does not select a unicast output device.
+    OtherType(RouteType),
     /// An explicit unreachable route.
     Unreachable,
     /// A route that silently discards packets.
@@ -270,14 +313,18 @@ pub enum RouteLookup {
 
 /// Parses only the first nonempty line of textual `ip route get` output.
 ///
-/// Special route types take precedence over device fields. Following lines,
+/// The line must start with an IP destination or a known iproute2 route type;
+/// explicit `unicast` must be followed by an IP destination. Special route types
+/// take precedence over a single device field. Following lines,
 /// including `cache` metadata, cannot supply a device. The exec layer must
 /// classify nonzero command exits before calling this parser.
 ///
 /// # Errors
 ///
-/// Returns [`ParseError`] for empty output, a missing device field or name,
-/// or an invalid interface name. Error text from `ip` is not a route.
+/// Returns [`ParseError`] for empty output, an invalid route prefix, a missing
+/// device field or name, multiple device fields, or any `nexthop` field.
+/// A device outside [`IfName`]'s syntax yields [`RouteLookup::OtherDev`].
+/// Error text from `ip` is not a route.
 pub fn parse_route_get(out: &str) -> Result<RouteLookup, ParseError> {
     let (index, text) = out
         .lines()
@@ -286,25 +333,40 @@ pub fn parse_route_get(out: &str) -> Result<RouteLookup, ParseError> {
         .ok_or(ParseError::EmptyRoute)?;
     let line = index + 1;
     let mut tokens = text.split_whitespace();
+    if tokens.clone().any(|token| token == "nexthop")
+        || tokens.clone().filter(|token| *token == "dev").count() > 1
+    {
+        return Err(ParseError::AmbiguousRouteDev { line });
+    }
     match tokens.next() {
         Some("unreachable") => return Ok(RouteLookup::Unreachable),
         Some("blackhole") => return Ok(RouteLookup::Blackhole),
         Some("prohibit") => return Ok(RouteLookup::Prohibit),
         Some("throw") => return Ok(RouteLookup::Throw),
         Some("local") => return Ok(RouteLookup::Local),
-        _ => {}
+        Some("broadcast") => return Ok(RouteLookup::OtherType(RouteType::Broadcast)),
+        Some("anycast") => return Ok(RouteLookup::OtherType(RouteType::Anycast)),
+        Some("multicast") => return Ok(RouteLookup::OtherType(RouteType::Multicast)),
+        Some("nat") => return Ok(RouteLookup::OtherType(RouteType::Nat)),
+        Some("xresolve") => return Ok(RouteLookup::OtherType(RouteType::Xresolve)),
+        Some("unicast") => {
+            if tokens
+                .next()
+                .is_none_or(|token| token.parse::<IpAddr>().is_err())
+            {
+                return Err(ParseError::InvalidRouteDestination { line });
+            }
+        }
+        Some(destination) if destination.parse::<IpAddr>().is_ok() => {}
+        _ => return Err(ParseError::InvalidRouteStart { line }),
     }
-    // Include the first token when searching: even a bare "dev NAME" is valid.
-    let mut tokens = text.split_whitespace();
     if !tokens.any(|token| token == "dev") {
         return Err(ParseError::MissingRouteDev { line });
     }
     let name = tokens
         .next()
         .ok_or(ParseError::MissingRouteInterface { line })?;
-    let name =
-        IfName::new(name).map_err(|source| ParseError::InvalidRouteInterface { line, source })?;
-    Ok(RouteLookup::Dev(name))
+    Ok(IfName::new(name).map_or(RouteLookup::OtherDev, RouteLookup::Dev))
 }
 
 /// Destination used by the v1 forwarded-client route probe.

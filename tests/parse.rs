@@ -6,7 +6,8 @@ use proptest::prelude::*;
 use scupper::{
     parse::{
         Handshake, HandshakeAge, ParseError, PeerHandshake, PeerKey, ROUTE_PROBE_DST, RouteLookup,
-        parse_latest_handshakes, parse_route_get, route_probe_argv, single_peer_handshake,
+        RouteType, parse_latest_handshakes, parse_route_get, route_probe_argv,
+        single_peer_handshake,
     },
     rules::{IfName, V1Config},
 };
@@ -173,7 +174,6 @@ fn route_get_ported() -> Result<(), Box<dyn Error>> {
             "eth0",
         ),
         ("\r\n \t\r\n1.1.1.1 dev wg0\r\n cache iif wg1\r\n", "wg0"),
-        ("dev wg0 dev eth0", "wg0"),
     ] {
         assert_eq!(parse_route_get(out)?, RouteLookup::Dev(IfName::new(name)?));
     }
@@ -182,12 +182,148 @@ fn route_get_ported() -> Result<(), Box<dyn Error>> {
     }
     assert_eq!(
         parse_route_get("RTNETLINK answers: Network is unreachable"),
-        Err(ParseError::MissingRouteDev { line: 1 })
+        Err(ParseError::InvalidRouteStart { line: 1 })
     );
     assert_eq!(
         parse_route_get("1.1.1.1 dev"),
         Err(ParseError::MissingRouteInterface { line: 1 })
     );
+    Ok(())
+}
+
+macro_rules! route_type_test {
+    ($test:ident, $route_type:literal, $expected:expr) => {
+        #[test]
+        fn $test() -> Result<(), Box<dyn Error>> {
+            assert_eq!(parse_route_get($route_type)?, $expected);
+            assert_eq!(
+                parse_route_get(concat!(
+                    $route_type,
+                    " 192.0.2.1 from 198.51.100.2 dev wg0 table 51820 \n    cache iif wg0"
+                ))?,
+                $expected
+            );
+            Ok(())
+        }
+    };
+}
+
+route_type_test!(
+    route_get_unreachable,
+    "unreachable",
+    RouteLookup::Unreachable
+);
+route_type_test!(route_get_blackhole, "blackhole", RouteLookup::Blackhole);
+route_type_test!(route_get_prohibit, "prohibit", RouteLookup::Prohibit);
+route_type_test!(route_get_throw, "throw", RouteLookup::Throw);
+route_type_test!(route_get_local, "local", RouteLookup::Local);
+route_type_test!(
+    route_get_broadcast,
+    "broadcast",
+    RouteLookup::OtherType(RouteType::Broadcast)
+);
+route_type_test!(
+    route_get_anycast,
+    "anycast",
+    RouteLookup::OtherType(RouteType::Anycast)
+);
+route_type_test!(
+    route_get_multicast,
+    "multicast",
+    RouteLookup::OtherType(RouteType::Multicast)
+);
+route_type_test!(route_get_nat, "nat", RouteLookup::OtherType(RouteType::Nat));
+route_type_test!(
+    route_get_xresolve,
+    "xresolve",
+    RouteLookup::OtherType(RouteType::Xresolve)
+);
+
+#[test]
+fn route_get_unicast() -> Result<(), Box<dyn Error>> {
+    for destination in ["192.0.2.1", "2001:db8::1"] {
+        for prefix in ["", "unicast "] {
+            assert_eq!(
+                parse_route_get(&format!("{prefix}{destination} dev proton0"))?,
+                RouteLookup::Dev(IfName::new("proton0")?)
+            );
+        }
+    }
+    for out in [
+        "unicast",
+        "unicast dev proton0",
+        "unicast invalid dev proton0",
+    ] {
+        assert_eq!(
+            parse_route_get(out),
+            Err(ParseError::InvalidRouteDestination { line: 1 })
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn route_get_rejects_unknown_prefixes() {
+    for out in [
+        "dev wg0",
+        "unknown 192.0.2.1 dev wg0",
+        "RTNETLINK answers: Network is unreachable dev wg0",
+        "192.0.2.999 dev wg0",
+        "2001:db8::gg dev wg0",
+    ] {
+        assert_eq!(
+            parse_route_get(&format!("\n{out}")),
+            Err(ParseError::InvalidRouteStart { line: 2 })
+        );
+    }
+}
+
+#[test]
+fn route_get_rejects_ambiguous_devices() {
+    for out in [
+        "dev wg0 dev eth0",
+        "192.0.2.1 dev wg0 dev eth0",
+        "192.0.2.1 dev wg0 dev",
+        "192.0.2.1 nexthop via 192.0.2.2 dev proton0 weight 1 nexthop via 192.0.2.3 dev eth0",
+        "192.0.2.1 nexthop via 192.0.2.2 dev proton0",
+        "local 192.0.2.1 dev lo dev eth0",
+        "blackhole 192.0.2.1 nexthop",
+    ] {
+        assert_eq!(
+            parse_route_get(&format!("\n{out}")),
+            Err(ParseError::AmbiguousRouteDev { line: 2 })
+        );
+    }
+}
+
+#[test]
+fn route_get_synthesized_printing_shapes() -> Result<(), Box<dyn Error>> {
+    // Synthesized from iproute2's printing rules (not captured), with documentation
+    // addresses. Replace these with captured fixtures later.
+    for (out, expected) in [
+        (
+            "192.0.2.1 from 198.51.100.2 nhid 12 dev proton0 table 51820 uid 0 \n    cache iif wg0",
+            RouteLookup::Dev(IfName::new("proton0")?),
+        ),
+        (
+            "unicast 192.0.2.1 from 198.51.100.2 dev proton0 table 51820 proto boot scope global \n    cache iif wg0",
+            RouteLookup::Dev(IfName::new("proton0")?),
+        ),
+        (
+            "192.0.2.1 from 198.51.100.2 dev proton0 table 51820 src 203.0.113.2 mtu 1420 \n    cache <redirected> iif wg0",
+            RouteLookup::Dev(IfName::new("proton0")?),
+        ),
+        (
+            "192.0.2.1 from 198.51.100.2 via inet6 2001:db8::1 dev eth0 table 51820 \n    cache iif wg0",
+            RouteLookup::Dev(IfName::new("eth0")?),
+        ),
+        (
+            "local 192.0.2.1 from 198.51.100.2 dev lo table local \n    cache <local> iif wg0",
+            RouteLookup::Local,
+        ),
+    ] {
+        assert_eq!(parse_route_get(out)?, expected);
+    }
     Ok(())
 }
 
@@ -221,11 +357,36 @@ fn route_get_route_types() -> Result<(), Box<dyn Error>> {
         Err(ParseError::MissingRouteInterface { line: 1 })
     );
     for name in ["-x", "wg\"0", "abcdefghijklmnop", "wg/0", "é"] {
-        assert!(matches!(
-            parse_route_get(&format!("1.1.1.1 dev {name}")),
-            Err(ParseError::InvalidRouteInterface { line: 1, .. })
-        ));
+        assert_eq!(
+            parse_route_get(&format!("1.1.1.1 dev {name}"))?,
+            RouteLookup::OtherDev
+        );
     }
+    Ok(())
+}
+
+#[test]
+fn route_get_other_device_has_no_config_error() -> Result<(), Box<dyn Error>> {
+    // Linux permits these names, while IfName restricts names for nftables quoting.
+    for name in ["-x", "wg\"0", "é"] {
+        assert!(IfName::new(name).is_err());
+        assert_eq!(
+            parse_route_get(&format!("192.0.2.1 dev {name}"))?,
+            RouteLookup::OtherDev
+        );
+    }
+    let error = ParseError::InvalidRouteInterface {
+        line: 1,
+        source: IfName::new("-x").err().ok_or("expected invalid name")?,
+    };
+    assert_eq!(
+        error.to_string(),
+        "route line 1: invalid device after 'dev'"
+    );
+    assert!(!error.to_string().contains("config:"));
+    let source = error.source().ok_or("expected interface error source")?;
+    assert!(source.to_string().starts_with("config:"));
+    assert!(source.source().is_none());
     Ok(())
 }
 
@@ -279,14 +440,89 @@ fn error_lines_and_bounded_diagnostics() -> Result<(), Box<dyn Error>> {
         PeerKey::new(&untrusted).map(|_| ()),
         parse_latest_handshakes(&format!("{untrusted}\t1")).map(|_| ()),
         parse_latest_handshakes(&format!("{}\t{untrusted}", key('A'))).map(|_| ()),
-        parse_route_get(&format!("1.1.1.1 dev {untrusted}")).map(|_| ()),
+        parse_route_get(&format!("{untrusted} dev wg0")).map(|_| ()),
     ] {
         let error = result.err().ok_or("expected malformed-input error")?;
         let message = error.to_string();
         assert!(!message.contains('界'));
         assert!(message.chars().count() < 240);
     }
+    assert_eq!(
+        parse_route_get(&format!("192.0.2.1 dev {untrusted}"))?,
+        RouteLookup::OtherDev
+    );
     Ok(())
+}
+
+fn parser_token() -> impl Strategy<Value = String> {
+    prop_oneof![
+        prop::sample::select(vec![
+            "dev",
+            "via",
+            "nexthop",
+            "from",
+            "table",
+            "cache",
+            "iif",
+            "unicast",
+            "local",
+            "broadcast",
+            "anycast",
+            "multicast",
+            "blackhole",
+            "unreachable",
+            "prohibit",
+            "throw",
+            "nat",
+            "xresolve",
+            "wg0",
+            "proton0",
+            "eth0",
+            "-x",
+            "wg\"0",
+            "abcdefghijklmnop",
+            "wg/0",
+            "é",
+            "192.0.2.1",
+            "2001:db8::1",
+            "192.0.2.999",
+            "2001:db8::gg",
+            "AbCd=",
+            "0",
+            "18446744073709551616",
+            "\t",
+            "\r",
+            "\u{2003}",
+            "\u{a0}",
+        ])
+        .prop_map(str::to_owned),
+        "[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=",
+        "[A-Za-z0-9+/]{42}[BDFH]=",
+        "[0-9]{1,30}",
+    ]
+}
+
+fn token_line() -> impl Strategy<Value = String> {
+    prop::collection::vec(
+        (
+            parser_token(),
+            prop::sample::select(vec![" ", "\t", "\r", "\u{2003}", "\u{a0}"]),
+        ),
+        0..40,
+    )
+    .prop_map(|fields| {
+        fields
+            .into_iter()
+            .fold(String::new(), |mut line, (token, separator)| {
+                line.push_str(&token);
+                line.push_str(separator);
+                line
+            })
+    })
+}
+
+fn token_output() -> impl Strategy<Value = String> {
+    prop::collection::vec(token_line(), 0..8).prop_map(|lines| lines.join("\n"))
 }
 
 proptest! {
@@ -297,10 +533,29 @@ proptest! {
     })]
 
     #[test]
-    fn prop_parsers_never_panic(out in any::<String>()) {
-        let _ = parse_latest_handshakes(&out);
-        let _ = single_peer_handshake(&out);
-        let _ = parse_route_get(&out);
+    fn prop_parsers_never_panic(
+        arbitrary in any::<String>(),
+        line in token_line(),
+        output in token_output(),
+    ) {
+        for out in [arbitrary, line, output] {
+            let _ = parse_latest_handshakes(&out);
+            let _ = single_peer_handshake(&out);
+            let _ = parse_route_get(&out);
+        }
+    }
+
+    #[test]
+    fn prop_special_types_never_dev(
+        route_type in prop::sample::select(vec![
+            "local", "broadcast", "anycast", "multicast", "blackhole", "unreachable",
+            "prohibit", "throw", "nat", "xresolve",
+        ]),
+        tail in token_line(),
+    ) {
+        // Include a valid device in every case so special-type precedence is exercised.
+        let out = format!("{route_type} 192.0.2.1 dev proton0 {tail}");
+        prop_assert!(!matches!(parse_route_get(&out), Ok(RouteLookup::Dev(_))));
     }
 
     #[test]
