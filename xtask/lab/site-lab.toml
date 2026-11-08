@@ -1,0 +1,42 @@
+schema = 1
+[site]
+name = "namespace lab"
+primary = "gw1"
+[identities.edge]
+public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+private_key_ref = "lab-client"
+listen_port = 51820
+[gateways.gw1]
+netns = "scupper"
+uplinks = ["eth0"]
+endpoint = "198.51.100.2:51820"
+[gateways.gw1.client_tunnel]
+ifname = "wg0"
+identity = "edge"
+address4 = "10.99.0.1/24"
+mtu = 1420
+[[gateways.gw1.exits]]
+id = "ch1"
+name = "Lab provider"
+provider = "proton"
+ifname = "ex-ch1"
+private_key_ref = "lab-exit"
+peer_public_key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+endpoint = "203.0.113.2:51820"
+address4 = "10.2.0.2/32"
+dns = ["10.2.0.1"]
+keepalive = "25s"
+mtu = 1420
+enabled = true
+[policy]
+exits = ["ch1"]
+[health]
+probe_targets = ["https://sink.lab.test/"]
+speed_test_url = "https://sink.lab.test/"
+[users.lab]
+role = "admin"
+[devices.client]
+user = "lab"
+public_key = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI="
+address4 = "10.99.0.2/32"
+gateways = ["gw1"]
