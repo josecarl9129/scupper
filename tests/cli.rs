@@ -7,7 +7,7 @@ use std::{
     net::IpAddr,
     path::{Path, PathBuf},
     rc::Rc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use scupper::{
@@ -15,7 +15,7 @@ use scupper::{
     check::{ExitProbe, TopologySource},
     cli::{self, Dependencies, Privilege, Prompt, Sleeper, UnimplementedTopology},
     rules::V1Config,
-    system::{EXEC_TIMEOUT, ExecError, ExecOutput, Program, System},
+    system::{EXEC_TIMEOUT, ExecError, ExecOutput, Program, SYSTEMCTL_TIMEOUT, System},
     verdict::{M1Topology, Probe, ProbeError, RulesetObs},
 };
 
@@ -25,6 +25,13 @@ struct FakeFs {
 }
 
 impl Fs for FakeFs {
+    fn check_target(&self, _: &Path) -> io::Result<()> {
+        Ok(())
+    }
+    fn cleanup_stale(&self, _: &Path) -> io::Result<()> {
+        Ok(())
+    }
+
     fn read(&self, _: &Path) -> io::Result<String> {
         Err(io::ErrorKind::NotFound.into())
     }
@@ -33,10 +40,6 @@ impl Fs for FakeFs {
         Ok(("/etc/.fake.tmp".into(), Box::new(FakeFile(Vec::new()))))
     }
     fn rename(&self, _: &Path, _: &Path) -> io::Result<()> {
-        Ok(())
-    }
-    fn set_mode(&self, _: &Path, mode: u32) -> io::Result<()> {
-        assert_eq!(mode, 0o644);
         Ok(())
     }
     fn sync_dir(&self, _: &Path) -> io::Result<()> {
@@ -57,6 +60,11 @@ impl Write for FakeFile {
     }
 }
 impl TempFile for FakeFile {
+    fn set_mode(&self, mode: u32) -> io::Result<()> {
+        assert_eq!(mode, 0o644);
+        Ok(())
+    }
+
     fn sync_all(&self) -> io::Result<()> {
         Ok(())
     }
@@ -73,6 +81,10 @@ struct Harness {
     calls: RefCell<Vec<Call>>,
     now: Rc<Cell<u64>>,
     wg_delay: u64,
+    wall_step: i64,
+    monotonic: Cell<Duration>,
+    epoch: Instant,
+    topology_calls: Cell<usize>,
     fs: FakeFs,
     root: bool,
     tty: bool,
@@ -88,6 +100,10 @@ impl Default for Harness {
             calls: RefCell::default(),
             now: Rc::new(Cell::new(1_000)),
             wg_delay: 0,
+            wall_step: 0,
+            monotonic: Cell::new(Duration::ZERO),
+            epoch: Instant::now(),
+            topology_calls: Cell::new(0),
             fs: FakeFs::default(),
             root: true,
             tty: false,
@@ -111,8 +127,11 @@ impl System for Harness {
             timeout,
         });
         if program == Program::Wg {
+            let delay = self.wg_delay.min(timeout.as_secs());
+            self.monotonic
+                .set(self.monotonic.get() + Duration::from_secs(delay));
             self.now
-                .set(self.now.get() + self.wg_delay.min(timeout.as_secs()));
+                .set((self.now.get() + delay).saturating_add_signed(self.wall_step));
         }
         self.responses
             .borrow_mut()
@@ -141,12 +160,18 @@ impl Prompt for Harness {
     }
 }
 impl Sleeper for Harness {
+    fn now(&self) -> Instant {
+        self.epoch + self.monotonic.get()
+    }
+
     fn sleep(&self, duration: Duration) {
         self.now.set(self.now.get() + duration.as_secs());
+        self.monotonic.set(self.monotonic.get() + duration);
     }
 }
 impl TopologySource for Harness {
     fn observe(&self, _: &dyn System, _: &V1Config) -> Probe<M1Topology> {
+        self.topology_calls.set(self.topology_calls.get() + 1);
         Ok(M1Topology {
             ruleset: RulesetObs::Exact,
             tc_hooks: vec![],
@@ -324,6 +349,10 @@ fn noninteractive_requires_yes() {
         assert!(err.contains("--yes"));
         assert!(h.calls.borrow().is_empty());
         assert_eq!(h.fs.writes.get(), 0);
+        assert!(
+            h.prompts.borrow().is_empty(),
+            "non-TTY must never read stdin"
+        );
         h.output("");
         if command == "apply" {
             h.output("");
@@ -349,6 +378,7 @@ fn connect_polls_until_fresh() {
     assert_eq!(calls.len(), 4);
     assert_eq!(calls[0].program, Program::Systemctl);
     assert_eq!(calls[0].args, ["start", "wg-quick@proton0"]);
+    assert_eq!(calls[0].timeout, SYSTEMCTL_TIMEOUT);
     for call in &calls[1..] {
         assert_eq!(call.program, Program::Wg);
         assert_eq!(call.args, ["show", "proton0", "latest-handshakes"]);
@@ -357,15 +387,15 @@ fn connect_polls_until_fresh() {
 }
 
 #[test]
-fn connect_times_out_fail_closed() {
+fn connect_times_out_degraded() {
     let h = Harness::default();
     h.output("");
     for _ in 0..10 {
         h.handshake(0);
     }
     let (code, out, err) = h.run(&["connect"]);
-    assert_eq!(code, 4, "{err}");
-    assert!(out.contains("fail closed"));
+    assert_eq!(code, 3, "{err}");
+    assert!(out.contains("no fresh handshake"));
     assert_eq!(h.now.get(), 1_010);
     let calls = h.calls.borrow();
     assert_eq!(calls.len(), 11);
@@ -383,6 +413,8 @@ fn disconnect_stops_unit() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].program, Program::Systemctl);
     assert_eq!(calls[0].args, ["stop", "wg-quick@proton0"]);
+    assert_eq!(calls[0].timeout, SYSTEMCTL_TIMEOUT);
+    assert_eq!(h.topology_calls.get(), 1);
     assert_eq!(Program::Systemctl.default_path(), "/usr/bin/systemctl");
 }
 
@@ -420,8 +452,10 @@ fn command_and_observation_errors_are_1() {
             stdout: String::new(),
             stderr: "unit failed".into(),
         }));
-        let (code, _, err) = h.run(&args);
+        let (code, out, err) = h.run(&args);
         assert_eq!(code, 1);
+        assert_eq!(out, "");
+        assert_eq!(h.topology_calls.get(), 0);
         assert!(err.starts_with("scupper:"));
         assert!(err.contains("unit failed"));
     }
@@ -443,10 +477,131 @@ fn connect_command_time_counts_toward_deadline() {
         after: Duration::from_secs(2),
     }));
     let (code, out, err) = h.run(&["connect"]);
-    assert_eq!(code, 4, "{err}");
-    assert!(out.contains("fail closed"));
+    assert_eq!(code, 3, "{err}");
+    assert!(out.contains("no fresh handshake"));
     assert_eq!(h.now.get(), 1_010);
     let calls = h.calls.borrow();
     assert_eq!(calls.len(), 4);
     assert_eq!(calls[3].timeout, Duration::from_secs(2));
+}
+
+#[test]
+fn confirmation_parsing_defaults_to_no() {
+    for answer in ["y", "yes", "Y", "YES", " YeS ", "  y\n"] {
+        assert!(cli::parse_confirmation(answer), "{answer:?}");
+    }
+    // read_line returns an empty string on EOF.
+    for answer in [
+        "",
+        "\n",
+        " \t\n",
+        "no",
+        "n",
+        "yeah",
+        "yes please",
+        "true",
+        "1",
+    ] {
+        assert!(!cli::parse_confirmation(answer), "{answer:?}");
+    }
+}
+
+#[test]
+fn disconnect_unknown_protection_is_1() {
+    let h = Harness::default();
+    h.output("");
+    let (code, out, err) = h.run_topology(&["disconnect", "--yes"], &UnimplementedTopology);
+    assert_eq!(code, 1);
+    assert_eq!(out, "");
+    assert_eq!(
+        err,
+        "exit tunnel stopped; kill switch state unknown, run 'scupper check'\n"
+    );
+}
+
+#[test]
+fn disconnect_checks_every_topology_violation_and_observation_error() -> Result<(), ProbeError> {
+    struct Topology(Probe<M1Topology>);
+    impl TopologySource for Topology {
+        fn observe(&self, _: &dyn System, _: &V1Config) -> Probe<M1Topology> {
+            self.0.clone()
+        }
+    }
+    let cfg = V1Config::default();
+    let clean = Harness::default().observe(&Harness::default(), &cfg);
+    for kind in 0..4 {
+        let mut topology = clean.clone()?;
+        match kind {
+            0 => topology.ruleset = RulesetObs::Missing,
+            1 => {
+                topology.ruleset = RulesetObs::Differs {
+                    live_sha256: [1; 32],
+                    want_sha256: [2; 32],
+                }
+            }
+            2 => topology.tc_hooks.push(cfg.client_iface.clone()),
+            _ => topology
+                .config_mismatches
+                .push(scupper::verdict::ConfigMismatch::ExitAddrNotOnExitIface),
+        }
+        let h = Harness::default();
+        h.output("");
+        let (code, out, err) = h.run_topology(&["disconnect", "--yes"], &Topology(Ok(topology)));
+        assert_eq!(code, 2);
+        assert_eq!(out, "");
+        assert!(err.contains("exit tunnel stopped; kill switch is NOT in place"));
+        assert_eq!(h.calls.borrow().len(), 1);
+    }
+    for error in [
+        ProbeError::Timeout,
+        ProbeError::io("permission denied"),
+        ProbeError::setup("not implemented"),
+    ] {
+        let h = Harness::default();
+        h.output("");
+        let (code, out, err) = h.run_topology(&["disconnect", "--yes"], &Topology(Err(error)));
+        assert_eq!(code, 1);
+        assert_eq!(out, "");
+        assert_eq!(
+            err,
+            "exit tunnel stopped; kill switch state unknown, run 'scupper check'\n"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn connect_deadline_ignores_wall_clock_steps() {
+    for wall_step in [-100, 100] {
+        let h = Harness {
+            wall_step,
+            ..Harness::default()
+        };
+        h.output("");
+        for _ in 0..10 {
+            h.handshake(0);
+        }
+        let (code, out, err) = h.run(&["connect"]);
+        assert_eq!(code, 3, "{err}");
+        assert!(out.contains("no fresh handshake"));
+        assert_eq!(h.monotonic.get(), Duration::from_secs(10));
+        assert_eq!(h.calls.borrow().len(), 11);
+    }
+}
+
+#[test]
+fn connect_reuses_verdict_freshness_bounds() {
+    for (timestamp, expected) in [(820, 0), (819, 3), (1_005, 0), (1_006, 3), (0, 3)] {
+        let h = Harness::default();
+        h.output("");
+        h.handshake(timestamp);
+        // Only the first poll can accept; a rejected timestamp must not end polling.
+        for _ in 1..10 {
+            h.handshake(0);
+        }
+        let (code, _, err) = h.run(&["connect"]);
+        assert_eq!(code, expected, "timestamp {timestamp}: {err}");
+        assert_eq!(err.contains("clock skew"), timestamp > 1_000);
+        assert_eq!(err.lines().count(), usize::from(timestamp > 1_000));
+    }
 }

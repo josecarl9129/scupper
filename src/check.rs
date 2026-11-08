@@ -83,6 +83,23 @@ pub fn observe_handshake(sys: &dyn System, cfg: &V1Config) -> Probe<Handshake> {
     exit_handshake(sys, cfg).map(|(handshake, _)| handshake)
 }
 
+// Query just the verdict engine's handshake stage. These synthetic topology
+// inputs let that stage run; they are never reported as containment observations.
+// Leave the route unobserved: requesting it means freshness passed.
+pub(crate) fn handshake_is_fresh(handshake: Handshake, cfg: &HealthConfig, now: u64) -> bool {
+    let observations = M1Observations {
+        topology: Some(Ok(M1Topology {
+            ruleset: RulesetObs::Exact,
+            tc_hooks: Vec::new(),
+            config_mismatches: Vec::new(),
+            uplink_addrs: vec![cfg.exit_addr.into()],
+        })),
+        handshake: Some(Ok(handshake)),
+        ..M1Observations::default()
+    };
+    matches!(verdict::next(&observations, cfg, now), Next::Route)
+}
+
 fn exit_handshake(sys: &dyn System, cfg: &V1Config) -> Probe<(Handshake, usize)> {
     let output = wg_output(sys, &cfg.exit_iface)?;
     if missing_device(&output) {

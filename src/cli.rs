@@ -5,7 +5,7 @@ use std::{
     io::{self, IsTerminal, Write},
     net::IpAddr,
     path::Path,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use clap::{Parser, Subcommand, error::ErrorKind};
@@ -15,8 +15,8 @@ use crate::{
     check::{self, ExitProbe, TopologySource},
     parse::HandshakeAge,
     rules::{self, V1Config},
-    system::{EXEC_TIMEOUT, ExecError, ExecOutput, Program, RealSystem, System},
-    verdict::{FailClosed, HealthConfig, M1Topology, Probe, ProbeError, Verdict, Warning},
+    system::{ExecError, ExecOutput, Program, RealSystem, SYSTEMCTL_TIMEOUT, System},
+    verdict::{self, HealthConfig, M1Topology, Probe, ProbeError, Warning},
 };
 
 #[derive(Parser)]
@@ -34,7 +34,9 @@ enum Command {
     Check,
     /// Start the exit tunnel and wait up to ten seconds for a fresh handshake.
     Connect,
-    /// Stop the exit tunnel, blocking client traffic.
+    /// Stop the exit tunnel and verify the kill switch.
+    ///
+    /// Over the SSH wrapper without a TTY, --yes is required.
     Disconnect {
         /// Skip confirmation.
         #[arg(long)]
@@ -43,6 +45,8 @@ enum Command {
     /// Print the generated nftables ruleset.
     Rules,
     /// Validate, replace and load /etc/nftables.conf.
+    ///
+    /// Over the SSH wrapper without a TTY, --yes is required.
     Apply {
         /// Skip confirmation.
         #[arg(long)]
@@ -96,15 +100,21 @@ impl Prompt for TerminalPrompt {
         output.flush()?;
         let mut answer = String::new();
         io::stdin().read_line(&mut answer)?;
-        Ok(matches!(
-            answer.trim().to_ascii_lowercase().as_str(),
-            "y" | "yes"
-        ))
+        Ok(parse_confirmation(&answer))
     }
 }
 
-/// Waiting boundary for the connect polling loop.
+/// Accepts only a trimmed, case-insensitive `y` or `yes`; empty input/EOF is no.
+#[must_use]
+pub fn parse_confirmation(answer: &str) -> bool {
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// Waiting and monotonic clock boundary for the connect polling loop.
 pub trait Sleeper {
+    /// Current monotonic instant, independent of wall-clock corrections.
+    fn now(&self) -> Instant;
+
     /// Waits for the requested duration.
     fn sleep(&self, duration: Duration);
 }
@@ -114,6 +124,10 @@ pub trait Sleeper {
 pub struct ThreadSleeper;
 
 impl Sleeper for ThreadSleeper {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
     fn sleep(&self, duration: Duration) {
         std::thread::sleep(duration);
     }
@@ -265,30 +279,57 @@ fn dispatch(
                 None,
             )?;
             systemctl(deps.system, "stop", &cfg)?;
-            writeln!(stdout, "traffic is now blocked").map_err(output_error)?;
-            Ok(0)
+            if let Ok(topology) = deps.topology.observe(deps.system, &cfg) {
+                if let Some(violations) = verdict::topology_violations(&topology) {
+                    writeln!(
+                        stderr,
+                        "exit tunnel stopped; kill switch is NOT in place: {}",
+                        verdict::Verdict::Unprotected(violations)
+                    )
+                    .map_err(output_error)?;
+                    Ok(2)
+                } else {
+                    writeln!(stdout, "traffic is now blocked").map_err(output_error)?;
+                    Ok(0)
+                }
+            } else {
+                writeln!(
+                    stderr,
+                    "exit tunnel stopped; kill switch state unknown, run 'scupper check'"
+                )
+                .map_err(output_error)?;
+                Ok(1)
+            }
         }
         Command::Apply { yes } => {
             require_root(deps, "apply")?;
-            require_interactive_or_yes(deps, "apply", yes)?;
             let rules = rules::ruleset(&cfg).map_err(|error| error.to_string())?;
-            let preview = if yes {
-                None
-            } else {
-                match deps.fs.read(Path::new(RULESET_PATH)) {
-                    Ok(old) => Some(apply::ruleset_diff(&old, &rules)),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-                    Err(error) => return Err(format!("read {RULESET_PATH}: {error}")),
-                }
+            let destination = Path::new(RULESET_PATH);
+            deps.fs
+                .check_target(destination)
+                .map_err(|error| format!("inspect {RULESET_PATH}: {error}"))?;
+            let old = match deps.fs.read(destination) {
+                Ok(old) => Some(old),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => return Err(format!("read {RULESET_PATH}: {error}")),
             };
-            confirm(
-                deps,
-                "apply",
-                yes,
-                "Replace /etc/nftables.conf and load it? [y/N]",
-                preview.as_deref(),
-            )?;
+            let unchanged = old.as_deref() == Some(&rules);
+            if unchanged {
+                writeln!(stdout, "ruleset unchanged; reloading").map_err(output_error)?;
+            } else {
+                let preview = old.as_deref().map(|old| apply::ruleset_diff(old, &rules));
+                confirm(
+                    deps,
+                    "apply",
+                    yes,
+                    "Replace /etc/nftables.conf and load it? [y/N]",
+                    preview.as_deref(),
+                )?;
+            }
             apply::apply(deps.system, deps.fs, &rules)?;
+            if !unchanged {
+                writeln!(stdout, "ruleset written and loaded").map_err(output_error)?;
+            }
             Ok(0)
         }
     }
@@ -348,7 +389,7 @@ fn systemctl(sys: &dyn System, action: &str, cfg: &V1Config) -> Result<(), Strin
         .run(
             Program::Systemctl,
             &[action.into(), format!("wg-quick@{}", cfg.exit_iface)],
-            EXEC_TIMEOUT,
+            SYSTEMCTL_TIMEOUT,
         )
         .map_err(|error| format!("systemctl {action}: {error}"))?;
     if output.status == Some(0) {
@@ -365,7 +406,8 @@ fn systemctl(sys: &dyn System, action: &str, cfg: &V1Config) -> Result<(), Strin
 // Caps handshake command execution at the remaining polling budget.
 struct PollSystem<'a> {
     inner: &'a dyn System,
-    deadline: u64,
+    clock: &'a dyn Sleeper,
+    deadline: Instant,
 }
 
 impl System for PollSystem<'_> {
@@ -375,7 +417,7 @@ impl System for PollSystem<'_> {
         args: &[String],
         timeout: Duration,
     ) -> Result<ExecOutput, ExecError> {
-        let remaining = Duration::from_secs(self.deadline.saturating_sub(self.now_unix_secs()));
+        let remaining = self.deadline.saturating_duration_since(self.clock.now());
         self.inner.run(program, args, timeout.min(remaining))
     }
 
@@ -394,39 +436,39 @@ fn connect(
     let health = HealthConfig::from(cfg);
     let sys = PollSystem {
         inner: deps.system,
-        deadline: deps.system.now_unix_secs().saturating_add(10),
+        clock: deps.sleeper,
+        deadline: deps.sleeper.now() + Duration::from_secs(10),
     };
     let mut warned = false;
-    while sys.now_unix_secs() < sys.deadline {
+    while deps.sleeper.now() < sys.deadline {
         let observed = check::observe_handshake(&sys, cfg);
         let now = sys.now_unix_secs();
         let handshake = match observed {
             Ok(handshake) => handshake,
-            Err(_) if now >= sys.deadline => break,
+            Err(_) if deps.sleeper.now() >= sys.deadline => break,
             Err(error) => return Err(error.to_string()),
         };
-        let fresh = match handshake.age_at(now) {
-            HandshakeAge::Age(age) => age <= health.max_handshake_age,
-            HandshakeAge::InFuture(skew) => {
-                if !warned {
-                    writeln!(stderr, "warning: {}", warning_text(Warning::ClockSkew))
-                        .map_err(output_error)?;
-                    warned = true;
-                }
-                skew <= health.max_clock_skew
-            }
-            HandshakeAge::Never => false,
-        };
-        if fresh && now <= sys.deadline {
+        if matches!(handshake.age_at(now), HandshakeAge::InFuture(_)) && !warned {
+            writeln!(stderr, "warning: {}", warning_text(Warning::ClockSkew))
+                .map_err(output_error)?;
+            warned = true;
+        }
+        if check::handshake_is_fresh(handshake, &health, now) && deps.sleeper.now() <= sys.deadline
+        {
             writeln!(stdout, "exit tunnel has a fresh handshake").map_err(output_error)?;
             return Ok(0);
         }
-        if now < sys.deadline {
-            deps.sleeper.sleep(Duration::from_secs(1));
+        let remaining = sys.deadline.saturating_duration_since(deps.sleeper.now());
+        if !remaining.is_zero() {
+            deps.sleeper.sleep(Duration::from_secs(1).min(remaining));
         }
     }
-    writeln!(stdout, "{}", Verdict::FailClosed(FailClosed::NoHealthyExit)).map_err(output_error)?;
-    Ok(4)
+    writeln!(
+        stdout,
+        "exit tunnel started; no fresh handshake within ten seconds"
+    )
+    .map_err(output_error)?;
+    Ok(3)
 }
 
 fn warning_text(warning: Warning) -> &'static str {

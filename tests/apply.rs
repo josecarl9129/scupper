@@ -6,7 +6,7 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     rc::Rc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use scupper::{
@@ -27,6 +27,8 @@ struct State {
     files: RefCell<BTreeMap<PathBuf, Vec<u8>>>,
     fail: RefCell<Option<&'static str>>,
     mode: Cell<u32>,
+    stdout: RefCell<String>,
+    nft_response: RefCell<Option<(&'static str, Result<ExecOutput, ExecError>)>>,
     tty: Cell<bool>,
     confirmed: Cell<bool>,
     preview: RefCell<Option<String>>,
@@ -70,12 +72,30 @@ impl Write for FakeFile {
     }
 }
 impl TempFile for FakeFile {
+    fn set_mode(&self, mode: u32) -> io::Result<()> {
+        assert_eq!(mode, 0o644);
+        self.0.step("mode")?;
+        self.0.mode.set(mode);
+        Ok(())
+    }
+
     fn sync_all(&self) -> io::Result<()> {
-        self.0.step("sync temp")
+        self.0.step(if self.0.mode.get() == 0o600 {
+            "sync temp"
+        } else {
+            "sync mode"
+        })
     }
 }
 
 impl Fs for Harness {
+    fn check_target(&self, _: &Path) -> io::Result<()> {
+        self.0.step("check target")
+    }
+    fn cleanup_stale(&self, _: &Path) -> io::Result<()> {
+        self.0.step("cleanup stale")
+    }
+
     fn read(&self, path: &Path) -> io::Result<String> {
         self.0.step("read")?;
         self.0
@@ -95,7 +115,7 @@ impl Fs for Harness {
     fn rename(&self, source: &Path, destination: &Path) -> io::Result<()> {
         assert_eq!(source, Path::new(TEMP));
         assert_eq!(destination, Path::new(RULESET_PATH));
-        assert_eq!(self.0.mode.get(), 0o600);
+        assert_eq!(self.0.mode.get(), 0o644);
         self.0.step("rename")?;
         let content = self
             .0
@@ -107,13 +127,6 @@ impl Fs for Harness {
             .files
             .borrow_mut()
             .insert(destination.into(), content);
-        Ok(())
-    }
-    fn set_mode(&self, path: &Path, mode: u32) -> io::Result<()> {
-        assert_eq!(path, Path::new(RULESET_PATH));
-        assert_eq!(mode, 0o644);
-        self.0.step("mode")?;
-        self.0.mode.set(mode);
         Ok(())
     }
     fn sync_dir(&self, directory: &Path) -> io::Result<()> {
@@ -134,14 +147,31 @@ impl System for Harness {
         let validate = args.first().is_some_and(|arg| arg == "-c");
         let step = if validate { "nft validate" } else { "nft load" };
         if validate {
-            assert_eq!(args, ["-c", "-f", TEMP]);
-            assert!(self.0.files.borrow().contains_key(Path::new(TEMP)));
+            assert_eq!(&args[..2], ["-c", "-f"]);
+            if args[2] == TEMP {
+                assert!(self.0.files.borrow().contains_key(Path::new(TEMP)));
+            }
         } else {
             assert_eq!(args, ["-f", RULESET_PATH]);
         }
         self.0
             .step(&format!("{step} exec"))
             .map_err(|error| ExecError::spawn(&error.to_string()))?;
+        if self
+            .0
+            .nft_response
+            .borrow()
+            .as_ref()
+            .is_some_and(|(name, _)| *name == step)
+        {
+            return self
+                .0
+                .nft_response
+                .borrow_mut()
+                .take()
+                .map(|(_, response)| response)
+                .ok_or_else(|| ExecError::spawn("missing injected response"))?;
+        }
         let failed = self.0.step(step).is_err();
         Ok(ExecOutput {
             status: Some(i32::from(failed)),
@@ -174,6 +204,10 @@ impl Prompt for Harness {
     }
 }
 impl Sleeper for Harness {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
     fn sleep(&self, _: Duration) {}
 }
 
@@ -188,13 +222,16 @@ impl Harness {
             .insert(RULESET_PATH.into(), b"old rules\n".to_vec());
     }
     fn run(&self, args: &[&str]) -> (u8, String) {
+        self.run_fs(args, self)
+    }
+    fn run_fs(&self, args: &[&str], fs: &dyn Fs) -> (u8, String) {
         let mut out = Vec::new();
         let mut err = Vec::new();
         let code = cli::run_with(
             std::iter::once("scupper").chain(args.iter().copied()),
             &Dependencies {
                 system: self,
-                fs: self,
+                fs,
                 privilege: self,
                 prompt: self,
                 sleeper: self,
@@ -204,6 +241,7 @@ impl Harness {
             &mut out,
             &mut err,
         );
+        *self.0.stdout.borrow_mut() = String::from_utf8_lossy(&out).into_owned();
         (code, String::from_utf8_lossy(&err).into_owned())
     }
     fn assert_no_temp(&self) {
@@ -226,13 +264,17 @@ fn apply_validates_before_rename() -> Result<(), String> {
     assert_eq!(
         *h.0.log.borrow(),
         [
+            "cleanup stale",
+            "check target",
+            "read",
             "create temp",
             "write temp",
             "sync temp",
             "nft validate exec",
             "nft validate",
-            "rename",
             "mode",
+            "sync mode",
+            "rename",
             "sync directory",
             "nft load exec",
             "nft load",
@@ -268,6 +310,7 @@ fn apply_load_failure_reported() {
     assert_eq!(code, 1);
     assert!(err.contains("first nft error\nsecond nft error"));
     assert!(err.contains("file on disk at /etc/nftables.conf is the new, validated version"));
+    assert!(err.contains("live ruleset was not changed by this run"));
     assert_eq!(
         h.disk().as_deref(),
         Some(include_str!("golden/ruleset.golden"))
@@ -288,6 +331,9 @@ fn apply_temp_cleanup_on_every_error() {
         }
     }
     for step in [
+        "cleanup stale",
+        "check target",
+        "read",
         "create temp",
         "write temp",
         "sync temp",
@@ -295,6 +341,7 @@ fn apply_temp_cleanup_on_every_error() {
         "nft validate",
         "rename",
         "mode",
+        "sync mode",
         "sync directory",
         "nft load exec",
         "nft load",
@@ -305,7 +352,7 @@ fn apply_temp_cleanup_on_every_error() {
         let (code, err) = h.run(&["apply", "--yes"]);
         assert_eq!(code, 1, "{step}: {err}");
         h.assert_no_temp();
-        if ["mode", "sync directory", "nft load exec", "nft load"].contains(&step) {
+        if ["sync directory", "nft load exec", "nft load"].contains(&step) {
             assert!(err.contains("validated version"), "{step}: {err}");
         } else {
             assert_eq!(h.disk().as_deref(), Some("old rules\n"), "{step}");
@@ -346,7 +393,10 @@ fn apply_diff_shown_on_tty() {
     assert!(diff.contains("-old rules\n"));
     assert!(diff.contains("+# Generated by scupper"));
     let log = h.0.log.borrow();
-    assert_eq!(&log[..3], ["read", "prompt", "create temp"]);
+    assert_eq!(
+        &log[..4],
+        ["check target", "read", "prompt", "cleanup stale"]
+    );
 }
 
 #[test]
@@ -355,7 +405,7 @@ fn preview_read_error_prevents_writes() {
     h.0.tty.set(true);
     h.fail("read");
     assert_eq!(h.run(&["apply"]).0, 1);
-    assert_eq!(*h.0.log.borrow(), ["read"]);
+    assert_eq!(*h.0.log.borrow(), ["check target", "read"]);
     h.assert_no_temp();
 }
 
@@ -377,4 +427,314 @@ fn diff_handles_empty_files_and_missing_newlines() {
     );
     let diff = apply::ruleset_diff("old", "");
     assert!(diff.contains("@@ -1 +0,0 @@\n-old\n\\ No newline at end of file\n"));
+}
+
+#[test]
+fn apply_signal_and_timeout_failures_preserve_the_correct_disk_version() {
+    for step in ["nft validate", "nft load"] {
+        for response in [
+            Ok(ExecOutput {
+                status: None,
+                stdout: String::new(),
+                stderr: "terminated".into(),
+            }),
+            Err(ExecError::Timeout {
+                after: Duration::from_secs(3),
+            }),
+        ] {
+            let h = Harness::default();
+            h.old();
+            *h.0.nft_response.borrow_mut() = Some((step, response));
+            let (code, err) = h.run(&["apply", "--yes"]);
+            assert_eq!(code, 1, "{step}: {err}");
+            assert!(h.0.stdout.borrow().is_empty());
+            h.assert_no_temp();
+            let renames =
+                h.0.log
+                    .borrow()
+                    .iter()
+                    .filter(|entry| *entry == "rename")
+                    .count();
+            if step == "nft validate" {
+                assert_eq!(renames, 0);
+                assert_eq!(h.disk().as_deref(), Some("old rules\n"));
+                assert!(
+                    !h.0.log
+                        .borrow()
+                        .iter()
+                        .any(|entry| entry == "nft load exec")
+                );
+            } else {
+                // The final load follows the single validated rename; no rollback rename.
+                assert_eq!(renames, 1);
+                assert_eq!(
+                    h.disk().as_deref(),
+                    Some(include_str!("golden/ruleset.golden"))
+                );
+                assert!(err.contains("new, validated version"));
+                assert!(err.contains("live ruleset was not changed by this run"));
+            }
+        }
+    }
+}
+
+#[test]
+fn apply_messages_and_unchanged_reload() {
+    let h = Harness::default();
+    let (code, err) = h.run(&["apply", "--yes"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(*h.0.stdout.borrow(), "ruleset written and loaded\n");
+    h.0.log.borrow_mut().clear();
+    // No TTY and no --yes: unchanged contents do not require confirmation.
+    let (code, err) = h.run(&["apply"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(*h.0.stdout.borrow(), "ruleset unchanged; reloading\n");
+    assert_eq!(
+        *h.0.log.borrow(),
+        [
+            "check target",
+            "read",
+            "cleanup stale",
+            "check target",
+            "read",
+            "nft validate exec",
+            "nft validate",
+            "nft load exec",
+            "nft load"
+        ]
+    );
+}
+
+// Redirect only the filesystem boundary; production sequencing and RealFs
+// operations run unchanged in an isolated directory, without touching /etc.
+struct DiskFs {
+    directory: PathBuf,
+    log: Rc<RefCell<Vec<&'static str>>>,
+}
+
+impl DiskFs {
+    fn new() -> io::Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "scupper-apply-test-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(io::Error::other)?
+                .as_nanos(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&directory)?;
+        Ok(Self {
+            directory,
+            log: Rc::default(),
+        })
+    }
+
+    fn path(&self, path: &Path) -> PathBuf {
+        path.strip_prefix("/etc")
+            .map_or_else(|_| path.to_owned(), |name| self.directory.join(name))
+    }
+}
+
+impl Drop for DiskFs {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
+struct DiskFile {
+    file: Box<dyn TempFile>,
+    path: PathBuf,
+    log: Rc<RefCell<Vec<&'static str>>>,
+}
+
+fn mode(path: &Path) -> io::Result<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    Ok(std::fs::metadata(path)?.permissions().mode() & 0o777)
+}
+
+impl Write for DiskFile {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        assert_eq!(mode(&self.path)?, 0o600);
+        let count = self.file.write(bytes)?;
+        self.log.borrow_mut().push("write 0600");
+        Ok(count)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl TempFile for DiskFile {
+    fn sync_all(&self) -> io::Result<()> {
+        self.file.sync_all()?;
+        self.log.borrow_mut().push(if mode(&self.path)? == 0o600 {
+            "sync content"
+        } else {
+            "sync mode"
+        });
+        Ok(())
+    }
+    fn set_mode(&self, mode: u32) -> io::Result<()> {
+        self.file.set_mode(mode)?;
+        self.log.borrow_mut().push("fchmod");
+        Ok(())
+    }
+}
+
+impl Fs for DiskFs {
+    fn check_target(&self, path: &Path) -> io::Result<()> {
+        apply::RealFs.check_target(&self.path(path))
+    }
+    fn cleanup_stale(&self, directory: &Path) -> io::Result<()> {
+        apply::RealFs.cleanup_stale(&self.path(directory))?;
+        self.log.borrow_mut().push("cleanup stale");
+        Ok(())
+    }
+    fn read(&self, path: &Path) -> io::Result<String> {
+        apply::RealFs.read(&self.path(path))
+    }
+    fn create_temp(&self, directory: &Path) -> io::Result<(PathBuf, Box<dyn TempFile>)> {
+        let (path, file) = apply::RealFs.create_temp(&self.path(directory))?;
+        assert_eq!(mode(&path)?, 0o600);
+        self.log.borrow_mut().push("create 0600");
+        Ok((
+            path.clone(),
+            Box::new(DiskFile {
+                file,
+                path,
+                log: self.log.clone(),
+            }),
+        ))
+    }
+    fn rename(&self, source: &Path, destination: &Path) -> io::Result<()> {
+        assert_eq!(
+            mode(source)?,
+            0o644,
+            "permissions must be final before rename"
+        );
+        assert_eq!(self.log.borrow().last(), Some(&"sync mode"));
+        apply::RealFs.rename(source, &self.path(destination))?;
+        self.log.borrow_mut().push("rename 0644");
+        Ok(())
+    }
+    fn sync_dir(&self, directory: &Path) -> io::Result<()> {
+        apply::RealFs.sync_dir(&self.path(directory))?;
+        self.log.borrow_mut().push("sync directory");
+        Ok(())
+    }
+    fn remove(&self, path: &Path) -> io::Result<()> {
+        apply::RealFs.remove(path)
+    }
+}
+
+#[test]
+fn real_fs_apply_permissions_and_durability() -> io::Result<()> {
+    let disk = DiskFs::new()?;
+    let h = Harness::default();
+    let (code, err) = h.run_fs(&["apply", "--yes"], &disk);
+    assert_eq!(code, 0, "{err}");
+    let destination = disk.directory.join("nftables.conf");
+    assert_eq!(
+        std::fs::read_to_string(&destination)?,
+        include_str!("golden/ruleset.golden")
+    );
+    assert_eq!(mode(&destination)?, 0o644);
+    assert_eq!(
+        *disk.log.borrow(),
+        [
+            "cleanup stale",
+            "create 0600",
+            "write 0600",
+            "sync content",
+            "fchmod",
+            "sync mode",
+            "rename 0644",
+            "sync directory"
+        ]
+    );
+    assert_eq!(std::fs::read_dir(&disk.directory)?.count(), 1);
+    disk.log.borrow_mut().clear();
+    let (code, err) = h.run_fs(&["apply"], &disk);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(*h.0.stdout.borrow(), "ruleset unchanged; reloading\n");
+    assert_eq!(*disk.log.borrow(), ["cleanup stale"]);
+    Ok(())
+}
+
+#[test]
+fn real_fs_refuses_symlinked_target_without_following_or_replacing_it() -> io::Result<()> {
+    use std::os::unix::fs::symlink;
+    for dangling in [false, true] {
+        let disk = DiskFs::new()?;
+        let victim = disk.directory.join("victim");
+        if !dangling {
+            std::fs::write(&victim, "keep this file")?;
+        }
+        let destination = disk.directory.join("nftables.conf");
+        symlink(&victim, &destination)?;
+        assert!(apply::RealFs.read(&destination).is_err());
+        for args in [vec!["apply", "--yes"], vec!["apply"]] {
+            let h = Harness::default();
+            let (code, err) = h.run_fs(&args, &disk);
+            assert_eq!(code, 1, "{err}");
+            assert!(err.contains("refusing symlinked boot ruleset"));
+            assert!(h.0.stdout.borrow().is_empty());
+            assert!(h.0.log.borrow().is_empty());
+            assert!(disk.log.borrow().is_empty());
+        }
+        // Check the real rename boundary too, including a link introduced
+        // after the preview/validation checks.
+        let (source, file) = apply::RealFs.create_temp(&disk.directory)?;
+        drop(file);
+        assert!(apply::RealFs.rename(&source, &destination).is_err());
+        assert!(source.exists());
+        assert_eq!(std::fs::read_link(&destination)?, victim);
+        if dangling {
+            assert!(!victim.exists());
+        } else {
+            assert_eq!(std::fs::read_to_string(&victim)?, "keep this file");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn real_fs_apply_cleans_only_matching_regular_stale_files() -> io::Result<()> {
+    use std::os::unix::fs::symlink;
+    let disk = DiskFs::new()?;
+    for name in [".scupper-123-0.tmp", ".scupper-456-987.tmp"] {
+        std::fs::write(disk.directory.join(name), "stale")?;
+    }
+    let preserved = [
+        "other.tmp",
+        ".scupper-.tmp",
+        ".scupper-1.tmp",
+        ".scupper-1-.tmp",
+        ".scupper--2.tmp",
+        ".scupper-one-2.tmp",
+        ".scupper-1-2.tmp.bak",
+        ".scupper-1-2-3.tmp",
+    ];
+    for name in preserved {
+        std::fs::write(disk.directory.join(name), "keep")?;
+    }
+    let subdir = disk.directory.join(".scupper-789-0.tmp");
+    std::fs::create_dir(&subdir)?;
+    let link = disk.directory.join(".scupper-789-1.tmp");
+    symlink(disk.directory.join("other.tmp"), &link)?;
+    let h = Harness::default();
+    let (code, err) = h.run_fs(&["apply", "--yes"], &disk);
+    assert_eq!(code, 0, "{err}");
+    assert!(!disk.directory.join(".scupper-123-0.tmp").exists());
+    assert!(!disk.directory.join(".scupper-456-987.tmp").exists());
+    for name in preserved {
+        assert_eq!(std::fs::read_to_string(disk.directory.join(name))?, "keep");
+    }
+    assert!(subdir.is_dir());
+    assert!(std::fs::symlink_metadata(link)?.is_symlink());
+    assert_eq!(disk.log.borrow().first(), Some(&"cleanup stale"));
+    Ok(())
 }

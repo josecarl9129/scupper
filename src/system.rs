@@ -15,6 +15,8 @@ use thiserror::Error;
 
 /// Default deadline for each kernel command.
 pub const EXEC_TIMEOUT: Duration = Duration::from_secs(3);
+/// Deadline for starting or stopping a tunnel unit.
+pub const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(30);
 const OUTPUT_CAP: usize = 1024 * 1024;
 
 /// A kernel utility selected without a shell or PATH lookup.
