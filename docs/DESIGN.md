@@ -1679,10 +1679,12 @@ handshake ages, by the Mac's own checks (§14) and by deploy confirmation
 ```rust
 pub type Probe<T> = Result<T, ProbeError>;
 
-pub enum Handshake { Never, At(UnixTime) }
+pub enum Handshake { Never, At { unix_secs: u64 } }
+pub enum HandshakeAge { Never, Age(Duration), InFuture(Duration) }
 impl Handshake {
-    /// None for Never. A future timestamp gives Some(0) plus Warning::ClockSkew.
-    pub fn age(&self, now: UnixTime) -> (Option<Duration>, Option<Warning>);
+    /// Pure. Freshness rule (above): InFuture(d) is fresh only if d <= max_clock_skew,
+    /// always with Warning::ClockSkew; beyond the bound it is stale.
+    pub fn age_at(&self, now_unix_secs: u64) -> HandshakeAge;
 }
 
 pub enum RulesetObs { Exact, Missing, Differs { live: Sha256, want: Sha256 } }
@@ -1731,11 +1733,11 @@ pub enum Violation {
 pub enum Degraded {
     FailoverStuck { exit: ExitId, fresh_standbys: Vec<ExitId> },
     ForwardingDisabled,
-    RouteLookupFailed { client: ClientAddr, err: ProbeError },
     RouteWrong { client: ClientAddr, got: RouteAnswer, want: RouteTarget },
     DisconnectNotEffective,
     ClientSideBroken(ClientFault),             // wg0 key, listen port or host socket
-    ExitProbeFailed(ProbeError),
+    ExitProbeFailed(ProbeError),               // the probe ran and the path failed (not a local setup error)
+    ExitProbeImplausible { ip: IpAddr },       // exit IP cannot be a public exit address
     CommonModeProbeFailure,
     DnsFailed(ProbeError),
 }

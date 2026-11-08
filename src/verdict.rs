@@ -5,7 +5,11 @@
 //! [`V1Config`] has no exit peer key. Callers must supply the exit interface's
 //! single-peer handshake, rather than a handshake from an unrelated interface.
 
-use std::{fmt, net::IpAddr, time::Duration};
+use std::{
+    fmt,
+    net::{IpAddr, Ipv4Addr},
+    time::Duration,
+};
 
 use thiserror::Error;
 
@@ -18,6 +22,10 @@ use crate::{
 pub type Probe<T> = Result<T, ProbeError>;
 
 /// A failed observation; it never establishes that a stage passed.
+///
+/// Local exit-probe setup failures (permission, socket creation, or binding the
+/// device) are observation errors: the exec layer must report a [`CheckError`]
+/// at [`Stage::ExitProbe`], not an `Ok(Err(..))` path failure.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ProbeError {
     /// The observation did not complete within its deadline.
@@ -119,6 +127,8 @@ pub struct M1Observations {
 pub struct HealthConfig {
     /// Required output interface for forwarded client traffic.
     pub exit_iface: IfName,
+    /// Local exit-interface address, which cannot verify a public exit.
+    pub exit_addr: Ipv4Addr,
     /// Inclusive handshake age limit (180 seconds by default).
     pub max_handshake_age: Duration,
     /// Inclusive future timestamp tolerance (5 seconds by default).
@@ -129,6 +139,7 @@ impl From<&V1Config> for HealthConfig {
     fn from(config: &V1Config) -> Self {
         Self {
             exit_iface: config.exit_iface.clone(),
+            exit_addr: config.exit_addr,
             max_handshake_age: Duration::from_secs(180),
             max_clock_skew: Duration::from_secs(5),
         }
@@ -208,6 +219,11 @@ impl Violations {
         Self(vec![first])
     }
 
+    /// Appends another observed violation, preserving the nonempty invariant.
+    pub fn push(&mut self, violation: Violation) {
+        self.0.push(violation);
+    }
+
     /// Borrows all violations in deterministic observation order.
     #[must_use]
     pub fn as_slice(&self) -> &[Violation] {
@@ -227,6 +243,11 @@ pub enum Degraded {
     },
     /// The final bound exit probe failed after routing passed.
     ExitProbeFailed(ProbeError),
+    /// The bound probe returned an address that cannot verify a public exit.
+    ExitProbeImplausible {
+        /// Observed address, retained in its original form for diagnosis.
+        ip: IpAddr,
+    },
 }
 
 /// A contained but unavailable tunnel, established before route/probe work.
@@ -273,6 +294,9 @@ impl Verdict {
 }
 
 /// Completed health decision with caveats from the stages actually reached.
+///
+/// Callers must print [`Self::warnings`] (including [`Warning::ClockSkew`]) next
+/// to the verdict so that observation caveats remain visible.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Report {
     /// The earliest decisive outcome in safety-preserving stage order.
@@ -342,11 +366,35 @@ fn topology_violations(topology: &M1Topology) -> Option<Violations> {
     }
 }
 
+fn exit_ip_plausible(ip: IpAddr, exit_addr: Ipv4Addr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(ip) => {
+            !(ip.is_unspecified()
+                || ip.is_loopback()
+                || ip.is_private()
+                || (ip.octets()[0] == 100 && (64..=127).contains(&ip.octets()[1]))
+                || ip.is_link_local()
+                || ip.is_multicast()
+                || ip.is_broadcast()
+                || ip == exit_addr)
+        }
+        IpAddr::V6(ip) => {
+            !ip.is_unspecified()
+                && !ip.is_loopback()
+                && !ip.is_unicast_link_local()
+                && !ip.is_unique_local()
+                && !ip.is_multicast()
+        }
+    }
+}
+
 /// Advances topology → handshake → route → exit probe, without I/O or a clock.
 ///
 /// Stops at the first missing or failed stage and ignores all later observations.
 /// Topology, handshake and route observation errors return code 1; the final
 /// bound-probe error is an availability failure (`ExitProbeFailed`, code 3).
+/// Local probe setup failures must instead be reported by the exec layer as
+/// [`CheckError`] at [`Stage::ExitProbe`], not as `Ok(Err(..))` path failures.
 /// Topology violations are collected before consulting later errors, so a known
 /// unsafe configuration cannot be hidden by an availability or probe failure.
 /// A future timestamp warns in all cases and is fresh only within the configured
@@ -360,6 +408,12 @@ pub fn next(obs: &M1Observations, cfg: &HealthConfig, now_unix_secs: u64) -> Nex
     };
     if let Some(violations) = topology_violations(topology) {
         return done(Verdict::Unprotected(violations), Vec::new());
+    }
+    if topology.uplink_addrs.is_empty() {
+        return failed(
+            Stage::Topology,
+            &ProbeError::io("topology contains no uplink addresses"),
+        );
     }
     let handshake = match &obs.handshake {
         None => return Next::Handshake,
@@ -398,8 +452,19 @@ pub fn next(obs: &M1Observations, cfg: &HealthConfig, now_unix_secs: u64) -> Nex
             Verdict::Degraded(Degraded::ExitProbeFailed(source.bounded())),
             warnings,
         ),
-        Some(Ok(ip)) if topology.uplink_addrs.contains(ip) => done(
-            Verdict::Unprotected(Violations::new(Violation::ExitIpIsUplinkAddress(*ip))),
+        Some(Ok(ip))
+            if topology
+                .uplink_addrs
+                .iter()
+                .any(|uplink| uplink.to_canonical() == ip.to_canonical()) =>
+        {
+            done(
+                Verdict::Unprotected(Violations::new(Violation::ExitIpIsUplinkAddress(*ip))),
+                warnings,
+            )
+        }
+        Some(Ok(ip)) if !exit_ip_plausible(*ip, cfg.exit_addr) => done(
+            Verdict::Degraded(Degraded::ExitProbeImplausible { ip: *ip }),
             warnings,
         ),
         Some(Ok(ip)) => done(Verdict::Protected { exit_ip: *ip }, warnings),
@@ -415,13 +480,28 @@ impl fmt::Display for Verdict {
             Self::FailClosed(FailClosed::NoHealthyExit) => {
                 f.write_str("exit tunnel is down, traffic is blocked (fail closed)")
             }
-            Self::Degraded(Degraded::ExitProbeFailed(_)) => {
-                f.write_str("exit probe failed, exit connectivity could not be verified")
+            Self::Degraded(Degraded::ExitProbeFailed(source)) => {
+                write!(
+                    f,
+                    "exit probe failed, exit connectivity could not be verified: {source}"
+                )
+            }
+            Self::Degraded(Degraded::ExitProbeImplausible { ip }) => {
+                write!(
+                    f,
+                    "exit probe returned implausible public exit IP {ip}, exit connectivity could not be verified"
+                )
             }
             Self::Degraded(Degraded::RouteWrong { got, want }) => {
-                f.write_str("client route uses ")?;
+                if let RouteLookup::Dev(name) = got {
+                    return write!(
+                        f,
+                        "client traffic routes via {name}, not {want} (policy rule missing?), traffic is blocked"
+                    );
+                }
+                f.write_str("client route is ")?;
                 display_route(got, f)?;
-                write!(f, ", expected {want}; traffic is blocked")
+                write!(f, ", not via {want}, traffic is blocked")
             }
             Self::Unprotected(violations) => {
                 f.write_str("unprotected: ")?;
@@ -440,7 +520,7 @@ impl fmt::Display for Verdict {
 fn display_route(route: &RouteLookup, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match route {
         RouteLookup::Dev(name) => write!(f, "{name}"),
-        RouteLookup::OtherDev => f.write_str("an unrecognized device"),
+        RouteLookup::OtherDev => f.write_str("via an unrecognized device"),
         RouteLookup::OtherType(kind) => f.write_str(match kind {
             RouteType::Broadcast => "broadcast",
             RouteType::Anycast => "anycast",
