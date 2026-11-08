@@ -201,7 +201,9 @@ impl Lab {
         Ok(())
     }
     fn prepare(&mut self) -> Result<()> {
-        for parent in ["/run/netns", "/etc/netns"] {
+        // /run/netns is left to iproute2: `ip netns add` creates it and turns it into a shared
+        // mount point, which cannot be removed afterwards (EBUSY).
+        for parent in ["/etc/netns"] {
             if !Path::new(parent).exists() {
                 self.registry
                     .register(Resource::EmptyDirectory(parent.into()));
