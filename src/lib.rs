@@ -5,3 +5,4 @@
 
 pub mod parse;
 pub mod rules;
+pub mod verdict;

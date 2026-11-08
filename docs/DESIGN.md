@@ -1660,9 +1660,10 @@ refuses an interface name that does not exist) (2) → handshake fresh (4) → `
 `dev proton0` (3) → exit probe bound to `proton0` (3).
 
 Rules: an observation error is 1, never a safe code; a known violation wins
-over an observation error. A handshake timestamp in the future counts as age
-0 and raises `Warning::ClockSkew` (it never makes a stale exit fresh by
-itself: probes are clock-independent). `check` run locally performs every
+over an observation error. `Never` is not fresh; `Age(d)` is fresh iff
+`d <= max_handshake_age`; `InFuture(d)` is fresh iff `d <= max_clock_skew`
+and always adds `Warning::ClockSkew`, including beyond the skew bound,
+where it is stale. `check` run locally performs every
 stage itself; via the API, scupperd runs a fresh check. `status` may show
 cached observations, always with their age.
 
