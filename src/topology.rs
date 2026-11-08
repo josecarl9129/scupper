@@ -12,7 +12,7 @@ use crate::{
     parse,
     rules::{IfName, V1Config},
     system::{EXEC_TIMEOUT, Program, System},
-    verdict::{self, ConfigMismatch, M1Topology, Probe, ProbeError, RulesetObs},
+    verdict::{self, ConfigMismatch, ExitLink, M1Topology, Probe, ProbeError, RulesetObs},
 };
 
 /// Injectable reader for the legacy firewall table lists in procfs.
@@ -103,6 +103,7 @@ fn exit_checks(
     let mut exit_errors = Vec::new();
     let mut rechecked = false;
     let mut address_missing = false;
+    let mut address_up = false;
     let mut hook = link.is_some_and(|link| link.xdp);
     for (program, kind) in [
         (Program::Ip, "addr"),
@@ -118,7 +119,12 @@ fn exit_checks(
             program,
             &["-j", kind, "show", "dev", cfg.exit_iface.as_str()],
             |out| match kind {
-                "addr" => Ok(!parse::local_addresses(out)?.contains(&cfg.exit_addr.into())),
+                "addr" => {
+                    address_up = parse::links(out)?
+                        .iter()
+                        .any(|link| link.name == cfg.exit_iface.as_str() && link.up);
+                    Ok(address_up && !parse::local_addresses(out)?.contains(&cfg.exit_addr.into()))
+                }
                 "qdisc" => parse::qdisc_has_hooks(out),
                 _ => parse::filter_has_hooks(out),
             },
@@ -141,11 +147,15 @@ fn exit_checks(
                             .iter()
                             .any(|link| link.name == cfg.exit_iface.as_str())
                     }) {
+                        topology.exit_link = ExitLink::Absent;
                         return;
                     }
                 }
             }
         }
+    }
+    if link.is_some_and(|link| link.up) && address_up && exit_errors.is_empty() {
+        topology.exit_link = ExitLink::Up;
     }
     errors.extend(exit_errors);
     if address_missing {
@@ -186,6 +196,7 @@ impl TopologySource for TopologyWithReader<'_> {
     fn observe(&self, sys: &dyn System, cfg: &V1Config) -> Probe<M1Topology> {
         let mut errors = Vec::new();
         let mut topology = M1Topology {
+            exit_link: ExitLink::Absent,
             // A failed ruleset collector is never returned as Exact unless a
             // separate known violation already determines the safety verdict.
             ruleset: RulesetObs::Exact,
@@ -261,6 +272,7 @@ impl TopologySource for TopologyWithReader<'_> {
             }
         }
         if exists(&cfg.exit_iface) {
+            topology.exit_link = ExitLink::Down;
             exit_checks(sys, cfg, link(&cfg.exit_iface), &mut topology, &mut errors);
         }
         topology.legacy_tables = legacy_tables(self.0, &mut errors);

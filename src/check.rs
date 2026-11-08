@@ -7,8 +7,8 @@ use crate::{
     rules::{IfName, V1Config},
     system::{EXEC_TIMEOUT, ExecError, ExecOutput, Program, System},
     verdict::{
-        self, CheckError, HealthConfig, M1Observations, M1Topology, Next, Probe, ProbeError,
-        Report, RulesetObs, Stage, Violations,
+        self, CheckError, ExitLink, HealthConfig, M1Observations, M1Topology, Next, Probe,
+        ProbeError, Report, RulesetObs, Stage, Violations,
     },
 };
 
@@ -89,6 +89,7 @@ pub fn observe_handshake(sys: &dyn System, cfg: &V1Config) -> Probe<Handshake> {
 pub(crate) fn handshake_is_fresh(handshake: Handshake, cfg: &HealthConfig, now: u64) -> bool {
     let observations = M1Observations {
         topology: Some(Ok(M1Topology {
+            exit_link: ExitLink::Up,
             ruleset: RulesetObs::Exact,
             tc_hooks: Vec::new(),
             legacy_tables: Vec::new(),

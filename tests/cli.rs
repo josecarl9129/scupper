@@ -16,7 +16,7 @@ use scupper::{
     cli::{self, Dependencies, NamespaceReader, Privilege, Prompt, Sleeper, UnimplementedTopology},
     rules::V1Config,
     system::{EXEC_TIMEOUT, ExecError, ExecOutput, Program, SYSTEMCTL_TIMEOUT, System},
-    verdict::{M1Topology, Probe, ProbeError, RulesetObs},
+    verdict::{ExitLink, M1Topology, Probe, ProbeError, RulesetObs},
 };
 
 #[derive(Default)]
@@ -190,6 +190,7 @@ impl TopologySource for Harness {
     fn observe(&self, _: &dyn System, _: &V1Config) -> Probe<M1Topology> {
         self.topology_calls.set(self.topology_calls.get() + 1);
         Ok(M1Topology {
+            exit_link: ExitLink::Up,
             ruleset: RulesetObs::Exact,
             tc_hooks: vec![],
             legacy_tables: Vec::new(),
@@ -304,6 +305,7 @@ fn check_verdict_codes() {
     impl TopologySource for Missing {
         fn observe(&self, _: &dyn System, _: &V1Config) -> Probe<M1Topology> {
             Ok(M1Topology {
+                exit_link: ExitLink::Up,
                 ruleset: RulesetObs::Missing,
                 tc_hooks: vec![],
                 legacy_tables: Vec::new(),
@@ -636,7 +638,7 @@ fn canon_is_hidden_and_requires_one_path() {
     for args in [
         vec!["canon"],
         vec!["canon", "one"],
-        vec!["canon", "--outer-netns", "X", "one", "two"],
+        vec!["canon", "--outer-netns", "net:[789]", "one", "two"],
     ] {
         let (code, out, err) = h.run(&args);
         assert_eq!(code, 1);
@@ -649,16 +651,21 @@ fn canon_is_hidden_and_requires_one_path() {
 #[test]
 fn canon_namespace_guards_run_before_any_system_calls() {
     for (current, pid1) in [
-        (Some("X"), Some("host")),
-        (None, Some("host")),
-        (Some("child"), Some("child")),
+        (Some("net:[789]"), Some("net:[456]")),
+        (None, Some("net:[456]")),
+        (Some("net:[123]"), Some("net:[123]")),
     ] {
         let h = Harness {
             self_netns: current,
             pid1_netns: pid1,
             ..Harness::default()
         };
-        let (code, out, err) = h.run(&["canon", "--outer-netns", "X", "/private/ruleset.nft"]);
+        let (code, out, err) = h.run(&[
+            "canon",
+            "--outer-netns",
+            "net:[789]",
+            "/private/ruleset.nft",
+        ]);
         assert_eq!(code, 1);
         assert_eq!(out, "");
         assert!(err.contains("canon:"));
@@ -675,7 +682,12 @@ fn canon_unreadable_pid1_is_optional_and_empty_ruleset_precedes_load() {
     h.output(r#"{"nftables":[{"metainfo":{"version":"1"}}]}"#);
     h.output("");
     h.output(r#"{"nftables":[{"table":{"name":"scupper","family":"inet"}}]}"#);
-    let (code, out, err) = h.run(&["canon", "--outer-netns", "X", "/private/ruleset.nft"]);
+    let (code, out, err) = h.run(&[
+        "canon",
+        "--outer-netns",
+        "net:[789]",
+        "/private/ruleset.nft",
+    ]);
     assert_eq!(code, 0, "{err}");
     assert!(out.contains("scupper"));
     let calls = h.calls.borrow();
@@ -698,12 +710,42 @@ fn canon_refuses_nonempty_or_unreadable_preload_ruleset() {
     ] {
         let h = Harness::default();
         h.output(before);
-        let (code, out, err) = h.run(&["canon", "--outer-netns", "X", "/private/ruleset.nft"]);
+        let (code, out, err) = h.run(&[
+            "canon",
+            "--outer-netns",
+            "net:[789]",
+            "/private/ruleset.nft",
+        ]);
         assert_eq!(code, 1);
         assert_eq!(out, "");
         assert!(err.contains("canon:"));
         let calls = h.calls.borrow();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].args, ["-j", "list", "ruleset"]);
+    }
+}
+
+#[test]
+fn canon_rejects_malformed_outer_namespace_before_system_calls() {
+    for outer in [
+        "net:[]",
+        "net:[12a]",
+        "mnt:[1]",
+        "",
+        "net:[1]/",
+        "net:[１２]",
+        "net:[+1]",
+        " net:[1]",
+    ] {
+        let h = Harness::default();
+        let (code, out, err) = h.run(&["canon", "--outer-netns", outer, "/private/ruleset.nft"]);
+        assert_eq!(code, 1, "{outer:?}");
+        assert_eq!(out, "");
+        assert_ne!(err, "");
+        // Clap rejects an empty PathBuf before the canon guard runs.
+        if !outer.is_empty() {
+            assert!(err.contains("outer network namespace must be"), "{err}");
+        }
+        assert!(h.calls.borrow().is_empty());
     }
 }

@@ -15,8 +15,10 @@ use scupper::{
     },
     parse::{Handshake, HandshakeAge, route_probe_argv},
     rules::V1Config,
-    system::{EXEC_TIMEOUT, ExecError, ExecOutput, Program, System, testing::FakeSystem},
-    verdict::{ConfigMismatch, M1Topology, Probe, ProbeError, RulesetObs, Stage, Verdict},
+    system::{EXEC_TIMEOUT, ExecError, ExecOutput, Program, Stream, System, testing::FakeSystem},
+    verdict::{
+        ConfigMismatch, ExitLink, M1Topology, Probe, ProbeError, RulesetObs, Stage, Verdict,
+    },
 };
 
 type Log = Rc<RefCell<Vec<&'static str>>>;
@@ -91,6 +93,7 @@ impl Harness {
             },
             topo: FakeTopology {
                 result: Ok(M1Topology {
+                    exit_link: ExitLink::Up,
                     ruleset: RulesetObs::Exact,
                     tc_hooks: vec![],
                     legacy_tables: Vec::new(),
@@ -314,7 +317,9 @@ fn check_observation_errors_stop_at_the_requested_stage() -> Result<(), Box<dyn 
         Err(ExecError::Timeout {
             after: EXEC_TIMEOUT,
         }),
-        Err(ExecError::OutputTooLarge),
+        Err(ExecError::OutputTooLarge {
+            stream: Stream::Stdout,
+        }),
         Err(ExecError::NonUtf8),
         Err(ExecError::spawn("not installed")),
         Ok(output("not a handshake")),
@@ -408,6 +413,7 @@ fn status_multi_peer_and_clock_skew() -> Result<(), Box<dyn Error>> {
 fn status_other_errors_and_missing_switch() {
     for topology in [
         Ok(M1Topology {
+            exit_link: ExitLink::Up,
             ruleset: RulesetObs::Missing,
             tc_hooks: vec![],
             legacy_tables: Vec::new(),

@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     parse::ParseError,
     rules::{self, V1Config},
-    system::{EXEC_TIMEOUT, ExecError, ExecOutput, Program, System},
+    system::{EXEC_TIMEOUT, ExecError, ExecOutput, Program, Stream, System},
     verdict::{Probe, ProbeError, RulesetObs},
 };
 
@@ -29,6 +29,10 @@ pub const CANON_TIMEOUT: Duration = Duration::from_secs(8);
 /// Diagnostic hash input for live rulesets exceeding the exec output cap.
 /// Such output cannot be the roughly 3 KB policy; no repeat is needed.
 pub const OVERSIZED_LIVE_RULESET: &[u8] = b"live ruleset exceeded output cap";
+
+/// Diagnostic hash input when live stdout overflow makes canonicalization unnecessary.
+pub const WANT_NOT_COMPUTED_LIVE_OVERFLOW: &[u8] =
+    b"want side not computed: live ruleset exceeded output cap";
 
 fn permission_failure(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
@@ -185,7 +189,19 @@ fn isolated_ruleset(
     outer_netns: &Path,
     read_namespace: impl Fn(&Path) -> io::Result<PathBuf>,
 ) -> Probe<String> {
-    // This is the first operation. Any read failure or equality aborts before nft.
+    let valid_outer = outer_netns
+        .to_str()
+        .and_then(|value| value.strip_prefix("net:["))
+        .and_then(|value| value.strip_suffix(']'))
+        .is_some_and(|digits| {
+            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+        });
+    if !valid_outer {
+        return Err(ProbeError::setup(
+            "outer network namespace must be net:[<decimal digits>]",
+        ));
+    }
+    // Any read failure or equality aborts before nft.
     let current = read_namespace(Path::new("/proc/self/ns/net"))
         .map_err(|error| ProbeError::setup(&format!("read current network namespace: {error}")))?;
     if current == outer_netns
@@ -313,22 +329,26 @@ pub fn fingerprint(value: &Value) -> Result<[u8; 32], ParseError> {
 
 // The boolean requests confirmation of an ordinary ruleset difference.
 fn compare_once(sys: &dyn System, cfg: &V1Config) -> Probe<(RulesetObs, bool)> {
-    // Collect both sides even if one fails. No failed observation is a verdict.
-    let want = want(sys, cfg).and_then(|json| Ok(canonicalize(&json)?));
     let live = sys.run(
         Program::Nft,
         &["-j".into(), "list".into(), "ruleset".into()],
         EXEC_TIMEOUT,
     );
-    if live == Err(ExecError::OutputTooLarge) {
+    if live
+        == Err(ExecError::OutputTooLarge {
+            stream: Stream::Stdout,
+        })
+    {
         return Ok((
             RulesetObs::Differs {
                 live_sha256: Sha256::digest(OVERSIZED_LIVE_RULESET).into(),
-                want_sha256: fingerprint(&want?)?,
+                want_sha256: Sha256::digest(WANT_NOT_COMPUTED_LIVE_OVERFLOW).into(),
             },
             false,
         ));
     }
+    // Otherwise collect both sides even if one fails, preserving both diagnostics.
+    let want = want(sys, cfg).and_then(|json| Ok(canonicalize(&json)?));
     let live = command_result(live).and_then(|json| Ok(canonicalize(&json)?));
     let (want, live) = match (want, live) {
         (Ok(want), Ok(live)) => (want, live),

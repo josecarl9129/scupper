@@ -13,14 +13,14 @@ use std::{
 
 use scupper::{
     canon::{
-        CANON_TIMEOUT, OVERSIZED_LIVE_RULESET, canonicalize, fingerprint, observe_ruleset,
-        run_isolated,
+        CANON_TIMEOUT, OVERSIZED_LIVE_RULESET, WANT_NOT_COMPUTED_LIVE_OVERFLOW, canonicalize,
+        fingerprint, observe_ruleset, run_isolated,
     },
     check::{ExitProbe, TopologySource, run_check},
     rules::{V1Config, ruleset},
-    system::{EXEC_TIMEOUT, ExecError, ExecOutput, Program, System},
+    system::{EXEC_TIMEOUT, ExecError, ExecOutput, Program, Stream, System},
     topology::{HostTopology, LegacyTablesReader},
-    verdict::{ConfigMismatch, Probe, ProbeError, RulesetObs},
+    verdict::{ConfigMismatch, ExitLink, FailClosed, Probe, ProbeError, RulesetObs, Verdict},
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -244,7 +244,7 @@ impl System for FakeSystem {
                 r#"[{"dst":"default","gateway":"192.0.2.1","dev":"eth0","protocol":"dhcp","metric":100}]"#
             }
             (Program::Ip, ["-j", "addr", "show", "dev", "proton0"]) => {
-                r#"[{"ifindex":4,"ifname":"proton0","addr_info":[{"family":"inet","local":"10.2.0.2","prefixlen":32}]}]"#
+                r#"[{"ifindex":4,"ifname":"proton0","flags":["UP"],"addr_info":[{"family":"inet","local":"10.2.0.2","prefixlen":32}]}]"#
             }
             (Program::Ip, ["-j", "addr", "show", "dev", "eth0"]) => {
                 r#"[{"ifindex":2,"ifname":"eth0","addr_info":[{"family":"inet","local":"192.0.2.10","prefixlen":24},{"family":"inet6","local":"2001:db8::10","prefixlen":64}]}]"#
@@ -583,6 +583,7 @@ fn repeat_error_does_not_confirm_a_difference() -> Result<(), Box<dyn Error>> {
 fn healthy_topology_collects_everything() -> Result<(), Box<dyn Error>> {
     let sys = FakeSystem::new();
     let topology = topology_source().observe(&sys, &V1Config::default())?;
+    assert_eq!(topology.exit_link, ExitLink::Up);
     assert_eq!(topology.ruleset, RulesetObs::Exact);
     assert_eq!(topology.tc_hooks, Vec::new());
     assert_eq!(topology.config_mismatches, Vec::new());
@@ -592,7 +593,7 @@ fn healthy_topology_collects_everything() -> Result<(), Box<dyn Error>> {
     );
     assert_eq!(sys.calls.borrow().len(), 11);
     assert_eq!(sys.calls.borrow()[0].0, Program::Ip);
-    assert_eq!(sys.calls.borrow()[9].0, Program::Unshare);
+    assert_eq!(sys.calls.borrow()[10].0, Program::Unshare);
     sys.assert_cleaned();
     Ok(())
 }
@@ -628,7 +629,7 @@ fn each_configuration_mismatch() -> Result<(), Box<dyn Error>> {
         (
             Program::Ip,
             vec!["-j", "addr", "show", "dev", "proton0"],
-            r#"[{"addr_info":[{"local":"10.2.0.3"}]}]"#,
+            r#"[{"ifname":"proton0","flags":["UP"],"addr_info":[{"local":"10.2.0.3"}]}]"#,
             ConfigMismatch::ExitAddrNotOnExitIface,
         ),
         (
@@ -836,6 +837,7 @@ fn missing_exit_interface_is_fail_closed_code_four() -> Result<(), Box<dyn Error
     let sys = FakeSystem::new();
     without_exit(&sys);
     let topology = topology_source().observe(&sys, &cfg)?;
+    assert_eq!(topology.exit_link, ExitLink::Absent);
     assert_eq!(topology.ruleset, RulesetObs::Exact);
     assert_eq!(topology.config_mismatches, Vec::new());
     assert_eq!(topology.tc_hooks, Vec::new());
@@ -915,29 +917,45 @@ fn check_error_is_one_and_violation_beats_exit_down() -> Result<(), Box<dyn Erro
 }
 
 #[test]
-fn oversized_live_ruleset_is_a_difference_without_repeat() -> Result<(), Box<dyn Error>> {
+fn oversized_live_ruleset_is_a_difference_without_canon_or_repeat() -> Result<(), Box<dyn Error>> {
     let sys = FakeSystem::new();
     sys.live_results
         .borrow_mut()
-        .push_back(Err(ExecError::OutputTooLarge));
+        .push_back(Err(ExecError::OutputTooLarge {
+            stream: Stream::Stdout,
+        }));
     assert_eq!(
         observe_ruleset(&sys, &V1Config::default())?,
         RulesetObs::Differs {
             live_sha256: Sha256::digest(OVERSIZED_LIVE_RULESET).into(),
-            want_sha256: fingerprint(&canonicalize(&nft_fixture().to_string())?)?,
+            want_sha256: Sha256::digest(WANT_NOT_COMPUTED_LIVE_OVERFLOW).into(),
         }
     );
-    assert_eq!(sys.calls.borrow().len(), 2);
-    sys.assert_cleaned();
-
-    let sys = FakeSystem::new();
-    sys.canon_results
-        .borrow_mut()
-        .push_back(Err(ExecError::OutputTooLarge));
-    assert!(observe_ruleset(&sys, &V1Config::default()).is_err());
-    assert_eq!(sys.calls.borrow().len(), 2);
+    assert_eq!(sys.calls.borrow().len(), 1);
+    assert_eq!(sys.calls.borrow()[0].0, Program::Nft);
+    assert!(sys.temp_paths.borrow().is_empty());
     sys.assert_cleaned();
     Ok(())
+}
+
+#[test]
+fn stderr_and_canon_overflow_are_observation_errors() {
+    for live in [false, true] {
+        let sys = FakeSystem::new();
+        let results = if live {
+            &sys.live_results
+        } else {
+            &sys.canon_results
+        };
+        results
+            .borrow_mut()
+            .push_back(Err(ExecError::OutputTooLarge {
+                stream: if live { Stream::Stderr } else { Stream::Stdout },
+            }));
+        assert!(observe_ruleset(&sys, &V1Config::default()).is_err());
+        assert_eq!(sys.calls.borrow().len(), 2);
+        sys.assert_cleaned();
+    }
 }
 
 #[test]
@@ -979,6 +997,7 @@ fn present_down_exit_with_noop_and_no_address_is_fail_closed() -> Result<(), Box
             assert_eq!(probe.0.get(), 0);
         } else {
             let topology = topology_source().observe(&sys, &cfg)?;
+            assert_eq!(topology.exit_link, ExitLink::Down);
             assert_eq!(topology.ruleset, RulesetObs::Exact);
             assert_eq!(topology.config_mismatches, Vec::new());
             assert_eq!(topology.tc_hooks, Vec::new());
@@ -1027,6 +1046,7 @@ fn vanished_exit_discards_its_query_errors_and_is_fail_closed() -> Result<(), Bo
                 assert_eq!(probe.0.get(), 0);
             } else {
                 let topology = topology_source().observe(&sys, &V1Config::default())?;
+                assert_eq!(topology.exit_link, ExitLink::Absent);
                 assert_eq!(topology.ruleset, RulesetObs::Exact);
                 assert_eq!(topology.config_mismatches, Vec::new());
                 assert_eq!(topology.tc_hooks, Vec::new());
@@ -1353,5 +1373,71 @@ fn exit_query_errors_recheck_links_only_once_and_preserve_other_errors()
         );
         sys.assert_cleaned();
     }
+    Ok(())
+}
+
+#[test]
+fn exit_appearing_after_topology_never_reaches_availability_stages() -> Result<(), Box<dyn Error>> {
+    let sys = FakeSystem::new();
+    without_exit(&sys);
+    healthy_path(&sys);
+    let probe = FakeExitProbe(Cell::new(0));
+    let report = run_check(&sys, &topology_source(), &probe, &V1Config::default())?;
+    assert_eq!(
+        report.verdict,
+        Verdict::FailClosed(FailClosed::ExitLinkNotUp)
+    );
+    assert_eq!(report.verdict.exit_code(), 4);
+    assert_eq!(probe.0.get(), 0);
+    assert!(!sys.calls.borrow().iter().any(|(program, args, _)| {
+        (*program == Program::Wg && args.iter().any(|arg| arg == "latest-handshakes"))
+            || (*program == Program::Ip && args.first().is_some_and(|arg| arg == "route"))
+    }));
+    sys.assert_cleaned();
+    Ok(())
+}
+
+#[test]
+fn failed_links_uses_address_flags_to_decide_missing_exit_address() -> Result<(), Box<dyn Error>> {
+    for up in [false, true] {
+        let sys = FakeSystem::new();
+        sys.push(
+            Program::Ip,
+            &["-j", "link", "show"],
+            Err(ExecError::spawn("links failed")),
+        );
+        let addr = json!([{"ifname":"proton0", "flags": if up { vec!["UP"] } else { vec!["POINTOPOINT"] }, "addr_info":[]}]);
+        sys.set(
+            Program::Ip,
+            &["-j", "addr", "show", "dev", "proton0"],
+            &addr.to_string(),
+        );
+        let probe = FakeExitProbe(Cell::new(0));
+        let result = run_check(&sys, &topology_source(), &probe, &V1Config::default());
+        if up {
+            assert_eq!(result?.verdict.exit_code(), 2);
+        } else {
+            let error = result.err().ok_or("expected links observation error")?;
+            assert_eq!(error.exit_code(), 1);
+            assert!(error.to_string().contains("links failed"));
+        }
+        assert_eq!(probe.0.get(), 0);
+        sys.assert_cleaned();
+    }
+    Ok(())
+}
+
+#[test]
+fn exit_down_in_address_observation_cannot_be_reported_up() -> Result<(), Box<dyn Error>> {
+    let sys = FakeSystem::new();
+    sys.set(
+        Program::Ip,
+        &["-j", "addr", "show", "dev", "proton0"],
+        r#"[{"ifname":"proton0","flags":["POINTOPOINT"],"addr_info":[]}]"#,
+    );
+    let topology = topology_source().observe(&sys, &V1Config::default())?;
+    assert_eq!(topology.exit_link, ExitLink::Down);
+    assert_eq!(topology.config_mismatches, Vec::new());
+    sys.assert_cleaned();
     Ok(())
 }

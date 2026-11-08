@@ -130,6 +130,15 @@ pub struct ExecOutput {
     pub stderr: String,
 }
 
+/// Command output stream identified by a bounded read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stream {
+    /// Standard output.
+    Stdout,
+    /// Standard error.
+    Stderr,
+}
+
 /// Execution failed before a trustworthy complete output was available.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ExecError {
@@ -143,8 +152,11 @@ pub enum ExecError {
         after: Duration,
     },
     /// Either output stream exceeded 1 MiB.
-    #[error("exec output exceeded 1 MiB per stream")]
-    OutputTooLarge,
+    #[error("exec {stream:?} exceeded 1 MiB")]
+    OutputTooLarge {
+        /// The stream that exceeded the output cap.
+        stream: Stream,
+    },
     /// Either output stream was not valid UTF-8.
     #[error("exec output is not UTF-8")]
     NonUtf8,
@@ -251,13 +263,13 @@ fn join_readers(readers: Vec<thread::JoinHandle<()>>, deadline: Instant) {
     }
 }
 
-fn read_pipe(pipe: impl Read) -> Result<String, ExecError> {
+fn read_pipe(pipe: impl Read, stream: Stream) -> Result<String, ExecError> {
     let mut bytes = Vec::new();
     pipe.take((OUTPUT_CAP + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|error| ExecError::spawn(&error.to_string()))?;
     if bytes.len() > OUTPUT_CAP {
-        return Err(ExecError::OutputTooLarge);
+        return Err(ExecError::OutputTooLarge { stream });
     }
     String::from_utf8(bytes).map_err(|_| ExecError::NonUtf8)
 }
@@ -284,7 +296,7 @@ fn collect(
         thread::Builder::new()
             .name("exec-stdout".into())
             .spawn(move || {
-                let _ = sender.send((0, read_pipe(stdout)));
+                let _ = sender.send((0, read_pipe(stdout, Stream::Stdout)));
             })
             .map_err(|error| ExecError::spawn(&error.to_string()))?,
     );
@@ -292,7 +304,7 @@ fn collect(
         thread::Builder::new()
             .name("exec-stderr".into())
             .spawn(move || {
-                let _ = err_sender.send((1, read_pipe(stderr)));
+                let _ = err_sender.send((1, read_pipe(stderr, Stream::Stderr)));
             })
             .map_err(|error| ExecError::spawn(&error.to_string()))?,
     );
@@ -621,7 +633,12 @@ mod tests {
     #[test]
     #[ignore = "subprocess fixture"]
     fn output_error_process_group_fixture() -> Result<(), Box<dyn Error>> {
-        assert_grandchild_killed("exec /usr/bin/yes", ExecError::OutputTooLarge)
+        assert_grandchild_killed(
+            "exec /usr/bin/yes",
+            ExecError::OutputTooLarge {
+                stream: Stream::Stdout,
+            },
+        )
     }
 
     #[test]
@@ -645,7 +662,9 @@ mod tests {
         let started = Instant::now();
         assert_eq!(
             system("/usr/bin/yes")?.run(Program::Wg, &[], EXEC_TIMEOUT),
-            Err(ExecError::OutputTooLarge)
+            Err(ExecError::OutputTooLarge {
+                stream: Stream::Stdout
+            })
         );
         assert!(started.elapsed() < Duration::from_secs(2));
         Ok(())
@@ -729,7 +748,9 @@ mod tests {
         for (fixture_name, expected) in [
             (
                 "system::tests::stderr_cap_fixture",
-                ExecError::OutputTooLarge,
+                ExecError::OutputTooLarge {
+                    stream: Stream::Stderr,
+                },
             ),
             ("system::tests::non_utf8_fixture", ExecError::NonUtf8),
         ] {

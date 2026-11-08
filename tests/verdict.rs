@@ -11,9 +11,9 @@ use scupper::{
     parse::{Handshake, ParseError, RouteLookup, RouteType},
     rules::{IfName, V1Config},
     verdict::{
-        CheckError, ConfigMismatch, Degraded, FailClosed, HealthConfig, M1Observations, M1Topology,
-        Next, Probe, ProbeError, Report, RulesetObs, Stage, Verdict, Violation, Violations,
-        Warning, next,
+        CheckError, ConfigMismatch, Degraded, ExitLink, FailClosed, HealthConfig, M1Observations,
+        M1Topology, Next, Probe, ProbeError, Report, RulesetObs, Stage, Verdict, Violation,
+        Violations, Warning, next,
     },
 };
 
@@ -27,6 +27,7 @@ fn config() -> HealthConfig {
 
 fn topology() -> M1Topology {
     M1Topology {
+        exit_link: ExitLink::Up,
         ruleset: RulesetObs::Exact,
         tc_hooks: vec![],
         legacy_tables: Vec::new(),
@@ -102,6 +103,49 @@ fn v1_verdict_table() {
             ..
         }))
     ));
+}
+
+#[test]
+fn uninspected_exit_stops_before_handshake() {
+    for exit_link in [ExitLink::Absent, ExitLink::Down] {
+        for handshake in [
+            None,
+            Some(Ok(Handshake::At { unix_secs: NOW })),
+            Some(Err(ProbeError::Timeout)),
+        ] {
+            let mut obs = passing();
+            obs.topology = Some(Ok(M1Topology {
+                exit_link,
+                ..topology()
+            }));
+            obs.handshake = handshake;
+            let result = next(&obs, &config(), NOW);
+            assert_eq!(code(&result), Some(4));
+            assert_eq!(
+                result,
+                Next::Done(Ok(Report {
+                    verdict: Verdict::FailClosed(FailClosed::ExitLinkNotUp),
+                    warnings: vec![],
+                }))
+            );
+            assert_eq!(
+                Verdict::FailClosed(FailClosed::ExitLinkNotUp).to_string(),
+                "exit tunnel is down, traffic is blocked"
+            );
+            obs.topology = Some(Ok(M1Topology {
+                exit_link,
+                ruleset: RulesetObs::Missing,
+                ..topology()
+            }));
+            assert_eq!(code(&next(&obs, &config(), NOW)), Some(2));
+            obs.topology = Some(Ok(M1Topology {
+                exit_link,
+                uplink_addrs: vec![],
+                ..topology()
+            }));
+            assert_eq!(code(&next(&obs, &config(), NOW)), Some(1));
+        }
+    }
 }
 
 #[test]
@@ -687,18 +731,22 @@ fn topologies() -> impl Strategy<Value = M1Topology> {
     ];
     (
         rules,
+        prop::sample::select(vec![ExitLink::Absent, ExitLink::Down, ExitLink::Up]),
         prop_oneof![9 => Just(vec![]), 1 => prop::collection::vec(names(), 1..4)],
         prop_oneof![9 => Just(vec![]), 1 => prop::collection::vec(mismatch, 1..4)],
         prop::collection::vec(ips(), 0..4),
         prop_oneof![9 => Just(vec![]), 1 => prop::collection::vec("[a-z]{1,32}", 1..9)],
     )
         .prop_map(
-            |(ruleset, tc_hooks, config_mismatches, uplink_addrs, legacy_tables)| M1Topology {
-                ruleset,
-                tc_hooks,
-                legacy_tables,
-                config_mismatches,
-                uplink_addrs,
+            |(ruleset, exit_link, tc_hooks, config_mismatches, uplink_addrs, legacy_tables)| {
+                M1Topology {
+                    exit_link,
+                    ruleset,
+                    tc_hooks,
+                    legacy_tables,
+                    config_mismatches,
+                    uplink_addrs,
+                }
             },
         )
 }
@@ -725,7 +773,8 @@ fn arbitrary_cases() -> impl Strategy<Value = (M1Observations, HealthConfig, u64
 }
 
 fn topology_passes(value: &M1Topology) -> bool {
-    value.ruleset == RulesetObs::Exact
+    value.exit_link == ExitLink::Up
+        && value.ruleset == RulesetObs::Exact
         && value.tc_hooks.is_empty()
         && value.legacy_tables.is_empty()
         && value.config_mismatches.is_empty()
@@ -851,6 +900,12 @@ fn reference_next(obs: &M1Observations, cfg: &HealthConfig, now: u64) -> Next {
             Stage::Topology,
             &ProbeError::Io("topology contains no uplink addresses".into()),
         );
+    }
+    if topology.exit_link != ExitLink::Up {
+        return Next::Done(Ok(Report {
+            verdict: Verdict::FailClosed(FailClosed::ExitLinkNotUp),
+            warnings: vec![],
+        }));
     }
     let handshake = match &obs.handshake {
         None => return Next::Handshake,

@@ -136,11 +136,24 @@ pub enum ConfigMismatch {
     InterfaceMissing(IfName),
 }
 
+/// Exit link state used by the containment collector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitLink {
+    /// The link was absent, including when it vanished during collection.
+    Absent,
+    /// The link was down or its containment checks were incomplete.
+    Down,
+    /// The link was up and its address, qdisc, filter and XDP checks all ran.
+    Up,
+}
+
 /// Containment observations collected together before any availability stage.
 /// When violations are present, fields not involved in a violation may be
 /// unobserved; only a topology with no violations establishes containment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct M1Topology {
+    /// Exit state covered by this containment observation.
+    pub exit_link: ExitLink,
     /// Exactness of the complete host ruleset.
     pub ruleset: RulesetObs,
     /// Interfaces with traffic-control hooks beyond the permitted baseline.
@@ -299,6 +312,8 @@ pub enum Degraded {
 /// A contained but unavailable tunnel, established before route/probe work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailClosed {
+    /// The exit link was absent or down during containment inspection.
+    ExitLinkNotUp,
     /// The exit handshake is absent, stale, or beyond the clock-skew bound.
     NoHealthyExit,
 }
@@ -322,7 +337,7 @@ pub enum Verdict {
     Unprotected(Violations),
     /// Containment passed but the path is unavailable or wrongly routed.
     Degraded(Degraded),
-    /// Containment passed but no fresh exit handshake was observed.
+    /// Containment passed but the exit link or handshake was unavailable.
     FailClosed(FailClosed),
 }
 
@@ -465,6 +480,9 @@ pub fn next(obs: &M1Observations, cfg: &HealthConfig, now_unix_secs: u64) -> Nex
             &ProbeError::io("topology contains no uplink addresses"),
         );
     }
+    if topology.exit_link != ExitLink::Up {
+        return done(Verdict::FailClosed(FailClosed::ExitLinkNotUp), Vec::new());
+    }
     let handshake = match &obs.handshake {
         None => return Next::Handshake,
         Some(Err(source)) => return failed(Stage::Handshake, source),
@@ -527,6 +545,9 @@ impl fmt::Display for Verdict {
         match self {
             Self::Protected { exit_ip } => {
                 write!(f, "connected through {exit_ip}, kill switch in place")
+            }
+            Self::FailClosed(FailClosed::ExitLinkNotUp) => {
+                f.write_str("exit tunnel is down, traffic is blocked")
             }
             Self::FailClosed(FailClosed::NoHealthyExit) => {
                 f.write_str("exit tunnel is down, traffic is blocked (fail closed)")
