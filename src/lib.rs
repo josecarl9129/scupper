@@ -7,6 +7,7 @@ pub mod apply;
 pub mod check;
 pub mod cli;
 pub mod parse;
+pub mod probe;
 pub mod rules;
 pub mod system;
 pub mod verdict;

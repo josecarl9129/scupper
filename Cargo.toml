@@ -17,6 +17,10 @@ required-features = ["testing"]
 clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
 rustix = { version = "1", default-features = false, features = ["process"] }
 thiserror = "2"
+socket2 = { version = "0.6", features = ["all"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+webpki-roots = "1"
+dns-lookup = { version = "4", default-features = false }
 
 [dev-dependencies]
 proptest = { version = "1", default-features = false, features = ["std"] }

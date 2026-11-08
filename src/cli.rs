@@ -14,6 +14,7 @@ use crate::{
     apply::{self, Fs, RULESET_PATH, RealFs},
     check::{self, ExitProbe, TopologySource},
     parse::HandshakeAge,
+    probe::BoundHttpsProbe,
     rules::{self, V1Config},
     system::{ExecError, ExecOutput, Program, RealSystem, SYSTEMCTL_TIMEOUT, System},
     verdict::{self, HealthConfig, M1Topology, Probe, ProbeError, Warning},
@@ -143,7 +144,7 @@ impl TopologySource for UnimplementedTopology {
     }
 }
 
-/// Placeholder bound exit probe, replaced by the next milestone step.
+/// Placeholder bound exit probe retained for injected command tests.
 #[derive(Debug, Default)]
 pub struct UnimplementedExitProbe;
 
@@ -187,7 +188,7 @@ where
             prompt: &TerminalPrompt,
             sleeper: &ThreadSleeper,
             topology: &UnimplementedTopology,
-            exit_probe: &UnimplementedExitProbe,
+            exit_probe: &BoundHttpsProbe::from(&V1Config::default()),
         },
         &mut io::stdout(),
         &mut io::stderr(),
