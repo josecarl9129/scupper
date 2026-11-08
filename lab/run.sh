@@ -118,7 +118,11 @@ record() {
 scupper() { timeout 60 ip netns exec gw "$binary" "$@"; }
 expect() {
     local wanted=$1 name=$2 first=''
+    # Let the fault act on live client traffic before and after check, so a leak has time to
+    # reach the capture (the positive control showed a one-second window catches nothing).
+    sleep 3
     capture "check-$name.txt" scupper check
+    sleep 1
     IFS= read -r first < "$captures/check-$name.txt" || true
     if [[ -z $first ]]; then IFS= read -r first < "$captures/check-$name.txt.stderr" || true; fi
     record "$name" "$wanted" "$CAPTURE_CODE" "$first"
