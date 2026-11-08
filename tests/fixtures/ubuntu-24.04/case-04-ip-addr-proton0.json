@@ -1,0 +1,1 @@
+[{"ifindex":5,"ifname":"proton0","flags":["POINTOPOINT","NOARP"],"mtu":1420,"qdisc":"noqueue","operstate":"DOWN","group":"default","txqlen":1000,"link_type":"none","addr_info":[{"family":"inet","local":"10.2.0.2","prefixlen":32,"scope":"global","label":"proton0","valid_life_time":4294967295,"preferred_life_time":4294967295}]}]

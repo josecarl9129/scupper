@@ -1,4 +1,5 @@
-//! Parity, validation and arbitrary-input coverage for command-output parsers.
+//! Captured output, validation and arbitrary-input coverage for command-output parsers.
+//! Synthetic inputs cover malformed data and shapes absent from the lab captures.
 
 use std::{error::Error, net::Ipv4Addr, time::Duration};
 
@@ -166,7 +167,7 @@ fn handshake_age_cases() {
 fn route_get_ported() -> Result<(), Box<dyn Error>> {
     for (out, name) in [
         (
-            "1.1.1.1 from 10.99.0.2 dev proton0 table 51820 \n    cache iif wg0",
+            include_str!("fixtures/ubuntu-24.04/ip-policy-route.txt"),
             "proton0",
         ),
         (
@@ -298,8 +299,8 @@ fn route_get_rejects_ambiguous_devices() {
 
 #[test]
 fn route_get_synthesized_printing_shapes() -> Result<(), Box<dyn Error>> {
-    // Synthesized from iproute2's printing rules (not captured), with documentation
-    // addresses. Replace these with captured fixtures later.
+    // These printing shapes were not captured by the lab; retain synthetic
+    // inputs for nexthop IDs, explicit unicast, route attributes, and IPv6 gateways.
     for (out, expected) in [
         (
             "192.0.2.1 from 198.51.100.2 nhid 12 dev proton0 table 51820 uid 0 \n    cache iif wg0",
@@ -575,13 +576,19 @@ proptest! {
     }
 }
 
-// Topology fixtures are synthesized; replaced by captured output in 1g.
 #[test]
 fn tc_json_baseline_and_hooks() -> Result<(), Box<dyn Error>> {
     use scupper::parse::{filter_has_hooks, qdisc_has_hooks};
-    assert!(!qdisc_has_hooks(
-        r#"[{"kind":"noqueue","handle":"0:","root":true,"refcnt":2}]"#
-    )?);
+    for out in [
+        include_str!("fixtures/ubuntu-24.04/tc-qdisc-wg0.json"),
+        include_str!("fixtures/ubuntu-24.04/tc-qdisc-proton0.json"),
+        include_str!("fixtures/ubuntu-24.04/case-04-tc-qdisc-proton0.json"),
+    ] {
+        assert!(!qdisc_has_hooks(out)?, "{out}");
+    }
+    assert!(qdisc_has_hooks(include_str!(
+        "fixtures/ubuntu-24.04/case-10-tc-qdisc-wg0.json"
+    ))?);
     assert!(!qdisc_has_hooks(r#"[{"kind":"noop","root":true}]"#)?);
     for out in [
         "[]",
@@ -607,10 +614,15 @@ fn tc_json_baseline_and_hooks() -> Result<(), Box<dyn Error>> {
     ] {
         assert!(qdisc_has_hooks(out).is_err(), "{out}");
     }
-    assert!(!filter_has_hooks("[]")?);
-    assert!(filter_has_hooks(
-        r#"[{"protocol":"all","pref":49152,"kind":"bpf","options":{"handle":1}}]"#
-    )?);
+    for out in [
+        include_str!("fixtures/ubuntu-24.04/tc-filter-wg0.json"),
+        include_str!("fixtures/ubuntu-24.04/tc-filter-proton0.json"),
+    ] {
+        assert!(!filter_has_hooks(out)?, "{out}");
+    }
+    assert!(filter_has_hooks(include_str!(
+        "fixtures/ubuntu-24.04/case-10-tc-filter-wg0-ingress.json"
+    ))?);
     for out in ["", "{}", "[null]"] {
         assert!(filter_has_hooks(out).is_err());
     }
@@ -621,29 +633,25 @@ fn tc_json_baseline_and_hooks() -> Result<(), Box<dyn Error>> {
 fn topology_ip_json() -> Result<(), Box<dyn Error>> {
     use scupper::parse::{default_routes_use, link_names, local_addresses};
     assert_eq!(
-        link_names(
-            r#"[{"ifindex":1,"ifname":"lo","flags":["LOOPBACK"]},{"ifindex":2,"ifname":"wg0"}]"#
-        )?,
-        ["lo", "wg0"]
+        link_names(include_str!("fixtures/ubuntu-24.04/ip-link.json"))?,
+        ["lo", "eth0", "wg0", "proton0"]
     );
     assert!(link_names("[{}]").is_err());
     let uplink = IfName::new("eth0")?;
     assert!(default_routes_use(
-        r#"[{"dst":"default","gateway":"192.0.2.1","dev":"eth0","protocol":"dhcp","metric":100}]"#,
+        include_str!("fixtures/ubuntu-24.04/ip-default.json"),
         &uplink
     )?);
     for out in ["[]", "[{}]", r#"[{"dev":"eth0"},{"dev":"eth1"}]"#] {
         assert!(!default_routes_use(out, &uplink)?);
     }
     assert!(default_routes_use(r#"[{"dev":false}]"#, &uplink).is_err());
-    let addrs = local_addresses(
-        r#"[{"ifindex":2,"ifname":"eth0","addr_info":[{"family":"inet","local":"192.0.2.10","prefixlen":24},{"family":"inet6","local":"2001:db8::10","prefixlen":64}]}]"#,
-    )?;
+    let addrs = local_addresses(include_str!("fixtures/ubuntu-24.04/ip-addr-eth0.json"))?;
     assert_eq!(
         addrs,
         [
-            "192.0.2.10".parse::<std::net::IpAddr>()?,
-            "2001:db8::10".parse()?
+            "172.31.0.2".parse::<std::net::IpAddr>()?,
+            "fe80::300d:a6ff:fe5f:c596".parse()?
         ]
     );
     assert_eq!(
@@ -731,6 +739,70 @@ fn link_flags_and_xdp_presence() -> Result<(), Box<dyn Error>> {
         r#"[{"ifname":"wg0","flags":[1]}]"#,
     ] {
         assert!(links(out).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn captured_wireguard_peer_and_allowed_ips() -> Result<(), Box<dyn Error>> {
+    let peer_key = key('A');
+    let handshakes =
+        include_str!("fixtures/ubuntu-24.04/wg-handshakes.txt").replace("PUBKEY3", &peer_key);
+    let expected = Handshake::At {
+        unix_secs: 1_794_160_057,
+    };
+    assert_eq!(
+        parse_latest_handshakes(&handshakes)?,
+        vec![PeerHandshake {
+            peer: PeerKey::new(&peer_key)?,
+            handshake: expected,
+        }]
+    );
+    assert_eq!(single_peer_handshake(&handshakes)?, expected);
+    let allowed_ips =
+        include_str!("fixtures/ubuntu-24.04/wg-allowed-ips.txt").replace("PUBKEY4", &peer_key);
+    assert!(scupper::parse::allowed_ips_contain(
+        &allowed_ips,
+        Ipv4Addr::new(10, 99, 0, 2)
+    )?);
+    Ok(())
+}
+
+#[test]
+fn captured_exit_link_and_address_states() -> Result<(), Box<dyn Error>> {
+    use scupper::parse::{links, local_addresses};
+
+    for (out, expected_up) in [
+        (include_str!("fixtures/ubuntu-24.04/ip-link.json"), true),
+        (
+            include_str!("fixtures/ubuntu-24.04/case-04-ip-link.json"),
+            false,
+        ),
+        (
+            include_str!("fixtures/ubuntu-24.04/ip-addr-proton0.json"),
+            true,
+        ),
+        (
+            include_str!("fixtures/ubuntu-24.04/case-04-ip-addr-proton0.json"),
+            false,
+        ),
+    ] {
+        let parsed = links(out)?;
+        let exit = parsed
+            .iter()
+            .find(|link| link.name == "proton0")
+            .ok_or("captured proton0 missing")?;
+        assert_eq!(exit.up, expected_up);
+        assert!(!exit.xdp);
+    }
+    for out in [
+        include_str!("fixtures/ubuntu-24.04/ip-addr-proton0.json"),
+        include_str!("fixtures/ubuntu-24.04/case-04-ip-addr-proton0.json"),
+    ] {
+        assert_eq!(
+            local_addresses(out)?,
+            [std::net::IpAddr::from([10, 2, 0, 2])]
+        );
     }
     Ok(())
 }

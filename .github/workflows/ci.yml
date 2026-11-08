@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'lab/**']
   pull_request:
   workflow_dispatch:
 
@@ -66,3 +66,80 @@ jobs:
 
       - name: Default-feature build
         run: timeout 600 cargo build --locked
+
+  musl:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Cache cargo registry and musl target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            target
+          key: ${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-musl
+
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add x86_64-unknown-linux-musl
+
+      - name: Build musl release
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+
+      - name: Verify static x86-64 executable
+        run: |
+          description=$(file target/x86_64-unknown-linux-musl/release/scupper)
+          printf '%s\n' "$description"
+          [[ "$description" == *'ELF 64-bit LSB'* && "$description" == *'x86-64'* ]]
+          [[ "$description" == *'statically linked'* || "$description" == *'static-pie linked'* ]]
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scupper-x86_64-linux-musl
+          path: target/x86_64-unknown-linux-musl/release/scupper
+          retention-days: 14
+          if-no-files-found: error
+
+  lab:
+    runs-on: ubuntu-24.04
+    needs: musl
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install lab tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wireguard-tools nftables iproute2 util-linux curl iptables
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: scupper-x86_64-linux-musl
+          path: lab-bin
+
+      - name: Run namespace lab
+        run: |
+          chmod +x lab-bin/scupper
+          timeout 900 sudo lab/run.sh "$PWD/lab-bin/scupper" "$PWD/lab-captures"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lab-captures
+          path: lab-captures
+          retention-days: 14
+          if-no-files-found: warn

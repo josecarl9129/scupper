@@ -1,4 +1,6 @@
 //! Driver ordering, fail-closed parity and independently rendered status.
+//! Synthetic handshakes use controlled timestamps for age and clock-skew cases;
+//! alternate devices and malformed outputs cover cases absent from lab captures.
 
 use std::{
     cell::{Cell, RefCell},
@@ -133,7 +135,12 @@ impl Harness {
 
     fn healthy_path(&self, device: &str) {
         self.exit_handshake(Ok(output(&handshake('A', 988))));
-        self.route(Ok(output(&format!("192.0.2.1 dev {device}"))));
+        let route = if device == "proton0" {
+            include_str!("fixtures/ubuntu-24.04/ip-policy-route.txt").to_owned()
+        } else {
+            format!("192.0.2.1 dev {device}")
+        };
+        self.route(Ok(output(&route)));
     }
 
     fn assert_log(&self, expected: &[&str]) {

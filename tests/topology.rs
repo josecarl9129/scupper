@@ -1,4 +1,4 @@
-//! Synthetic containment observations: no real networking commands are run.
+//! Captured containment observations and synthetic edge cases; no networking commands run.
 
 use std::{
     cell::{Cell, RefCell},
@@ -36,56 +36,12 @@ fn topology_source() -> impl TopologySource {
     HostTopology::with_legacy_reader(&EmptyLegacyTables)
 }
 
-// All command fixtures are synthesized; replaced by captured output in 1g.
-fn nft_fixture() -> Value {
-    json!({"nftables": [
-        {"metainfo": {"version": "1.0.9", "release_name": "Old Doc Yak", "json_schema_version": 1}},
-        {"table": {"family": "inet", "name": "scupper", "handle": 1}},
-        {"chain": {"family": "inet", "table": "scupper", "name": "forward", "handle": 2,
-                   "type": "filter", "hook": "forward", "prio": 0, "policy": "drop"}},
-        {"rule": {"family": "inet", "table": "scupper", "chain": "forward", "handle": 3, "expr": [
-            {"match": {"op": "==", "left": {"meta": {"key": "iifname"}}, "right": "wg0"}},
-            {"match": {"op": "==", "left": {"meta": {"key": "oifname"}}, "right": "proton0"}},
-            {"accept": null}
-        ]}},
-        {"rule": {"family": "inet", "table": "scupper", "chain": "forward", "handle": 4, "expr": [
-            {"match": {"op": "==", "left": {"meta": {"key": "iifname"}}, "right": "proton0"}},
-            {"match": {"op": "==", "left": {"meta": {"key": "oifname"}}, "right": "wg0"}},
-            {"match": {"op": "in", "left": {"ct": {"key": "state"}}, "right": ["established", "related"]}},
-            {"accept": null}
-        ]}},
-        {"chain": {"family": "inet", "table": "scupper", "name": "postrouting", "handle": 5,
-                   "type": "nat", "hook": "postrouting", "prio": 100, "policy": "accept"}},
-        {"rule": {"family": "inet", "table": "scupper", "chain": "postrouting", "handle": 6, "expr": [
-            {"match": {"op": "==", "left": {"meta": {"key": "oifname"}}, "right": "proton0"}},
-            {"masquerade": null}
-        ]}},
-        {"chain": {"family": "inet", "table": "scupper", "name": "output", "handle": 7,
-                   "type": "filter", "hook": "output", "prio": 0, "policy": "accept"}},
-        {"rule": {"family": "inet", "table": "scupper", "chain": "output", "handle": 8, "expr": [
-            {"match": {"op": "==", "left": {"meta": {"key": "oifname"}}, "right": "eth0"}},
-            {"match": {"op": "==", "left": {"payload": {"protocol": "ip", "field": "saddr"}}, "right": "10.2.0.2"}},
-            {"drop": null}
-        ]}}
-    ]})
-}
+const NFT_LIVE: &str = include_str!("fixtures/ubuntu-24.04/nft-live.json");
+const NFT_WANT: &str = include_str!("fixtures/ubuntu-24.04/nft-want.json");
+const NFT_EXTRA: &str = include_str!("fixtures/ubuntu-24.04/case-06-nft.json");
 
-fn extra_rule() -> Value {
-    json!({"rule": {"family": "inet", "table": "scupper", "chain": "forward", "handle": 99, "expr": [
-        {"match": {"op": "==", "left": {"meta": {"key": "iifname"}}, "right": "wg0"}},
-        {"match": {"op": "==", "left": {"meta": {"key": "oifname"}}, "right": "eth0"}},
-        {"accept": null}
-    ]}})
-}
-
-fn with_extra() -> Result<String, Box<dyn Error>> {
-    let mut fixture = nft_fixture();
-    fixture["nftables"]
-        .as_array_mut()
-        .ok_or("missing fixture array")?
-        .push(extra_rule());
-    Ok(fixture.to_string())
-}
+// Synthetic overrides below cover malformed output, races, and states absent
+// from the lab captures. Healthy command defaults always use captured output.
 
 fn output(stdout: &str) -> ExecOutput {
     ExecOutput {
@@ -202,7 +158,7 @@ impl FakeSystem {
         self.canon_results
             .borrow_mut()
             .pop_front()
-            .unwrap_or_else(|| Ok(output(&nft_fixture().to_string())))
+            .unwrap_or_else(|| Ok(output(NFT_WANT)))
     }
 }
 
@@ -235,35 +191,80 @@ impl System for FakeSystem {
                     .live_results
                     .borrow_mut()
                     .pop_front()
-                    .unwrap_or_else(|| Ok(output(&nft_fixture().to_string())));
+                    .unwrap_or_else(|| Ok(output(NFT_LIVE)));
             }
             (Program::Ip, ["-j", "link", "show"]) => {
-                r#"[{"ifindex":1,"ifname":"lo"},{"ifindex":2,"ifname":"eth0"},{"ifindex":3,"ifname":"wg0"},{"ifindex":4,"ifname":"proton0","flags":["UP"]}]"#
+                include_str!("fixtures/ubuntu-24.04/ip-link.json")
             }
             (Program::Ip, ["-j", "route", "show", "default"]) => {
-                r#"[{"dst":"default","gateway":"192.0.2.1","dev":"eth0","protocol":"dhcp","metric":100}]"#
+                include_str!("fixtures/ubuntu-24.04/ip-default.json")
             }
             (Program::Ip, ["-j", "addr", "show", "dev", "proton0"]) => {
-                r#"[{"ifindex":4,"ifname":"proton0","flags":["UP"],"addr_info":[{"family":"inet","local":"10.2.0.2","prefixlen":32}]}]"#
+                include_str!("fixtures/ubuntu-24.04/ip-addr-proton0.json")
             }
             (Program::Ip, ["-j", "addr", "show", "dev", "eth0"]) => {
-                r#"[{"ifindex":2,"ifname":"eth0","addr_info":[{"family":"inet","local":"192.0.2.10","prefixlen":24},{"family":"inet6","local":"2001:db8::10","prefixlen":64}]}]"#
+                include_str!("fixtures/ubuntu-24.04/ip-addr-eth0.json")
             }
             (Program::Wg, ["show", "wg0", "allowed-ips"]) => {
-                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\t10.99.0.2/32\n"
+                return Ok(output(
+                    &include_str!("fixtures/ubuntu-24.04/wg-allowed-ips.txt")
+                        .replace("PUBKEY4", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+                ));
             }
-            (Program::Tc, ["-j", "qdisc", "show", "dev", "wg0" | "proton0"]) => {
-                r#"[{"kind":"noqueue","handle":"0:","root":true,"refcnt":2}]"#
+            (Program::Tc, ["-j", "qdisc", "show", "dev", "wg0"]) => {
+                include_str!("fixtures/ubuntu-24.04/tc-qdisc-wg0.json")
             }
-            (Program::Tc, ["-j", "filter", "show", "dev", "wg0" | "proton0"]) => "[]",
+            (Program::Tc, ["-j", "qdisc", "show", "dev", "proton0"]) => {
+                include_str!("fixtures/ubuntu-24.04/tc-qdisc-proton0.json")
+            }
+            (Program::Tc, ["-j", "filter", "show", "dev", "wg0"]) => {
+                include_str!("fixtures/ubuntu-24.04/tc-filter-wg0.json")
+            }
+            (Program::Tc, ["-j", "filter", "show", "dev", "proton0"]) => {
+                include_str!("fixtures/ubuntu-24.04/tc-filter-proton0.json")
+            }
             _ => return Err(ExecError::spawn("unexpected command")),
         };
         Ok(output(text))
     }
 
     fn now_unix_secs(&self) -> u64 {
-        1000
+        1_794_160_067 // Ten seconds after the captured handshake.
     }
+}
+
+#[test]
+fn captured_host_and_netns_rulesets_are_equal_v04() -> Result<(), Box<dyn Error>> {
+    let live = canonicalize(NFT_LIVE)?;
+    let want = canonicalize(NFT_WANT)?;
+    assert_eq!(live, want);
+    assert_eq!(fingerprint(&live)?, fingerprint(&want)?);
+    Ok(())
+}
+
+#[test]
+fn captured_unsafe_rulesets_differ_from_want() -> Result<(), Box<dyn Error>> {
+    let want = canonicalize(NFT_WANT)?;
+    for (case, json) in [
+        ("06: extra accept", NFT_EXTRA),
+        (
+            "07: unconstrained ct",
+            include_str!("fixtures/ubuntu-24.04/case-07-nft.json"),
+        ),
+        (
+            "08: foreign ip table with dup",
+            include_str!("fixtures/ubuntu-24.04/case-08-nft.json"),
+        ),
+        (
+            "09: netdev fwd",
+            include_str!("fixtures/ubuntu-24.04/case-09-nft.json"),
+        ),
+    ] {
+        let live = canonicalize(json)?;
+        assert_ne!(live, want, "case {case}");
+        assert_ne!(fingerprint(&live)?, fingerprint(&want)?, "case {case}");
+    }
+    Ok(())
 }
 
 #[test]
@@ -308,22 +309,17 @@ fn ruleset_exact_and_private_file_argv() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn ruleset_differences_confirmed_with_both_fingerprints() -> Result<(), Box<dyn Error>> {
-    let mut broad = nft_fixture();
-    broad["nftables"].as_array_mut().ok_or("fixture array")?.push(json!({"rule":{"family":"inet","table":"scupper","chain":"forward","expr":[{"match":{"op":"in","left":{"ct":{"key":"state"}},"right":["established","related"]}},{"accept":null}]}}));
-    let mut foreign = nft_fixture();
-    foreign["nftables"]
-        .as_array_mut()
-        .ok_or("fixture array")?
-        .push(json!({"table":{"family":"netdev","name":"foreign","handle":20}}));
-    let mut swapped = nft_fixture();
+    // Rule ordering is not changed by the lab cases; retain this synthetic mutation.
+    let mut swapped: Value = serde_json::from_str(NFT_LIVE)?;
     swapped["nftables"]
         .as_array_mut()
         .ok_or("fixture array")?
-        .swap(3, 4);
+        .swap(5, 6);
     for live in [
-        with_extra()?,
-        broad.to_string(),
-        foreign.to_string(),
+        NFT_EXTRA.to_owned(),
+        include_str!("fixtures/ubuntu-24.04/case-07-nft.json").to_owned(),
+        include_str!("fixtures/ubuntu-24.04/case-08-nft.json").to_owned(),
+        include_str!("fixtures/ubuntu-24.04/case-09-nft.json").to_owned(),
         swapped.to_string(),
     ] {
         let sys = FakeSystem::new();
@@ -334,7 +330,7 @@ fn ruleset_differences_confirmed_with_both_fingerprints() -> Result<(), Box<dyn 
             observe_ruleset(&sys, &V1Config::default())?,
             RulesetObs::Differs {
                 live_sha256: fingerprint(&canonicalize(&live)?)?,
-                want_sha256: fingerprint(&canonicalize(&nft_fixture().to_string())?)?,
+                want_sha256: fingerprint(&canonicalize(NFT_WANT)?)?,
             }
         );
         assert_eq!(
@@ -361,10 +357,9 @@ fn ruleset_differences_confirmed_with_both_fingerprints() -> Result<(), Box<dyn 
 #[test]
 fn ruleset_repeat_is_fresh_and_can_recover() -> Result<(), Box<dyn Error>> {
     let sys = FakeSystem::new();
-    sys.live_results.borrow_mut().extend([
-        Ok(output(&with_extra()?)),
-        Ok(output(&nft_fixture().to_string())),
-    ]);
+    sys.live_results
+        .borrow_mut()
+        .extend([Ok(output(NFT_EXTRA)), Ok(output(NFT_LIVE))]);
     assert_eq!(
         observe_ruleset(&sys, &V1Config::default())?,
         RulesetObs::Exact
@@ -373,13 +368,12 @@ fn ruleset_repeat_is_fresh_and_can_recover() -> Result<(), Box<dyn Error>> {
     sys.assert_cleaned();
     // Both sides of the repeat are fresh, including a changed desired form.
     let sys = FakeSystem::new();
-    sys.canon_results.borrow_mut().extend([
-        Ok(output(&nft_fixture().to_string())),
-        Ok(output(&with_extra()?)),
-    ]);
+    sys.canon_results
+        .borrow_mut()
+        .extend([Ok(output(NFT_LIVE)), Ok(output(NFT_EXTRA))]);
     sys.live_results
         .borrow_mut()
-        .extend([Ok(output(&with_extra()?)), Ok(output(&with_extra()?))]);
+        .extend([Ok(output(NFT_EXTRA)), Ok(output(NFT_EXTRA))]);
     assert_eq!(
         observe_ruleset(&sys, &V1Config::default())?,
         RulesetObs::Exact
@@ -463,7 +457,7 @@ fn isolated_canon_loads_then_lists_and_reports_failures() -> Result<(), Box<dyn 
     sys.set(Program::Nft, &["-f", "/private/ruleset.nft"], "");
     let (code, stdout, stderr) = isolated_run(&sys);
     assert_eq!(code, 0);
-    assert_eq!(String::from_utf8(stdout)?, nft_fixture().to_string());
+    assert_eq!(String::from_utf8(stdout)?, NFT_LIVE);
     assert_eq!(stderr, Vec::<u8>::new());
     assert_eq!(
         *sys.calls.borrow(),
@@ -566,17 +560,16 @@ fn ruleset_errors_are_observation_errors_and_cleanup() {
 }
 
 #[test]
-fn repeat_error_does_not_confirm_a_difference() -> Result<(), Box<dyn Error>> {
+fn repeat_error_does_not_confirm_a_difference() {
     let sys = FakeSystem::new();
     sys.live_results
         .borrow_mut()
-        .extend([Ok(output(&with_extra()?)), Ok(output("not JSON"))]);
+        .extend([Ok(output(NFT_EXTRA)), Ok(output("not JSON"))]);
     assert!(matches!(
         observe_ruleset(&sys, &V1Config::default()),
         Err(ProbeError::Parse(_))
     ));
     sys.assert_cleaned();
-    Ok(())
 }
 
 #[test]
@@ -587,13 +580,50 @@ fn healthy_topology_collects_everything() -> Result<(), Box<dyn Error>> {
     assert_eq!(topology.ruleset, RulesetObs::Exact);
     assert_eq!(topology.tc_hooks, Vec::new());
     assert_eq!(topology.config_mismatches, Vec::new());
+    assert_eq!(topology.legacy_tables, Vec::<String>::new());
     assert_eq!(
         topology.uplink_addrs,
-        ["192.0.2.10".parse::<IpAddr>()?, "2001:db8::10".parse()?]
+        [
+            "172.31.0.2".parse::<IpAddr>()?,
+            "fe80::300d:a6ff:fe5f:c596".parse()?
+        ]
     );
     assert_eq!(sys.calls.borrow().len(), 11);
     assert_eq!(sys.calls.borrow()[0].0, Program::Ip);
     assert_eq!(sys.calls.borrow()[10].0, Program::Unshare);
+    sys.assert_cleaned();
+    Ok(())
+}
+
+#[test]
+fn captured_case_04_topology_is_down_without_violations() -> Result<(), Box<dyn Error>> {
+    let sys = FakeSystem::new();
+    sys.set(
+        Program::Ip,
+        &["-j", "link", "show"],
+        include_str!("fixtures/ubuntu-24.04/case-04-ip-link.json"),
+    );
+    sys.set(
+        Program::Ip,
+        &["-j", "addr", "show", "dev", "proton0"],
+        include_str!("fixtures/ubuntu-24.04/case-04-ip-addr-proton0.json"),
+    );
+    sys.set(
+        Program::Tc,
+        &["-j", "qdisc", "show", "dev", "proton0"],
+        include_str!("fixtures/ubuntu-24.04/case-04-tc-qdisc-proton0.json"),
+    );
+    let topology = topology_source().observe(&sys, &V1Config::default())?;
+    assert_eq!(topology.exit_link, ExitLink::Down);
+    assert_eq!(topology.ruleset, RulesetObs::Exact);
+    assert_eq!(topology.tc_hooks, Vec::new());
+    assert_eq!(topology.legacy_tables, Vec::<String>::new());
+    assert_eq!(topology.config_mismatches, Vec::new());
+    assert_eq!(sys.calls.borrow().len(), 10);
+    // A known-down exit skips its address query but still checks tc and nft.
+    assert!(!sys.calls.borrow().iter().any(|(program, args, _)| {
+        *program == Program::Ip && args == &["-j", "addr", "show", "dev", "proton0"]
+    }));
     sys.assert_cleaned();
     Ok(())
 }
@@ -710,7 +740,7 @@ fn all_violations_survive_other_collector_errors() -> Result<(), Box<dyn Error>>
     );
     sys.live_results
         .borrow_mut()
-        .extend([Ok(output(&with_extra()?)), Ok(output(&with_extra()?))]);
+        .extend([Ok(output(NFT_EXTRA)), Ok(output(NFT_EXTRA))]);
     let topology = topology_source().observe(&sys, &V1Config::default())?;
     assert!(matches!(topology.ruleset, RulesetObs::Differs { .. }));
     assert_eq!(topology.tc_hooks, [V1Config::default().client_iface]);
@@ -795,12 +825,13 @@ fn healthy_path(sys: &FakeSystem) {
     sys.set(
         Program::Wg,
         &["show", "proton0", "latest-handshakes"],
-        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\t990\n",
+        &include_str!("fixtures/ubuntu-24.04/wg-handshakes.txt")
+            .replace("PUBKEY3", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
     );
     sys.set(
         Program::Ip,
         &["route", "get", "1.1.1.1", "from", "10.99.0.2", "iif", "wg0"],
-        "1.1.1.1 from 10.99.0.2 dev proton0 table 51820\n",
+        include_str!("fixtures/ubuntu-24.04/ip-policy-route.txt"),
     );
 }
 
@@ -813,7 +844,7 @@ fn check_healthy_and_extra_rule() -> Result<(), Box<dyn Error>> {
         if extra {
             sys.live_results
                 .borrow_mut()
-                .extend([Ok(output(&with_extra()?)), Ok(output(&with_extra()?))]);
+                .extend([Ok(output(NFT_EXTRA)), Ok(output(NFT_EXTRA))]);
         }
         let report = run_check(&sys, &topology_source(), &probe, &V1Config::default())?;
         assert_eq!(report.verdict.exit_code(), if extra { 2 } else { 0 });
@@ -904,7 +935,7 @@ fn check_error_is_one_and_violation_beats_exit_down() -> Result<(), Box<dyn Erro
     without_exit(&sys);
     sys.live_results
         .borrow_mut()
-        .extend([Ok(output(&with_extra()?)), Ok(output(&with_extra()?))]);
+        .extend([Ok(output(NFT_EXTRA)), Ok(output(NFT_EXTRA))]);
     assert_eq!(
         run_check(&sys, &topology_source(), &probe, &cfg)?
             .verdict
@@ -965,7 +996,7 @@ fn present_down_exit_with_noop_and_no_address_is_fail_closed() -> Result<(), Box
         sys.set(
             Program::Ip,
             &["-j", "link", "show"],
-            r#"[{"ifname":"eth0"},{"ifname":"wg0"},{"ifname":"proton0","flags":["POINTOPOINT"]}]"#,
+            include_str!("fixtures/ubuntu-24.04/case-04-ip-link.json"),
         );
         // An address query must be skipped entirely for a down exit.
         sys.push(
@@ -1148,6 +1179,23 @@ const LEGACY_PATHS: [&str; 3] = [
     "/proc/net/ip6_tables_names",
     "/proc/net/arp_tables_names",
 ];
+
+#[test]
+fn captured_legacy_mangle_table_is_reported() -> Result<(), Box<dyn Error>> {
+    let reader = FakeLegacyTables {
+        values: BTreeMap::from([(
+            LEGACY_PATHS[0],
+            Ok(include_str!("fixtures/ubuntu-24.04/case-11-ip-tables-names.txt").into()),
+        )]),
+        ..FakeLegacyTables::default()
+    };
+    let sys = FakeSystem::new();
+    let topology = HostTopology::with_legacy_reader(&reader).observe(&sys, &V1Config::default())?;
+    assert_eq!(topology.legacy_tables, ["mangle"]);
+    assert_eq!(*reader.paths.borrow(), LEGACY_PATHS.map(PathBuf::from));
+    sys.assert_cleaned();
+    Ok(())
+}
 
 #[test]
 fn legacy_tables_missing_empty_and_whitespace_are_clean() -> Result<(), Box<dyn Error>> {
@@ -1433,7 +1481,7 @@ fn exit_down_in_address_observation_cannot_be_reported_up() -> Result<(), Box<dy
     sys.set(
         Program::Ip,
         &["-j", "addr", "show", "dev", "proton0"],
-        r#"[{"ifname":"proton0","flags":["POINTOPOINT"],"addr_info":[]}]"#,
+        include_str!("fixtures/ubuntu-24.04/case-04-ip-addr-proton0.json"),
     );
     let topology = topology_source().observe(&sys, &V1Config::default())?;
     assert_eq!(topology.exit_link, ExitLink::Down);
