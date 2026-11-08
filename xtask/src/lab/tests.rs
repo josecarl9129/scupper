@@ -25,6 +25,10 @@ fn address_table_is_disjoint_and_restricted() {
         [A.client_net, A.exit_net, A.client_v6_net, A.internet_v6_net]
             .map(|s| s.parse::<IpNet>().unwrap()),
     );
+    networks.extend(
+        ["2001:db8:2::/64", "2001:db8:3::/64", "2001:db8:5::/64"]
+            .map(|s| s.parse::<IpNet>().unwrap()),
+    );
     let permitted = [
         "192.0.2.0/24",
         "198.51.100.0/24",
@@ -63,6 +67,9 @@ fn address_table_is_disjoint_and_restricted() {
         (A.client_v6_net, A.client_v6),
         (A.internet_v6_net, A.internet_v6),
         (A.internet_v6_net, A.wan_v6),
+        ("2001:db8:5::/64", A.bridge_v6),
+        ("2001:db8:5::/64", A.bridge_wan_v6),
+        ("fe80::/64", A.client_link_local_v6),
     ] {
         assert!(
             network
@@ -110,7 +117,7 @@ fn policy_for_every_case_has_exact_endpoints_and_positive_evidence() {
         let text = evidence::policy(&markers, false).unwrap();
         Policy::from_toml(&text).unwrap();
         let value: toml::Value = toml::from_str(&text).unwrap();
-        assert_eq!(value["min_packets"].as_integer(), Some(16));
+        assert_eq!(value["min_packets"].as_integer(), Some(4));
         assert_eq!(value["expect"].as_array().unwrap().len(), 2);
         assert_eq!(
             value["wireguard"][0]["gateway"].as_str(),
@@ -166,7 +173,7 @@ fn udp(source: [u8; 4], destination: [u8; 4], sport: u16, dport: u16, payload: &
     bytes
 }
 #[test]
-fn positive_controls_require_packet_evidence_and_silence_is_auxiliary_only() {
+fn positive_controls_require_packet_evidence_and_reject_silence() {
     let marker = "scupper-canary-00112233445566778899aabbccddeeff".to_owned();
     let policy =
         Policy::from_toml(&evidence::policy(std::slice::from_ref(&marker), false).unwrap())
@@ -196,7 +203,7 @@ fn positive_controls_require_packet_evidence_and_silence_is_auxiliary_only() {
     assert!(!evidence::contained(&empty));
     let auxiliary = Policy::from_toml(&evidence::policy(&[], true).unwrap()).unwrap();
     let empty = classify(&capture(&[]), &auxiliary, 0).unwrap();
-    assert!(evidence::contained(&empty));
+    assert!(!evidence::contained(&empty));
     assert!(!evidence::leak_seen(&empty));
     let malformed = classify(&capture(&[vec![0_u8; 30]]), &auxiliary, 0).unwrap();
     assert!(!evidence::contained(&malformed));
@@ -429,4 +436,206 @@ fn inherited_pipes_are_bounded_after_the_leader_exits() {
     assert!(runner.run(&invocation).is_err());
     assert!(start.elapsed() < Duration::from_millis(1500));
     fs::remove_dir_all(dir).unwrap();
+}
+
+fn healthy_outer_packets() -> Vec<Vec<u8>> {
+    let mut wg = vec![0; 32];
+    wg[0] = 4;
+    (0..8)
+        .flat_map(|_| {
+            [
+                udp([198, 51, 100, 2], [192, 0, 2, 2], 51820, 51820, &wg),
+                udp([198, 51, 100, 2], [203, 0, 113, 2], 51821, 51820, &wg),
+            ]
+        })
+        .collect()
+}
+
+#[test]
+fn uplink_control_requires_exact_injections_reasons_and_no_other_leaks() {
+    let marker = "scupper-canary-00112233445566778899aabbccddeeff".to_owned();
+    let policy =
+        Policy::from_toml(&evidence::policy(std::slice::from_ref(&marker), false).unwrap())
+            .unwrap();
+    let mut packets = healthy_outer_packets();
+    packets.extend(super::helpers::injection_packets(&marker).unwrap());
+    let bytes = capture(&packets);
+    let report = classify(&bytes, &policy, 0).unwrap();
+    assert_eq!(report.violation_count, 3);
+    assert_eq!(report.counts["Violation(CanaryMarker)"], 2);
+    assert_eq!(report.counts["Violation(ForbiddenAddress)"], 1);
+    assert!(evidence::injected_only(&report, &bytes, &marker).is_ok());
+
+    // A real extra leak cannot be laundered as the deliberate positive control.
+    packets.push(udp(
+        [10, 99, 0, 2],
+        [198, 51, 100, 1],
+        1234,
+        8080,
+        b"unrelated",
+    ));
+    let bytes = capture(&packets);
+    assert!(
+        evidence::injected_only(&classify(&bytes, &policy, 0).unwrap(), &bytes, &marker).is_err()
+    );
+    packets.pop();
+    // Three violations, but one is not an injected tuple/payload.
+    packets.last_mut().unwrap()[20..22].copy_from_slice(&40004_u16.to_be_bytes());
+    let bytes = capture(&packets);
+    let report = classify(&bytes, &policy, 0).unwrap();
+    assert_eq!(report.violation_count, 3);
+    assert!(evidence::injected_only(&report, &bytes, &marker).is_err());
+    packets.pop();
+    let bytes = capture(&packets);
+    assert!(
+        evidence::injected_only(&classify(&bytes, &policy, 0).unwrap(), &bytes, &marker).is_err()
+    );
+    let mut wrong = classify(&capture(&healthy_outer_packets()), &policy, 0).unwrap();
+    wrong.violation_count = 3;
+    assert!(evidence::injected_only(&wrong, &bytes, &marker).is_err());
+
+    // With the marker list broken, both marker-only injections cease to have
+    // CanaryMarker as their reason; forbidden-address coverage alone cannot pass.
+    let text = evidence::policy(&[], false).unwrap();
+    let policy = Policy::from_toml(&text).unwrap();
+    let mut packets = healthy_outer_packets();
+    packets.extend(super::helpers::injection_packets(&marker).unwrap());
+    let bytes = capture(&packets);
+    assert!(
+        evidence::injected_only(&classify(&bytes, &policy, 0).unwrap(), &bytes, &marker).is_err()
+    );
+}
+
+fn ipv6(source: &str, protocol: u8, payload: &[u8]) -> Vec<u8> {
+    let mut packet = vec![0; 40];
+    packet[0] = 0x60;
+    packet[4..6].copy_from_slice(&u16::try_from(payload.len()).unwrap().to_be_bytes());
+    packet[6] = protocol;
+    packet[7] = 64;
+    packet[8..24].copy_from_slice(&source.parse::<std::net::Ipv6Addr>().unwrap().octets());
+    packet[24..40].copy_from_slice(
+        &A.internet_v6
+            .parse::<std::net::Ipv6Addr>()
+            .unwrap()
+            .octets(),
+    );
+    packet.extend(payload);
+    packet
+}
+
+#[test]
+fn ipv6_exit_leak_fails_and_all_capture_instances_require_liveness() {
+    let markers: Vec<String> = (0..5)
+        .map(|i| format!("scupper-canary-00112233445566778899aabbccddeef{i}"))
+        .collect();
+    let mut packets: Vec<_> = (0..4)
+        .map(|_| udp([10, 2, 0, 2], [192, 0, 2, 6], 1234, 8080, b"liveness"))
+        .collect();
+    let check = |packets: &[Vec<u8>], ingress, permissive| {
+        evidence::v6_evidence(&capture(packets), &markers, ingress, permissive, "fe80::2")
+    };
+    assert!(check(&[], false, false).is_err());
+    assert!(check(&packets, false, false).is_ok());
+    assert!(check(&packets, true, false).is_err());
+    assert!(check(&packets, false, true).is_err());
+    let mut payload = vec![0, 1, 0x1f, 0x90, 0, 60, 0, 1];
+    payload.extend(markers[2].as_bytes());
+    packets.push(ipv6(A.client_v6, 17, &payload));
+    assert!(check(&packets, false, false).is_err());
+    assert!(check(&packets, false, true).is_err());
+    payload.truncate(8);
+    payload.extend(markers[3].as_bytes());
+    packets.push(ipv6(A.client_v6, 17, &payload));
+    assert!(check(&packets, false, true).is_ok());
+    let mut tcp = vec![0; 20];
+    tcp[..4].copy_from_slice(&[0, 1, 0x1f, 0x90]);
+    tcp[12] = 0x50;
+    packets.push(ipv6(A.client_v6, 6, &tcp));
+    tcp[1] = 2;
+    packets.push(ipv6(A.client_v6, 6, &tcp));
+    assert!(check(&packets, true, false).is_err());
+    payload.truncate(8);
+    payload.extend(markers[4].as_bytes());
+    packets.push(ipv6("fe80::2", 17, &payload));
+    assert!(check(&packets, true, false).is_ok());
+    // Removing IPv4 traffic makes even a nonempty canary capture fail liveness.
+    assert!(check(&packets[4..], true, false).is_err());
+}
+
+#[test]
+fn antispoof_drop_must_belong_to_the_observed_source_trace() {
+    let trace = "trace id ab inet scupper antispoof packet: ip6 saddr fd00:99::2 ip6 daddr 2001:db8:4::6\ntrace id ab inet scupper antispoof rule ... (verdict drop)\n";
+    assert!(evidence::antispoof_trace(trace, &[A.client_v6]).is_ok());
+    assert!(evidence::antispoof_trace(trace, &["fe80::2"]).is_err());
+    assert!(
+        evidence::antispoof_trace(
+            &trace.replace(
+                "id ab inet scupper antispoof rule",
+                "id cd inet scupper antispoof rule"
+            ),
+            &[A.client_v6]
+        )
+        .is_err()
+    );
+    assert!(
+        evidence::antispoof_trace(
+            &trace.replace("antispoof rule", "forward rule"),
+            &[A.client_v6]
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn bridge_policy_requires_arp_and_both_ping_exchanges() {
+    let ethernet = |kind: u16, payload: &[u8]| {
+        let mut frame = vec![0; 12];
+        frame.extend(kind.to_be_bytes());
+        frame.extend(payload);
+        frame
+    };
+    let mut frames = Vec::new();
+    for (source, destination, operation) in [
+        ([198, 51, 100, 6], [198, 51, 100, 5], 1_u8),
+        ([198, 51, 100, 5], [198, 51, 100, 6], 2),
+    ] {
+        let mut arp = vec![0; 28];
+        arp[..8].copy_from_slice(&[0, 1, 8, 0, 6, 4, 0, operation]);
+        arp[14..18].copy_from_slice(&source);
+        arp[24..28].copy_from_slice(&destination);
+        frames.push(ethernet(0x0806, &arp));
+    }
+    for (source, destination, kind) in [
+        ([198, 51, 100, 6], [198, 51, 100, 5], 8),
+        ([198, 51, 100, 5], [198, 51, 100, 6], 0),
+    ] {
+        let mut ip = udp(source, destination, 0, 0, &[]);
+        ip[9] = 1;
+        ip[20] = kind;
+        frames.push(ethernet(0x0800, &ip));
+    }
+    for (source, destination, kind) in [
+        (A.bridge_v6, A.bridge_wan_v6, 128),
+        (A.bridge_wan_v6, A.bridge_v6, 129),
+    ] {
+        let mut ip = ipv6(source, 58, &[kind, 0, 0, 0, 0, 1, 0, 1]);
+        ip[24..40].copy_from_slice(&destination.parse::<std::net::Ipv6Addr>().unwrap().octets());
+        frames.push(ethernet(0x86dd, &ip));
+    }
+    let policy = Policy::from_toml(&evidence::policy(&[], true).unwrap()).unwrap();
+    let classify_frames = |frames: &[Vec<u8>]| {
+        let mut bytes = capture(frames);
+        bytes[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        classify(&bytes, &policy, 0).unwrap()
+    };
+    assert!(evidence::contained(&classify_frames(&frames)));
+    for omitted in [0..2, 2..4, 4..6] {
+        let remaining: Vec<_> = frames
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !omitted.contains(i))
+            .map(|(_, frame)| frame.clone())
+            .collect();
+        assert!(!evidence::contained(&classify_frames(&remaining)));
+    }
 }

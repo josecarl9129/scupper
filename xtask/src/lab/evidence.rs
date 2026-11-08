@@ -42,7 +42,7 @@ pub(super) fn policy(markers: &[String], auxiliary: bool) -> Result<String> {
     let mut text = format!(
         "uplink_addrs = {}\nforbidden_addrs = {}\ncanary_markers = {}\narp = true\nndp = true\nmin_packets = {}\nexpect = {}\n",
         serde_json::to_string(&if auxiliary {
-            vec![A.bridge.wan, A.bridge.peer]
+            vec![A.bridge.wan, A.bridge.peer, A.bridge_wan_v6, A.bridge_v6]
         } else {
             vec![A.gwhost.peer]
         })?,
@@ -54,14 +54,29 @@ pub(super) fn policy(markers: &[String], auxiliary: bool) -> Result<String> {
             A.internet_v6
         ])?,
         serde_json::to_string(markers)?,
-        if auxiliary { 1 } else { 16 },
         if auxiliary {
-            "[]"
+            2 * 2 + 2 // Two echo request/reply pairs plus an ARP request/reply.
+        } else {
+            markers.len().saturating_mul(4).max(1)
+        },
+        if auxiliary {
+            "[\"arp\", \"host_allow[0]\", \"host_allow[1]\"]"
         } else {
             "[\"wireguard[0]\", \"wireguard[1]\"]"
         },
     );
-    if !auxiliary {
+    if auxiliary {
+        write!(
+            text,
+            "\n[[host_allow]]\nproto = \"icmp\"\nremote_addr = \"{}\"\ntypes = [0, 8]\n",
+            A.bridge.peer
+        )?;
+        write!(
+            text,
+            "\n[[host_allow]]\nproto = \"icmpv6\"\nremote_addr = \"{}\"\ntypes = [128, 129]\n",
+            A.bridge_wan_v6
+        )?;
+    } else {
         for (local_port, remote, remote_port) in [
             (51820, A.client.peer, 51820),
             (51821, A.provider.peer, 51820),
@@ -103,11 +118,126 @@ pub(super) fn leak_seen(report: &Report) -> bool {
         )
     })
 }
-// A monitored auxiliary interface may legitimately be silent. Container errors
-// still fail in classify; only its explicit, sole EmptyCapture failure is expected.
 pub(super) fn contained(report: &Report) -> bool {
-    report.violation_count == 0
-        || (report.packet_count == 0 && report.capture_failures == [Reason::EmptyCapture])
+    report.violation_count == 0 && report.capture_failures.is_empty()
+}
+
+pub(super) fn injected_only(report: &Report, bytes: &[u8], marker: &str) -> Result<()> {
+    use crate::pcap::{Location, observe};
+    let expected = super::helpers::injection_packets(marker)?;
+    let observed = observe(bytes)?;
+    if report.violation_count != expected.len() || !report.capture_failures.is_empty() {
+        return super::fail("uplink control: unexpected violation count or capture failure");
+    }
+    let mut seen = vec![false; expected.len()];
+    for packet in &report.packets {
+        let Class::Violation(reason) = &packet.class else {
+            continue;
+        };
+        let actual = observed
+            .iter()
+            .find(|p| p.index == packet.index)
+            .ok_or("violation is not an injected IP packet")?;
+        let found = expected
+            .iter()
+            .position(|raw| {
+                actual.source.to_string()
+                    == std::net::Ipv4Addr::new(raw[12], raw[13], raw[14], raw[15]).to_string()
+                    && actual.destination.to_string()
+                        == std::net::Ipv4Addr::new(raw[16], raw[17], raw[18], raw[19]).to_string()
+                    && actual.protocol == 17
+                    && actual.payload == raw[20..]
+            })
+            .ok_or("uplink control: unrelated violation")?;
+        let wanted = if found == 0 {
+            Reason::ForbiddenAddress {
+                addr: A.client_inner.parse()?,
+                location: Location::Outer,
+            }
+        } else {
+            Reason::CanaryMarker
+        };
+        if seen[found] || *reason != wanted {
+            return super::fail("uplink control: duplicate packet or wrong violation reason");
+        }
+        seen[found] = true;
+    }
+    if !seen.iter().all(|seen| *seen) {
+        return super::fail("uplink control: injected packet missing");
+    }
+    Ok(())
+}
+
+// Every v6 capture also carries a complete healthy IPv4 service check.
+pub(super) fn v6_evidence(
+    bytes: &[u8],
+    markers: &[String],
+    ingress: bool,
+    permissive: bool,
+    link_local: &str,
+) -> Result<String> {
+    if !matches!(markers.len(), 4 | 5) {
+        return super::fail("incorrect IPv6 canary manifest");
+    }
+    let packets = crate::pcap::observe(bytes)?;
+    let v4 = packets
+        .iter()
+        .filter(|p| p.source.is_ipv4() && p.destination.to_string() == A.internet.peer)
+        .count();
+    let v6: Vec<_> = packets.iter().filter(|p| p.source.is_ipv6()).collect();
+    if v4 < 4 {
+        return super::fail("IPv6 capture has no IPv4 liveness evidence");
+    }
+    if ingress {
+        let tcp_ports: std::collections::BTreeSet<_> = v6
+            .iter()
+            .filter(|p| {
+                p.source.to_string() == A.client_v6
+                    && p.destination.to_string() == A.internet_v6
+                    && p.protocol == 6
+            })
+            .filter_map(|p| p.payload.get(..2))
+            .collect();
+        if tcp_ports.len() < 2 {
+            return super::fail("IPv6 TCP attempts missing at wg0");
+        }
+        for (i, marker) in markers.iter().enumerate() {
+            let source = if i == 4 { link_local } else { A.client_v6 };
+            let protocol = if i < 2 { 6 } else { 17 };
+            if !v6.iter().any(|p| {
+                p.source.to_string() == source
+                    && p.destination.to_string() == A.internet_v6
+                    && p.protocol == protocol
+                    && (protocol == 6
+                        || p.payload
+                            .windows(marker.len())
+                            .any(|w| w == marker.as_bytes()))
+            }) {
+                return super::fail(format!(
+                    "IPv6 canary missing at wg0: {source} {protocol} {marker}"
+                ));
+            }
+        }
+    } else if permissive {
+        for marker in &markers[2..4] {
+            if !v6.iter().any(|p| {
+                p.destination.to_string() == A.internet_v6
+                    && p.protocol == 17
+                    && p.payload
+                        .windows(marker.len())
+                        .any(|w| w == marker.as_bytes())
+            }) {
+                return super::fail("IPv6 positive control was blind");
+            }
+        }
+    } else if !v6.is_empty() {
+        return super::fail("IPv6 handed to exit/provider");
+    }
+    Ok(format!(
+        "ipv4_liveness={v4}, ipv6_records={}, markers_checked={}",
+        v6.len(),
+        markers.len()
+    ))
 }
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct Row {
@@ -152,6 +282,26 @@ pub(super) fn check_capture_stats(stderr: &str) -> Result<()> {
     }
     if !kernel_stats {
         return super::fail("tcpdump shutdown statistics missing");
+    }
+    Ok(())
+}
+
+pub(super) fn antispoof_trace(text: &str, sources: &[&str]) -> Result<()> {
+    for source in sources {
+        let ids: Vec<_> = text
+            .lines()
+            .filter(|line| line.contains(&format!("ip6 saddr {source} ")))
+            .filter_map(|line| line.split_whitespace().nth(2))
+            .collect();
+        if !ids.iter().any(|id| {
+            text.lines().any(|line| {
+                line.split_whitespace().nth(2) == Some(*id)
+                    && line.contains(" inet scupper antispoof ")
+                    && line.contains("(verdict drop)")
+            })
+        }) {
+            return super::fail(format!("no antispoof drop trace for {source}"));
+        }
     }
     Ok(())
 }

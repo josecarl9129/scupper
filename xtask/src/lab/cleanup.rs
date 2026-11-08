@@ -1,4 +1,4 @@
-//! Write-ahead ownership registry. Never claims a pre-existing resource.
+//! Ownership registry. Register only successful, exclusive creations.
 use super::{
     Result,
     command::{Invocation, Runner},
@@ -14,18 +14,20 @@ pub(super) enum Resource {
     Namespace(String),
     Link(String),
     Directory(PathBuf),
-    EmptyDirectory(PathBuf),
 }
 #[derive(Default)]
 pub(super) struct Registry {
     resources: Vec<Resource>,
 }
 impl Registry {
-    // Call before the creating command, including commands that can partly fail.
+    // Call immediately after successful exclusive creation. A failed create never grants ownership.
     pub fn register(&mut self, resource: Resource) {
         if !self.resources.contains(&resource) {
             self.resources.push(resource);
         }
+    }
+    pub fn unregister(&mut self, resource: &Resource) {
+        self.resources.retain(|owned| owned != resource);
     }
     pub fn cleanup(&mut self, runner: &mut Runner) -> Result<()> {
         runner.cleanup = true;
@@ -62,11 +64,6 @@ impl Registry {
                             fs::remove_dir_all(path)?;
                         }
                     }
-                    Resource::EmptyDirectory(path) => {
-                        if path.exists() {
-                            fs::remove_dir(path)?;
-                        }
-                    }
                 }
                 Ok(())
             })();
@@ -88,17 +85,20 @@ mod tests {
     use super::*;
     use std::sync::{Arc, atomic::AtomicBool};
     #[test]
-    fn registers_before_creation_deduplicates_and_cleans_idempotently() {
+    fn successful_creation_deduplicates_and_cleans_idempotently() {
         let dir = std::env::current_dir()
             .unwrap()
             .join(format!("target/lab-registry-test-{}", std::process::id()));
         fs::create_dir_all(dir.parent().unwrap()).unwrap();
         let mut registry = Registry::default();
+        fs::create_dir(&dir).unwrap();
         registry.register(Resource::Directory(dir.clone()));
         registry.register(Resource::Directory(dir.clone()));
         assert_eq!(registry.resources.len(), 1);
-        assert!(!dir.exists());
-        fs::create_dir(&dir).unwrap();
+        assert!(dir.exists());
+        registry.unregister(&Resource::Directory(dir.clone()));
+        assert_eq!(registry.resources, []);
+        registry.register(Resource::Directory(dir.clone()));
         let trace = fs::File::create(dir.join("trace")).unwrap();
         let mut runner = Runner::new(trace, Arc::new(AtomicBool::new(false)));
         registry.cleanup(&mut runner).unwrap();

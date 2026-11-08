@@ -624,3 +624,43 @@ pub fn classify(capture: &[u8], policy: &Policy, limit: usize) -> Result<Report,
         violations,
     })
 }
+
+// Decoded evidence for namespace-case preconditions and exact injected controls.
+// Reuse the oracle's framing/length validation; never search arbitrary pcap bytes.
+pub(crate) struct Observed {
+    pub index: usize,
+    pub source: IpAddr,
+    pub destination: IpAddr,
+    pub protocol: u8,
+    pub payload: Vec<u8>,
+}
+pub(crate) fn observe(bytes: &[u8]) -> Result<Vec<Observed>, Error> {
+    let capture = reader::read(bytes)?;
+    let mut observed = Vec::new();
+    for (index, record) in capture.records.iter().enumerate() {
+        if record.truncated {
+            return Err(Error::Capture("truncated case evidence".into()));
+        }
+        let data = record
+            .data
+            .get(..record.data.len().saturating_sub(capture.fcs_len))
+            .ok_or_else(|| Error::Capture("short FCS".into()))?;
+        let linked = decode::link(data, capture.linktype)
+            .map_err(|e| Error::Capture(format!("case link: {e:?}")))?;
+        if let Link::Ip(data) = linked {
+            let ip =
+                decode::ip(data, false).map_err(|e| Error::Capture(format!("case IP: {e:?}")))?;
+            if ip.truncated || ip.fragment.is_some() {
+                return Err(Error::Capture("incomplete case datagram".into()));
+            }
+            observed.push(Observed {
+                index: index + 1,
+                source: ip.src,
+                destination: ip.dst,
+                protocol: ip.proto,
+                payload: ip.payload.to_vec(),
+            });
+        }
+    }
+    Ok(observed)
+}

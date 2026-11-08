@@ -1,4 +1,6 @@
-//! Reference builder and the first five cases. No host routes or host sysctls.
+//! Reference builder and cases. No host routes or host sysctls.
+mod bridge;
+mod ipv6;
 use super::{
     Lab, Result,
     addresses::{A, PORT, Segment},
@@ -13,6 +15,7 @@ use scupper_core::{
     rules::IfName,
 };
 use std::{
+    fmt::Write as _,
     fs,
     time::{Duration, Instant},
 };
@@ -159,6 +162,7 @@ impl Lab {
                 "net.ipv6.conf.all.forwarding=0",
             ],
         )?;
+        self.sysctls(&[IfName::new("lo")?], false)?;
         for iface in ["wg0", "ex-ch1"] {
             self.cmd("gwhost", "ip", &["link", "set", iface, "netns", "scupper"])?;
         }
@@ -170,6 +174,17 @@ impl Lab {
         if gateway.client_tunnel().address4().addr().to_string() != A.gateway_inner {
             return fail("lab gateway address differs from the address table");
         }
+        self.apply_sysctls(false, false)?;
+        self.load_real_rules()?;
+        self.new_namespace("scupper-verify", "")?;
+        let rules = self.rules.to_string_lossy().into_owned();
+        self.cmd("scupper-verify", "nft", &["-f", &rules])?;
+        self.expected_rules =
+            canonicalize(&self.cmd("scupper-verify", "nft", &["-j", "list", "ruleset"])?)?;
+        self.cmd("", "ip", &["netns", "delete", "scupper-verify"])?;
+        self.registry
+            .unregister(&Resource::Namespace("scupper-verify".into()));
+        self.verify_rules()?;
         self.address_up(
             "scupper",
             "wg0",
@@ -182,8 +197,6 @@ impl Lab {
             &gateway.exits()[0].address4().to_string(),
             gateway.exits()[0].mtu(),
         )?;
-        self.load_real_rules()?;
-        self.apply_sysctls(false, false)?;
         for (family, target) in desired_routes(
             &self.site,
             &GatewayId("gw1".into()),
@@ -193,15 +206,6 @@ impl Lab {
             let args: Vec<_> = args.iter().map(String::as_str).collect();
             self.cmd("scupper", "ip", &args)?;
         }
-        // Compare independent kernel-normalized expected/live rules before
-        // opening forwarding, using the same canonicalizer as the product.
-        self.new_namespace("scupper-verify", "")?;
-        let rules = self.rules.to_string_lossy().into_owned();
-        self.cmd("scupper-verify", "nft", &["-f", &rules])?;
-        self.expected_rules =
-            canonicalize(&self.cmd("scupper-verify", "nft", &["-j", "list", "ruleset"])?)?;
-        self.cmd("", "ip", &["netns", "delete", "scupper-verify"])?;
-        self.verify_rules()?;
         // Forwarding is enabled only now. desired_sysctls deliberately writes
         // forwarding first, then reapplies every setting reset by that write.
         self.apply_sysctls(true, false)?;
@@ -349,9 +353,6 @@ impl Lab {
         Ok(())
     }
     fn veth(&mut self, segment: Segment, peer_if: &str) -> Result<()> {
-        for name in [segment.staging, segment.wan_if] {
-            self.registry.register(Resource::Link(name.into()));
-        }
         self.cmd(
             "",
             "ip",
@@ -366,12 +367,19 @@ impl Lab {
                 segment.wan_if,
             ],
         )?;
+        for name in [segment.staging, segment.wan_if] {
+            self.registry.register(Resource::Link(name.into()));
+        }
         self.cmd(
             "",
             "ip",
             &["link", "set", segment.staging, "netns", segment.ns],
         )?;
+        self.registry
+            .unregister(&Resource::Link(segment.staging.into()));
         self.cmd("", "ip", &["link", "set", segment.wan_if, "netns", "wan"])?;
+        self.registry
+            .unregister(&Resource::Link(segment.wan_if.into()));
         self.cmd(
             segment.ns,
             "ip",
@@ -459,7 +467,10 @@ impl Lab {
         if bridge {
             links.push(IfName::new("lab-bridge")?);
         }
-        let values = desired_sysctls(&links, forwarding);
+        self.sysctls(&links, forwarding)
+    }
+    fn sysctls(&mut self, links: &[IfName], forwarding: bool) -> Result<()> {
+        let values = desired_sysctls(links, forwarding);
         for value in &values {
             self.cmd(
                 "scupper",
@@ -492,86 +503,64 @@ impl Lab {
         Ok(())
     }
     fn restore(&mut self, case: Case) -> Result<()> {
-        if matches!(case, Case::Bridge | Case::Permissive) {
-            // Delete the wan end explicitly, before any namespace disappears.
-            self.cmd(
-                "scupper",
-                "ip",
-                &["route", "del", &format!("{}/32", A.internet.peer)],
-            )?;
-            self.cmd("wan", "ip", &["route", "del", A.client_net])?;
-            self.cmd("wan", "ip", &["link", "delete", A.bridge.wan_if])?;
-            let until = Instant::now() + Duration::from_secs(3);
-            while self
-                .runner
-                .output(
-                    &super::command::Invocation::new(
-                        "scupper",
-                        "ip",
-                        &["link", "show", "dev", "lab-bridge"],
-                    ),
-                    None,
-                )?
-                .0
-                .success()
-            {
-                if Instant::now() >= until {
-                    return fail("bridge peer did not disappear after deletion");
-                }
-                self.runner.dwell(Duration::from_millis(50))?;
+        let mut failures = Vec::new();
+        let specific = match case {
+            Case::Bridge | Case::Permissive => self.restore_bridge(),
+            Case::V6 => self.restore_v6(),
+            Case::Uplink => self
+                .cmd("wan", "nft", &["delete", "table", "inet", "lab_inject"])
+                .map(|_| ()),
+            Case::Baseline => Ok(()),
+        };
+        if let Err(error) = specific {
+            failures.push(error.to_string());
+        }
+        for outcome in [
+            self.load_real_rules(),
+            self.cmd("scupper", "conntrack", &["-F", "-f", "ipv4"])
+                .map(|_| ()),
+            self.cmd("scupper", "conntrack", &["-F", "-f", "ipv6"])
+                .map(|_| ()),
+            self.verify_rules(),
+            self.apply_sysctls(true, false),
+        ] {
+            if let Err(error) = outcome {
+                failures.push(error.to_string());
             }
         }
-        if case == Case::V6 {
-            self.cmd(
-                "client",
-                "ip",
-                &[
-                    "-6",
-                    "addr",
-                    "del",
-                    &format!("{}/64", A.client_v6),
-                    "dev",
-                    "wg0",
-                ],
-            )?;
-            self.cmd(
-                "scupper",
-                "wg",
-                &[
-                    "set",
-                    "wg0",
-                    "peer",
-                    &self.public_keys[3].clone(),
-                    "allowed-ips",
-                    &format!("{}/32", A.client_inner),
-                ],
-            )?;
-        }
-        self.load_real_rules()?;
-        self.verify_rules()?;
-        self.apply_sysctls(true, false)?;
         self.runner.dwell(Duration::from_secs(1))?;
-        Ok(())
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            fail(failures.join("; "))
+        }
     }
-    pub(super) fn case(&mut self, case: Case) -> Result<()> {
+    pub(super) fn case(&mut self, case: Case) -> Result<String> {
         let stem = case.name();
         let mut markers = Vec::new();
-        self.capture("wan", A.gwhost.wan_if, stem, false)?;
-        self.service_check(&mut markers)?;
-        let fault = match case {
-            Case::Baseline => self.service_check(&mut markers),
-            Case::V6 => self.v6_fault(&mut markers),
-            Case::Bridge | Case::Permissive => self.bridge_fault(case, &mut markers),
-            Case::Uplink => self.uplink_fault(&mut markers),
-        };
+        let fault = (|| {
+            self.capture("wan", A.gwhost.wan_if, stem)?;
+            self.service_check(&mut markers)?;
+            match case {
+                Case::Baseline => self.service_check(&mut markers),
+                Case::V6 => self.v6_fault(&mut markers),
+                Case::Bridge | Case::Permissive => self.bridge_fault(case, &mut markers),
+                Case::Uplink => self.uplink_fault(&mut markers),
+            }
+        })();
         // Attempt restoration and a positive service check even if the fault
         // assertion failed, preserving the original failure alongside diagnostics.
-        let bridge_stop =
-            if matches!(case, Case::Bridge | Case::Permissive) && self.captures.len() > 1 {
-                self.stop_capture()
-            } else {
-                Ok(())
-            };
+        let mut auxiliary_failures = Vec::new();
+        while self.captures.len() > 1 {
+            if let Err(error) = self.stop_capture() {
+                auxiliary_failures.push(error.to_string());
+            }
+        }
+        let auxiliary_stop = if auxiliary_failures.is_empty() {
+            Ok(())
+        } else {
+            fail(auxiliary_failures.join("; "))
+        };
         let restored = self.restore(case);
         let after = if restored.is_ok() {
             self.service_check(&mut markers)
@@ -582,174 +571,98 @@ impl Lab {
         let alive = self.ensure_services();
         let stopped = self.stop_captures();
         let judged = self.judge(case, &markers);
+        let observed = judged.as_ref().ok().cloned().unwrap_or_default();
         let failures: Vec<_> = [
             fault,
-            bridge_stop,
+            auxiliary_stop,
             restored,
             after,
             dwell,
             alive,
             stopped,
-            judged,
+            judged.map(|_| ()),
         ]
         .into_iter()
         .filter_map(std::result::Result::err)
         .map(|error| error.to_string())
         .collect();
         if failures.is_empty() {
-            Ok(())
+            Ok(observed)
         } else {
             fail(failures.join("; "))
         }
     }
-    fn judge(&self, case: Case, markers: &[String]) -> Result<()> {
+    fn judge(&self, case: Case, markers: &[String]) -> Result<String> {
         let stem = case.name();
         let uplink = evidence::report(&self.artifacts, stem, markers, false)?;
         if case == Case::Uplink {
-            if !evidence::leak_seen(&uplink) || !uplink.capture_failures.is_empty() {
-                return fail(
-                    "uplink positive control did not detect an actual leak with healthy WireGuard evidence",
-                );
-            }
+            let marker = markers.get(4).ok_or("injection marker missing")?;
+            evidence::injected_only(
+                &uplink,
+                &fs::read(self.artifacts.join(format!("{stem}.pcap")))?,
+                marker,
+            )?;
         } else if uplink.violation_count != 0 {
             return fail(format!(
                 "uplink oracle: {} violations",
                 uplink.violation_count
             ));
         }
+        let receipts = helpers::receipts(&fs::read_to_string(self.artifacts.join("sink.jsonl"))?)?;
+        let seen: Vec<_> = receipts
+            .iter()
+            .filter(|r| markers.contains(&r.marker))
+            .map(|r| r.marker.as_str())
+            .collect();
+        let mut observed = format!(
+            "uplink_packets={}, violations={}, receipts={}, seen_markers={seen:?}",
+            uplink.packet_count,
+            uplink.violation_count,
+            seen.len()
+        );
         if matches!(case, Case::Bridge | Case::Permissive) {
             let report =
                 evidence::report(&self.artifacts, &format!("{stem}-bridge"), markers, true)?;
             if case == Case::Bridge && !evidence::contained(&report) {
                 return fail("bridge containment oracle failed");
             }
-            if case == Case::Permissive && !evidence::leak_seen(&report) {
+            write!(
+                observed,
+                ", bridge_packets={}, bridge_violations={}",
+                report.packet_count, report.violation_count
+            )?;
+            if case == Case::Permissive {
+                let outputs = [markers.get(8), markers.get(13)];
+                let packets = crate::pcap::observe(&fs::read(
+                    self.artifacts.join(format!("{stem}-bridge.pcap")),
+                )?)?;
+                for (output, source) in outputs.into_iter().zip([A.bridge.peer, A.bridge_v6]) {
+                    let output = output.ok_or("bridge output marker missing")?;
+                    if !packets.iter().any(|p| {
+                        p.source.to_string() == source
+                            && p.protocol == 17
+                            && p.payload.get(8..) == Some(output.as_bytes())
+                    }) {
+                        return fail("permissive bridge output marker missing from capture");
+                    }
+                }
+            }
+            if case == Case::Permissive
+                && (!evidence::leak_seen(&report) || !report.capture_failures.is_empty())
+            {
                 return fail("bridge positive control was blind");
             }
         }
         if case == Case::V6 {
-            for suffix in ["provider-v6", "internet-v6"] {
-                let report =
-                    evidence::report(&self.artifacts, &format!("{stem}-{suffix}"), markers, true)?;
-                if report.packet_count != 0 || !evidence::contained(&report) {
-                    return fail(format!("IPv6 reached {suffix}"));
-                }
-            }
+            observed.push_str(", ipv6_ingress_and_controls=verified");
         }
-        Ok(())
-    }
-    fn v6_fault(&mut self, markers: &mut Vec<String>) -> Result<()> {
-        let stem = Case::V6.name();
-        self.cmd(
-            "client",
-            "ip",
-            &[
-                "-6",
-                "addr",
-                "add",
-                &format!("{}/64", A.client_v6),
-                "dev",
-                "wg0",
-                "nodad",
-            ],
-        )?;
-        // Admit the source at WireGuard so the real nft antispoof rule,
-        // rather than WireGuard's cryptokey routing, enforces F4.
-        self.cmd(
-            "scupper",
-            "wg",
-            &[
-                "set",
-                "wg0",
-                "peer",
-                &self.public_keys[3].clone(),
-                "allowed-ips",
-                &format!("{}/32,{}/128", A.client_inner, A.client_v6),
-            ],
-        )?;
-        self.capture("provA", "wgp", &format!("{stem}-provider-v6"), true)?;
-        self.capture("internet", "eth0", &format!("{stem}-internet-v6"), true)?;
-        self.runner.dwell(Duration::from_secs(3))?;
-        let sent = self.canaries(markers, true, false)?;
-        self.runner.dwell(Duration::from_secs(3))?;
-        let receipts = helpers::receipts(&fs::read_to_string(self.artifacts.join("sink.jsonl"))?)?;
-        if receipts.iter().any(|r| sent.contains(&r.marker)) {
-            return fail("IPv6 marker reached the sink");
-        }
-        Ok(())
-    }
-    fn bridge_fault(&mut self, case: Case, markers: &mut Vec<String>) -> Result<()> {
-        let stem = case.name();
-        self.veth(A.bridge, "lab-bridge")?;
-        self.apply_sysctls(true, true)?;
-        self.cmd(
-            "scupper",
-            "ip",
-            &[
-                "route",
-                "add",
-                &format!("{}/32", A.internet.peer),
-                "via",
-                A.bridge.wan,
-                "dev",
-                "lab-bridge",
-                "metric",
-                "1",
-            ],
-        )?;
-        self.cmd(
-            "wan",
-            "ip",
-            &[
-                "route",
-                "add",
-                A.client_net,
-                "via",
-                A.bridge.peer,
-                "dev",
-                A.bridge.wan_if,
-            ],
-        )?;
-        self.capture("wan", A.bridge.wan_if, &format!("{stem}-bridge"), false)?;
-        if case == Case::Permissive {
-            self.runner.input(
-                &super::command::Invocation::new("scupper", "nft", &["-f", "-"]),
-                Some(PERMISSIVE_RULES),
-            )?;
-        }
-        self.runner.dwell(Duration::from_secs(3))?;
-        let sent = self.canaries(markers, false, case == Case::Permissive)?;
-        // Exercise output containment as well as forwarded client traffic.
-        let marker = Self::marker()?;
-        markers.push(marker.clone());
-        let success = self.send("scupper", "udp", A.internet.peer, &marker, false)?;
-        if success != (case == Case::Permissive) {
-            return fail("bridge output containment/control failed");
-        }
-        self.runner.dwell(Duration::from_secs(3))?;
-        let receipts = helpers::receipts(&fs::read_to_string(self.artifacts.join("sink.jsonl"))?)?;
-        if case == Case::Bridge
-            && receipts
-                .iter()
-                .any(|r| sent.contains(&r.marker) || r.marker == marker)
-        {
-            return fail("real ruleset leaked a bridge marker");
-        }
-        if case == Case::Permissive
-            && !sent.iter().all(|m| {
-                receipts
-                    .iter()
-                    .any(|r| r.marker == *m && r.peer.ip().to_string() == A.client_inner)
-            })
-        {
-            return fail("permissive bridge did not deliver client markers without NAT");
-        }
-        Ok(())
+        Ok(observed)
     }
     fn uplink_fault(&mut self, markers: &mut Vec<String>) -> Result<()> {
         self.runner.dwell(Duration::from_secs(3))?;
         let marker = Self::marker()?;
         markers.push(marker.clone());
+        self.runner.input(&super::command::Invocation::new("wan", "nft", &["-f", "-"]), Some(b"table inet lab_inject { chain input { type filter hook input priority filter; ip saddr 198.51.100.2 ip daddr 198.51.100.1 udp sport { 40002, 40003 } udp dport { 53, 8080 } drop; } }\n"))?;
         let exe = self.executable.clone();
         self.cmd("gwhost", &exe, &["inject", "--marker", &marker])?;
         self.runner.dwell(Duration::from_secs(3))?;

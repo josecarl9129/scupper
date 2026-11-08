@@ -25,6 +25,9 @@ pub(super) struct Addresses {
     pub internet_v6_net: &'static str,
     pub internet_v6: &'static str,
     pub wan_v6: &'static str,
+    pub bridge_v6: &'static str,
+    pub bridge_wan_v6: &'static str,
+    pub client_link_local_v6: &'static str,
 }
 pub(super) const PORT: u16 = 8080;
 pub(super) const A: Addresses = Addresses {
@@ -79,6 +82,9 @@ pub(super) const A: Addresses = Addresses {
     internet_v6_net: "2001:db8:4::/64",
     internet_v6: "2001:db8:4::6",
     wan_v6: "2001:db8:4::5",
+    bridge_v6: "2001:db8:5::6",
+    bridge_wan_v6: "2001:db8:5::5",
+    client_link_local_v6: "fe80::2",
 };
 impl Addresses {
     pub fn segments(&self) -> [Segment; 5] {
@@ -91,3 +97,11 @@ impl Addresses {
         ]
     }
 }
+
+// IPv6-only path additions, installed only for nft isolation/control phases.
+pub(super) const V6_PATH: [(&str, &str, &str); 4] = [
+    ("scupper", "ex-ch1", "2001:db8:2::2/64"),
+    ("provA", "wgp", "2001:db8:2::1/64"),
+    ("provA", "eth0", "2001:db8:3::2/64"),
+    ("wan", "to-provA", "2001:db8:3::1/64"),
+];

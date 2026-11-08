@@ -5,7 +5,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     fs::OpenOptions,
     io::{BufRead, BufReader, Read, Write},
-    net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket},
+    net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket},
     path::Path,
     thread,
     time::{Duration, Instant},
@@ -27,6 +27,115 @@ pub(super) struct Attempt {
     pub protocol: String,
     pub marker: String,
     pub destination: SocketAddr,
+    pub outcome: Outcome,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(super) enum Outcome {
+    Delivered,
+    TimedOut,
+    LocalReject(i32),
+    HarnessError { errno: Option<i32>, message: String },
+}
+impl Outcome {
+    fn from_error(error: &std::io::Error, attempted: bool) -> Self {
+        if attempted
+            && matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            )
+        {
+            Self::TimedOut
+        } else if attempted && error.raw_os_error() == Some(1) {
+            Self::LocalReject(1)
+        } else {
+            Self::HarnessError {
+                errno: error.raw_os_error(),
+                message: error.to_string(),
+            }
+        }
+    }
+}
+
+// No libc/NSS resolution: the only resolver contacted is the lab dnsmasq.
+fn resolve(target: &str, ipv6: bool) -> Result<IpAddr> {
+    if let Ok(ip) = target.parse::<IpAddr>() {
+        if ip.is_ipv6() == ipv6 {
+            return Ok(ip);
+        }
+        return fail("target address family mismatch");
+    }
+    if !target.ends_with(".lab.test") {
+        return fail("non-lab DNS name");
+    }
+    let query = dns_query(target, ipv6)?;
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.set_read_timeout(Some(IO_TIMEOUT))?;
+    socket.connect((super::addresses::A.provider_inner, 53))?;
+    socket.send(&query)?;
+    let mut bytes = [0; 4096];
+    let n = socket.recv(&mut bytes)?;
+    dns_answer(&bytes[..n], &query, ipv6)
+}
+fn dns_query(name: &str, ipv6: bool) -> Result<Vec<u8>> {
+    let mut query = vec![0x53, 0x43, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+    for label in name.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return fail("invalid DNS label");
+        }
+        query.push(u8::try_from(label.len())?);
+        query.extend(label.as_bytes());
+    }
+    query.extend([0, 0, if ipv6 { 28 } else { 1 }, 0, 1]);
+    Ok(query)
+}
+fn dns_answer(bytes: &[u8], query: &[u8], ipv6: bool) -> Result<IpAddr> {
+    if bytes.len() < query.len()
+        || bytes[..2] != query[..2]
+        || bytes[2] & 0x82 != 0x80
+        || bytes[3] & 15 != 0
+        || bytes[4..6] != [0, 1]
+        || bytes[12..query.len()] != query[12..]
+    {
+        return fail("invalid lab DNS response");
+    }
+    let mut at = query.len();
+    for _ in 0..u16::from_be_bytes([bytes[6], bytes[7]]) {
+        loop {
+            let len = *bytes.get(at).ok_or("short DNS name")?;
+            at += 1;
+            if len & 0xc0 == 0xc0 {
+                bytes.get(at).ok_or("short DNS pointer")?;
+                at += 1;
+                break;
+            }
+            if len == 0 {
+                break;
+            }
+            if len > 63 {
+                return fail("invalid DNS name");
+            }
+            at += usize::from(len);
+            if at > bytes.len() {
+                return fail("short DNS label");
+            }
+        }
+        let header = bytes.get(at..at + 10).ok_or("short DNS answer")?;
+        at += 10;
+        let len = usize::from(u16::from_be_bytes([header[8], header[9]]));
+        let data = bytes.get(at..at + len).ok_or("short DNS address")?;
+        if header[..4] == [0, if ipv6 { 28 } else { 1 }, 0, 1] {
+            if ipv6 && len == 16 {
+                let octets: [u8; 16] = data.try_into()?;
+                return Ok(std::net::Ipv6Addr::from(octets).into());
+            }
+            if !ipv6 && len == 4 {
+                return Ok(std::net::Ipv4Addr::new(data[0], data[1], data[2], data[3]).into());
+            }
+        }
+        at += len;
+    }
+    fail("lab DNS response has no requested address")
 }
 
 pub(super) fn receipts(text: &str) -> Result<Vec<Receipt>> {
@@ -118,7 +227,7 @@ pub fn sink(protocol: &str, bind: SocketAddr, log: &Path) -> Result<()> {
     fail("sink lifetime exceeded")
 }
 
-/// Sends one marker and requires an identical acknowledgment from the sink.
+/// Sends one marker, prints its structured outcome, and returns whether acknowledged.
 ///
 /// # Errors
 /// Returns resolution, connection, timeout or acknowledgment failures.
@@ -129,55 +238,95 @@ pub fn probe(
     marker: &str,
     ipv6: bool,
     source_port: u16,
-) -> Result<()> {
+    source: Option<IpAddr>,
+) -> Result<bool> {
     if !valid_marker(marker) {
         return fail("invalid probe marker");
     }
-    let address = (target, port)
-        .to_socket_addrs()?
-        .find(|addr| addr.is_ipv6() == ipv6)
-        .ok_or("target has no addresses")?;
+    let address = SocketAddr::new(resolve(target, ipv6)?, port);
+    let mut attempted = false;
+    let result: std::io::Result<()> = (|| {
+        if protocol == "tcp" {
+            let socket = Socket::new(
+                if ipv6 { Domain::IPV6 } else { Domain::IPV4 },
+                Type::STREAM,
+                Some(Protocol::TCP),
+            )?;
+            let local = if ipv6 {
+                IpAddr::from(std::net::Ipv6Addr::UNSPECIFIED)
+            } else {
+                IpAddr::from(std::net::Ipv4Addr::UNSPECIFIED)
+            };
+            socket.bind(&SocketAddr::new(local, source_port).into())?;
+            socket
+                .connect_timeout(&address.into(), IO_TIMEOUT)
+                .inspect_err(|error| {
+                    // Only connect_timeout's timeout proves an attempted SYN.
+                    attempted = error.kind() == std::io::ErrorKind::TimedOut;
+                })?;
+            let mut stream: TcpStream = socket.into();
+            stream.set_write_timeout(Some(IO_TIMEOUT))?;
+            stream.set_read_timeout(Some(IO_TIMEOUT))?;
+            writeln!(stream, "{marker}")?;
+            attempted = true;
+            let mut reply = String::new();
+            BufReader::new(stream).read_line(&mut reply)?;
+            if reply.trim_end() != marker {
+                return Err(std::io::Error::other("TCP acknowledgment mismatch"));
+            }
+        } else if protocol == "udp" {
+            let local = source.unwrap_or_else(|| {
+                if ipv6 {
+                    std::net::Ipv6Addr::UNSPECIFIED.into()
+                } else {
+                    std::net::Ipv4Addr::UNSPECIFIED.into()
+                }
+            });
+            let socket = Socket::new(
+                if ipv6 { Domain::IPV6 } else { Domain::IPV4 },
+                Type::DGRAM,
+                Some(Protocol::UDP),
+            )?;
+            if source.is_some() {
+                socket.bind_device(Some(b"wg0"))?;
+            }
+            socket.bind(&SocketAddr::new(local, source_port).into())?;
+            socket.set_read_timeout(Some(IO_TIMEOUT))?;
+            socket.connect(&address.into())?;
+            let socket: UdpSocket = socket.into();
+            socket.send(marker.as_bytes()).inspect_err(|error| {
+                // nft output drop is EPERM, distinct from local send failures.
+                attempted = error.raw_os_error() == Some(1);
+            })?;
+            attempted = true;
+            let mut reply = [0; 1024];
+            let len = socket.recv(&mut reply)?;
+            if &reply[..len] != marker.as_bytes() {
+                return Err(std::io::Error::other("UDP acknowledgment mismatch"));
+            }
+        } else {
+            return Err(std::io::Error::other("protocol must be tcp or udp"));
+        }
+        Ok(())
+    })();
+    let outcome = match result {
+        Ok(()) => Outcome::Delivered,
+        Err(error) => Outcome::from_error(&error, attempted),
+    };
+    let delivered = outcome == Outcome::Delivered;
     println!(
         "{}",
         serde_json::to_string(&Attempt {
             protocol: protocol.into(),
             marker: marker.into(),
-            destination: address
+            destination: address,
+            outcome
         })?
     );
-    std::io::stdout().flush()?;
-    if protocol == "tcp" {
-        let mut stream = TcpStream::connect_timeout(&address, IO_TIMEOUT)?;
-        stream.set_write_timeout(Some(IO_TIMEOUT))?;
-        stream.set_read_timeout(Some(IO_TIMEOUT))?;
-        writeln!(stream, "{marker}")?;
-        let mut reply = String::new();
-        BufReader::new(stream).read_line(&mut reply)?;
-        if reply.trim_end() != marker {
-            return fail("TCP acknowledgment mismatch");
-        }
-    } else if protocol == "udp" {
-        let local = if address.is_ipv4() {
-            format!("0.0.0.0:{source_port}")
-        } else {
-            format!("[::]:{source_port}")
-        };
-        let socket = UdpSocket::bind(local)?;
-        socket.set_read_timeout(Some(IO_TIMEOUT))?;
-        socket.connect(address)?;
-        socket.send(marker.as_bytes())?;
-        let mut reply = [0; 1024];
-        let len = socket.recv(&mut reply)?;
-        if &reply[..len] != marker.as_bytes() {
-            return fail("UDP acknowledgment mismatch");
-        }
-    } else {
-        return fail("protocol must be tcp or udp");
-    }
-    Ok(())
+    Ok(delivered)
 }
 
-/// Injects a marker-bearing IPv4 UDP packet with a forbidden source on eth0.
+/// Injects one forbidden-source packet and two marker-only packets on eth0.
 ///
 /// # Errors
 /// Requires Linux `CAP_NET_RAW`; returns packet construction or socket errors.
@@ -185,17 +334,36 @@ pub fn inject(marker: &str) -> Result<()> {
     if !valid_marker(marker) {
         return fail("invalid injection marker");
     }
-    let source = super::addresses::A.client_inner.parse()?;
-    let destination = super::addresses::A.internet.peer.parse()?;
-    let packet = spoofed_packet(source, destination, marker.as_bytes())?;
     let socket = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::UDP))?;
     socket.set_header_included_v4(true)?;
     socket.bind_device(Some(b"eth0"))?;
-    socket.send_to(
-        &packet,
-        &SocketAddr::new(destination, super::addresses::PORT).into(),
-    )?;
+    for packet in injection_packets(marker)? {
+        let dst = std::net::Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+        socket.send_to(&packet, &SocketAddr::new(dst.into(), 0).into())?;
+    }
     Ok(())
+}
+pub(super) fn injection_packets(marker: &str) -> Result<Vec<Vec<u8>>> {
+    use super::addresses::A;
+    let forbidden = spoofed_packet(
+        A.client_inner.parse()?,
+        A.internet.peer.parse()?,
+        marker.as_bytes(),
+    )?;
+    let mut dns = spoofed_packet(
+        A.gwhost.peer.parse()?,
+        A.gwhost.wan.parse()?,
+        &dns_query(&format!("{marker}.lab.test"), false)?,
+    )?;
+    dns[20..22].copy_from_slice(&40002_u16.to_be_bytes());
+    dns[22..24].copy_from_slice(&53_u16.to_be_bytes());
+    let mut payload = spoofed_packet(
+        A.gwhost.peer.parse()?,
+        A.gwhost.wan.parse()?,
+        marker.as_bytes(),
+    )?;
+    payload[20..22].copy_from_slice(&40003_u16.to_be_bytes());
+    Ok(vec![forbidden, dns, payload])
 }
 fn spoofed_packet(source: IpAddr, destination: IpAddr, marker: &[u8]) -> Result<Vec<u8>> {
     let (IpAddr::V4(src), IpAddr::V4(dst)) = (source, destination) else {
@@ -229,6 +397,48 @@ fn spoofed_packet(source: IpAddr, destination: IpAddr, marker: &[u8]) -> Result<
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[test]
+    fn local_socket_errors_never_count_as_a_forward_drop() {
+        for errno in [101, 98, 99, 111, 113] {
+            let error = std::io::Error::from_raw_os_error(errno);
+            for attempted in [false, true] {
+                assert!(
+                    matches!(Outcome::from_error(&error, attempted), Outcome::HarnessError { errno: Some(value), .. } if value == errno)
+                );
+            }
+        }
+        let again = std::io::Error::from_raw_os_error(11);
+        assert_eq!(Outcome::from_error(&again, true), Outcome::TimedOut);
+        assert!(matches!(
+            Outcome::from_error(&again, false),
+            Outcome::HarnessError { .. }
+        ));
+        let denied = std::io::Error::from_raw_os_error(1);
+        assert_eq!(Outcome::from_error(&denied, true), Outcome::LocalReject(1));
+        assert!(matches!(
+            Outcome::from_error(&denied, false),
+            Outcome::HarnessError { .. }
+        ));
+    }
+    #[test]
+    fn lab_dns_is_explicit_and_rejects_malformed_responses() {
+        let query = dns_query("scupper-canary-0011223344556677.lab.test", false).unwrap();
+        let mut response = query.clone();
+        response[2] = 0x84;
+        response[7] = 1;
+        response.extend([0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 0, 0, 4, 192, 0, 2, 6]);
+        assert_eq!(
+            dns_answer(&response, &query, false).unwrap().to_string(),
+            "192.0.2.6"
+        );
+        for len in 0..response.len() {
+            assert!(dns_answer(&response[..len], &query, false).is_err());
+        }
+        response[0] ^= 1;
+        assert!(dns_answer(&response, &query, false).is_err());
+        assert!(resolve("example.invalid", false).is_err());
+        assert!(resolve("::1", false).is_err());
+    }
     #[test]
     fn strict_sink_log_and_spoofed_packet() {
         let receipt = Receipt {

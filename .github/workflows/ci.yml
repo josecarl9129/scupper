@@ -206,7 +206,7 @@ jobs:
       - name: Install leak lab tools
         run: |
           sudo timeout 300 apt-get update
-          sudo timeout 300 apt-get install -y wireguard-tools nftables iproute2 tcpdump dnsmasq-base util-linux
+          sudo timeout 300 apt-get install -y wireguard-tools nftables iproute2 tcpdump dnsmasq-base util-linux iputils-ping conntrack
 
       - name: Build reference lab
         run: timeout 600 cargo build -p xtask --release --locked

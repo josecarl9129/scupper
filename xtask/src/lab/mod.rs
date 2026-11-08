@@ -102,7 +102,10 @@ fn run_inner(
     let config = scupper_core::config::parse_site(SITE)?;
     let site = scupper_core::config::validate(config)
         .map_err(|errors| format!("lab config: {errors:?}"))?;
-    let private = artifacts.join(".private");
+    let private = PathBuf::from("/run").join(format!("scupper-lab-{}", Lab::marker()?));
+    if private.starts_with(&artifacts) {
+        return fail("artifact directory must not contain the private /run directory");
+    }
     let rules = private.join("netns.nft");
     let mut lab = Lab {
         runner,
@@ -128,15 +131,16 @@ fn run_inner(
         if let Some(dir) = capture_fixtures {
             lab.fixtures(dir)?;
         }
+        let mut failures = Vec::new();
         for case in Case::ALL {
             lab.runner.phase = Instant::now() + Duration::from_secs(140);
             let result = lab.case(case);
             let (got, detail) = match &result {
-                Ok(()) => (
-                    case.wanted().to_owned(),
+                Ok(observed) => (
+                    observed.clone(),
                     "before/after provider-NAT service checks and oracle assertions passed".into(),
                 ),
-                Err(error) => ("failed".into(), error.to_string()),
+                Err(error) => (format!("failed: {error}"), error.to_string()),
             };
             lab.rows.push(Row {
                 name: case.name().into(),
@@ -145,9 +149,15 @@ fn run_inner(
                 detail,
             });
             evidence::save_results(&lab.artifacts, &lab.rows)?;
-            result?;
+            if let Err(error) = result {
+                failures.push(format!("{}: {error}", case.name()));
+            }
         }
-        Ok(())
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            fail(failures.join("; "))
+        }
     })();
     if let Err(error) = &outcome {
         fs::write(lab.artifacts.join("failure.txt"), error.to_string())?;
@@ -201,17 +211,9 @@ impl Lab {
         Ok(())
     }
     fn prepare(&mut self) -> Result<()> {
-        // /run/netns is left to iproute2: `ip netns add` creates it and turns it into a shared
-        // mount point, which cannot be removed afterwards (EBUSY).
-        let parent = "/etc/netns";
-        if !Path::new(parent).exists() {
-            self.registry
-                .register(Resource::EmptyDirectory(parent.into()));
-            fs::create_dir(parent)?;
-        }
+        fs::DirBuilder::new().mode(0o700).create(&self.private)?;
         self.registry
             .register(Resource::Directory(self.private.clone()));
-        fs::DirBuilder::new().mode(0o700).create(&self.private)?;
         for key in ["gateway", "exit", "provider", "client"] {
             let private = self.cmd("", "wg", &["genkey"])?;
             let path = self.private.join(format!("{key}.key"));
@@ -263,22 +265,25 @@ impl Lab {
             },
         )?;
         fs::write(&self.rules, rules)?;
-        let resolver = PathBuf::from("/etc/netns/client");
-        self.registry
-            .register(Resource::Directory(resolver.clone()));
-        fs::create_dir(&resolver)?;
-        fs::write(
-            resolver.join("resolv.conf"),
-            format!(
-                "nameserver {}\noptions timeout:1 attempts:1\n",
-                A.provider_inner
-            ),
-        )?;
         Ok(())
     }
     fn new_namespace(&mut self, ns: &str, from: &str) -> Result<()> {
-        self.registry.register(Resource::Namespace(ns.into()));
         self.cmd(from, "ip", &["netns", "add", ns])?;
+        self.registry.register(Resource::Namespace(ns.into()));
+        self.cmd(
+            ns,
+            "sysctl",
+            &[
+                "-q",
+                "-w",
+                if ns == "gwhost" {
+                    "net.ipv4.ip_forward=1"
+                } else {
+                    "net.ipv4.ip_forward=0"
+                },
+                "net.ipv6.conf.all.forwarding=0",
+            ],
+        )?;
         self.cmd(ns, "ip", &["link", "set", "lo", "up"])?;
         Ok(())
     }
@@ -324,7 +329,18 @@ impl Lab {
         target: &str,
         marker: &str,
         ipv6: bool,
-    ) -> Result<bool> {
+    ) -> Result<helpers::Outcome> {
+        self.send_from(namespace, protocol, target, marker, ipv6, None)
+    }
+    fn send_from(
+        &mut self,
+        namespace: &str,
+        protocol: &str,
+        target: &str,
+        marker: &str,
+        ipv6: bool,
+        source: Option<&str>,
+    ) -> Result<helpers::Outcome> {
         let exe = self.executable.clone();
         // A unique UDP tuple avoids reusing an earlier case's conntrack NAT
         // mapping when the permissive ruleset temporarily removes masquerading.
@@ -348,6 +364,9 @@ impl Lab {
         ];
         if ipv6 {
             args.push("--ipv6");
+        }
+        if let Some(source) = source {
+            args.extend(["--source", source]);
         }
         let (status, stdout) = self
             .runner
@@ -376,7 +395,13 @@ impl Lab {
         if !status.success() && status.code() != Some(1) {
             return fail(format!("probe launcher failed: {status}"));
         }
-        Ok(status.success())
+        if status.success() != (attempt.outcome == helpers::Outcome::Delivered) {
+            return fail("probe status/outcome mismatch");
+        }
+        if matches!(attempt.outcome, helpers::Outcome::HarnessError { .. }) {
+            return fail(format!("probe harness error: {:?}", attempt.outcome));
+        }
+        Ok(attempt.outcome)
     }
     fn canaries(
         &mut self,
@@ -399,9 +424,14 @@ impl Lab {
                 markers.push(marker.clone());
                 sent.push(marker.clone());
                 let success = self.send("client", protocol, &target, &marker, ipv6)?;
-                if success != healthy {
+                let expected = if healthy {
+                    helpers::Outcome::Delivered
+                } else {
+                    helpers::Outcome::TimedOut
+                };
+                if success != expected {
                     return fail(format!(
-                        "{protocol} canary for {target}: wanted success={healthy}, got {success}"
+                        "{protocol} canary for {target}: wanted {expected:?}, got {success:?}"
                     ));
                 }
             }
@@ -423,10 +453,10 @@ impl Lab {
         }
         Ok(())
     }
-    fn capture(&mut self, ns: &str, iface: &str, stem: &str, v6_only: bool) -> Result<()> {
+    fn capture(&mut self, ns: &str, iface: &str, stem: &str) -> Result<()> {
         let pcap = self.artifacts.join(format!("{stem}.pcap"));
         let log = self.artifacts.join(format!("{stem}.tcpdump.stdout"));
-        let mut args = vec![
+        let args = vec![
             "-n",
             "-Z",
             "root",
@@ -438,9 +468,6 @@ impl Lab {
             "-w",
             pcap.to_str().ok_or("non-UTF8 artifact path")?,
         ];
-        if v6_only {
-            args.push("ip6");
-        }
         let group = self
             .runner
             .background(&Invocation::new(ns, "tcpdump", &args), &log)?;

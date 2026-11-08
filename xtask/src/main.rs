@@ -52,6 +52,8 @@ enum Command {
         ipv6: bool,
         #[arg(long, default_value_t = 0)]
         source_port: u16,
+        #[arg(long)]
+        source: Option<std::net::IpAddr>,
     },
     /// Deliberately inject a spoofed packet for the uplink positive control.
     #[command(hide = true)]
@@ -97,10 +99,8 @@ fn run() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
             marker,
             ipv6,
             source_port,
-        } => {
-            xtask::lab::probe(&protocol, &target, port, &marker, ipv6, source_port)?;
-            Ok(true)
-        }
+            source,
+        } => xtask::lab::probe(&protocol, &target, port, &marker, ipv6, source_port, source),
         #[cfg(target_os = "linux")]
         Command::Inject { marker } => {
             xtask::lab::inject(&marker)?;
