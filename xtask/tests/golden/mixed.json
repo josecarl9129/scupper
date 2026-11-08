@@ -1,0 +1,101 @@
+{
+  "packet_count": 4,
+  "violation_count": 3,
+  "counts": {
+    "Allowed(wireguard[0])": 1,
+    "Violation(ForbiddenAddress)": 2,
+    "Violation(MalformedWireGuard)": 1
+  },
+  "packets": [
+    {
+      "index": 1,
+      "timestamp": {
+        "seconds": 1700000000,
+        "nanoseconds": 123000
+      },
+      "class": {
+        "Allowed": "wireguard[0]"
+      },
+      "summary": "192.0.2.1 -> 198.51.100.2 proto 17"
+    },
+    {
+      "index": 2,
+      "timestamp": {
+        "seconds": 1700000001,
+        "nanoseconds": 123000
+      },
+      "class": {
+        "Violation": {
+          "ForbiddenAddress": {
+            "addr": "10.99.0.2",
+            "where": "Outer"
+          }
+        }
+      },
+      "summary": "10.99.0.2 -> 198.51.100.2 proto 6"
+    },
+    {
+      "index": 3,
+      "timestamp": {
+        "seconds": 1700000002,
+        "nanoseconds": 123000
+      },
+      "class": {
+        "Violation": {
+          "ForbiddenAddress": {
+            "addr": "10.99.0.2",
+            "where": "Quoted"
+          }
+        }
+      },
+      "summary": "192.0.2.1 -> 198.51.100.2 proto 1"
+    },
+    {
+      "index": 4,
+      "timestamp": {
+        "seconds": 1700000003,
+        "nanoseconds": 123000
+      },
+      "class": {
+        "Violation": "MalformedWireGuard"
+      },
+      "summary": "192.0.2.1 -> 198.51.100.2 proto 17"
+    }
+  ],
+  "violations": [
+    {
+      "index": 2,
+      "timestamp": {
+        "seconds": 1700000001,
+        "nanoseconds": 123000
+      },
+      "class": {
+        "Violation": {
+          "ForbiddenAddress": {
+            "addr": "10.99.0.2",
+            "where": "Outer"
+          }
+        }
+      },
+      "summary": "10.99.0.2 -> 198.51.100.2 proto 6",
+      "captured_hex": "4500002800000000400600000a630002c633640200169c4000000000000000005000000000000000"
+    },
+    {
+      "index": 3,
+      "timestamp": {
+        "seconds": 1700000002,
+        "nanoseconds": 123000
+      },
+      "class": {
+        "Violation": {
+          "ForbiddenAddress": {
+            "addr": "10.99.0.2",
+            "where": "Quoted"
+          }
+        }
+      },
+      "summary": "192.0.2.1 -> 198.51.100.2 proto 1",
+      "captured_hex": "450000380000000040010000c0000201c633640203000000000000004500001c0000000040110000c00002010a6300020001000200080000"
+    }
+  ]
+}

@@ -1,0 +1,161 @@
+# Uplink capture oracle
+
+`cargo xtask classify capture.pcap --policy policy.toml [--limit 20]` prints a
+JSON report. Exit status is 0 only when every capture record is allowed and the
+positive-evidence requirements are met; policy, container and packet failures
+return 1. Container/policy errors go to stderr.
+The library entry points are `xtask::pcap::Policy::from_toml` and
+`xtask::pcap::classify`; neither performs I/O.
+
+Capture the entire uplink without a source-address filter. A capture filtered to
+client/exit addresses cannot prove the allow-list property: leaked packets can
+have host addresses after NAT, or carry client addresses inside ICMP quotations.
+This checker is the pure oracle for the later namespace runner; it does not run
+namespaces, tcpdump, or leak scenarios.
+
+## Policy
+
+`forbidden_addrs` is required and must be non-empty. Other lists and toggles
+default to empty/false; `min_packets` defaults to 1 and cannot be zero. Unknown
+keys are errors. A capture below `min_packets` fails with `EmptyCapture`.
+The optional `expect` list requires at least one allowed packet for every listed
+class (`wireguard`, `host_allow`, `arp`, `ndp`) or exact rule (`wireguard[0]`,
+`host_allow[0]`); missing evidence fails with `ExpectedClassMissing`. Use this as
+a positive control alongside the runner's own positive control.
+Addresses must be literal IP addresses; prefixes accept CIDR or a single IP.
+Rules use either direction, with the local endpoint always in `uplink_addrs`.
+Omitted host ports mean any port, but TCP/UDP rules must specify at least one
+port. Host prefixes wider than /24 (IPv4) or /48 (IPv6) require `allow_wide = true`.
+Uplink addresses, WireGuard endpoints and host remote prefixes must not overlap
+forbidden prefixes. Protocols are `tcp`, `udp`, `icmp` and `icmpv6`; ICMP rules
+cannot specify ports. Their optional `types = [8]` list restricts accepted types.
+Without it, ICMPv4 permits echo 0/8 and errors 3/4/5/11/12; ICMPv6 permits echo
+128/129 and errors 1–4. Link control types still require `ndp`.
+
+```toml
+uplink_addrs = ["192.0.2.1", "2001:db8::1"]
+forbidden_addrs = ["10.99.0.0/24", "10.2.0.2/32"]
+canary_markers = ["canary.example", [222, 173, 190, 239, 42, 19, 87, 233, 16, 92, 188, 211]]
+min_packets = 1
+expect = ["wireguard[0]"]
+arp = true
+ndp = true
+
+[[wireguard]]
+gateway = "192.0.2.1:51820"
+peer = "198.51.100.2:51820"
+
+[[host_allow]]
+proto = "tcp"
+local_port = 22
+remote_addr = "198.51.100.0/24"
+# remote_port omitted: the harness's SSH source port can vary.
+
+[[host_allow]]
+proto = "udp"
+local_port = 40000
+remote_addr = "192.0.2.53"
+remote_port = 53
+```
+
+Markers are UTF-8 strings or arrays of bytes 0–255, each at least 12 bytes.
+Short markers can randomly match encrypted WireGuard or TLS ciphertext and make
+large leak captures flaky; a 12-byte marker makes that probability negligible.
+Use unpredictable markers for leak runs. They are matched exactly against the
+whole IP datagram (including options and extensions), trailers, reassembled
+payloads and ICMP quotations. Expanded DNS names join labels with dots; string
+markers match those names ASCII case-insensitively, while byte-array markers
+remain exact. Markers supplement the allow-list, which also rejects unmarked
+unexpected traffic.
+
+WireGuard rules require an uplink gateway IP and equal endpoint address
+families. UDP endpoints must match exactly. The four-byte type/reserved field
+must be `[1..4, 0, 0, 0]`; initiation, response and cookie messages require
+148, 92 and 64 bytes respectively; transport data requires at least 32 bytes.
+A matching endpoint pair with an invalid message cannot fall back to a host
+rule. Configured WireGuard transports may use port 53. Bounded DNS name scanning
+runs before the WireGuard decision; decoding failures are non-fatal for a packet
+that otherwise matches WireGuard. Data packets have no 16-byte length alignment
+requirement because Linux may cap padding at the MTU.
+
+Content inside allowed WireGuard/TLS flows is opaque: it is judged only by
+endpoints and shape, with plaintext canary detection as an additional check.
+The oracle cannot determine what encrypted content carries. Keep host rules
+narrow; an allowed SSH/TLS or UDP flow can carry tunneled traffic that endpoint
+and shape checks cannot distinguish.
+
+ARP permits Ethernet/IPv4 requests and replies only when sender or target is an
+uplink address. The `ndp` toggle permits router solicitation/advertisement,
+neighbor solicitation/advertisement and MLDv1/v2 reports from link-local or the
+uplink's own addresses. NS also permits the unspecified source for duplicate
+address detection; NS/NA targeting an uplink address remain permitted inbound.
+RS/RA and MLD reports require multicast destinations. ND/RS/RA require code 0,
+hop limit 255 and valid option lengths. Redirects are not permitted by `ndp`.
+Forbidden fields override these permissions, including ND targets, redirect
+target/destination, RA prefixes, route and DNS-server options, and MLD group/source
+addresses.
+
+Forbidden outer source/destination addresses always override allow rules and
+markers. IPv6 v4-mapped, v4-compatible, NAT64 `64:ff9b::/96` and 6to4 addresses
+also check their embedded IPv4 address against forbidden IPv4 prefixes.
+ICMPv4 errors 3/4/5/11/12 and ICMPv6 errors 1–4 inspect quotations recursively to
+depth 3, including source/destination, options/extensions, payload and available
+DNS names. ICMPv4 redirect gateways are also checked. Quotes may legally omit
+the original packet's tail; a cut quoted IP/extension header still fails.
+Quotations exceeding the depth limit fail closed.
+
+## Capture and report semantics
+
+The small hand-written classic-pcap reader avoids adding a parser dependency or
+licence exception. It accepts microsecond/nanosecond timestamps in either byte
+order, Ethernet (including stacked 802.1Q/802.1ad tags), SLL, SLL2 and raw IP
+LINKTYPE 101. Pcapng is rejected. Invalid framing, impossible capture lengths and
+incomplete container records are errors; unsupported link layers are packet
+violations. Any snaplen-cut record fails, including a cut payload whose headers
+are intact. Checksums are not validated because captures can precede checksum
+offload. IPv6 jumbograms and unsupported extension/transport protocols have no
+allow rule and fail closed.
+
+IPv4 options and IPv6 hop-by-hop, routing, fragment and destination option
+headers are traversed and their raw bytes scanned. Defined IPv4 RR/LSRR/SSRR and
+timestamp address lists, IPv6 routing type 0/2/4 segment lists and Home Address
+options are checked for forbidden addresses. Unsupported routing formats fail
+closed. Authentication header bytes are also retained and scanned. Reassembly
+keys are `(source, destination, ID, protocol)`.
+Nonterminal fragments require eight-byte alignment. Duplicate/overlapping
+ranges, inconsistent lengths and oversized sets fail; incomplete sets fail at
+EOF. Complete groups are classified as datagrams and their verdict is assigned
+to every contributing record. IDs can be reused after completion. There is no
+wall-clock expiry: unresolved sets remain until EOF. Reassembly storage grows
+with the capture, with at most 65,535 payload bytes per valid pending datagram.
+
+Bytes after the declared IP length fail with `TrailingData`. Ethernet permits
+only padding up to the 60-byte minimum frame (64 with a declared four-byte FCS);
+padding is still scanned for markers. Raw IP, SLL and SLL2 permit no trailers.
+
+DNS decodes questions, answer owner names and common name-bearing answer RDATA,
+with bounded compression-pointer traversal. TCP DNS requires complete framed
+messages within the captured TCP segment. TCP stream reassembly is outside this
+checker: partial frames fail closed. ICMP quotations inspect all complete DNS
+names available before a short tail.
+
+The report contains one `Allowed(rule)` or `Violation(reason)` per record,
+counts by allowed rule/violation kind, and the first `--limit` packet violations in
+capture order. Reassembled fragments retain their original indexes/timestamps.
+Timestamps use integer seconds/nanoseconds. Summaries contain addresses and
+protocols; each sampled violation includes at most the first 64 captured bytes
+as hex. Counts and all packet verdicts remain complete when the sample is capped.
+Capture-wide `EmptyCapture`/`ExpectedClassMissing` reasons appear in
+`capture_failures` (omitted when empty), without inventing packet records.
+`violation_count` includes both failed records and capture-wide failures; the
+packet sample limit does not suppress capture-wide failures.
+
+## Verification
+
+`cargo test -p xtask` builds synthetic captures in code: all WireGuard message
+types/directions, host SSH, ARP, ND, client/exit sources, all required ICMP error
+types and quotations, DNS compression and loops, fragment reassembly/overlap/
+incompleteness, IPv4/TCP options, IPv6 extension headers, VLAN/SLL/SLL2, truncated
+headers/captures, byte order/timestamp resolution, strict policy parsing, CLI
+JSON/exit codes, bounded property tests and a golden mixed JSON report.
+`UPDATE_GOLDEN=1 cargo test -p xtask golden_report` regenerates the golden.
