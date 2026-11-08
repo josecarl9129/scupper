@@ -125,6 +125,9 @@ impl Lab {
             ("scupper", "wg0", "ingress"),
             ("scupper", "ex-ch1", "exit"),
             ("provA", "wgp", "provider"),
+            // Diagnostic only: where a permissive-phase IPv6 flow stops beyond the provider.
+            ("provA", "eth0", "provider-uplink"),
+            ("internet", "eth0", "internet"),
         ] {
             self.capture(ns, iface, &format!("{stem}-{suffix}"))?;
         }
@@ -170,7 +173,7 @@ impl Lab {
             let text = fs::read_to_string(self.artifacts.join(format!("{stem}.trace")))?;
             evidence::antispoof_trace(&text, &[A.client_v6, A.client_link_local_v6])?;
         }
-        for _ in 0..3 {
+        for _ in 0..5 {
             self.stop_capture()?;
         }
         for suffix in ["ingress", "exit", "provider"] {
