@@ -24,22 +24,28 @@ pub type Probe<T> = Result<T, ProbeError>;
 /// A failed observation; it never establishes that a stage passed.
 ///
 /// Local exit-probe setup failures (permission, socket creation, or binding the
-/// device) are observation errors: the exec layer must report a [`CheckError`]
-/// at [`Stage::ExitProbe`], not an `Ok(Err(..))` path failure.
+/// device) use [`ProbeError::Setup`] and produce a [`CheckError`] at
+/// [`Stage::ExitProbe`] (code 1). Every other error at that stage is a path
+/// failure (code 3); errors at earlier stages are always observation errors.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ProbeError {
     /// The observation did not complete within its deadline.
     #[error("probe timed out")]
     Timeout,
     /// The observation command failed before producing usable output.
-    #[error("probe exited unsuccessfully (code {code:?})")]
+    #[error("probe exited unsuccessfully ({}){}", exit_code(*.code), stderr_diagnostic(.stderr))]
     ExitStatus {
         /// Exit code, or `None` when terminated without a code.
         code: Option<i32>,
+        /// First stderr line, at most 200 characters via [`Self::exit_status`].
+        stderr: String,
     },
     /// Output could not be interpreted as a trustworthy observation.
     #[error("{0}")]
     Parse(#[from] ParseError),
+    /// Local exit-probe setup failed; use [`Self::setup`] to bound stored text.
+    #[error("probe setup error: {}", bounded_io(.0))]
+    Setup(String),
     /// I/O failed; use [`Self::io`] to bound stored text to 200 characters.
     ///
     /// Directly constructed values are bounded when reported by [`next`],
@@ -52,7 +58,39 @@ fn bounded_io(message: &str) -> String {
     message.chars().take(200).collect()
 }
 
+fn stderr_line(stderr: &str) -> String {
+    bounded_io(stderr.lines().next().unwrap_or_default())
+}
+
+fn stderr_diagnostic(stderr: &str) -> String {
+    let line = stderr_line(stderr);
+    if line.is_empty() {
+        String::new()
+    } else {
+        format!(": {line}")
+    }
+}
+
+fn exit_code(code: Option<i32>) -> String {
+    code.map_or_else(|| "killed by signal".into(), |code| format!("code {code}"))
+}
+
 impl ProbeError {
+    /// Retains only the first 200 characters of the first stderr line.
+    #[must_use]
+    pub fn exit_status(code: Option<i32>, stderr: &str) -> Self {
+        Self::ExitStatus {
+            code,
+            stderr: stderr_line(stderr),
+        }
+    }
+
+    /// Bounds a local setup diagnostic before retaining it in an observation.
+    #[must_use]
+    pub fn setup(message: &str) -> Self {
+        Self::Setup(bounded_io(message))
+    }
+
     /// Bounds an I/O diagnostic before retaining it in an observation.
     #[must_use]
     pub fn io(message: &str) -> Self {
@@ -62,6 +100,8 @@ impl ProbeError {
     fn bounded(&self) -> Self {
         match self {
             Self::Io(message) => Self::io(message),
+            Self::Setup(message) => Self::setup(message),
+            Self::ExitStatus { code, stderr } => Self::exit_status(*code, stderr),
             other => other.clone(),
         }
     }
@@ -331,7 +371,7 @@ fn done(verdict: Verdict, warnings: Vec<Warning>) -> Next {
     Next::Done(Ok(Report { verdict, warnings }))
 }
 
-fn topology_violations(topology: &M1Topology) -> Option<Violations> {
+pub(crate) fn topology_violations(topology: &M1Topology) -> Option<Violations> {
     let mut violations = match topology.ruleset {
         RulesetObs::Exact => Vec::new(),
         RulesetObs::Missing => vec![Violation::RulesetMissing],
@@ -392,9 +432,8 @@ fn exit_ip_plausible(ip: IpAddr, exit_addr: Ipv4Addr) -> bool {
 ///
 /// Stops at the first missing or failed stage and ignores all later observations.
 /// Topology, handshake and route observation errors return code 1; the final
-/// bound-probe error is an availability failure (`ExitProbeFailed`, code 3).
-/// Local probe setup failures must instead be reported by the exec layer as
-/// [`CheckError`] at [`Stage::ExitProbe`], not as `Ok(Err(..))` path failures.
+/// bound probe returns code 1 only for [`ProbeError::Setup`]. All its other
+/// errors are availability failures (`ExitProbeFailed`, code 3).
 /// Topology violations are collected before consulting later errors, so a known
 /// unsafe configuration cannot be hidden by an availability or probe failure.
 /// A future timestamp warns in all cases and is fresh only within the configured
@@ -448,6 +487,7 @@ pub fn next(obs: &M1Observations, cfg: &HealthConfig, now_unix_secs: u64) -> Nex
     }
     match &obs.exit_probe {
         None => Next::ExitProbe,
+        Some(Err(source @ ProbeError::Setup(_))) => failed(Stage::ExitProbe, source),
         Some(Err(source)) => done(
             Verdict::Degraded(Degraded::ExitProbeFailed(source.bounded())),
             warnings,
@@ -536,7 +576,7 @@ fn display_route(route: &RouteLookup, f: &mut fmt::Formatter<'_>) -> fmt::Result
     }
 }
 
-fn display_violation(violation: &Violation, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+pub(crate) fn display_violation(violation: &Violation, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match violation {
         Violation::RulesetMissing => f.write_str("ruleset missing"),
         Violation::RulesetDiffers { .. } => f.write_str("ruleset differs from policy"),

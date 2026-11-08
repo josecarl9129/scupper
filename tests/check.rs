@@ -1,13 +1,22 @@
 //! Driver ordering, fail-closed parity and independently rendered status.
 
-use std::{cell::RefCell, error::Error, net::IpAddr, rc::Rc, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    error::Error,
+    net::IpAddr,
+    rc::Rc,
+    time::Duration,
+};
 
 use scupper::{
-    check::{ExitProbe, TopologySource, observe_handshake, observe_route, run_check, run_status},
+    check::{
+        ExitProbe, KillSwitchStatus, TopologySource, observe_handshake, observe_route, run_check,
+        run_status,
+    },
     parse::{Handshake, HandshakeAge, route_probe_argv},
     rules::V1Config,
     system::{EXEC_TIMEOUT, ExecError, ExecOutput, Program, System, testing::FakeSystem},
-    verdict::{M1Topology, Probe, ProbeError, RulesetObs, Stage, Verdict},
+    verdict::{ConfigMismatch, M1Topology, Probe, ProbeError, RulesetObs, Stage, Verdict},
 };
 
 type Log = Rc<RefCell<Vec<&'static str>>>;
@@ -205,7 +214,13 @@ fn check_tunnel_permission_error() -> Result<(), Box<dyn Error>> {
         .ok_or("expected handshake error")?;
     assert_eq!(error.exit_code(), 1);
     assert_eq!(error.stage, Stage::Handshake);
-    assert_eq!(error.source, ProbeError::ExitStatus { code: Some(1) });
+    assert_eq!(
+        error.source,
+        ProbeError::exit_status(
+            Some(1),
+            "Unable to access interface: Operation not permitted"
+        )
+    );
     h.assert_log(&["topology", "wg"]);
     Ok(())
 }
@@ -223,7 +238,10 @@ fn check_route_rtnetlink_error() -> Result<(), Box<dyn Error>> {
         .ok_or("expected route error")?;
     assert_eq!(error.exit_code(), 1);
     assert_eq!(error.stage, Stage::Route);
-    assert_eq!(error.source, ProbeError::ExitStatus { code: Some(2) });
+    assert_eq!(
+        error.source,
+        ProbeError::exit_status(Some(2), "RTNETLINK answers: Network is unreachable")
+    );
     h.assert_log(&["topology", "wg", "ip"]);
     Ok(())
 }
@@ -257,9 +275,10 @@ fn check_no_repeat_calls() -> Result<(), Box<dyn Error>> {
 #[test]
 fn check_exit_setup_and_path_errors() -> Result<(), Box<dyn Error>> {
     for (source, setup) in [
-        (ProbeError::io("binding device: permission denied"), true),
+        (ProbeError::setup("binding device: permission denied"), true),
+        (ProbeError::io("connection reset"), false),
         (ProbeError::Timeout, false),
-        (ProbeError::ExitStatus { code: Some(1) }, false),
+        (ProbeError::exit_status(Some(1), "request failed"), false),
     ] {
         let mut h = Harness::new();
         h.healthy_path("proton0");
@@ -319,7 +338,7 @@ fn status_independent_fields() {
     assert_eq!(
         report.to_string(),
         concat!(
-            "client wg0:     unknown (probe exited unsuccessfully (code Some(1)))\n",
+            "client wg0:     unknown (probe exited unsuccessfully (code 1): Operation not permitted)\n",
             "exit   proton0: last handshake 12s ago\n",
             "client route:   via proton0\n",
             "kill switch:    in place"
@@ -328,7 +347,7 @@ fn status_independent_fields() {
     assert!(report.client_handshake.is_err());
     assert!(report.exit_handshake.is_ok());
     assert!(report.client_route.is_ok());
-    assert_eq!(report.kill_switch, Ok(true));
+    assert_eq!(report.kill_switch, Ok(KillSwitchStatus::InPlace));
     h.assert_log(&["wg", "wg", "ip", "topology"]);
 }
 
@@ -447,5 +466,143 @@ fn collectors_use_configured_interfaces_and_single_peer_parser() -> Result<(), B
         observe_handshake(&h.sys, &h.cfg),
         Err(ProbeError::Parse(_))
     ));
+    Ok(())
+}
+
+#[test]
+fn check_wg_nonzero_without_missing_device_is_code_1() -> Result<(), Box<dyn Error>> {
+    let h = Harness::new();
+    h.exit_handshake(Ok(failure(Some(2), "unrelated command failure")));
+    let error = run_check(&h.sys, &h.topo, &h.probe, &h.cfg)
+        .err()
+        .ok_or("expected observation error")?;
+    assert_eq!(error.exit_code(), 1);
+    assert_eq!(error.stage, Stage::Handshake);
+    h.assert_log(&["topology", "wg"]);
+    Ok(())
+}
+
+#[test]
+fn missing_device_requires_exact_diagnostic_and_nonzero_status() -> Result<(), Box<dyn Error>> {
+    for stderr in [
+        "unrelated message: No such device while inspecting a route",
+        "unrelated: Unable to access interface: No such device",
+        "unrelated message\nUnable to access interface: No such device",
+        "Unable to access interface: No such device (unrelated context)",
+    ] {
+        let h = Harness::new();
+        h.exit_handshake(Ok(failure(Some(1), stderr)));
+        assert!(matches!(
+            observe_handshake(&h.sys, &h.cfg),
+            Err(ProbeError::ExitStatus { .. })
+        ));
+    }
+    for status in [Some(0), None] {
+        let h = Harness::new();
+        let mut response = failure(status, "Unable to access interface: No such device\n");
+        response.stdout = handshake('A', 988);
+        h.exit_handshake(Ok(response));
+        let result = observe_handshake(&h.sys, &h.cfg);
+        if status == Some(0) {
+            assert_eq!(result?, Handshake::At { unix_secs: 988 });
+        } else {
+            assert!(matches!(result, Err(ProbeError::ExitStatus { .. })));
+        }
+    }
+    Ok(())
+}
+
+fn status_with_topology(topology: M1Topology) -> String {
+    let mut h = Harness::new();
+    h.topo.result = Ok(topology);
+    h.client_handshake(Ok(output(&handshake('A', 988))));
+    h.healthy_path("proton0");
+    run_status(&h.sys, &h.topo, &h.cfg).to_string()
+}
+
+#[test]
+fn status_tc_hook_not_in_place() -> Result<(), Box<dyn Error>> {
+    let h = Harness::new();
+    let mut topology = h.topo.result?;
+    topology.tc_hooks.push(h.cfg.client_iface);
+    assert!(
+        status_with_topology(topology)
+            .ends_with("kill switch:    NOT VERIFIED: unexpected traffic-control hook on wg0")
+    );
+    Ok(())
+}
+
+#[test]
+fn status_config_mismatch_not_in_place() -> Result<(), Box<dyn Error>> {
+    let h = Harness::new();
+    let mut topology = h.topo.result?;
+    topology
+        .config_mismatches
+        .push(ConfigMismatch::ExitAddrNotOnExitIface);
+    assert!(
+        status_with_topology(topology)
+            .ends_with("kill switch:    NOT VERIFIED: exit address is not on the exit interface")
+    );
+    Ok(())
+}
+
+#[test]
+fn status_reports_all_topology_violations() -> Result<(), Box<dyn Error>> {
+    let h = Harness::new();
+    let mut topology = h.topo.result?;
+    topology.ruleset = RulesetObs::Differs {
+        live_sha256: [1; 32],
+        want_sha256: [2; 32],
+    };
+    topology.tc_hooks.push(h.cfg.client_iface);
+    topology
+        .config_mismatches
+        .push(ConfigMismatch::ExitAddrNotOnExitIface);
+    assert!(status_with_topology(topology).ends_with(
+        "kill switch:    NOT VERIFIED: ruleset differs from policy; unexpected traffic-control hook on wg0; exit address is not on the exit interface"
+    ));
+    Ok(())
+}
+
+#[test]
+fn status_reads_clock_after_each_wg_call() -> Result<(), Box<dyn Error>> {
+    struct AdvancingSystem {
+        fake: FakeSystem,
+        now: Cell<u64>,
+    }
+    impl System for AdvancingSystem {
+        fn run(
+            &self,
+            program: Program,
+            args: &[String],
+            timeout: Duration,
+        ) -> Result<ExecOutput, ExecError> {
+            let result = self.fake.run(program, args, timeout);
+            if program == Program::Wg {
+                self.now.set(self.now.get() + 1);
+            }
+            result
+        }
+        fn now_unix_secs(&self) -> u64 {
+            self.now.get()
+        }
+    }
+    let h = Harness::new();
+    h.client_handshake(Ok(output(&handshake('A', 1_001))));
+    h.exit_handshake(Ok(output(&handshake('A', 1_002))));
+    h.route(Ok(output("192.0.2.1 dev proton0")));
+    let sys = AdvancingSystem {
+        fake: h.sys.fake,
+        now: Cell::new(1_000),
+    };
+    let status = run_status(&sys, &h.topo, &h.cfg);
+    assert_eq!(
+        status.client_handshake?.age,
+        HandshakeAge::Age(Duration::ZERO)
+    );
+    assert_eq!(
+        status.exit_handshake?.age,
+        HandshakeAge::Age(Duration::ZERO)
+    );
     Ok(())
 }

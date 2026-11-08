@@ -6,7 +6,15 @@ rust-version = "1.99"
 license = "MIT OR Apache-2.0"
 publish = false
 
+[features]
+testing = []
+
+[[test]]
+name = "check"
+required-features = ["testing"]
+
 [dependencies]
+rustix = { version = "1", default-features = false, features = ["process"] }
 thiserror = "2"
 
 [dev-dependencies]

@@ -79,7 +79,7 @@ fn v1_verdict_table() {
     let mut wrong_route = passing();
     wrong_route.route = Some(Ok(RouteLookup::Dev(V1Config::default().uplink_iface)));
     let mut failed_route = passing();
-    failed_route.route = Some(Err(ProbeError::ExitStatus { code: Some(2) }));
+    failed_route.route = Some(Err(ProbeError::exit_status(Some(2), "route failed")));
     for (label, obs, expected) in [
         ("connected", passing(), 0),
         ("missing ruleset outranks everything", missing, 2),
@@ -193,9 +193,8 @@ fn violation_beats_observation_error() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn observation_errors_are_code_1() {
-    // The explicit stage-4 rule and v1 "probe failed" case specify code 3,
-    // conflicting with the blanket "Err at each stage" code-1 requirement.
-    // Preserve that explicit final-probe exception; all earlier errors use 1.
+    // Parse failures use code 1 at required-observation stages and code 3 at
+    // the final path probe. Its Setup exception is covered separately.
     for stage in [
         Stage::Topology,
         Stage::Handshake,
@@ -657,7 +656,10 @@ fn ips() -> impl Strategy<Value = IpAddr> {
 fn errors() -> impl Strategy<Value = ProbeError> {
     prop_oneof![
         Just(ProbeError::Timeout),
-        prop::option::of(any::<i32>()).prop_map(|code| ProbeError::ExitStatus { code }),
+        (prop::option::of(any::<i32>()), any::<String>())
+            .prop_map(|(code, stderr)| ProbeError::ExitStatus { code, stderr }),
+        any::<String>().prop_map(ProbeError::Setup),
+        Just(ProbeError::Setup("界".repeat(201))),
         Just(ProbeError::Parse(ParseError::NoPeers)),
         Just(ProbeError::Parse(ParseError::EmptyRoute)),
         any::<String>().prop_map(ProbeError::Io),
@@ -777,6 +779,17 @@ fn reference_plausible(ip: IpAddr, cfg: &HealthConfig) -> bool {
 fn reference_error(stage: Stage, source: &ProbeError) -> Next {
     let source = match source {
         ProbeError::Io(text) => ProbeError::Io(text.chars().take(200).collect()),
+        ProbeError::Setup(text) => ProbeError::Setup(text.chars().take(200).collect()),
+        ProbeError::ExitStatus { code, stderr } => ProbeError::ExitStatus {
+            code: *code,
+            stderr: stderr
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .chars()
+                .take(200)
+                .collect(),
+        },
         other => other.clone(),
     };
     Next::Done(Err(CheckError { stage, source }))
@@ -859,9 +872,21 @@ fn reference_next(obs: &M1Observations, cfg: &HealthConfig, now: u64) -> Next {
     }
     let ip = match &obs.exit_probe {
         None => return Next::ExitProbe,
+        Some(Err(error @ ProbeError::Setup(_))) => return reference_error(Stage::ExitProbe, error),
         Some(Err(error)) => {
             let bounded = match error {
                 ProbeError::Io(text) => ProbeError::Io(text.chars().take(200).collect()),
+                ProbeError::Setup(text) => ProbeError::Setup(text.chars().take(200).collect()),
+                ProbeError::ExitStatus { code, stderr } => ProbeError::ExitStatus {
+                    code: *code,
+                    stderr: stderr
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(200)
+                        .collect(),
+                },
                 other => other.clone(),
             };
             return Next::Done(Ok(Report {
@@ -934,9 +959,9 @@ proptest! {
         };
         if let Some(stage) = reached_error {
             let result = next(&obs, &cfg, now);
-            // The explicit final bound-probe failure is degraded (3), as in
-            // the v1 table; required observations at earlier stages use 1.
-            if stage == Stage::ExitProbe {
+            // Final path failures use 3; local Setup failures and required
+            // observations at earlier stages use 1.
+            if stage == Stage::ExitProbe && !matches!(obs.exit_probe, Some(Err(ProbeError::Setup(_)))) {
                 prop_assert_eq!(code(&result), Some(3));
                 prop_assert!(matches!(result, Next::Done(Ok(Report { verdict: Verdict::Degraded(Degraded::ExitProbeFailed(_)), .. }))), "wrong bound-probe classification");
             } else {
@@ -945,4 +970,91 @@ proptest! {
             }
         }
     }
+}
+
+#[test]
+fn exit_probe_setup_error_is_code_1() {
+    let mut obs = passing();
+    let source = ProbeError::setup("binding device: permission denied");
+    obs.exit_probe = Some(Err(source.clone()));
+    let result = next(&obs, &config(), NOW);
+    assert_eq!(code(&result), Some(1));
+    assert_eq!(
+        result,
+        Next::Done(Err(CheckError {
+            stage: Stage::ExitProbe,
+            source
+        }))
+    );
+}
+
+#[test]
+fn exit_probe_io_error_is_code_3() -> Result<(), Box<dyn Error>> {
+    let mut obs = passing();
+    let source = ProbeError::io("connection reset");
+    obs.exit_probe = Some(Err(source.clone()));
+    let result = report(&obs)?;
+    assert_eq!(result.verdict.exit_code(), 3);
+    assert_eq!(
+        result.verdict,
+        Verdict::Degraded(Degraded::ExitProbeFailed(source))
+    );
+    Ok(())
+}
+
+#[test]
+fn setup_errors_are_bounded() {
+    let long = "界".repeat(201);
+    assert_eq!(
+        ProbeError::setup(&long),
+        ProbeError::Setup("界".repeat(200))
+    );
+    assert_eq!(
+        ProbeError::Setup(long.clone()).to_string(),
+        format!("probe setup error: {}", "界".repeat(200))
+    );
+    let mut obs = passing();
+    obs.exit_probe = Some(Err(ProbeError::Setup(long.clone())));
+    assert_eq!(
+        next(&obs, &config(), NOW),
+        Next::Done(Err(CheckError {
+            stage: Stage::ExitProbe,
+            source: ProbeError::setup(&long),
+        }))
+    );
+}
+
+#[test]
+fn exit_status_diagnostics_are_bounded_and_readable() -> Result<(), Box<dyn Error>> {
+    for (code, expected) in [(Some(1), "code 1"), (None, "killed by signal")] {
+        let stderr = format!("{}\nsecond line must be omitted", "界".repeat(201));
+        let error = ProbeError::exit_status(code, &stderr);
+        assert_eq!(
+            error,
+            ProbeError::ExitStatus {
+                code,
+                stderr: "界".repeat(200)
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "probe exited unsuccessfully ({expected}): {}",
+                "界".repeat(200)
+            )
+        );
+        let direct = ProbeError::ExitStatus { code, stderr };
+        assert_eq!(direct.to_string(), error.to_string());
+        let mut obs = passing();
+        obs.exit_probe = Some(Err(direct));
+        assert_eq!(
+            report(&obs)?.verdict,
+            Verdict::Degraded(Degraded::ExitProbeFailed(error))
+        );
+    }
+    assert_eq!(
+        ProbeError::exit_status(None, "").to_string(),
+        "probe exited unsuccessfully (killed by signal)"
+    );
+    Ok(())
 }

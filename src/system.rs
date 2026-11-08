@@ -2,6 +2,7 @@
 
 use std::{
     io::Read,
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::mpsc,
@@ -9,6 +10,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use rustix::process::{Pid, Signal, kill_process_group};
 use thiserror::Error;
 
 /// Default deadline for each kernel command.
@@ -64,6 +66,9 @@ impl Default for Programs {
 impl Programs {
     /// Applies absolute-path overrides to the defaults (last override wins).
     ///
+    /// Callers must use paths from code defaults or root-owned configuration only,
+    /// never from command-line arguments or environment variables.
+    ///
     /// # Errors
     ///
     /// Returns a bounded [`ExecError::Spawn`] if any override is relative.
@@ -115,7 +120,7 @@ pub enum ExecError {
     /// Spawn, pipe or wait failure; stored by [`Self::spawn`] with bounded text.
     #[error("exec I/O error: {}", bounded(.0))]
     Spawn(String),
-    /// The child was killed and reaped after the deadline expired.
+    /// The deadline expired; the process group was killed and reaping requested.
     #[error("exec timed out after {after:?}")]
     Timeout {
         /// The requested execution budget.
@@ -179,6 +184,8 @@ impl RealSystem {
             .env_clear()
             .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
             .env("LC_ALL", "C")
+            .current_dir("/")
+            .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -186,13 +193,45 @@ impl RealSystem {
     }
 }
 
-// Every return path, including reader setup and wait errors, reaps the child.
-struct ReapChild(Child);
+// Never block the caller on a child in uninterruptible kernel sleep. A detached
+// reaper owns it after a bounded poll, so it can be reaped if it eventually exits.
+fn terminate(mut child: Child, deadline: Instant) {
+    if let Some(pgid) = Pid::from_raw(child.id().cast_signed()) {
+        let _ = kill_process_group(pgid, Signal::KILL);
+    }
+    let reap_deadline = (Instant::now() + Duration::from_millis(500)).min(deadline);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Err(_) => break,
+            Ok(None) => {}
+        }
+        if Instant::now() >= reap_deadline {
+            break;
+        }
+        thread::sleep(
+            Duration::from_millis(2).min(reap_deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+    let _ = thread::Builder::new()
+        .name("exec-reaper".into())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+}
 
-impl Drop for ReapChild {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+fn join_readers(readers: Vec<thread::JoinHandle<()>>, deadline: Instant) {
+    while readers.iter().any(|reader| !reader.is_finished()) && Instant::now() < deadline {
+        thread::sleep(
+            Duration::from_millis(2).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+    for reader in readers {
+        if reader.is_finished() {
+            let _ = reader.join();
+        }
+        // Dropping an unfinished handle detaches the reader. Its bounded buffer
+        // and pipe are released when the killed process group's pipes close.
     }
 }
 
@@ -208,36 +247,39 @@ fn read_pipe(pipe: impl Read) -> Result<String, ExecError> {
 }
 
 fn collect(
-    child: &mut ReapChild,
+    child: &mut Child,
     started: Instant,
     timeout: Duration,
+    readers: &mut Vec<thread::JoinHandle<()>>,
 ) -> Result<ExecOutput, ExecError> {
     let stdout = child
-        .0
         .stdout
         .take()
         .ok_or_else(|| ExecError::spawn("stdout pipe unavailable"))?;
     let stderr = child
-        .0
         .stderr
         .take()
         .ok_or_else(|| ExecError::spawn("stderr pipe unavailable"))?;
     let (sender, receiver) = mpsc::channel();
     let err_sender = sender.clone();
-    // Never join a blocking pipe reader: the deadline also covers EOF, including
-    // a pipe inherited by a descendant. Each reader retains at most cap + 1.
-    thread::Builder::new()
-        .name("exec-stdout".into())
-        .spawn(move || {
-            let _ = sender.send((0, read_pipe(stdout)));
-        })
-        .map_err(|error| ExecError::spawn(&error.to_string()))?;
-    thread::Builder::new()
-        .name("exec-stderr".into())
-        .spawn(move || {
-            let _ = err_sender.send((1, read_pipe(stderr)));
-        })
-        .map_err(|error| ExecError::spawn(&error.to_string()))?;
+    // The deadline covers EOF, including pipes inherited by descendants.
+    // Keep the handles so readers can be joined within the cleanup budget.
+    readers.push(
+        thread::Builder::new()
+            .name("exec-stdout".into())
+            .spawn(move || {
+                let _ = sender.send((0, read_pipe(stdout)));
+            })
+            .map_err(|error| ExecError::spawn(&error.to_string()))?,
+    );
+    readers.push(
+        thread::Builder::new()
+            .name("exec-stderr".into())
+            .spawn(move || {
+                let _ = err_sender.send((1, read_pipe(stderr)));
+            })
+            .map_err(|error| ExecError::spawn(&error.to_string()))?,
+    );
 
     let mut streams = [None, None];
     loop {
@@ -248,7 +290,6 @@ fn collect(
             streams[index] = Some(result?);
         }
         let status = child
-            .0
             .try_wait()
             .map_err(|error| ExecError::spawn(&error.to_string()))?;
         if let (Some(status), [Some(stdout), Some(stderr)]) = (status, &mut streams) {
@@ -270,11 +311,19 @@ impl System for RealSystem {
         timeout: Duration,
     ) -> Result<ExecOutput, ExecError> {
         let started = Instant::now();
-        let child = self
+        let mut child = self
             .command(program, args)
             .spawn()
             .map_err(|error| ExecError::spawn(&error.to_string()))?;
-        collect(&mut ReapChild(child), started, timeout)
+        // Reserve less than the permitted extra second for bounded cleanup.
+        let deadline = started + timeout + Duration::from_millis(900);
+        let mut readers = Vec::with_capacity(2);
+        let result = collect(&mut child, started, timeout, &mut readers);
+        if result.is_err() {
+            terminate(child, deadline);
+        }
+        join_readers(readers, deadline);
+        result
     }
 
     fn now_unix_secs(&self) -> u64 {
@@ -285,8 +334,8 @@ impl System for RealSystem {
     }
 }
 
-/// Scripted test support, public so integration and downstream tests can use it
-/// without enabling a feature or changing the production execution path.
+/// Scripted test support, available only with the `testing` feature.
+#[cfg(feature = "testing")]
 pub mod testing {
     use std::{cell::RefCell, collections::BTreeMap, collections::VecDeque, time::Duration};
 
@@ -401,14 +450,17 @@ mod tests {
         let sys = system("/usr/bin/sleep")?;
         let timeout = Duration::from_millis(200);
         let started = Instant::now();
-        let mut child = ReapChild(sys.command(Program::Wg, &args(&["5"])).spawn()?);
-        let pid = child.0.id();
+        let mut child = sys.command(Program::Wg, &args(&["5"])).spawn()?;
+        let pid = child.id();
+        let mut readers = vec![];
         assert_eq!(
-            collect(&mut child, started, timeout),
+            collect(&mut child, started, timeout, &mut readers),
             Err(ExecError::Timeout { after: timeout })
         );
-        drop(child);
-        assert!(started.elapsed() < Duration::from_secs(2));
+        let deadline = started + timeout + Duration::from_millis(900);
+        terminate(child, deadline);
+        join_readers(readers, deadline);
+        assert!(started.elapsed() < timeout + Duration::from_secs(1));
         // kill -0 fails for a process that has been killed AND reaped (including
         // on non-Linux Unix systems, where /proc is not available).
         let exists = Command::new("/usr/bin/kill")
@@ -417,6 +469,158 @@ mod tests {
             .stderr(Stdio::null())
             .status()?;
         assert!(!exists.success(), "timed-out child {pid} still exists");
+        Ok(())
+    }
+
+    #[test]
+    fn exec_stdin_is_null() -> Result<(), Box<dyn Error>> {
+        let started = Instant::now();
+        let output = system("/usr/bin/cat")?.run(Program::Wg, &[], EXEC_TIMEOUT)?;
+        assert_eq!(
+            output,
+            ExecOutput {
+                status: Some(0),
+                stdout: String::new(),
+                stderr: String::new()
+            }
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        Ok(())
+    }
+
+    #[test]
+    fn exec_cwd_is_root() -> Result<(), Box<dyn Error>> {
+        let output = system("/usr/bin/pwd")?.run(Program::Wg, &[], EXEC_TIMEOUT)?;
+        assert_eq!(output.status, Some(0));
+        assert_eq!(output.stdout, "/\n");
+        Ok(())
+    }
+
+    fn assert_grandchild_killed(tail: &str, expected: ExecError) -> Result<(), Box<dyn Error>> {
+        struct PidFile(PathBuf);
+        impl Drop for PidFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        // This helper runs only in an isolated harness subprocess. Adopt the
+        // orphan on Linux so the test does not depend on container PID 1 reaping.
+        #[cfg(target_os = "linux")]
+        rustix::process::set_child_subreaper(Some(Pid::INIT))
+            .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
+        let file = PidFile(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join(format!(
+                    "exec-grandchild-{}-{}.pid",
+                    std::process::id(),
+                    SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+                )),
+        );
+        let timeout = Duration::from_millis(200);
+        let started = Instant::now();
+        // A shell is used only in this test to arrange an inherited-pipe tree.
+        let script = format!("/usr/bin/sleep 30 & printf '%s' \"$!\" > \"$1\"; {tail}");
+        let result = system("/bin/sh")?.run(
+            Program::Wg,
+            &[
+                "-c".into(),
+                script,
+                "exec-test".into(),
+                file.0.to_string_lossy().into_owned(),
+            ],
+            timeout,
+        );
+        assert_eq!(result, Err(expected));
+        assert!(started.elapsed() < timeout + Duration::from_secs(1));
+        let pid = std::fs::read_to_string(&file.0)?;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            #[cfg(target_os = "linux")]
+            let _ = rustix::process::waitpid(
+                Pid::from_raw(pid.parse()?),
+                rustix::process::WaitOptions::NOHANG,
+            );
+            let exists = Command::new("/usr/bin/kill")
+                .args(["-0", &pid])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()?
+                .success();
+            if !exists {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "grandchild {pid} survived group cleanup"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn exec_timeout_kills_process_group() -> Result<(), Box<dyn Error>> {
+        group_fixture("system::tests::timeout_process_group_fixture")
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture"]
+    fn timeout_process_group_fixture() -> Result<(), Box<dyn Error>> {
+        assert_grandchild_killed(
+            "exec /usr/bin/sleep 30",
+            ExecError::Timeout {
+                after: Duration::from_millis(200),
+            },
+        )
+    }
+
+    #[test]
+    fn exec_timeout_covers_inherited_pipes_after_child_exit() -> Result<(), Box<dyn Error>> {
+        group_fixture("system::tests::inherited_pipes_fixture")
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture"]
+    fn inherited_pipes_fixture() -> Result<(), Box<dyn Error>> {
+        assert_grandchild_killed(
+            "exit 0",
+            ExecError::Timeout {
+                after: Duration::from_millis(200),
+            },
+        )
+    }
+
+    #[test]
+    fn exec_output_error_kills_process_group() -> Result<(), Box<dyn Error>> {
+        group_fixture("system::tests::output_error_process_group_fixture")
+    }
+
+    fn group_fixture(name: &str) -> Result<(), Box<dyn Error>> {
+        let output = fixture(name)?;
+        assert_eq!(output.status, Some(0), "{}{}", output.stdout, output.stderr);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture"]
+    fn output_error_process_group_fixture() -> Result<(), Box<dyn Error>> {
+        assert_grandchild_killed("exec /usr/bin/yes", ExecError::OutputTooLarge)
+    }
+
+    #[test]
+    fn exec_reader_join_is_bounded() -> Result<(), Box<dyn Error>> {
+        let (release, blocked) = mpsc::channel();
+        let (done, finished) = mpsc::channel();
+        let reader = thread::Builder::new().spawn(move || {
+            let _ = blocked.recv();
+            let _ = done.send(());
+        })?;
+        let started = Instant::now();
+        join_readers(vec![reader], started + Duration::from_millis(30));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        release.send(())?;
+        finished.recv_timeout(Duration::from_secs(1))?;
         Ok(())
     }
 
@@ -453,8 +657,8 @@ mod tests {
         }
     }
 
-    // These helpers are test-harness subprocesses: no shell or production-only
-    // escape hatch is needed to exercise both pipes and malformed bytes.
+    // Test-harness subprocesses exercise both pipes, malformed bytes, and
+    // process-wide test setup without exposing an escape hatch in the library.
     fn fixture(name: &str) -> Result<ExecOutput, Box<dyn Error>> {
         let sys = RealSystem::new(Programs::new([(Program::Wg, std::env::current_exe()?)])?);
         Ok(sys.run(
@@ -522,6 +726,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "testing")]
     #[should_panic(expected = "unexpected or exhausted command: Ip")]
     fn fake_rejects_unknown_calls() {
         let fake = testing::FakeSystem::new(1_000);

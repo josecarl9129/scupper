@@ -8,7 +8,7 @@ use crate::{
     system::{EXEC_TIMEOUT, ExecError, ExecOutput, Program, System},
     verdict::{
         self, CheckError, HealthConfig, M1Observations, M1Topology, Next, Probe, ProbeError,
-        Report, RulesetObs, Stage,
+        Report, RulesetObs, Stage, Violations,
     },
 };
 
@@ -25,9 +25,8 @@ pub trait TopologySource {
 /// Bound exit-path observation, implemented in the next milestone step.
 ///
 /// Implementations must report local setup failures (permission, socket creation,
-/// binding the device) as [`ProbeError::Io`]. [`run_check`] promotes these to
-/// observation errors (code 1). Path failures use other errors, such as
-/// [`ProbeError::Timeout`] or [`ProbeError::ExitStatus`], and yield code 3.
+/// binding the device) as [`ProbeError::Setup`] (code 1). Every other error,
+/// including [`ProbeError::Io`], is a path failure (code 3).
 /// The setup/path distinction must be preserved when implementing this probe.
 pub trait ExitProbe {
     /// Observes the external address through the configured exit interface.
@@ -60,19 +59,14 @@ fn wg_output(sys: &dyn System, iface: &IfName) -> Probe<ExecOutput> {
 
 fn missing_device(output: &ExecOutput) -> bool {
     output.status.is_some_and(|code| code != 0)
-        && output
-            .stderr
-            .lines()
-            .any(|line| line.trim() == "Unable to access interface: No such device")
+        && output.stderr.trim() == "Unable to access interface: No such device"
 }
 
 fn successful(output: ExecOutput) -> Probe<ExecOutput> {
     if output.status == Some(0) {
         Ok(output)
     } else {
-        Err(ProbeError::ExitStatus {
-            code: output.status,
-        })
+        Err(ProbeError::exit_status(output.status, &output.stderr))
     }
 }
 
@@ -147,14 +141,7 @@ pub fn run_check(
                 observations.route = Some(observe_route(sys, cfg));
             }
             Next::ExitProbe if observations.exit_probe.is_none() => {
-                let result = probe.probe(cfg);
-                if let Err(ProbeError::Io(message)) = result {
-                    return Err(CheckError {
-                        stage: Stage::ExitProbe,
-                        source: ProbeError::io(&message),
-                    });
-                }
-                observations.exit_probe = Some(result);
+                observations.exit_probe = Some(probe.probe(cfg));
             }
             request => return Err(internal_error(request_stage(&request))),
         }
@@ -183,6 +170,17 @@ pub struct HandshakeStatus {
     pub peer_count: usize,
 }
 
+/// Whether containment was verified, absent, or invalidated by violations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KillSwitchStatus {
+    /// Exact ruleset, no unexpected tc hooks, and no config mismatches.
+    InPlace,
+    /// The required ruleset is absent.
+    Missing,
+    /// Containment cannot be claimed because of these violations.
+    NotVerified(Violations),
+}
+
 /// Informational observations; each field retains its own success or error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusReport {
@@ -196,11 +194,11 @@ pub struct StatusReport {
     pub exit_handshake: Probe<HandshakeStatus>,
     /// Forwarded-client route.
     pub client_route: Probe<RouteLookup>,
-    /// True only when the observed ruleset is exact with no tc/config violations.
-    pub kill_switch: Probe<bool>,
+    /// Containment status, retaining violations and observation errors.
+    pub kill_switch: Probe<KillSwitchStatus>,
 }
 
-fn client_handshake(sys: &dyn System, cfg: &V1Config, now: u64) -> Probe<HandshakeStatus> {
+fn client_handshake(sys: &dyn System, cfg: &V1Config) -> Probe<HandshakeStatus> {
     let output = wg_output(sys, &cfg.client_iface)?;
     if missing_device(&output) {
         return Ok(HandshakeStatus {
@@ -218,7 +216,7 @@ fn client_handshake(sys: &dyn System, cfg: &V1Config, now: u64) -> Probe<Handsha
         .max()
         .map_or(Handshake::Never, |unix_secs| Handshake::At { unix_secs });
     Ok(HandshakeStatus {
-        age: latest.age_at(now),
+        age: latest.age_at(sys.now_unix_secs()),
         peer_count: peers.len(),
     })
 }
@@ -226,20 +224,23 @@ fn client_handshake(sys: &dyn System, cfg: &V1Config, now: u64) -> Probe<Handsha
 /// Collects every status field independently, without running an exit probe.
 #[must_use]
 pub fn run_status(sys: &dyn System, topo: &dyn TopologySource, cfg: &V1Config) -> StatusReport {
-    let now = sys.now_unix_secs();
     StatusReport {
         client_iface: cfg.client_iface.clone(),
         exit_iface: cfg.exit_iface.clone(),
-        client_handshake: client_handshake(sys, cfg, now),
+        client_handshake: client_handshake(sys, cfg),
         exit_handshake: exit_handshake(sys, cfg).map(|(handshake, peer_count)| HandshakeStatus {
-            age: handshake.age_at(now),
+            age: handshake.age_at(sys.now_unix_secs()),
             peer_count,
         }),
         client_route: observe_route(sys, cfg),
         kill_switch: topo.observe(sys, cfg).map(|topology| {
-            topology.ruleset == RulesetObs::Exact
-                && topology.tc_hooks.is_empty()
-                && topology.config_mismatches.is_empty()
+            if topology.ruleset == RulesetObs::Missing {
+                KillSwitchStatus::Missing
+            } else if let Some(violations) = verdict::topology_violations(&topology) {
+                KillSwitchStatus::NotVerified(violations)
+            } else {
+                KillSwitchStatus::InPlace
+            }
         }),
     }
 }
@@ -294,8 +295,18 @@ impl fmt::Display for StatusReport {
         }
         write!(f, "\n{:<width$}", "kill switch:")?;
         match &self.kill_switch {
-            Ok(true) => f.write_str("in place"),
-            Ok(false) => f.write_str("MISSING"),
+            Ok(KillSwitchStatus::InPlace) => f.write_str("in place"),
+            Ok(KillSwitchStatus::Missing) => f.write_str("MISSING"),
+            Ok(KillSwitchStatus::NotVerified(violations)) => {
+                f.write_str("NOT VERIFIED: ")?;
+                for (index, violation) in violations.as_slice().iter().enumerate() {
+                    if index > 0 {
+                        f.write_str("; ")?;
+                    }
+                    verdict::display_violation(violation, f)?;
+                }
+                Ok(())
+            }
             Err(error) => write!(f, "unknown ({error})"),
         }
     }
