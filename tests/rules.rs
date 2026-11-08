@@ -3,7 +3,7 @@
 use std::net::Ipv4Addr;
 
 use proptest::prelude::*;
-use scupper::rules::{IfName, V1Config, ruleset};
+use scupper::rules::{ConfigError, IfName, V1Config, ruleset};
 
 const GOLDEN: &str = include_str!("golden/ruleset.golden");
 
@@ -35,6 +35,15 @@ fn golden_byte_exact() {
 
     let actual = ruleset(&cfg).expect("default configuration must render");
     assert_eq!(actual, GOLDEN, "\n{}", line_diff(GOLDEN, &actual));
+}
+
+#[test]
+fn default_names_are_valid() {
+    let cfg = V1Config::default();
+    for name in [&cfg.client_iface, &cfg.exit_iface, &cfg.uplink_iface] {
+        assert_eq!(IfName::new(name.as_str()).as_ref(), Ok(name));
+    }
+    assert_eq!(cfg.validate(), Ok(()));
 }
 
 #[test]
@@ -76,6 +85,9 @@ fn ifname_validation_table() {
         "/",
         ".",
         "..",
+        "-",
+        "-wg0",
+        "--help",
         "wg0;",
         "é",
         "wg\"0",
@@ -87,8 +99,13 @@ fn ifname_validation_table() {
         "wg\0",
     ] {
         let error = IfName::new(invalid).expect_err("invalid name must be rejected");
+        assert!(matches!(
+            error,
+            ConfigError::InvalidInterfaceName { field: None, .. }
+        ));
+        assert!(error.to_string().starts_with("config: interface name "));
         for field in ["client_iface", "exit_iface", "uplink_iface"] {
-            assert!(error.to_string().contains(field));
+            assert!(!error.to_string().contains(field));
         }
         assert!(invalid.parse::<IfName>().is_err(), "accepted {invalid:?}");
     }
@@ -99,13 +116,70 @@ fn ifname_validation_table() {
         "eth0.100",
         "a_b",
         "A0",
-        "-",
         "_",
     ] {
         let name = IfName::new(valid).expect("valid name must be accepted");
         assert_eq!(name.as_str(), valid);
         assert_eq!(name.to_string(), valid);
         assert_eq!(valid.parse::<IfName>().unwrap(), name);
+    }
+}
+
+#[test]
+fn from_strs_names_the_bad_field() {
+    let cfg = V1Config::default();
+    let fields = ["client_iface", "exit_iface", "uplink_iface"];
+    for (index, field) in fields.iter().enumerate() {
+        for invalid in ["-", "-wg0", "--help"] {
+            let mut names = ["wg0", "proton0", "eth0"];
+            names[index] = invalid;
+            let error =
+                V1Config::from_strs(names[0], names[1], names[2], cfg.exit_addr, cfg.client_addr)
+                    .expect_err("invalid interface must identify its field");
+            assert!(matches!(
+                error,
+                ConfigError::InvalidInterfaceName { field: Some(actual), .. } if actual == *field
+            ));
+            assert!(error.to_string().starts_with(&format!("config: {field} ")));
+            for other in fields.iter().filter(|other| *other != field) {
+                assert!(!error.to_string().contains(other));
+            }
+        }
+    }
+}
+
+#[test]
+fn from_strs_validates_configuration() {
+    let cfg = V1Config::default();
+    assert_eq!(
+        V1Config::from_strs("wg0", "proton0", "eth0", cfg.exit_addr, cfg.client_addr),
+        Ok(cfg.clone())
+    );
+    for invalid in [
+        V1Config {
+            exit_iface: cfg.uplink_iface.clone(),
+            ..cfg.clone()
+        },
+        V1Config {
+            exit_addr: Ipv4Addr::LOCALHOST,
+            ..cfg.clone()
+        },
+        V1Config {
+            client_addr: cfg.exit_addr,
+            ..cfg
+        },
+    ] {
+        let error = invalid.validate().expect_err("invalid configuration");
+        assert_eq!(
+            V1Config::from_strs(
+                invalid.client_iface.as_str(),
+                invalid.exit_iface.as_str(),
+                invalid.uplink_iface.as_str(),
+                invalid.exit_addr,
+                invalid.client_addr,
+            ),
+            Err(error)
+        );
     }
 }
 
@@ -155,6 +229,8 @@ fn address_validation() {
             Ipv4Addr::BROADCAST,
             Ipv4Addr::new(224, 0, 0, 0),
             Ipv4Addr::new(239, 255, 255, 255),
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::new(127, 255, 255, 254),
         ] {
             let mut cfg = V1Config::default();
             if field == "exit_addr" {
@@ -187,7 +263,10 @@ fn valid_address() -> impl Strategy<Value = Ipv4Addr> {
     any::<[u8; 4]>()
         .prop_map(Ipv4Addr::from)
         .prop_filter("individual endpoint", |address| {
-            !address.is_unspecified() && !address.is_broadcast() && !address.is_multicast()
+            !address.is_unspecified()
+                && !address.is_broadcast()
+                && !address.is_multicast()
+                && !address.is_loopback()
         })
 }
 
@@ -229,6 +308,7 @@ fn invalid_ifname() -> impl Strategy<Value = String> {
         )
             .prop_map(|(prefix, character, suffix)| format!("{prefix}{character}{suffix}")),
         "[A-Za-z0-9._-]{16,128}",
+        "-[A-Za-z0-9._-]{0,14}",
     ]
 }
 

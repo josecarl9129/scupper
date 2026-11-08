@@ -8,8 +8,10 @@ use thiserror::Error;
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ConfigError {
     /// Rejects unsafe syntax before a name can enter any interface field.
-    #[error("config: client_iface/exit_iface/uplink_iface: {reason}")]
+    #[error("config: {} {reason}", field.unwrap_or("interface name"))]
     InvalidInterfaceName {
+        /// The interface field, or `None` for a name with no assigned role.
+        field: Option<&'static str>,
         /// Why the name cannot safely identify a Linux interface in nftables.
         reason: &'static str,
     },
@@ -41,16 +43,22 @@ pub enum ConfigError {
 pub struct IfName(String);
 
 impl IfName {
-    /// Validates a 1–15 byte ASCII name without quote or statement injection.
+    /// Validates a 1–15 byte ASCII name safe for quotes and command arguments.
     ///
     /// # Errors
     ///
     /// Returns [`ConfigError::InvalidInterfaceName`] for invalid length,
-    /// characters, or the reserved names `.` and `..`. Since the name has no
-    /// assigned role yet, the error identifies all three interface fields.
+    /// characters, a leading dash, or the reserved names `.` and `..`.
+    /// Since the name has no assigned role yet, the error has `field: None`.
     pub fn new(name: &str) -> Result<Self, ConfigError> {
+        Self::with_field(name, None)
+    }
+
+    fn with_field(name: &str, field: Option<&'static str>) -> Result<Self, ConfigError> {
         let reason = if name.is_empty() || name.len() > 15 {
             Some("must contain 1 to 15 bytes")
+        } else if name.starts_with('-') {
+            Some("must not start with '-'")
         } else if name == "." || name == ".." {
             Some("must not be . or ..")
         } else if !name
@@ -63,7 +71,7 @@ impl IfName {
         };
 
         if let Some(reason) = reason {
-            return Err(ConfigError::InvalidInterfaceName { reason });
+            return Err(ConfigError::InvalidInterfaceName { field, reason });
         }
         Ok(Self(name.to_owned()))
     }
@@ -123,6 +131,30 @@ impl Default for V1Config {
 }
 
 impl V1Config {
+    /// Parses interface names with their field identities and validates all inputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns a field-naming [`ConfigError`] for invalid interface names or
+    /// any configuration rejected by [`Self::validate`].
+    pub fn from_strs(
+        client_iface: &str,
+        exit_iface: &str,
+        uplink_iface: &str,
+        exit_addr: Ipv4Addr,
+        client_addr: Ipv4Addr,
+    ) -> Result<Self, ConfigError> {
+        let config = Self {
+            client_iface: IfName::with_field(client_iface, Some("client_iface"))?,
+            exit_iface: IfName::with_field(exit_iface, Some("exit_iface"))?,
+            uplink_iface: IfName::with_field(uplink_iface, Some("uplink_iface"))?,
+            exit_addr,
+            client_addr,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
     /// Checks that endpoint and interface identities preserve separate roles.
     ///
     /// In particular, an exit equal to the uplink would turn the forwarding
@@ -131,7 +163,7 @@ impl V1Config {
     /// # Errors
     ///
     /// Returns a field-naming [`ConfigError`] for overlapping interface roles,
-    /// unspecified, broadcast or multicast addresses, or equal endpoints.
+    /// unspecified, broadcast, multicast or loopback addresses, or equal endpoints.
     pub fn validate(&self) -> Result<(), ConfigError> {
         for (field, name, other, other_name) in [
             (
@@ -168,6 +200,8 @@ impl V1Config {
                 Some("must not be broadcast")
             } else if address.is_multicast() {
                 Some("must not be multicast")
+            } else if address.is_loopback() {
+                Some("must not be loopback")
             } else {
                 None
             };
