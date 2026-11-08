@@ -2,7 +2,7 @@
 
 use std::{error::Error, io, net::IpAddr};
 
-use scupper::probe::{
+use scupper_sys::probe::{
     IoOperation, MAX_RESPONSE_BYTES, Target, default_targets, is_setup_error, parse_ip_response,
 };
 
@@ -176,7 +176,7 @@ mod injected {
         time::{Duration, Instant},
     };
 
-    use scupper::{
+    use scupper_sys::{
         probe::{BoundHttpsProbe, Connector, Target, default_targets},
         rules::{IfName, V1Config},
         verdict::{Probe, ProbeError},
@@ -258,7 +258,7 @@ mod injected {
         let probe = BoundHttpsProbe::new(default_targets()).with_connector(connector.clone());
         // Exercise the production entry on Linux and the same loop elsewhere.
         #[cfg(target_os = "linux")]
-        let result = scupper::check::ExitProbe::probe(&probe, &cfg);
+        let result = scupper_sys::check::ExitProbe::probe(&probe, &cfg);
         #[cfg(not(target_os = "linux"))]
         let result = probe.probe_with_budget(&cfg, BUDGET);
         assert_eq!(result?, "192.0.2.10".parse::<IpAddr>()?);
@@ -571,10 +571,12 @@ mod injected {
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn unsupported_platform_is_setup() {
-    use scupper::{check::ExitProbe, probe::BoundHttpsProbe, rules::V1Config, verdict::ProbeError};
+    use scupper_sys::{
+        check::ExitProbe, probe::BoundHttpsProbe, rules::V1Config, verdict::ProbeError,
+    };
     let cfg = V1Config::default();
     assert_eq!(
-        BoundHttpsProbe::new(scupper::probe::default_targets()).probe(&cfg),
+        BoundHttpsProbe::new(scupper_sys::probe::default_targets()).probe(&cfg),
         Err(ProbeError::setup("exit probe needs Linux"))
     );
 }

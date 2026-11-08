@@ -342,7 +342,10 @@ fn status_always_exits_zero() {
 fn rules_prints_golden() {
     let (code, out, err) = Harness::default().run(&["rules"]);
     assert_eq!(code, 0);
-    assert_eq!(out, include_str!("golden/ruleset.golden"));
+    assert_eq!(
+        out,
+        include_str!("../../scupper-core/tests/golden/ruleset.golden")
+    );
     assert_eq!(err, "");
 }
 

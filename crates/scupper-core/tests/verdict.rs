@@ -7,7 +7,7 @@ use std::{
 };
 
 use proptest::prelude::*;
-use scupper::{
+use scupper_core::{
     parse::{Handshake, ParseError, RouteLookup, RouteType},
     rules::{IfName, V1Config},
     verdict::{

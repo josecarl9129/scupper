@@ -86,7 +86,9 @@ pub fn observe_handshake(sys: &dyn System, cfg: &V1Config) -> Probe<Handshake> {
 // Query just the verdict engine's handshake stage. These synthetic topology
 // inputs let that stage run; they are never reported as containment observations.
 // Leave the route unobserved: requesting it means freshness passed.
-pub(crate) fn handshake_is_fresh(handshake: Handshake, cfg: &HealthConfig, now: u64) -> bool {
+/// Uses the verdict engine to check handshake freshness at the supplied time.
+#[must_use]
+pub fn handshake_is_fresh(handshake: Handshake, cfg: &HealthConfig, now: u64) -> bool {
     let observations = M1Observations {
         topology: Some(Ok(M1Topology {
             exit_link: ExitLink::Up,

@@ -392,7 +392,9 @@ fn done(verdict: Verdict, warnings: Vec<Warning>) -> Next {
     Next::Done(Ok(Report { verdict, warnings }))
 }
 
-pub(crate) fn topology_violations(topology: &M1Topology) -> Option<Violations> {
+/// Collects all known containment violations in a topology observation.
+#[must_use]
+pub fn topology_violations(topology: &M1Topology) -> Option<Violations> {
     let mut violations = match topology.ruleset {
         RulesetObs::Exact => Vec::new(),
         RulesetObs::Missing => vec![Violation::RulesetMissing],
@@ -608,7 +610,11 @@ fn display_route(route: &RouteLookup, f: &mut fmt::Formatter<'_>) -> fmt::Result
     }
 }
 
-pub(crate) fn display_violation(violation: &Violation, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+/// Formats one containment violation for a human-readable diagnostic.
+///
+/// # Errors
+/// Returns an error if writing to the formatter fails.
+pub fn display_violation(violation: &Violation, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match violation {
         Violation::RulesetMissing => f.write_str("ruleset missing"),
         Violation::RulesetDiffers { .. } => f.write_str("ruleset differs from policy"),

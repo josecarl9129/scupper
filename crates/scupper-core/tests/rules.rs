@@ -3,7 +3,7 @@
 use std::net::Ipv4Addr;
 
 use proptest::prelude::*;
-use scupper::rules::{ConfigError, IfName, V1Config, ruleset};
+use scupper_core::rules::{ConfigError, IfName, V1Config, ruleset};
 
 const GOLDEN: &str = include_str!("golden/ruleset.golden");
 

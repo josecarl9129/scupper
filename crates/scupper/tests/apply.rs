@@ -314,7 +314,9 @@ fn apply_load_failure_reported() {
     assert!(err.contains("live ruleset was not changed by this run"));
     assert_eq!(
         h.disk().as_deref(),
-        Some(include_str!("golden/ruleset.golden"))
+        Some(include_str!(
+            "../../scupper-core/tests/golden/ruleset.golden"
+        ))
     );
     h.assert_no_temp();
 }
@@ -470,7 +472,9 @@ fn apply_signal_and_timeout_failures_preserve_the_correct_disk_version() {
                 assert_eq!(renames, 1);
                 assert_eq!(
                     h.disk().as_deref(),
-                    Some(include_str!("golden/ruleset.golden"))
+                    Some(include_str!(
+                        "../../scupper-core/tests/golden/ruleset.golden"
+                    ))
                 );
                 assert!(err.contains("new, validated version"));
                 assert!(err.contains("live ruleset was not changed by this run"));
@@ -640,7 +644,7 @@ fn real_fs_apply_permissions_and_durability() -> io::Result<()> {
     let destination = disk.directory.join("nftables.conf");
     assert_eq!(
         std::fs::read_to_string(&destination)?,
-        include_str!("golden/ruleset.golden")
+        include_str!("../../scupper-core/tests/golden/ruleset.golden")
     );
     assert_eq!(mode(&destination)?, 0o644);
     assert_eq!(

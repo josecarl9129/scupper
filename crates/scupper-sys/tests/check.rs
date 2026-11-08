@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use scupper::{
+use scupper_sys::{
     check::{
         ExitProbe, KillSwitchStatus, TopologySource, observe_handshake, observe_route, run_check,
         run_status,

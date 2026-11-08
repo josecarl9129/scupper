@@ -1,0 +1,30 @@
+[package]
+name = "scupper-sys"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+testing = []
+
+[[test]]
+name = "check"
+required-features = ["testing"]
+
+[dependencies]
+scupper-core.workspace = true
+rustix.workspace = true
+thiserror.workspace = true
+socket2.workspace = true
+rustls.workspace = true
+webpki-roots.workspace = true
+dns-lookup.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+sha2.workspace = true
+
+[lints]
+workspace = true

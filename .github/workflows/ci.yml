@@ -51,13 +51,13 @@ jobs:
         run: timeout 600 cargo fmt --all -- --check
 
       - name: Clippy
-        run: timeout 600 cargo clippy --all-targets --all-features --locked -- -D warnings
+        run: timeout 600 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Test
-        run: timeout 900 cargo test --all-features --locked
+        run: timeout 900 cargo test --workspace --all-features --locked
 
       - name: Doc
-        run: timeout 600 cargo doc --no-deps --locked
+        run: timeout 600 cargo doc --workspace --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
 
@@ -65,7 +65,7 @@ jobs:
         run: timeout 600 cargo deny check
 
       - name: Default-feature build
-        run: timeout 600 cargo build --locked
+        run: timeout 600 cargo build --workspace --locked
 
   musl:
     runs-on: ubuntu-24.04

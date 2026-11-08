@@ -538,7 +538,7 @@ mod tests {
             .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
         let file = PidFile(
             Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("target")
+                .join("../../target")
                 .join(format!(
                     "exec-grandchild-{}-{}.pid",
                     std::process::id(),

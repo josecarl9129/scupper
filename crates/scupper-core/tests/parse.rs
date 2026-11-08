@@ -4,7 +4,7 @@
 use std::{error::Error, net::Ipv4Addr, time::Duration};
 
 use proptest::prelude::*;
-use scupper::{
+use scupper_core::{
     parse::{
         Handshake, HandshakeAge, ParseError, PeerHandshake, PeerKey, ROUTE_PROBE_DST, RouteLookup,
         RouteType, parse_latest_handshakes, parse_route_get, route_probe_argv,
@@ -167,7 +167,7 @@ fn handshake_age_cases() {
 fn route_get_ported() -> Result<(), Box<dyn Error>> {
     for (out, name) in [
         (
-            include_str!("fixtures/ubuntu-24.04/ip-policy-route.txt"),
+            include_str!("../../scupper-sys/tests/fixtures/ubuntu-24.04/ip-policy-route.txt"),
             "proton0",
         ),
         (
@@ -578,16 +578,16 @@ proptest! {
 
 #[test]
 fn tc_json_baseline_and_hooks() -> Result<(), Box<dyn Error>> {
-    use scupper::parse::{filter_has_hooks, qdisc_has_hooks};
+    use scupper_core::parse::{filter_has_hooks, qdisc_has_hooks};
     for out in [
-        include_str!("fixtures/ubuntu-24.04/tc-qdisc-wg0.json"),
-        include_str!("fixtures/ubuntu-24.04/tc-qdisc-proton0.json"),
-        include_str!("fixtures/ubuntu-24.04/case-04-tc-qdisc-proton0.json"),
+        include_str!("../../scupper-sys/tests/fixtures/ubuntu-24.04/tc-qdisc-wg0.json"),
+        include_str!("../../scupper-sys/tests/fixtures/ubuntu-24.04/tc-qdisc-proton0.json"),
+        include_str!("../../scupper-sys/tests/fixtures/ubuntu-24.04/case-04-tc-qdisc-proton0.json"),
     ] {
         assert!(!qdisc_has_hooks(out)?, "{out}");
     }
     assert!(qdisc_has_hooks(include_str!(
-        "fixtures/ubuntu-24.04/case-10-tc-qdisc-wg0.json"
+        "../../scupper-sys/tests/fixtures/ubuntu-24.04/case-10-tc-qdisc-wg0.json"
     ))?);
     assert!(!qdisc_has_hooks(r#"[{"kind":"noop","root":true}]"#)?);
     for out in [
@@ -615,13 +615,13 @@ fn tc_json_baseline_and_hooks() -> Result<(), Box<dyn Error>> {
         assert!(qdisc_has_hooks(out).is_err(), "{out}");
     }
     for out in [
-        include_str!("fixtures/ubuntu-24.04/tc-filter-wg0.json"),
-        include_str!("fixtures/ubuntu-24.04/tc-filter-proton0.json"),
+        include_str!("../../scupper-sys/tests/fixtures/ubuntu-24.04/tc-filter-wg0.json"),
+        include_str!("../../scupper-sys/tests/fixtures/ubuntu-24.04/tc-filter-proton0.json"),
     ] {
         assert!(!filter_has_hooks(out)?, "{out}");
     }
     assert!(filter_has_hooks(include_str!(
-        "fixtures/ubuntu-24.04/case-10-tc-filter-wg0-ingress.json"
+        "../../scupper-sys/tests/fixtures/ubuntu-24.04/case-10-tc-filter-wg0-ingress.json"
     ))?);
     for out in ["", "{}", "[null]"] {
         assert!(filter_has_hooks(out).is_err());
@@ -631,22 +631,26 @@ fn tc_json_baseline_and_hooks() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn topology_ip_json() -> Result<(), Box<dyn Error>> {
-    use scupper::parse::{default_routes_use, link_names, local_addresses};
+    use scupper_core::parse::{default_routes_use, link_names, local_addresses};
     assert_eq!(
-        link_names(include_str!("fixtures/ubuntu-24.04/ip-link.json"))?,
+        link_names(include_str!(
+            "../../scupper-sys/tests/fixtures/ubuntu-24.04/ip-link.json"
+        ))?,
         ["lo", "eth0", "wg0", "proton0"]
     );
     assert!(link_names("[{}]").is_err());
     let uplink = IfName::new("eth0")?;
     assert!(default_routes_use(
-        include_str!("fixtures/ubuntu-24.04/ip-default.json"),
+        include_str!("../../scupper-sys/tests/fixtures/ubuntu-24.04/ip-default.json"),
         &uplink
     )?);
     for out in ["[]", "[{}]", r#"[{"dev":"eth0"},{"dev":"eth1"}]"#] {
         assert!(!default_routes_use(out, &uplink)?);
     }
     assert!(default_routes_use(r#"[{"dev":false}]"#, &uplink).is_err());
-    let addrs = local_addresses(include_str!("fixtures/ubuntu-24.04/ip-addr-eth0.json"))?;
+    let addrs = local_addresses(include_str!(
+        "../../scupper-sys/tests/fixtures/ubuntu-24.04/ip-addr-eth0.json"
+    ))?;
     assert_eq!(
         addrs,
         [
@@ -676,7 +680,7 @@ fn topology_ip_json() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn allowed_ips_ipv4_prefix_containment() -> Result<(), Box<dyn Error>> {
-    use scupper::parse::allowed_ips_contain;
+    use scupper_core::parse::allowed_ips_contain;
     let client = Ipv4Addr::new(10, 99, 0, 2);
     for (cidrs, expected) in [
         ("10.99.0.2/32", true),
@@ -725,7 +729,7 @@ fn allowed_ips_ipv4_prefix_containment() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn link_flags_and_xdp_presence() -> Result<(), Box<dyn Error>> {
-    use scupper::parse::links;
+    use scupper_core::parse::links;
     let parsed = links(
         r#"[{"ifname":"wg0","flags":["POINTOPOINT","UP"],"xdp":null},{"ifname":"proton0","flags":["POINTOPOINT"]},{"ifname":"eth0"}]"#,
     )?;
@@ -747,7 +751,8 @@ fn link_flags_and_xdp_presence() -> Result<(), Box<dyn Error>> {
 fn captured_wireguard_peer_and_allowed_ips() -> Result<(), Box<dyn Error>> {
     let peer_key = key('A');
     let handshakes =
-        include_str!("fixtures/ubuntu-24.04/wg-handshakes.txt").replace("PUBKEY3", &peer_key);
+        include_str!("../../scupper-sys/tests/fixtures/ubuntu-24.04/wg-handshakes.txt")
+            .replace("PUBKEY3", &peer_key);
     let expected = Handshake::At {
         unix_secs: 1_794_160_057,
     };
@@ -760,8 +765,9 @@ fn captured_wireguard_peer_and_allowed_ips() -> Result<(), Box<dyn Error>> {
     );
     assert_eq!(single_peer_handshake(&handshakes)?, expected);
     let allowed_ips =
-        include_str!("fixtures/ubuntu-24.04/wg-allowed-ips.txt").replace("PUBKEY4", &peer_key);
-    assert!(scupper::parse::allowed_ips_contain(
+        include_str!("../../scupper-sys/tests/fixtures/ubuntu-24.04/wg-allowed-ips.txt")
+            .replace("PUBKEY4", &peer_key);
+    assert!(scupper_core::parse::allowed_ips_contain(
         &allowed_ips,
         Ipv4Addr::new(10, 99, 0, 2)
     )?);
@@ -770,20 +776,25 @@ fn captured_wireguard_peer_and_allowed_ips() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn captured_exit_link_and_address_states() -> Result<(), Box<dyn Error>> {
-    use scupper::parse::{links, local_addresses};
+    use scupper_core::parse::{links, local_addresses};
 
     for (out, expected_up) in [
-        (include_str!("fixtures/ubuntu-24.04/ip-link.json"), true),
         (
-            include_str!("fixtures/ubuntu-24.04/case-04-ip-link.json"),
-            false,
-        ),
-        (
-            include_str!("fixtures/ubuntu-24.04/ip-addr-proton0.json"),
+            include_str!("../../scupper-sys/tests/fixtures/ubuntu-24.04/ip-link.json"),
             true,
         ),
         (
-            include_str!("fixtures/ubuntu-24.04/case-04-ip-addr-proton0.json"),
+            include_str!("../../scupper-sys/tests/fixtures/ubuntu-24.04/case-04-ip-link.json"),
+            false,
+        ),
+        (
+            include_str!("../../scupper-sys/tests/fixtures/ubuntu-24.04/ip-addr-proton0.json"),
+            true,
+        ),
+        (
+            include_str!(
+                "../../scupper-sys/tests/fixtures/ubuntu-24.04/case-04-ip-addr-proton0.json"
+            ),
             false,
         ),
     ] {
@@ -796,8 +807,8 @@ fn captured_exit_link_and_address_states() -> Result<(), Box<dyn Error>> {
         assert!(!exit.xdp);
     }
     for out in [
-        include_str!("fixtures/ubuntu-24.04/ip-addr-proton0.json"),
-        include_str!("fixtures/ubuntu-24.04/case-04-ip-addr-proton0.json"),
+        include_str!("../../scupper-sys/tests/fixtures/ubuntu-24.04/ip-addr-proton0.json"),
+        include_str!("../../scupper-sys/tests/fixtures/ubuntu-24.04/case-04-ip-addr-proton0.json"),
     ] {
         assert_eq!(
             local_addresses(out)?,

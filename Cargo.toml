@@ -1,19 +1,17 @@
-[package]
-name = "scupper"
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT OR Apache-2.0"
 publish = false
 
-[features]
-testing = []
-
-[[test]]
-name = "check"
-required-features = ["testing"]
-
-[dependencies]
+[workspace.dependencies]
+scupper-core = { version = "0.1.0", path = "crates/scupper-core" }
+scupper-sys = { version = "0.1.0", path = "crates/scupper-sys" }
 clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
 rustix = { version = "1", default-features = false, features = ["process"] }
 thiserror = "2"
@@ -23,15 +21,13 @@ webpki-roots = "1"
 dns-lookup = { version = "4", default-features = false }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 sha2 = { version = "0.10", default-features = false }
-
-[dev-dependencies]
 proptest = { version = "1", default-features = false, features = ["std"] }
 
-[lints.rust]
+[workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
 
-[lints.clippy]
+[workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 unwrap_used = "deny"
 expect_used = "deny"
