@@ -43,6 +43,7 @@ ping_pid=''
 tcp_pid=''
 dump_pid=''
 mismatches=0
+last_count=0
 results="$captures/results.tsv"
 printf 'name\twanted\tgot\tfirst_line\n' > "$results"
 
@@ -174,7 +175,7 @@ begin_case() {
         sleep 0.1
     done
     setsid timeout --kill-after=2 240 ip netns exec client \
-        ping -n -i 0.2 1.1.1.1 > "$captures/$name-ping.txt" 2>&1 &
+        stdbuf -oL ping -n -i 0.2 1.1.1.1 > "$captures/$name-ping.txt" 2>&1 &
     ping_pid=$!
     # A rate-limited response keeps an established NAT/TCP flow across the fault.
     # Reconnect if the server closes it; no request depends on a host proxy.
@@ -220,6 +221,7 @@ finish_case() {
     count=$(tcpdump -nn -r "$captures/$name.pcap" \
         2> "$captures/$name-pcap-read.stderr" | wc -l)
     count=${count//[[:space:]]/}
+    last_count=$count
     if [[ $wanted == 2 && $check_code == 2 ]]; then
         record "$name-uplink-packets" info "$count" 'un-NATed uplink packets; check reported 2'
     else
@@ -445,6 +447,19 @@ gw nft 'add rule inet scupper forward iifname "wg0" oifname "eth0" accept'
 capture case-06-nft.json gw nft -j list ruleset
 expect 2 extra-accept
 heal extra-accept
+
+# Positive control for the leak detector: with rule 1000 gone and an eth0 accept, client
+# traffic really leaves un-NATed via eth0, so the capture must see it.
+begin_case leak-control
+gw ip rule del priority 1000
+gw nft 'add rule inet scupper forward iifname "wg0" oifname "eth0" accept'
+expect 2 leak-control
+if (( last_count > 0 )); then
+    record leak-control-detector-sees-leak 1 1 "$last_count un-NATed packets captured"
+else
+    record leak-control-detector-sees-leak 1 0 'detector saw nothing during a real leak'
+fi
+heal leak-control
 
 begin_case unconstrained-ct
 gw nft 'add rule inet scupper forward ct state established,related accept'
