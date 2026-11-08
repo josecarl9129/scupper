@@ -1,14 +1,3 @@
-# scupper is built only for Linux (gateway) and macOS (client); dependencies of other
-# platforms (e.g. windows-sys) are out of scope for the policy checks.
-[graph]
-targets = [
-    "x86_64-unknown-linux-gnu",
-    "x86_64-unknown-linux-musl",
-    "aarch64-unknown-linux-gnu",
-    "aarch64-unknown-linux-musl",
-    "aarch64-apple-darwin",
-]
-
 [advisories]
 db-path = "target/advisory-db"
 db-urls = ["https://github.com/RustSec/advisory-db"]
@@ -24,6 +13,8 @@ allow = [
 [bans]
 multiple-versions = "deny"
 wildcards = "deny"
+# ring pulls windows-sys 0.52; dns-lookup, socket2 and rustix pull 0.61.
+skip = [{ crate = "windows-sys@0.52.0", reason = "ring pins 0.52; Windows-only" }]
 
 [sources]
 unknown-registry = "deny"

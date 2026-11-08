@@ -146,12 +146,13 @@ fn error_classification_table() {
         (Path, TimedOut, Some(110), false),             // ETIMEDOUT
         (Path, Other, Some(113), false),                // EHOSTUNREACH
         (Path, Other, Some(101), false),                // ENETUNREACH
-        (Path, io::ErrorKind::InvalidData, None, false), // TLS error
-        (Path, io::ErrorKind::InvalidData, None, false), // HTTP error
+        (Path, io::ErrorKind::InvalidData, None, false), // TLS/HTTP error
         (BindDevice, Other, Some(101), false),
         (Socket, Other, None, true),
         (Socket, PermissionDenied, Some(13), true),
-        (Resolve, NotFound, Some(2), true), // no resolver configuration
+        (Resolve, NotFound, Some(2), false), // ambiguous resolver failure
+        (Resolve, NotFound, None, false),
+        (Resolve, Other, Some(2), false),
         (Resolve, Other, None, false),
         (Resolve, TimedOut, None, false),
         (Path, PermissionDenied, Some(13), false),
@@ -164,7 +165,7 @@ fn error_classification_table() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(feature = "testing")]
 mod injected {
     use std::{
         collections::VecDeque,
@@ -176,12 +177,12 @@ mod injected {
     };
 
     use scupper::{
-        check::ExitProbe,
-        probe::{BoundHttpsProbe, Connector, PROBE_TIMEOUT, Target, default_targets},
+        probe::{BoundHttpsProbe, Connector, Target, default_targets},
         rules::{IfName, V1Config},
         verdict::{Probe, ProbeError},
     };
 
+    const BUDGET: Duration = Duration::from_millis(200);
     const FIRST: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
     const SECOND: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 2);
 
@@ -234,13 +235,168 @@ mod injected {
 
     fn probe(connector: Arc<FakeConnector>) -> Probe<IpAddr> {
         let cfg = V1Config::default();
-        BoundHttpsProbe::from(&cfg)
+        BoundHttpsProbe::new(default_targets())
             .with_connector(connector)
-            .probe(&cfg)
+            .probe_with_budget(&cfg, BUDGET)
     }
 
     fn answer() -> Vec<u8> {
         b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n192.0.2.10".to_vec()
+    }
+
+    #[test]
+    fn interface_comes_from_probe_config() -> Result<(), Box<dyn Error>> {
+        let connector = Arc::new(FakeConnector {
+            resolutions: Mutex::new(VecDeque::from([Ok(vec![FIRST])])),
+            exchanges: Mutex::new(VecDeque::from([Ok(answer())])),
+            ..FakeConnector::default()
+        });
+        let cfg = V1Config {
+            exit_iface: IfName::new("proton1")?,
+            ..V1Config::default()
+        };
+        let probe = BoundHttpsProbe::new(default_targets()).with_connector(connector.clone());
+        // Exercise the production entry on Linux and the same loop elsewhere.
+        #[cfg(target_os = "linux")]
+        let result = scupper::check::ExitProbe::probe(&probe, &cfg);
+        #[cfg(not(target_os = "linux"))]
+        let result = probe.probe_with_budget(&cfg, BUDGET);
+        assert_eq!(result?, "192.0.2.10".parse::<IpAddr>()?);
+        assert_eq!(
+            *connector.calls.lock().map_err(|_| "poisoned calls")?,
+            [
+                "resolve ifconfig.me",
+                "exchange proton1 ifconfig.me 192.0.2.1"
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolution_setup_stops_before_the_next_target() -> Result<(), Box<dyn Error>> {
+        let connector = Arc::new(FakeConnector {
+            resolutions: Mutex::new(VecDeque::from([
+                Err(ProbeError::setup("local resolver worker failed")),
+                Err(ProbeError::io("second target path failed")),
+            ])),
+            ..FakeConnector::default()
+        });
+        let error = probe(connector.clone())
+            .err()
+            .ok_or("expected setup failure")?;
+        assert!(matches!(error, ProbeError::Setup(_)));
+        assert!(error.to_string().contains("local resolver worker failed"));
+        assert!(error.to_string().contains("ifconfig.me"));
+        assert_eq!(
+            *connector.calls.lock().map_err(|_| "poisoned calls")?,
+            ["resolve ifconfig.me"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exchange_setup_stops_before_the_next_address_or_target() -> Result<(), Box<dyn Error>> {
+        let connector = Arc::new(FakeConnector {
+            resolutions: Mutex::new(VecDeque::from([Ok(vec![FIRST, SECOND]), Ok(vec![FIRST])])),
+            exchanges: Mutex::new(VecDeque::from([
+                Err(ProbeError::setup("device binding failed")),
+                Err(ProbeError::io("second address path failed")),
+            ])),
+            ..FakeConnector::default()
+        });
+        let error = probe(connector.clone())
+            .err()
+            .ok_or("expected setup failure")?;
+        assert!(matches!(error, ProbeError::Setup(_)));
+        assert!(error.to_string().contains("device binding failed"));
+        assert_eq!(
+            *connector.calls.lock().map_err(|_| "poisoned calls")?,
+            [
+                "resolve ifconfig.me",
+                "exchange proton0 ifconfig.me 192.0.2.1"
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn every_address_failure_is_in_the_history() -> Result<(), Box<dyn Error>> {
+        let connector = Arc::new(FakeConnector {
+            resolutions: Mutex::new(VecDeque::from([Ok(vec![FIRST, SECOND])])),
+            exchanges: Mutex::new(VecDeque::from([
+                Err(ProbeError::io("first address TLS failed")),
+                Err(ProbeError::io("second address HTTP failed")),
+            ])),
+            ..FakeConnector::default()
+        });
+        let cfg = V1Config::default();
+        let error = BoundHttpsProbe::new(vec![Target::new("example.com", "/")?])
+            .with_connector(connector.clone())
+            .probe_with_budget(&cfg, BUDGET)
+            .err()
+            .ok_or("expected path failure")?;
+        assert!(matches!(error, ProbeError::Io(_)));
+        let text = error.to_string();
+        assert!(text.contains("first address TLS failed"));
+        assert!(text.contains("second address HTTP failed"));
+        assert!(text.find("first address") < text.find("second address"));
+        assert_eq!(
+            connector.calls.lock().map_err(|_| "poisoned calls")?.len(),
+            3
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ipv6_answer_is_a_path_failure_and_falls_back() -> Result<(), Box<dyn Error>> {
+        let ipv6 = b"HTTP/1.1 200 OK\r\n\r\n2001:db8::10".to_vec();
+        for same_target in [true, false] {
+            let resolutions = if same_target {
+                VecDeque::from([Ok(vec![FIRST, SECOND])])
+            } else {
+                VecDeque::from([Ok(vec![FIRST]), Ok(vec![SECOND])])
+            };
+            let connector = Arc::new(FakeConnector {
+                resolutions: Mutex::new(resolutions),
+                exchanges: Mutex::new(VecDeque::from([Ok(ipv6.clone()), Ok(answer())])),
+                ..FakeConnector::default()
+            });
+            assert_eq!(probe(connector.clone())?, "192.0.2.10".parse::<IpAddr>()?);
+            assert_eq!(
+                connector.calls.lock().map_err(|_| "poisoned calls")?.len(),
+                if same_target { 3 } else { 4 }
+            );
+        }
+        let connector = Arc::new(FakeConnector {
+            resolutions: Mutex::new(VecDeque::from([Ok(vec![FIRST]), Ok(vec![])])),
+            exchanges: Mutex::new(VecDeque::from([Ok(ipv6)])),
+            ..FakeConnector::default()
+        });
+        let error = probe(connector).err().ok_or("expected path failure")?;
+        assert!(matches!(error, ProbeError::Io(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("probe answered with IPv6 over an IPv4 connection")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mapped_ipv6_answer_counts_as_ipv4() -> Result<(), Box<dyn Error>> {
+        let connector = Arc::new(FakeConnector {
+            resolutions: Mutex::new(VecDeque::from([Ok(vec![FIRST, SECOND])])),
+            exchanges: Mutex::new(VecDeque::from([Ok(
+                b"HTTP/1.1 200 OK\r\n\r\n::ffff:192.0.2.10".to_vec(),
+            )])),
+            ..FakeConnector::default()
+        });
+        assert_eq!(probe(connector.clone())?, "192.0.2.10".parse::<IpAddr>()?);
+        assert_eq!(
+            connector.calls.lock().map_err(|_| "poisoned calls")?.len(),
+            2
+        );
+        Ok(())
     }
 
     #[test]
@@ -351,9 +507,9 @@ mod injected {
         });
         let cfg = V1Config::default();
         let targets = default_targets().into_iter().cycle().take(8).collect();
-        let error = BoundHttpsProbe::new(cfg.exit_iface.clone(), targets)
+        let error = BoundHttpsProbe::new(targets)
             .with_connector(connector)
-            .probe(&cfg)
+            .probe_with_budget(&cfg, BUDGET)
             .err()
             .ok_or("expected failure")?;
         if let ProbeError::Io(text) = error {
@@ -378,14 +534,16 @@ mod injected {
                 Ok(answer()),
                 Ok(answer()),
             ])),
-            exchange_delay: PROBE_TIMEOUT + Duration::from_secs(2),
+            exchange_delay: BUDGET + Duration::from_millis(100),
             ..FakeConnector::default()
         });
         let start = Instant::now();
         let error = probe(connector.clone()).err().ok_or("expected timeout")?;
-        assert!(start.elapsed() < PROBE_TIMEOUT + Duration::from_secs(1));
+        assert!(start.elapsed() < BUDGET + Duration::from_secs(1));
+        assert!(start.elapsed() >= BUDGET);
         assert!(!matches!(error, ProbeError::Setup(_)));
         assert!(error.to_string().contains("timed out"));
+        assert!(error.to_string().ends_with(" (deadline reached)"));
         assert_eq!(
             connector.calls.lock().map_err(|_| "poisoned calls")?.len(),
             2
@@ -397,12 +555,13 @@ mod injected {
     fn dns_counts_against_budget() -> Result<(), Box<dyn Error>> {
         let connector = Arc::new(FakeConnector {
             resolutions: Mutex::new(VecDeque::from([Ok(vec![FIRST])])),
-            resolve_delay: PROBE_TIMEOUT + Duration::from_secs(2),
+            resolve_delay: BUDGET + Duration::from_millis(100),
             ..FakeConnector::default()
         });
         let start = Instant::now();
         let error = probe(connector).err().ok_or("expected timeout")?;
-        assert!(start.elapsed() < PROBE_TIMEOUT + Duration::from_secs(1));
+        assert!(start.elapsed() < BUDGET + Duration::from_secs(1));
+        assert!(start.elapsed() >= BUDGET);
         assert!(!matches!(error, ProbeError::Setup(_)));
         assert!(error.to_string().contains("timed out"));
         Ok(())
@@ -415,7 +574,7 @@ fn unsupported_platform_is_setup() {
     use scupper::{check::ExitProbe, probe::BoundHttpsProbe, rules::V1Config, verdict::ProbeError};
     let cfg = V1Config::default();
     assert_eq!(
-        BoundHttpsProbe::from(&cfg).probe(&cfg),
+        BoundHttpsProbe::new(scupper::probe::default_targets()).probe(&cfg),
         Err(ProbeError::setup("exit probe needs Linux"))
     );
 }

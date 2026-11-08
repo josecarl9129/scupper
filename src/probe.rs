@@ -96,11 +96,12 @@ pub fn default_targets() -> Vec<Target> {
 ///
 /// Calls run on helper threads. A stalled resolver or connector cannot extend the
 /// caller's deadline; a stuck system resolver may outlive this observation.
+#[doc(hidden)]
 pub trait Connector: Send + Sync + 'static {
     /// Resolves only IPv4 addresses, using the same overall deadline.
     ///
     /// # Errors
-    /// Returns a local resolver setup error or a path resolution failure.
+    /// Returns a path resolution failure. Local worker failures may use Setup.
     fn resolve(&self, target: &Target, deadline: Instant) -> Probe<Vec<Ipv4Addr>>;
 
     /// Fetches one HTTPS response through the exit device at one IPv4 address.
@@ -118,50 +119,53 @@ pub trait Connector: Send + Sync + 'static {
 
 /// HTTPS probe with ordered fallback and one deadline across all operations.
 pub struct BoundHttpsProbe {
-    exit_iface: IfName,
     targets: Vec<Target>,
     connector: Arc<dyn Connector>,
 }
 
-impl From<&V1Config> for BoundHttpsProbe {
-    fn from(cfg: &V1Config) -> Self {
-        Self::new(cfg.exit_iface.clone(), default_targets())
-    }
-}
-
 impl BoundHttpsProbe {
-    /// Configures the device and target order, with the fixed eight-second budget.
+    /// Configures the target order, with the fixed eight-second budget.
     #[must_use]
-    pub fn new(exit_iface: IfName, targets: Vec<Target>) -> Self {
+    pub fn new(targets: Vec<Target>) -> Self {
         Self {
-            exit_iface,
             targets,
             connector: Arc::new(SystemConnector),
         }
     }
 
     /// Replaces the network boundary, for deterministic tests without networking.
+    #[cfg(feature = "testing")]
     #[must_use]
     pub fn with_connector(mut self, connector: Arc<dyn Connector>) -> Self {
         self.connector = connector;
         self
     }
 
-    fn run(&self) -> Probe<IpAddr> {
-        let deadline = Instant::now() + PROBE_TIMEOUT;
+    /// Runs the target loop on any platform with an injected connector and budget.
+    ///
+    /// # Errors
+    /// Returns setup or path failures with the same history as the production probe.
+    #[cfg(feature = "testing")]
+    pub fn probe_with_budget(&self, cfg: &V1Config, budget: Duration) -> Probe<IpAddr> {
+        self.run(&cfg.exit_iface, budget)
+    }
+
+    fn run(&self, iface: &IfName, budget: Duration) -> Probe<IpAddr> {
+        let deadline = Instant::now() + budget;
         let mut failures = Failures::default();
         let mut last = ProbeError::io("no HTTPS probe targets");
         for target in &self.targets {
             if remaining(deadline).is_err() {
-                failures.push(target.host(), &ProbeError::Timeout);
+                failures.push(target.host(), &ProbeError::Timeout, true);
                 return Err(failures.finish(ProbeError::Timeout));
             }
-            match self.try_target(target, deadline) {
+            match self.try_target(iface, target, deadline, &mut failures) {
                 Ok(ip) => return Ok(ip),
                 Err(error) => {
-                    failures.push(target.host(), &error);
-                    if remaining(deadline).is_err() {
-                        return Err(failures.finish(ProbeError::Timeout));
+                    let expired = remaining(deadline).is_err();
+                    failures.push(target.host(), &error, expired);
+                    if matches!(error, ProbeError::Setup(_)) || expired {
+                        return Err(failures.finish(error));
                     }
                     last = error;
                 }
@@ -170,35 +174,56 @@ impl BoundHttpsProbe {
         Err(failures.finish(last))
     }
 
-    fn try_target(&self, target: &Target, deadline: Instant) -> Probe<IpAddr> {
+    fn try_target(
+        &self,
+        iface: &IfName,
+        target: &Target,
+        deadline: Instant,
+        failures: &mut Failures,
+    ) -> Probe<IpAddr> {
         let connector = Arc::clone(&self.connector);
         let owned_target = target.clone();
         let addresses =
             before_deadline(deadline, move || connector.resolve(&owned_target, deadline))?;
-        let mut last = ProbeError::io("DNS returned no IPv4 addresses");
-        for address in addresses {
+        let mut addresses = addresses.into_iter().peekable();
+        while let Some(address) = addresses.next() {
             let connector = Arc::clone(&self.connector);
             let owned_target = target.clone();
-            let iface = self.exit_iface.clone();
+            let iface = iface.clone();
             let response = before_deadline(deadline, move || {
                 connector.exchange(&iface, &owned_target, address, deadline)
             });
             match response.and_then(|bytes| {
-                parse_ip_response(&bytes).map_err(|error| ProbeError::io(&error.to_string()))
+                let ip = parse_ip_response(&bytes)
+                    .map_err(|error| ProbeError::io(&error.to_string()))?
+                    .to_canonical();
+                match ip {
+                    IpAddr::V4(_) => Ok(ip),
+                    IpAddr::V6(_) => Err(ProbeError::io(
+                        "probe answered with IPv6 over an IPv4 connection",
+                    )),
+                }
             }) {
                 Ok(ip) => return Ok(ip),
-                Err(error) => last = error,
+                Err(error) => {
+                    if matches!(error, ProbeError::Setup(_))
+                        || remaining(deadline).is_err()
+                        || addresses.peek().is_none()
+                    {
+                        return Err(error);
+                    }
+                    failures.push(target.host(), &error, false);
+                }
             }
-            remaining(deadline)?;
         }
-        Err(last)
+        Err(ProbeError::io("DNS returned no IPv4 addresses"))
     }
 }
 
 impl ExitProbe for BoundHttpsProbe {
-    fn probe(&self, _cfg: &V1Config) -> Probe<IpAddr> {
+    fn probe(&self, cfg: &V1Config) -> Probe<IpAddr> {
         if cfg!(target_os = "linux") {
-            self.run()
+            self.run(&cfg.exit_iface, PROBE_TIMEOUT)
         } else {
             Err(ProbeError::setup("exit probe needs Linux"))
         }
@@ -226,12 +251,16 @@ fn before_deadline<T: Send + 'static>(
         })
         .map_err(|error| ProbeError::setup(&format!("probe worker: {error}")))?;
     let result = rx
-        .recv_timeout(remaining(deadline)?)
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
         .map_err(|error| match error {
             mpsc::RecvTimeoutError::Timeout => ProbeError::Timeout,
             mpsc::RecvTimeoutError::Disconnected => ProbeError::io("probe worker stopped"),
         })?;
-    remaining(deadline)?;
+    // Preserve an observed failure, especially Setup, even if the deadline has
+    // just expired. A successful result still has to arrive within the budget.
+    if result.is_ok() {
+        remaining(deadline)?;
+    }
     result
 }
 
@@ -241,13 +270,14 @@ struct Failures {
 }
 
 impl Failures {
-    fn push(&mut self, host: &str, error: &ProbeError) {
+    fn push(&mut self, host: &str, error: &ProbeError, expired: bool) {
         // Reserve space for each default target, including its diagnostic. With
         // custom lists the newest failures replace the oldest, never exceeding
         // ProbeError's 200-character diagnostic bound.
         let host: String = host.chars().take(30).collect();
-        let diagnostic: String = error.to_string().chars().take(58).collect();
-        let entry = format!("{host}: {diagnostic}");
+        let diagnostic: String = error.to_string().chars().take(60).collect();
+        let suffix = if expired { " (deadline reached)" } else { "" };
+        let entry = format!("{host}: {diagnostic}{suffix}");
         if !self.text.is_empty() {
             self.text.push_str("; ");
         }
@@ -271,7 +301,7 @@ impl Failures {
             return last;
         }
         // Timeout is a unit variant, so retain its diagnostic and path class in
-        // Io when attaching target history. The final target determines class.
+        // Io when attaching history. Setup stops the loop and retains its class.
         if matches!(last, ProbeError::Setup(_)) {
             ProbeError::setup(&self.text)
         } else {
@@ -287,7 +317,7 @@ pub enum IoOperation {
     Socket,
     /// Binding the exit device; permission and missing-device errors are local.
     BindDevice,
-    /// Resolving a host; missing resolver configuration is local setup.
+    /// Resolving a host; all resolver failures are path errors, even `NotFound`.
     Resolve,
     /// Connect, TLS, HTTP and other path operations.
     Path,
@@ -296,7 +326,7 @@ pub enum IoOperation {
 /// Pure classification of operating-system failures, independent of error text.
 ///
 /// Raw bind errno values are Linux values because device binding is Linux-only.
-/// Resolver adapters report absent configuration as `NotFound` / `ENOENT`.
+/// Resolver errors cannot reliably distinguish local configuration from the path.
 #[must_use]
 pub fn is_setup_error(operation: IoOperation, kind: io::ErrorKind, raw: Option<i32>) -> bool {
     match operation {
@@ -308,11 +338,12 @@ pub fn is_setup_error(operation: IoOperation, kind: io::ErrorKind, raw: Option<i
                     io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound
                 )
         }
-        IoOperation::Resolve => kind == io::ErrorKind::NotFound || raw == Some(2),
-        IoOperation::Path => false,
+        IoOperation::Resolve | IoOperation::Path => false,
     }
 }
 
+/// Maps local socket failures to Setup, timeouts to Timeout, and other failures
+/// to Io with their diagnostic. Resolving always uses the path classification.
 #[cfg(target_os = "linux")]
 fn io_failure(operation: IoOperation, error: &io::Error) -> ProbeError {
     if is_setup_error(operation, error.kind(), error.raw_os_error()) {
@@ -372,24 +403,8 @@ mod linux {
                 socktype: SockType::Stream.into(),
                 ..AddrInfoHints::default()
             };
-            let addresses =
-                getaddrinfo(Some(target.host()), Some("443"), Some(hints)).map_err(|error| {
-                    // getaddrinfo may report EAI_AGAIN rather than ENOENT when its
-                    // configuration is absent. Inspect only after lookup failure.
-                    if std::fs::metadata("/etc/resolv.conf")
-                        .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
-                    {
-                        io_failure(
-                            IoOperation::Resolve,
-                            &io::Error::new(
-                                io::ErrorKind::NotFound,
-                                "system resolver configuration is missing",
-                            ),
-                        )
-                    } else {
-                        io_failure(IoOperation::Resolve, &io::Error::from(error))
-                    }
-                })?;
+            let addresses = getaddrinfo(Some(target.host()), Some("443"), Some(hints))
+                .map_err(|error| io_failure(IoOperation::Resolve, &io::Error::from(error)))?;
             remaining(deadline)?;
             addresses
                 .filter_map(|address| match address {
