@@ -224,7 +224,7 @@ impl Lab {
             "sysctl",
             &["-q", "-w", "net.ipv4.conf.wgp.rp_filter=0"],
         )?;
-        self.runner.input(&super::command::Invocation::new("provA", "nft", &["-f", "-"]), Some(b"table ip lab_nat { chain postrouting { type nat hook postrouting priority srcnat; policy accept; oifname \"eth0\" masquerade; } }\n"))?;
+        self.runner.input(&super::command::Invocation::new("provA", "nft", &["-f", "-"]), Some(b"table ip lab_nat {\n\tchain postrouting {\n\t\ttype nat hook postrouting priority srcnat; policy accept;\n\t\toifname \"eth0\" masquerade\n\t}\n}\n"))?;
         self.start(
             "provA",
             "dnsmasq",
