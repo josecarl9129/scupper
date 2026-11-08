@@ -147,7 +147,13 @@ impl Lab {
             )?)
         };
         self.runner.dwell(Duration::from_secs(1))?;
-        let sent = self.canaries(markers, true, permissive)?;
+        let sent = match self.canaries(markers, true, permissive) {
+            Ok(sent) => sent,
+            Err(error) => {
+                let _ = self.v6_diagnostics(&stem);
+                return Err(error);
+            }
+        };
         let mut sent = sent;
         if !permissive {
             let marker = Self::marker()?;
