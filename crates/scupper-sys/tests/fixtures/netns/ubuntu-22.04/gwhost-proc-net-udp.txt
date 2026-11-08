@@ -1,0 +1,3 @@
+   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops            
+ 2037: 00000000:CA6C 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 20383 2 ffff8e1f50288900 0         
+ 2038: 00000000:CA6D 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 20401 2 ffff8e1f50289200 0         
