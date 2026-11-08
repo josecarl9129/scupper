@@ -356,6 +356,8 @@ if command -v iptables-legacy >/dev/null; then
     gw iptables-legacy -t mangle -L -n > /dev/null
     capture case-11-ip-tables-names.txt gw cat /proc/net/ip_tables_names
     expect 2 legacy-iptables
+    # Deleting the host end first; a veth pair otherwise disappears asynchronously.
+    ip link del "${host_links[0]}"
     ip netns del gw
     create_gateway
     heal legacy-iptables
