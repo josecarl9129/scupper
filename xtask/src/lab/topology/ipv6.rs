@@ -176,6 +176,7 @@ impl Lab {
         for _ in 0..5 {
             self.stop_capture()?;
         }
+        self.v6_diagnostics(&stem)?;
         for suffix in ["ingress", "exit", "provider"] {
             let summary = evidence::v6_evidence(
                 &fs::read(self.artifacts.join(format!("{stem}-{suffix}.pcap")))?,
@@ -189,6 +190,44 @@ impl Lab {
                 summary,
             )?;
         }
+        Ok(())
+    }
+    /// Diagnostic only: forwarding state of the IPv6 path after a phase.
+    fn v6_diagnostics(&mut self, stem: &str) -> Result<()> {
+        let mut parts = Vec::new();
+        for (ns, args) in [
+            ("wan", &["-6", "route", "show"][..]),
+            ("wan", &["-6", "addr", "show"][..]),
+            ("wan", &["-6", "neigh", "show"][..]),
+            ("provA", &["-6", "route", "show"][..]),
+            ("internet", &["-6", "addr", "show"][..]),
+            ("internet", &["-6", "route", "show"][..]),
+        ] {
+            let out = self.cmd(ns, "ip", args).unwrap_or_else(|e| e.to_string());
+            parts.push(format!("== {ns} ip {}\n{out}", args.join(" ")));
+        }
+        for ns in ["wan", "provA", "internet"] {
+            let out = self
+                .cmd(
+                    ns,
+                    "sysctl",
+                    &[
+                        "net.ipv6.conf.all.forwarding",
+                        "net.ipv6.conf.all.disable_ipv6",
+                    ],
+                )
+                .unwrap_or_else(|e| e.to_string());
+            parts.push(format!("== {ns} sysctl\n{out}"));
+            let out = self
+                .cmd(ns, "nstat", &["-az"])
+                .unwrap_or_else(|e| e.to_string());
+            let keep: Vec<&str> = out.lines().filter(|l| l.contains("Ip6")).collect();
+            parts.push(format!("== {ns} nstat Ip6\n{}", keep.join("\n")));
+        }
+        fs::write(
+            self.artifacts.join(format!("{stem}.diag.txt")),
+            parts.join("\n"),
+        )?;
         Ok(())
     }
     pub(super) fn restore_v6(&mut self) -> Result<()> {
