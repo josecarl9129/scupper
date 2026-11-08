@@ -23,6 +23,10 @@ serde_json = { version = "1", default-features = false, features = ["std"] }
 sha2 = { version = "0.10", default-features = false }
 proptest = { version = "1", default-features = false, features = ["std"] }
 
+serde = { version = "1", default-features = false, features = ["derive", "std"] }
+toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
+ipnet = { version = "2", default-features = false, features = ["std"] }
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"

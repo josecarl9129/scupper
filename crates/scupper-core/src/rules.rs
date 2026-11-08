@@ -54,6 +54,23 @@ impl IfName {
         Self::with_field(name, None)
     }
 
+    // Site configs use the stricter lowercase grammar from DESIGN §8. Keep
+    // v1's existing constructor contract while sharing the validated type.
+    pub(crate) fn site_name(name: &str) -> Result<Self, ConfigError> {
+        if name.is_empty()
+            || name.len() > 15
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return Err(ConfigError::InvalidInterfaceName {
+                field: None,
+                reason: "must contain 1 to 15 lowercase letters, digits or hyphens",
+            });
+        }
+        Ok(Self(name.to_owned()))
+    }
+
     fn with_field(name: &str, field: Option<&'static str>) -> Result<Self, ConfigError> {
         let reason = if name.is_empty() || name.len() > 15 {
             Some("must contain 1 to 15 bytes")
