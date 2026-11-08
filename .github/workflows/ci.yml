@@ -113,9 +113,13 @@ jobs:
           if-no-files-found: error
 
   lab:
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-22.04]
+    runs-on: ${{ matrix.runner }}
     needs: musl
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -124,7 +128,7 @@ jobs:
       - name: Install lab tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y wireguard-tools nftables iproute2 util-linux curl iptables
+          sudo apt-get install -y wireguard-tools nftables iproute2 util-linux curl iptables tcpdump iputils-ping
 
       - uses: actions/download-artifact@v4
         with:
@@ -136,10 +140,28 @@ jobs:
           chmod +x lab-bin/scupper
           timeout 900 sudo lab/run.sh "$PWD/lab-bin/scupper" "$PWD/lab-captures"
 
+      - name: Record nftables service behavior (V-23)
+        run: timeout --kill-after=10 300 sudo lab/v23.sh "$PWD/lab-captures"
+
+      - name: Record networkd behavior (V-24)
+        run: timeout --kill-after=10 180 sudo lab/v24.sh "$PWD/lab-captures"
+
+      - name: Print lab results
+        if: always()
+        run: |
+          for report in results v23 v24; do
+            echo "${report}.tsv"
+            if [[ -f "lab-captures/${report}.tsv" ]]; then
+              cat "lab-captures/${report}.tsv"
+            else
+              echo 'Report unavailable: the corresponding step did not complete.'
+            fi
+          done
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: lab-captures
+          name: lab-captures-${{ matrix.runner }}
           path: lab-captures
           retention-days: 14
           if-no-files-found: warn

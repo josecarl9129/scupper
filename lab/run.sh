@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export LC_ALL=C
 
 if [[ $# != 2 || $EUID != 0 ]]; then
     echo "Usage (root, disposable VM only): $0 <scupper-binary> <capture-dir>" >&2
@@ -37,7 +38,12 @@ nat_added=0
 forwarding_changed=0
 netns_dir_created=0
 private=''
+active_case=''
+ping_pid=''
+tcp_pid=''
+dump_pid=''
 mismatches=0
+last_count=0
 results="$captures/results.tsv"
 printf 'name\twanted\tgot\tfirst_line\n' > "$results"
 
@@ -45,6 +51,7 @@ cleanup() {
     local code=$? ns link failed=0
     trap - EXIT
     set +e
+    stop_traffic || failed=1
     cat "$results"
     for link in "${forward_in[@]}"; do
         iptables -w -D FORWARD -i "$link" -m comment --comment "$tag" -j ACCEPT || failed=1
@@ -104,20 +111,149 @@ record() {
     local name=$1 wanted=$2 got=$3 first=$4
     first=${first//$'\t'/ }
     first=${first//$'\r'/ }
+    first=${first//$'\n'/ }
     printf '%s\t%s\t%s\t%s\n' "$name" "$wanted" "$got" "$first" >> "$results"
-    if [[ $got != skipped && $got != "$wanted" ]]; then mismatches=$((mismatches + 1)); fi
+    if [[ $wanted != info && $got != skipped && $got != "$wanted" ]]; then mismatches=$((mismatches + 1)); fi
 }
 scupper() { timeout 60 ip netns exec gw "$binary" "$@"; }
 expect() {
     local wanted=$1 name=$2 first=''
+    # Let the fault act on live client traffic before and after check, so a leak has time to
+    # reach the capture (the positive control showed a one-second window catches nothing).
+    sleep 3
     capture "check-$name.txt" scupper check
+    sleep 1
     IFS= read -r first < "$captures/check-$name.txt" || true
     if [[ -z $first ]]; then IFS= read -r first < "$captures/check-$name.txt.stderr" || true; fi
     record "$name" "$wanted" "$CAPTURE_CODE" "$first"
+    finish_case "$name" "$wanted" "$CAPTURE_CODE"
 }
 gw() { ip netns exec gw "$@"; }
 provider() { ip netns exec provider "$@"; }
 client() { ip netns exec client "$@"; }
+
+# Each background command owns a process group, including the TCP request loop.
+# Signal the whole group and escalate after five seconds; always reap the leader.
+stop_group() {
+    local pid=$1 signal=$2 attempt failed=0
+    [[ -n $pid ]] || return 0
+    kill -s "$signal" -- "-$pid" 2>/dev/null || true
+    for ((attempt = 0; attempt < 50; attempt++)); do
+        if ! kill -0 "$pid" 2>/dev/null; then break; fi
+        sleep 0.1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -KILL -- "-$pid" 2>/dev/null || true
+        failed=1
+    fi
+    GROUP_STATUS=0
+    wait "$pid" 2>/dev/null || GROUP_STATUS=$?
+    return "$failed"
+}
+stop_traffic() {
+    local failed=0
+    stop_group "$ping_pid" TERM || failed=1
+    stop_group "$tcp_pid" TERM || failed=1
+    stop_group "$dump_pid" INT || failed=1
+    if [[ -n $dump_pid && $GROUP_STATUS != 0 ]]; then
+        echo "tcpdump failed (exit $GROUP_STATUS)" >&2
+        failed=1
+    fi
+    ping_pid='' tcp_pid='' dump_pid=''
+    return "$failed"
+}
+begin_case() {
+    local name=$1 deadline flow next_flow
+    [[ -z $active_case ]] || { echo "Capture still active: $active_case" >&2; return 1; }
+    active_case=$name
+    # This is the host end of gw's eth0, before the host uplink's NAT.
+    setsid tcpdump -ni "${host_links[0]}" -U -w "$captures/$name.pcap" \
+        'host 10.99.0.2 or host 10.2.0.2' > /dev/null 2> "$captures/$name-tcpdump.stderr" &
+    dump_pid=$!
+    deadline=$((SECONDS + 5))
+    until grep -q 'listening on' "$captures/$name-tcpdump.stderr"; do
+        if ! kill -0 "$dump_pid" 2>/dev/null || (( SECONDS >= deadline )); then
+            echo "tcpdump did not start for $name" >&2
+            return 1
+        fi
+        sleep 0.1
+    done
+    setsid timeout --kill-after=2 240 ip netns exec client \
+        stdbuf -oL ping -n -i 0.2 1.1.1.1 > "$captures/$name-ping.txt" 2>&1 &
+    ping_pid=$!
+    # A rate-limited response keeps an established NAT/TCP flow across the fault.
+    # Reconnect if the server closes it; no request depends on a host proxy.
+    setsid timeout --kill-after=2 240 ip netns exec client bash -c '
+        while :; do
+            curl --noproxy "*" -4 --fail --silent --show-error --limit-rate 20k \
+                --connect-timeout 10 --max-time 180 --output /dev/null \
+                "https://speed.cloudflare.com/__down?bytes=10000000" || true
+            sleep 0.2
+        done' > "$captures/$name-tcp.txt" 2>&1 &
+    tcp_pid=$!
+    deadline=$((SECONDS + 25))
+    while (( SECONDS < deadline )); do
+        flow=$(client_tcp_flow) || flow=''
+        if [[ -n $flow ]]; then
+            # Check that the same connection persists before injecting the fault.
+            sleep 1
+            next_flow=$(client_tcp_flow) || next_flow=''
+            if [[ $flow == "$next_flow" ]]; then
+                printf '%s\n' "$flow" > "$captures/$name-tcp-established.txt"
+                return 0
+            fi
+        fi
+        if ! kill -0 "$tcp_pid" 2>/dev/null; then break; fi
+        sleep 0.2
+    done
+    record "$name-tcp-established" 0 1 'no persistent established client HTTPS flow before the fault'
+    return 1
+}
+client_tcp_flow() {
+    client ss -Hnt state established | awk '
+        $3 ~ /^10[.]99[.]0[.]2:/ && $4 ~ /:443$/ { print $3, $4; found=1 }
+        END { exit !found }'
+}
+finish_case() {
+    local name=$1 wanted=$2 check_code=$3 count
+    [[ $active_case == "$name" ]]
+    # A dead capture cannot establish silence, even if its partial pcap is empty.
+    kill -0 "$dump_pid"
+    kill -0 "$ping_pid"
+    kill -0 "$tcp_pid"
+    stop_traffic
+    count=$(tcpdump -nn -r "$captures/$name.pcap" \
+        2> "$captures/$name-pcap-read.stderr" | wc -l)
+    count=${count//[[:space:]]/}
+    last_count=$count
+    if [[ $wanted == 2 && $check_code == 2 ]]; then
+        record "$name-uplink-packets" info "$count" 'un-NATed uplink packets; check reported 2'
+    else
+        record "$name-uplink-silent" 0 "$count" 'un-NATed uplink packets'
+    fi
+    active_case=''
+}
+
+# Optional kernel facilities differ between runner images. Skip only explicit
+# capability errors; malformed commands and other failures still fail the lab.
+optional_fault() {
+    local name=$1 reason code
+    shift
+    capture "fault-$name.txt" "$@"
+    code=$CAPTURE_CODE
+    if (( code == 0 )); then return 0; fi
+    reason=$(< "$captures/fault-$name.txt.stderr")
+    if [[ $reason =~ Operation\ not\ supported|Protocol\ not\ supported|Address\ family\ not\ supported|[Uu]nsupported\ family|[Uu]nsupported\ operation|Specified\ qdisc\ kind\ is\ unknown|Table\ does\ not\ exist ]]; then
+        record "$name" 2 skipped "$reason"
+    else
+        record "$name" 2 "fault-failed-$code" "${reason:-fault command failed without stderr}"
+    fi
+    if ! stop_traffic; then
+        record "$name-capture-stop" 0 1 'capture or traffic shutdown failed'
+    fi
+    active_case=''
+    return 1
+}
 
 capture nft-version.txt nft --version
 capture kernel.txt uname -r
@@ -212,6 +348,7 @@ heal() {
     gw ip route replace default dev proton0 table 51820
     gw nft -f "$private/policy.nft"
     wait_exit
+    begin_case "heal-$name"
     expect 0 "heal-$name"
 }
 capture_links() {
@@ -263,6 +400,7 @@ client ip route add default dev wg0
 resolver client
 wait_exit
 
+begin_case healthy
 expect 0 healthy
 capture_links healthy
 capture healthy/nft-live.json gw nft -j list ruleset
@@ -286,36 +424,56 @@ else
     record client-exit-matches 0 1 'client and check exit IPs differ or check did not report an IP'
 fi
 
+begin_case bug-4
 gw ip rule del priority 1000
 expect 3 bug-4
 heal bug-4
 
+begin_case tunnel-deleted
 gw ip link del proton0
 expect 4 tunnel-deleted
 heal tunnel-deleted
 
+begin_case exit-link-down
 gw ip link set proton0 down
 capture_links case-04
 expect 4 exit-link-down
 heal exit-link-down
 
+begin_case ruleset-missing-tunnel-down
 gw ip link del proton0
 gw nft flush ruleset
 expect 2 ruleset-missing-tunnel-down
 heal ruleset-missing-tunnel-down
 
+begin_case extra-accept
 gw nft 'add rule inet scupper forward iifname "wg0" oifname "eth0" accept'
 capture case-06-nft.json gw nft -j list ruleset
 expect 2 extra-accept
 heal extra-accept
 
+# Positive control for the leak detector: with rule 1000 gone and an eth0 accept, client
+# traffic really leaves un-NATed via eth0, so the capture must see it.
+begin_case leak-control
+gw ip rule del priority 1000
+gw nft 'add rule inet scupper forward iifname "wg0" oifname "eth0" accept'
+expect 2 leak-control
+if (( last_count > 0 )); then
+    record leak-control-detector-sees-leak 1 1 "$last_count un-NATed packets captured"
+else
+    record leak-control-detector-sees-leak 1 0 'detector saw nothing during a real leak'
+fi
+heal leak-control
+
+begin_case unconstrained-ct
 gw nft 'add rule inet scupper forward ct state established,related accept'
 capture case-07-nft.json gw nft -j list ruleset
 expect 2 unconstrained-ct
 heal unconstrained-ct
 
+begin_case dup
 # nft rejects dup in the inet family ("unsupported family"), so a foreign ip table carries it.
-gw nft -f - <<'NFT'
+if optional_fault dup gw nft -f - <<'NFT'
 table ip foreign_dup {
     chain forward {
         type filter hook forward priority -10; policy accept;
@@ -323,11 +481,14 @@ table ip foreign_dup {
     }
 }
 NFT
-capture case-08-nft.json gw nft -j list ruleset
-expect 2 dup
+then
+    capture case-08-nft.json gw nft -j list ruleset
+    expect 2 dup
+fi
 heal dup
 
-gw nft -f - <<'NFT'
+begin_case netdev-fwd
+if optional_fault netdev-fwd gw nft -f - <<'NFT'
 table netdev foreign {
     chain ingress {
         type filter hook ingress device "wg0" priority 0; policy accept;
@@ -335,32 +496,39 @@ table netdev foreign {
     }
 }
 NFT
-capture case-09-nft.json gw nft -j list ruleset
-expect 2 netdev-fwd
+then
+    capture case-09-nft.json gw nft -j list ruleset
+    expect 2 netdev-fwd
+fi
 heal netdev-fwd
 
-gw tc qdisc add dev wg0 clsact
-gw tc filter add dev wg0 ingress matchall action mirred egress redirect dev eth0
-capture_links case-10
-# The collector queries root filters; also retain the actual ingress action.
-capture case-10/tc-filter-wg0-ingress.json gw tc -j filter show dev wg0 ingress
-expect 2 tc-mirred
+begin_case tc-mirred
+if optional_fault tc-mirred gw tc qdisc add dev wg0 clsact &&
+    optional_fault tc-mirred gw tc filter add dev wg0 ingress matchall action mirred egress redirect dev eth0; then
+    capture_links case-10
+    # The collector queries root filters; also retain the actual ingress action.
+    capture case-10/tc-filter-wg0-ingress.json gw tc -j filter show dev wg0 ingress
+    expect 2 tc-mirred
+fi
 heal tc-mirred
 
+begin_case config-disagreement
 gw wg set wg0 peer "$client_pub" allowed-ips 10.99.0.3/32
 expect 2 config-disagreement
 heal config-disagreement
 
 # Loading a legacy table cannot be undone by flushing it; use a fresh gw to heal.
 if command -v iptables-legacy >/dev/null; then
-    gw iptables-legacy -t mangle -L -n > /dev/null
-    capture case-11-ip-tables-names.txt gw cat /proc/net/ip_tables_names
-    expect 2 legacy-iptables
-    # Deleting the host end first; a veth pair otherwise disappears asynchronously.
-    ip link del "${host_links[0]}"
-    ip netns del gw
-    create_gateway
-    heal legacy-iptables
+    begin_case legacy-iptables
+    if optional_fault legacy-iptables gw iptables-legacy -t mangle -L -n; then
+        capture case-11-ip-tables-names.txt gw cat /proc/net/ip_tables_names
+        expect 2 legacy-iptables
+        # Deleting the host end first; a veth pair otherwise disappears asynchronously.
+        ip link del "${host_links[0]}"
+        ip netns del gw
+        create_gateway
+        heal legacy-iptables
+    fi
 else
     record legacy-iptables 2 skipped 'iptables-legacy is missing'
 fi
