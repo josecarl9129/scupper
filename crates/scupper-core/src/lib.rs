@@ -5,5 +5,6 @@
 pub mod canon;
 pub mod config;
 pub mod parse;
+pub mod render;
 pub mod rules;
 pub mod verdict;

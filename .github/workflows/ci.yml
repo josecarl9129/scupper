@@ -56,6 +56,16 @@ jobs:
       - name: Test
         run: timeout 900 cargo test --workspace --all-features --locked
 
+      - name: Check nftables goldens without tunnel links
+        run: |
+          if ! command -v nft >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y nftables
+          fi
+          while IFS= read -r -d '' ruleset; do
+            sudo unshare --net -- nft -c -f "$ruleset"
+          done < <(find crates/*/tests/golden/ -type f \( -name '*.nft' -o -name '*.golden' \) -print0)
+
       - name: Doc
         run: timeout 600 cargo doc --workspace --no-deps --locked
         env:
