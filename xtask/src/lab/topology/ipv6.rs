@@ -110,7 +110,7 @@ impl Lab {
                 &["-q", "-w", "net.ipv6.conf.all.forwarding=1"],
             )?;
         }
-        self.runner.input(&crate::lab::command::Invocation::new("provA", "nft", &["-f", "-"]), Some(b"table ip6 lab_nat6 { chain postrouting { type nat hook postrouting priority srcnat; oifname \"eth0\" masquerade; } }\n"))?;
+        self.runner.input(&crate::lab::command::Invocation::new("provA", "nft", &["-f", "-"]), Some(b"table ip6 lab_nat6 { chain postrouting { type nat hook postrouting priority srcnat; oifname \"eth0\" masquerade;\n\t}\n}\n"))?;
         Ok(())
     }
     fn v6_phase(&mut self, markers: &mut Vec<String>, phase: &str, permissive: bool) -> Result<()> {
@@ -127,7 +127,7 @@ impl Lab {
         let mut trace = if permissive {
             None
         } else {
-            self.runner.input(&crate::lab::command::Invocation::new("scupper", "nft", &["-f", "-"]), Some(b"table inet lab_trace { chain preraw { type filter hook prerouting priority -301; iifname \"wg0\" meta nfproto ipv6 meta nftrace set 1; } }\n"))?;
+            self.runner.input(&crate::lab::command::Invocation::new("scupper", "nft", &["-f", "-"]), Some(b"table inet lab_trace { chain preraw { type filter hook prerouting priority -301; iifname \"wg0\" meta nfproto ipv6 meta nftrace set 1;\n\t}\n}\n"))?;
             Some(self.runner.background(
                 &crate::lab::command::Invocation::new(
                     "scupper",

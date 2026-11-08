@@ -592,6 +592,20 @@ fn ndp_allows_uplink_resolution_and_checks_hop_limit() {
 }
 
 #[test]
+fn mldv2_report_from_unspecified_source_during_dad_is_link_control() {
+    // Seen in the namespace lab: a tentative interface reports from `::` (RFC 3810 §5.2.13).
+    let mut report = vec![143, 0, 0, 0, 0, 0, 0, 1, 4, 0, 0, 0];
+    report.extend_from_slice(&v6("ff02::1:ff00:1").octets());
+    let packet = ip6("::", "ff02::16", 58, &report);
+    assert_eq!(classes(std::slice::from_ref(&packet)), [allowed("ndp")]);
+    // A unicast destination is still not link control.
+    assert_eq!(
+        classes(&[ip6("::", "2001:db8:1::2", 58, &report)]),
+        [violation(Reason::NotAllowListed)]
+    );
+}
+
+#[test]
 fn vlan_sll_sll2_and_unknown_links_are_classified() {
     let packet = ip4(CLIENT, PEER, 6, &tcp(22, 40000, b""));
     for tags in [0, 1, 2] {

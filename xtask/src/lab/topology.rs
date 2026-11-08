@@ -517,10 +517,9 @@ impl Lab {
         }
         for outcome in [
             self.load_real_rules(),
-            self.cmd("scupper", "conntrack", &["-F", "-f", "ipv4"])
-                .map(|_| ()),
-            self.cmd("scupper", "conntrack", &["-F", "-f", "ipv6"])
-                .map(|_| ()),
+            // conntrack-tools 1.4.6 (Ubuntu 22.04) rejects `-f` with `-F`; a plain flush is
+            // enough for the lab, which forwards IPv6 only in the explicit IPv6 variant.
+            self.cmd("scupper", "conntrack", &["-F"]).map(|_| ()),
             self.verify_rules(),
             self.apply_sysctls(true, false),
         ] {
@@ -662,7 +661,7 @@ impl Lab {
         self.runner.dwell(Duration::from_secs(3))?;
         let marker = Self::marker()?;
         markers.push(marker.clone());
-        self.runner.input(&super::command::Invocation::new("wan", "nft", &["-f", "-"]), Some(b"table inet lab_inject { chain input { type filter hook input priority filter; ip saddr 198.51.100.2 ip daddr 198.51.100.1 udp sport { 40002, 40003 } udp dport { 53, 8080 } drop; } }\n"))?;
+        self.runner.input(&super::command::Invocation::new("wan", "nft", &["-f", "-"]), Some(b"table inet lab_inject { chain input { type filter hook input priority filter; ip saddr 198.51.100.2 ip daddr 198.51.100.1 udp sport { 40002, 40003 } udp dport { 53, 8080 } drop;\n\t}\n}\n"))?;
         let exe = self.executable.clone();
         self.cmd("gwhost", &exe, &["inject", "--marker", &marker])?;
         self.runner.dwell(Duration::from_secs(3))?;
