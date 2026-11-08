@@ -116,6 +116,39 @@ impl Lab {
                 &["-q", "-w", "net.ipv6.conf.all.forwarding=1"],
             )?;
         }
+        // The lab links have no link-local addresses (addrgenmode none), so neighbour
+        // discovery towards the IPv6 sink does not complete: use static entries, as the
+        // bridge does.
+        for (local_ns, local_iface, remote_ns, remote_iface, address) in [
+            ("wan", A.internet.wan_if, "internet", "eth0", A.internet_v6),
+            ("internet", "eth0", "wan", A.internet.wan_if, A.wan_v6),
+        ] {
+            let links: serde_json::Value = serde_json::from_str(&self.cmd(
+                remote_ns,
+                "ip",
+                &["-j", "link", "show", "dev", remote_iface],
+            )?)?;
+            let mac = links[0]["address"]
+                .as_str()
+                .ok_or("internet link MAC missing")?
+                .to_owned();
+            self.cmd(
+                local_ns,
+                "ip",
+                &[
+                    "-6",
+                    "neigh",
+                    "replace",
+                    address,
+                    "lladdr",
+                    &mac,
+                    "nud",
+                    "permanent",
+                    "dev",
+                    local_iface,
+                ],
+            )?;
+        }
         self.runner.input(&crate::lab::command::Invocation::new("provA", "nft", &["-f", "-"]), Some(b"table ip6 lab_nat6 { chain postrouting { type nat hook postrouting priority srcnat; oifname \"eth0\" masquerade;\n\t}\n}\n"))?;
         Ok(())
     }
