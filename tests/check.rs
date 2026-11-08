@@ -38,6 +38,7 @@ impl System for LoggedSystem {
             Program::Ip => "ip",
             Program::Nft => "nft",
             Program::Tc => "tc",
+            Program::Systemctl => "systemctl",
         });
         self.fake.run(program, args, timeout)
     }

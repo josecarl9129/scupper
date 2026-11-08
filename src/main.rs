@@ -1,8 +1,7 @@
-//! Command entry point; commands remain unavailable until implemented.
+//! Command entry point.
 
-use std::process::ExitCode;
+use scupper::cli;
 
-fn main() -> ExitCode {
-    eprintln!("scupper: commands are not implemented yet");
-    ExitCode::FAILURE
+fn main() -> std::process::ExitCode {
+    std::process::ExitCode::from(cli::run(std::env::args_os()))
 }

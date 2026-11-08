@@ -28,6 +28,8 @@ pub enum Program {
     Nft,
     /// Traffic-control inspection.
     Tc,
+    /// Start and stop the exit tunnel unit.
+    Systemctl,
 }
 
 impl Program {
@@ -39,6 +41,7 @@ impl Program {
             Self::Ip => "/usr/sbin/ip",
             Self::Nft => "/usr/sbin/nft",
             Self::Tc => "/usr/sbin/tc",
+            Self::Systemctl => "/usr/bin/systemctl",
         }
     }
 }
@@ -50,6 +53,7 @@ pub struct Programs {
     ip: PathBuf,
     nft: PathBuf,
     tc: PathBuf,
+    systemctl: PathBuf,
 }
 
 impl Default for Programs {
@@ -59,6 +63,7 @@ impl Default for Programs {
             ip: Program::Ip.default_path().into(),
             nft: Program::Nft.default_path().into(),
             tc: Program::Tc.default_path().into(),
+            systemctl: Program::Systemctl.default_path().into(),
         }
     }
 }
@@ -85,6 +90,7 @@ impl Programs {
                 Program::Ip => &mut paths.ip,
                 Program::Nft => &mut paths.nft,
                 Program::Tc => &mut paths.tc,
+                Program::Systemctl => &mut paths.systemctl,
             };
             path.as_ref().clone_into(destination);
         }
@@ -99,6 +105,7 @@ impl Programs {
             Program::Ip => &self.ip,
             Program::Nft => &self.nft,
             Program::Tc => &self.tc,
+            Program::Systemctl => &self.systemctl,
         }
     }
 }
