@@ -4,10 +4,12 @@
 //! barrier against sending client plaintext through the host uplink.
 
 pub mod apply;
+pub mod canon;
 pub mod check;
 pub mod cli;
 pub mod parse;
 pub mod probe;
 pub mod rules;
 pub mod system;
+pub mod topology;
 pub mod verdict;

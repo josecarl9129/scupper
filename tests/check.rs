@@ -39,6 +39,7 @@ impl System for LoggedSystem {
             Program::Nft => "nft",
             Program::Tc => "tc",
             Program::Systemctl => "systemctl",
+            Program::Unshare => "unshare",
         });
         self.fake.run(program, args, timeout)
     }
@@ -92,6 +93,7 @@ impl Harness {
                 result: Ok(M1Topology {
                     ruleset: RulesetObs::Exact,
                     tc_hooks: vec![],
+                    legacy_tables: Vec::new(),
                     config_mismatches: vec![],
                     uplink_addrs: vec![IpAddr::from([192, 0, 2, 10])],
                 }),
@@ -408,6 +410,7 @@ fn status_other_errors_and_missing_switch() {
         Ok(M1Topology {
             ruleset: RulesetObs::Missing,
             tc_hooks: vec![],
+            legacy_tables: Vec::new(),
             config_mismatches: vec![],
             uplink_addrs: vec![],
         }),

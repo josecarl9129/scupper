@@ -12,7 +12,7 @@ use std::{
 use scupper::{
     apply::{self, Fs, RULESET_PATH, TempFile},
     cli::{
-        self, Dependencies, Privilege, Prompt, Sleeper, UnimplementedExitProbe,
+        self, Dependencies, NamespaceReader, Privilege, Prompt, Sleeper, UnimplementedExitProbe,
         UnimplementedTopology,
     },
     system::{ExecError, ExecOutput, Program, System},
@@ -237,6 +237,7 @@ impl Harness {
                 sleeper: self,
                 topology: &UnimplementedTopology,
                 exit_probe: &UnimplementedExitProbe,
+                namespaces: &NoNamespaces,
             },
             &mut out,
             &mut err,
@@ -737,4 +738,13 @@ fn real_fs_apply_cleans_only_matching_regular_stale_files() -> io::Result<()> {
     assert!(std::fs::symlink_metadata(link)?.is_symlink());
     assert_eq!(disk.log.borrow().first(), Some(&"cleanup stale"));
     Ok(())
+}
+
+/// `apply` never runs `canon`, so namespace reads must not happen.
+struct NoNamespaces;
+
+impl NamespaceReader for NoNamespaces {
+    fn read_namespace(&self, _path: &Path) -> io::Result<PathBuf> {
+        Err(io::Error::other("namespace read in an apply test"))
+    }
 }

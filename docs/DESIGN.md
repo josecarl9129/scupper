@@ -1658,6 +1658,9 @@ uplink is the device of the host default route, `exit_addr` is assigned to
 `exit_iface`, `client_addr` lies inside `wg0`'s peer AllowedIPs; validation
 refuses an interface name that does not exist) (2) → handshake fresh (4) → `ip route get 1.1.1.1 from 10.99.0.2 iif wg0` =
 `dev proton0` (3) → exit probe bound to `proton0` (3).
+In M1, tcx BPF links (kernel 6.6+) and other eBPF attachments without a
+qdisc are not detected; `tc filter show` covers only root filters, and the
+qdisc check is the guard for ingress/clsact.
 
 Rules: an observation error is 1, never a safe code; a known violation wins
 over an observation error. `Never` is not fresh; `Age(d)` is fresh iff

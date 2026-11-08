@@ -30,6 +30,8 @@ pub enum Program {
     Nft,
     /// Traffic-control inspection.
     Tc,
+    /// Create an anonymous network namespace for ruleset canonicalization.
+    Unshare,
     /// Start and stop the exit tunnel unit.
     Systemctl,
 }
@@ -43,6 +45,7 @@ impl Program {
             Self::Ip => "/usr/sbin/ip",
             Self::Nft => "/usr/sbin/nft",
             Self::Tc => "/usr/sbin/tc",
+            Self::Unshare => "/usr/bin/unshare",
             Self::Systemctl => "/usr/bin/systemctl",
         }
     }
@@ -56,6 +59,7 @@ pub struct Programs {
     nft: PathBuf,
     tc: PathBuf,
     systemctl: PathBuf,
+    unshare: PathBuf,
 }
 
 impl Default for Programs {
@@ -66,6 +70,7 @@ impl Default for Programs {
             nft: Program::Nft.default_path().into(),
             tc: Program::Tc.default_path().into(),
             systemctl: Program::Systemctl.default_path().into(),
+            unshare: Program::Unshare.default_path().into(),
         }
     }
 }
@@ -92,6 +97,7 @@ impl Programs {
                 Program::Ip => &mut paths.ip,
                 Program::Nft => &mut paths.nft,
                 Program::Tc => &mut paths.tc,
+                Program::Unshare => &mut paths.unshare,
                 Program::Systemctl => &mut paths.systemctl,
             };
             path.as_ref().clone_into(destination);
@@ -108,6 +114,7 @@ impl Programs {
             Program::Nft => &self.nft,
             Program::Tc => &self.tc,
             Program::Systemctl => &self.systemctl,
+            Program::Unshare => &self.unshare,
         }
     }
 }
@@ -658,7 +665,15 @@ mod tests {
         for path in ["wg", "./wg", "", "../usr/bin/wg"] {
             assert!(Programs::new([(Program::Wg, path)]).is_err());
         }
-        for program in [Program::Wg, Program::Ip, Program::Nft, Program::Tc] {
+        for program in [
+            Program::Wg,
+            Program::Ip,
+            Program::Nft,
+            Program::Tc,
+            Program::Systemctl,
+            Program::Unshare,
+        ] {
+            assert!(Programs::new([(program, "relative")]).is_err());
             assert_eq!(
                 Programs::default().path(program),
                 Path::new(program.default_path())

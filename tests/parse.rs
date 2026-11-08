@@ -574,3 +574,163 @@ proptest! {
         prop_assert_eq!(parsed[0].handshake, expected);
     }
 }
+
+// Topology fixtures are synthesized; replaced by captured output in 1g.
+#[test]
+fn tc_json_baseline_and_hooks() -> Result<(), Box<dyn Error>> {
+    use scupper::parse::{filter_has_hooks, qdisc_has_hooks};
+    assert!(!qdisc_has_hooks(
+        r#"[{"kind":"noqueue","handle":"0:","root":true,"refcnt":2}]"#
+    )?);
+    assert!(!qdisc_has_hooks(r#"[{"kind":"noop","root":true}]"#)?);
+    for out in [
+        "[]",
+        r#"[{"kind":"noop"}]"#,
+        r#"[{"kind":"noop","root":false}]"#,
+        r#"[{"kind":"noop","root":true},{"kind":"noqueue","root":true}]"#,
+        r#"[{"kind":"noqueue"}]"#,
+        r#"[{"kind":"noqueue","root":false}]"#,
+        r#"[{"kind":"fq_codel","root":true}]"#,
+        r#"[{"kind":"ingress","parent":"ffff:fff1"}]"#,
+        r#"[{"kind":"clsact","parent":"ffff:fff1"}]"#,
+        r#"[{"kind":"noqueue","root":true},{"kind":"noqueue","root":true}]"#,
+    ] {
+        assert!(qdisc_has_hooks(out)?, "{out}");
+    }
+    for out in [
+        "garbage",
+        "{}",
+        "[null]",
+        "[{}]",
+        r#"[{"kind":2}]"#,
+        r#"[{"kind":"noqueue","root":1}]"#,
+    ] {
+        assert!(qdisc_has_hooks(out).is_err(), "{out}");
+    }
+    assert!(!filter_has_hooks("[]")?);
+    assert!(filter_has_hooks(
+        r#"[{"protocol":"all","pref":49152,"kind":"bpf","options":{"handle":1}}]"#
+    )?);
+    for out in ["", "{}", "[null]"] {
+        assert!(filter_has_hooks(out).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn topology_ip_json() -> Result<(), Box<dyn Error>> {
+    use scupper::parse::{default_routes_use, link_names, local_addresses};
+    assert_eq!(
+        link_names(
+            r#"[{"ifindex":1,"ifname":"lo","flags":["LOOPBACK"]},{"ifindex":2,"ifname":"wg0"}]"#
+        )?,
+        ["lo", "wg0"]
+    );
+    assert!(link_names("[{}]").is_err());
+    let uplink = IfName::new("eth0")?;
+    assert!(default_routes_use(
+        r#"[{"dst":"default","gateway":"192.0.2.1","dev":"eth0","protocol":"dhcp","metric":100}]"#,
+        &uplink
+    )?);
+    for out in ["[]", "[{}]", r#"[{"dev":"eth0"},{"dev":"eth1"}]"#] {
+        assert!(!default_routes_use(out, &uplink)?);
+    }
+    assert!(default_routes_use(r#"[{"dev":false}]"#, &uplink).is_err());
+    let addrs = local_addresses(
+        r#"[{"ifindex":2,"ifname":"eth0","addr_info":[{"family":"inet","local":"192.0.2.10","prefixlen":24},{"family":"inet6","local":"2001:db8::10","prefixlen":64}]}]"#,
+    )?;
+    assert_eq!(
+        addrs,
+        [
+            "192.0.2.10".parse::<std::net::IpAddr>()?,
+            "2001:db8::10".parse()?
+        ]
+    );
+    assert_eq!(
+        local_addresses(r#"[{"addr_info":[]},{}]"#)?,
+        Vec::<std::net::IpAddr>::new()
+    );
+    for out in [
+        r#"[{"addr_info":{}}]"#,
+        r#"[{"addr_info":[{}]}]"#,
+        r#"[{"addr_info":[{"local":"bad"}]}]"#,
+        r#"[{"addr_info":[{"local":2}]}]"#,
+    ] {
+        assert!(local_addresses(out).is_err());
+    }
+    for out in ["", "not JSON", "{}", "[42]"] {
+        assert!(link_names(out).is_err());
+        assert!(default_routes_use(out, &uplink).is_err());
+        assert!(local_addresses(out).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn allowed_ips_ipv4_prefix_containment() -> Result<(), Box<dyn Error>> {
+    use scupper::parse::allowed_ips_contain;
+    let client = Ipv4Addr::new(10, 99, 0, 2);
+    for (cidrs, expected) in [
+        ("10.99.0.2/32", true),
+        ("10.99.0.3/32", false),
+        ("10.99.0.0/24", true),
+        ("10.99.1.0/24", false),
+        ("0.0.0.0/0", true),
+        ("10.99.0.128/25", false),
+        ("10.99.0.2/31", true),
+        ("::/0", false),
+        ("2001:db8::1/128 10.99.0.0/24", true),
+        ("(none)", false),
+    ] {
+        assert_eq!(
+            allowed_ips_contain(&format!("{}\t{cidrs}\n", key('A')), client)?,
+            expected,
+            "{cidrs}"
+        );
+    }
+    assert!(!allowed_ips_contain("", client)?);
+    assert!(allowed_ips_contain(
+        &format!("{}\t(none)\n{}\t10.99.0.0/24", key('A'), key('E')),
+        client
+    )?);
+    for cidr in [
+        "10.0.0.0",
+        "10.0.0.0/33",
+        "10.0.0.0/-1",
+        "10.0.0.0/+1",
+        "10.0.0.0/",
+        "bad/24",
+        "10.0.0.0/1/2",
+        "::/129",
+        "",
+        "10.99.0.0/24 bad",
+    ] {
+        assert!(
+            allowed_ips_contain(&format!("{}\t{cidr}", key('A')), client).is_err(),
+            "{cidr}"
+        );
+    }
+    assert!(allowed_ips_contain("invalid-key\t0.0.0.0/0", client).is_err());
+    assert!(allowed_ips_contain(&format!("{} 0.0.0.0/0", key('A')), client).is_err());
+    Ok(())
+}
+
+#[test]
+fn link_flags_and_xdp_presence() -> Result<(), Box<dyn Error>> {
+    use scupper::parse::links;
+    let parsed = links(
+        r#"[{"ifname":"wg0","flags":["POINTOPOINT","UP"],"xdp":null},{"ifname":"proton0","flags":["POINTOPOINT"]},{"ifname":"eth0"}]"#,
+    )?;
+    assert!(parsed[0].up);
+    assert!(parsed[0].xdp);
+    assert!(!parsed[1].up);
+    assert!(!parsed[1].xdp);
+    assert!(!parsed[2].up);
+    for out in [
+        r#"[{"ifname":"wg0","flags":null}]"#,
+        r#"[{"ifname":"wg0","flags":[1]}]"#,
+    ] {
+        assert!(links(out).is_err());
+    }
+    Ok(())
+}

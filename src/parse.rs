@@ -1,4 +1,4 @@
-//! Pure parsers for `WireGuard` handshakes and the client route lookup.
+//! Pure parsers for kernel topology, `WireGuard` and the client route lookup.
 
 use std::{
     collections::BTreeSet,
@@ -17,6 +17,9 @@ use crate::rules::{ConfigError, IfName, V1Config};
 /// Diagnostics describe the failure without echoing untrusted input.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ParseError {
+    /// Malformed topology output, without retaining untrusted input.
+    #[error("invalid topology output: {0}")]
+    Topology(&'static str),
     /// A standalone public key has invalid base64 syntax or padding bits.
     #[error("peer key {reason}")]
     InvalidPeerKey {
@@ -388,4 +391,203 @@ pub fn route_probe_argv(cfg: &V1Config) -> Vec<String> {
         "iif".to_owned(),
         cfg.client_iface.to_string(),
     ]
+}
+
+pub(crate) fn json_array(out: &str) -> Result<Vec<serde_json::Value>, ParseError> {
+    let value: serde_json::Value =
+        serde_json::from_str(out).map_err(|_| ParseError::Topology("malformed JSON"))?;
+    let serde_json::Value::Array(entries) = value else {
+        return Err(ParseError::Topology("expected a JSON array"));
+    };
+    if entries.iter().any(|entry| !entry.is_object()) {
+        return Err(ParseError::Topology("expected JSON object entries"));
+    }
+    Ok(entries)
+}
+
+/// Whether `tc -j qdisc show` contains anything beyond one root `noqueue` or `noop`.
+/// Unknown fields are retained only by the JSON reader and otherwise ignored.
+///
+/// # Errors
+/// Returns an error for malformed JSON, missing kinds or invalid root flags.
+pub fn qdisc_has_hooks(out: &str) -> Result<bool, ParseError> {
+    let entries = json_array(out)?;
+    let mut baseline = entries.len() == 1;
+    for entry in entries {
+        let kind = entry["kind"]
+            .as_str()
+            .ok_or(ParseError::Topology("qdisc is missing a string kind"))?;
+        let root = match entry.get("root") {
+            None => false,
+            Some(value) => value
+                .as_bool()
+                .ok_or(ParseError::Topology("qdisc root must be boolean"))?,
+        };
+        baseline &= matches!(kind, "noqueue" | "noop") && root;
+    }
+    Ok(!baseline)
+}
+
+/// Whether `tc -j filter show` contains any filter.
+///
+/// # Errors
+/// Returns an error for malformed JSON or non-object entries.
+pub fn filter_has_hooks(out: &str) -> Result<bool, ParseError> {
+    Ok(!json_array(out)?.is_empty())
+}
+
+/// Link details needed to distinguish fail-closed exits and netfilter bypasses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    /// Kernel interface name.
+    pub name: String,
+    /// Whether the flags include the administrative `UP` flag.
+    pub up: bool,
+    /// Whether an XDP key is present, regardless of its value.
+    pub xdp: bool,
+}
+
+/// Collects names, administrative state and XDP presence from `ip -j link show`.
+/// Missing flags mean the link is not up; unknown fields are ignored.
+///
+/// # Errors
+/// Returns an error for malformed JSON, names or flags.
+pub fn links(out: &str) -> Result<Vec<Link>, ParseError> {
+    json_array(out)?
+        .iter()
+        .map(|entry| {
+            let name = entry["ifname"]
+                .as_str()
+                .ok_or(ParseError::Topology("link is missing a string ifname"))?
+                .to_owned();
+            let mut up = false;
+            if let Some(flags) = entry.get("flags") {
+                for flag in flags
+                    .as_array()
+                    .ok_or(ParseError::Topology("link flags must be an array"))?
+                {
+                    up |= flag
+                        .as_str()
+                        .ok_or(ParseError::Topology("link flag must be a string"))?
+                        == "UP";
+                }
+            }
+            Ok(Link {
+                name,
+                up,
+                xdp: entry.get("xdp").is_some(),
+            })
+        })
+        .collect()
+}
+
+/// Collects interface names from `ip -j link show`, ignoring unknown fields.
+///
+/// # Errors
+/// Returns an error for malformed JSON or missing/non-string interface names.
+pub fn link_names(out: &str) -> Result<Vec<String>, ParseError> {
+    json_array(out)?
+        .iter()
+        .map(|entry| {
+            entry["ifname"]
+                .as_str()
+                .map(str::to_owned)
+                .ok_or(ParseError::Topology("link is missing a string ifname"))
+        })
+        .collect()
+}
+
+/// Checks that every default route selects the uplink and at least one exists.
+/// A route without a device (including a multipath route) cannot agree.
+///
+/// # Errors
+/// Returns an error for malformed JSON or a non-string device.
+pub fn default_routes_use(out: &str, uplink: &IfName) -> Result<bool, ParseError> {
+    let entries = json_array(out)?;
+    let mut agrees = !entries.is_empty();
+    for entry in entries {
+        let dev = entry
+            .get("dev")
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or(ParseError::Topology("route dev must be a string"))
+            })
+            .transpose()?;
+        agrees &= dev == Some(uplink.as_str());
+    }
+    Ok(agrees)
+}
+
+/// Collects all IPv4 and IPv6 `local` addresses from `ip -j addr show`.
+/// An interface with no `addr_info` has no addresses.
+///
+/// # Errors
+/// Returns an error for malformed JSON, address entries or IP addresses.
+pub fn local_addresses(out: &str) -> Result<Vec<IpAddr>, ParseError> {
+    let mut addresses = Vec::new();
+    for entry in json_array(out)? {
+        let Some(info) = entry.get("addr_info") else {
+            continue;
+        };
+        let info = info
+            .as_array()
+            .ok_or(ParseError::Topology("addr_info must be an array"))?;
+        for address in info {
+            let local = address["local"]
+                .as_str()
+                .ok_or(ParseError::Topology("address is missing a string local"))?;
+            addresses.push(
+                local
+                    .parse()
+                    .map_err(|_| ParseError::Topology("invalid local IP address"))?,
+            );
+        }
+    }
+    Ok(addresses)
+}
+
+/// Checks client containment in `wg show IFACE allowed-ips` output.
+/// IPv6 CIDRs are validated but cannot contain an IPv4 client. All lines are
+/// parsed even after a match so malformed later records remain errors.
+///
+/// # Errors
+/// Returns an error for invalid peer records or CIDRs.
+pub fn allowed_ips_contain(out: &str, client: Ipv4Addr) -> Result<bool, ParseError> {
+    let mut contains = false;
+    for line in out.lines().filter(|line| !line.trim().is_empty()) {
+        let (key, ips) = line.split_once('\t').ok_or(ParseError::Topology(
+            "allowed-ips record must contain a tab",
+        ))?;
+        PeerKey::new(key)?;
+        if ips.trim() == "(none)" {
+            continue;
+        }
+        if ips.trim().is_empty() {
+            return Err(ParseError::Topology("empty allowed-ips record"));
+        }
+        for cidr in ips.split_whitespace() {
+            let (network, prefix) = cidr
+                .split_once('/')
+                .ok_or(ParseError::Topology("allowed IP must be a CIDR"))?;
+            let network: IpAddr = network
+                .parse()
+                .map_err(|_| ParseError::Topology("invalid CIDR address"))?;
+            if prefix.is_empty() || !prefix.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(ParseError::Topology("invalid CIDR prefix"));
+            }
+            let prefix: u32 = prefix
+                .parse()
+                .map_err(|_| ParseError::Topology("invalid CIDR prefix"))?;
+            match network {
+                IpAddr::V4(network) if prefix <= 32 => {
+                    let mask = u32::MAX.checked_shl(32 - prefix).unwrap_or(0);
+                    contains |= u32::from(network) & mask == u32::from(client) & mask;
+                }
+                IpAddr::V6(_) if prefix <= 128 => {}
+                _ => return Err(ParseError::Topology("CIDR prefix out of range")),
+            }
+        }
+    }
+    Ok(contains)
 }

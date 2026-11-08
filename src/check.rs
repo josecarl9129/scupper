@@ -91,6 +91,7 @@ pub(crate) fn handshake_is_fresh(handshake: Handshake, cfg: &HealthConfig, now: 
         topology: Some(Ok(M1Topology {
             ruleset: RulesetObs::Exact,
             tc_hooks: Vec::new(),
+            legacy_tables: Vec::new(),
             config_mismatches: Vec::new(),
             uplink_addrs: vec![cfg.exit_addr.into()],
         })),

@@ -29,6 +29,7 @@ fn topology() -> M1Topology {
     M1Topology {
         ruleset: RulesetObs::Exact,
         tc_hooks: vec![],
+        legacy_tables: Vec::new(),
         config_mismatches: vec![],
         uplink_addrs: vec![UPLINK],
     }
@@ -154,6 +155,7 @@ fn violations_collected() -> Result<(), Box<dyn Error>> {
             want_sha256: [2; 32],
         },
         tc_hooks: vec![tc.clone()],
+        legacy_tables: Vec::new(),
         config_mismatches: mismatches.clone(),
         ..topology()
     }));
@@ -576,6 +578,7 @@ fn messages_snapshot() {
     obs.topology = Some(Ok(M1Topology {
         ruleset: RulesetObs::Missing,
         tc_hooks: vec![config().exit_iface],
+        legacy_tables: Vec::new(),
         ..topology()
     }));
     #[allow(clippy::panic)]
@@ -687,11 +690,13 @@ fn topologies() -> impl Strategy<Value = M1Topology> {
         prop_oneof![9 => Just(vec![]), 1 => prop::collection::vec(names(), 1..4)],
         prop_oneof![9 => Just(vec![]), 1 => prop::collection::vec(mismatch, 1..4)],
         prop::collection::vec(ips(), 0..4),
+        prop_oneof![9 => Just(vec![]), 1 => prop::collection::vec("[a-z]{1,32}", 1..9)],
     )
         .prop_map(
-            |(ruleset, tc_hooks, config_mismatches, uplink_addrs)| M1Topology {
+            |(ruleset, tc_hooks, config_mismatches, uplink_addrs, legacy_tables)| M1Topology {
                 ruleset,
                 tc_hooks,
+                legacy_tables,
                 config_mismatches,
                 uplink_addrs,
             },
@@ -722,6 +727,7 @@ fn arbitrary_cases() -> impl Strategy<Value = (M1Observations, HealthConfig, u64
 fn topology_passes(value: &M1Topology) -> bool {
     value.ruleset == RulesetObs::Exact
         && value.tc_hooks.is_empty()
+        && value.legacy_tables.is_empty()
         && value.config_mismatches.is_empty()
         && !value.uplink_addrs.is_empty()
 }
@@ -823,6 +829,11 @@ fn reference_next(obs: &M1Observations, cfg: &HealthConfig, now: u64) -> Next {
     }
     for mismatch in &topology.config_mismatches {
         findings.push(Violation::ConfigMismatch(mismatch.clone()));
+    }
+    if !topology.legacy_tables.is_empty() {
+        findings.push(Violation::LegacyFirewallTables(
+            topology.legacy_tables.clone(),
+        ));
     }
     let mut findings = findings.into_iter();
     if let Some(first) = findings.next() {
@@ -1055,6 +1066,32 @@ fn exit_status_diagnostics_are_bounded_and_readable() -> Result<(), Box<dyn Erro
     assert_eq!(
         ProbeError::exit_status(None, "").to_string(),
         "probe exited unsuccessfully (killed by signal)"
+    );
+    Ok(())
+}
+
+#[test]
+fn legacy_firewall_tables_outrank_later_errors_and_display_names() -> Result<(), Box<dyn Error>> {
+    let mut obs = passing();
+    obs.topology = Some(Ok(M1Topology {
+        legacy_tables: vec!["filter".into(), "nat".into()],
+        uplink_addrs: vec![],
+        ..topology()
+    }));
+    obs.handshake = Some(Err(ProbeError::Timeout));
+    let verdict = report(&obs)?.verdict;
+    assert_eq!(verdict.exit_code(), 2);
+    assert_eq!(
+        verdict,
+        Verdict::Unprotected(Violations::new(Violation::LegacyFirewallTables(vec![
+            "filter".into(),
+            "nat".into()
+        ])))
+    );
+    assert!(
+        verdict
+            .to_string()
+            .contains("legacy iptables tables loaded: filter, nat")
     );
     Ok(())
 }

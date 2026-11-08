@@ -137,12 +137,16 @@ pub enum ConfigMismatch {
 }
 
 /// Containment observations collected together before any availability stage.
+/// When violations are present, fields not involved in a violation may be
+/// unobserved; only a topology with no violations establishes containment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct M1Topology {
     /// Exactness of the complete host ruleset.
     pub ruleset: RulesetObs,
     /// Interfaces with traffic-control hooks beyond the permitted baseline.
     pub tc_hooks: Vec<IfName>,
+    /// Legacy `x_tables` names, bounded to eight names of at most 32 characters.
+    pub legacy_tables: Vec<String>,
     /// All observed configuration/kernel disagreements.
     pub config_mismatches: Vec<ConfigMismatch>,
     /// Host uplink addresses that must never be reported as protected exits.
@@ -242,6 +246,8 @@ pub enum Violation {
     },
     /// An interface has an unexpected traffic-control hook.
     TrafficControlHook(IfName),
+    /// Legacy `x_tables` can bypass the observed nftables policy.
+    LegacyFirewallTables(Vec<String>),
     /// The bound probe returned a host uplink address.
     ExitIpIsUplinkAddress(IpAddr),
     /// Configuration disagrees with the observed kernel state.
@@ -399,6 +405,11 @@ pub(crate) fn topology_violations(topology: &M1Topology) -> Option<Violations> {
             .cloned()
             .map(Violation::ConfigMismatch),
     );
+    if !topology.legacy_tables.is_empty() {
+        violations.push(Violation::LegacyFirewallTables(
+            topology.legacy_tables.clone(),
+        ));
+    }
     if violations.is_empty() {
         None
     } else {
@@ -582,6 +593,9 @@ pub(crate) fn display_violation(violation: &Violation, f: &mut fmt::Formatter<'_
         Violation::RulesetDiffers { .. } => f.write_str("ruleset differs from policy"),
         Violation::TrafficControlHook(name) => {
             write!(f, "unexpected traffic-control hook on {name}")
+        }
+        Violation::LegacyFirewallTables(names) => {
+            write!(f, "legacy iptables tables loaded: {}", names.join(", "))
         }
         Violation::ExitIpIsUplinkAddress(ip) => write!(f, "exit IP {ip} is an uplink address"),
         Violation::ConfigMismatch(mismatch) => match mismatch {

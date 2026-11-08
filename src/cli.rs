@@ -4,7 +4,7 @@ use std::{
     ffi::OsString,
     io::{self, IsTerminal, Write},
     net::IpAddr,
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -12,11 +12,13 @@ use clap::{Parser, Subcommand, error::ErrorKind};
 
 use crate::{
     apply::{self, Fs, RULESET_PATH, RealFs},
+    canon,
     check::{self, ExitProbe, TopologySource},
     parse::HandshakeAge,
     probe::{BoundHttpsProbe, default_targets},
     rules::{self, V1Config},
     system::{ExecError, ExecOutput, Program, RealSystem, SYSTEMCTL_TIMEOUT, System},
+    topology::HostTopology,
     verdict::{self, HealthConfig, M1Topology, Probe, ProbeError, Warning},
 };
 
@@ -27,8 +29,17 @@ struct Cli {
     command: Command,
 }
 
-#[derive(Clone, Copy, Subcommand)]
+#[derive(Clone, Subcommand)]
 enum Command {
+    /// Canonicalize a ruleset only inside an isolated network namespace.
+    #[command(hide = true)]
+    Canon {
+        /// Namespace inspected by the parent, which must never be modified.
+        #[arg(long)]
+        outer_netns: PathBuf,
+        /// Rendered ruleset to load in the isolated namespace.
+        path: std::path::PathBuf,
+    },
     /// Show an informational human-readable status report.
     Status,
     /// Check protection and return the verdict as an exit code.
@@ -53,6 +64,25 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+}
+
+/// Namespace identity reader used before any canon command execution.
+pub trait NamespaceReader {
+    /// Reads a namespace symlink such as `/proc/self/ns/net`.
+    ///
+    /// # Errors
+    /// Returns the symlink read error.
+    fn read_namespace(&self, path: &Path) -> io::Result<PathBuf>;
+}
+
+/// Reads namespace identities from procfs.
+#[derive(Debug, Default)]
+pub struct ProcNamespaces;
+
+impl NamespaceReader for ProcNamespaces {
+    fn read_namespace(&self, path: &Path) -> io::Result<PathBuf> {
+        std::fs::read_link(path)
+    }
 }
 
 /// Effective-user-ID boundary for commands that mutate the host.
@@ -134,7 +164,7 @@ impl Sleeper for ThreadSleeper {
     }
 }
 
-/// Placeholder containment source, replaced by the next milestone step.
+/// Placeholder containment source retained for injected command tests.
 #[derive(Debug, Default)]
 pub struct UnimplementedTopology;
 
@@ -158,6 +188,8 @@ impl ExitProbe for UnimplementedExitProbe {
 pub struct Dependencies<'a> {
     /// Command execution and clock.
     pub system: &'a dyn System,
+    /// Network namespace identities for the canon safety guard.
+    pub namespaces: &'a dyn NamespaceReader,
     /// Ruleset storage.
     pub fs: &'a dyn Fs,
     /// Effective uid check.
@@ -183,11 +215,12 @@ where
         args,
         &Dependencies {
             system: &RealSystem::default(),
+            namespaces: &ProcNamespaces,
             fs: &RealFs,
             privilege: &EffectiveUid,
             prompt: &TerminalPrompt,
             sleeper: &ThreadSleeper,
-            topology: &UnimplementedTopology,
+            topology: &HostTopology,
             exit_probe: &BoundHttpsProbe::new(default_targets()),
         },
         &mut io::stdout(),
@@ -231,6 +264,45 @@ where
     }
 }
 
+fn disconnect(
+    deps: &Dependencies<'_>,
+    cfg: &V1Config,
+    yes: bool,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<u8, String> {
+    require_root(deps, "disconnect")?;
+    confirm(
+        deps,
+        "disconnect",
+        yes,
+        "Block all client traffic now? [y/N]",
+        None,
+    )?;
+    systemctl(deps.system, "stop", cfg)?;
+    if let Ok(topology) = deps.topology.observe(deps.system, cfg) {
+        if let Some(violations) = verdict::topology_violations(&topology) {
+            writeln!(
+                stderr,
+                "exit tunnel stopped; kill switch is NOT in place: {}",
+                verdict::Verdict::Unprotected(violations)
+            )
+            .map_err(output_error)?;
+            Ok(2)
+        } else {
+            writeln!(stdout, "traffic is now blocked").map_err(output_error)?;
+            Ok(0)
+        }
+    } else {
+        writeln!(
+            stderr,
+            "exit tunnel stopped; kill switch state unknown, run 'scupper check'"
+        )
+        .map_err(output_error)?;
+        Ok(1)
+    }
+}
+
 fn dispatch(
     command: Command,
     deps: &Dependencies<'_>,
@@ -239,6 +311,14 @@ fn dispatch(
 ) -> Result<u8, String> {
     let cfg = V1Config::default();
     match command {
+        Command::Canon { outer_netns, path } => Ok(canon::run_isolated(
+            deps.system,
+            &path,
+            &outer_netns,
+            |path| deps.namespaces.read_namespace(path),
+            stdout,
+            stderr,
+        )),
         Command::Status => {
             // Status is informational, including when observations fail.
             let _ = writeln!(
@@ -270,38 +350,7 @@ fn dispatch(
             require_root(deps, "connect")?;
             connect(deps, &cfg, stdout, stderr)
         }
-        Command::Disconnect { yes } => {
-            require_root(deps, "disconnect")?;
-            confirm(
-                deps,
-                "disconnect",
-                yes,
-                "Block all client traffic now? [y/N]",
-                None,
-            )?;
-            systemctl(deps.system, "stop", &cfg)?;
-            if let Ok(topology) = deps.topology.observe(deps.system, &cfg) {
-                if let Some(violations) = verdict::topology_violations(&topology) {
-                    writeln!(
-                        stderr,
-                        "exit tunnel stopped; kill switch is NOT in place: {}",
-                        verdict::Verdict::Unprotected(violations)
-                    )
-                    .map_err(output_error)?;
-                    Ok(2)
-                } else {
-                    writeln!(stdout, "traffic is now blocked").map_err(output_error)?;
-                    Ok(0)
-                }
-            } else {
-                writeln!(
-                    stderr,
-                    "exit tunnel stopped; kill switch state unknown, run 'scupper check'"
-                )
-                .map_err(output_error)?;
-                Ok(1)
-            }
-        }
+        Command::Disconnect { yes } => disconnect(deps, &cfg, yes, stdout, stderr),
         Command::Apply { yes } => {
             require_root(deps, "apply")?;
             let rules = rules::ruleset(&cfg).map_err(|error| error.to_string())?;

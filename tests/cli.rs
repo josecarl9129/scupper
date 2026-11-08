@@ -13,7 +13,7 @@ use std::{
 use scupper::{
     apply::{Fs, TempFile},
     check::{ExitProbe, TopologySource},
-    cli::{self, Dependencies, Privilege, Prompt, Sleeper, UnimplementedTopology},
+    cli::{self, Dependencies, NamespaceReader, Privilege, Prompt, Sleeper, UnimplementedTopology},
     rules::V1Config,
     system::{EXEC_TIMEOUT, ExecError, ExecOutput, Program, SYSTEMCTL_TIMEOUT, System},
     verdict::{M1Topology, Probe, ProbeError, RulesetObs},
@@ -87,6 +87,8 @@ struct Harness {
     topology_calls: Cell<usize>,
     fs: FakeFs,
     root: bool,
+    self_netns: Option<&'static str>,
+    pid1_netns: Option<&'static str>,
     tty: bool,
     answer: bool,
     prompt_error: Option<&'static str>,
@@ -106,6 +108,8 @@ impl Default for Harness {
             topology_calls: Cell::new(0),
             fs: FakeFs::default(),
             root: true,
+            self_netns: Some("net:[123]"),
+            pid1_netns: Some("net:[456]"),
             tty: false,
             answer: true,
             prompt_error: None,
@@ -142,6 +146,19 @@ impl System for Harness {
         self.now.get()
     }
 }
+impl NamespaceReader for Harness {
+    fn read_namespace(&self, path: &Path) -> io::Result<PathBuf> {
+        let value = if path == Path::new("/proc/self/ns/net") {
+            self.self_netns
+        } else {
+            assert_eq!(path, Path::new("/proc/1/ns/net"));
+            self.pid1_netns
+        };
+        value
+            .map(PathBuf::from)
+            .ok_or_else(|| io::ErrorKind::PermissionDenied.into())
+    }
+}
 impl Privilege for Harness {
     fn is_root(&self) -> bool {
         self.root
@@ -175,6 +192,7 @@ impl TopologySource for Harness {
         Ok(M1Topology {
             ruleset: RulesetObs::Exact,
             tc_hooks: vec![],
+            legacy_tables: Vec::new(),
             config_mismatches: vec![],
             uplink_addrs: vec![IpAddr::from([192, 0, 2, 10])],
         })
@@ -206,6 +224,7 @@ impl Harness {
             std::iter::once("scupper").chain(args.iter().copied()),
             &Dependencies {
                 system: self,
+                namespaces: self,
                 fs: &self.fs,
                 privilege: self,
                 prompt: self,
@@ -287,6 +306,7 @@ fn check_verdict_codes() {
             Ok(M1Topology {
                 ruleset: RulesetObs::Missing,
                 tc_hooks: vec![],
+                legacy_tables: Vec::new(),
                 config_mismatches: vec![],
                 uplink_addrs: vec![],
             })
@@ -603,5 +623,87 @@ fn connect_reuses_verdict_freshness_bounds() {
         assert_eq!(code, expected, "timestamp {timestamp}: {err}");
         assert_eq!(err.contains("clock skew"), timestamp > 1_000);
         assert_eq!(err.lines().count(), usize::from(timestamp > 1_000));
+    }
+}
+
+#[test]
+fn canon_is_hidden_and_requires_one_path() {
+    let h = Harness::default();
+    let (code, out, err) = h.run(&["--help"]);
+    assert_eq!(code, 0);
+    assert!(!out.contains("canon"));
+    assert_eq!(err, "");
+    for args in [
+        vec!["canon"],
+        vec!["canon", "one"],
+        vec!["canon", "--outer-netns", "X", "one", "two"],
+    ] {
+        let (code, out, err) = h.run(&args);
+        assert_eq!(code, 1);
+        assert_eq!(out, "");
+        assert_ne!(err, "");
+    }
+    assert!(h.calls.borrow().is_empty());
+}
+
+#[test]
+fn canon_namespace_guards_run_before_any_system_calls() {
+    for (current, pid1) in [
+        (Some("X"), Some("host")),
+        (None, Some("host")),
+        (Some("child"), Some("child")),
+    ] {
+        let h = Harness {
+            self_netns: current,
+            pid1_netns: pid1,
+            ..Harness::default()
+        };
+        let (code, out, err) = h.run(&["canon", "--outer-netns", "X", "/private/ruleset.nft"]);
+        assert_eq!(code, 1);
+        assert_eq!(out, "");
+        assert!(err.contains("canon:"));
+        assert!(h.calls.borrow().is_empty());
+    }
+}
+
+#[test]
+fn canon_unreadable_pid1_is_optional_and_empty_ruleset_precedes_load() {
+    let h = Harness {
+        pid1_netns: None,
+        ..Harness::default()
+    };
+    h.output(r#"{"nftables":[{"metainfo":{"version":"1"}}]}"#);
+    h.output("");
+    h.output(r#"{"nftables":[{"table":{"name":"scupper","family":"inet"}}]}"#);
+    let (code, out, err) = h.run(&["canon", "--outer-netns", "X", "/private/ruleset.nft"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("scupper"));
+    let calls = h.calls.borrow();
+    assert_eq!(calls.len(), 3);
+    assert!(calls.iter().all(|call| call.program == Program::Nft));
+    assert_eq!(calls[0].args, ["-j", "list", "ruleset"]);
+    assert_eq!(calls[1].args, ["-f", "/private/ruleset.nft"]);
+    assert_eq!(calls[2].args, calls[0].args);
+}
+
+#[test]
+fn canon_refuses_nonempty_or_unreadable_preload_ruleset() {
+    for before in [
+        r#"{"nftables":[{"table":{"family":"inet","name":"foreign"}}]}"#,
+        r#"{"nftables":[{"metainfo":{},"table":{}}]}"#,
+        r#"{"nftables":[null]}"#,
+        r#"{"nftables":[{"metainfo":null}]}"#,
+        "{}",
+        "invalid JSON",
+    ] {
+        let h = Harness::default();
+        h.output(before);
+        let (code, out, err) = h.run(&["canon", "--outer-netns", "X", "/private/ruleset.nft"]);
+        assert_eq!(code, 1);
+        assert_eq!(out, "");
+        assert!(err.contains("canon:"));
+        let calls = h.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].args, ["-j", "list", "ruleset"]);
     }
 }
