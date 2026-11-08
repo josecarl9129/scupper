@@ -1,0 +1,68 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  CARGO_DENY_VERSION: "0.20.2"
+
+jobs:
+  gate:
+    name: fmt, clippy, test, doc, deny
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Cache cargo registry, cargo-deny and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/bin/cargo-deny
+            target
+          key: ${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-deny-${{ env.CARGO_DENY_VERSION }}
+
+      - name: Install cargo-deny
+        run: |
+          if ! cargo deny --version 2>/dev/null | grep -qx "cargo-deny ${CARGO_DENY_VERSION}"; then
+            cargo install --locked --force cargo-deny --version "${CARGO_DENY_VERSION}"
+          fi
+
+      - name: Format
+        run: timeout 600 cargo fmt --all -- --check
+
+      - name: Clippy
+        run: timeout 600 cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Test
+        run: timeout 900 cargo test --all-features --locked
+
+      - name: Doc
+        run: timeout 600 cargo doc --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      - name: Dependency policy
+        run: timeout 600 cargo deny check
+
+      - name: Default-feature build
+        run: timeout 600 cargo build --locked
