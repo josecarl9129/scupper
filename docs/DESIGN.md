@@ -134,7 +134,7 @@ Phases: **S** steady state, **F** failover, **A** apply, **B** boot,
   directional exit→client return; client→client is dropped.
 - F: one `ip route replace` per family, each atomic. Before: old exit; after:
   new exit or `unreachable`. The route writer only accepts
-  `RouteTarget::{Exit(ExitId), Unreachable}`; the ruleset is not touched.
+  `RouteTarget::{Exit(ExitIfname), Unreachable}`; the ruleset is not touched.
 - A: `nft -f` (flush + full table) is one kernel transaction. Even with no
   ruleset at all, T holds; the effect is loss of NAT, isolation and DNS
   forcing (I7 gap below), never an uplink path. I1 does not rely on the

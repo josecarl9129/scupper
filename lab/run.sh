@@ -65,7 +65,11 @@ cleanup() {
     fi
     for ns in "${namespaces[@]}"; do ip netns del "$ns" || failed=1; done
     for link in "${links[@]}"; do
-        if ip link show dev "$link" &>/dev/null; then ip link del "$link" || failed=1; fi
+        # A veth vanishes asynchronously when its namespace is deleted: only a link that is
+        # still present after a failed delete counts as a cleanup failure.
+        if ip link show dev "$link" &>/dev/null; then
+            ip link del "$link" 2>/dev/null || ! ip link show dev "$link" &>/dev/null || failed=1
+        fi
     done
     for ns in "${resolver_dirs[@]}"; do
         rm -f -- "/etc/netns/$ns/resolv.conf" || failed=1

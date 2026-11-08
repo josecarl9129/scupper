@@ -454,3 +454,56 @@ pub(super) fn build(cfg: SiteConfig) -> Option<ValidatedSite> {
         devices,
     })
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // Invalid internal fixtures must fail these tests.
+mod render_tests {
+    use super::*;
+    use crate::{
+        config::parse_site,
+        render::{Family, RouteTarget, VersionStamp, desired_routes, render_netns},
+    };
+
+    // Release validation requires one enabled exit. Build internal fixtures here
+    // to exercise fail-closed renderer behavior without relaxing that contract.
+    fn no_exit_site(disabled: bool) -> ValidatedSite {
+        let mut cfg = parse_site(include_str!("../../tests/fixtures/site-m2.toml")).unwrap();
+        if disabled {
+            cfg.gateways
+                .get_mut(&GatewayId("gw1".into()))
+                .unwrap()
+                .exits[0]
+                .enabled = false;
+        } else {
+            cfg.policy.exits.clear();
+        }
+        build(cfg).unwrap()
+    }
+
+    #[test]
+    fn empty_enabled_exit_list_matches_golden() {
+        let stamp = VersionStamp {
+            version: 43,
+            sha256: std::array::from_fn(|i| u8::try_from(i).unwrap()),
+        };
+        for disabled in [false, true] {
+            assert_eq!(
+                render_netns(&no_exit_site(disabled), &GatewayId("gw1".into()), &stamp).unwrap(),
+                include_str!("../../tests/golden/netns-m2-no-exit.nft")
+            );
+        }
+    }
+
+    #[test]
+    fn desired_routes_ignores_disabled_exits() {
+        let site = no_exit_site(true);
+        assert!(!site.gateway(&GatewayId("gw1".into())).unwrap().exits()[0].enabled());
+        assert_eq!(
+            desired_routes(&site, &GatewayId("gw1".into()), Some(&ExitId("ch1".into()))),
+            [
+                (Family::V4, RouteTarget::Unreachable),
+                (Family::V6, RouteTarget::Unreachable)
+            ]
+        );
+    }
+}
