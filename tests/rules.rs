@@ -60,7 +60,12 @@ fn config_values_flow_into_output() {
         "iifname \"wgX\" oifname \"exitY\" accept",
         "iifname \"exitY\" oifname \"wgX\" ct state established,related accept",
         "oifname \"exitY\" masquerade",
-        "oifname \"upZ\" ip saddr 10.9.9.9 drop",
+        concat!(
+            "\tchain output {\n",
+            "\t\ttype filter hook output priority 0; policy accept;\n",
+            "\t\toifname \"upZ\" ip saddr 10.9.9.9 drop\n",
+            "\t}\n",
+        ),
     ] {
         assert!(actual.contains(expected), "missing rule: {expected}");
     }
@@ -70,6 +75,22 @@ fn config_values_flow_into_output() {
             "stale default: {stale_default}"
         );
     }
+}
+
+#[test]
+fn config_values_flow_into_egress_after_nat() {
+    let cfg = V1Config {
+        uplink_iface: IfName::new("wan1").unwrap(),
+        exit_addr: Ipv4Addr::new(10, 8, 0, 2),
+        ..V1Config::default()
+    };
+    let actual = ruleset(&cfg).unwrap();
+    assert!(actual.contains(concat!(
+        "\tchain egress {\n",
+        "\t\ttype filter hook postrouting priority 110; policy accept;\n",
+        "\t\toifname \"wan1\" ip saddr 10.8.0.2 drop\n",
+        "\t}\n",
+    )));
 }
 
 #[test]
@@ -344,14 +365,14 @@ proptest! {
                 prop_assert!(!line.contains(&quoted_uplink));
             }
         }
-        for (name, count) in [(&cfg.client_iface, 2), (&cfg.exit_iface, 3), (&cfg.uplink_iface, 1)] {
+        for (name, count) in [(&cfg.client_iface, 2), (&cfg.exit_iface, 3), (&cfg.uplink_iface, 2)] {
             let quoted = format!("\"{name}\"");
             prop_assert_eq!(interfaces.iter().filter(|&&token| token == quoted).count(), count);
             prop_assert_eq!(lines.iter().map(|line| line.matches(&quoted).count()).sum::<usize>(), count);
         }
-        prop_assert_eq!(interfaces.len(), 6);
+        prop_assert_eq!(interfaces.len(), 7);
         let drop_rule = format!("oifname \"{}\" ip saddr {} drop", cfg.uplink_iface, cfg.exit_addr);
-        prop_assert!(lines.iter().any(|line| line.trim() == drop_rule));
+        prop_assert_eq!(lines.iter().filter(|line| line.trim() == drop_rule).count(), 2);
     }
 
     #[test]

@@ -108,7 +108,7 @@ pub struct V1Config {
     pub client_iface: IfName,
     /// VPN exit tunnel, the only permitted forwarding and masquerade target.
     pub exit_iface: IfName,
-    /// Host uplink, excluded from forwarding accepts and guarded on output.
+    /// Host uplink, excluded from forwarding accepts and guarded before/after NAT.
     pub uplink_iface: IfName,
     /// Exit tunnel source address blocked from escaping over the host uplink.
     pub exit_addr: Ipv4Addr,
@@ -216,13 +216,14 @@ impl V1Config {
     }
 }
 
-/// Renders the complete v1 nftables file without performing any I/O.
+/// Renders the v1 nftables file plus the post-NAT uplink guard without any I/O.
 ///
 /// Forward `policy drop` closes every path except client→exit and directional
 /// exit→client established/related replies. A broad established accept would
 /// permit replies on an uplink path. Masquerade applies only to the exit.
-/// The output chain blocks locally generated exit-source traffic on the uplink;
-/// other host traffic remains permitted, as required for v1 parity.
+/// The output chain blocks locally generated exit-source traffic on the uplink.
+/// The egress chain runs after source NAT to catch related ICMP errors whose
+/// source becomes the exit address after output. Other host traffic is permitted.
 /// Interface matches use quoted names so links need not exist at load time.
 ///
 /// # Errors
@@ -252,6 +253,11 @@ pub fn ruleset(cfg: &V1Config) -> Result<String, ConfigError> {
             "\n",
             "\tchain output {{\n",
             "\t\ttype filter hook output priority 0; policy accept;\n",
+            "\t\toifname \"{uplink}\" ip saddr {exit_addr} drop\n",
+            "\t}}\n",
+            "\n",
+            "\tchain egress {{\n",
+            "\t\ttype filter hook postrouting priority 110; policy accept;\n",
             "\t\toifname \"{uplink}\" ip saddr {exit_addr} drop\n",
             "\t}}\n",
             "}}\n",

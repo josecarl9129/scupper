@@ -34,10 +34,11 @@ Each case and heal also runs continuous client pings and a rate-limited HTTPS
 transfer, with an established TCP connection verified before fault injection.
 `tcpdump` captures the host end of gateway `eth0`, filtering for `10.99.0.2` or
 `10.2.0.2` before the host's NAT. Healthy, bug-4, tunnel-deleted (bug 2),
-exit-link-down, and every heal must have zero un-NATed packets; check-2 cases
-report their counts as information. Per-case pcaps, traffic logs, and packet
-counts accompany the existing verdict assertions in `results.tsv`. Failure to
-establish the TCP flow or run/read the capture fails the lab.
+exit-link-down, config-disagreement, and every heal must have zero un-NATed
+packets; other check-2 cases report their counts as information. Per-case pcaps,
+traffic logs, and packet counts accompany the existing verdict assertions in
+`results.tsv`. Failure to establish the TCP flow or run/read the capture fails
+the lab.
 
 Run `sudo timeout --kill-after=10 300 lab/v23.sh lab-captures` after the namespace
 lab to record V-23 on the disposable runner host. It records the nftables unit's
