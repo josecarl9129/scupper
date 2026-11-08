@@ -314,7 +314,15 @@ capture case-07-nft.json gw nft -j list ruleset
 expect 2 unconstrained-ct
 heal unconstrained-ct
 
-gw nft 'add rule inet scupper forward dup to 172.31.0.1 device "eth0"'
+# nft rejects dup in the inet family ("unsupported family"), so a foreign ip table carries it.
+gw nft -f - <<'NFT'
+table ip foreign_dup {
+    chain forward {
+        type filter hook forward priority -10; policy accept;
+        iifname "wg0" dup to 172.31.0.1 device "eth0"
+    }
+}
+NFT
 capture case-08-nft.json gw nft -j list ruleset
 expect 2 dup
 heal dup
