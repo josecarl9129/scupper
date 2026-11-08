@@ -19,4 +19,9 @@ table inet scupper {
 		type filter hook output priority 0; policy accept;
 		oifname "eth0" ip saddr 10.2.0.2 drop
 	}
+
+	chain egress {
+		type filter hook postrouting priority 110; policy accept;
+		oifname "eth0" ip saddr 10.2.0.2 drop
+	}
 }

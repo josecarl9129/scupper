@@ -226,7 +226,7 @@ finish_case() {
         2> "$captures/$name-pcap-read.stderr" | wc -l)
     count=${count//[[:space:]]/}
     last_count=$count
-    if [[ $wanted == 2 && $check_code == 2 ]]; then
+    if [[ $name != config-disagreement && $wanted == 2 && $check_code == 2 ]]; then
         record "$name-uplink-packets" info "$count" 'un-NATed uplink packets; check reported 2'
     else
         record "$name-uplink-silent" 0 "$count" 'un-NATed uplink packets'

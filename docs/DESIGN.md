@@ -377,7 +377,7 @@ crates/
   scupper-edge/     bin: DNS forwarder, HTTP API, metrics
   scupper/          bin: CLI (clap), transports, human rendering; hidden boot/probe/deliver
 xtask/              leak-test harness, golden update, reproducible release build
-tests/golden/       v1 ruleset.golden (copied), netns rulesets, pf anchors, units, --json
+tests/golden/       v1 ruleset.golden + egress guard (ADR 0032), netns rulesets, pf anchors, units, --json
 ```
 
 M1 is a single crate (`scupper`) at the repository root with `rules`,
@@ -415,8 +415,9 @@ Ubuntu 22.04, Ubuntu 24.04 and Debian 12.
 
 ### 5.1 M1: v1 parity ruleset
 
-`fn ruleset(cfg: &V1Config) -> Result<String, ConfigError>` reproduces
-`tests/golden/ruleset.golden` byte for byte (copied from v1; reproduced here):
+`fn ruleset(cfg: &V1Config) -> Result<String, ConfigError>` renders
+`tests/golden/ruleset.golden` byte for byte: v1's ruleset plus the post-NAT
+egress chain (ADR 0032), reproduced here:
 
 ```nft
 #!/usr/sbin/nft -f
@@ -440,8 +441,20 @@ table inet scupper {
 		type filter hook output priority 0; policy accept;
 		oifname "eth0" ip saddr 10.2.0.2 drop
 	}
+
+	chain egress {
+		type filter hook postrouting priority 110; policy accept;
+		oifname "eth0" ip saddr 10.2.0.2 drop
+	}
 }
 ```
+
+Gateway-generated ICMP errors about NATed client flows can take the main-table
+route to the uplink; conntrack applies the related flow's NAT after the output
+hook, so the output rule cannot see their final exit source address. The egress
+chain runs at postrouting priority 110, after source NAT at 100, and drops those
+packets on the uplink. The output rule remains for locally generated packets
+that do not pass through NAT.
 
 `apply` behaves as v1 with one addition: write a temp file, validate it
 with `nft -c -f`, rename it over `/etc/nftables.conf`, `nft -f` it. A file
@@ -489,6 +502,9 @@ Example config: one client `mac` (10.99.0.2, fd00:99::2), client tunnel
 `wg0`, exits `ex-ch1` (v4+v6) and `ex-nl1` (v4 only), API port 7380. Loaded
 with `ip netns exec scupper nft -f`, so `flush ruleset` affects only the
 namespace (ADR 0017).
+
+The uplink-side property must hold after NAT: nothing with an exit address or
+client address may appear on the uplink, including gateway-generated ICMP errors.
 
 ```nft
 #!/usr/sbin/nft -f
@@ -2350,7 +2366,8 @@ several gateways (rejected in R1); `devices.*.gateways` is a list;
   `Handshake::age` incl. clock skew; `next()` staging; verdict table (v1
   cases plus every new variant); API auth (source mapping, token, Host,
   preflight).
-- **Golden:** v1 `ruleset.golden` byte-exact (M1 until v1 retirement); netns
+- **Golden:** v1 plus ADR 0032 egress chain in `ruleset.golden`, byte-exact
+  (M1 until v1 retirement); netns
   rulesets per milestone gating (one exit v4; two exits mixed v6; R2-shaped
   config rejected); pf anchors; units; `--json` outputs; human output
   (piped form and TTY form rendered with a fixed width). `UPDATE_GOLDEN=1`
@@ -2471,6 +2488,7 @@ several gateways (rejected in R1); `devices.*.gateways` is a list;
 | L52 | an extra main-table route via an exit in the netns | check 3 `RouteWrong`; removed | M2 |
 | L53 | heartbeat child started just before scupperd is SIGKILLed and the uplink is delayed | no ping after the child's deadline | M2 |
 | L54 | client queries `use-application-dns.net` (A, AAAA, HTTPS) | NXDOMAIN from the gateway; no upstream query for it on any exit | M4 |
+| L55 | gateway-generated ICMP errors about NATed client flows (undeliverable reply, frag-needed) | nothing with the exit address or client addresses on the uplink, checked after NAT | M1 (lab), M2 |
 
 ---
 
@@ -2527,7 +2545,7 @@ Each milestone ends tested and deployable.
 | M | Content | Exit criteria |
 |---|---|---|
 | **M1 Parity** | Single crate. Pure Rust port of v1 in the v1 layout: `status check connect disconnect rules apply`, exit codes 0-4, v1 verdict order; `V1Config` with v1 defaults (optional `/etc/scupper/v1.toml`); renderer byte-exact to the golden; parsers ported (latest-handshakes, `ip route get` dev); **route probe** (`ip route get 1.1.1.1 from 10.99.0.2 iif wg0` = `dev proton0`); **exact comparison of the whole host ruleset** by kernel canonicalization in an anonymous namespace (§5.1); config cross-check against the kernel; `nft -c` before `apply` renames; exit probe with `SO_BINDTODEVICE`; networkd drop-in with both `ManageForeign*` settings documented; cargo-deny, pinned toolchain, musl x86_64 build. | golden byte-exact; v1 verdict and parser tests ported and green; negative tests **only in an `unshare -rn` lab or a VM** (L40) → 2; V-04 (host), V-23, V-24 recorded; in a VM built in the v1 layout `check` = 0, `ip rule del … priority 1000` → 3, re-added → 0. Not deployed (D-1). |
-| **M2 Netns + daemon** | Workspace split; netns layout (§3, §5.2 M2 parts, §5.4); `scupper boot`; scupperd reconcile loop, repairs, budgets, planner; single-exit failover machine; event log; alert sinks (ntfy, webhook); external heartbeat; exit code 5; basic `scupper install`, basic `scupper deploy --host` (no rollback timer) and config version store + bundle; leak harness in CI with L1-L20; migration to a fresh host. | L1-L20, L41, L43, L44, L46, L50, L52, L53 green in CI; fake-system scenarios green, including the latch property; new gateway serving the Mac with `check` = 0 and rebooted twice with `check` = 0 afterwards and a clean uplink capture from the first packet; host `ip rule flush` → still 0; `ip -n scupper route del default` → 3 then repaired; heartbeat observed at the external service and stopping when scupperd is stopped; old gateway kept as rollback. |
+| **M2 Netns + daemon** | Workspace split; netns layout (§3, §5.2 M2 parts, §5.4); `scupper boot`; scupperd reconcile loop, repairs, budgets, planner; single-exit failover machine; event log; alert sinks (ntfy, webhook); external heartbeat; exit code 5; basic `scupper install`, basic `scupper deploy --host` (no rollback timer) and config version store + bundle; leak harness in CI with L1-L20; migration to a fresh host. | L1-L20, L41, L43, L44, L46, L50, L52, L53, L55 green in CI; fake-system scenarios green, including the latch property; new gateway serving the Mac with `check` = 0 and rebooted twice with `check` = 0 afterwards and a clean uplink capture from the first packet; host `ip rule flush` → still 0; `ip -n scupper route del default` → 3 then repaired; heartbeat observed at the external service and stopping when scupperd is stopped; old gateway kept as rollback. |
 | **M3 Exits** | Two exits; full failover machine (sticky, pin, prefer, optional auto failback); hot standby (after V-09) or cold; `exit list/show/use/auto/test/import`. | L21-L27, L47, L48 green; V-09, V-10, V-25 recorded; cold-standby outage measured against its 30-60 s target; real failover on the gateway by blocking one exit's endpoint: switch ≤ 20 s, event and alert delivered. |
 | **M4 DNS + IPv6** | Edge with forwarder; `dns_redirect`, 853 rejects, `nonglobal` sets; dual-stack model, v6 fail-closed path; v6 exit only after V-11. | L28-L34, L42, L45, L49, L54 green; Mac resolves via 10.99.0.1; an opportunistic DoT client falls back to 53 and a strict DoT client fails without sending plaintext DNS; v6 on v4-only exit gets ICMPv6 unreachable; V-11, V-12, V-26 recorded. |
 | **M5 API + Mac** | Tunnel API and auth; CLI transports; `/metrics`; `scupper mac` join/leave, pf anchor, auto-join, notifications, enrolment, bundle copies. | L35 green; auth unit tests; Mac matrix (§14) passed with external capture against the written pass conditions; V-05, V-06, V-20, V-21 recorded; CLI works identically via local, API and SSH. |
@@ -2627,3 +2645,4 @@ hardware) before anything depends on them.
 | [0029](adr/0029-risk-classified-mutations.md) | Risk-classified mutations: high-risk changes only over the local socket |
 | [0030](adr/0030-mac-root-helper.md) | Mac: a minimal root helper with root-owned tools, a user agent for the rest |
 | [0031](adr/0031-quarantine-latch.md) | Persisted quarantine latch after an exhausted repair budget |
+| [0032](adr/0032-post-nat-uplink-filter.md) | Drop exit-sourced uplink packets after NAT |
