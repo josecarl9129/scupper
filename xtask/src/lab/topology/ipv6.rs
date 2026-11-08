@@ -103,6 +103,12 @@ impl Lab {
             "ip",
             &["-6", "route", "add", "default", "via", "2001:db8:3::1"],
         )?;
+        // De-NATed replies for the client prefix must go back through the tunnel.
+        self.cmd(
+            "provA",
+            "ip",
+            &["-6", "route", "add", A.client_v6_net, "dev", "wgp"],
+        )?;
         for ns in ["wan", "provA"] {
             self.cmd(
                 ns,
@@ -284,6 +290,14 @@ impl Lab {
                 "provA",
                 "ip",
                 &["-6", "route", "del", "default"],
+            ),
+            None,
+        )?;
+        let _ = self.runner.output(
+            &crate::lab::command::Invocation::new(
+                "provA",
+                "ip",
+                &["-6", "route", "del", A.client_v6_net, "dev", "wgp"],
             ),
             None,
         )?;
