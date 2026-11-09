@@ -134,7 +134,8 @@ impl Script {
                 assert!(netns);
                 if arg(0) == "-6" {
                     out.status = Some(2);
-                    out.stderr = "RTNETLINK answers: Network is unreachable\n".into();
+                    // What the kernel answers for an `unreachable` IPv6 default (CI lab).
+                    out.stderr = "RTNETLINK answers: No route to host\n".into();
                     return Ok(out);
                 }
                 "scupper-route-get-public.txt".into()

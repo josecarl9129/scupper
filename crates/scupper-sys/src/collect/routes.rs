@@ -138,10 +138,15 @@ fn lookup(
     // iproute2 reports a negative kernel lookup as exit 2, rather than printing
     // a route. Accept only its exact unreachable diagnostic, never arbitrary
     // command/permission failures, timeout or missing executables.
+    // An `unreachable` route answers EHOSTUNREACH ("No route to host"; seen for the IPv6
+    // default in the CI lab on Ubuntu 22.04 and 24.04), a missing route ENETUNREACH.
     if output.as_ref().is_ok_and(|out| {
         out.status == Some(2)
             && out.stdout.is_empty()
-            && out.stderr.trim() == "RTNETLINK answers: Network is unreachable"
+            && matches!(
+                out.stderr.trim(),
+                "RTNETLINK answers: Network is unreachable" | "RTNETLINK answers: No route to host"
+            )
     }) {
         return Ok(RouteAnswer::Unreachable);
     }
