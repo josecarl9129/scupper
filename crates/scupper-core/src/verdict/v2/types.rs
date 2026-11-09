@@ -23,7 +23,8 @@ pub type ClientAddr = IpAddr;
 pub type RouteAnswer = RouteLookup;
 
 /// Persisted operator selection, distinct from route intent and kernel state.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum Selection {
     /// Use the configured candidate order.
     #[default]

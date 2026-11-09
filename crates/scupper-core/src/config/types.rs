@@ -167,7 +167,24 @@ impl SecretName {
     pub fn name(&self) -> &str {
         &self.name
     }
-    pub(super) fn valid(&self) -> bool {
+    /// Builds a reference after checking its basename grammar.
+    ///
+    /// # Errors
+    /// Returns a value-free error for an invalid reference.
+    pub fn new(kind: SecretKind, name: &str) -> Result<Self, Rule> {
+        let result = Self {
+            kind,
+            name: name.into(),
+        };
+        if result.valid() {
+            Ok(result)
+        } else {
+            Err(Rule::InvalidSecretRef)
+        }
+    }
+    /// Checks the reference basename without filesystem access.
+    #[must_use]
+    pub fn valid(&self) -> bool {
         (1..=63).contains(&self.name.len())
             && self
                 .name
@@ -263,4 +280,42 @@ pub(super) fn valid_exit_ifname(text: &str) -> bool {
                 .bytes()
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
     })
+}
+
+/// Checks strict HTTPS syntax without allocating or retaining the supplied URL.
+#[must_use]
+pub fn valid_https_url(text: &str) -> bool {
+    super::network::https_host(text).is_some()
+}
+
+/// Checks exactly 44 padded standard-base64 characters encoding 32 bytes.
+/// The caller may remove one trailing newline before validation.
+#[must_use]
+pub fn valid_wg_secret(text: &str) -> bool {
+    // Validate syntax without constructing a second copy of private key bytes.
+    let input = text.as_bytes();
+    (input.len() == 44 && input[43] == b'=')
+        && input[..43]
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/'))
+        && input.get(42).is_some_and(|b| {
+            matches!(
+                b,
+                b'A' | b'E'
+                    | b'I'
+                    | b'M'
+                    | b'Q'
+                    | b'U'
+                    | b'Y'
+                    | b'c'
+                    | b'g'
+                    | b'k'
+                    | b'o'
+                    | b's'
+                    | b'w'
+                    | b'0'
+                    | b'4'
+                    | b'8'
+            )
+        })
 }

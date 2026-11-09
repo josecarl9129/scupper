@@ -20,6 +20,7 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 webpki-roots = "1"
 dns-lookup = { version = "4", default-features = false }
 serde_json = { version = "1", default-features = false, features = ["std"] }
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
 sha2 = { version = "0.10", default-features = false }
 proptest = { version = "1", default-features = false, features = ["std"] }
 

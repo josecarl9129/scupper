@@ -217,44 +217,126 @@ pub fn apply(sys: &dyn System, fs: &dyn Fs, rules: &str) -> Result<(), String> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("read {RULESET_PATH}: {error}")),
     }
+    let installed = std::cell::Cell::new(false);
+    let result = durable_replace(
+        fs,
+        destination,
+        rules.as_bytes(),
+        0o644,
+        &|path| nft(sys, &["-c", "-f", &path.to_string_lossy()]).map_err(io::Error::other),
+        &|step| {
+            if step == DurableStep::Renamed {
+                installed.set(true);
+            }
+            Ok(())
+        },
+    )
+    .map_err(|error| {
+        error
+            .to_string()
+            .replace("temporary file", "temporary ruleset")
+    })
+    .and_then(|()| nft(sys, &["-f", RULESET_PATH]));
+    result.map_err(|error| {
+        if installed.get() {
+            format!("{error}; the file on disk at {RULESET_PATH} is the new, validated version; the live ruleset was not changed by this run")
+        } else { error }
+    })
+}
+
+/// Completed steps of an atomic durable replacement, exposed for fault injection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableStep {
+    /// The exclusive temporary file exists.
+    Created,
+    /// All content has been written to the temporary file.
+    Written,
+    /// Content has been synchronized, before optional validation.
+    ContentSynced,
+    /// Final permissions and content have been synchronized.
+    FileSynced,
+    /// The temporary file has atomically replaced the destination.
+    Renamed,
+    /// The containing directory has been synchronized.
+    DirectorySynced,
+}
+
+// Persist every new directory entry, including a previously absent configured
+// root. Merely syncing the new directory does not persist its entry in parent.
+pub(crate) fn durable_directory(path: &Path) -> io::Result<()> {
+    if path.as_os_str().is_empty() || path.is_dir() {
+        return Ok(());
+    }
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    durable_directory(parent)?;
+    match fs::create_dir(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => {}
+        Err(error) => return Err(error),
+    }
+    RealFs.sync_dir(path)?;
+    RealFs.sync_dir(parent)
+}
+
+// Shared by M1 apply, the config head and mirror, rendered files, and state.json.
+// A failed pre-rename step removes its temporary file; post-rename errors leave
+// the complete new file in place. `prepare` sees the synced, still-private file.
+pub(crate) fn durable_replace(
+    fs: &dyn Fs,
+    destination: &Path,
+    bytes: &[u8],
+    mode: u32,
+    prepare: &dyn Fn(&Path) -> io::Result<()>,
+    hook: &dyn Fn(DurableStep) -> io::Result<()>,
+) -> io::Result<()> {
+    let directory = destination
+        .parent()
+        .ok_or_else(|| io::Error::other("missing parent directory"))?;
     let (path, mut file) = fs
         .create_temp(directory)
-        .map_err(|error| format!("create temporary ruleset: {error}"))?;
+        .map_err(context("create temporary file"))?;
     let mut temp = PendingTemp {
         fs,
         path,
         pending: true,
     };
     let result = (|| {
-        file.write_all(rules.as_bytes())
-            .map_err(|error| format!("write temporary ruleset: {error}"))?;
+        hook(DurableStep::Created)?;
+        file.write_all(bytes)
+            .map_err(context("write temporary file"))?;
+        hook(DurableStep::Written)?;
         file.sync_all()
-            .map_err(|error| format!("sync temporary ruleset: {error}"))?;
-        nft(sys, &["-c", "-f", &temp.path.to_string_lossy()])?;
-        file.set_mode(0o644)
-            .map_err(|error| format!("set ruleset permissions: {error}"))?;
+            .map_err(context("sync temporary file content"))?;
+        hook(DurableStep::ContentSynced)?;
+        prepare(&temp.path)?;
+        file.set_mode(mode)
+            .map_err(context("set temporary file permissions"))?;
         file.sync_all()
-            .map_err(|error| format!("sync ruleset permissions: {error}"))?;
+            .map_err(context("sync temporary file permissions"))?;
+        hook(DurableStep::FileSynced)?;
         drop(file);
         fs.rename(&temp.path, destination)
-            .map_err(|error| format!("rename ruleset: {error}"))?;
+            .map_err(context("rename temporary file"))?;
         temp.pending = false;
-        let installed = || -> Result<(), String> {
-            fs.sync_dir(directory)
-                .map_err(|error| format!("sync ruleset directory: {error}"))?;
-            nft(sys, &["-f", RULESET_PATH])
-        };
-        installed().map_err(|error| {
-            format!("{error}; the file on disk at {RULESET_PATH} is the new, validated version; the live ruleset was not changed by this run")
-        })
+        hook(DurableStep::Renamed)?;
+        fs.sync_dir(directory)
+            .map_err(context("sync destination directory"))?;
+        hook(DurableStep::DirectorySynced)
     })();
     match (result, temp.cleanup()) {
         (result, Ok(())) => result,
-        (Ok(()), Err(error)) => Err(format!("remove temporary ruleset: {error}")),
-        (Err(original), Err(error)) => {
-            Err(format!("{original}; remove temporary ruleset: {error}"))
-        }
+        (Ok(()), Err(error)) => Err(context("remove temporary file")(error)),
+        (Err(original), Err(error)) => Err(io::Error::other(format!(
+            "{original}; remove temporary file: {error}"
+        ))),
     }
+}
+
+fn context(step: &'static str) -> impl FnOnce(io::Error) -> io::Error {
+    move |error| io::Error::new(error.kind(), format!("{step}: {error}"))
 }
 
 fn nft(sys: &dyn System, args: &[&str]) -> Result<(), String> {
@@ -316,6 +398,106 @@ fn diff_range(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Each failure is injected at the filesystem operation, before its hook.
+    struct FailingFs(&'static str);
+    struct FailingFile(&'static str, std::cell::Cell<u8>);
+
+    fn fail_if(actual: &str, requested: &str) -> io::Result<()> {
+        if actual == requested {
+            Err(io::Error::from(io::ErrorKind::StorageFull))
+        } else {
+            Ok(())
+        }
+    }
+    impl Write for FailingFile {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            fail_if("write", self.0)?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl TempFile for FailingFile {
+        fn sync_all(&self) -> io::Result<()> {
+            let operation = if self.1.get() == 0 {
+                "content sync"
+            } else {
+                "permissions sync"
+            };
+            self.1.set(self.1.get() + 1);
+            fail_if(operation, self.0)
+        }
+        fn set_mode(&self, _: u32) -> io::Result<()> {
+            fail_if("chmod", self.0)
+        }
+    }
+    impl Fs for FailingFs {
+        fn check_target(&self, _: &Path) -> io::Result<()> {
+            Ok(())
+        }
+        fn cleanup_stale(&self, _: &Path) -> io::Result<()> {
+            Ok(())
+        }
+        fn read(&self, _: &Path) -> io::Result<String> {
+            Err(io::ErrorKind::NotFound.into())
+        }
+        fn create_temp(&self, directory: &Path) -> io::Result<(PathBuf, Box<dyn TempFile>)> {
+            fail_if("create", self.0)?;
+            Ok((
+                directory.join(".fake"),
+                Box::new(FailingFile(self.0, std::cell::Cell::new(0))),
+            ))
+        }
+        fn rename(&self, _: &Path, _: &Path) -> io::Result<()> {
+            fail_if("rename", self.0)
+        }
+        fn sync_dir(&self, _: &Path) -> io::Result<()> {
+            fail_if("directory sync", self.0)
+        }
+        fn remove(&self, _: &Path) -> io::Result<()> {
+            fail_if("remove", self.0)
+        }
+    }
+
+    #[test]
+    fn durability_errors_name_the_failed_operation() -> io::Result<()> {
+        for (operation, diagnostic) in [
+            ("create", "create temporary file"),
+            ("write", "write temporary file"),
+            ("content sync", "sync temporary file content"),
+            ("chmod", "set temporary file permissions"),
+            ("permissions sync", "sync temporary file permissions"),
+            ("rename", "rename temporary file"),
+            ("directory sync", "sync destination directory"),
+        ] {
+            let error = durable_replace(
+                &FailingFs(operation),
+                Path::new("unused/rules"),
+                b"rules",
+                0o644,
+                &|_| Ok(()),
+                &|_| Ok(()),
+            )
+            .err()
+            .ok_or_else(|| io::Error::other("injected operation succeeded"))?;
+            assert!(error.to_string().contains(diagnostic), "{error}");
+            assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+        }
+        let error = durable_replace(
+            &FailingFs("remove"),
+            Path::new("unused/rules"),
+            b"rules",
+            0o644,
+            &|_| Err(io::Error::other("validation failed")),
+            &|_| Ok(()),
+        )
+        .err()
+        .ok_or_else(|| io::Error::other("injected remove succeeded"))?;
+        assert!(error.to_string().contains("remove temporary file"));
+        Ok(())
+    }
 
     #[test]
     fn real_temp_creation_is_exclusive_and_cleanup_requires_ownership() -> io::Result<()> {

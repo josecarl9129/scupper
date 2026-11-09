@@ -10,3 +10,8 @@ pub mod netns;
 pub mod probe;
 pub mod system;
 pub mod topology;
+
+pub mod lock;
+pub mod secrets;
+pub mod state;
+pub mod store;
