@@ -517,6 +517,20 @@ pub fn boot(deps: &BootDeps<'_>) -> BootReport {
                 None,
             )?;
         }
+        // An admin disconnect closes the exits too (also when adopting a namespace whose
+        // exits are up): DESIGN §12 stage 2 counts it effective only when the kernel shows
+        // both defaults unreachable and the exit links down or without peers.
+        if cfg.state.selection == Selection::Disconnected {
+            for exit in gw.exits() {
+                execute(
+                    deps,
+                    ExecTarget::Netns(&handle),
+                    Program::Ip,
+                    &strings(&["link", "set", "dev", exit.ifname().as_str(), "down"]),
+                    None,
+                )?;
+            }
+        }
         Ok(())
     }) {
         return report;
