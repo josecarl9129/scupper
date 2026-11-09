@@ -15,6 +15,9 @@ use support::{Root, Script, fixture, fresh};
 
 struct Host;
 impl NamespaceReader for Host {
+    fn gateway_marker(&self) -> io::Result<bool> {
+        Ok(false)
+    }
     fn read_namespace(&self, _: &Path) -> io::Result<PathBuf> {
         unreachable!()
     }
@@ -81,6 +84,14 @@ fn m2_check_codes_and_json_work_without_a_tty() {
     assert_eq!(code, 0);
     let status: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(status["schema"], 1);
+    assert!(
+        !status["observations"]["topology"]
+            .as_str()
+            .unwrap()
+            .contains("endpoint: Some")
+    );
+    let (_, text_status, _) = run(&sys, &root, &["status"]);
+    assert!(!text_status.contains("endpoint: Some"));
     assert_eq!(status["observations"]["supervisor"], "Some(NotRequired)");
     for (filename, value, code) in [
         (
@@ -109,6 +120,12 @@ fn m2_check_codes_and_json_work_without_a_tty() {
     let error: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(error["schema"], 1);
     assert_eq!(error["error"]["stage"], "Topology");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("boot.json")
+    );
     let (code, out, _) = run(&sys, &root, &["status"]);
     assert_eq!(code, 0);
     assert!(out.contains("boot.json"));
@@ -128,9 +145,14 @@ fn corrupt_m2_head_never_falls_back_to_m1() {
     assert_eq!(run(&sys, &root, &["check"]).0, 1);
     let (code, out, _) = run(&sys, &root, &["check", "--json"]);
     assert_eq!(code, 1);
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&out).unwrap()["schema"],
-        1
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(report["schema"], 1);
+    assert!(report["error"]["stage"].is_null());
+    assert!(
+        report["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid head")
     );
     let (code, out, _) = run(&sys, &root, &["status"]);
     assert_eq!(code, 0);
@@ -164,4 +186,73 @@ fn required_future_daemon_uses_code_five_only_after_data_path_passes() {
     assert_eq!(report["config_version"], 2);
     assert_eq!(report["verdict"]["Unsupervised"]["why"], "Dead");
     assert_eq!(run(&sys, &root, &["status"]).0, 0);
+}
+
+#[test]
+fn each_m2_marker_without_head_refuses_m1_fallback() {
+    struct NamespaceMarker;
+    impl NamespaceReader for NamespaceMarker {
+        fn read_namespace(&self, _: &Path) -> io::Result<PathBuf> {
+            unreachable!()
+        }
+        fn gateway_marker(&self) -> io::Result<bool> {
+            Ok(true)
+        }
+    }
+    for marker in [
+        "store",
+        "boot.json",
+        "state.json",
+        "gateway-id",
+        "namespace",
+    ] {
+        let sys = Script::new("ubuntu-24.04");
+        let root = Root::new(&sys.runner, &testing::handle().unwrap());
+        let state = root.path.join("partial-state");
+        let config = root.path.join("partial-config");
+        match marker {
+            "store" => std::fs::create_dir(&state).unwrap(),
+            "boot.json" | "state.json" => {
+                std::fs::create_dir(&state).unwrap();
+                std::fs::write(state.join(marker), "{}").unwrap();
+            }
+            "gateway-id" => {
+                std::fs::create_dir(&config).unwrap();
+                std::fs::write(config.join(marker), "gw1\n").unwrap();
+            }
+            _ => {}
+        }
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = cli::run_with(
+            ["scupper", "check", "--json"],
+            &Dependencies {
+                system: &sys,
+                namespaces: if marker == "namespace" {
+                    &NamespaceMarker
+                } else {
+                    &Host
+                },
+                privilege: &Host,
+                prompt: &Host,
+                sleeper: &cli::ThreadSleeper,
+                fs: &scupper::apply::RealFs,
+                topology: &cli::UnimplementedTopology,
+                exit_probe: &cli::UnimplementedExitProbe,
+                probe_exec: &sys,
+                state_root: &state,
+                config_root: &config,
+            },
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 1, "{marker}");
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("M2 layout without an applied head"),
+            "{marker}"
+        );
+        assert!(sys.calls.borrow().is_empty(), "{marker}: M1 collector ran");
+    }
 }

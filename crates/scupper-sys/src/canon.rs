@@ -308,6 +308,13 @@ pub fn observe_netns_ruleset(
             &crate::cmd::KernelCmd::Nft(crate::cmd::NftCmd::ListRulesetJson),
             EXEC_TIMEOUT,
         );
+        if live
+            == Err(ExecError::OutputTooLarge {
+                stream: Stream::Stdout,
+            })
+        {
+            return Ok((oversized_live_ruleset(), false));
+        }
         let executable = fs::read_link("/proc/self/exe").map_err(|error| file_error(&error))?;
         let outer = fs::read_link("/proc/self/ns/net").map_err(|error| file_error(&error))?;
         let file = PrivateRuleset::create(rendered)?;

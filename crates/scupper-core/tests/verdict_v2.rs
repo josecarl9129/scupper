@@ -61,6 +61,10 @@ fn current() -> Handshake {
 fn passing() -> Observations {
     Observations {
         topology: Some(Ok(TopologyObs {
+            host_wireguard_on_client_port: vec![],
+            errors: vec![],
+            links_complete: true,
+            addresses_complete: true,
             netns: NetnsObs::Present {
                 device: NETNS.device,
                 inode: NETNS.inode,
@@ -108,6 +112,7 @@ fn passing() -> Observations {
             tc_hooks: vec![],
         })),
         defaults: Some(Ok(DefaultRoutes {
+            violations: vec![],
             v4: dev("ex-ch1").into(),
             v6: DefaultRouteObs::Unreachable,
             extra: vec![],
@@ -116,6 +121,8 @@ fn passing() -> Observations {
         active: RouteTarget::Exit(config().exit_iface),
         handshakes: Some(Ok(BTreeMap::from([(exit_id(), current())]))),
         forwarding: Some(Ok(Forwarding {
+            client_v4: 1,
+            netns_sockets: vec![],
             hardening: vec![],
             v4: 1,
             v6: 0,
@@ -461,8 +468,8 @@ fn route_wrong_for_intent_extra_defaults_and_ipv6() {
     obs.active = RouteTarget::Unreachable;
     assert_degraded(
         &obs,
-        Degraded::RouteWrong {
-            client: "10.99.0.1".parse().unwrap(),
+        Degraded::DefaultRouteWrong {
+            family: scupper_core::render::Family::V4,
             got: dev("ex-ch1").into(),
             want: RouteTarget::Unreachable,
         },
@@ -481,8 +488,8 @@ fn route_wrong_for_intent_extra_defaults_and_ipv6() {
     defaults(&mut obs).v6 = dev("ex-ch1").into();
     assert_degraded(
         &obs,
-        Degraded::RouteWrong {
-            client: "::".parse().unwrap(),
+        Degraded::DefaultRouteWrong {
+            family: scupper_core::render::Family::V6,
             got: dev("ex-ch1").into(),
             want: RouteTarget::Unreachable,
         },
@@ -491,8 +498,8 @@ fn route_wrong_for_intent_extra_defaults_and_ipv6() {
     defaults(&mut obs).v4 = dev("wg0").into();
     assert_degraded(
         &obs,
-        Degraded::RouteWrong {
-            client: "10.99.0.1".parse().unwrap(),
+        Degraded::DefaultRouteWrong {
+            family: scupper_core::render::Family::V4,
             got: dev("wg0").into(),
             want: obs.active.clone(),
         },
@@ -965,11 +972,11 @@ fn missing_defaults_are_route_failures_for_each_family() {
         }
         assert_degraded(
             &obs,
-            Degraded::RouteWrong {
-                client: if v6 {
-                    "::".parse().unwrap()
+            Degraded::DefaultRouteWrong {
+                family: if v6 {
+                    scupper_core::render::Family::V6
                 } else {
-                    config().client_addr.into()
+                    scupper_core::render::Family::V4
                 },
                 got: DefaultRouteObs::Missing,
                 want: if v6 {
@@ -1552,9 +1559,29 @@ fn pin_rejects_different_exit_intent_before_closed_route_availability() {
     close_defaults(&mut obs);
     assert_degraded(
         &obs,
+        Degraded::DefaultRouteWrong {
+            family: scupper_core::render::Family::V4,
+            got: DefaultRouteObs::Unreachable,
+            want: RouteTarget::Exit(config().exit_iface),
+        },
+    );
+}
+
+#[test]
+fn exit_down_does_not_hide_foreign_or_extra_routes() {
+    let mut obs = passing();
+    topology(&mut obs).links[2].up = false;
+    defaults(&mut obs).v4 = DefaultRouteObs::Dev("foreign0".into());
+    assert_violation(&obs, Violation::ForeignLink("foreign0".into()));
+    defaults(&mut obs).v4 = DefaultRouteObs::Missing;
+    defaults(&mut obs)
+        .extra
+        .push(DefaultRouteObs::Dev("wg0".into()));
+    assert_degraded(
+        &obs,
         Degraded::RouteWrong {
             client: config().client_addr.into(),
-            got: DefaultRouteObs::Unreachable,
+            got: DefaultRouteObs::Dev("wg0".into()),
             want: RouteTarget::Exit(config().exit_iface),
         },
     );

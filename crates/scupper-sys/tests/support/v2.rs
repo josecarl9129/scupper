@@ -40,6 +40,8 @@ pub struct Script {
     pub fail: RefCell<Option<usize>>,
     pub probe: RefCell<String>,
     pub file_error: RefCell<bool>,
+    pub oversized_nft: RefCell<bool>,
+    pub route_failure: RefCell<Option<(i32, String)>>,
 }
 impl Script {
     pub fn new(runner: &str) -> Self {
@@ -54,7 +56,7 @@ impl Script {
             }
         }
         Self { runner: runner.into(), calls: RefCell::default(), replacements: RefCell::new(BTreeMap::from([("scupper--4-link.json".into(), links.to_string())])),
-            fail: RefCell::default(), file_error: RefCell::new(false),
+            fail: RefCell::default(), oversized_nft: RefCell::new(false), route_failure: RefCell::default(), file_error: RefCell::new(false),
             probe: RefCell::new(serde_json::json!({"result": {"class": "success", "ip": "8.8.4.4"},
                 "credentials": {"uids": [99,99,99,99], "gids": [98,98,98,98], "no_new_privs": true, "cap_bnd": 0},
                 "threads_before_setns": 1}).to_string()) }
@@ -71,6 +73,7 @@ impl Script {
             .cloned()
             .unwrap_or_else(|| fixture(&self.runner, name))
     }
+    #[allow(clippy::too_many_lines)] // One command table keeps target assertions next to fixtures.
     fn execute(
         &self,
         netns: bool,
@@ -90,7 +93,33 @@ impl Script {
             stderr: String::new(),
         };
         let arg = |index: usize| args.get(index).map_or("", String::as_str);
+        if netns && program == Program::Nft && *self.oversized_nft.borrow() {
+            return Err(ExecError::OutputTooLarge {
+                stream: scupper_sys::system::Stream::Stdout,
+            });
+        }
         let name = match program {
+            Program::Cat => {
+                assert!(netns);
+                assert!(args.len() == 1 && matches!(arg(0), "/proc/net/udp" | "/proc/net/udp6"));
+                let filename = format!(
+                    "scupper-proc-net-{}.txt",
+                    if arg(0).ends_with('6') { "udp6" } else { "udp" }
+                );
+                out.stdout = self
+                    .replacements
+                    .borrow()
+                    .get(&filename)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        fixture(&self.runner, "gwhost-proc-net-udp.txt")
+                            .lines()
+                            .next()
+                            .unwrap()
+                            .to_owned()
+                    });
+                return Ok(out);
+            }
             Program::Unshare => {
                 assert!(!netns);
                 assert_eq!(arg(0), "--net");
@@ -102,14 +131,38 @@ impl Script {
                 "scupper-nft-ruleset.json".into()
             }
             Program::Wg => {
-                assert!(netns);
-                format!("scupper-wg-{}-{}.txt", arg(1), arg(2))
+                if netns {
+                    format!("scupper-wg-{}-{}.txt", arg(1), arg(2))
+                } else {
+                    assert_eq!(arg(0), "show");
+                    if arg(1) == "interfaces" {
+                        out.stdout = self
+                            .replacements
+                            .borrow()
+                            .get("host-wg-interfaces")
+                            .cloned()
+                            .unwrap_or_default();
+                        return Ok(out);
+                    }
+                    assert_eq!(arg(2), "listen-port");
+                    format!("host-wg-{}-listen-port", arg(1))
+                }
             }
             Program::Sysctl => {
                 assert!(netns);
+                if arg(1) == "net.ipv4.conf.wg0.forwarding"
+                    && !self
+                        .replacements
+                        .borrow()
+                        .contains_key("scupper-sysctl-net.ipv4.conf.wg0.forwarding.txt")
+                {
+                    out.stdout = "1\n".into();
+                    return Ok(out);
+                }
                 format!("scupper-sysctl-{}.txt", arg(1))
             }
             Program::Tc if arg(1) == "qdisc" => {
+                assert!(netns);
                 let dev = arg(4);
                 let entries: Vec<serde_json::Value> =
                     serde_json::from_str(&self.text("scupper-tc-qdisc.json")).unwrap();
@@ -123,6 +176,7 @@ impl Script {
                 return Ok(out);
             }
             Program::Tc => {
+                assert!(netns);
                 let parent = arg(5);
                 if parent == "root" {
                     out.stdout = "[]".into();
@@ -132,6 +186,11 @@ impl Script {
             }
             Program::Ip if args.iter().any(|a| a == "get") => {
                 assert!(netns);
+                if let Some((status, stderr)) = &*self.route_failure.borrow() {
+                    out.status = Some(*status);
+                    out.stderr.clone_from(stderr);
+                    return Ok(out);
+                }
                 if arg(0) == "-6" {
                     out.status = Some(2);
                     // What the kernel answers for an `unreachable` IPv6 default (CI lab).
@@ -140,10 +199,40 @@ impl Script {
                 }
                 "scupper-route-get-public.txt".into()
             }
-            Program::Ip if arg(0) == "-d" => "scupper--4-link.json".into(),
-            Program::Ip if arg(1) == "addr" => format!("{host}--4-addr.json"),
-            Program::Ip if arg(2) == "rule" => format!("scupper-{}-rule.json", arg(1)),
+            Program::Ip if arg(0) == "-d" => {
+                assert!(netns);
+                "scupper--4-link.json".into()
+            }
+            Program::Ip if arg(1) == "addr" => {
+                format!("{host}--4-addr.json")
+            }
+            Program::Ip if arg(2) == "rule" => {
+                assert!(netns);
+                format!("scupper-{}-rule.json", arg(1))
+            }
             Program::Ip if arg(2) == "route" => {
+                assert!(netns);
+                if arg(5) == "all" || arg(5) == "local" {
+                    let text = self.text(&format!("scupper-{}-routes-all.json", arg(1)));
+                    if arg(5) == "all" {
+                        out.stdout = text;
+                    } else {
+                        let entries: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+                        out.stdout = serde_json::to_string(
+                            &entries
+                                .into_iter()
+                                .filter(|e| e["table"] == "local" || e["table"] == 255)
+                                .map(|mut entry| {
+                                    // Explicit table selection omits redundant table metadata.
+                                    entry.as_object_mut().unwrap().remove("table");
+                                    entry
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                        .unwrap();
+                    }
+                    return Ok(out);
+                }
                 if arg(4) == "default" {
                     let text = self.text(&format!("scupper-{}-route.json", arg(1)));
                     let entries: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
@@ -160,11 +249,7 @@ impl Script {
             }
             _ => return Err(ExecError::spawn("unexpected scripted command")),
         };
-        out.stdout = if name == "want.json" && !self.replacements.borrow().contains_key(&name) {
-            fixture(&self.runner, "scupper-nft-ruleset.json")
-        } else {
-            self.text(&name)
-        };
+        out.stdout = self.text(&name);
         Ok(out)
     }
 }

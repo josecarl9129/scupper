@@ -12,7 +12,7 @@ use ipnet::IpNet;
 use crate::{
     config::ExitId,
     parse::{Handshake, RouteLookup, UdpSocket},
-    render::RouteTarget,
+    render::{Family, RouteTarget},
 };
 
 pub use super::super::v1::{Probe, ProbeError};
@@ -144,6 +144,8 @@ impl From<RouteAnswer> for DefaultRouteObs {
 /// Main-table inventory summarized by the collector, distinct from intent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DefaultRoutes {
+    /// Unexpected routes outside main, retaining table, destination and device.
+    pub violations: Vec<Violation>,
     /// The observed IPv4 default, or explicit absence.
     pub v4: DefaultRouteObs,
     /// The single observed IPv6 default, even in IPv4-only M2.
@@ -156,6 +158,14 @@ pub struct DefaultRoutes {
 /// Complete containment inventory, collected independently of default routes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopologyObs {
+    /// Host `WireGuard` links using the configured client port.
+    pub host_wireguard_on_client_port: Vec<String>,
+    /// Per-item observation failures; known violations still take precedence.
+    pub errors: Vec<ProbeError>,
+    /// Whether links were successfully inventoried (required for missing links).
+    pub links_complete: bool,
+    /// Whether the address inventory was successfully collected and matched links.
+    pub addresses_complete: bool,
     /// Namespace identity.
     pub netns: NetnsObs,
     /// Complete link inventory, optionally including loopback.
@@ -166,7 +176,7 @@ pub struct TopologyObs {
     pub ruleset: RulesetObs,
     /// RPDB entries differing from kernel defaults, including missing defaults.
     pub extra_rules: Vec<String>,
-    /// Interfaces with traffic control beyond the baseline (including tcx/XDP).
+    /// Interfaces with traffic control beyond the baseline or XDP.
     pub tc_hooks: Vec<String>,
 }
 
@@ -180,6 +190,10 @@ pub enum RepairKind {
 /// Forwarding and the listening side of the client tunnel, observed together.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Forwarding {
+    /// IPv4 forwarding on the client ingress device.
+    pub client_v4: i64,
+    /// UDP sockets read inside the held namespace.
+    pub netns_sockets: Vec<UdpSocket>,
     /// Exact IPv4 forwarding sysctl value; only 1 passes.
     pub v4: i64,
     /// Hardening keys whose observed values differ from desired values.
@@ -216,7 +230,7 @@ pub enum ClientFault {
     PublicKey,
     /// `WireGuard` is listening on a different port.
     ListenPort,
-    /// No host UDP socket is bound to the configured port.
+    /// Host listener is absent or a socket uses the port inside the namespace.
     HostSocket,
 }
 
@@ -322,6 +336,17 @@ impl<T> NonEmpty<T> {
 /// Observed containment violations, all collected before availability decisions.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum Violation {
+    /// A parallel host `WireGuard` path uses the client listen port.
+    HostWireguardOnClientPort(String),
+    /// Unexpected local or other non-main route.
+    ExtraRoute {
+        /// Kernel table name or number.
+        table: String,
+        /// Destination prefix or default.
+        dst: String,
+        /// Output device, when present.
+        dev: Option<String>,
+    },
     /// Owned namespace does not exist.
     NetnsMissing,
     /// Namespace identity differs from the expected boot record inode.
@@ -368,7 +393,16 @@ pub enum Degraded {
     QuarantineNotEffective,
     /// Required IPv4 forwarding is not exactly 1.
     ForwardingDisabled,
-    /// Observed default or client lookup disagrees with required routing.
+    /// Observed family default disagrees with required routing.
+    DefaultRouteWrong {
+        /// Address family whose default is wrong.
+        family: Family,
+        /// Observed default.
+        got: DefaultRouteObs,
+        /// Required target.
+        want: RouteTarget,
+    },
+    /// Observed client lookup or extra main route disagrees with required routing.
     RouteWrong {
         /// Source being checked (gateway source for defaults).
         client: ClientAddr,

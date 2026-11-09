@@ -33,6 +33,31 @@ mount --bind "$1/var-lib" /var/lib
 exec nsenter --net=/run/netns/gwhost -- "$2" check --json
 "#;
 
+// Each row proves the intended stage, even when several verdicts share a code.
+fn verdict_matches(name: &str, report: &serde_json::Value) -> bool {
+    let verdict = &report["verdict"];
+    match name {
+        "default" => {
+            verdict["Degraded"]["DefaultRouteWrong"]["family"] == "V4"
+                && verdict["Degraded"]["DefaultRouteWrong"]["got"] == "Missing"
+        }
+        "ruleset" => verdict["Unprotected"]
+            .as_array()
+            .is_some_and(|found| found.iter().any(|v| v.get("RulesetDiffers").is_some())),
+        "local-table" => verdict["Unprotected"].as_array().is_some_and(|found| {
+            found.iter().any(|v| {
+                v["ExtraRoute"]["table"] == "local"
+                    && v["ExtraRoute"]["dst"] == "128.0.0.0/1"
+                    && v["ExtraRoute"]["dev"] == "wg0"
+            })
+        }),
+        "exit-down" => verdict["FailClosed"] == "NoHealthyExit",
+        _ => verdict["Protected"]["exit_ip"]
+            .as_str()
+            .is_some_and(|ip| ip.parse::<std::net::IpAddr>().is_ok()),
+    }
+}
+
 impl Lab {
     pub(super) fn check_v2_case(&mut self) -> Result<String> {
         let binary = fs::canonicalize(
@@ -46,6 +71,21 @@ impl Lab {
         let result = self.check_v2_faults(&binary, &root);
         // Restore the reference state even after an assertion/launcher failure.
         let restored = (|| {
+            // These faults may still be active after an assertion/launcher error.
+            let _ = self.cmd(
+                "scupper",
+                "ip",
+                &[
+                    "route",
+                    "del",
+                    "128.0.0.0/1",
+                    "dev",
+                    "wg0",
+                    "table",
+                    "local",
+                ],
+            );
+            let _ = self.cmd("gwhost", "ip", &["link", "del", "wg-legacy"]);
             self.cmd("scupper", "ip", &["link", "set", "ex-ch1", "up"])?;
             self.cmd(
                 "scupper",
@@ -174,7 +214,7 @@ impl Lab {
             detail: skip.map_or_else(|| report.to_string(), str::to_owned),
         });
         evidence::save_results(&self.artifacts, &self.rows)?;
-        if code != want && skip.is_none() {
+        if skip.is_none() && (code != want || !verdict_matches(name, report)) {
             // Diagnostic only: the namespace route tables at the time of the mismatch.
             let mut dump = Vec::new();
             for args in [
@@ -193,12 +233,13 @@ impl Lab {
                 dump.join("\n"),
             )?;
             return fail(format!(
-                "check-v2 {name}: wanted {want}, got {code}: {report}"
+                "check-v2 {name}: wanted {want} and its specific verdict, got {code}: {report}"
             ));
         }
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)] // Keep each injected fault beside its assertion and restoration.
     fn check_v2_faults(&mut self, binary: &Path, root: &Path) -> Result<String> {
         let (code, report) = self.check_result(binary, root)?;
         // Skip only a classified exit-path error after every local stage passed.
@@ -210,8 +251,43 @@ impl Lab {
         let reason =
             no_internet.then(|| format!("runner internet unavailable through provA: {report}"));
         self.check_row("healthy", 0, code, &report, reason.as_deref())?;
-        for fault in ["default", "ruleset", "exit-down"] {
+        for fault in [
+            "host-wg-other-port",
+            "default",
+            "ruleset",
+            "local-table",
+            "exit-down",
+        ] {
             let expected = match fault {
+                "host-wg-other-port" => {
+                    self.cmd(
+                        "gwhost",
+                        "ip",
+                        &["link", "add", "wg-legacy", "type", "wireguard"],
+                    )?;
+                    self.cmd(
+                        "gwhost",
+                        "wg",
+                        &["set", "wg-legacy", "listen-port", "51822"],
+                    )?;
+                    0
+                }
+                "local-table" => {
+                    self.cmd(
+                        "scupper",
+                        "ip",
+                        &[
+                            "route",
+                            "add",
+                            "128.0.0.0/1",
+                            "dev",
+                            "wg0",
+                            "table",
+                            "local",
+                        ],
+                    )?;
+                    2
+                }
                 "default" => {
                     self.cmd("scupper", "ip", &["route", "del", "default"])?;
                     3
@@ -233,7 +309,42 @@ impl Lab {
                 }
             };
             let (code, report) = self.check_result(binary, root)?;
-            self.check_row(fault, expected, code, &report, None)?;
+            if fault == "exit-down" {
+                let defaults: serde_json::Value = serde_json::from_str(&self.cmd(
+                    "scupper",
+                    "ip",
+                    &["-j", "route", "show", "default"],
+                )?)?;
+                if !defaults.as_array().is_some_and(Vec::is_empty) {
+                    return fail(format!("exit-down retained a default: {defaults}"));
+                }
+            }
+            let skip = reason.as_deref().filter(|_| {
+                fault == "default" && verdict_matches(fault, &report)
+                    || fault == "host-wg-other-port"
+                        && report["verdict"]["Degraded"]
+                            .get("ExitProbeFailed")
+                            .is_some()
+            });
+            self.check_row(fault, expected, code, &report, skip)?;
+            if fault == "local-table" {
+                self.cmd(
+                    "scupper",
+                    "ip",
+                    &[
+                        "route",
+                        "del",
+                        "128.0.0.0/1",
+                        "dev",
+                        "wg0",
+                        "table",
+                        "local",
+                    ],
+                )?;
+            }
+            if fault == "host-wg-other-port" {
+                self.cmd("gwhost", "ip", &["link", "del", "wg-legacy"])?;
+            }
             self.cmd("scupper", "ip", &["link", "set", "ex-ch1", "up"])?;
             self.cmd(
                 "scupper",
@@ -257,8 +368,58 @@ impl Lab {
             )?;
         }
         Ok(reason.map_or_else(
-            || "0,3,0,2,0,4,0".into(),
-            |reason| format!("skipped: {reason}; fault codes 3,2,4 verified"),
+            || "Protected and host wg on another port; DefaultRouteWrong, RulesetDiffers, ExtraRoute, NoHealthyExit; all restores Protected".into(),
+            |reason| format!("skipped healthy, host-wg-other-port, default and restores: {reason}; RulesetDiffers, ExtraRoute and NoHealthyExit verified"),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::verdict_matches;
+    use serde_json::json;
+
+    #[test]
+    fn lab_rows_require_specific_verdicts_and_healthy_exit_ip() {
+        let probe_failure = json!({"verdict":{"Degraded":{"ExitProbeFailed":"path"}}});
+        for row in [
+            "healthy",
+            "default",
+            "ruleset",
+            "local-table",
+            "exit-down",
+            "host-wg-other-port",
+            "restore-default",
+        ] {
+            assert!(!verdict_matches(row, &probe_failure), "{row}");
+        }
+        assert!(verdict_matches(
+            "healthy",
+            &json!({"verdict":{"Protected":{"exit_ip":"8.8.4.4"}}})
+        ));
+        assert!(!verdict_matches(
+            "healthy",
+            &json!({"verdict":{"Protected":{}}})
+        ));
+        assert!(verdict_matches(
+            "default",
+            &json!({"verdict":{"Degraded":{"DefaultRouteWrong":{"family":"V4","got":"Missing"}}}})
+        ));
+        assert!(verdict_matches(
+            "ruleset",
+            &json!({"verdict":{"Unprotected":[{"RulesetDiffers":{}}]}})
+        ));
+        assert!(!verdict_matches(
+            "ruleset",
+            &json!({"verdict":{"Unprotected":[{"ForeignLink":"eth0"}]}})
+        ));
+        assert!(verdict_matches(
+            "local-table",
+            &json!({"verdict":{"Unprotected":[{"ExtraRoute":{"table":"local","dst":"128.0.0.0/1","dev":"wg0"}}]}})
+        ));
+        assert!(verdict_matches(
+            "exit-down",
+            &json!({"verdict":{"FailClosed":"NoHealthyExit"}})
+        ));
     }
 }

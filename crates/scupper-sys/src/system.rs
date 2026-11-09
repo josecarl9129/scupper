@@ -24,6 +24,8 @@ const OUTPUT_CAP: usize = 1024 * 1024;
 /// A kernel utility selected without a shell or PATH lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Program {
+    /// Read fixed public procfs socket tables inside a namespace.
+    Cat,
     /// `WireGuard` inspection.
     Wg,
     /// Link and routing inspection.
@@ -49,6 +51,7 @@ impl Program {
     #[must_use]
     pub const fn default_path(self) -> &'static str {
         match self {
+            Self::Cat => "/usr/bin/cat",
             Self::Nsenter => "/usr/bin/nsenter",
             Self::Sysctl => "/usr/sbin/sysctl",
             Self::Conntrack => "/usr/sbin/conntrack",
@@ -65,6 +68,7 @@ impl Program {
 /// Validated executable paths; private fields prevent relative-path injection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Programs {
+    cat: PathBuf,
     wg: PathBuf,
     ip: PathBuf,
     nft: PathBuf,
@@ -79,6 +83,7 @@ pub struct Programs {
 impl Default for Programs {
     fn default() -> Self {
         Self {
+            cat: Program::Cat.default_path().into(),
             wg: Program::Wg.default_path().into(),
             ip: Program::Ip.default_path().into(),
             nft: Program::Nft.default_path().into(),
@@ -110,6 +115,7 @@ impl Programs {
                 return Err(ExecError::spawn("program path must be absolute"));
             }
             let destination = match program {
+                Program::Cat => &mut paths.cat,
                 Program::Nsenter => &mut paths.nsenter,
                 Program::Sysctl => &mut paths.sysctl,
                 Program::Conntrack => &mut paths.conntrack,
@@ -129,6 +135,7 @@ impl Programs {
     #[must_use]
     pub fn path(&self, program: Program) -> &Path {
         match program {
+            Program::Cat => &self.cat,
             Program::Nsenter => &self.nsenter,
             Program::Sysctl => &self.sysctl,
             Program::Conntrack => &self.conntrack,
@@ -1275,6 +1282,7 @@ mod tests {
             assert!(Programs::new([(Program::Wg, path)]).is_err());
         }
         for program in [
+            Program::Cat,
             Program::Wg,
             Program::Ip,
             Program::Nft,

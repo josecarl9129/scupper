@@ -3,7 +3,7 @@
 use crate::config::{ExitId, ExitIfname, GatewayId, ValidatedSite};
 
 /// Address family of a namespace default route.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum Family {
     /// IPv4 (the default family for `ip route`).
     V4,

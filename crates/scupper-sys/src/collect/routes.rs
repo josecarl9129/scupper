@@ -13,7 +13,7 @@ use scupper_core::{
     rules::IfName,
     verdict::v2::{
         ClientAddr, DefaultRouteObs, DefaultRoutes, HealthConfigV2, Probe, ProbeError, RouteAnswer,
-        RouteObs,
+        RouteObs, Violation,
     },
 };
 use std::net::IpAddr;
@@ -102,8 +102,138 @@ fn family_defaults(
     Ok((first, extra))
 }
 
+fn kernel_local(route: &RouteEntry, cfg: &HealthConfigV2, family: Family) -> bool {
+    if !matches!(route.protocol.as_deref(), Some("kernel" | "2"))
+        || route.gateway.is_some()
+        || route.from.is_some()
+    {
+        return false;
+    }
+    let Some(dev) = &route.dev else {
+        return false;
+    };
+    let Ok(lo4) = "127.0.0.1/8".parse::<ipnet::IpNet>() else {
+        return false;
+    };
+    let Ok(lo6) = "::1/128".parse::<ipnet::IpNet>() else {
+        return false;
+    };
+    let lo = [lo4, lo6];
+    let addresses = if dev == "lo" {
+        &lo[..]
+    } else {
+        let Some(addresses) = cfg.links.get(dev) else {
+            return false;
+        };
+        addresses.as_slice()
+    };
+    let RouteDestination::Prefix(dst) = route.dst else {
+        return false;
+    };
+    if family == Family::V6 && route.kind == RouteKind::Multicast {
+        return "ff00::/8"
+            .parse::<ipnet::IpNet>()
+            .is_ok_and(|multicast| dst == multicast);
+    }
+    addresses.iter().any(|address| {
+        if address.addr().is_ipv4() != (family == Family::V4)
+            || route.prefsrc.is_some_and(|source| source != address.addr())
+        {
+            return false;
+        }
+        match (route.kind, address) {
+            (RouteKind::Local, _) => {
+                dst.addr() == address.addr()
+                    && dst.prefix_len() == if family == Family::V4 { 32 } else { 128 }
+                    || dev == "lo" && family == Family::V4 && dst == address.trunc()
+            }
+            (RouteKind::Broadcast, ipnet::IpNet::V4(address)) => {
+                address.prefix_len() < 31
+                    && dst.prefix_len() == 32
+                    && (dst.addr() == IpAddr::V4(address.network())
+                        || dst.addr() == IpAddr::V4(address.broadcast()))
+            }
+            (RouteKind::Anycast, ipnet::IpNet::V6(address)) => {
+                dst.prefix_len() == 128
+                    && address.prefix_len() < 128
+                    && dst.addr() == IpAddr::V6(address.network())
+            }
+            _ => false,
+        }
+    })
+}
+
+fn extra_route(route: &RouteEntry) -> Violation {
+    let table = match &route.table {
+        RoutingTable::Main => "main".into(),
+        RoutingTable::Local => "local".into(),
+        RoutingTable::Default => "default".into(),
+        RoutingTable::Number(n) => n.to_string(),
+        RoutingTable::Named(name) => name.clone(),
+    };
+    let dst = match &route.dst {
+        RouteDestination::Default => "default".into(),
+        RouteDestination::Prefix(prefix) => prefix.to_string(),
+    };
+    Violation::ExtraRoute {
+        table,
+        dst,
+        dev: route.dev.clone(),
+    }
+}
+
+fn non_main_routes(
+    sys: &dyn System,
+    handle: &NetnsHandle,
+    cfg: &HealthConfigV2,
+    family: Family,
+) -> Probe<Vec<Violation>> {
+    let mut local = parse_ip_route(&observe(
+        sys,
+        handle,
+        KernelCmd::Ip(IpCmd::RouteShowJson {
+            family,
+            table: RouteTable::Local,
+        }),
+    )?)?;
+    // iproute2 may omit the table when the dump selected it explicitly. The
+    // generic parser defaults that absent field to main; here it means local.
+    for route in &mut local {
+        if route.table == RoutingTable::Main {
+            route.table = RoutingTable::Local;
+        }
+    }
+    let all = parse_ip_route(&observe(
+        sys,
+        handle,
+        KernelCmd::Ip(IpCmd::RouteShowJson {
+            family,
+            table: RouteTable::All,
+        }),
+    )?)?;
+    let mut found = Vec::new();
+    for route in &local {
+        if route.table != RoutingTable::Local || !kernel_local(route, cfg, family) {
+            found.push(extra_route(route));
+        }
+    }
+    for route in &all {
+        if !matches!(route.table, RoutingTable::Main | RoutingTable::Local)
+            || route.table == RoutingTable::Local && !kernel_local(route, cfg, family)
+        {
+            let violation = extra_route(route);
+            if !found.contains(&violation) {
+                found.push(violation);
+            }
+        }
+    }
+    Ok(found)
+}
+
 /// Observes default routes for both families and rejects extra main-table routes,
 /// permitting only connected kernel routes for configured tunnel prefixes.
+/// Local routes must match kernel entries for configured addresses and loopback;
+/// routes in every other table are containment violations.
 ///
 /// # Errors
 /// Returns command, malformed route and inconsistent snapshot errors.
@@ -115,7 +245,14 @@ pub fn defaults(
     let (v4, mut extra) = family_defaults(sys, handle, cfg, Family::V4)?;
     let (v6, extra6) = family_defaults(sys, handle, cfg, Family::V6)?;
     extra.extend(extra6);
-    Ok(DefaultRoutes { v4, v6, extra })
+    let mut violations = non_main_routes(sys, handle, cfg, Family::V4)?;
+    violations.extend(non_main_routes(sys, handle, cfg, Family::V6)?);
+    Ok(DefaultRoutes {
+        v4,
+        v6,
+        extra,
+        violations,
+    })
 }
 
 fn lookup(

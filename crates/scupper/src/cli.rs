@@ -86,6 +86,18 @@ pub trait NamespaceReader {
     /// Returns the symlink read error.
     fn read_namespace(&self, path: &Path) -> io::Result<PathBuf>;
 
+    /// Whether the owned namespace name exists, including an invalid handle.
+    ///
+    /// # Errors
+    /// Returns filesystem errors other than absence.
+    fn gateway_marker(&self) -> io::Result<bool> {
+        match std::fs::symlink_metadata("/run/netns/scupper") {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Opens the owned namespace once; all later commands borrow this handle.
     ///
     /// # Errors
@@ -295,7 +307,7 @@ where
             if cli.json {
                 let _ = serde_json::to_writer(
                     &mut *stdout,
-                    &serde_json::json!({"schema": 1, "error": error}),
+                    &serde_json::json!({"schema": 1, "error": json_error(None, &error)}),
                 );
                 let _ = writeln!(stdout);
             }
@@ -405,6 +417,9 @@ fn dispatch(
             if let Some(config) = m2_config(deps)? {
                 return m2_check(deps, &config, false, json, stdout, stderr);
             }
+            if json {
+                return Err("check --json requires an M2 layout".into());
+            }
             let report = check::run_check(deps.system, deps.topology, deps.exit_probe, &cfg)
                 .map_err(|error| error.to_string())?;
             writeln!(stdout, "{}", report.verdict).map_err(output_error)?;
@@ -470,6 +485,25 @@ struct AppliedConfig {
 fn m2_config(deps: &Dependencies<'_>) -> Result<Option<AppliedConfig>, String> {
     let store = scupper_sys::store::VersionStore::read_only(deps.state_root, deps.config_root);
     let Some(version) = store.head().map_err(|error| error.to_string())? else {
+        for path in [
+            deps.state_root.to_path_buf(),
+            deps.state_root.join("boot.json"),
+            deps.state_root.join("state.json"),
+            deps.config_root.join("gateway-id"),
+        ] {
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => return Err("M2 layout without an applied head".into()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("inspect M2 marker: {error}")),
+            }
+        }
+        if deps
+            .namespaces
+            .gateway_marker()
+            .map_err(|error| format!("inspect M2 namespace marker: {error}"))?
+        {
+            return Err("M2 layout without an applied head".into());
+        }
         return Ok(None);
     };
     let (text, meta) = store.read(version).map_err(|error| error.to_string())?;
@@ -497,11 +531,23 @@ fn m2_config(deps: &Dependencies<'_>) -> Result<Option<AppliedConfig>, String> {
     }))
 }
 
+fn json_error(stage: Option<scupper_core::verdict::v2::Stage>, message: &str) -> serde_json::Value {
+    serde_json::json!({"stage": stage, "message": message})
+}
+
+fn redact_endpoints(obs: &mut scupper_core::verdict::v2::Observations) {
+    if let Some(Ok(topology)) = &mut obs.topology {
+        for peer in topology.peers.values_mut().flatten() {
+            peer.endpoint = None;
+        }
+    }
+}
+
 fn status_error(stdout: &mut dyn Write, json: bool, error: &str) -> Result<u8, String> {
     if json {
         serde_json::to_writer(
             &mut *stdout,
-            &serde_json::json!({"schema": 1, "error": error}),
+            &serde_json::json!({"schema": 1, "error": json_error(None, error)}),
         )
         .map_err(|error| error.to_string())?;
         writeln!(stdout).map_err(output_error)?;
@@ -519,7 +565,7 @@ fn status_json(
     // Status retains a diagnostic representation of every stage, including
     // explicitly unrequested stages. Check's machine interface is the Report.
     let value = serde_json::json!({"schema": 1, "report": result.as_ref().ok(),
-    "error": result.as_ref().err(), "observations": {
+    "error": result.as_ref().err().map(|error| json_error(Some(error.stage), &error.source.to_string())), "observations": {
         "topology": format!("{:?}", obs.topology),
         "selection": format!("{:?}", obs.selection),
         "active": format!("{:?}", obs.active),
@@ -551,7 +597,7 @@ fn m2_check(
         }
         Err(error) => return Err(error),
     };
-    let (result, observations) = scupper_sys::check_v2::run_with_observations(
+    let (result, mut observations) = scupper_sys::check_v2::run_with_observations(
         &scupper_sys::check_v2::Dependencies {
             system: deps.system,
             probe_exec: deps.probe_exec,
@@ -565,6 +611,7 @@ fn m2_check(
         },
     );
     if status {
+        redact_endpoints(&mut observations);
         if json {
             status_json(stdout, &result, &observations)?;
             return Ok(0);
@@ -597,7 +644,7 @@ fn m2_check(
             if json {
                 serde_json::to_writer(
                     &mut *stdout,
-                    &serde_json::json!({"schema": 1, "error": error}),
+                    &serde_json::json!({"schema": 1, "error": json_error(Some(error.stage), &error.source.to_string())}),
                 )
                 .map_err(|error| error.to_string())?;
                 writeln!(stdout).map_err(output_error)?;

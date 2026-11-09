@@ -36,7 +36,7 @@ use std::{collections::BTreeSet, net::IpAddr, time::Duration};
 
 use crate::{
     parse::{Handshake, HandshakeAge, RouteLookup},
-    render::RouteTarget,
+    render::{Family, RouteTarget},
 };
 
 use super::v1::exit_ip_plausible;
@@ -88,6 +88,7 @@ pub fn violations(obs: &Observations, cfg: &HealthConfigV2) -> Option<NonEmpty<V
         topology_violations(topology, &obs.selection, cfg, &mut found);
     }
     if let Some(Ok(defaults)) = &obs.defaults {
+        found.extend(defaults.violations.clone());
         for answer in [&defaults.v4, &defaults.v6]
             .into_iter()
             .chain(&defaults.extra)
@@ -128,6 +129,12 @@ fn topology_violations(
     cfg: &HealthConfigV2,
     found: &mut Vec<Violation>,
 ) {
+    found.extend(
+        t.host_wireguard_on_client_port
+            .iter()
+            .cloned()
+            .map(Violation::HostWireguardOnClientPort),
+    );
     match t.netns {
         NetnsObs::Missing => found.push(Violation::NetnsMissing),
         NetnsObs::WrongInode => found.push(Violation::NetnsWrongInode),
@@ -157,7 +164,8 @@ fn topology_violations(
             .copied()
             .filter(|net| !matches!(net, ipnet::IpNet::V6(v6) if v6.addr().is_unicast_link_local()))
             .collect();
-        if let Some(expected) = cfg.links.get(&link.name)
+        if t.addresses_complete
+            && let Some(expected) = cfg.links.get(&link.name)
             && !same_prefixes(&addresses, expected)
         {
             found.push(Violation::ConfigMismatch(format!(
@@ -169,7 +177,7 @@ fn topology_violations(
     for name in cfg
         .links
         .keys()
-        .filter(|name| !seen.contains(name.as_str()))
+        .filter(|name| t.links_complete && !seen.contains(name.as_str()))
     {
         found.push(Violation::ForeignLink(name.clone()));
     }
@@ -231,6 +239,11 @@ fn route_violations(answer: &DefaultRouteObs, cfg: &HealthConfigV2, found: &mut 
 fn observation_error(obs: &Observations, cfg: &HealthConfigV2) -> Option<(Stage, ProbeError)> {
     // Supplied errors and incomplete answers outrank availability, even out of order.
     if let Some(Err(source)) = &obs.topology {
+        return Some((Stage::Topology, source.clone()));
+    }
+    if let Some(Ok(t)) = &obs.topology
+        && let Some(source) = t.errors.first()
+    {
         return Some((Stage::Topology, source.clone()));
     }
     if let Some(Ok(t)) = &obs.topology
@@ -328,6 +341,14 @@ fn route_wrong(client: IpAddr, got: &DefaultRouteObs, want: RouteTarget) -> Verd
     })
 }
 
+fn default_wrong(family: Family, got: &DefaultRouteObs, want: RouteTarget) -> Verdict {
+    Verdict::Degraded(Degraded::DefaultRouteWrong {
+        family,
+        got: got.clone(),
+        want,
+    })
+}
+
 fn defaults_failure(
     t: &TopologyObs,
     defaults: &DefaultRoutes,
@@ -355,8 +376,8 @@ fn defaults_failure(
         return Some(route_wrong(client, extra, obs.active.clone()));
     }
     if defaults.v6 != DefaultRouteObs::Unreachable {
-        return Some(route_wrong(
-            IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+        return Some(default_wrong(
+            Family::V6,
             &defaults.v6,
             RouteTarget::Unreachable,
         ));
@@ -365,8 +386,8 @@ fn defaults_failure(
     if matches!(obs.selection, Selection::Pin(_))
         && matches!(&obs.active, RouteTarget::Exit(iface) if iface != &cfg.exit_iface)
     {
-        return Some(route_wrong(
-            client,
+        return Some(default_wrong(
+            Family::V4,
             &defaults.v4,
             RouteTarget::Exit(cfg.exit_iface.clone()),
         ));
@@ -409,7 +430,7 @@ fn defaults_failure(
     if obs.active != expected
         || defaults.v4 != DefaultRouteObs::Dev(cfg.exit_iface.as_str().to_owned())
     {
-        return Some(route_wrong(client, &defaults.v4, obs.active.clone()));
+        return Some(default_wrong(Family::V4, &defaults.v4, obs.active.clone()));
     }
     None
 }
@@ -419,14 +440,19 @@ fn client_fault(f: &Forwarding, cfg: &HealthConfigV2) -> Option<ClientFault> {
         Some(ClientFault::PublicKey)
     } else if f.listen_port != cfg.listen_port {
         Some(ClientFault::ListenPort)
-    } else if !f.host_sockets.iter().any(|socket| {
-        socket.local.port() == cfg.listen_port
-            && (socket.local.ip().is_unspecified()
-                || cfg
-                    .uplink_addrs
-                    .iter()
-                    .any(|ip| ip.to_canonical() == socket.local.ip().to_canonical()))
-    }) {
+    } else if f
+        .netns_sockets
+        .iter()
+        .any(|socket| socket.local.port() == cfg.listen_port)
+        || !f.host_sockets.iter().any(|socket| {
+            socket.local.port() == cfg.listen_port
+                && (socket.local.ip().is_unspecified()
+                    || cfg
+                        .uplink_addrs
+                        .iter()
+                        .any(|ip| ip.to_canonical() == socket.local.ip().to_canonical()))
+        })
+    {
         Some(ClientFault::HostSocket)
     } else {
         None
@@ -514,7 +540,7 @@ pub fn next(obs: &Observations, cfg: &HealthConfigV2, now: u64) -> Next {
             now,
         );
     }
-    if forwarding.v4 != 1 {
+    if forwarding.v4 != 1 || forwarding.client_v4 != 1 {
         return report(
             Verdict::Degraded(Degraded::ForwardingDisabled),
             warnings,

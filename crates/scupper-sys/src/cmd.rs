@@ -19,6 +19,8 @@ use std::{
 pub enum RouteTable {
     /// Main routing table.
     Main,
+    /// Kernel local routing table.
+    Local,
     /// All routing tables, including local routes.
     All,
 }
@@ -166,6 +168,8 @@ pub enum ConntrackCmd {
 /// Commands permitted by the M2 kernel adapter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KernelCmd {
+    /// Read the selected public UDP socket table in the execution namespace.
+    ReadUdp(bool),
     /// Links, addresses, routes and rules.
     Ip(IpCmd),
     /// `WireGuard` public observations and constrained configuration.
@@ -203,6 +207,7 @@ impl IpCmd {
                 "table",
                 match table {
                     RouteTable::Main => "main",
+                    RouteTable::Local => "local",
                     RouteTable::All => "all",
                 },
             ]),
@@ -284,6 +289,14 @@ impl KernelCmd {
     #[must_use]
     pub fn render(&self) -> (Program, Vec<String>) {
         match self {
+            Self::ReadUdp(ipv6) => (
+                Program::Cat,
+                strings(&[if *ipv6 {
+                    "/proc/net/udp6"
+                } else {
+                    "/proc/net/udp"
+                }]),
+            ),
             Self::Ip(cmd) => (Program::Ip, cmd.argv()),
             Self::Wg(cmd) => (Program::Wg, cmd.argv()),
             Self::Nft(cmd) => (
