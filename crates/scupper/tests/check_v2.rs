@@ -50,7 +50,7 @@ fn run(sys: &Script, root: &Root, args: &[&str]) -> (u8, String, String) {
             prompt: &Host,
 
             probe_exec: sys,
-            writer_root: &root.path.join("writer"),
+            writer_root: &root.path,
             state_root: &root.path,
             config_root: &root.path,
         },
@@ -235,7 +235,7 @@ fn each_m2_marker_without_head_refuses_m1_fallback() {
                 prompt: &Host,
 
                 probe_exec: &sys,
-                writer_root: &root.path.join("writer"),
+                writer_root: &root.path,
                 state_root: &state,
                 config_root: &config,
             },
@@ -251,4 +251,40 @@ fn each_m2_marker_without_head_refuses_m1_fallback() {
         );
         assert!(sys.calls.borrow().is_empty(), "{marker}: M1 collector ran");
     }
+}
+
+#[test]
+fn check_reports_the_applied_version_when_the_head_is_pending() {
+    use scupper_sys::{
+        lock::WriterLock,
+        state::StateFile,
+        store::{MetaInput, VersionStore},
+    };
+    let sys = Script::new("ubuntu-24.04");
+    fresh(&sys);
+    let root = Root::new(&sys.runner, &testing::handle().unwrap());
+    let writer = WriterLock::acquire(root.path.join("writer")).unwrap();
+    StateFile::open(&root.path, Some(&writer))
+        .unwrap()
+        .update(&writer, |state| state.applied_version = Some(1))
+        .unwrap();
+    let store = VersionStore::open(&root.path, Some(&writer)).unwrap();
+    let candidate = support::site_text(&sys.runner).replace("1420", "1380");
+    store
+        .commit(
+            &writer,
+            Some(1),
+            &candidate,
+            MetaInput {
+                actor: "test".into(),
+                at: 2,
+                reason: "pending candidate".into(),
+            },
+        )
+        .unwrap();
+    drop(writer);
+    let (code, out, err) = run(&sys, &root, &["check", "--json"]);
+    assert_eq!(code, 0, "{out} {err}");
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(report["config_version"], 1);
 }

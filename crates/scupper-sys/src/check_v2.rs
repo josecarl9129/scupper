@@ -27,17 +27,19 @@ pub struct Dependencies<'a> {
     pub probe_exec: &'a dyn ProbeExec,
     /// Held namespace, or None when the owned name is missing.
     pub handle: Option<&'a NetnsHandle>,
-    /// Persistent boot and safety-state root (production /var/lib/scupper).
+    /// Per-boot identity root (production /run/scupper).
+    pub run_root: &'a Path,
+    /// Persistent safety-state root (production /var/lib/scupper).
     pub state_root: &'a Path,
 }
 
 /// Applied immutable site and version, never a mirror or pending candidate.
 pub struct Config<'a> {
-    /// Validated head configuration.
+    /// Validated applied configuration.
     pub site: &'a ValidatedSite,
     /// Local gateway ID.
     pub gateway: &'a GatewayId,
-    /// Head version and exact source digest.
+    /// Applied version and exact source digest.
     pub stamp: VersionStamp,
 }
 
@@ -83,7 +85,7 @@ fn prepare(
 ) -> Probe<(HealthConfigV2, crate::state::State, Option<ProbeError>)> {
     // Preconditions are observations too: inventory containment even when boot,
     // persisted intent or host addresses cannot be read.
-    let identity = collect::boot_identity(deps.state_root);
+    let identity = collect::boot_identity(deps.run_root);
     let health_result = identity
         .clone()
         .and_then(|identity| health(deps, cfg, identity));

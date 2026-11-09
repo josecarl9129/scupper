@@ -1,5 +1,6 @@
 //! Disposable Linux network-namespace reference lab for the M2 leak suite.
 mod addresses;
+mod boot;
 mod check_v2;
 mod cleanup;
 mod command;
@@ -68,6 +69,7 @@ struct Lab {
     rows: Vec<Row>,
     cleaned: bool,
     next_source_port: u16,
+    exit_port: u16,
 }
 
 /// Runs the reference namespace lab, preserving captures, policies and reports.
@@ -125,6 +127,7 @@ fn run_inner(
         rows: Vec::new(),
         cleaned: false,
         next_source_port: 41000,
+        exit_port: 51821,
     };
     let outcome: Result<()> = (|| {
         lab.preflight()?;
@@ -132,6 +135,7 @@ fn run_inner(
         lab.build()?;
         Lab::verify_handle_execution()?;
         lab.service_check(&mut Vec::new())?;
+        lab.boot_cases()?;
         if let Some(dir) = capture_fixtures {
             lab.fixtures(dir)?;
         }

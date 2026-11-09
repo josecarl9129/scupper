@@ -163,7 +163,7 @@ JSON/exit codes, bounded property tests and a golden mixed JSON report.
 # Reference namespace leak lab
 
 On a disposable Linux VM, install `wireguard-tools nftables iproute2 tcpdump
-dnsmasq-base util-linux iputils-ping conntrack`, build `cargo build -p xtask --release --locked`, then:
+dnsmasq-base util-linux iputils-ping conntrack slirp4netns`, build `cargo build -p xtask --release --locked`, then:
 
 ```console
 sudo timeout 1200 target/release/xtask leaktest --artifacts lab-out --capture-fixtures lab-out/fixtures
@@ -175,8 +175,10 @@ or its randomly named private directory under `/run`. It creates no addresses,
 routes, firewall rules or sysctl changes in the invoking host's network
 namespace. Staging veths briefly exist there before moving; run on a disposable
 host without a network manager that configures unknown links. The M1 shell lab
-was retired in M2. This reference builder will be replaced by
-`scupper boot` in M2-2j.
+was retired in M2. The reference builder now invokes `scupper boot`.
+`conntrack` is required for an existing namespace rebuild: after loading and
+verifying the rules, boot flushes conntrack before enabling forwarding. A missing
+binary or failed flush stops boot with forwarding off.
 
 The allocation lives in `src/lab/addresses.rs` (WAN address first):
 
@@ -282,3 +284,20 @@ injections, missing or extra violations, empty auxiliary captures, v6 on ex-ch1,
 antispoof trace correlation, explicit DNS decoding and local probe errors
 (including an occupied UDP source port through the CLI). The actual namespace
 suite runs in CI on both Ubuntu 24.04 and 22.04; it is not part of `cargo test`.
+
+Boot rebuilds first close forwarding, disable every foreign or wrong-kind link
+using its raw kernel name, and clear clsact/ingress and XDP on all namespace links.
+Foreign links remain down and boot fails for operator attention. Other RPDB or
+main-table route drift still requires the operator or planner to remove it.
+Pin and Prefer naming an unconfigured exit both fail closed; no fallback exit is
+chosen. Missing state retains Disconnected intent and forwarding=0 because the
+quarantine latch is unknown. Failed attempts holding the writer lock replace
+boot.json with their failure report (publication failures are reported too).
+
+L9 tests fresh crash prefixes and L9b rebuilds a live namespace with hardening
+drift, killing at steps 1–6. Whenever wg0 is configured, the client session is
+reset and a fresh gateway handshake is required before canaries. The oracle
+requires increasing wg0 receive bytes and the UDP marker in a wg0 capture, plus
+a clean uplink capture; steps 6–7 also require provider transport as a positive
+control. Host leftovers are checked down and peerless before retry. The expected
+ruleset is independently loaded from `render_netns` output in scupper-verify.
