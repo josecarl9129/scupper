@@ -337,16 +337,12 @@ fn fixture_wg(name: &str, field: WgField, out: &str) -> Result<(), ParseError> {
 }
 
 #[test]
-fn captured_rule_selectors_when_available() -> Result<(), Box<dyn Error>> {
+fn captured_rule_selectors() -> Result<(), Box<dyn Error>> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/netns");
     for runner in ["ubuntu-22.04", "ubuntu-24.04"] {
         for family in ["v4", "v6"] {
             let path = root.join(runner).join(format!("rules-{family}.json"));
-            // Skip until CI commits the captures. Once committed, their presence
-            // makes these value assertions mandatory on every test run.
-            if !path.exists() {
-                continue;
-            }
+            // Captured in CI by `xtask leaktest --capture-fixtures` (mandatory).
             let rules = parse_ip_rule(&fs::read_to_string(path)?)?;
             let lookup = |table| {
                 rules

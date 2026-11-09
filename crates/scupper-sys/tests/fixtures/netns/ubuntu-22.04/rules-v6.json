@@ -1,0 +1,1 @@
+[{"priority":0,"src":"all","table":"local"},{"priority":32765,"src":"fd00:99::","srclen":64,"table":"106"},{"priority":32766,"src":"all","table":"main"}]
