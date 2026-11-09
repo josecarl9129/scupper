@@ -1,31 +1,24 @@
-//! The v1 command line with injectable operating-system and interaction boundaries.
+//! M2 commands with injectable operating-system and interaction boundaries.
 
 use std::{
     ffi::OsString,
     io::{self, IsTerminal, Write},
-    net::IpAddr,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
 };
-
-use clap::{Parser, Subcommand, error::ErrorKind};
 
 use crate::{
-    apply::{self, Fs, RULESET_PATH, RealFs},
     canon,
-    check::{self, ExitProbe, TopologySource},
-    parse::HandshakeAge,
-    probe::{BoundHttpsProbe, default_targets},
-    rules::{self, V1Config},
-    system::{ExecError, ExecOutput, Program, RealSystem, SYSTEMCTL_TIMEOUT, System},
-    topology::HostTopology,
-    verdict::{self, HealthConfig, M1Topology, Probe, ProbeError, Warning},
+    system::{RealSystem, System},
 };
+use clap::{Parser, Subcommand, error::ErrorKind};
+
+mod config;
+use config::ConfigCommand;
 
 #[derive(Parser)]
 #[command(name = "scupper", version, about = "Fail-closed VPN gateway")]
 struct Cli {
-    /// Render a schema-1 machine-readable report.
+    /// Render a schema-1 machine-readable health report (check/status).
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
@@ -56,25 +49,16 @@ enum Command {
     Status,
     /// Check protection and return the verdict as an exit code.
     Check,
-    /// Start the exit tunnel and wait up to ten seconds for a fresh handshake.
-    Connect,
-    /// Stop the exit tunnel and verify the kill switch.
-    ///
-    /// Over the SSH wrapper without a TTY, --yes is required.
-    Disconnect {
-        /// Skip confirmation.
-        #[arg(long)]
-        yes: bool,
+    /// Inspect and version the M2 site configuration.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
     },
-    /// Print the generated nftables ruleset.
-    Rules,
-    /// Validate, replace and load /etc/nftables.conf.
-    ///
-    /// Over the SSH wrapper without a TTY, --yes is required.
-    Apply {
-        /// Skip confirmation.
+    /// Print head's rendered namespace ruleset or compare it with live rules.
+    Rules {
+        /// Show a canonical diff against the live scupper namespace.
         #[arg(long)]
-        yes: bool,
+        diff: bool,
     },
 }
 
@@ -126,6 +110,21 @@ impl NamespaceReader for ProcNamespaces {
 pub trait Privilege {
     /// Whether the effective uid is zero.
     fn is_root(&self) -> bool;
+
+    /// Local account name recorded in configuration history.
+    ///
+    /// # Errors
+    /// Returns account database read errors or an unmapped effective uid.
+    fn user_name(&self) -> io::Result<String> {
+        let uid = rustix::process::geteuid().as_raw().to_string();
+        std::fs::read_to_string("/etc/passwd")?
+            .lines()
+            .find_map(|line| {
+                let fields: Vec<_> = line.split(':').collect();
+                (fields.get(2) == Some(&uid.as_str())).then(|| fields[0].to_owned())
+            })
+            .ok_or_else(|| io::Error::other("effective uid has no local account name"))
+    }
 }
 
 /// Reads the host's effective uid through rustix.
@@ -140,7 +139,7 @@ impl Privilege for EffectiveUid {
 
 /// Confirmation boundary, including detection of interactive input and output.
 pub trait Prompt {
-    /// Whether both input and prompt output are terminals.
+    /// Whether input, preview output and prompt output are terminals.
     fn is_terminal(&self) -> bool;
 
     /// Shows the optional preview, then asks the question; the default is no.
@@ -156,7 +155,7 @@ pub struct TerminalPrompt;
 
 impl Prompt for TerminalPrompt {
     fn is_terminal(&self) -> bool {
-        io::stdin().is_terminal() && io::stderr().is_terminal()
+        io::stdin().is_terminal() && io::stdout().is_terminal() && io::stderr().is_terminal()
     }
 
     fn confirm(&self, question: &str, preview: Option<&str>) -> io::Result<bool> {
@@ -178,49 +177,6 @@ pub fn parse_confirmation(answer: &str) -> bool {
     matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
-/// Waiting and monotonic clock boundary for the connect polling loop.
-pub trait Sleeper {
-    /// Current monotonic instant, independent of wall-clock corrections.
-    fn now(&self) -> Instant;
-
-    /// Waits for the requested duration.
-    fn sleep(&self, duration: Duration);
-}
-
-/// Host thread sleeper.
-#[derive(Debug, Default)]
-pub struct ThreadSleeper;
-
-impl Sleeper for ThreadSleeper {
-    fn now(&self) -> Instant {
-        Instant::now()
-    }
-
-    fn sleep(&self, duration: Duration) {
-        std::thread::sleep(duration);
-    }
-}
-
-/// Placeholder containment source retained for injected command tests.
-#[derive(Debug, Default)]
-pub struct UnimplementedTopology;
-
-impl TopologySource for UnimplementedTopology {
-    fn observe(&self, _sys: &dyn System, _cfg: &V1Config) -> Probe<M1Topology> {
-        Err(ProbeError::setup("not implemented in this build"))
-    }
-}
-
-/// Placeholder bound exit probe retained for injected command tests.
-#[derive(Debug, Default)]
-pub struct UnimplementedExitProbe;
-
-impl ExitProbe for UnimplementedExitProbe {
-    fn probe(&self, _cfg: &V1Config) -> Probe<IpAddr> {
-        Err(ProbeError::setup("not implemented in this build"))
-    }
-}
-
 /// Dependencies shared by commands; M2 checks read the validated immutable head.
 pub struct Dependencies<'a> {
     /// Persistent M2 config, boot and state root.
@@ -233,18 +189,12 @@ pub struct Dependencies<'a> {
     pub system: &'a dyn System,
     /// Network namespace identities for the canon safety guard.
     pub namespaces: &'a dyn NamespaceReader,
-    /// Ruleset storage.
-    pub fs: &'a dyn Fs,
     /// Effective uid check.
     pub privilege: &'a dyn Privilege,
     /// Terminal detection and confirmations.
     pub prompt: &'a dyn Prompt,
-    /// Connect polling delays.
-    pub sleeper: &'a dyn Sleeper,
-    /// Containment observations.
-    pub topology: &'a dyn TopologySource,
-    /// Bound public exit-address observation.
-    pub exit_probe: &'a dyn ExitProbe,
+    /// Global writer lock directory (`/run/scupper` in production).
+    pub writer_root: &'a Path,
 }
 
 /// Runs the CLI against the host using only default executable paths.
@@ -262,12 +212,9 @@ where
             probe_exec: &RealSystem::default(),
             system: &RealSystem::default(),
             namespaces: &ProcNamespaces,
-            fs: &RealFs,
             privilege: &EffectiveUid,
             prompt: &TerminalPrompt,
-            sleeper: &ThreadSleeper,
-            topology: &HostTopology,
-            exit_probe: &BoundHttpsProbe::new(default_targets()),
+            writer_root: Path::new("/run/scupper"),
         },
         &mut io::stdout(),
         &mut io::stderr(),
@@ -317,46 +264,6 @@ where
     }
 }
 
-fn disconnect(
-    deps: &Dependencies<'_>,
-    cfg: &V1Config,
-    yes: bool,
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-) -> Result<u8, String> {
-    require_root(deps, "disconnect")?;
-    confirm(
-        deps,
-        "disconnect",
-        yes,
-        "Block all client traffic now? [y/N]",
-        None,
-    )?;
-    systemctl(deps.system, "stop", cfg)?;
-    if let Ok(topology) = deps.topology.observe(deps.system, cfg) {
-        if let Some(violations) = verdict::topology_violations(&topology) {
-            writeln!(
-                stderr,
-                "exit tunnel stopped; kill switch is NOT in place: {}",
-                verdict::Verdict::Unprotected(violations)
-            )
-            .map_err(output_error)?;
-            Ok(2)
-        } else {
-            writeln!(stdout, "traffic is now blocked").map_err(output_error)?;
-            Ok(0)
-        }
-    } else {
-        writeln!(
-            stderr,
-            "exit tunnel stopped; kill switch state unknown, run 'scupper check'"
-        )
-        .map_err(output_error)?;
-        Ok(1)
-    }
-}
-
-#[allow(clippy::too_many_lines)] // Keep command dispatch and M1 behavior together.
 fn dispatch(
     command: Command,
     json: bool,
@@ -364,7 +271,9 @@ fn dispatch(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<u8, String> {
-    let cfg = V1Config::default();
+    if json && matches!(command, Command::Config { .. } | Command::Rules { .. }) {
+        return Err("--json is supported only for check and status".into());
+    }
     match command {
         Command::Probe { request } => {
             let outcome = scupper_sys::probe_child::child_main(&request)?;
@@ -397,82 +306,18 @@ fn dispatch(
             stdout,
             stderr,
         )),
-        Command::Status => {
-            match m2_config(deps) {
-                Ok(Some(config)) => return m2_check(deps, &config, true, json, stdout, stderr),
-                Err(error) => {
-                    return status_error(stdout, json, &error);
-                }
-                Ok(None) => {}
-            }
-            // Status is informational, including when observations fail.
-            let _ = writeln!(
-                stdout,
-                "{}",
-                check::run_status(deps.system, deps.topology, &cfg)
-            );
-            Ok(0)
-        }
-        Command::Check => {
-            if let Some(config) = m2_config(deps)? {
-                return m2_check(deps, &config, false, json, stdout, stderr);
-            }
-            if json {
-                return Err("check --json requires an M2 layout".into());
-            }
-            let report = check::run_check(deps.system, deps.topology, deps.exit_probe, &cfg)
-                .map_err(|error| error.to_string())?;
-            writeln!(stdout, "{}", report.verdict).map_err(output_error)?;
-            for warning in report.warnings {
-                writeln!(stderr, "warning: {}", warning_text(warning)).map_err(output_error)?;
-            }
-            Ok(report.verdict.exit_code())
-        }
-        Command::Rules => {
-            write!(
-                stdout,
-                "{}",
-                rules::ruleset(&cfg).map_err(|error| error.to_string())?
-            )
-            .map_err(output_error)?;
-            Ok(0)
-        }
-        Command::Connect => {
-            require_root(deps, "connect")?;
-            connect(deps, &cfg, stdout, stderr)
-        }
-        Command::Disconnect { yes } => disconnect(deps, &cfg, yes, stdout, stderr),
-        Command::Apply { yes } => {
-            require_root(deps, "apply")?;
-            let rules = rules::ruleset(&cfg).map_err(|error| error.to_string())?;
-            let destination = Path::new(RULESET_PATH);
-            deps.fs
-                .check_target(destination)
-                .map_err(|error| format!("inspect {RULESET_PATH}: {error}"))?;
-            let old = match deps.fs.read(destination) {
-                Ok(old) => Some(old),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-                Err(error) => return Err(format!("read {RULESET_PATH}: {error}")),
+        Command::Status | Command::Check => {
+            let status = matches!(command, Command::Status);
+            let config = match m2_config(deps) {
+                Ok(Some(config)) => config,
+                Ok(None) => return Err("not an M2 gateway (no /var/lib/scupper store)".into()),
+                Err(error) if status => return status_error(stdout, json, &error),
+                Err(error) => return Err(error),
             };
-            let unchanged = old.as_deref() == Some(&rules);
-            if unchanged {
-                writeln!(stdout, "ruleset unchanged; reloading").map_err(output_error)?;
-            } else {
-                let preview = old.as_deref().map(|old| apply::ruleset_diff(old, &rules));
-                confirm(
-                    deps,
-                    "apply",
-                    yes,
-                    "Replace /etc/nftables.conf and load it? [y/N]",
-                    preview.as_deref(),
-                )?;
-            }
-            apply::apply(deps.system, deps.fs, &rules)?;
-            if !unchanged {
-                writeln!(stdout, "ruleset written and loaded").map_err(output_error)?;
-            }
-            Ok(0)
+            m2_check(deps, &config, status, json, stdout, stderr)
         }
+        Command::Config { command } => config::run(command, deps, stdout),
+        Command::Rules { diff } => config::rules(deps, diff, stdout),
     }
 }
 
@@ -507,27 +352,12 @@ fn m2_config(deps: &Dependencies<'_>) -> Result<Option<AppliedConfig>, String> {
         return Ok(None);
     };
     let (text, meta) = store.read(version).map_err(|error| error.to_string())?;
-    let site = scupper_core::config::parse_site(&text).map_err(|error| error.to_string())?;
-    let site = scupper_core::config::validate(site).map_err(|_| "invalid applied site")?;
-    let gateway = scupper_core::config::GatewayId(
-        RealFs
-            .read(&deps.config_root.join("gateway-id"))
-            .map_err(|error| format!("read gateway-id: {error}"))?
-            .trim()
-            .into(),
-    );
-    if site.gateway(&gateway).is_none() {
-        return Err("gateway-id is absent from applied site".into());
-    }
-    let mut sha256 = [0; 32];
-    for (index, byte) in sha256.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&meta.sha256[index * 2..index * 2 + 2], 16)
-            .map_err(|_| "invalid applied digest")?;
-    }
+    let site = config::validate_text(&text)?;
+    let gateway = config::gateway_id(deps, &site)?;
     Ok(Some(AppliedConfig {
         site,
         gateway,
-        stamp: scupper_core::render::VersionStamp { version, sha256 },
+        stamp: config::stamp(version, &meta.sha256)?,
     }))
 }
 
@@ -702,98 +532,5 @@ fn confirm(
         Ok(())
     } else {
         Err(format!("{command} cancelled"))
-    }
-}
-
-fn systemctl(sys: &dyn System, action: &str, cfg: &V1Config) -> Result<(), String> {
-    let output = sys
-        .run(
-            Program::Systemctl,
-            &[action.into(), format!("wg-quick@{}", cfg.exit_iface)],
-            SYSTEMCTL_TIMEOUT,
-        )
-        .map_err(|error| format!("systemctl {action}: {error}"))?;
-    if output.status == Some(0) {
-        Ok(())
-    } else {
-        Err(format!(
-            "systemctl {action} failed (status {:?}): {}",
-            output.status,
-            output.stderr.trim()
-        ))
-    }
-}
-
-// Caps handshake command execution at the remaining polling budget.
-struct PollSystem<'a> {
-    inner: &'a dyn System,
-    clock: &'a dyn Sleeper,
-    deadline: Instant,
-}
-
-impl System for PollSystem<'_> {
-    fn run(
-        &self,
-        program: Program,
-        args: &[String],
-        timeout: Duration,
-    ) -> Result<ExecOutput, ExecError> {
-        let remaining = self.deadline.saturating_duration_since(self.clock.now());
-        self.inner.run(program, args, timeout.min(remaining))
-    }
-
-    fn now_unix_secs(&self) -> u64 {
-        self.inner.now_unix_secs()
-    }
-}
-
-fn connect(
-    deps: &Dependencies<'_>,
-    cfg: &V1Config,
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-) -> Result<u8, String> {
-    systemctl(deps.system, "start", cfg)?;
-    let health = HealthConfig::from(cfg);
-    let sys = PollSystem {
-        inner: deps.system,
-        clock: deps.sleeper,
-        deadline: deps.sleeper.now() + Duration::from_secs(10),
-    };
-    let mut warned = false;
-    while deps.sleeper.now() < sys.deadline {
-        let observed = check::observe_handshake(&sys, cfg);
-        let now = sys.now_unix_secs();
-        let handshake = match observed {
-            Ok(handshake) => handshake,
-            Err(_) if deps.sleeper.now() >= sys.deadline => break,
-            Err(error) => return Err(error.to_string()),
-        };
-        if matches!(handshake.age_at(now), HandshakeAge::InFuture(_)) && !warned {
-            writeln!(stderr, "warning: {}", warning_text(Warning::ClockSkew))
-                .map_err(output_error)?;
-            warned = true;
-        }
-        if check::handshake_is_fresh(handshake, &health, now) && deps.sleeper.now() <= sys.deadline
-        {
-            writeln!(stdout, "exit tunnel has a fresh handshake").map_err(output_error)?;
-            return Ok(0);
-        }
-        let remaining = sys.deadline.saturating_duration_since(deps.sleeper.now());
-        if !remaining.is_zero() {
-            deps.sleeper.sleep(Duration::from_secs(1).min(remaining));
-        }
-    }
-    writeln!(
-        stdout,
-        "exit tunnel started; no fresh handshake within ten seconds"
-    )
-    .map_err(output_error)?;
-    Ok(3)
-}
-
-fn warning_text(warning: Warning) -> &'static str {
-    match warning {
-        Warning::ClockSkew => "handshake timestamp is in the future (clock skew?)",
     }
 }

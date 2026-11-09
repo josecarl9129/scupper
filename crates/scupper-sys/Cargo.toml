@@ -9,10 +9,6 @@ publish.workspace = true
 [features]
 testing = []
 
-[[test]]
-name = "check"
-required-features = ["testing"]
-
 [dependencies]
 scupper-core.workspace = true
 rustix = { workspace = true, features = ["stdio"] }

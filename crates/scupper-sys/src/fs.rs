@@ -1,4 +1,4 @@
-//! Validate and durably replace the v1 boot ruleset before loading it.
+//! Crash-safe file replacement shared by the M2 store, mirror and state.
 
 use std::{
     fs::{self, File, OpenOptions},
@@ -7,11 +7,6 @@ use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
-
-use crate::system::{EXEC_TIMEOUT, Program, System};
-
-/// Fixed v1 boot ruleset destination.
-pub const RULESET_PATH: &str = "/etc/nftables.conf";
 
 /// An open, exclusively created temporary file.
 pub trait TempFile: Write {
@@ -38,9 +33,9 @@ impl TempFile for File {
     }
 }
 
-/// Filesystem operations needed for previewing and installing the ruleset.
+/// Filesystem operations for durable persistence.
 pub trait Fs {
-    /// Refuses a symlink at the boot ruleset destination, including dangling links.
+    /// Refuses a symlink at the file destination, including dangling links.
     ///
     /// # Errors
     /// Returns a refusal or an inspection error; a missing target is allowed.
@@ -92,7 +87,7 @@ impl Fs for RealFs {
     fn check_target(&self, path: &Path) -> io::Result<()> {
         match fs::symlink_metadata(path) {
             Ok(metadata) if metadata.is_symlink() => {
-                Err(io::Error::other("refusing symlinked boot ruleset"))
+                Err(io::Error::other("refusing symlinked file"))
             }
             Ok(_) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -194,56 +189,6 @@ impl Drop for PendingTemp<'_> {
     }
 }
 
-/// Validates, installs, and loads the default boot ruleset.
-///
-/// The temporary file is removed on every failure before rename. Once renamed,
-/// errors explicitly identify the new validated version that remains on disk.
-///
-/// # Errors
-/// Returns a user-facing diagnostic for any filesystem or nft failure.
-pub fn apply(sys: &dyn System, fs: &dyn Fs, rules: &str) -> Result<(), String> {
-    let directory = Path::new("/etc");
-    let destination = Path::new(RULESET_PATH);
-    fs.cleanup_stale(directory)
-        .map_err(|error| format!("clean stale temporary rulesets: {error}"))?;
-    fs.check_target(destination)
-        .map_err(|error| format!("inspect {RULESET_PATH}: {error}"))?;
-    match fs.read(destination) {
-        Ok(old) if old == rules => {
-            nft(sys, &["-c", "-f", RULESET_PATH])?;
-            return nft(sys, &["-f", RULESET_PATH]);
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("read {RULESET_PATH}: {error}")),
-    }
-    let installed = std::cell::Cell::new(false);
-    let result = durable_replace(
-        fs,
-        destination,
-        rules.as_bytes(),
-        0o644,
-        &|path| nft(sys, &["-c", "-f", &path.to_string_lossy()]).map_err(io::Error::other),
-        &|step| {
-            if step == DurableStep::Renamed {
-                installed.set(true);
-            }
-            Ok(())
-        },
-    )
-    .map_err(|error| {
-        error
-            .to_string()
-            .replace("temporary file", "temporary ruleset")
-    })
-    .and_then(|()| nft(sys, &["-f", RULESET_PATH]));
-    result.map_err(|error| {
-        if installed.get() {
-            format!("{error}; the file on disk at {RULESET_PATH} is the new, validated version; the live ruleset was not changed by this run")
-        } else { error }
-    })
-}
-
 /// Completed steps of an atomic durable replacement, exposed for fault injection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DurableStep {
@@ -281,7 +226,7 @@ pub(crate) fn durable_directory(path: &Path) -> io::Result<()> {
     RealFs.sync_dir(parent)
 }
 
-// Shared by M1 apply, the config head and mirror, rendered files, and state.json.
+// Shared by the config head and mirror, rendered files, and state.json.
 // A failed pre-rename step removes its temporary file; post-rename errors leave
 // the complete new file in place. `prepare` sees the synced, still-private file.
 pub(crate) fn durable_replace(
@@ -337,62 +282,6 @@ pub(crate) fn durable_replace(
 
 fn context(step: &'static str) -> impl FnOnce(io::Error) -> io::Error {
     move |error| io::Error::new(error.kind(), format!("{step}: {error}"))
-}
-
-fn nft(sys: &dyn System, args: &[&str]) -> Result<(), String> {
-    let output = sys
-        .run(
-            Program::Nft,
-            &args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(),
-            EXEC_TIMEOUT,
-        )
-        .map_err(|error| format!("nft: {error}"))?;
-    if output.status == Some(0) {
-        Ok(())
-    } else {
-        let diagnostic = if args.first() == Some(&"-c") {
-            output.stderr.lines().next().unwrap_or_default()
-        } else {
-            output.stderr.trim()
-        };
-        Err(format!(
-            "nft failed (status {:?}): {diagnostic}",
-            output.status
-        ))
-    }
-}
-
-/// Produces a unified diff containing one complete-file hunk.
-///
-/// Keeping the entire ruleset visible makes the small v1 policy reviewable.
-#[must_use]
-pub fn ruleset_diff(old: &str, new: &str) -> String {
-    if old == new {
-        return String::new();
-    }
-    let mut diff = format!(
-        "--- {RULESET_PATH}\n+++ {RULESET_PATH} (generated)\n@@ -{} +{} @@\n",
-        diff_range(old),
-        diff_range(new)
-    );
-    for (prefix, contents) in [('-', old), ('+', new)] {
-        for line in contents.split_inclusive('\n') {
-            diff.push(prefix);
-            diff.push_str(line);
-            if !line.ends_with('\n') {
-                diff.push_str("\n\\ No newline at end of file\n");
-            }
-        }
-    }
-    diff
-}
-
-fn diff_range(text: &str) -> String {
-    match text.lines().count() {
-        0 => "0,0".to_owned(),
-        1 => "1".to_owned(),
-        count => format!("1,{count}"),
-    }
 }
 
 #[cfg(test)]

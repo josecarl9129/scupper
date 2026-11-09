@@ -1,8 +1,8 @@
 //! Strict, crash-safe persistence of operator selection and quarantine.
 
-pub use crate::apply::DurableStep;
+pub use crate::fs::DurableStep;
 use crate::{
-    apply::{Fs, RealFs, durable_directory, durable_replace},
+    fs::{Fs, RealFs, durable_directory, durable_replace},
     lock::WriterGuard,
 };
 pub use scupper_core::verdict::v2::Selection;

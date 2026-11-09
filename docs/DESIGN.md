@@ -415,6 +415,8 @@ Ubuntu 22.04, Ubuntu 24.04 and Debian 12.
 
 ### 5.1 M1: v1 parity ruleset
 
+The v1 host-layout commands were retired in M2; the pure v1 renderer and golden remain as regression tests.
+
 `fn ruleset(cfg: &V1Config) -> Result<String, ConfigError>` renders
 `tests/golden/ruleset.golden` byte for byte: v1's ruleset plus the post-NAT
 egress chain (ADR 0032), reproduced here:

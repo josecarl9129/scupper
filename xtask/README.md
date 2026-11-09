@@ -174,8 +174,8 @@ root and refuses occupied namespace names, resolver directories, staging links,
 or its randomly named private directory under `/run`. It creates no addresses,
 routes, firewall rules or sysctl changes in the invoking host's network
 namespace. Staging veths briefly exist there before moving; run on a disposable
-host without a network manager that configures unknown links. The M1
-`lab/run.sh` remains independent. This reference builder will be replaced by
+host without a network manager that configures unknown links. The M1 shell lab
+was retired in M2. This reference builder will be replaced by
 `scupper boot` in M2-2j.
 
 The allocation lives in `src/lab/addresses.rs` (WAN address first):

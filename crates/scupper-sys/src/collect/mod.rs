@@ -11,9 +11,9 @@ pub use routes::{defaults, routes};
 pub use topology::topology;
 
 use crate::{
-    apply::{Fs, RealFs},
     canon::command_result,
     cmd::{KernelCmd, WgCmd, run_cmd},
+    fs::{Fs, RealFs},
     netns::NetnsHandle,
     probe_child::{ProbeExec, ProbeKind, ProbeRequest, Url, run_probe},
     state::{State, StateFile, StateRead},

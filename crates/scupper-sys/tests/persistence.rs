@@ -4,7 +4,7 @@
 use rustix::fs::{CWD, Mode, mkfifoat};
 use scupper_core::config::{ExitId, SecretKind, SecretName, parse_site};
 use scupper_sys::{
-    apply::DurableStep,
+    fs::DurableStep,
     lock::{WriterGuard, WriterLock},
     secrets::{SecretError, SecretFile},
     state::{Quarantine, Selection, State, StateFile, StateRead},

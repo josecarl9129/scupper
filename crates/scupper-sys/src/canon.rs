@@ -1,7 +1,4 @@
-//! Whole-host ruleset equality using kernel canonicalization in a private netns.
-//!
-//! M1 uses no cache. Caching is an optional optimization of DESIGN §5.1; even
-//! without it, a difference is confirmed by a fresh canonicalization/live read.
+//! Namespace ruleset equality using kernel canonicalization in a private netns.
 
 use std::{
     collections::hash_map::RandomState,
@@ -16,9 +13,8 @@ use std::{
 use serde_json::Value;
 
 use crate::{
-    rules::{self, V1Config},
     system::{EXEC_TIMEOUT, ExecError, ExecOutput, Program, Stream, System},
-    verdict::{Probe, ProbeError, RulesetObs},
+    verdict::{Probe, ProbeError},
 };
 
 pub use scupper_core::canon::{
@@ -161,21 +157,6 @@ fn unshare_argv(executable: &Path, outer_netns: &Path, file: &Path) -> Probe<Vec
     ])
 }
 
-fn want(sys: &dyn System, cfg: &V1Config) -> Probe<String> {
-    let rendered = rules::ruleset(cfg).map_err(|error| ProbeError::setup(&error.to_string()))?;
-    // Resolve in the parent: /proc/self/exe in the child would name unshare.
-    let executable = fs::read_link("/proc/self/exe").map_err(|error| file_error(&error))?;
-    let outer_netns = fs::read_link("/proc/self/ns/net").map_err(|error| file_error(&error))?;
-    let file = PrivateRuleset::create(&rendered)?;
-    // The canon child uses default program paths, not the parent's overrides.
-    command(
-        sys,
-        Program::Unshare,
-        &unshare_argv(&executable, &outer_netns, &file.path())?,
-        CANON_TIMEOUT,
-    )
-}
-
 fn isolated_ruleset(
     sys: &dyn System,
     path: &Path,
@@ -315,65 +296,67 @@ pub fn observe_netns_ruleset(
         {
             return Ok((oversized_live_ruleset(), false));
         }
-        let executable = fs::read_link("/proc/self/exe").map_err(|error| file_error(&error))?;
-        let outer = fs::read_link("/proc/self/ns/net").map_err(|error| file_error(&error))?;
-        let file = PrivateRuleset::create(rendered)?;
-        let mut args = unshare_argv(&executable, &outer, &file.path())?;
-        args.splice(
-            6..6,
-            [
-                "--gateway-netns".into(),
-                format!("net:[{}]", handle.identity().1),
-            ],
-        );
-        let want = command(sys, Program::Unshare, &args, CANON_TIMEOUT)
-            .and_then(|text| Ok(canonicalize(&text)?));
-        let live = command_result(live).and_then(|text| Ok(canonicalize(&text)?));
-        match (want, live) {
-            (Ok(want), Ok(live)) => compare_rulesets(&want, &live),
-            (Err(first), Err(second)) => Err(combined_error(first, &[second])),
-            (Err(error), _) | (_, Err(error)) => Err(error),
-        }
+        let (want, live) = canonical_pair(sys, handle, rendered, live)?;
+        compare_rulesets(&want, &live)
     };
     let (observation, confirm) = once()?;
     Ok(if confirm { once()?.0 } else { observation }.into())
 }
 
-// The boolean requests confirmation of an ordinary ruleset difference.
-fn compare_once(sys: &dyn System, cfg: &V1Config) -> Probe<(RulesetObs, bool)> {
-    let live = sys.run(
-        Program::Nft,
-        &["-j".into(), "list".into(), "ruleset".into()],
-        EXEC_TIMEOUT,
-    );
-    if live
-        == Err(ExecError::OutputTooLarge {
-            stream: Stream::Stdout,
-        })
-    {
-        return Ok((oversized_live_ruleset(), false));
-    }
-    // Otherwise collect both sides even if one fails, preserving both diagnostics.
-    let want = want(sys, cfg).and_then(|json| Ok(canonicalize(&json)?));
-    let live = command_result(live).and_then(|json| Ok(canonicalize(&json)?));
-    let (want, live) = match (want, live) {
-        (Ok(want), Ok(live)) => (want, live),
-        (Err(first), Err(second)) => return Err(combined_error(first, &[second])),
-        (Err(error), _) | (_, Err(error)) => return Err(error),
-    };
-    compare_rulesets(&want, &live)
-}
-
-/// Observes complete host ruleset equality, confirming any difference once.
+/// Reads canonical rendered and live rulesets for a held namespace.
+/// Shares the exact comparison's isolated loader and metadata stripping.
 ///
 /// # Errors
-/// Returns execution, permission, file or JSON errors as observation errors.
-pub fn observe_ruleset(sys: &dyn System, cfg: &V1Config) -> Probe<RulesetObs> {
-    let (observation, confirm) = compare_once(sys, cfg)?;
-    if confirm {
-        compare_once(sys, cfg).map(|(observation, _)| observation)
+/// Returns namespace, command, output-limit, JSON or temporary-file errors.
+pub fn netns_rulesets(
+    sys: &dyn System,
+    handle: &crate::netns::NetnsHandle,
+    rendered: &str,
+) -> Probe<(Value, Value)> {
+    let live = crate::cmd::run_cmd(
+        sys,
+        crate::system::ExecTarget::Netns(handle),
+        &crate::cmd::KernelCmd::Nft(crate::cmd::NftCmd::ListRulesetJson),
+        EXEC_TIMEOUT,
+    );
+    let (want, live) = canonical_pair(sys, handle, rendered, live)?;
+    if compare_rulesets(&want, &live)?.1 {
+        let live = crate::cmd::run_cmd(
+            sys,
+            crate::system::ExecTarget::Netns(handle),
+            &crate::cmd::KernelCmd::Nft(crate::cmd::NftCmd::ListRulesetJson),
+            EXEC_TIMEOUT,
+        );
+        canonical_pair(sys, handle, rendered, live)
     } else {
-        Ok(observation)
+        Ok((want, live))
+    }
+}
+
+fn canonical_pair(
+    sys: &dyn System,
+    handle: &crate::netns::NetnsHandle,
+    rendered: &str,
+    live: Result<ExecOutput, ExecError>,
+) -> Probe<(Value, Value)> {
+    let executable = fs::read_link("/proc/self/exe").map_err(|error| file_error(&error))?;
+    let outer = fs::read_link("/proc/self/ns/net").map_err(|error| file_error(&error))?;
+    let file = PrivateRuleset::create(rendered)?;
+    let mut args = unshare_argv(&executable, &outer, &file.path())?;
+    args.splice(
+        6..6,
+        [
+            "--gateway-netns".into(),
+            format!("net:[{}]", handle.identity().1),
+        ],
+    );
+    let want = command(sys, Program::Unshare, &args, CANON_TIMEOUT)
+        .and_then(|text| Ok(canonicalize(&text)?));
+    let live = command_result(live).and_then(|text| Ok(canonicalize(&text)?));
+    match (want, live) {
+        (Ok(want), Ok(live)) => Ok((want, live)),
+        (Err(first), Err(second)) => Err(combined_error(first, &[second])),
+        (Err(error), _) | (_, Err(error)) => Err(error),
     }
 }
 

@@ -8,7 +8,7 @@
 //! deadlock even in one process; the two locks must use distinct directories.
 
 use crate::{
-    apply::{DurableStep, Fs, RealFs, durable_directory, durable_replace},
+    fs::{DurableStep, Fs, RealFs, durable_directory, durable_replace},
     lock::{WriterGuard, WriterLock},
 };
 use scupper_core::config::{parse_site, validate};
