@@ -7,6 +7,7 @@ pub mod config;
 pub mod dns;
 pub mod failover;
 pub mod parse;
+pub mod planner;
 pub mod render;
 pub mod rules;
 pub mod verdict;

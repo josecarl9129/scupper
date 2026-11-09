@@ -33,6 +33,8 @@ netns Nft -j list ruleset
 host Unshare --net -- <executable> canon --outer-netns <identity> --gateway-netns <identity> <render>
 netns Sysctl -n net.ipv4.ip_forward
 netns Sysctl -n net.ipv6.conf.all.forwarding
+netns Sysctl -n net.ipv4.conf.default.forwarding
+netns Sysctl -n net.ipv6.conf.default.forwarding
 netns Sysctl -n net.ipv4.conf.all.rp_filter
 netns Sysctl -n net.ipv4.conf.default.rp_filter
 netns Sysctl -n net.ipv4.conf.ex-ch1.rp_filter

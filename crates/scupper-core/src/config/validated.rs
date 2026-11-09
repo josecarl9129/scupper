@@ -517,3 +517,9 @@ mod render_tests {
         );
     }
 }
+
+// Multi-exit planner properties use the same internal-fixture boundary as the
+// renderer tests above. Public M2 validation must continue to reject N > 1.
+#[cfg(test)]
+#[path = "../planner/multi_exit_tests.rs"]
+mod planner_properties;

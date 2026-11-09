@@ -241,12 +241,17 @@ fn sysctls_write_forwarding_before_all_hardening_values() {
     for forwarding in [true, false] {
         let values = desired_sysctls(&links, forwarding);
         assert_eq!(
-            values[..2]
+            values[..4]
                 .iter()
                 .map(|value| (value.key.to_string(), value.value.clone()))
                 .collect::<Vec<_>>(),
-            ["net.ipv4.ip_forward", "net.ipv6.conf.all.forwarding"]
-                .map(|key| (key.into(), u8::from(forwarding).to_string()))
+            [
+                "net.ipv4.ip_forward",
+                "net.ipv6.conf.all.forwarding",
+                "net.ipv4.conf.default.forwarding",
+                "net.ipv6.conf.default.forwarding"
+            ]
+            .map(|key| (key.into(), u8::from(forwarding).to_string()))
         );
         let expected = [
             "net.ipv4.conf.all.rp_filter",
@@ -289,13 +294,13 @@ fn sysctls_write_forwarding_before_all_hardening_values() {
             "net.netfilter.nf_conntrack_tcp_loose",
         ];
         assert_eq!(
-            values[2..]
+            values[4..]
                 .iter()
                 .map(|value| value.key.to_string())
                 .collect::<Vec<_>>(),
             expected
         );
-        assert!(values[2..].iter().all(|value| value.value == "0"));
+        assert!(values[4..].iter().all(|value| value.value == "0"));
         assert_eq!(
             values
                 .iter()
@@ -309,7 +314,7 @@ fn sysctls_write_forwarding_before_all_hardening_values() {
         assert_eq!(values, desired_sysctls(&reversed, forwarding));
     }
     let empty = desired_sysctls(&[], false);
-    assert_eq!(empty.len(), 20);
+    assert_eq!(empty.len(), 22);
     assert!(empty.iter().all(|value| value.value == "0"));
 }
 

@@ -70,6 +70,7 @@ fn every_namespace_fixture() -> Result<(), Box<dyn Error>> {
                         i64::from(
                             name.ends_with("ip_forward.txt")
                                 || name.ends_with("all.forwarding.txt")
+                                || name.ends_with("default.forwarding.txt")
                         )
                     );
                 })
@@ -111,7 +112,7 @@ fn every_namespace_fixture() -> Result<(), Box<dyn Error>> {
             };
             assert!(result.is_ok(), "{}: {result:?}", path.display());
         }
-        assert_eq!(counts, [4, 4, 8, 4, 16, 32, 2, 10, 2, 2, 2]);
+        assert_eq!(counts, [4, 4, 8, 4, 16, 34, 2, 10, 2, 2, 2]);
     }
     Ok(())
 }

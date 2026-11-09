@@ -929,11 +929,14 @@ version (stay on the applied version, alert).
 
 ### Budgets and fighting
 
-- At most **3 repairs per object per 10 min** (monotonic clock). When
-  exhausted: stop repairing that object, emit `RepairSuppressed`, and for
-  safety drift (ruleset, foreign link, tc) **set forwarding 0 and the
-  quarantine latch** (ADR 0031): `state.json` records
-  `quarantine {reason, object, since}` (fsynced); boot step 6 and every
+- At most **3 Restore repairs per object per 10 min** (monotonic clock);
+  for safety drift (ruleset, foreign link, tc) the budget is per drift
+  class, so changing names or handles does not reset it. Tighten repairs
+  are never budgeted. When exhausted: stop restoring that object, emit
+  `RepairSuppressed`, and for safety drift **set forwarding 0 and the
+  quarantine latch** (ADR 0031): the latch is held in memory before the
+  first step, forwarding goes to 0, the drift is tightened away, then
+  `state.json` records `quarantine {reason, object, since}` (fsynced); boot step 6 and every
   planner and repair step refuse to raise forwarding while it is set; only
   `scupper repair clear` or a verified full `scupper apply` removes it, with
   an `AdminAction` event. If the latch cannot be persisted, it holds in

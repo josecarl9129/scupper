@@ -109,6 +109,8 @@ pub fn desired_sysctls(links: &[IfName], forwarding: bool) -> Vec<Sysctl> {
     for (family, scope, name) in [
         (Ipv4, Scope::Global, "ip_forward"),
         (Ipv6, Scope::All, "forwarding"),
+        (Ipv4, Scope::Default, "forwarding"),
+        (Ipv6, Scope::Default, "forwarding"),
     ] {
         values.push(Sysctl {
             key: SysctlKey {
