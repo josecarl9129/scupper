@@ -176,7 +176,7 @@ impl Lab {
             }
         }
         let (code, report) = self.check_result(&Self::boot_binary()?, &root)?;
-        if code != 4 || report["verdict"]["FailClosed"] != "Disconnected" {
+        if code != 4 || report["verdict"]["FailClosed"] != "AdminDisconnected" {
             return fail(format!("L14 check: {code}: {report}"));
         }
         let writer = WriterLock::acquire(root.join("run/scupper"))?;
