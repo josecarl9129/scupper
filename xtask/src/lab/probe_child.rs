@@ -129,21 +129,9 @@ impl Lab {
         restored_route
     }
     pub(super) fn restore_probe_child_routes(&mut self) -> Result<()> {
-        self.cmd(
-            "scupper",
-            "ip",
-            &[
-                "route",
-                "replace",
-                A.exit_net,
-                "dev",
-                "ex-ch1",
-                "scope",
-                "link",
-                "src",
-                A.exit_inner,
-            ],
-        )?;
+        // The reference namespace has no provider-subnet route (ex-ch1 carries a /32 and
+        // DESIGN §5.3 allows only the default routes besides kernel routes); restoring one
+        // here once left a stray route that check v2 rightly reported.
         self.cmd(
             "scupper",
             "ip",
