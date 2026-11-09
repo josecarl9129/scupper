@@ -639,3 +639,19 @@ fn bridge_policy_requires_arp_and_both_ping_exchanges() {
         assert!(!evidence::contained(&classify_frames(&remaining)));
     }
 }
+
+/// nft rejects `...; } }` on one line (a closing brace after a chain needs a newline);
+/// every inline ruleset in the lab must be written with newlines.
+#[test]
+fn inline_nft_rulesets_have_no_single_line_closing_braces() {
+    for (name, source) in [
+        ("topology.rs", include_str!("topology.rs")),
+        ("probe_child.rs", include_str!("probe_child.rs")),
+        ("check_v2.rs", include_str!("check_v2.rs")),
+    ] {
+        assert!(
+            !source.contains("; } }"),
+            "{name} contains a one-line nft ruleset"
+        );
+    }
+}

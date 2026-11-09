@@ -149,7 +149,7 @@ impl Lab {
             self.runner.dwell(Duration::from_millis(100))?;
         }
         self.runner.input(&super::command::Invocation::new("wan", "nft", &["-f", "-"]),
-            Some(b"table ip lab_internet { chain postrouting { type nat hook postrouting priority srcnat; policy accept; oifname \"lab-uplink\" masquerade; } }\n"))?;
+            Some(b"table ip lab_internet { chain postrouting { type nat hook postrouting priority srcnat; policy accept; oifname \"lab-uplink\" masquerade;\n\t}\n}\n"))?;
         Ok(())
     }
     fn build_gateway(&mut self) -> Result<()> {
