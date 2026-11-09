@@ -933,6 +933,27 @@ fn regression_link_local_addresses_are_ignored() {
 }
 
 #[test]
+fn missing_default_with_exit_link_down_fails_closed() {
+    // The kernel drops a down link's routes (CI lab, exit link set down): fail closed (4).
+    let mut obs = passing();
+    defaults(&mut obs).v4 = DefaultRouteObs::Missing;
+    if let Some(Ok(topology)) = &mut obs.topology {
+        for link in &mut topology.links {
+            if link.name == config().exit_iface.as_str() {
+                link.up = false;
+            }
+        }
+    }
+    let Next::Done(Ok(report)) = next(&obs, &config(), NOW) else {
+        panic!("expected a verdict");
+    };
+    assert_eq!(
+        report.verdict,
+        Verdict::FailClosed(FailClosed::NoHealthyExit)
+    );
+}
+
+#[test]
 fn missing_defaults_are_route_failures_for_each_family() {
     for v6 in [false, true] {
         let mut obs = passing();

@@ -392,6 +392,19 @@ fn defaults_failure(
             _ => FailClosed::NoHealthyExit,
         }));
     }
+    // The kernel removes a down link's routes, so a down (or absent) exit link leaves
+    // the v4 default missing: nothing can leave, the exit is simply down (fail closed).
+    // A missing default while the exit link is up stays degraded (route wrong).
+    let exit_up = t
+        .links
+        .iter()
+        .any(|link| link.name == cfg.exit_iface.as_str() && link.up);
+    if defaults.v4 == DefaultRouteObs::Missing && !exit_up {
+        return Some(Verdict::FailClosed(match &obs.selection {
+            Selection::Pin(exit) => FailClosed::PinnedExitDown(exit.clone()),
+            _ => FailClosed::NoHealthyExit,
+        }));
+    }
     let expected = RouteTarget::Exit(cfg.exit_iface.clone());
     if obs.active != expected
         || defaults.v4 != DefaultRouteObs::Dev(cfg.exit_iface.as_str().to_owned())
