@@ -739,6 +739,7 @@ instead of waiting for the 30 s standby cadence. If every probed exit fails
 at once, the probe target or the gateway is suspect: no switch, verdict 3
 `CommonModeProbeFailure`, alert. With a single configured exit, probe
 failures alone never cause a switch.
+A comparison witness must be non-Down with a successful latest probe within the window (a same-round failure invalidates it), and switches including automatic failback are blocked when all recent observed probes fail, regardless of Down or unprobed standbys.
 
 **No comparison available** (cold standbys only, or the hot standby is
 itself Down): if the active exit has failed its probes for 60 s with a fresh
