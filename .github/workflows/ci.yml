@@ -211,6 +211,9 @@ jobs:
       - name: Build reference lab
         run: timeout 600 cargo build -p xtask --release --locked
 
+      - name: Build privilege-dropping probe child
+        run: timeout 600 cargo build -p scupper --locked
+
       - name: Run reference namespace lab
         run: sudo timeout 1200 target/release/xtask leaktest --artifacts lab-out --capture-fixtures lab-out/fixtures
 

@@ -12,6 +12,7 @@ use std::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Resource {
     Namespace(String),
+    User(String),
     Link(String),
     Directory(PathBuf),
 }
@@ -37,6 +38,15 @@ impl Registry {
         while let Some(resource) = self.resources.pop() {
             let outcome: Result<()> = (|| {
                 match &resource {
+                    Resource::User(user) => {
+                        runner.run(&Invocation::new("", "userdel", &[user]))?;
+                        if fs::read_to_string("/etc/group")?
+                            .lines()
+                            .any(|line| line.split(':').next() == Some(user.as_str()))
+                        {
+                            runner.run(&Invocation::new("", "groupdel", &[user]))?;
+                        }
+                    }
                     Resource::Namespace(ns) => {
                         if PathBuf::from(format!("/run/netns/{ns}")).exists() {
                             runner.run(&Invocation::new("", "ip", &["netns", "delete", ns]))?;

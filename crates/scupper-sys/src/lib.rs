@@ -8,6 +8,7 @@ pub mod check;
 pub mod cmd;
 pub mod netns;
 pub mod probe;
+pub mod probe_child;
 pub mod system;
 pub mod topology;
 

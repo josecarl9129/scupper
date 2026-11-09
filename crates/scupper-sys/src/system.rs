@@ -553,6 +553,42 @@ impl RealSystem {
     }
 }
 
+// The probe has its own single-threaded namespace entry; its stdin is a file,
+// never a request pipe. Reuse the same capture/deadline/group-kill machinery.
+/// Runs an explicitly selected executable with an inherited file on stdin.
+/// Applies the same output cap, environment, process-group termination and wall
+/// deadline as kernel-command execution. Paths must come from trusted code.
+///
+/// # Errors
+/// Returns spawn, capture, output-limit or timeout errors.
+pub fn execute_file_command(
+    mut command: Command,
+    file: std::fs::File,
+    timeout: Duration,
+) -> Result<ExecOutput, ExecError> {
+    command
+        .env_clear()
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .env("LC_ALL", "C")
+        .current_dir("/")
+        .process_group(0)
+        .stdin(Stdio::from(file))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let started = Instant::now();
+    let mut child = command
+        .spawn()
+        .map_err(|error| ExecError::spawn(&error.to_string()))?;
+    let deadline = started + timeout + Duration::from_millis(900);
+    let mut readers = Vec::with_capacity(2);
+    let result = collect(&mut child, started, timeout, &mut readers, None);
+    if result.is_err() {
+        terminate(child, deadline);
+    }
+    join_readers(readers, deadline);
+    result
+}
+
 fn namespace_result(
     target: ExecTarget<'_>,
     result: Result<ExecOutput, ExecError>,

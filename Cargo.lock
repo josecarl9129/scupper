@@ -412,6 +412,7 @@ dependencies = [
  "rustix",
  "scupper-core",
  "scupper-sys",
+ "serde_json",
 ]
 
 [[package]]
