@@ -508,6 +508,19 @@ pub fn boot(deps: &BootDeps<'_>) -> BootReport {
                 Some(id)
             }
         };
+        // Leaving a disconnect: exits closed by it come back up before routes use them
+        // (a route via a down link is refused by the kernel).
+        if cfg.state.selection != Selection::Disconnected {
+            for exit in gw.exits() {
+                execute(
+                    deps,
+                    ExecTarget::Netns(&handle),
+                    Program::Ip,
+                    &strings(&["link", "set", "dev", exit.ifname().as_str(), "up"]),
+                    None,
+                )?;
+            }
+        }
         for (family, target) in desired_routes(&cfg.site, &cfg.gateway, selected) {
             execute(
                 deps,

@@ -55,5 +55,6 @@ netns Sysctl -n net.ipv4.conf.all.proxy_arp
 netns Sysctl -n net.ipv6.conf.all.proxy_ndp
 netns Sysctl -n net.ipv4.conf.all.route_localnet
 netns Sysctl -n net.netfilter.nf_conntrack_tcp_loose
+netns Ip link set dev ex-ch1 up
 netns Ip route replace default dev ex-ch1
 netns Ip -6 route replace unreachable default
