@@ -1,4 +1,8 @@
 //! Serialized gateway construction. Every mutation prefix preserves containment.
+//! A fresh namespace may inherit forwarding=1 until the first gate write, but has
+//! only loopback then. Existing namespaces are closed before any build checkpoint.
+//! Foreign links are all disabled and redirect hooks removed before failing closed.
+//! Extra RPDB rules and main-table routes still require operator/planner repair.
 
 mod links;
 
@@ -50,7 +54,7 @@ pub enum BootStep {
 pub struct StepResult {
     /// Numbered operation.
     pub step: BootStep,
-    /// Failure reason, without command output or key material.
+    /// Failure reason, with bounded diagnostics but never secret command output.
     pub error: Option<String>,
     /// This step needed no writes because the namespace was adopted.
     pub adopted: bool,
@@ -146,6 +150,7 @@ struct Inputs {
     state: State,
     rules: String,
     secrets: BTreeMap<String, Secret>,
+    missing_state_alert: bool,
 }
 
 fn inputs(deps: &BootDeps<'_>, report: &mut BootReport) -> Result<Inputs> {
@@ -220,6 +225,7 @@ fn inputs(deps: &BootDeps<'_>, report: &mut BootReport) -> Result<Inputs> {
         state: resolved.state,
         rules,
         secrets,
+        missing_state_alert: resolved.missing_state_alert,
     })
 }
 
@@ -227,7 +233,7 @@ fn strings(args: &[&str]) -> Vec<String> {
     args.iter().map(|s| (*s).into()).collect()
 }
 
-// Never retain stdout/stderr from a failed writer (wg could echo input).
+// Commands receiving secret stdin must never retain child diagnostics.
 fn execute(
     deps: &BootDeps<'_>,
     target: ExecTarget<'_>,
@@ -244,14 +250,27 @@ fn execute(
             .run_with_stdin(target, program, args, input, EXEC_TIMEOUT),
         None => deps.system.run_in(target, program, args, EXEC_TIMEOUT),
     }
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| format!("{program:?} execution failed: {e}"))?;
     if out.status != Some(0) {
+        let diagnostic = if program == Program::Wg && input.is_some() {
+            String::new()
+        } else {
+            diagnostic(&out.stderr)
+        };
         return Err(format!(
-            "{program:?} command failed (status {:?})",
+            "{program:?} command failed (status {:?}): {diagnostic}",
             out.status
         ));
     }
     Ok(out.stdout)
+}
+
+fn diagnostic(stderr: &str) -> String {
+    stderr
+        .chars()
+        .take(2048)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 fn inventory(
@@ -277,18 +296,23 @@ fn sysctls(
 ) -> Result<()> {
     let values = desired_sysctls(names, forwarding);
     let target = ExecTarget::Netns(handle);
+    let mut write_errors = BTreeMap::new();
     if write {
         for value in &values {
             // procps can return nonzero even for a successful write. Read all
             // values after all writes, including hardening reset by ip_forward.
-            deps.system
+            let output = deps
+                .system
                 .run_in(
                     target,
                     Program::Sysctl,
                     &strings(&["-w", &format!("{}={}", value.key, value.value)]),
                     EXEC_TIMEOUT,
                 )
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("Sysctl execution failed: {e}"))?;
+            if output.status != Some(0) {
+                write_errors.insert(value.key.to_string(), diagnostic(&output.stderr));
+            }
         }
     }
     for value in values {
@@ -300,7 +324,13 @@ fn sysctls(
             None,
         )?;
         if got.trim() != value.value {
-            return Err(format!("sysctl readback mismatch: {}", value.key));
+            return Err(format!(
+                "sysctl readback mismatch: {}: {}",
+                value.key,
+                write_errors
+                    .get(&value.key.to_string())
+                    .map_or("", String::as_str)
+            ));
         }
     }
     Ok(())
@@ -376,6 +406,35 @@ pub fn boot(deps: &BootDeps<'_>) -> BootReport {
             return report;
         }
     };
+    let report = boot_locked(deps, report);
+    if !report.succeeded() {
+        let mut report = report;
+        if let Err(error) = save_report(deps, &report) {
+            report
+                .warnings
+                .push(format!("failed to publish boot failure: {error}"));
+        }
+        return report;
+    }
+    drop(guard);
+    report
+}
+
+fn save_report(deps: &BootDeps<'_>, report: &BootReport) -> Result<()> {
+    let bytes = serde_json::to_vec(report).map_err(|e| e.to_string())?;
+    durable_replace(
+        &RealFs,
+        &deps.run_root.join("boot.json"),
+        &bytes,
+        0o644,
+        &|_| Ok(()),
+        &|_| Ok(()),
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[allow(clippy::too_many_lines)] // Keep the ordered build and its failure boundaries together.
+fn boot_locked(deps: &BootDeps<'_>, mut report: BootReport) -> BootReport {
     if !step(&mut report, deps, BootStep::Lock, false, || Ok(())) {
         return report;
     }
@@ -403,27 +462,31 @@ pub fn boot(deps: &BootDeps<'_>) -> BootReport {
         let names = configured_names(&cfg)?;
         let adopted = existed
             && cfg.state.quarantine.is_none()
-            && !report
-                .warnings
-                .iter()
-                .any(|w| w.contains("lost quarantine"))
+            && !cfg.missing_state_alert
+            && links::adoptable(deps, &handle, &cfg).is_ok()
             && containment(deps, &handle, &cfg).is_ok()
             && sysctls(deps, &handle, &names, true, false).is_ok();
-        if !adopted {
-            // A newly created netns can inherit forwarding=1. Close its gate
-            // before publishing the Inputs checkpoint or bringing loopback up.
+        let closed = if adopted {
+            Ok(())
+        } else {
+            // A newly created netns can inherit forwarding=1. Close the gate
+            // and redirect bypasses before publishing the Inputs checkpoint.
             sysctls(deps, &handle, &[], false, true)?;
-            execute(
-                deps,
-                ExecTarget::Netns(&handle),
-                Program::Ip,
-                &strings(&["link", "set", "lo", "up"]),
-                None,
-            )?;
-        }
-        Ok((cfg, handle, adopted))
+            let closed = links::close(deps, &handle, &cfg);
+            if closed.is_ok() {
+                execute(
+                    deps,
+                    ExecTarget::Netns(&handle),
+                    Program::Ip,
+                    &strings(&["link", "set", "lo", "up"]),
+                    None,
+                )?;
+            }
+            closed
+        };
+        Ok((cfg, handle, adopted, existed, closed))
     })();
-    let (cfg, handle, adopted) = match prepared {
+    let (cfg, handle, adopted, existed, closed) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
             step(&mut report, deps, BootStep::Inputs, false, || Err(error));
@@ -438,25 +501,13 @@ pub fn boot(deps: &BootDeps<'_>) -> BootReport {
         if adopted {
             return Ok(());
         }
+        closed?;
         let actual = inventory(deps, &handle)?;
-        let names = actual
-            .iter()
-            .map(|l| IfName::new(&l.ifname).map_err(|e| e.to_string()))
-            .collect::<Result<Vec<_>>>()?;
+        let names = configured_names(&cfg)?
+            .into_iter()
+            .filter(|n| actual.iter().any(|l| l.ifname == n.as_str()))
+            .collect::<Vec<_>>();
         sysctls(deps, &handle, &names, false, true)?;
-        let configured = configured_names(&cfg)?;
-        for link in actual {
-            if !configured.iter().any(|n| n.as_str() == link.ifname) {
-                execute(
-                    deps,
-                    ExecTarget::Netns(&handle),
-                    Program::Ip,
-                    &strings(&["link", "set", "dev", &link.ifname, "down"]),
-                    None,
-                )?;
-                return Err("foreign namespace link disabled; operator attention required".into());
-            }
-        }
         Ok(())
     }) {
         return report;
@@ -479,6 +530,18 @@ pub fn boot(deps: &BootDeps<'_>) -> BootReport {
             != RulesetObs::Exact
         {
             return Err("ruleset canonical fingerprint mismatch".into());
+        }
+        if existed {
+            execute(
+                deps,
+                ExecTarget::Netns(&handle),
+                Program::Conntrack,
+                &strings(&["-F"]),
+                None,
+            )
+            .map_err(|e| {
+                format!("conntrack flush required for rebuild (install conntrack): {e}")
+            })?;
         }
         Ok(())
     }) {
@@ -564,7 +627,7 @@ pub fn boot(deps: &BootDeps<'_>) -> BootReport {
             deps,
             &handle,
             &configured_names(&cfg)?,
-            cfg.state.quarantine.is_none(),
+            cfg.state.quarantine.is_none() && !cfg.missing_state_alert,
             true,
         )
     }) {
@@ -576,26 +639,12 @@ pub fn boot(deps: &BootDeps<'_>) -> BootReport {
         error: None,
         adopted: false,
     });
-    let saved = serde_json::to_vec(&report)
-        .map_err(|e| e.to_string())
-        .and_then(|bytes| {
-            durable_replace(
-                &RealFs,
-                &deps.run_root.join("boot.json"),
-                &bytes,
-                0o644,
-                &|_| Ok(()),
-                &|_| Ok(()),
-            )
-            .map_err(|e| e.to_string())
-        })
-        .and_then(|()| checkpoint(deps, BootStep::Record));
+    let saved = save_report(deps, &report).and_then(|()| checkpoint(deps, BootStep::Record));
     if let Err(error) = saved
         && let Some(last) = report.steps.last_mut()
     {
         last.error = Some(error);
     }
-    drop(guard);
     report
 }
 

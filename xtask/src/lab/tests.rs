@@ -674,8 +674,27 @@ fn boot_prefix_oracle_rejects_plaintext_and_silence_with_ephemeral_exit_ports() 
         ),
     ];
     fs::write(dir.join("prefix.pcap"), capture(&packets)).unwrap();
-    evidence::boot_prefix(&dir, "prefix", markers, 43210).unwrap();
-    assert!(evidence::boot_prefix(&dir, "prefix", markers, 51821).is_err());
+    evidence::boot_prefix(&dir, "prefix", markers, 43210, false).unwrap();
+    evidence::boot_prefix(&dir, "prefix", markers, 43210, true).unwrap();
+    fs::write(dir.join("prefix.pcap"), capture(&packets[..1])).unwrap();
+    assert!(evidence::boot_prefix(&dir, "prefix", markers, 43210, true).is_err());
+    let mut initiation = vec![0; 148];
+    initiation[0] = 1;
+    let handshake_only = vec![
+        packets[0].clone(),
+        udp(
+            [198, 51, 100, 2],
+            [203, 0, 113, 2],
+            43210,
+            51820,
+            &initiation,
+        ),
+    ];
+    fs::write(dir.join("prefix.pcap"), capture(&handshake_only)).unwrap();
+    evidence::boot_prefix(&dir, "prefix", markers, 43210, false).unwrap();
+    assert!(evidence::boot_prefix(&dir, "prefix", markers, 43210, true).is_err());
+    fs::write(dir.join("prefix.pcap"), capture(&packets)).unwrap();
+    assert!(evidence::boot_prefix(&dir, "prefix", markers, 51821, false).is_err());
     packets.push(udp(
         [10, 99, 0, 2],
         [192, 0, 2, 6],
@@ -684,8 +703,20 @@ fn boot_prefix_oracle_rejects_plaintext_and_silence_with_ephemeral_exit_ports() 
         marker.as_bytes(),
     ));
     fs::write(dir.join("prefix.pcap"), capture(&packets)).unwrap();
-    assert!(evidence::boot_prefix(&dir, "prefix", markers, 43210).is_err());
+    assert!(evidence::boot_prefix(&dir, "prefix", markers, 43210, false).is_err());
     fs::write(dir.join("prefix.pcap"), capture(&[])).unwrap();
-    assert!(evidence::boot_prefix(&dir, "prefix", markers, 43210).is_err());
+    assert!(evidence::boot_prefix(&dir, "prefix", markers, 43210, false).is_err());
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn boot_canary_requires_received_bytes_and_the_actual_ingress_marker() {
+    use super::boot::boot_canary_arrival;
+    let markers = vec!["marker".to_owned()];
+    let packet = udp([10, 99, 0, 2], [192, 0, 2, 6], 40001, 8080, b"marker");
+    let pcap = capture(std::slice::from_ref(&packet));
+    boot_canary_arrival(10, 11, &pcap, &markers).unwrap();
+    assert!(boot_canary_arrival(10, 10, &pcap, &markers).is_err());
+    assert!(boot_canary_arrival(10, 11, &capture(&[]), &markers).is_err());
+    assert!(boot_canary_arrival(10, 11, &pcap, &["different".into()]).is_err());
 }

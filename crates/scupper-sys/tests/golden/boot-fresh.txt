@@ -39,6 +39,10 @@ netns Sysctl -n net.ipv4.conf.all.proxy_arp
 netns Sysctl -n net.ipv6.conf.all.proxy_ndp
 netns Sysctl -n net.ipv4.conf.all.route_localnet
 netns Sysctl -n net.netfilter.nf_conntrack_tcp_loose
+netns Ip -d -j link show
+netns Tc qdisc del dev lo clsact
+netns Tc qdisc del dev lo ingress
+netns Ip link set dev lo xdp off
 netns Ip link set lo up
 netns Ip -d -j link show
 netns Sysctl -w net.ipv4.ip_forward=0
@@ -167,7 +171,7 @@ host Ip link add ex-ch1 type wireguard
 host Ip link set ex-ch1 netns <netns-fd>
 netns Wg set ex-ch1 private-key /dev/stdin stdin=45
 netns Wg show ex-ch1 peers
-netns Wg set ex-ch1 peer AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI= endpoint 203.0.113.2:51820 allowed-ips 0.0.0.0/0 persistent-keepalive 25
+netns Wg set ex-ch1 peer AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI= allowed-ips 0.0.0.0/0 endpoint 203.0.113.2:51820 persistent-keepalive 25
 netns Ip addr flush dev ex-ch1
 netns Ip addr add 10.2.0.2/32 dev ex-ch1
 netns Ip -d -j link show

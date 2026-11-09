@@ -1,4 +1,12 @@
 netns Ip -d -j link show
+netns Wg pubkey stdin=45
+netns Wg show wg0 public-key
+netns Wg pubkey stdin=45
+netns Wg show ex-ch1 public-key
+netns Wg show wg0 listen-port
+netns Wg show ex-ch1 endpoints
+netns Wg show ex-ch1 persistent-keepalive
+netns Ip -d -j link show
 netns Ip -j addr show
 netns Wg show ex-ch1 peers
 netns Wg show ex-ch1 allowed-ips

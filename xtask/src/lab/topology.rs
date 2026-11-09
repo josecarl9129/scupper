@@ -154,8 +154,16 @@ impl Lab {
             .register(Resource::Namespace("scupper".into()));
         self.boot_gateway(&[], "boot-fresh")?;
         self.boot_sysctls()?;
+        // Load the independently rendered transaction, never boot's live output.
+        self.new_namespace("scupper-verify", "")?;
+        let path = self.rules.to_string_lossy().into_owned();
+        self.cmd("scupper-verify", "nft", &["-f", &path])?;
         self.expected_rules =
-            canonicalize(&self.cmd("scupper", "nft", &["-j", "list", "ruleset"])?)?;
+            canonicalize(&self.cmd("scupper-verify", "nft", &["-j", "list", "ruleset"])?)?;
+        self.cmd("", "ip", &["netns", "delete", "scupper-verify"])?;
+        self.registry
+            .unregister(&Resource::Namespace("scupper-verify".into()));
+        self.verify_rules()?;
         self.boot_adopt()?;
         Ok(())
     }

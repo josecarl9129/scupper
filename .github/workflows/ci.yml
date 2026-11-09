@@ -142,6 +142,7 @@ jobs:
 
       - name: Install leak lab tools
         run: |
+          # conntrack is required by boot when rebuilding an existing namespace.
           sudo timeout 300 apt-get update
           sudo timeout 300 apt-get install -y wireguard-tools nftables iproute2 tcpdump dnsmasq-base util-linux iputils-ping conntrack slirp4netns
 

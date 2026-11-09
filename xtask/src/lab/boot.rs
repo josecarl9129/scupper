@@ -84,7 +84,7 @@ impl Lab {
                     routes += 1;
                 }
                 Some("Ip") if argv.contains(&"show") => {}
-                Some("Wg") if argv.first() == Some(&"show") => {}
+                Some("Wg") if matches!(argv.first(), Some(&"show" | &"pubkey")) => {}
                 Some("Sysctl") if argv.first() == Some(&"-n") => {}
                 Some("Nft") if argv == ["-j", "list", "ruleset"] => {}
                 Some("Tc" | "Unshare") => {}
@@ -151,7 +151,10 @@ impl Lab {
             .map(|n| n.to_string())
             .chain(["link-add-wg0".into(), "link-add-ex-ch1".into()])
         {
-            self.boot_kill(&point)?;
+            self.boot_kill(&point, false)?;
+        }
+        for point in 1_u8..=6 {
+            self.boot_kill(&point.to_string(), true)?;
         }
         Ok(())
     }
@@ -183,6 +186,12 @@ impl Lab {
         state.update(&writer, |s| s.selection = Selection::Auto)?;
         drop(writer);
         self.boot_gateway(&[], "L14-restore")?;
+        self.wait_provider()?;
+        self.boot_fresh_client_handshake()?;
+        let (code, restored) = self.check_result(&Self::boot_binary()?, &root)?;
+        if code != 0 {
+            return fail(format!("L14 restore check: {code}: {restored}"));
+        }
         self.rows.push(Row {
             name: "L14-boot".into(),
             wanted: "two unreachable defaults; check 4 Disconnected".into(),
@@ -191,12 +200,75 @@ impl Lab {
         });
         Ok(())
     }
+    fn boot_client_rx(&mut self) -> Result<u64> {
+        self.cmd("scupper", "wg", &["show", "wg0", "transfer"])?
+            .lines()
+            .map(|line| {
+                line.split_whitespace()
+                    .nth(1)
+                    .ok_or("missing wg0 rx")?
+                    .parse::<u64>()
+                    .map_err(|_| "invalid wg0 rx")
+            })
+            .try_fold(0_u64, |total, value| {
+                total.checked_add(value?).ok_or("wg0 rx overflow")
+            })
+            .map_err(Into::into)
+    }
+    fn boot_fresh_client_handshake(&mut self) -> Result<()> {
+        let latest = |text: &str| {
+            text.lines()
+                .filter_map(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
+                .max()
+                .unwrap_or(0)
+        };
+        let before = latest(&self.cmd("scupper", "wg", &["show", "wg0", "latest-handshakes"])?);
+        if before != 0 {
+            self.runner.dwell(Duration::from_millis(1100))?;
+        }
+        // Down/up discards the old client session even if the gateway survived.
+        self.cmd("client", "ip", &["link", "set", "wg0", "down"])?;
+        self.cmd("client", "ip", &["link", "set", "wg0", "up"])?;
+        for family in ["-4", "-6"] {
+            self.cmd(
+                "client",
+                "ip",
+                &[family, "route", "replace", "default", "dev", "wg0"],
+            )?;
+        }
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            // A reply is unnecessary: the authenticated request triggers a handshake.
+            self.runner.output(
+                &Invocation::new("client", "ping", &["-c", "1", "-W", "1", A.gateway_inner]),
+                None,
+            )?;
+            let after =
+                latest(&self.cmd("scupper", "wg", &["show", "wg0", "latest-handshakes"])?);
+            if after > before {
+                return Ok(());
+            }
+            if Instant::now() >= until {
+                return fail("L9 fresh client handshake deadline exceeded");
+            }
+            self.runner.dwell(Duration::from_millis(100))?;
+        }
+    }
     #[allow(clippy::too_many_lines)] // Each crash assertion stays next to the retry and capture it protects.
-    fn boot_kill(&mut self, point: &str) -> Result<()> {
-        let stem = format!("L9-{point}");
+    fn boot_kill(&mut self, point: &str, live: bool) -> Result<()> {
+        let stem = format!("{}-{point}", if live { "L9b" } else { "L9" });
         // Lab reboot simulation: only the lab-owned gateway namespace is removed.
         // Boot itself never deletes an existing namespace, including during retry.
-        self.cmd("", "ip", &["netns", "delete", "scupper"])?;
+        if live {
+            // The previous retry is healthy, with forwarding and clients live.
+            self.cmd(
+                "scupper",
+                "sysctl",
+                &["-w", "net.ipv4.conf.all.rp_filter=2"],
+            )?;
+        } else {
+            self.cmd("", "ip", &["netns", "delete", "scupper"])?;
+        }
         let record = self.private.join("boot-root/run/scupper/boot.json");
         if record.exists() {
             fs::remove_file(record)?;
@@ -239,6 +311,36 @@ impl Lab {
                 }
             }
         }
+        if let Some(name) = point.strip_prefix("link-add-") {
+            let links = scupper_core::parse::parse_ip_link(&self.cmd(
+                "gwhost",
+                "ip",
+                &["-d", "-j", "link", "show"],
+            )?)?;
+            let link = links
+                .iter()
+                .find(|l| l.ifname == name)
+                .ok_or("L9 leftover missing")?;
+            if link.flags.iter().any(|f| f == "UP")
+                || link.kind.as_deref() != Some("wireguard")
+                || link.xdp
+                || !self
+                    .cmd("gwhost", "wg", &["show", name, "peers"])?
+                    .trim()
+                    .is_empty()
+            {
+                return fail("L9 host leftover is not down and peerless");
+            }
+        }
+        let client_ready =
+            exists && (live || matches!(point, "4" | "5" | "6" | "7" | "link-add-ex-ch1"));
+        let rx_before = if client_ready {
+            self.boot_fresh_client_handshake()?;
+            self.capture("scupper", "wg0", &format!("{stem}-wg0"))?;
+            Some(self.boot_client_rx()?)
+        } else {
+            None
+        };
         let mut markers = vec![];
         for protocol in ["udp", "tcp"] {
             let marker = Self::marker()?;
@@ -272,6 +374,15 @@ impl Lab {
         }
         self.runner.dwell(Duration::from_secs(1))?;
         self.stop_captures()?;
+        if let Some(before) = rx_before {
+            let after = self.boot_client_rx()?;
+            boot_canary_arrival(
+                before,
+                after,
+                &fs::read(self.artifacts.join(format!("{stem}-wg0.pcap")))?,
+                &markers,
+            )?;
+        }
         // The port is a transport property, read while the killed namespace still
         // exists. Prefixes before exit creation have no exit transport to allow.
         let exit_port = if exists {
@@ -287,25 +398,18 @@ impl Lab {
         } else {
             51821
         };
-        evidence::boot_prefix(&self.artifacts, &stem, &markers, exit_port)?;
+        evidence::boot_prefix(
+            &self.artifacts,
+            &stem,
+            &markers,
+            exit_port,
+            matches!(point, "6" | "7"),
+        )?;
         self.boot_gateway(&[], &format!("{stem}-retry"))?;
         self.registry
             .register(Resource::Namespace("scupper".into()));
         self.wait_provider()?;
-        // Rekey the client after the reboot simulation, so its stale session
-        // does not delay the test until WireGuard's next retry timer.
-        self.cmd("client", "ip", &["link", "set", "wg0", "down"])?;
-        self.cmd("client", "ip", &["link", "set", "wg0", "up"])?;
-        self.cmd(
-            "client",
-            "ip",
-            &["route", "replace", "default", "dev", "wg0"],
-        )?;
-        self.cmd(
-            "client",
-            "ip",
-            &["-6", "route", "replace", "default", "dev", "wg0"],
-        )?;
+        self.boot_fresh_client_handshake()?;
         let root = self.private.join("boot-root");
         let (code, report) = self.check_result(&Self::boot_binary()?, &root)?;
         let skip = (code == 3
@@ -330,4 +434,29 @@ impl Lab {
         evidence::save_results(&self.artifacts, &self.rows)?;
         Ok(())
     }
+}
+
+// Require authenticated ingress as well as a clean uplink: stale WireGuard
+// sessions must not make the crash-prefix oracle pass without any client traffic.
+pub(super) fn boot_canary_arrival(
+    before: u64,
+    after: u64,
+    pcap: &[u8],
+    markers: &[String],
+) -> Result<()> {
+    if after <= before {
+        return fail("L9 gateway wg0 rx did not increase");
+    }
+    let packets = crate::pcap::observe(pcap)?;
+    // A TCP SYN has no application marker while forwarding is closed; the UDP
+    // canary carries one and is sufficient to prove plaintext reached wg0.
+    let marker = markers.first().ok_or("L9 missing UDP canary marker")?;
+    if !packets.iter().any(|p| {
+        p.source.to_string() == A.client_inner
+            && p.protocol == 17
+            && p.payload.get(8..) == Some(marker.as_bytes())
+    }) {
+        return fail("L9 UDP canary absent from gateway wg0 capture");
+    }
+    Ok(())
 }

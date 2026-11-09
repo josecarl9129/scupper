@@ -1,10 +1,14 @@
 use super::{BootDeps, Inputs, Result, execute, inventory, strings, sysctls};
 use crate::{
+    cmd::{KernelCmd, WgCmd},
     netns::NetnsHandle,
     system::{ExecTarget, Program},
 };
 use scupper_core::{
-    parse::{parse_ip_addr, parse_ip_link},
+    parse::{
+        PeerKey, WgField, WgOutput, parse_ip_addr, parse_ip_link, parse_tc_qdisc, parse_wg,
+        parse_wg_public_key,
+    },
     rules::IfName,
 };
 
@@ -123,11 +127,12 @@ pub(super) fn configure(deps: &BootDeps<'_>, handle: &NetnsHandle, cfg: &Inputs)
         }
         let target = ExecTarget::Netns(handle);
         let key = cfg.secrets.get(name).ok_or("resolved link key missing")?;
-        execute(
+        wg(
             deps,
-            target,
-            Program::Wg,
-            &strings(&["set", name, "private-key", "/dev/stdin"]),
+            handle,
+            WgCmd::SetPrivateKeyFromStdin {
+                ifname: IfName::new(name).map_err(|e| e.to_string())?,
+            },
             Some(key.expose()),
         )?;
         // Recover interrupted configuration without retaining any stale peer.
@@ -139,12 +144,13 @@ pub(super) fn configure(deps: &BootDeps<'_>, handle: &NetnsHandle, cfg: &Inputs)
             None,
         )?;
         for peer in peers.split_whitespace() {
-            scupper_core::parse::PeerKey::new(peer).map_err(|e| e.to_string())?;
-            execute(
+            wg(
                 deps,
-                target,
-                Program::Wg,
-                &strings(&["set", name, "peer", peer, "remove"]),
+                handle,
+                WgCmd::RemovePeer {
+                    ifname: IfName::new(name).map_err(|e| e.to_string())?,
+                    public_key: PeerKey::new(peer).map_err(|e| e.to_string())?,
+                },
                 None,
             )?;
         }
@@ -164,10 +170,11 @@ pub(super) fn configure(deps: &BootDeps<'_>, handle: &NetnsHandle, cfg: &Inputs)
             None,
         )?;
         // Setting all/default hardening again also covers the just-moved link.
-        let names = inventory(deps, handle)?
-            .iter()
-            .map(|l| IfName::new(&l.ifname).map_err(|e| e.to_string()))
-            .collect::<Result<Vec<_>>>()?;
+        let actual = inventory(deps, handle)?;
+        let names = super::configured_names(cfg)?
+            .into_iter()
+            .filter(|name| actual.iter().any(|link| link.ifname == name.as_str()))
+            .collect::<Vec<_>>();
         sysctls(deps, handle, &names, false, true)?;
         let mtu = mtu.to_string();
         let mut args = vec!["link", "set", name, "mtu", &mtu];
@@ -187,18 +194,14 @@ fn configure_peers(
 ) -> Result<()> {
     let gw = cfg.site.gateway(&cfg.gateway).ok_or("unknown gateway")?;
     let client = gw.client_tunnel();
-    let target = ExecTarget::Netns(handle);
     if name == client.ifname().as_str() {
-        execute(
+        wg(
             deps,
-            target,
-            Program::Wg,
-            &strings(&[
-                "set",
-                name,
-                "listen-port",
-                &client.identity().listen_port.to_string(),
-            ]),
+            handle,
+            WgCmd::SetListenPort {
+                ifname: client.ifname().clone(),
+                port: u16::try_from(client.identity().listen_port).map_err(|e| e.to_string())?,
+            },
             None,
         )?;
         for device in cfg
@@ -207,18 +210,17 @@ fn configure_peers(
             .values()
             .filter(|d| d.gateways().contains(&cfg.gateway))
         {
-            execute(
+            wg(
                 deps,
-                target,
-                Program::Wg,
-                &strings(&[
-                    "set",
-                    name,
-                    "peer",
-                    device.public_key_text().as_str(),
-                    "allowed-ips",
-                    &device.address4().to_string(),
-                ]),
+                handle,
+                WgCmd::SetPeer {
+                    ifname: client.ifname().clone(),
+                    public_key: PeerKey::new(device.public_key_text().as_str())
+                        .map_err(|e| e.to_string())?,
+                    allowed_ips: vec![device.address4().into()],
+                    endpoint: None,
+                    keepalive: None,
+                },
                 None,
             )?;
         }
@@ -228,24 +230,230 @@ fn configure_peers(
             .iter()
             .find(|e| e.ifname().as_str() == name)
             .ok_or("exit missing")?;
-        execute(
+        wg(
             deps,
-            target,
-            Program::Wg,
-            &strings(&[
-                "set",
-                name,
-                "peer",
-                exit.peer_public_key_text().as_str(),
-                "endpoint",
-                &exit.endpoint().to_string(),
-                "allowed-ips",
-                "0.0.0.0/0",
-                "persistent-keepalive",
-                &exit.keepalive().as_secs().to_string(),
-            ]),
+            handle,
+            WgCmd::SetPeer {
+                ifname: IfName::new(exit.ifname().as_str()).map_err(|e| e.to_string())?,
+                public_key: PeerKey::new(exit.peer_public_key_text().as_str())
+                    .map_err(|e| e.to_string())?,
+                allowed_ips: vec!["0.0.0.0/0".parse().map_err(|_| "invalid default prefix")?],
+                endpoint: Some(exit.endpoint()),
+                keepalive: Some(
+                    u16::try_from(exit.keepalive().as_secs()).map_err(|e| e.to_string())?,
+                ),
+            },
             None,
         )?;
+    }
+    Ok(())
+}
+
+// All boot WG mutations are rendered by the complete typed allow-list. Secret
+// bytes stay separate from the command and execute redacts their diagnostics.
+fn wg(
+    deps: &BootDeps<'_>,
+    handle: &NetnsHandle,
+    cmd: WgCmd,
+    input: Option<&[u8]>,
+) -> Result<String> {
+    let (program, args) = KernelCmd::Wg(cmd).render();
+    execute(deps, ExecTarget::Netns(handle), program, &args, input)
+}
+
+fn raw_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 15
+        || name
+            .chars()
+            .any(|c| c == '\0' || c == '/' || c.is_whitespace())
+    {
+        return Err("invalid raw kernel link name; refusing namespace rebuild".into());
+    }
+    Ok(())
+}
+
+pub(super) fn close(deps: &BootDeps<'_>, handle: &NetnsHandle, cfg: &Inputs) -> Result<()> {
+    let actual = inventory(deps, handle)?;
+    let configured = super::configured_names(cfg)?;
+    let foreign = |link: &scupper_core::parse::IpLink| {
+        link.ifname != "lo"
+            && (!configured.iter().any(|n| n.as_str() == link.ifname)
+                || link.kind.as_deref() != Some("wireguard"))
+    };
+    let mut errors = Vec::new();
+    // Complete the whole down pass before inspecting hooks or any per-link sysctl.
+    for link in actual.iter().filter(|link| foreign(link)) {
+        let result = raw_name(&link.ifname).and_then(|()| {
+            execute(
+                deps,
+                ExecTarget::Netns(handle),
+                Program::Ip,
+                &strings(&["link", "set", "dev", &link.ifname, "down"]),
+                None,
+            )
+            .map(|_| ())
+        });
+        if let Err(error) = result {
+            errors.push(error);
+        }
+    }
+    for link in &actual {
+        let result = raw_name(&link.ifname).and_then(|()| clear_hooks(deps, handle, &link.ifname));
+        if let Err(error) = result {
+            errors.push(error);
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors.join("; "));
+    }
+    if actual.iter().any(foreign) {
+        return Err("foreign namespace links disabled; operator attention required".into());
+    }
+    Ok(())
+}
+
+fn clear_hooks(deps: &BootDeps<'_>, handle: &NetnsHandle, name: &str) -> Result<()> {
+    let target = ExecTarget::Netns(handle);
+    let mut errors = Vec::new();
+    for kind in ["clsact", "ingress"] {
+        // Deleting an absent qdisc returns nonzero. Accept that only after a
+        // successful inventory proves absence; other errors remain failures.
+        let result = (|| {
+            if let Err(error) = execute(
+                deps,
+                target,
+                Program::Tc,
+                &strings(&["qdisc", "del", "dev", name, kind]),
+                None,
+            ) {
+                let got = execute(
+                    deps,
+                    target,
+                    Program::Tc,
+                    &strings(&["-j", "qdisc", "show", "dev", name]),
+                    None,
+                )?;
+                if parse_tc_qdisc(&got)
+                    .map_err(|e| e.to_string())?
+                    .iter()
+                    .any(|q| q.kind == kind)
+                {
+                    return Err(error);
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            errors.push(error);
+        }
+    }
+    if let Err(error) = execute(
+        deps,
+        target,
+        Program::Ip,
+        &strings(&["link", "set", "dev", name, "xdp", "off"]),
+        None,
+    ) {
+        errors.push(error);
+    }
+    if errors.is_empty() {
+        return Ok(());
+    }
+    // A failed detach must not leave a configured link able to redirect traffic.
+    if let Err(error) = execute(
+        deps,
+        target,
+        Program::Ip,
+        &strings(&["link", "set", "dev", name, "down"]),
+        None,
+    ) {
+        errors.push(error);
+    }
+    Err(errors.join("; "))
+}
+
+// Stage 1 already checks peer keys, AllowedIPs and addresses. Adoption also
+// requires every value boot writes that is intentionally outside drift checks.
+pub(super) fn adoptable(deps: &BootDeps<'_>, handle: &NetnsHandle, cfg: &Inputs) -> Result<()> {
+    let actual = inventory(deps, handle)?;
+    let gw = cfg.site.gateway(&cfg.gateway).ok_or("unknown gateway")?;
+    if !actual
+        .iter()
+        .any(|l| l.ifname == "lo" && l.flags.iter().any(|f| f == "UP"))
+    {
+        return Err("loopback is down or missing".into());
+    }
+    for (name, mtu) in std::iter::once((
+        gw.client_tunnel().ifname().as_str(),
+        gw.client_tunnel().mtu(),
+    ))
+    .chain(gw.exits().iter().map(|e| (e.ifname().as_str(), e.mtu())))
+    {
+        if !actual.iter().any(|l| {
+            l.ifname == name
+                && l.kind.as_deref() == Some("wireguard")
+                && l.mtu == mtu
+                && l.flags.iter().any(|f| f == "UP")
+        }) {
+            return Err("configured link missing, down, wrong kind or MTU".into());
+        }
+        let secret = cfg.secrets.get(name).ok_or("resolved link key missing")?;
+        let derived = wg(deps, handle, WgCmd::Pubkey, Some(secret.expose()))?;
+        let live = wg(
+            deps,
+            handle,
+            WgCmd::Show {
+                ifname: IfName::new(name).map_err(|e| e.to_string())?,
+                field: WgField::PublicKey,
+            },
+            None,
+        )?;
+        let derived = parse_wg_public_key(&derived).map_err(|e| e.to_string())?;
+        if derived.is_none() || derived != parse_wg_public_key(&live).map_err(|e| e.to_string())? {
+            return Err("configured link identity differs".into());
+        }
+    }
+    let client = gw.client_tunnel();
+    let port = wg(
+        deps,
+        handle,
+        WgCmd::Show {
+            ifname: client.ifname().clone(),
+            field: WgField::ListenPort,
+        },
+        None,
+    )?;
+    if parse_wg(WgField::ListenPort, &port).map_err(|e| e.to_string())?
+        != WgOutput::ListenPort(
+            u16::try_from(client.identity().listen_port).map_err(|e| e.to_string())?,
+        )
+    {
+        return Err("client listen port differs".into());
+    }
+    for exit in gw.exits() {
+        for field in [WgField::Endpoints, WgField::PersistentKeepalive] {
+            let text = wg(
+                deps,
+                handle,
+                WgCmd::Show {
+                    ifname: IfName::new(exit.ifname().as_str()).map_err(|e| e.to_string())?,
+                    field,
+                },
+                None,
+            )?;
+            let WgOutput::Peers(peers) = parse_wg(field, &text).map_err(|e| e.to_string())? else {
+                return Err("invalid peer observation".into());
+            };
+            if peers.len() != 1
+                || peers[0].public_key.as_str() != exit.peer_public_key_text().as_str()
+                || (field == WgField::Endpoints && peers[0].endpoint != Some(exit.endpoint()))
+                || (field == WgField::PersistentKeepalive
+                    && peers[0].keepalive.map(u64::from) != Some(exit.keepalive().as_secs()))
+            {
+                return Err("exit peer configuration differs".into());
+            }
+        }
     }
     Ok(())
 }
