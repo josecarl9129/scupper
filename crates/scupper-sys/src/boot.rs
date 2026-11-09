@@ -511,7 +511,14 @@ pub fn boot(deps: &BootDeps<'_>) -> BootReport {
         // Leaving a disconnect: exits closed by it come back up before routes use them
         // (a route via a down link is refused by the kernel).
         if cfg.state.selection != Selection::Disconnected {
+            let links = inventory(deps, &handle)?;
             for exit in gw.exits() {
+                let up = links.iter().any(|l| {
+                    l.ifname == exit.ifname().as_str() && l.flags.iter().any(|f| f == "UP")
+                });
+                if up {
+                    continue;
+                }
                 execute(
                     deps,
                     ExecTarget::Netns(&handle),
