@@ -18,7 +18,7 @@ use scupper_core::{
 };
 use std::net::IpAddr;
 
-fn answer(route: &RouteEntry) -> DefaultRouteObs {
+pub(crate) fn answer(route: &RouteEntry) -> DefaultRouteObs {
     match route.kind {
         RouteKind::Unreachable => DefaultRouteObs::Unreachable,
         RouteKind::Unicast => route
@@ -35,7 +35,7 @@ fn answer(route: &RouteEntry) -> DefaultRouteObs {
     }
 }
 
-fn kernel_route(route: &RouteEntry, cfg: &HealthConfigV2) -> bool {
+pub(crate) fn kernel_route(route: &RouteEntry, cfg: &HealthConfigV2) -> bool {
     let RouteDestination::Prefix(prefix) = route.dst else {
         return false;
     };
@@ -102,7 +102,7 @@ fn family_defaults(
     Ok((first, extra))
 }
 
-fn kernel_local(route: &RouteEntry, cfg: &HealthConfigV2, family: Family) -> bool {
+pub(crate) fn kernel_local(route: &RouteEntry, cfg: &HealthConfigV2, family: Family) -> bool {
     if !matches!(route.protocol.as_deref(), Some("kernel" | "2"))
         || route.gateway.is_some()
         || route.from.is_some()

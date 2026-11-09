@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
 use std::{
     io,
     path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex, OnceLock, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 /// Persisted safety latch; consumers must honor it before enabling forwarding.
@@ -100,10 +104,68 @@ impl StateRead {
     }
 }
 
+// Every StateFile writer invalidates outstanding snapshots, including readers
+// owned by another adapter. The writer-lock boundary handles other processes.
+static READ_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileGeneration {
+    device: u64,
+    inode: u64,
+    modified: (i64, i64),
+    size: u64,
+}
+fn file_generation(path: &Path) -> io::Result<Option<FileGeneration>> {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::symlink_metadata(path) {
+        Ok(m) => Ok(Some(FileGeneration {
+            device: m.dev(),
+            inode: m.ino(),
+            modified: (m.mtime(), m.mtime_nsec()),
+            size: m.size(),
+        })),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+type Snapshot = (StateRead, Option<FileGeneration>);
+type PendingJob<T> = (Option<u64>, std::sync::mpsc::Receiver<io::Result<T>>);
+
+// Separate adapters may open the same state file. A path-scoped permit also
+// bounds jobs across those handles, including when a handle is dropped mid-read.
+#[derive(Debug, Default)]
+struct ReadCapacity {
+    busy: AtomicBool,
+}
+#[derive(Debug)]
+struct ReadPermit(Arc<ReadCapacity>);
+impl Drop for ReadPermit {
+    fn drop(&mut self) {
+        self.0.busy.store(false, Ordering::SeqCst);
+    }
+}
+fn read_capacity(path: &Path) -> Arc<ReadCapacity> {
+    static CAPACITIES: OnceLock<Mutex<std::collections::BTreeMap<PathBuf, Weak<ReadCapacity>>>> =
+        OnceLock::new();
+    let mut capacities = CAPACITIES
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    capacities.retain(|_, capacity| capacity.strong_count() > 0);
+    if let Some(capacity) = capacities.get(path).and_then(Weak::upgrade) {
+        return capacity;
+    }
+    let capacity = Arc::new(ReadCapacity::default());
+    capacities.insert(path.to_path_buf(), Arc::downgrade(&capacity));
+    capacity
+}
+
 /// State access rooted at `/var/lib/scupper` in production.
 #[derive(Debug)]
 pub struct StateFile {
     path: PathBuf,
+    capacity: Arc<ReadCapacity>,
+    pending_read: std::cell::RefCell<Option<PendingJob<Snapshot>>>,
+    pending_metadata: std::cell::RefCell<Option<PendingJob<Option<FileGeneration>>>>,
 }
 impl StateFile {
     /// Chooses `root/state.json`. A writer guard enables stale-temp cleanup.
@@ -116,8 +178,13 @@ impl StateFile {
             durable_directory(root.as_ref())?;
             RealFs.cleanup_stale(root.as_ref())?;
         }
+        let path = std::path::absolute(root.as_ref().join("state.json"))?;
+        let capacity = read_capacity(&path);
         Ok(Self {
-            path: root.as_ref().join("state.json"),
+            path,
+            capacity,
+            pending_read: std::cell::RefCell::new(None),
+            pending_metadata: std::cell::RefCell::new(None),
         })
     }
 
@@ -135,6 +202,152 @@ impl StateFile {
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(StateRead::Missing),
             Err(error) => Err(error),
+        }
+    }
+
+    /// Invalidate snapshots at a writer-lock boundary or intent write, retaining
+    /// worker ownership until completion so stalled I/O cannot accumulate jobs.
+    pub fn invalidate_reads(&self) {
+        if let Some((generation, _)) = self.pending_read.borrow_mut().as_mut() {
+            *generation = None;
+        }
+        if let Some((generation, _)) = self.pending_metadata.borrow_mut().as_mut() {
+            *generation = None;
+        }
+    }
+
+    /// Bound a background read by the tick deadline. A pending read survives
+    /// timeouts; administrative writes invalidate its potentially stale result.
+    /// A subsequent call returns `TimedOut` immediately while a worker is busy.
+    ///
+    /// # Errors
+    /// Returns read errors or `TimedOut` without waiting for blocked disk I/O.
+    pub fn read_until(&self, deadline: std::time::Instant) -> io::Result<StateRead> {
+        loop {
+            if let Some(state) = self.read_attempt(deadline)? {
+                return Ok(state);
+            }
+        }
+    }
+
+    fn snapshot(&self) -> io::Result<Snapshot> {
+        let before = file_generation(&self.path)?;
+        let state = self.read()?;
+        if file_generation(&self.path)? != before {
+            return Err(io::Error::other("state changed during read"));
+        }
+        Ok((state, before))
+    }
+
+    fn reserve_worker(&self) -> io::Result<ReadPermit> {
+        self.capacity
+            .busy
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "state worker busy"))?;
+        Ok(ReadPermit(self.capacity.clone()))
+    }
+
+    #[allow(clippy::too_many_lines)] // Keep worker ownership and generation checks together.
+    fn read_attempt(&self, deadline: std::time::Instant) -> io::Result<Option<StateRead>> {
+        use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
+        let timeout = || io::Error::new(io::ErrorKind::TimedOut, "state read deadline");
+        if std::time::Instant::now() >= deadline {
+            return Err(timeout());
+        }
+        // A timed-out verification no longer has a waiting caller. Discard its
+        // completion before starting a fresh snapshot, but retain a blocked job.
+        let mut metadata = self.pending_metadata.borrow_mut();
+        if let Some((_, receive)) = metadata.as_ref() {
+            match receive.try_recv() {
+                Err(TryRecvError::Empty) => return Err(timeout()),
+                Ok(_) | Err(TryRecvError::Disconnected) => *metadata = None,
+            }
+        }
+        drop(metadata);
+        let mut pending = self.pending_read.borrow_mut();
+        let generation = READ_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
+        let new_worker = pending.is_none();
+        if new_worker {
+            let permit = self.reserve_worker()?;
+            let (send, receive) = std::sync::mpsc::sync_channel(1);
+            let path = self.path.clone();
+            std::thread::Builder::new()
+                .name("state-read".into())
+                .spawn(move || {
+                    let file = Self {
+                        path,
+                        capacity: permit.0.clone(),
+                        pending_read: std::cell::RefCell::new(None),
+                        pending_metadata: std::cell::RefCell::new(None),
+                    };
+                    let result = file.snapshot();
+                    drop(permit);
+                    let _ = send.send(result);
+                })?;
+            *pending = Some((Some(generation), receive));
+        }
+        let (started, receive) = pending
+            .as_ref()
+            .ok_or_else(|| io::Error::other("missing read worker"))?;
+        let started = *started;
+        let result = if new_worker {
+            receive.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        } else {
+            receive.try_recv().map_err(|error| match error {
+                TryRecvError::Empty => RecvTimeoutError::Timeout,
+                TryRecvError::Disconnected => RecvTimeoutError::Disconnected,
+            })
+        };
+        match result {
+            Ok(result) => {
+                *pending = None;
+                if started != Some(READ_GENERATION.load(std::sync::atomic::Ordering::SeqCst)) {
+                    return Ok(None);
+                }
+                drop(pending);
+                let (state, identity) = result?;
+                // Metadata verification is itself bounded and its receiver is
+                // retained on timeout, just like the state reader's receiver.
+                let permit = self.reserve_worker()?;
+                let (send, receive) = std::sync::mpsc::sync_channel(1);
+                let path = self.path.clone();
+                std::thread::Builder::new()
+                    .name("state-generation".into())
+                    .spawn(move || {
+                        let result = file_generation(&path);
+                        drop(permit);
+                        let _ = send.send(result);
+                    })?;
+                let mut metadata = self.pending_metadata.borrow_mut();
+                *metadata = Some((Some(generation), receive));
+                let result = metadata
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("missing metadata worker"))?
+                    .1
+                    .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+                let current = match result {
+                    Ok(result) => {
+                        *metadata = None;
+                        result?
+                    }
+                    Err(RecvTimeoutError::Timeout) => return Err(timeout()),
+                    Err(RecvTimeoutError::Disconnected) => {
+                        *metadata = None;
+                        return Err(io::Error::other("state metadata worker stopped"));
+                    }
+                };
+                if current != identity
+                    || generation != READ_GENERATION.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Ok(None);
+                }
+                Ok(Some(state))
+            }
+            Err(RecvTimeoutError::Timeout) => Err(timeout()),
+            Err(RecvTimeoutError::Disconnected) => {
+                *pending = None;
+                Err(io::Error::other("state read worker stopped"))
+            }
         }
     }
 
@@ -187,6 +400,8 @@ impl StateFile {
         state: &State,
         hook: &dyn Fn(DurableStep) -> io::Result<()>,
     ) -> io::Result<()> {
+        self.invalidate_reads();
+        READ_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         check_schema(state)?;
         let bytes = serde_json::to_vec(state).map_err(io::Error::other)?;
         let parent = self
@@ -202,5 +417,178 @@ fn check_schema(state: &State) -> io::Result<()> {
         Ok(())
     } else {
         Err(io::Error::other("unsupported state.json schema"))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use crate::lock::WriterLock;
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::{Duration, Instant},
+    };
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn worker_capacity_is_shared_across_handles_and_survives_handle_drop() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/state-worker-capacity")
+            .join(format!(
+                "{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+        let guard = WriterLock::acquire(&root).unwrap();
+        let reader = StateFile::open(&root, Some(&guard)).unwrap();
+        reader.write(&guard, &State::default()).unwrap();
+        let permit = reader.reserve_worker().unwrap();
+        // The worker owns the permit while its I/O is blocked, even after the
+        // originating adapter is gone. Another handle must not start a job.
+        drop(reader);
+        let reader = StateFile::open(&root, None).unwrap();
+        reader.invalidate_reads();
+        let start = Instant::now();
+        assert_eq!(
+            reader
+                .read_until(start + Duration::from_secs(60))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(reader.pending_read.borrow().is_none());
+        assert!(reader.pending_metadata.borrow().is_none());
+        drop(permit);
+        assert_eq!(
+            reader
+                .read_until(Instant::now() + Duration::from_secs(3))
+                .unwrap(),
+            StateRead::Present(State::default())
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stalled_workers_survive_invalidation_without_spawning_replacements() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/state-workers")
+            .join(format!(
+                "{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+        let guard = WriterLock::acquire(&root).unwrap();
+        let reader = StateFile::open(&root, Some(&guard)).unwrap();
+        reader.write(&guard, &State::default()).unwrap();
+        let old_snapshot = reader.snapshot().unwrap();
+        let generation = READ_GENERATION.load(Ordering::SeqCst);
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        *reader.pending_read.borrow_mut() = Some((Some(generation), receive));
+        for _ in 0..32 {
+            reader.invalidate_reads();
+            let start = Instant::now();
+            assert_eq!(
+                reader
+                    .read_until(start + Duration::from_secs(60))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::TimedOut
+            );
+            assert!(start.elapsed() < Duration::from_secs(1));
+            assert_eq!(reader.pending_read.borrow().as_ref().unwrap().0, None);
+            assert!(reader.pending_metadata.borrow().is_none());
+        }
+        let state = State {
+            selection: Selection::Disconnected,
+            ..State::default()
+        };
+        reader.write(&guard, &state).unwrap();
+        send.send(Ok(old_snapshot)).unwrap();
+        assert_eq!(
+            reader
+                .read_until(Instant::now() + Duration::from_secs(3))
+                .unwrap(),
+            StateRead::Present(state.clone())
+        );
+
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        *reader.pending_metadata.borrow_mut() = Some((Some(generation), receive));
+        for _ in 0..32 {
+            reader.invalidate_reads();
+            let start = Instant::now();
+            assert_eq!(
+                reader
+                    .read_until(start + Duration::from_secs(60))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::TimedOut
+            );
+            assert!(start.elapsed() < Duration::from_secs(1));
+            assert!(reader.pending_read.borrow().is_none());
+            assert_eq!(reader.pending_metadata.borrow().as_ref().unwrap().0, None);
+        }
+        send.send(Ok(None)).unwrap(); // Stale metadata must be discarded too.
+        assert_eq!(
+            reader
+                .read_until(Instant::now() + Duration::from_secs(3))
+                .unwrap(),
+            StateRead::Present(state)
+        );
+        assert!(reader.pending_read.borrow().is_none());
+        assert!(reader.pending_metadata.borrow().is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn delayed_snapshots_are_discarded_after_other_writers_and_lock_boundaries() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/state-generation")
+            .join(format!(
+                "{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+        let guard = WriterLock::acquire(&root).unwrap();
+        let reader = StateFile::open(&root, Some(&guard)).unwrap();
+        let writer = StateFile::open(&root, None).unwrap();
+        writer.write(&guard, &State::default()).unwrap();
+        for mode in 0..3 {
+            let old = reader.snapshot().unwrap();
+            let epoch = READ_GENERATION.load(Ordering::SeqCst);
+            let (send, receive) = std::sync::mpsc::sync_channel(1);
+            *reader.pending_read.borrow_mut() = Some((Some(epoch), receive));
+            // Deterministically hold a worker's captured old intent beyond its timeout.
+            assert!(
+                reader
+                    .read_until(Instant::now() + Duration::from_millis(1))
+                    .is_err()
+            );
+            let state = State {
+                selection: Selection::Disconnected,
+                ..State::default()
+            };
+            if mode == 0 {
+                writer.write(&guard, &state).unwrap();
+            } else if mode == 1 {
+                // A replacement outside this process's generation counter.
+                let replacement = root.join("replacement.json");
+                std::fs::write(&replacement, serde_json::to_vec(&state).unwrap()).unwrap();
+                std::fs::rename(replacement, root.join("state.json")).unwrap();
+            } else {
+                reader.invalidate_reads(); // A new locked tick must start a new read.
+                writer.write(&guard, &state).unwrap();
+            }
+            let _ = send.send(Ok(old));
+            assert_eq!(
+                reader
+                    .read_until(Instant::now() + Duration::from_secs(3))
+                    .unwrap(),
+                StateRead::Present(state)
+            );
+            writer.write(&guard, &State::default()).unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -44,6 +44,35 @@ impl SecretFile {
         name: &SecretName,
         owner: u32,
     ) -> Result<Secret, SecretError> {
+        let fd = Self::checked_file(root.as_ref(), name, owner)?;
+        let failure = |check| SecretError {
+            reference: name.name().into(),
+            check,
+        };
+        let mut bytes = Zeroizing::new(Vec::with_capacity(4097));
+        fd.take(4097)
+            .read_to_end(&mut bytes)
+            .map_err(|_| failure("read reference"))?;
+        if bytes.len() > 4096 {
+            return Err(failure("reference exceeds 4 KiB"));
+        }
+        let text = std::str::from_utf8(&bytes).map_err(|_| failure("content must be UTF-8"))?;
+        let valid = match name.kind() {
+            SecretKind::Wg => valid_wg_secret(text.strip_suffix('\n').unwrap_or(text)),
+            SecretKind::Url => valid_https_url(text),
+        };
+        if !valid {
+            return Err(failure("invalid content for secret kind"));
+        }
+        Ok(Secret(bytes))
+    }
+    // Open and validate metadata without reading the value. Reconciliation uses
+    // this for availability signals; only an actual configure step reads bytes.
+    pub(crate) fn checked_file(
+        root: &Path,
+        name: &SecretName,
+        owner: u32,
+    ) -> Result<File, SecretError> {
         if !name.valid() {
             return Err(SecretError {
                 reference: format!("<invalid ref; length {}>", name.name().len()),
@@ -55,8 +84,7 @@ impl SecretFile {
             check,
         };
         let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-        let root = open(root.as_ref(), flags, Mode::empty())
-            .map_err(|_| failure("open root directory"))?;
+        let root = open(root, flags, Mode::empty()).map_err(|_| failure("open root directory"))?;
         let stat = fstat(&root).map_err(|_| failure("stat root directory"))?;
         if stat.st_uid != owner {
             return Err(failure("root directory owner"));
@@ -109,22 +137,6 @@ impl SecretFile {
         if !(0..=4096).contains(&stat.st_size) {
             return Err(failure("reference exceeds 4 KiB"));
         }
-        let mut bytes = Zeroizing::new(Vec::with_capacity(4097));
-        File::from(fd)
-            .take(4097)
-            .read_to_end(&mut bytes)
-            .map_err(|_| failure("read reference"))?;
-        if bytes.len() > 4096 {
-            return Err(failure("reference exceeds 4 KiB"));
-        }
-        let text = std::str::from_utf8(&bytes).map_err(|_| failure("content must be UTF-8"))?;
-        let valid = match name.kind() {
-            SecretKind::Wg => valid_wg_secret(text.strip_suffix('\n').unwrap_or(text)),
-            SecretKind::Url => valid_https_url(text),
-        };
-        if !valid {
-            return Err(failure("invalid content for secret kind"));
-        }
-        Ok(Secret(bytes))
+        Ok(fd.into())
     }
 }

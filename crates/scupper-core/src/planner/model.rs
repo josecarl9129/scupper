@@ -52,7 +52,9 @@ impl KernelLink {
     pub(super) fn owned(&self) -> bool {
         self.ours == Known::Value(true) && self.kind == Known::Value("wireguard".into())
     }
-    pub(super) fn ready(&self, desired: &LinkSpec) -> bool {
+    /// Whether the observed owned tunnel is up/down as intended and exactly configured.
+    #[must_use]
+    pub fn ready(&self, desired: &LinkSpec) -> bool {
         self.owned() && self.up == Known::Value(desired.up) && self.matches_config(desired)
     }
     pub(super) fn matches_config(&self, desired: &LinkSpec) -> bool {
@@ -625,6 +627,23 @@ impl KernelModel {
         match family {
             Family::V4 => &self.default_v4,
             Family::V6 => &self.default_v6,
+        }
+    }
+    /// An exit route requires verified policy and a configured, wanted UP link.
+    #[must_use]
+    pub fn route_ready(&self, desired: &Desired, target: &RouteTarget) -> bool {
+        match target {
+            RouteTarget::Unreachable => true,
+            RouteTarget::Exit(name) => {
+                self.ruleset == Known::Value(Ruleset::Verified(desired.fingerprint()))
+                    && desired.links().get(name.as_str()).is_some_and(|want| {
+                        want.up
+                            && self
+                                .links
+                                .get(name.as_str())
+                                .is_some_and(|link| link.ready(want))
+                    })
+            }
         }
     }
     /// Both forwarding gates are positively observed closed.

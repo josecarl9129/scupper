@@ -24,6 +24,11 @@ pub struct Desired {
     pub(super) disconnected: bool,
 }
 impl Desired {
+    /// Whether operator intent requires exits and forwarding to remain closed.
+    #[must_use]
+    pub const fn disconnected(&self) -> bool {
+        self.disconnected
+    }
     /// Uses the canonical fingerprint of `render_netns` supplied by the caller's
     /// renderer/canonicalizer. Pure Rust cannot ask nft to produce canonical JSON.
     /// Invalid or disconnected route intent becomes unreachable in both families.
@@ -136,6 +141,11 @@ impl Desired {
     #[must_use]
     pub const fn fingerprint(&self) -> Fingerprint {
         self.fingerprint
+    }
+    /// Applied rendered nft source for the system executor's transaction checks.
+    #[must_use]
+    pub fn rendered(&self) -> &str {
+        &self.rendered
     }
     /// Configured public tunnel settings, keyed by namespace name.
     #[must_use]

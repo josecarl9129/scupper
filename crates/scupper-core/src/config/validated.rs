@@ -523,3 +523,11 @@ mod render_tests {
 #[cfg(test)]
 #[path = "../planner/multi_exit_tests.rs"]
 mod planner_properties;
+
+/// Build internal multi-exit fixtures without relaxing release validation.
+/// Callers must use validated prototypes; this bypasses release-only restrictions.
+#[cfg(feature = "testing")]
+#[must_use]
+pub fn testing_build(cfg: super::SiteConfig) -> Option<ValidatedSite> {
+    build(cfg)
+}

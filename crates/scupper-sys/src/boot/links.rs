@@ -14,7 +14,7 @@ use scupper_core::{
 
 // Host mutations are deliberately confined here: an unconfigured host-born WG
 // link is the sole exception to namespace-only mutation dispatch.
-fn create(deps: &BootDeps<'_>, handle: &NetnsHandle, name: &str) -> Result<()> {
+pub(crate) fn cleanup_host(deps: &BootDeps<'_>, name: &str) -> Result<()> {
     let links = parse_ip_link(&execute(
         deps,
         ExecTarget::Host,
@@ -60,6 +60,11 @@ fn create(deps: &BootDeps<'_>, handle: &NetnsHandle, name: &str) -> Result<()> {
             None,
         )?;
     }
+    Ok(())
+}
+
+pub(crate) fn add_host(deps: &BootDeps<'_>, name: &str) -> Result<()> {
+    raw_name(name)?;
     execute(
         deps,
         ExecTarget::Host,
@@ -73,6 +78,11 @@ fn create(deps: &BootDeps<'_>, handle: &NetnsHandle, name: &str) -> Result<()> {
             IfName::new(name).map_err(|e| e.to_string())?,
         ))?;
     }
+    Ok(())
+}
+
+pub(crate) fn move_link(deps: &BootDeps<'_>, handle: &NetnsHandle, name: &str) -> Result<()> {
+    raw_name(name)?;
     execute(
         deps,
         ExecTarget::Host,
@@ -91,102 +101,153 @@ fn create(deps: &BootDeps<'_>, handle: &NetnsHandle, name: &str) -> Result<()> {
 
 pub(super) fn configure(deps: &BootDeps<'_>, handle: &NetnsHandle, cfg: &Inputs) -> Result<()> {
     let gw = cfg.site.gateway(&cfg.gateway).ok_or("unknown gateway")?;
-    let client = gw.client_tunnel();
-    // Under an admin disconnect the exit links stay down: the closure DESIGN §12 stage 2
-    // requires is both defaults unreachable and exit links down or without peers.
-    let exits_up = cfg.state.selection != scupper_core::verdict::v2::Selection::Disconnected;
-    let links = std::iter::once((
-        client.ifname().as_str(),
-        client.address4().to_string(),
-        client.mtu(),
-        true,
-    ))
-    .chain(gw.exits().iter().map(|e| {
-        (
-            e.ifname().as_str(),
-            e.address4().to_string(),
-            e.mtu(),
-            exits_up,
-        )
-    }));
-    for (name, address, mtu, up) in links {
+    for name in super::configured_names(cfg)?
+        .iter()
+        .filter(|n| n.as_str() != "lo")
+    {
+        let name = name.as_str();
         let existing = inventory(deps, handle)?;
         if let Some(link) = existing.iter().find(|l| l.ifname == name) {
             if link.kind.as_deref() != Some("wireguard") {
                 return Err("configured namespace link has foreign kind".into());
             }
-            execute(
-                deps,
-                ExecTarget::Netns(handle),
-                Program::Ip,
-                &strings(&["link", "set", "dev", name, "down"]),
-                None,
-            )?;
+            set_up(deps, handle, name, false)?;
         } else {
-            create(deps, handle, name)?;
+            cleanup_host(deps, name)?;
+            add_host(deps, name)?;
+            move_link(deps, handle, name)?;
         }
-        let target = ExecTarget::Netns(handle);
-        let key = cfg.secrets.get(name).ok_or("resolved link key missing")?;
+        let up = name == gw.client_tunnel().ifname().as_str()
+            || cfg.state.selection != scupper_core::verdict::v2::Selection::Disconnected;
+        configure_body(deps, handle, cfg, name, up, true)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn configure_one(
+    deps: &BootDeps<'_>,
+    handle: &NetnsHandle,
+    cfg: &Inputs,
+    name: &str,
+) -> Result<()> {
+    let existing = inventory(deps, handle)?;
+    if let Some(link) = existing.iter().find(|l| l.ifname == name) {
+        if link.kind.as_deref() != Some("wireguard") {
+            return Err("configured namespace link has foreign kind".into());
+        }
+        execute(
+            deps,
+            ExecTarget::Netns(handle),
+            Program::Ip,
+            &strings(&["link", "set", "dev", name, "down"]),
+            None,
+        )?;
+    } else {
+        return Err("link missing before configuration".into());
+    }
+    configure_body(deps, handle, cfg, name, false, false)
+}
+
+fn configure_body(
+    deps: &BootDeps<'_>,
+    handle: &NetnsHandle,
+    cfg: &Inputs,
+    name: &str,
+    up: bool,
+    global_gates_and_hardening: bool,
+) -> Result<()> {
+    let gw = cfg.site.gateway(&cfg.gateway).ok_or("unknown gateway")?;
+    let client = gw.client_tunnel();
+    let (address, mtu) = if name == client.ifname().as_str() {
+        (client.address4().to_string(), client.mtu())
+    } else {
+        let exit = gw
+            .exits()
+            .iter()
+            .find(|e| e.ifname().as_str() == name)
+            .ok_or("unknown link")?;
+        (exit.address4().to_string(), exit.mtu())
+    };
+    let target = ExecTarget::Netns(handle);
+    let key = cfg.secrets.get(name).ok_or("resolved link key missing")?;
+    wg(
+        deps,
+        handle,
+        WgCmd::SetPrivateKeyFromStdin {
+            ifname: IfName::new(name).map_err(|e| e.to_string())?,
+        },
+        Some(key.expose()),
+    )?;
+    // Recover interrupted configuration without retaining any stale peer.
+    let peers = execute(
+        deps,
+        target,
+        Program::Wg,
+        &strings(&["show", name, "peers"]),
+        None,
+    )?;
+    for peer in peers.split_whitespace() {
         wg(
             deps,
             handle,
-            WgCmd::SetPrivateKeyFromStdin {
+            WgCmd::RemovePeer {
                 ifname: IfName::new(name).map_err(|e| e.to_string())?,
+                public_key: PeerKey::new(peer).map_err(|e| e.to_string())?,
             },
-            Some(key.expose()),
-        )?;
-        // Recover interrupted configuration without retaining any stale peer.
-        let peers = execute(
-            deps,
-            target,
-            Program::Wg,
-            &strings(&["show", name, "peers"]),
             None,
         )?;
-        for peer in peers.split_whitespace() {
-            wg(
-                deps,
-                handle,
-                WgCmd::RemovePeer {
-                    ifname: IfName::new(name).map_err(|e| e.to_string())?,
-                    public_key: PeerKey::new(peer).map_err(|e| e.to_string())?,
-                },
-                None,
-            )?;
-        }
-        configure_peers(deps, handle, cfg, name)?;
-        execute(
-            deps,
-            target,
-            Program::Ip,
-            &strings(&["addr", "flush", "dev", name]),
-            None,
-        )?;
-        execute(
-            deps,
-            target,
-            Program::Ip,
-            &strings(&["addr", "add", &address, "dev", name]),
-            None,
-        )?;
-        // Setting all/default hardening again also covers the just-moved link.
+    }
+    configure_peers(deps, handle, cfg, name)?;
+    execute(
+        deps,
+        target,
+        Program::Ip,
+        &strings(&["addr", "flush", "dev", name]),
+        None,
+    )?;
+    execute(
+        deps,
+        target,
+        Program::Ip,
+        &strings(&["addr", "add", &address, "dev", name]),
+        None,
+    )?;
+    // Setting all/default hardening again also covers the just-moved link.
+    if global_gates_and_hardening {
         let actual = inventory(deps, handle)?;
         let names = super::configured_names(cfg)?
             .into_iter()
             .filter(|name| actual.iter().any(|link| link.ifname == name.as_str()))
             .collect::<Vec<_>>();
         sysctls(deps, handle, &names, false, true)?;
-        let mtu = mtu.to_string();
-        let mut args = vec!["link", "set", name, "mtu", &mtu];
-        if up {
-            args.push("up");
-        }
-        execute(deps, target, Program::Ip, &strings(&args), None)?;
     }
+    let mtu = mtu.to_string();
+    let mut args = vec!["link", "set", name, "mtu", &mtu];
+    if up {
+        args.push("up");
+    }
+    execute(deps, target, Program::Ip, &strings(&args), None)?;
     Ok(())
 }
 
-fn configure_peers(
+pub(crate) fn set_up(
+    deps: &BootDeps<'_>,
+    handle: &NetnsHandle,
+    name: &str,
+    up: bool,
+) -> Result<()> {
+    raw_name(name)?;
+    execute(
+        deps,
+        ExecTarget::Netns(handle),
+        Program::Ip,
+        &strings(&["link", "set", "dev", name, if up { "up" } else { "down" }]),
+        None,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn configure_peers(
     deps: &BootDeps<'_>,
     handle: &NetnsHandle,
     cfg: &Inputs,
@@ -261,7 +322,7 @@ fn wg(
     execute(deps, ExecTarget::Netns(handle), program, &args, input)
 }
 
-fn raw_name(name: &str) -> Result<()> {
+pub(crate) fn raw_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name.len() > 15
         || name
@@ -313,7 +374,7 @@ pub(super) fn close(deps: &BootDeps<'_>, handle: &NetnsHandle, cfg: &Inputs) -> 
     Ok(())
 }
 
-fn clear_hooks(deps: &BootDeps<'_>, handle: &NetnsHandle, name: &str) -> Result<()> {
+pub(crate) fn clear_hooks(deps: &BootDeps<'_>, handle: &NetnsHandle, name: &str) -> Result<()> {
     let target = ExecTarget::Netns(handle);
     let mut errors = Vec::new();
     for kind in ["clsact", "ingress"] {
@@ -456,4 +517,37 @@ pub(super) fn adoptable(deps: &BootDeps<'_>, handle: &NetnsHandle, cfg: &Inputs)
         }
     }
     Ok(())
+}
+
+/// Remove only the positively observed attachment class, then let the caller verify.
+pub(crate) fn delete_hook(
+    deps: &BootDeps<'_>,
+    held: &NetnsHandle,
+    name: &str,
+    hook: &str,
+) -> Result<()> {
+    raw_name(name)?;
+    if hook == "root" {
+        if let Err(error) = execute(
+            deps,
+            ExecTarget::Netns(held),
+            Program::Tc,
+            &strings(&["qdisc", "del", "dev", name, "root"]),
+            None,
+        ) {
+            let remaining = crate::collect::reconcile::hooks(deps.system, held, name, false)
+                .map_err(|e| e.to_string())?;
+            if remaining.iter().any(|h| h == hook) {
+                return Err(error);
+            }
+        }
+        Ok(())
+    } else if matches!(
+        hook,
+        "clsact" | "ingress" | "ingress-filters" | "egress-filters" | "xdp"
+    ) {
+        clear_hooks(deps, held, name)
+    } else {
+        Err("unknown hook identity".into())
+    }
 }

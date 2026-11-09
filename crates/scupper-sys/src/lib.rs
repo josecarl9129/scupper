@@ -19,3 +19,5 @@ pub mod lock;
 pub mod secrets;
 pub mod state;
 pub mod store;
+
+pub mod reconcile;

@@ -788,21 +788,9 @@ impl Builder<'_> {
         self.harden_all();
     }
     fn route_ready(&self, target: &RouteTarget) -> bool {
-        match target {
-            RouteTarget::Unreachable => true,
-            RouteTarget::Exit(name) => {
-                self.model.ruleset == Known::Value(Ruleset::Verified(self.desired.fingerprint))
-                    && self.desired.links.get(name.as_str()).is_some_and(|want| {
-                        want.up
-                            && self
-                                .model
-                                .links
-                                .get(name.as_str())
-                                .is_some_and(|link| link.ready(want))
-                    })
-            }
-        }
+        self.model.route_ready(self.desired, target)
     }
+
     fn tighten(&mut self, repair: &Repair) {
         self.result.repairs.push(repair.clone());
         match repair {

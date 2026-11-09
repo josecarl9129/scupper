@@ -340,3 +340,54 @@ mod udp_binding_tests {
         Ok(())
     }
 }
+
+/// Rebind a missing or hijacked namespace name to the original held descriptor.
+/// Never creates a second namespace. The caller must hold the writer lock.
+/// scupperd must see host `/run/netns` mount propagation: the 2o unit must not
+/// put this operation in a private mount namespace. A successful local readback
+/// cannot prove that edge and the host can see a bind in a private mount tree.
+///
+/// # Errors
+/// Returns identity, unsafe mount-point, detach or bind-mount failures.
+pub fn restore_mount(
+    held: &NetnsHandle,
+    path: &Path,
+    _writer: &crate::lock::WriterGuard,
+) -> Result<(), NetnsError> {
+    use rustix::mount::{MountFlags, UnmountFlags, mount, unmount};
+    use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt};
+    held.verify(held.identity())?;
+    if let Ok(stat) = std::fs::symlink_metadata(path) {
+        if !stat.is_file() || stat.file_type().is_symlink() {
+            return Err(std::io::Error::other("unsafe namespace mount point").into());
+        }
+        if (stat.dev(), stat.ino()) == held.identity() {
+            return Ok(());
+        }
+        // A replacement nsfs mount must be detached before the owned inode is bound.
+        if stat.dev() == held.identity().0 {
+            unmount(path, UnmountFlags::DETACH)?;
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let point = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(OFlags::NOFOLLOW.bits().cast_signed())
+        .mode(0o600)
+        .open(path)?;
+    if !point.metadata()?.is_file() {
+        return Err(std::io::Error::other("unsafe namespace mount point").into());
+    }
+    mount(
+        held.child_fd_path().as_path(),
+        path,
+        "",
+        MountFlags::BIND,
+        None::<&std::ffi::CStr>,
+    )?;
+    held.verify_link(path)
+}

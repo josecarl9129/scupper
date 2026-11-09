@@ -16,7 +16,7 @@ use scupper_core::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-fn peers(sys: &dyn System, handle: &NetnsHandle, name: &str) -> Probe<Vec<PeerObs>> {
+pub(crate) fn peers(sys: &dyn System, handle: &NetnsHandle, name: &str) -> Probe<Vec<PeerObs>> {
     let keys = peer_field(sys, handle, name, WgField::Peers)?;
     let allowed = peer_field(sys, handle, name, WgField::AllowedIps)?;
     let endpoints = peer_field(sys, handle, name, WgField::Endpoints)?;
@@ -152,6 +152,18 @@ pub fn topology(
     gateway: &GatewayId,
     stamp: &VersionStamp,
 ) -> Probe<TopologyObs> {
+    topology_recorded(sys, handle, site, gateway, stamp, &mut BTreeMap::new())
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) fn topology_recorded(
+    sys: &dyn System,
+    handle: &NetnsHandle,
+    site: &ValidatedSite,
+    gateway_id: &GatewayId,
+    stamp: &VersionStamp,
+    identities: &mut BTreeMap<String, u32>,
+) -> Probe<TopologyObs> {
     let mut errors = Vec::new();
     let raw = retain(
         observe(sys, handle, KernelCmd::Ip(IpCmd::LinkShowJson))
@@ -179,9 +191,8 @@ pub fn topology(
     if links_complete && addresses.is_some() && !addresses_complete {
         errors.push(ProbeError::io("link/address inventories disagree"));
     }
-    let gateway_id = gateway;
     let gateway = site
-        .gateway(gateway)
+        .gateway(gateway_id)
         .ok_or_else(|| ProbeError::setup("unknown gateway"))?;
     let configured = |name: &str| {
         name == "lo"
@@ -191,6 +202,12 @@ pub fn topology(
                 .iter()
                 .any(|exit| exit.ifname().as_str() == name)
     };
+    identities.clear();
+    identities.extend(
+        raw.iter()
+            .filter(|link| configured(&link.ifname) && link.kind.as_deref() == Some("wireguard"))
+            .map(|link| (link.ifname.clone(), link.ifindex)),
+    );
     let mut links = Vec::new();
     let mut peer_inventory = BTreeMap::new();
     let mut tc_hooks = Vec::new();

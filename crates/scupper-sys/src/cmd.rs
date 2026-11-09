@@ -57,6 +57,8 @@ pub enum IpCmd {
     },
     /// Replace a default route with a validated exit or unreachable route.
     RouteReplace(Family, RouteTarget),
+    /// Delete one fully observed route.
+    RouteDelete(scupper_core::planner::RouteKey),
     /// Administratively disable a link.
     LinkSetDown(IfName),
     /// Delete a link.
@@ -229,6 +231,7 @@ impl IpCmd {
                 args
             }
             Self::RouteReplace(family, target) => route_argv(*family, target),
+            Self::RouteDelete(route) => route_delete_argv(route),
             Self::LinkSetDown(dev) => strings(&["link", "set", "dev", dev.as_str(), "down"]),
             Self::LinkDelete(dev) => strings(&["link", "delete", "dev", dev.as_str()]),
         }
@@ -343,14 +346,17 @@ impl KernelCmd {
     pub const fn mutates(&self) -> bool {
         matches!(
             self,
-            Self::Ip(IpCmd::RouteReplace(..) | IpCmd::LinkSetDown(_) | IpCmd::LinkDelete(_))
-                | Self::Wg(
-                    WgCmd::SetPrivateKeyFromStdin { .. }
-                        | WgCmd::SetListenPort { .. }
-                        | WgCmd::SetPeer { .. }
-                        | WgCmd::RemovePeer { .. }
-                )
-                | Self::Nft(NftCmd::LoadStdin)
+            Self::Ip(
+                IpCmd::RouteReplace(..)
+                    | IpCmd::RouteDelete(_)
+                    | IpCmd::LinkSetDown(_)
+                    | IpCmd::LinkDelete(_)
+            ) | Self::Wg(
+                WgCmd::SetPrivateKeyFromStdin { .. }
+                    | WgCmd::SetListenPort { .. }
+                    | WgCmd::SetPeer { .. }
+                    | WgCmd::RemovePeer { .. }
+            ) | Self::Nft(NftCmd::LoadStdin)
                 | Self::Sysctl(SysctlCmd::Write(..))
                 | Self::Conntrack(_)
         )
@@ -491,6 +497,128 @@ pub fn write_sysctl_verified(
         return Err(ExecError::spawn(
             "sysctl readback did not match requested value",
         ));
+    }
+    Ok(())
+}
+
+fn route_delete_argv(route: &scupper_core::planner::RouteKey) -> Vec<String> {
+    use scupper_core::parse::{RouteDestination, RouteKind, RoutingTable};
+    let r = &route.entry;
+    let mut args = strings(&[family_flag(route.family), "route", "del"]);
+    args.push(
+        match r.kind {
+            RouteKind::Unicast => "unicast",
+            RouteKind::Unreachable => "unreachable",
+            RouteKind::Blackhole => "blackhole",
+            RouteKind::Local => "local",
+            RouteKind::Broadcast => "broadcast",
+            RouteKind::Multicast => "multicast",
+            RouteKind::Anycast => "anycast",
+            RouteKind::Prohibit => "prohibit",
+            RouteKind::Throw => "throw",
+            RouteKind::Nat => "nat",
+            RouteKind::Xresolve => "xresolve",
+        }
+        .into(),
+    );
+    args.push(match &r.dst {
+        RouteDestination::Default => "default".into(),
+        RouteDestination::Prefix(p) => p.to_string(),
+    });
+    let table = match &r.table {
+        RoutingTable::Main => "main".into(),
+        RoutingTable::Local => "local".into(),
+        RoutingTable::Default => "default".into(),
+        RoutingTable::Number(n) => n.to_string(),
+        RoutingTable::Named(s) => s.clone(),
+    };
+    args.extend(["table".into(), table]);
+    if let Some(from) = r.from {
+        args.extend(["from".into(), from.to_string()]);
+    }
+    if let Some(gateway) = r.gateway {
+        args.extend(["via".into(), gateway.to_string()]);
+    }
+    if let Some(dev) = &r.dev {
+        args.extend(["dev".into(), dev.clone()]);
+    }
+    if let Some(metric) = r.metric {
+        args.extend(["metric".into(), metric.to_string()]);
+    }
+    if let Some(src) = r.prefsrc {
+        args.extend(["src".into(), src.to_string()]);
+    }
+    if let Some(protocol) = &r.protocol {
+        args.extend(["proto".into(), protocol.clone()]);
+    }
+    if let Some(scope) = &r.scope {
+        args.extend(["scope".into(), scope.clone()]);
+    }
+    args
+}
+
+/// Delete an observed unique-priority rule only after rechecking its full identity.
+/// The encoded identity is supplied by the collector, never by a control request.
+///
+/// # Errors
+/// Refuses ambiguous, stale, malformed identities and execution failures.
+pub(crate) fn delete_observed_rule(
+    sys: &dyn System,
+    held: &NetnsHandle,
+    identity: &str,
+) -> Result<(), ExecError> {
+    let value: serde_json::Value =
+        serde_json::from_str(identity).map_err(|_| ExecError::spawn("invalid rule identity"))?;
+    let family = match value["v6"].as_bool() {
+        Some(true) => Family::V6,
+        Some(false) => Family::V4,
+        None => return Err(ExecError::spawn("invalid rule family")),
+    };
+    let rule = &value["rule"];
+    let priority = rule["priority"]
+        .as_u64()
+        .and_then(|p| u32::try_from(p).ok())
+        .ok_or_else(|| ExecError::spawn("invalid rule priority"))?;
+    let output = run_cmd(
+        sys,
+        ExecTarget::Netns(held),
+        &KernelCmd::Ip(IpCmd::RuleShowJson { family }),
+        crate::system::EXEC_TIMEOUT,
+    )?;
+    if output.status != Some(0) {
+        return Err(ExecError::spawn("rule inventory failed"));
+    }
+    scupper_core::parse::parse_ip_rule(&output.stdout)
+        .map_err(|_| ExecError::spawn("invalid rule inventory"))?;
+    let live: serde_json::Value = serde_json::from_str(&output.stdout)
+        .map_err(|_| ExecError::spawn("invalid rule inventory"))?;
+    let entries = live
+        .as_array()
+        .ok_or_else(|| ExecError::spawn("invalid rule inventory"))?;
+    let matches: Vec<_> = entries
+        .iter()
+        .filter(|r| r["priority"].as_u64() == Some(u64::from(priority)))
+        .collect();
+    if matches.is_empty() {
+        return Ok(());
+    }
+    if matches.len() != 1 || matches[0] != rule {
+        return Err(ExecError::spawn("rule changed before deletion"));
+    }
+    let output = sys.run_in(
+        ExecTarget::Netns(held),
+        Program::Ip,
+        &strings(&[
+            family_flag(family),
+            "rule",
+            "del",
+            "priority",
+            &priority.to_string(),
+        ]),
+        crate::system::EXEC_TIMEOUT,
+    )?;
+    if output.status != Some(0) {
+        return Err(ExecError::spawn("rule deletion failed"));
     }
     Ok(())
 }

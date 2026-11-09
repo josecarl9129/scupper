@@ -353,6 +353,7 @@ impl Kernel {
                             "allowed-ips" => format!("{key}\t{allowed}\n"),
                             "endpoints" => format!("{key}\t{endpoint}\n"),
                             "persistent-keepalive" => format!("{key}\t{}\n", link.keepalive),
+                            "latest-handshakes" => format!("{key}\t999\n"),
                             _ => panic!("unexpected wg read"),
                         })
                         .collect(),
@@ -502,6 +503,21 @@ fn fresh_and_adopt_call_goldens() {
         serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
     assert_eq!(persisted["steps"].as_array().unwrap().len(), 8);
     assert_eq!(persisted["applied_version"], 1);
+    let identities =
+        scupper_core::parse::parse_ip_link(&Kernel::json_links(&fixture.kernel.ns.borrow()))
+            .unwrap()
+            .into_iter()
+            .filter(|l| l.kind.as_deref() == Some("wireguard"))
+            .map(|l| (l.ifname, l.ifindex))
+            .collect::<BTreeMap<_, _>>();
+    assert_eq!(report.owned_links, identities);
+    assert_eq!(
+        persisted["owned_links"],
+        serde_json::to_value(&identities).unwrap()
+    );
+    let roundtrip: BootReport = serde_json::from_value(persisted).unwrap();
+    assert!(roundtrip.succeeded());
+    assert_eq!(roundtrip.owned_links, identities);
     fixture.kernel.calls.borrow_mut().clear();
     let report = fixture.run(None);
     assert!(report.succeeded() && report.adopted, "{report:?}");
@@ -1365,4 +1381,184 @@ fn inputs_checkpoint_already_has_every_foreign_link_down_and_every_redirect_remo
     }
     assert!(links.values().all(|l| !l.hooks && !l.xdp));
     assert_eq!(f.kernel.values.borrow()["net.ipv4.ip_forward"], "0");
+}
+
+#[test]
+fn reconciler_link_configuration_is_local_and_ignores_other_missing_keys() {
+    use scupper_core::{
+        config::GatewayId,
+        planner::{Desired, Step},
+        render::RouteTarget,
+        verdict::v2::Selection,
+    };
+    use scupper_sys::reconcile::{Config, Kernel as _, RealKernel};
+    use std::sync::Arc;
+    let fixture = Fixture::new();
+    assert!(fixture.run(None).succeeded());
+    let site = support::site("ubuntu-24.04");
+    let exit = &site.gateway(&GatewayId("gw1".into())).unwrap().exits()[0];
+    fs::remove_file(
+        fixture
+            .root
+            .path
+            .join("secrets/wg")
+            .join(exit.private_key_ref().name()),
+    )
+    .unwrap();
+    let handle = Arc::new(testing::handle().unwrap());
+    let config = Config {
+        site: site.clone(),
+        gateway: GatewayId("gw1".into()),
+        stamp: fixture.root.stamp,
+        fingerprint: [7; 32],
+        run_root: fixture.root.path.join("run"),
+        lock_wait: Duration::ZERO,
+    };
+    let desired = Desired::new(
+        &site,
+        &config.gateway,
+        &config.stamp,
+        config.fingerprint,
+        &RouteTarget::Unreachable,
+        &Selection::Auto,
+    )
+    .unwrap();
+    let adapter = RealKernel::new(
+        BootDeps {
+            system: &fixture.kernel,
+            namespace: &fixture.kernel,
+            state_root: &fixture.root.path,
+            config_root: &fixture.root.path,
+            run_root: &config.run_root,
+            hook: None,
+            secret_owner: rustix::process::geteuid().as_raw(),
+        },
+        handle.clone(),
+        &config,
+        support::health(&site, &handle),
+        handle.fd_path(),
+        None,
+    )
+    .unwrap();
+    fixture.kernel.calls.borrow_mut().clear();
+    let gates = fixture.kernel.values.borrow().clone();
+    adapter
+        .execute(&Step::LinkReconfigure {
+            link: desired.links()["wg0"].clone(),
+        })
+        .unwrap();
+    assert_eq!(*fixture.kernel.values.borrow(), gates);
+    assert!(
+        !fixture
+            .kernel
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call.contains("Sysctl"))
+    );
+}
+
+#[test]
+fn durable_boot_handoff_resumes_owned_links_and_guards_forwarding_intent() {
+    use scupper_core::{
+        config::GatewayId,
+        failover::MonoTime,
+        planner::{Known, Step},
+        render::VersionStamp,
+        verdict::v2::{HealthConfigV2, NetnsIdentity},
+    };
+    use scupper_sys::{
+        events::EventLog,
+        reconcile::{Config, Kernel as KernelAdapter, RealKernel, Reconciler},
+        state::Selection,
+    };
+    use std::{sync::Arc, time::Instant};
+    let fixture = Fixture::new();
+    assert!(fixture.run(None).succeeded());
+    let held = Arc::new(fixture.kernel.open().unwrap().unwrap());
+    let config = Config {
+        site: support::site("ubuntu-24.04"),
+        gateway: GatewayId("gw1".into()),
+        stamp: VersionStamp {
+            version: 1,
+            sha256: [0; 32],
+        },
+        fingerprint: scupper_sys::canon::fingerprint(
+            &scupper_sys::canon::canonicalize(&support::fixture(
+                "ubuntu-24.04",
+                "scupper-nft-ruleset.json",
+            ))
+            .unwrap(),
+        )
+        .unwrap(),
+        run_root: fixture.root.path.join("run"),
+        lock_wait: Duration::ZERO,
+    };
+    let health = HealthConfigV2::new(
+        &config.site,
+        &config.gateway,
+        NetnsIdentity {
+            device: held.identity().0,
+            inode: held.identity().1,
+        },
+        vec!["203.0.113.1".parse().unwrap()],
+        1,
+    )
+    .unwrap();
+    let run_root = config.run_root.clone();
+    let kernel = RealKernel::from_boot_file(
+        BootDeps {
+            system: &fixture.kernel,
+            namespace: &fixture.kernel,
+            state_root: &fixture.root.path,
+            config_root: &fixture.root.path,
+            run_root: &run_root,
+            hook: None,
+            secret_owner: rustix::process::geteuid().as_raw(),
+        },
+        held.clone(),
+        &config,
+        health,
+        held.fd_path(),
+        None,
+    )
+    .unwrap();
+    let safety = kernel.observe(&held);
+    for name in ["wg0", "ex-ch1"] {
+        assert_eq!(safety.model.links[name].ours, Known::Value(true));
+    }
+    // The pre-enable state read has a fresh timeout even after collection expired.
+    kernel.observe_rest(&held, safety, Instant::now());
+    kernel.execute(&Step::FlushConntrack).unwrap();
+    let on = Step::ForwardingOn {
+        requires: config.fingerprint,
+    };
+    kernel.execute(&on).unwrap();
+    kernel.execute(&Step::ForwardingOff).unwrap();
+    let guard = WriterLock::acquire(&config.run_root).unwrap();
+    let store = StateFile::open(&fixture.root.path, None).unwrap();
+    store
+        .update(&guard, |state| state.selection = Selection::Disconnected)
+        .unwrap();
+    kernel.execute(&Step::FlushConntrack).unwrap();
+    assert!(kernel.execute(&on).is_err());
+    drop(guard);
+    let log =
+        EventLog::memory_only(config.gateway.clone(), || scupper_proto::UnixSeconds(1000)).unwrap();
+    let mut reconciler = Reconciler::new(kernel, store, log.handle.clone(), config, held, || {
+        (MonoTime(Duration::from_secs(1)), 1000)
+    })
+    .unwrap();
+    let report = reconciler.tick();
+    assert!(
+        !report
+            .escalations
+            .contains(&scupper_sys::reconcile::Escalation::LinkCollision)
+    );
+    assert!(
+        report
+            .steps
+            .iter()
+            .all(|s| !matches!(s, Step::ForwardingOn { .. }))
+    );
 }

@@ -504,6 +504,7 @@ impl LogHandle {
     ) -> Result<u64, EmitError> {
         let mut queue = self.shared.lock();
         if queue.state != WriterState::Running {
+            queue.dropped = queue.dropped.saturating_add(1);
             return Err(EmitError::Stopped);
         }
         let event = self.shared.event(&mut queue, kind, actor, config_version)?;
@@ -519,7 +520,7 @@ impl LogHandle {
         self.shared.committed.load(Ordering::Acquire)
     }
 
-    /// Total buffered events discarded by this writer since open.
+    /// Total events discarded from the buffer or refused after shutdown since open.
     #[must_use]
     pub fn dropped(&self) -> u64 {
         self.shared.lock().dropped

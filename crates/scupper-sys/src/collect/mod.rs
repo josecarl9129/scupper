@@ -2,9 +2,11 @@
 //! Missing boot.json or state.json is an observation error, never a reset to Auto.
 //! No collector reads a private key or asks `WireGuard` for a secret-bearing field.
 
-mod forwarding;
-mod routes;
-mod topology;
+pub(crate) mod forwarding;
+pub(crate) mod reconcile;
+pub(crate) mod routes;
+pub(crate) mod topology;
+pub(crate) use topology::topology_recorded;
 
 pub use forwarding::forwarding;
 pub use routes::{defaults, routes};

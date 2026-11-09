@@ -4,12 +4,12 @@
 //! Foreign links are all disabled and redirect hooks removed before failing closed.
 //! Extra RPDB rules and main-table routes still require operator/planner repair.
 
-mod links;
+pub(crate) mod links;
 
 use crate::{
     canon, collect,
     fs::{Fs, RealFs, durable_replace},
-    lock::WriterLock,
+    lock::{WriterGuard, WriterLock},
     netns::{NetnsError, NetnsHandle},
     secrets::{Secret, SecretFile},
     state::{State, StateFile},
@@ -23,12 +23,12 @@ use scupper_core::{
     rules::IfName,
     verdict::v2::{self, HealthConfigV2, NetnsIdentity, Next, Observations, RulesetObs, Selection},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, path::Path};
 
 /// Numbered boot checkpoints from DESIGN §15.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum BootStep {
     /// 0: acquire the global writer lock, with a bounded wait.
@@ -50,7 +50,7 @@ pub enum BootStep {
 }
 
 /// A single step's outcome. Unrun steps do not appear in the report.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepResult {
     /// Numbered operation.
     pub step: BootStep,
@@ -61,7 +61,7 @@ pub struct StepResult {
 }
 
 /// Per-boot namespace identity, never persisted across reboots.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NamespaceIdentity {
     /// Namespace filesystem device.
     pub dev: u64,
@@ -70,7 +70,7 @@ pub struct NamespaceIdentity {
 }
 
 /// Complete or stopped boot attempt; the first failed step ends the attempt.
-#[derive(Debug, Default, Clone, Serialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct BootReport {
     /// Ordered attempted steps.
     pub steps: Vec<StepResult>,
@@ -82,6 +82,9 @@ pub struct BootReport {
     pub warnings: Vec<String>,
     /// Whether the namespace passed the verify-only adoption criteria.
     pub adopted: bool,
+    /// Owned `WireGuard` names and ifindexes verified through the held namespace.
+    #[serde(default)]
+    pub owned_links: BTreeMap<String, u32>,
 }
 impl BootReport {
     /// True only after every checkpoint, including durable publication, succeeded.
@@ -143,17 +146,24 @@ pub struct BootDeps<'a> {
 }
 
 type Result<T, E = String> = std::result::Result<T, E>;
-struct Inputs {
+pub(crate) struct Inputs {
     site: ValidatedSite,
     gateway: GatewayId,
     stamp: VersionStamp,
     state: State,
-    rules: String,
+    pub(crate) rules: String,
     secrets: BTreeMap<String, Secret>,
     missing_state_alert: bool,
 }
 
-fn inputs(deps: &BootDeps<'_>, report: &mut BootReport) -> Result<Inputs> {
+pub(crate) fn inputs(deps: &BootDeps<'_>, report: &mut BootReport) -> Result<Inputs> {
+    inputs_for_link(deps, report, None)
+}
+pub(crate) fn inputs_for_link(
+    deps: &BootDeps<'_>,
+    report: &mut BootReport,
+    only: Option<&str>,
+) -> Result<Inputs> {
     let store = VersionStore::read_only(deps.state_root, deps.config_root);
     let head = store
         .head()
@@ -211,7 +221,7 @@ fn inputs(deps: &BootDeps<'_>, report: &mut BootReport) -> Result<Inputs> {
             .map(|exit| (exit.ifname().as_str(), exit.private_key_ref())),
     );
     let mut secrets = BTreeMap::new();
-    for (name, reference) in refs {
+    for (name, reference) in refs.filter(|(name, _)| only.is_none_or(|only| only == *name)) {
         #[cfg(feature = "testing")]
         let key = SecretFile::open_with_owner(deps.config_root, reference, deps.secret_owner);
         #[cfg(not(feature = "testing"))]
@@ -234,7 +244,7 @@ fn strings(args: &[&str]) -> Vec<String> {
 }
 
 // Commands receiving secret stdin must never retain child diagnostics.
-fn execute(
+pub(crate) fn execute(
     deps: &BootDeps<'_>,
     target: ExecTarget<'_>,
     program: Program,
@@ -273,7 +283,7 @@ fn diagnostic(stderr: &str) -> String {
         .collect()
 }
 
-fn inventory(
+pub(crate) fn inventory(
     deps: &BootDeps<'_>,
     handle: &NetnsHandle,
 ) -> Result<Vec<scupper_core::parse::IpLink>> {
@@ -287,7 +297,7 @@ fn inventory(
     .map_err(|e| e.to_string())
 }
 
-fn sysctls(
+pub(crate) fn sysctls(
     deps: &BootDeps<'_>,
     handle: &NetnsHandle,
     names: &[IfName],
@@ -336,7 +346,12 @@ fn sysctls(
     Ok(())
 }
 
-fn containment(deps: &BootDeps<'_>, handle: &NetnsHandle, cfg: &Inputs) -> Result<()> {
+fn containment(
+    deps: &BootDeps<'_>,
+    handle: &NetnsHandle,
+    cfg: &Inputs,
+    identities: &mut BTreeMap<String, u32>,
+) -> Result<()> {
     let (device, inode) = handle.identity();
     let health = HealthConfigV2::new(
         &cfg.site,
@@ -347,12 +362,13 @@ fn containment(deps: &BootDeps<'_>, handle: &NetnsHandle, cfg: &Inputs) -> Resul
     )
     .map_err(|e| e.to_string())?;
     let obs = Observations {
-        topology: Some(collect::topology(
+        topology: Some(collect::topology_recorded(
             deps.system,
             handle,
             &cfg.site,
             &cfg.gateway,
             &cfg.stamp,
+            identities,
         )),
         selection: cfg.state.selection.clone(),
         ..Observations::default()
@@ -406,7 +422,11 @@ pub fn boot(deps: &BootDeps<'_>) -> BootReport {
             return report;
         }
     };
-    let report = boot_locked(deps, report);
+    boot_with_guard(deps, &guard)
+}
+
+pub(crate) fn boot_with_guard(deps: &BootDeps<'_>, _guard: &WriterGuard) -> BootReport {
+    let report = boot_locked(deps, BootReport::default());
     if !report.succeeded() {
         let mut report = report;
         if let Err(error) = save_report(deps, &report) {
@@ -416,7 +436,6 @@ pub fn boot(deps: &BootDeps<'_>) -> BootReport {
         }
         return report;
     }
-    drop(guard);
     report
 }
 
@@ -438,6 +457,7 @@ fn boot_locked(deps: &BootDeps<'_>, mut report: BootReport) -> BootReport {
     if !step(&mut report, deps, BootStep::Lock, false, || Ok(())) {
         return report;
     }
+    let mut owned_links = BTreeMap::new();
     let prepared = (|| {
         let cfg = inputs(deps, &mut report)?;
         let existing = deps.namespace.open().map_err(|e| e.to_string())?;
@@ -464,7 +484,7 @@ fn boot_locked(deps: &BootDeps<'_>, mut report: BootReport) -> BootReport {
             && cfg.state.quarantine.is_none()
             && !cfg.missing_state_alert
             && links::adoptable(deps, &handle, &cfg).is_ok()
-            && containment(deps, &handle, &cfg).is_ok()
+            && containment(deps, &handle, &cfg, &mut owned_links).is_ok()
             && sysctls(deps, &handle, &names, true, false).is_ok();
         let closed = if adopted {
             Ok(())
@@ -622,7 +642,7 @@ fn boot_locked(deps: &BootDeps<'_>, mut report: BootReport) -> BootReport {
         if adopted {
             return Ok(());
         }
-        containment(deps, &handle, &cfg)?;
+        containment(deps, &handle, &cfg, &mut owned_links)?;
         sysctls(
             deps,
             &handle,
@@ -633,6 +653,7 @@ fn boot_locked(deps: &BootDeps<'_>, mut report: BootReport) -> BootReport {
     }) {
         return report;
     }
+    report.owned_links = owned_links;
     // Serialize the successful Record result as part of its own durable write.
     report.steps.push(StepResult {
         step: BootStep::Record,
@@ -648,7 +669,7 @@ fn boot_locked(deps: &BootDeps<'_>, mut report: BootReport) -> BootReport {
     report
 }
 
-fn configured_names(cfg: &Inputs) -> Result<Vec<IfName>> {
+pub(crate) fn configured_names(cfg: &Inputs) -> Result<Vec<IfName>> {
     let gw = cfg.site.gateway(&cfg.gateway).ok_or("unknown gateway")?;
     std::iter::once("lo")
         .chain(std::iter::once(gw.client_tunnel().ifname().as_str()))
