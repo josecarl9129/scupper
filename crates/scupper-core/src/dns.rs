@@ -82,20 +82,28 @@ fn name(bytes: &[u8], cursor: &mut usize) -> Option<String> {
     None
 }
 
-/// Accepts only an untruncated successful response to the exact IN/A question.
+/// A matching DNS reply that cannot provide usable IPv4 addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum DnsFailure {
+    /// Resolver returned a nonzero response code.
+    #[error("DNS rcode {0}")]
+    Rcode(u8),
+    /// Reply requires unsupported TCP fallback.
+    #[error("DNS truncated reply")]
+    Truncated,
+    /// Answer is malformed or has no usable A record.
+    #[error("DNS malformed answer or no usable IPv4 addresses")]
+    Unusable,
+}
+
+/// Ignores unrelated packets; matching replies return addresses or a failure.
 /// Returns at most two addresses, following at most eight CNAMEs entirely within
-/// the answer section. Malformed, unrelated and mismatched packets are ignored.
+/// the answer section. Once the id and exact IN/A question match, unusable replies
+/// end the query rather than consuming its deadline.
 #[must_use]
-pub fn response(bytes: &[u8], id: u16, host: &str) -> Option<Vec<Ipv4Addr>> {
-    if bytes.len() > MAX_MESSAGE
-        || word(bytes, 0)? != id
-        || word(bytes, 2)? & 0xfa0f != 0x8000 // QR, opcode, TC, RCODE
-        || word(bytes, 4)? != 1
-    {
-        return None;
-    }
-    let count = usize::from(word(bytes, 6)?);
-    if count > MAX_RECORDS {
+pub fn response(bytes: &[u8], id: u16, host: &str) -> Option<Result<Vec<Ipv4Addr>, DnsFailure>> {
+    let flags = word(bytes, 2)?;
+    if word(bytes, 0)? != id || flags & 0xf800 != 0x8000 || word(bytes, 4)? != 1 {
         return None;
     }
     let mut at = 12;
@@ -105,7 +113,19 @@ pub fn response(bytes: &[u8], id: u16, host: &str) -> Option<Vec<Ipv4Addr>> {
     {
         return None;
     }
-    at += 4;
+    if flags & 0xf != 0 {
+        return Some(Err(DnsFailure::Rcode(u8::try_from(flags & 0xf).ok()?)));
+    }
+    if flags & 0x0200 != 0 {
+        return Some(Err(DnsFailure::Truncated));
+    }
+    Some(answers(bytes, at + 4, host).ok_or(DnsFailure::Unusable))
+}
+fn answers(bytes: &[u8], mut at: usize, host: &str) -> Option<Vec<Ipv4Addr>> {
+    let count = usize::from(word(bytes, 6)?);
+    if bytes.len() > MAX_MESSAGE || count > MAX_RECORDS {
+        return None;
+    }
     let mut aliases = Vec::new();
     let mut addresses = Vec::new();
     for _ in 0..count {
@@ -115,7 +135,10 @@ pub fn response(bytes: &[u8], id: u16, host: &str) -> Option<Vec<Ipv4Addr>> {
         let length = usize::from(word(bytes, at + 8)?);
         at += 10;
         let data = bytes.get(at..at + length)?;
-        if class == 1 && kind == 1 && length == 4 {
+        if class == 1 && kind == 1 {
+            if length != 4 {
+                return None;
+            }
             addresses.push((owner, Ipv4Addr::new(data[0], data[1], data[2], data[3])));
         } else if class == 1 && kind == 5 {
             let mut cursor = at;
@@ -146,7 +169,7 @@ pub fn response(bytes: &[u8], id: u16, host: &str) -> Option<Vec<Ipv4Addr>> {
                     result.push(*address);
                 }
             }
-            return Some(result);
+            return (!result.is_empty()).then_some(result);
         }
         if links.len() != 1 || !found.is_empty() {
             return None;
@@ -176,7 +199,7 @@ mod tests {
         let bytes = answer(42, "probe.test");
         assert_eq!(
             response(&bytes, 42, "PROBE.test"),
-            Some(vec![Ipv4Addr::new(10, 2, 0, 1)])
+            Some(Ok(vec![Ipv4Addr::new(10, 2, 0, 1)]))
         );
         assert_eq!(response(&bytes, 43, "probe.test"), None);
         assert_eq!(response(&bytes, 42, "other.test"), None);
@@ -186,7 +209,10 @@ mod tests {
         assert_eq!(response(&wrong_label_boundaries, 42, "probe.test"), None);
         let mut truncated = bytes.clone();
         truncated[2] |= 2;
-        assert_eq!(response(&truncated, 42, "probe.test"), None);
+        assert_eq!(
+            response(&truncated, 42, "probe.test"),
+            Some(Err(DnsFailure::Truncated))
+        );
         for packet in [&[0xc0, 0][..], &[1, b'a', 0xc0, 0], &[0xc0, 2, 0xc0, 0]] {
             assert!(name(packet, &mut 0).is_none());
         }
@@ -201,11 +227,59 @@ mod tests {
         bytes.extend_from_slice(&[1, b'b', 0xc0, 14, 0, 1, 0, 1, 0, 0, 0, 1, 0, 4, 1, 2, 3, 4]);
         assert_eq!(
             response(&bytes, 1, "a.test"),
-            Some(vec![Ipv4Addr::new(1, 2, 3, 4)])
+            Some(Ok(vec![Ipv4Addr::new(1, 2, 3, 4)]))
         );
         bytes[37] = b'a';
-        assert_eq!(response(&bytes, 1, "a.test"), None);
+        assert_eq!(
+            response(&bytes, 1, "a.test"),
+            Some(Err(DnsFailure::Unusable))
+        );
         assert_eq!(response(&answer(1, "unrelated.test"), 1, "a.test"), None);
+    }
+
+    #[test]
+    fn matching_dns_failures_are_not_unrelated_packets() {
+        let mut bytes = answer(42, "probe.test");
+        bytes[3] |= 3;
+        assert_eq!(
+            response(&bytes, 42, "probe.test"),
+            Some(Err(DnsFailure::Rcode(3)))
+        );
+        bytes[3] = 2;
+        assert_eq!(
+            response(&bytes, 42, "probe.test"),
+            Some(Err(DnsFailure::Rcode(2)))
+        );
+        bytes[3] = 0;
+        bytes.truncate(bytes.len() - 1);
+        assert_eq!(
+            response(&bytes, 42, "probe.test"),
+            Some(Err(DnsFailure::Unusable))
+        );
+        bytes[7] = 0;
+        assert_eq!(
+            response(&bytes, 42, "probe.test"),
+            Some(Err(DnsFailure::Unusable))
+        );
+    }
+
+    #[test]
+    fn matching_malformed_owners_and_cname_with_a_fail_the_query() {
+        let mut bytes = answer(42, "probe.test");
+        bytes[7] = 2;
+        bytes.extend_from_slice(&[0xc0, 12, 0, 5, 0, 1, 0, 0, 0, 1, 0, 3, 1, b'a', 0]);
+        assert_eq!(
+            response(&bytes, 42, "probe.test"),
+            Some(Err(DnsFailure::Unusable))
+        );
+        let mut bytes = query(42, "probe.test").unwrap();
+        bytes[2] = 0x81;
+        bytes[7] = 1;
+        bytes.extend_from_slice(&[1, b'_', 0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 4, 1, 2, 3, 4]);
+        assert_eq!(
+            response(&bytes, 42, "probe.test"),
+            Some(Err(DnsFailure::Unusable))
+        );
     }
 
     proptest! {
@@ -221,7 +295,7 @@ mod tests {
             prop_assert_eq!(name(&bytes, &mut cursor), Some(host.clone()));
             prop_assert_eq!(word(&bytes, cursor), Some(1));
             prop_assert_eq!(word(&bytes, cursor + 2), Some(1));
-            prop_assert_eq!(response(&answer(id, &host), id, &host).unwrap().len(), 1);
+            prop_assert_eq!(response(&answer(id, &host), id, &host).unwrap().unwrap().len(), 1);
         }
     }
 }

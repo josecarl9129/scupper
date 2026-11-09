@@ -3,8 +3,7 @@ use super::{Lab, Result, addresses::A, fail};
 use scupper_sys::{
     netns::NetnsHandle,
     probe_child::{
-        ProbeCredentials, ProbeExec, ProbeIdentity, ProbeKind, ProbeRequest, ProbeResult, Url,
-        run_probe,
+        ProbeCredentials, ProbeExec, ProbeIdentity, ProbeKind, ProbeRequest, ProbeResult, run_probe,
     },
     rules::IfName,
     system::{ExecError, ExecOutput, execute_file_command},
@@ -78,20 +77,21 @@ impl Lab {
                     )?;
                 }
                 self.runner.check()?;
-                let request = ProbeRequest {
-                    kind,
-                    bind,
-                    expected_netns: handle.identity(),
-                    dns: A.provider_inner.parse()?,
-                    targets: vec![Url::new("https://probe-child.lab.test/")?],
-                    deadline_ms: 0,
-                    identity: None,
-                };
+                let request: ProbeRequest = serde_json::from_value(serde_json::json!({
+                    "kind": kind,
+                    "bind": bind.as_ref().map(IfName::as_str),
+                    "expected_netns": handle.identity(),
+                    "dns": A.provider_inner,
+                    "targets": ["https://probe-child.lab.test/"],
+                    "deadline_ms": 0,
+                }))?;
                 let outcome = run_probe(&exec, &handle, &request)?;
                 if outcome.credentials
                     != Some(ProbeCredentials {
                         uids: [identity.uid; 4],
                         gids: [identity.gid; 4],
+                        no_new_privs: true,
+                        cap_bnd: 0,
                     })
                     || outcome.threads_before_setns != Some(1)
                 {

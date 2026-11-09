@@ -9,7 +9,7 @@ use std::{
 #[test]
 fn child_starts_single_threaded_and_refuses_invalid_stdin_with_json_outcome()
 -> Result<(), Box<dyn Error>> {
-    let json = r#"{"kind":"Path","bind":null,"expected_netns":[0,0],"dns":"10.2.0.1","targets":["https://probe.test/"],"identity":{"uid":65534,"gid":65534}}"#;
+    let json = r#"{"kind":"Path","bind":null,"expected_netns":[0,0],"dns":"10.2.0.1","targets":["https://probe.test/"]}"#;
     let output = Command::new(env!("CARGO_BIN_EXE_scupper"))
         .args(["probe", json])
         .stdin(Stdio::from(File::open("/proc/self/ns/net")?))

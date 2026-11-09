@@ -15,7 +15,7 @@ required-features = ["testing"]
 
 [dependencies]
 scupper-core.workspace = true
-rustix.workspace = true
+rustix = { workspace = true, features = ["stdio"] }
 thiserror.workspace = true
 socket2.workspace = true
 rustls.workspace = true
