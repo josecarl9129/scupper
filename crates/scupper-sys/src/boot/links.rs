@@ -88,17 +88,24 @@ fn create(deps: &BootDeps<'_>, handle: &NetnsHandle, name: &str) -> Result<()> {
 pub(super) fn configure(deps: &BootDeps<'_>, handle: &NetnsHandle, cfg: &Inputs) -> Result<()> {
     let gw = cfg.site.gateway(&cfg.gateway).ok_or("unknown gateway")?;
     let client = gw.client_tunnel();
+    // Under an admin disconnect the exit links stay down: the closure DESIGN §12 stage 2
+    // requires is both defaults unreachable and exit links down or without peers.
+    let exits_up = cfg.state.selection != scupper_core::verdict::v2::Selection::Disconnected;
     let links = std::iter::once((
         client.ifname().as_str(),
         client.address4().to_string(),
         client.mtu(),
+        true,
     ))
-    .chain(
-        gw.exits()
-            .iter()
-            .map(|e| (e.ifname().as_str(), e.address4().to_string(), e.mtu())),
-    );
-    for (name, address, mtu) in links {
+    .chain(gw.exits().iter().map(|e| {
+        (
+            e.ifname().as_str(),
+            e.address4().to_string(),
+            e.mtu(),
+            exits_up,
+        )
+    }));
+    for (name, address, mtu, up) in links {
         let existing = inventory(deps, handle)?;
         if let Some(link) = existing.iter().find(|l| l.ifname == name) {
             if link.kind.as_deref() != Some("wireguard") {
@@ -162,13 +169,12 @@ pub(super) fn configure(deps: &BootDeps<'_>, handle: &NetnsHandle, cfg: &Inputs)
             .map(|l| IfName::new(&l.ifname).map_err(|e| e.to_string()))
             .collect::<Result<Vec<_>>>()?;
         sysctls(deps, handle, &names, false, true)?;
-        execute(
-            deps,
-            target,
-            Program::Ip,
-            &strings(&["link", "set", name, "mtu", &mtu.to_string(), "up"]),
-            None,
-        )?;
+        let mtu = mtu.to_string();
+        let mut args = vec!["link", "set", name, "mtu", &mtu];
+        if up {
+            args.push("up");
+        }
+        execute(deps, target, Program::Ip, &strings(&args), None)?;
     }
     Ok(())
 }
