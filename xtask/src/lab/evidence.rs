@@ -46,7 +46,11 @@ impl Case {
         }
     }
 }
+#[cfg(test)]
 pub(super) fn policy(markers: &[String], auxiliary: bool) -> Result<String> {
+    policy_with_exit_port(markers, auxiliary, 51821)
+}
+fn policy_with_exit_port(markers: &[String], auxiliary: bool, exit_port: u16) -> Result<String> {
     let mut text = format!(
         "uplink_addrs = {}\nforbidden_addrs = {}\ncanary_markers = {}\narp = true\nndp = true\nmin_packets = {}\nexpect = {}\n",
         serde_json::to_string(&if auxiliary {
@@ -87,7 +91,7 @@ pub(super) fn policy(markers: &[String], auxiliary: bool) -> Result<String> {
     } else {
         for (local_port, remote, remote_port) in [
             (51820, A.client.peer, 51820),
-            (51821, A.provider.peer, 51820),
+            (exit_port, A.provider.peer, 51820),
         ] {
             write!(
                 text,
@@ -104,8 +108,9 @@ pub(super) fn report(
     stem: &str,
     markers: &[String],
     auxiliary: bool,
+    port: u16,
 ) -> Result<Report> {
-    let text = policy(markers, auxiliary)?;
+    let text = policy_with_exit_port(markers, auxiliary, port)?;
     fs::write(dir.join(format!("{stem}.policy.toml")), &text)?;
     let report = classify(
         &fs::read(dir.join(format!("{stem}.pcap")))?,
@@ -310,6 +315,44 @@ pub(super) fn antispoof_trace(text: &str, sources: &[&str]) -> Result<()> {
         }) {
             return super::fail(format!("no antispoof drop trace for {source}"));
         }
+    }
+    Ok(())
+}
+
+/// Prefixes can have only client transport, plus host ICMP port-unreachable
+/// errors before the client socket exists. Quoted plaintext remains forbidden.
+pub(super) fn boot_prefix(dir: &Path, stem: &str, markers: &[String], port: u16) -> Result<()> {
+    let base = policy_with_exit_port(markers, false, port)?;
+    let base = base
+        .lines()
+        .map(|line| {
+            if line.starts_with("min_packets = ") {
+                "min_packets = 1"
+            } else if line.starts_with("expect = ") {
+                "expect = [\"wireguard[0]\"]"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let text = format!(
+        "{base}\n[[host_allow]]\nproto = \"icmp\"\nremote_addr = \"{}\"\ntypes = [3]\n",
+        A.client.peer
+    );
+    fs::write(dir.join(format!("{stem}.policy.toml")), &text)?;
+    let policy_with_icmp = Policy::from_toml(&text)?;
+    let report = classify(
+        &fs::read(dir.join(format!("{stem}.pcap")))?,
+        &policy_with_icmp,
+        30,
+    )?;
+    fs::write(
+        dir.join(format!("{stem}.report.json")),
+        serde_json::to_vec_pretty(&report)?,
+    )?;
+    if report.violation_count != 0 || !report.capture_failures.is_empty() {
+        return super::fail(format!("boot prefix oracle: {report:?}"));
     }
     Ok(())
 }

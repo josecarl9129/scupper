@@ -22,7 +22,7 @@ pub const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(30);
 const OUTPUT_CAP: usize = 1024 * 1024;
 
 /// A kernel utility selected without a shell or PATH lookup.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub enum Program {
     /// Read fixed public procfs socket tables inside a namespace.
     Cat,
@@ -677,7 +677,7 @@ pub mod testing {
     use super::{ExecError, ExecOutput, ExecTarget, Program, System};
 
     /// One recorded command, including its execution budget.
-    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
     pub struct Call {
         /// The selected executable.
         pub program: Program,
@@ -775,6 +775,84 @@ pub mod testing {
         #[must_use]
         pub fn calls(&self) -> Vec<Call> {
             self.calls.borrow().clone()
+        }
+    }
+
+    /// Records literal argv and input lengths around a real or fake executor.
+    pub struct RecordingSystem<'a> {
+        inner: &'a dyn System,
+        calls: RefCell<Vec<Call>>,
+    }
+    impl<'a> RecordingSystem<'a> {
+        /// Wraps an executor without changing its namespace or secret handling.
+        #[must_use]
+        pub fn new(inner: &'a dyn System) -> Self {
+            Self {
+                inner,
+                calls: RefCell::default(),
+            }
+        }
+        /// Returns public command metadata; stdin bytes are never retained.
+        #[must_use]
+        pub fn calls(&self) -> Vec<Call> {
+            self.calls.borrow().clone()
+        }
+        fn record(
+            &self,
+            target: ExecTarget<'_>,
+            program: Program,
+            args: &[String],
+            stdin_len: Option<usize>,
+            timeout: Duration,
+        ) {
+            self.calls.borrow_mut().push(Call {
+                program,
+                args: args.to_vec(),
+                target_identity: identity(target),
+                stdin_len,
+                timeout,
+            });
+        }
+    }
+    impl System for RecordingSystem<'_> {
+        fn run(
+            &self,
+            program: Program,
+            args: &[String],
+            timeout: Duration,
+        ) -> Result<ExecOutput, ExecError> {
+            self.run_in(ExecTarget::Host, program, args, timeout)
+        }
+        fn run_in(
+            &self,
+            target: ExecTarget<'_>,
+            program: Program,
+            args: &[String],
+            timeout: Duration,
+        ) -> Result<ExecOutput, ExecError> {
+            self.record(target, program, args, None, timeout);
+            self.inner.run_in(target, program, args, timeout)
+        }
+        fn run_with_stdin(
+            &self,
+            target: ExecTarget<'_>,
+            program: Program,
+            args: &[String],
+            stdin: &[u8],
+            timeout: Duration,
+        ) -> Result<ExecOutput, ExecError> {
+            self.record(target, program, args, Some(stdin.len()), timeout);
+            self.inner
+                .run_with_stdin(target, program, args, stdin, timeout)
+        }
+        fn now_unix_secs(&self) -> u64 {
+            self.inner.now_unix_secs()
+        }
+        fn wireguard_socket_dirs(&self) -> Vec<std::path::PathBuf> {
+            self.inner.wireguard_socket_dirs()
+        }
+        fn read_host_udp(&self, ipv6: bool) -> std::io::Result<String> {
+            self.inner.read_host_udp(ipv6)
         }
     }
 

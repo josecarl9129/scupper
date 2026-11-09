@@ -30,6 +30,7 @@ fn scripted_driver_exit_contract_on_both_runners() {
             system: &sys,
             probe_exec: &sys,
             handle: Some(&handle),
+            run_root: &root.path,
             state_root: &root.path,
         };
         let check = || check_v2::run_check_v2(&deps, &cfg);
@@ -234,6 +235,7 @@ fn inventory_drift_state_loss_and_hardening_are_distinguished() {
         system: &sys,
         probe_exec: &sys,
         handle: Some(&handle),
+        run_root: &root.path,
         state_root: &root.path,
     };
     let check = || check_v2::run_check_v2(&deps, &cfg);
@@ -336,6 +338,7 @@ fn client_socket_birth_namespace_and_host_wireguard_ownership() {
             system: &sys,
             probe_exec: &sys,
             handle: Some(&handle),
+            run_root: &root.path,
             state_root: &root.path,
         };
         let check = || check_v2::run_check_v2(&deps, &cfg).unwrap().verdict;
@@ -388,6 +391,7 @@ fn local_and_other_table_routes_are_containment_violations() {
             system: &sys,
             probe_exec: &sys,
             handle: Some(&handle),
+            run_root: &root.path,
             state_root: &root.path,
         };
         for (family, dst, table) in [
@@ -448,6 +452,7 @@ fn topology_retains_violations_across_item_and_precondition_errors() {
         system: &sys,
         probe_exec: &sys,
         handle: Some(&handle),
+        run_root: &root.path,
         state_root: &root.path,
     };
     let check = || check_v2::run_check_v2(&deps, &cfg);
@@ -547,6 +552,7 @@ fn ingress_forwarding_and_strict_unreachable_diagnostics() {
         system: &sys,
         probe_exec: &sys,
         handle: Some(&handle),
+        run_root: &root.path,
         state_root: &root.path,
     };
     *sys.route_failure.borrow_mut() = Some((2, "RTNETLINK answers: No route to host\n".into()));
@@ -584,4 +590,35 @@ fn ingress_forwarding_and_strict_unreachable_diagnostics() {
         collect::routes(&sys, &handle, &health).unwrap()[0].1.v4,
         Ok(RouteAnswer::Unreachable)
     );
+}
+
+#[test]
+fn boot_identity_comes_only_from_the_injected_run_root() {
+    let sys = Script::new("ubuntu-24.04");
+    fresh(&sys);
+    let handle = testing::handle().unwrap();
+    let root = Root::new(&sys.runner, &handle);
+    let run = root.path.join("run/scupper");
+    fs::create_dir_all(&run).unwrap();
+    let site = site(&sys.runner);
+    let gateway = GatewayId("gw1".into());
+    let cfg = cfg(&site, &gateway, root.stamp);
+    let deps = Dependencies {
+        system: &sys,
+        probe_exec: &sys,
+        handle: Some(&handle),
+        run_root: &run,
+        state_root: &root.path,
+    };
+    // The old persistent-root boot.json cannot supply a per-boot identity.
+    assert!(check_v2::run_check_v2(&deps, &cfg).is_err());
+    fs::rename(root.path.join("boot.json"), run.join("boot.json")).unwrap();
+    assert_eq!(
+        check_v2::run_check_v2(&deps, &cfg)
+            .unwrap()
+            .verdict
+            .exit_code(),
+        0
+    );
+    assert!(!run.join("state.json").exists());
 }

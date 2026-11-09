@@ -349,6 +349,11 @@ impl ValidatedExit {
     pub fn dns(&self) -> &[IpAddr] {
         &self.dns
     }
+    /// Returns the validated public provider key encoding.
+    #[must_use]
+    pub fn peer_public_key_text(&self) -> &super::PublicKey {
+        &self.settings.peer_public_key
+    }
     /// Returns the decoded provider peer key.
     #[must_use]
     pub fn peer_public_key(&self) -> [u8; 32] {
@@ -381,6 +386,11 @@ impl ValidatedDevice {
     #[must_use]
     pub fn address4(&self) -> Ipv4Net {
         self.address4
+    }
+    /// Returns the validated public device key encoding.
+    #[must_use]
+    pub fn public_key_text(&self) -> &super::PublicKey {
+        &self.settings.public_key
     }
     /// Returns the decoded peer key.
     #[must_use]

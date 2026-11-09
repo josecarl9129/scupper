@@ -1,4 +1,4 @@
-//! Real check CLI against an immutable store and the reference topology. Mount
+//! Real check CLI against an immutable store and the boot-built topology. Mount
 //! overlays confine its fixed production roots to the lab's private directory.
 use super::{
     Lab, Result,
@@ -7,13 +7,11 @@ use super::{
     fail,
 };
 use scupper_core::{
-    canon::canonicalize,
     config::{GatewayId, HealthSettings, parse_site, validate},
     render::{VersionStamp, render_netns},
 };
 use scupper_sys::{
     lock::WriterLock,
-    netns::NetnsHandle,
     state::{State, StateFile},
     store::{MetaInput, VersionStore},
 };
@@ -30,7 +28,7 @@ const CHECK: &str = r#"
 set -eu
 mount --bind "$1/etc" /etc
 mount --bind "$1/var-lib" /var/lib
-exec nsenter --net=/run/netns/gwhost -- "$2" check --json
+exec nsenter --net=/run/netns/gwhost -- "$2" --test-root "$1" check --json
 "#;
 
 // Each row proves the intended stage, even when several verdicts share a code.
@@ -69,7 +67,7 @@ impl Lab {
         )?;
         let root = self.prepare_check_v2()?;
         let result = self.check_v2_faults(&binary, &root);
-        // Restore the reference state even after an assertion/launcher failure.
+        // Restore the boot-built state even after an assertion/launcher failure.
         let restored = (|| {
             // These faults may still be active after an assertion/launcher error.
             let _ = self.cmd(
@@ -103,8 +101,11 @@ impl Lab {
         }
     }
 
-    fn prepare_check_v2(&mut self) -> Result<PathBuf> {
-        let root = self.private.join("check-v2");
+    pub(super) fn prepare_check_v2(&mut self) -> Result<PathBuf> {
+        let root = self.private.join("boot-root");
+        if root.is_dir() {
+            return Ok(root);
+        }
         let etc = root.join("etc/scupper");
         let state = root.join("var-lib/scupper");
         fs::create_dir_all(&etc)?;
@@ -121,12 +122,17 @@ impl Lab {
             fs::create_dir(&path)?;
             fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
         }
-        // Runtime lab public keys, plus the real default HTTPS targets. Private
-        // keys stay in the existing private lab files; check never reads them.
+        fs::create_dir_all(root.join("run/scupper"))?;
+        for (key, reference) in [("gateway", "lab-client"), ("exit", "lab-exit")] {
+            let path = etc.join("secrets/wg").join(reference);
+            fs::copy(self.private.join(format!("{key}.key")), &path)?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        }
+        // Runtime public identities and real HTTPS probes describe the boot inputs.
         let text = fs::read_to_string(self.private.join("runtime-site.toml"))?;
         let mut config = parse_site(&text)?;
         config.health.probe_targets = HealthSettings::default().probe_targets;
-        config.health.require_daemon = false; // scupperd is deliberately absent in 2i1.
+        config.health.require_daemon = false; // scupperd is deliberately absent in this lab.
         let text = toml::to_string(&config)?;
         self.site = validate(config).map_err(|errors| format!("check lab config: {errors:?}"))?;
         let writer = WriterLock::acquire(root.join("writer"))?;
@@ -138,7 +144,7 @@ impl Lab {
             MetaInput {
                 actor: "lab".into(),
                 at: 1,
-                reason: "check-v2 reference topology".into(),
+                reason: "boot-built namespace lab".into(),
             },
         )?;
         StateFile::open(&state, Some(&writer))?.write(
@@ -148,13 +154,6 @@ impl Lab {
                 ..State::default()
             },
         )?;
-        let handle = NetnsHandle::open("/run/netns/scupper")?;
-        fs::write(
-            state.join("boot.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "netns": { "dev": handle.identity().0, "ino": handle.identity().1 }
-            }))?,
-        )?;
         let rules = render_netns(
             &self.site,
             &GatewayId("gw1".into()),
@@ -163,14 +162,16 @@ impl Lab {
                 sha256: Sha256::digest(text.as_bytes()).into(),
             },
         )?;
+        store.write_rendered(&writer, version, &rules)?;
         fs::write(&self.rules, rules)?;
-        self.load_real_rules()?;
-        self.expected_rules =
-            canonicalize(&self.cmd("scupper", "nft", &["-j", "list", "ruleset"])?)?;
         Ok(root)
     }
 
-    fn check_result(&mut self, binary: &Path, root: &Path) -> Result<(i32, serde_json::Value)> {
+    pub(super) fn check_result(
+        &mut self,
+        binary: &Path,
+        root: &Path,
+    ) -> Result<(i32, serde_json::Value)> {
         let (status, stdout) = self.runner.output(
             &Invocation::new(
                 "",

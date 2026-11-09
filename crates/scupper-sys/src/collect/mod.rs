@@ -63,9 +63,9 @@ pub(super) fn peer_field(
     }
 }
 
-/// Reads the expected identity from boot.json. Absence is a required-observation
+/// Reads the expected identity from `root/boot.json` (`/run/scupper` in production). Absence is a required-observation
 /// error: a live inode cannot establish the identity boot was meant to create.
-/// Other boot fields belong to the future boot implementation and are ignored.
+/// The remaining boot report fields are intentionally ignored.
 ///
 /// # Errors
 /// Returns missing/unsafe file, malformed identity and I/O errors.

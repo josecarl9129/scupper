@@ -145,13 +145,13 @@ jobs:
           sudo timeout 300 apt-get update
           sudo timeout 300 apt-get install -y wireguard-tools nftables iproute2 tcpdump dnsmasq-base util-linux iputils-ping conntrack slirp4netns
 
-      - name: Build reference lab
+      - name: Build namespace lab
         run: timeout 600 cargo build -p xtask --release --locked
 
-      - name: Build check and probe CLI
-        run: timeout 600 cargo build -p scupper --locked
+      - name: Build boot, check and probe testing CLI
+        run: timeout 600 cargo build -p scupper --features testing --locked
 
-      - name: Run reference namespace lab
+      - name: Run boot-built namespace lab
         run: sudo timeout 1200 target/release/xtask leaktest --artifacts lab-out --capture-fixtures lab-out/fixtures
 
       - uses: actions/upload-artifact@v4

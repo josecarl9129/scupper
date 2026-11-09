@@ -458,3 +458,25 @@ fn machine_output_never_prompts_for_config_writes() {
     assert_eq!(h.snapshot(), before);
     assert!(!h.path.join("state").exists());
 }
+
+#[test]
+fn boot_is_hidden_root_only_and_reports_input_failure_without_kernel_writes() {
+    let mut h = Harness::new();
+    let (code, help, _) = h.run(&["--help"]);
+    assert_eq!(code, 0);
+    assert!(!help.contains("boot"));
+    h.root = false;
+    let (code, out, err) = h.run(&["boot"]);
+    assert_eq!(code, 1);
+    assert_eq!(out, "");
+    assert!(err.contains("boot must run as root"));
+    assert!(!h.path.join("run").exists());
+    h.root = true;
+    let (code, out, err) = h.run(&["boot"]);
+    assert_eq!(code, 1, "{out} {err}");
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(report["steps"].as_array().unwrap().len(), 2);
+    assert_eq!(report["steps"][1]["step"], "Inputs");
+    assert_eq!(report["steps"][1]["error"], "no configuration");
+    assert!(h.system.calls.borrow().is_empty());
+}

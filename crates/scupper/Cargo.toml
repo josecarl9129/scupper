@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+testing = ["scupper-sys/testing"]
+
 [dependencies]
 scupper-core.workspace = true
 scupper-sys.workspace = true

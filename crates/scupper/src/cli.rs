@@ -18,6 +18,10 @@ use config::ConfigCommand;
 #[derive(Parser)]
 #[command(name = "scupper", version, about = "Fail-closed VPN gateway")]
 struct Cli {
+    /// Test-only isolated filesystem roots for the disposable namespace lab.
+    #[cfg(feature = "testing")]
+    #[arg(long, global = true, hide = true)]
+    test_root: Option<PathBuf>,
     /// Render a schema-1 machine-readable health report (check/status).
     #[arg(long, global = true)]
     json: bool,
@@ -27,6 +31,22 @@ struct Cli {
 
 #[derive(Clone, Subcommand)]
 enum Command {
+    /// Construct or adopt the gateway namespace, stopping at the first failure.
+    #[command(hide = true)]
+    Boot {
+        /// Test-only process kill after a numbered checkpoint.
+        #[cfg(feature = "testing")]
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=7))]
+        stop_after: Option<u8>,
+        /// Test-only process kill between host link creation and movement.
+        #[cfg(feature = "testing")]
+        #[arg(long, num_args = 0..=1, default_missing_value = "any")]
+        stop_after_link_add: Option<String>,
+        /// Test-only public argv trace (no stdin contents).
+        #[cfg(feature = "testing")]
+        #[arg(long)]
+        trace: Option<PathBuf>,
+    },
     /// Run one isolated namespace observation using stdin as a namespace fd.
     #[command(hide = true)]
     Probe {
@@ -179,7 +199,7 @@ pub fn parse_confirmation(answer: &str) -> bool {
 
 /// Dependencies shared by commands; M2 checks read the validated immutable head.
 pub struct Dependencies<'a> {
-    /// Persistent M2 config, boot and state root.
+    /// Persistent M2 config and safety-state root.
     pub state_root: &'a Path,
     /// Gateway-id, mirror and secrets root; check never opens private keys.
     pub config_root: &'a Path,
@@ -248,6 +268,25 @@ where
             return 1;
         }
     };
+    #[cfg(feature = "testing")]
+    let test_state = cli.test_root.as_ref().map(|r| r.join("var-lib/scupper"));
+    #[cfg(feature = "testing")]
+    let test_config = cli.test_root.as_ref().map(|r| r.join("etc/scupper"));
+    #[cfg(feature = "testing")]
+    let test_run = cli.test_root.as_ref().map(|r| r.join("run/scupper"));
+    #[cfg(feature = "testing")]
+    let overridden = Dependencies {
+        state_root: test_state.as_deref().unwrap_or(deps.state_root),
+        config_root: test_config.as_deref().unwrap_or(deps.config_root),
+        writer_root: test_run.as_deref().unwrap_or(deps.writer_root),
+        system: deps.system,
+        probe_exec: deps.probe_exec,
+        namespaces: deps.namespaces,
+        privilege: deps.privilege,
+        prompt: deps.prompt,
+    };
+    #[cfg(feature = "testing")]
+    let deps = &overridden;
     match dispatch(cli.command, cli.json, deps, stdout, stderr) {
         Ok(code) => code,
         Err(error) => {
@@ -264,6 +303,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_lines)] // Keep the hidden boot lifecycle alongside the command dispatch.
 fn dispatch(
     command: Command,
     json: bool,
@@ -275,6 +315,63 @@ fn dispatch(
         return Err("--json is supported only for check and status".into());
     }
     match command {
+        Command::Boot {
+            #[cfg(feature = "testing")]
+            stop_after,
+            #[cfg(feature = "testing")]
+            stop_after_link_add,
+            #[cfg(feature = "testing")]
+            trace,
+        } => {
+            require_root(deps, "boot")?;
+            #[cfg(feature = "testing")]
+            let hook = |point: scupper_sys::boot::BootPoint| {
+                use scupper_sys::boot::BootPoint;
+                let stop = match point {
+                    BootPoint::After(step) => stop_after == Some(step as u8),
+                    BootPoint::LinkAdded(name) => stop_after_link_add
+                        .as_deref()
+                        .is_some_and(|wanted| wanted == "any" || wanted == name.as_str()),
+                };
+                if stop {
+                    rustix::process::kill_process(
+                        rustix::process::getpid(),
+                        rustix::process::Signal::KILL,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    return Err("injected boot stop".into());
+                }
+                Ok(())
+            };
+            #[cfg(feature = "testing")]
+            let recorder = scupper_sys::system::testing::RecordingSystem::new(deps.system);
+            #[cfg(feature = "testing")]
+            let system: &dyn System = &recorder;
+            #[cfg(not(feature = "testing"))]
+            let system = deps.system;
+            let report = scupper_sys::boot::boot(&scupper_sys::boot::BootDeps {
+                system,
+                namespace: &BootNamespaces(deps.namespaces),
+                state_root: deps.state_root,
+                config_root: deps.config_root,
+                run_root: deps.writer_root,
+                #[cfg(feature = "testing")]
+                hook: Some(&hook),
+                #[cfg(feature = "testing")]
+                secret_owner: 0,
+            });
+            #[cfg(feature = "testing")]
+            if let Some(path) = trace {
+                std::fs::write(
+                    path,
+                    serde_json::to_vec_pretty(&recorder.calls()).map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            serde_json::to_writer_pretty(&mut *stdout, &report).map_err(|e| e.to_string())?;
+            writeln!(stdout).map_err(output_error)?;
+            Ok(u8::from(!report.succeeded()))
+        }
         Command::Probe { request } => {
             let outcome = scupper_sys::probe_child::child_main(&request)?;
             serde_json::to_writer(&mut *stdout, &outcome).map_err(|error| error.to_string())?;
@@ -332,7 +429,7 @@ fn m2_config(deps: &Dependencies<'_>) -> Result<Option<AppliedConfig>, String> {
     let Some(version) = store.head().map_err(|error| error.to_string())? else {
         for path in [
             deps.state_root.to_path_buf(),
-            deps.state_root.join("boot.json"),
+            deps.writer_root.join("boot.json"),
             deps.state_root.join("state.json"),
             deps.config_root.join("gateway-id"),
         ] {
@@ -350,6 +447,15 @@ fn m2_config(deps: &Dependencies<'_>) -> Result<Option<AppliedConfig>, String> {
             return Err("M2 layout without an applied head".into());
         }
         return Ok(None);
+    };
+    let version = match scupper_sys::state::StateFile::open(deps.state_root, None)
+        .and_then(|file| file.read())
+    {
+        Ok(scupper_sys::state::StateRead::Present(state)) => {
+            state.applied_version.unwrap_or(version)
+        }
+        // The driver inventories containment before reporting missing/corrupt state.
+        _ => version,
     };
     let (text, meta) = store.read(version).map_err(|error| error.to_string())?;
     let site = config::validate_text(&text)?;
@@ -433,6 +539,7 @@ fn m2_check(
             probe_exec: deps.probe_exec,
             handle: handle.as_ref(),
             state_root: deps.state_root,
+            run_root: deps.writer_root,
         },
         &scupper_sys::check_v2::Config {
             site: &config.site,
@@ -532,5 +639,16 @@ fn confirm(
         Ok(())
     } else {
         Err(format!("{command} cancelled"))
+    }
+}
+
+struct BootNamespaces<'a>(&'a dyn NamespaceReader);
+impl scupper_sys::boot::BootNamespace for BootNamespaces<'_> {
+    fn open(
+        &self,
+    ) -> Result<Option<scupper_sys::netns::NetnsHandle>, scupper_sys::netns::NetnsError> {
+        self.0
+            .open_gateway()
+            .map_err(|error| scupper_sys::netns::NetnsError::Proc(io::Error::other(error)))
     }
 }

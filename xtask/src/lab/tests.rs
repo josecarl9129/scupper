@@ -655,3 +655,37 @@ fn inline_nft_rulesets_have_no_single_line_closing_braces() {
         );
     }
 }
+
+#[test]
+fn boot_prefix_oracle_rejects_plaintext_and_silence_with_ephemeral_exit_ports() {
+    let dir = test_dir("boot-prefix");
+    let marker = "scupper-canary-00112233445566778899aabbccddeeff".to_owned();
+    let markers = std::slice::from_ref(&marker);
+    let mut encrypted = vec![0; 32];
+    encrypted[0] = 4;
+    let mut packets = vec![
+        udp([192, 0, 2, 2], [198, 51, 100, 2], 51820, 51820, &encrypted),
+        udp(
+            [198, 51, 100, 2],
+            [203, 0, 113, 2],
+            43210,
+            51820,
+            &encrypted,
+        ),
+    ];
+    fs::write(dir.join("prefix.pcap"), capture(&packets)).unwrap();
+    evidence::boot_prefix(&dir, "prefix", markers, 43210).unwrap();
+    assert!(evidence::boot_prefix(&dir, "prefix", markers, 51821).is_err());
+    packets.push(udp(
+        [10, 99, 0, 2],
+        [192, 0, 2, 6],
+        40001,
+        8080,
+        marker.as_bytes(),
+    ));
+    fs::write(dir.join("prefix.pcap"), capture(&packets)).unwrap();
+    assert!(evidence::boot_prefix(&dir, "prefix", markers, 43210).is_err());
+    fs::write(dir.join("prefix.pcap"), capture(&[])).unwrap();
+    assert!(evidence::boot_prefix(&dir, "prefix", markers, 43210).is_err());
+    fs::remove_dir_all(dir).unwrap();
+}

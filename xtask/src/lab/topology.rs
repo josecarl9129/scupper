@@ -1,4 +1,4 @@
-//! Reference builder and cases. No host routes or host sysctls.
+//! Boot-built gateway and containment cases. No machine-host networking writes.
 mod bridge;
 mod ipv6;
 use super::{
@@ -8,12 +8,7 @@ use super::{
     evidence::{self, Case},
     fail, helpers,
 };
-use scupper_core::{
-    canon::canonicalize,
-    config::{ExitId, GatewayId},
-    render::{desired_routes, desired_sysctls, route_argv},
-    rules::IfName,
-};
+use scupper_core::{canon::canonicalize, render::desired_sysctls, rules::IfName};
 use std::{
     fmt::Write as _,
     fs,
@@ -153,94 +148,15 @@ impl Lab {
         Ok(())
     }
     fn build_gateway(&mut self) -> Result<()> {
-        // These links' UDP sockets belong to gwhost for their entire lifetime.
-        for iface in ["wg0", "ex-ch1"] {
-            self.cmd("gwhost", "ip", &["link", "add", iface, "type", "wireguard"])?;
-        }
-        self.wg(
-            "gwhost",
-            "wg0",
-            "gateway",
-            "51820",
-            3,
-            &["allowed-ips", &format!("{}/32", A.client_inner)],
-        )?;
-        self.wg(
-            "gwhost",
-            "ex-ch1",
-            "exit",
-            "51821",
-            2,
-            &[
-                "endpoint",
-                &format!("{}:51820", A.provider.peer),
-                "allowed-ips",
-                "0.0.0.0/0",
-                "persistent-keepalive",
-                "25",
-            ],
-        )?;
-        // nsenter preserves the mount namespace. ip-netns-exec gwhost here would
-        // hide the new scupper bind mount from the runner.
-        self.new_namespace("scupper", "gwhost")?;
-        self.cmd(
-            "scupper",
-            "sysctl",
-            &[
-                "-q",
-                "-w",
-                "net.ipv4.ip_forward=0",
-                "net.ipv6.conf.all.forwarding=0",
-            ],
-        )?;
-        self.sysctls(&[IfName::new("lo")?], false)?;
-        for iface in ["wg0", "ex-ch1"] {
-            self.cmd("gwhost", "ip", &["link", "set", iface, "netns", "scupper"])?;
-        }
-        let gateway = self
-            .site
-            .gateway(&GatewayId("gw1".into()))
-            .ok_or("missing gateway")?
-            .clone();
-        if gateway.client_tunnel().address4().addr().to_string() != A.gateway_inner {
-            return fail("lab gateway address differs from the address table");
-        }
-        self.apply_sysctls(false, false)?;
-        self.load_real_rules()?;
-        self.new_namespace("scupper-verify", "")?;
-        let rules = self.rules.to_string_lossy().into_owned();
-        self.cmd("scupper-verify", "nft", &["-f", &rules])?;
-        self.expected_rules =
-            canonicalize(&self.cmd("scupper-verify", "nft", &["-j", "list", "ruleset"])?)?;
-        self.cmd("", "ip", &["netns", "delete", "scupper-verify"])?;
+        self.prepare_check_v2()?;
+        self.boot_inheritance()?;
         self.registry
-            .unregister(&Resource::Namespace("scupper-verify".into()));
-        self.verify_rules()?;
-        self.address_up(
-            "scupper",
-            "wg0",
-            &gateway.client_tunnel().address4().to_string(),
-            gateway.client_tunnel().mtu(),
-        )?;
-        self.address_up(
-            "scupper",
-            "ex-ch1",
-            &gateway.exits()[0].address4().to_string(),
-            gateway.exits()[0].mtu(),
-        )?;
-        for (family, target) in desired_routes(
-            &self.site,
-            &GatewayId("gw1".into()),
-            Some(&ExitId("ch1".into())),
-        ) {
-            let args = route_argv(family, &target);
-            let args: Vec<_> = args.iter().map(String::as_str).collect();
-            self.cmd("scupper", "ip", &args)?;
-        }
-        // Forwarding is enabled only now. desired_sysctls deliberately writes
-        // forwarding first, then reapplies every setting reset by that write.
-        self.apply_sysctls(true, false)?;
-
+            .register(Resource::Namespace("scupper".into()));
+        self.boot_gateway(&[], "boot-fresh")?;
+        self.boot_sysctls()?;
+        self.expected_rules =
+            canonicalize(&self.cmd("scupper", "nft", &["-j", "list", "ruleset"])?)?;
+        self.boot_adopt()?;
         Ok(())
     }
     fn build_provider(&mut self) -> Result<()> {
@@ -631,7 +547,7 @@ impl Lab {
     }
     fn judge(&self, case: Case, markers: &[String]) -> Result<String> {
         let stem = case.name();
-        let uplink = evidence::report(&self.artifacts, stem, markers, false)?;
+        let uplink = evidence::report(&self.artifacts, stem, markers, false, self.exit_port)?;
         if case == Case::Uplink {
             let marker = markers.get(4).ok_or("injection marker missing")?;
             evidence::injected_only(
@@ -658,8 +574,13 @@ impl Lab {
             seen.len()
         );
         if matches!(case, Case::Bridge | Case::Permissive) {
-            let report =
-                evidence::report(&self.artifacts, &format!("{stem}-bridge"), markers, true)?;
+            let report = evidence::report(
+                &self.artifacts,
+                &format!("{stem}-bridge"),
+                markers,
+                true,
+                self.exit_port,
+            )?;
             if case == Case::Bridge && !evidence::contained(&report) {
                 return fail("bridge containment oracle failed");
             }

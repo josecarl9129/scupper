@@ -1,0 +1,59 @@
+netns Ip -d -j link show
+netns Ip -j addr show
+netns Wg show ex-ch1 peers
+netns Wg show ex-ch1 allowed-ips
+netns Wg show ex-ch1 endpoints
+netns Tc -j qdisc show dev ex-ch1
+netns Tc -j filter show dev ex-ch1 root
+netns Tc -j filter show dev ex-ch1 ingress
+netns Tc -j filter show dev ex-ch1 egress
+netns Tc -j qdisc show dev lo
+netns Tc -j filter show dev lo root
+netns Tc -j filter show dev lo ingress
+netns Tc -j filter show dev lo egress
+netns Wg show wg0 peers
+netns Wg show wg0 allowed-ips
+netns Wg show wg0 endpoints
+netns Tc -j qdisc show dev wg0
+netns Tc -j filter show dev wg0 root
+netns Tc -j filter show dev wg0 ingress
+netns Tc -j filter show dev wg0 egress
+host Wg show interfaces
+netns Ip -j -4 rule show
+netns Ip -j -6 rule show
+netns Nft -j list ruleset
+host Unshare --net -- <executable> canon --outer-netns <identity> --gateway-netns <identity> <render>
+netns Sysctl -n net.ipv4.ip_forward
+netns Sysctl -n net.ipv6.conf.all.forwarding
+netns Sysctl -n net.ipv4.conf.all.rp_filter
+netns Sysctl -n net.ipv4.conf.default.rp_filter
+netns Sysctl -n net.ipv4.conf.ex-ch1.rp_filter
+netns Sysctl -n net.ipv4.conf.lo.rp_filter
+netns Sysctl -n net.ipv4.conf.wg0.rp_filter
+netns Sysctl -n net.ipv4.conf.all.accept_redirects
+netns Sysctl -n net.ipv4.conf.all.send_redirects
+netns Sysctl -n net.ipv4.conf.all.accept_source_route
+netns Sysctl -n net.ipv4.conf.default.accept_redirects
+netns Sysctl -n net.ipv4.conf.default.send_redirects
+netns Sysctl -n net.ipv4.conf.default.accept_source_route
+netns Sysctl -n net.ipv4.conf.ex-ch1.accept_redirects
+netns Sysctl -n net.ipv4.conf.ex-ch1.send_redirects
+netns Sysctl -n net.ipv4.conf.ex-ch1.accept_source_route
+netns Sysctl -n net.ipv4.conf.lo.accept_redirects
+netns Sysctl -n net.ipv4.conf.lo.send_redirects
+netns Sysctl -n net.ipv4.conf.lo.accept_source_route
+netns Sysctl -n net.ipv4.conf.wg0.accept_redirects
+netns Sysctl -n net.ipv4.conf.wg0.send_redirects
+netns Sysctl -n net.ipv4.conf.wg0.accept_source_route
+netns Sysctl -n net.ipv6.conf.all.accept_ra
+netns Sysctl -n net.ipv6.conf.all.accept_redirects
+netns Sysctl -n net.ipv6.conf.all.autoconf
+netns Sysctl -n net.ipv6.conf.default.accept_ra
+netns Sysctl -n net.ipv6.conf.default.accept_redirects
+netns Sysctl -n net.ipv6.conf.default.autoconf
+netns Sysctl -n net.ipv4.conf.all.proxy_arp
+netns Sysctl -n net.ipv6.conf.all.proxy_ndp
+netns Sysctl -n net.ipv4.conf.all.route_localnet
+netns Sysctl -n net.netfilter.nf_conntrack_tcp_loose
+netns Ip route replace default dev ex-ch1
+netns Ip -6 route replace unreachable default
