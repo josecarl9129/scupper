@@ -5,6 +5,7 @@ mod command;
 mod evidence;
 mod fixtures;
 mod helpers;
+mod probe_child;
 mod topology;
 
 use addresses::A;
@@ -185,6 +186,14 @@ impl Lab {
         self.runner.run(&Invocation::new(ns, program, args))
     }
     fn preflight(&mut self) -> Result<()> {
+        for path in ["/etc/passwd", "/etc/group"] {
+            if fs::read_to_string(path)?
+                .lines()
+                .any(|line| line.split(':').next() == Some("scupper-probe"))
+            {
+                return fail("refusing occupied scupper-probe lab account/group");
+            }
+        }
         for ns in NAMESPACES {
             for path in [format!("/run/netns/{ns}"), format!("/etc/netns/{ns}")] {
                 if fs::symlink_metadata(&path).is_ok() {
@@ -213,9 +222,28 @@ impl Lab {
         Ok(())
     }
     fn prepare(&mut self) -> Result<()> {
+        self.cmd(
+            "",
+            "useradd",
+            &[
+                "--system",
+                "--user-group",
+                "--no-create-home",
+                "--shell",
+                "/usr/sbin/nologin",
+                "scupper-probe",
+            ],
+        )?;
+        self.registry
+            .register(Resource::User("scupper-probe".into()));
         fs::DirBuilder::new().mode(0o700).create(&self.private)?;
         self.registry
             .register(Resource::Directory(self.private.clone()));
+        let resolver_dir = PathBuf::from("/etc/netns/scupper");
+        fs::create_dir_all(&resolver_dir)?;
+        self.registry
+            .register(Resource::Directory(resolver_dir.clone()));
+        fs::write(resolver_dir.join("resolv.conf"), "nameserver 127.0.0.53\n")?;
         for key in ["gateway", "exit", "provider", "client"] {
             let private = self.cmd("", "wg", &["genkey"])?;
             let path = self.private.join(format!("{key}.key"));

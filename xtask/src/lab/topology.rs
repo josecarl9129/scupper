@@ -511,6 +511,7 @@ impl Lab {
                 .cmd("wan", "nft", &["delete", "table", "inet", "lab_inject"])
                 .map(|_| ()),
             Case::Baseline => Ok(()),
+            Case::ProbeChild => self.restore_probe_child_routes(),
         };
         if let Err(error) = specific {
             failures.push(error.to_string());
@@ -542,6 +543,7 @@ impl Lab {
             self.service_check(&mut markers)?;
             match case {
                 Case::Baseline => self.service_check(&mut markers),
+                Case::ProbeChild => self.probe_child_case(),
                 Case::V6 => self.v6_fault(&mut markers),
                 Case::Bridge | Case::Permissive => self.bridge_fault(case, &mut markers),
                 Case::Uplink => self.uplink_fault(&mut markers),

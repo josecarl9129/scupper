@@ -71,6 +71,39 @@ impl NetnsHandle {
         Ok(handle)
     }
 
+    /// Validates an inherited descriptor against a recorded foreign namespace.
+    ///
+    /// # Errors
+    /// Rejects non-network descriptors, host namespaces and identity mismatches.
+    pub fn from_file(file: File, expected: NetnsId) -> Result<Self, NetnsError> {
+        let stat = fstat(&file)?;
+        let reference = std::fs::metadata("/proc/self/ns/net")?;
+        if stat.st_dev != reference.dev() {
+            return Err(NetnsError::NotNsfs);
+        }
+        let handle = Self {
+            file,
+            dev: stat.st_dev,
+            ino: stat.st_ino,
+        };
+        if let Ok(target) = std::fs::read_link(handle.fd_path())
+            && !target.to_string_lossy().starts_with("net:")
+            && target.to_string_lossy().contains(":[")
+        {
+            return Err(NetnsError::NotNetworkNamespace);
+        }
+        handle.verify(expected)?;
+        Ok(handle)
+    }
+
+    /// Duplicates the held descriptor without changing its CLOEXEC flags.
+    ///
+    /// # Errors
+    /// Returns a descriptor duplication error.
+    pub fn try_clone_file(&self) -> std::io::Result<File> {
+        self.file.try_clone()
+    }
+
     fn open_network(path: impl AsRef<Path>) -> Result<Self, NetnsError> {
         let file = open(
             path.as_ref(),

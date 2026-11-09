@@ -4,6 +4,7 @@
 
 pub mod canon;
 pub mod config;
+pub mod dns;
 pub mod parse;
 pub mod render;
 pub mod rules;

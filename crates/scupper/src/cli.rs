@@ -31,6 +31,12 @@ struct Cli {
 
 #[derive(Clone, Subcommand)]
 enum Command {
+    /// Run one isolated namespace observation using stdin as a namespace fd.
+    #[command(hide = true)]
+    Probe {
+        /// One JSON `ProbeRequest` (stdin is not a byte stream).
+        request: String,
+    },
     /// Canonicalize a ruleset only inside an isolated network namespace.
     #[command(hide = true)]
     Canon {
@@ -311,6 +317,12 @@ fn dispatch(
 ) -> Result<u8, String> {
     let cfg = V1Config::default();
     match command {
+        Command::Probe { request } => {
+            let outcome = scupper_sys::probe_child::child_main(&request)?;
+            serde_json::to_writer(&mut *stdout, &outcome).map_err(|error| error.to_string())?;
+            writeln!(stdout).map_err(output_error)?;
+            Ok(0)
+        }
         Command::Canon { outer_netns, path } => Ok(canon::run_isolated(
             deps.system,
             &path,

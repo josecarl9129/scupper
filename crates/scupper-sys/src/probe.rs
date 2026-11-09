@@ -230,7 +230,7 @@ impl ExitProbe for BoundHttpsProbe {
     }
 }
 
-fn remaining(deadline: Instant) -> Probe<Duration> {
+pub(crate) fn remaining(deadline: Instant) -> Probe<Duration> {
     deadline
         .checked_duration_since(Instant::now())
         .filter(|duration| !duration.is_zero())
@@ -345,7 +345,7 @@ pub fn is_setup_error(operation: IoOperation, kind: io::ErrorKind, raw: Option<i
 /// Maps local socket failures to Setup, timeouts to Timeout, and other failures
 /// to Io with their diagnostic. Resolving always uses the path classification.
 #[cfg(target_os = "linux")]
-fn io_failure(operation: IoOperation, error: &io::Error) -> ProbeError {
+pub(crate) fn io_failure(operation: IoOperation, error: &io::Error) -> ProbeError {
     if is_setup_error(operation, error.kind(), error.raw_os_error()) {
         ProbeError::setup(&error.to_string())
     } else if matches!(
@@ -378,7 +378,7 @@ impl Connector for SystemConnector {
 }
 
 #[cfg(target_os = "linux")]
-mod linux {
+pub(crate) mod linux {
     use std::{
         io::{Read, Write},
         net::{SocketAddr, TcpStream},
@@ -430,56 +430,66 @@ mod linux {
             socket
                 .bind_device(Some(iface.as_str().as_bytes()))
                 .map_err(|error| io_failure(IoOperation::BindDevice, &error))?;
-            socket
-                .connect_timeout(
-                    &SocketAddr::from((address, 443)).into(),
-                    remaining(deadline)?,
-                )
+            exchange_socket(socket, target, address, deadline)
+        }
+    }
+
+    // Shared by the M1 connector and the namespace child. The child supplies an
+    // unconnected socket created before its permanent privilege drop.
+    pub(crate) fn exchange_socket(
+        socket: Socket,
+        target: &Target,
+        address: Ipv4Addr,
+        deadline: Instant,
+    ) -> Probe<Vec<u8>> {
+        socket
+            .connect_timeout(
+                &SocketAddr::from((address, 443)).into(),
+                remaining(deadline)?,
+            )
+            .map_err(|error| io_failure(IoOperation::Path, &error))?;
+        let stream = DeadlineStream {
+            stream: socket.into(),
+            deadline,
+        };
+        stream
+            .set_timeouts()
+            .map_err(|error| io_failure(IoOperation::Path, &error))?;
+        let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+                .map_err(|error| ProbeError::setup(&error.to_string()))?
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+        let name = ServerName::try_from(target.host.clone())
+            .map_err(|error| ProbeError::setup(&error.to_string()))?;
+        let connection = ClientConnection::new(Arc::new(config), name)
+            .map_err(|error| ProbeError::io(&error.to_string()))?;
+        let mut tls = StreamOwned::new(connection, stream);
+        tls.write_all(&target.request_bytes())
+            .and_then(|()| tls.flush())
+            .map_err(|error| io_failure(IoOperation::Path, &error))?;
+        let mut bytes = Vec::new();
+        let mut buffer = [0; 2048];
+        loop {
+            remaining(deadline)?;
+            // Read at most 16 KiB. A response exactly at the cap is rejected
+            // conservatively if framing cannot prove it is complete.
+            let available = (MAX_RESPONSE_BYTES - bytes.len()).min(buffer.len());
+            if available == 0 {
+                return Err(ProbeError::io("HTTP response too large"));
+            }
+            let count = tls
+                .read(&mut buffer[..available])
                 .map_err(|error| io_failure(IoOperation::Path, &error))?;
-            let stream = DeadlineStream {
-                stream: socket.into(),
-                deadline,
-            };
-            stream
-                .set_timeouts()
-                .map_err(|error| io_failure(IoOperation::Path, &error))?;
-            let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            let config = ClientConfig::builder_with_provider(Arc::new(
-                rustls::crypto::ring::default_provider(),
-            ))
-            .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
-            .map_err(|error| ProbeError::setup(&error.to_string()))?
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-            let name = ServerName::try_from(target.host.clone())
-                .map_err(|error| ProbeError::setup(&error.to_string()))?;
-            let connection = ClientConnection::new(Arc::new(config), name)
-                .map_err(|error| ProbeError::io(&error.to_string()))?;
-            let mut tls = StreamOwned::new(connection, stream);
-            tls.write_all(&target.request_bytes())
-                .and_then(|()| tls.flush())
-                .map_err(|error| io_failure(IoOperation::Path, &error))?;
-            let mut bytes = Vec::new();
-            let mut buffer = [0; 2048];
-            loop {
-                remaining(deadline)?;
-                // Read at most 16 KiB. A response exactly at the cap is rejected
-                // conservatively if framing cannot prove it is complete.
-                let available = (MAX_RESPONSE_BYTES - bytes.len()).min(buffer.len());
-                if available == 0 {
-                    return Err(ProbeError::io("HTTP response too large"));
-                }
-                let count = tls
-                    .read(&mut buffer[..available])
-                    .map_err(|error| io_failure(IoOperation::Path, &error))?;
-                if count == 0 {
-                    return Ok(bytes);
-                }
-                bytes.extend_from_slice(&buffer[..count]);
-                // Framed responses need not wait for the peer to close TLS.
-                if parse_complete(&bytes) {
-                    return Ok(bytes);
-                }
+            if count == 0 {
+                return Ok(bytes);
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+            // Framed responses need not wait for the peer to close TLS.
+            if parse_complete(&bytes) {
+                return Ok(bytes);
             }
         }
     }
