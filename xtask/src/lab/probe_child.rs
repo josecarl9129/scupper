@@ -51,10 +51,15 @@ impl Lab {
                 if bind.is_some() {
                     // Remove the connected provider route too, so reaching DNS
                     // depends on the bound-device IPv4 fallback (V-02).
-                    self.cmd(
-                        "scupper",
-                        "ip",
-                        &["route", "del", A.exit_net, "dev", "ex-ch1"],
+                    // ex-ch1 carries a /32, so usually there is no connected route;
+                    // an absent route is the state we want.
+                    let _ = self.runner.output(
+                        &super::command::Invocation::new(
+                            "scupper",
+                            "ip",
+                            &["route", "del", A.exit_net, "dev", "ex-ch1"],
+                        ),
+                        None,
                     )?;
                     self.cmd(
                         "scupper",
