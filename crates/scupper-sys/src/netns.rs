@@ -87,14 +87,20 @@ impl NetnsHandle {
             dev: stat.st_dev,
             ino: stat.st_ino,
         };
+        // A `/proc/<pid>/ns/<type>` link names its type; a bind-mounted namespace file
+        // (`/run/netns/<name>`) is not a link and its fd path shows the mount path. In
+        // that case the type is enforced at every exec: nsenter's `--net` performs
+        // setns(fd, CLONE_NEWNET), which fails for any other namespace type.
+        if let Ok(target) = std::fs::read_link(path.as_ref()) {
+            if target != Path::new(&format!("net:[{}]", handle.ino)) {
+                return Err(NetnsError::NotNetworkNamespace);
+            }
+        }
         handle.verify_link(&handle.fd_path())?;
         Ok(handle)
     }
 
     fn verify_link(&self, path: &Path) -> Result<(), NetnsError> {
-        if std::fs::read_link(path)? != Path::new(&format!("net:[{}]", self.ino)) {
-            return Err(NetnsError::NotNetworkNamespace);
-        }
         let stat = std::fs::metadata(path)?;
         if (stat.dev(), stat.ino()) != self.identity() {
             return Err(NetnsError::IdentityMismatch);
