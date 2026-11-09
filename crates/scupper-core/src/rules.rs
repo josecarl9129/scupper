@@ -58,6 +58,8 @@ impl IfName {
     // v1's existing constructor contract while sharing the validated type.
     pub(crate) fn site_name(name: &str) -> Result<Self, ConfigError> {
         if name.is_empty()
+            || name.starts_with('-')
+            || matches!(name, "all" | "interfaces")
             || name.len() > 15
             || !name
                 .bytes()
@@ -76,8 +78,8 @@ impl IfName {
             Some("must contain 1 to 15 bytes")
         } else if name.starts_with('-') {
             Some("must not start with '-'")
-        } else if name == "." || name == ".." {
-            Some("must not be . or ..")
+        } else if matches!(name, "." | ".." | "all" | "interfaces") {
+            Some("must not be a reserved interface name")
         } else if !name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
@@ -284,4 +286,16 @@ pub fn ruleset(cfg: &V1Config) -> Result<String, ConfigError> {
         uplink = cfg.uplink_iface,
         exit_addr = cfg.exit_addr,
     ))
+}
+
+#[cfg(test)]
+mod argv_name_tests {
+    #[test]
+    fn site_names_reject_options_and_wg_meta_names() {
+        for name in ["-h", "-wg0", "all", "interfaces"] {
+            assert!(super::IfName::site_name(name).is_err());
+            assert!(super::IfName::new(name).is_err());
+        }
+        assert!(super::IfName::site_name("ex-ch1").is_ok());
+    }
 }

@@ -193,7 +193,7 @@ impl System for FakeSystem {
                     .pop_front()
                     .unwrap_or_else(|| Ok(output(NFT_LIVE)));
             }
-            (Program::Ip, ["-j", "link", "show"]) => {
+            (Program::Ip, ["-d", "-j", "link", "show"]) => {
                 include_str!("fixtures/ubuntu-24.04/ip-link.json")
             }
             (Program::Ip, ["-j", "route", "show", "default"]) => {
@@ -539,7 +539,7 @@ fn captured_case_04_topology_is_down_without_violations() -> Result<(), Box<dyn 
     let sys = FakeSystem::new();
     sys.set(
         Program::Ip,
-        &["-j", "link", "show"],
+        &["-d", "-j", "link", "show"],
         include_str!("fixtures/ubuntu-24.04/case-04-ip-link.json"),
     );
     sys.set(
@@ -573,13 +573,13 @@ fn each_configuration_mismatch() -> Result<(), Box<dyn Error>> {
     for (program, args, text, expected) in [
         (
             Program::Ip,
-            vec!["-j", "link", "show"],
+            vec!["-d", "-j", "link", "show"],
             r#"[{"ifname":"eth0"},{"ifname":"proton0"}]"#,
             ConfigMismatch::InterfaceMissing(cfg.client_iface.clone()),
         ),
         (
             Program::Ip,
-            vec!["-j", "link", "show"],
+            vec!["-d", "-j", "link", "show"],
             r#"[{"ifname":"wg0"},{"ifname":"proton0"}]"#,
             ConfigMismatch::InterfaceMissing(cfg.uplink_iface.clone()),
         ),
@@ -707,7 +707,7 @@ fn all_violations_survive_other_collector_errors() -> Result<(), Box<dyn Error>>
 #[test]
 fn collector_error_alone_is_error_and_others_still_run() {
     for (program, args) in [
-        (Program::Ip, vec!["-j", "link", "show"]),
+        (Program::Ip, vec!["-d", "-j", "link", "show"]),
         (Program::Ip, vec!["-j", "route", "show", "default"]),
         (Program::Ip, vec!["-j", "addr", "show", "dev", "proton0"]),
         (Program::Ip, vec!["-j", "addr", "show", "dev", "eth0"]),
@@ -732,7 +732,7 @@ fn multiple_errors_are_bounded_and_include_later_errors() -> Result<(), Box<dyn 
     let sys = FakeSystem::new();
     sys.push(
         Program::Ip,
-        &["-j", "link", "show"],
+        &["-d", "-j", "link", "show"],
         Err(ExecError::spawn(&format!("first {}", "é".repeat(200)))),
     );
     sys.push(
@@ -796,7 +796,7 @@ fn check_healthy_and_extra_rule() -> Result<(), Box<dyn Error>> {
 fn without_exit(sys: &FakeSystem) {
     sys.set(
         Program::Ip,
-        &["-j", "link", "show"],
+        &["-d", "-j", "link", "show"],
         r#"[{"ifname":"lo"},{"ifname":"eth0"},{"ifname":"wg0"}]"#,
     );
 }
@@ -934,7 +934,7 @@ fn present_down_exit_with_noop_and_no_address_is_fail_closed() -> Result<(), Box
         let sys = FakeSystem::new();
         sys.set(
             Program::Ip,
-            &["-j", "link", "show"],
+            &["-d", "-j", "link", "show"],
             include_str!("fixtures/ubuntu-24.04/case-04-ip-link.json"),
         );
         // An address query must be skipped entirely for a down exit.
@@ -995,7 +995,7 @@ fn vanished_exit_discards_its_query_errors_and_is_fail_closed() -> Result<(), Bo
             let sys = FakeSystem::new();
             sys.set(
                 Program::Ip,
-                &["-j", "link", "show"],
+                &["-d", "-j", "link", "show"],
                 r#"[{"ifname":"eth0"},{"ifname":"wg0"},{"ifname":"proton0","flags":["UP"]}]"#,
             );
             without_exit(&sys);
@@ -1026,7 +1026,7 @@ fn vanished_exit_discards_its_query_errors_and_is_fail_closed() -> Result<(), Bo
                     .borrow()
                     .iter()
                     .filter(|(program, args, _)| *program == Program::Ip
-                        && args == &["-j", "link", "show"])
+                        && args == &["-d", "-j", "link", "show"])
                     .count(),
                 2
             );
@@ -1043,7 +1043,7 @@ fn failed_links_observation_is_code_one_unless_a_violation_is_found() -> Result<
         let sys = FakeSystem::new();
         sys.push(
             Program::Ip,
-            &["-j", "link", "show"],
+            &["-d", "-j", "link", "show"],
             Err(ExecError::spawn("links failed")),
         );
         if violation {
@@ -1085,7 +1085,11 @@ fn xdp_on_either_interface_is_a_hook_regardless_of_value() -> Result<(), Box<dyn
                     link["xdp"] = value.clone();
                 }
             }
-            sys.set(Program::Ip, &["-j", "link", "show"], &links.to_string());
+            sys.set(
+                Program::Ip,
+                &["-d", "-j", "link", "show"],
+                &links.to_string(),
+            );
             assert_eq!(
                 topology_source().observe(&sys, &cfg)?.tc_hooks,
                 std::slice::from_ref(iface)
@@ -1242,7 +1246,7 @@ fn legacy_read_errors_are_observation_errors_but_known_tables_win() -> Result<()
 #[test]
 fn combined_errors_preserve_later_setup_classification() {
     let sys = FakeSystem::new();
-    sys.set(Program::Ip, &["-j", "link", "show"], "invalid JSON");
+    sys.set(Program::Ip, &["-d", "-j", "link", "show"], "invalid JSON");
     sys.push(
         Program::Ip,
         &["-j", "route", "show", "default"],
@@ -1314,7 +1318,7 @@ fn exit_query_errors_recheck_links_only_once_and_preserve_other_errors()
         if vanished {
             sys.set(
                 Program::Ip,
-                &["-j", "link", "show"],
+                &["-d", "-j", "link", "show"],
                 r#"[{"ifname":"eth0"},{"ifname":"wg0"},{"ifname":"proton0","flags":["UP"]}]"#,
             );
             without_exit(&sys);
@@ -1352,9 +1356,8 @@ fn exit_query_errors_recheck_links_only_once_and_preserve_other_errors()
             sys.calls
                 .borrow()
                 .iter()
-                .filter(
-                    |(program, args, _)| *program == Program::Ip && args == &["-j", "link", "show"]
-                )
+                .filter(|(program, args, _)| *program == Program::Ip
+                    && args == &["-d", "-j", "link", "show"])
                 .count(),
             2
         );
@@ -1390,7 +1393,7 @@ fn failed_links_uses_address_flags_to_decide_missing_exit_address() -> Result<()
         let sys = FakeSystem::new();
         sys.push(
             Program::Ip,
-            &["-j", "link", "show"],
+            &["-d", "-j", "link", "show"],
             Err(ExecError::spawn("links failed")),
         );
         let addr = json!([{"ifname":"proton0", "flags": if up { vec!["UP"] } else { vec!["POINTOPOINT"] }, "addr_info":[]}]);

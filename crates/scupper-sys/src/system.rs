@@ -1,7 +1,7 @@
 //! Bounded command execution behind an injectable clock and kernel interface.
 
 use std::{
-    io::Read,
+    io::{Read, Write},
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -12,6 +12,8 @@ use std::{
 
 use rustix::process::{Pid, Signal, kill_process_group};
 use thiserror::Error;
+
+use crate::netns::NetnsHandle;
 
 /// Default deadline for each kernel command.
 pub const EXEC_TIMEOUT: Duration = Duration::from_secs(3);
@@ -30,6 +32,12 @@ pub enum Program {
     Nft,
     /// Traffic-control inspection.
     Tc,
+    /// Enter a held network namespace.
+    Nsenter,
+    /// Namespace sysctl access.
+    Sysctl,
+    /// Connection tracking maintenance.
+    Conntrack,
     /// Create an anonymous network namespace for ruleset canonicalization.
     Unshare,
     /// Start and stop the exit tunnel unit.
@@ -41,6 +49,9 @@ impl Program {
     #[must_use]
     pub const fn default_path(self) -> &'static str {
         match self {
+            Self::Nsenter => "/usr/bin/nsenter",
+            Self::Sysctl => "/usr/sbin/sysctl",
+            Self::Conntrack => "/usr/sbin/conntrack",
             Self::Wg => "/usr/bin/wg",
             Self::Ip => "/usr/sbin/ip",
             Self::Nft => "/usr/sbin/nft",
@@ -60,6 +71,9 @@ pub struct Programs {
     tc: PathBuf,
     systemctl: PathBuf,
     unshare: PathBuf,
+    nsenter: PathBuf,
+    sysctl: PathBuf,
+    conntrack: PathBuf,
 }
 
 impl Default for Programs {
@@ -71,6 +85,9 @@ impl Default for Programs {
             tc: Program::Tc.default_path().into(),
             systemctl: Program::Systemctl.default_path().into(),
             unshare: Program::Unshare.default_path().into(),
+            nsenter: Program::Nsenter.default_path().into(),
+            sysctl: Program::Sysctl.default_path().into(),
+            conntrack: Program::Conntrack.default_path().into(),
         }
     }
 }
@@ -93,6 +110,9 @@ impl Programs {
                 return Err(ExecError::spawn("program path must be absolute"));
             }
             let destination = match program {
+                Program::Nsenter => &mut paths.nsenter,
+                Program::Sysctl => &mut paths.sysctl,
+                Program::Conntrack => &mut paths.conntrack,
                 Program::Wg => &mut paths.wg,
                 Program::Ip => &mut paths.ip,
                 Program::Nft => &mut paths.nft,
@@ -109,6 +129,9 @@ impl Programs {
     #[must_use]
     pub fn path(&self, program: Program) -> &Path {
         match program {
+            Program::Nsenter => &self.nsenter,
+            Program::Sysctl => &self.sysctl,
+            Program::Conntrack => &self.conntrack,
             Program::Wg => &self.wg,
             Program::Ip => &self.ip,
             Program::Nft => &self.nft,
@@ -160,6 +183,18 @@ pub enum ExecError {
     /// Either output stream was not valid UTF-8.
     #[error("exec output is not UTF-8")]
     NonUtf8,
+    /// Namespace identity verification failed before spawning.
+    #[error("namespace identity verification failed")]
+    NamespaceIdentity,
+    /// nsenter itself failed, independently of the target program.
+    #[error("namespace entry failed (status {status:?})")]
+    NamespaceEnter {
+        /// nsenter exit status, without retaining untrusted diagnostics.
+        status: Option<i32>,
+    },
+    /// A shared filesystem socket could redirect wg to a host userspace device.
+    #[error("refusing userspace WireGuard socket: {}", .0.display())]
+    UserspaceWireguardSocket(PathBuf),
 }
 
 fn bounded(message: &str) -> String {
@@ -174,7 +209,27 @@ impl ExecError {
     }
 }
 
+/// Where a command observes or changes kernel state.
+#[derive(Debug, Clone, Copy)]
+pub enum ExecTarget<'a> {
+    /// The caller's network namespace.
+    Host,
+    /// A namespace pinned by its open descriptor, never by name.
+    Netns(&'a NetnsHandle),
+}
+
 /// The only command and wall-clock operations needed by collectors.
+///
+/// Adapters implement host execution; namespace execution fails closed by default.
+/// An adapter without an executor cannot compile:
+///
+/// ```compile_fail
+/// use scupper_sys::system::System;
+/// struct MissingExecutor;
+/// impl System for MissingExecutor {
+///     fn now_unix_secs(&self) -> u64 { 0 }
+/// }
+/// ```
 pub trait System {
     /// Executes one utility with literal arguments and a hard deadline.
     ///
@@ -188,25 +243,113 @@ pub trait System {
         timeout: Duration,
     ) -> Result<ExecOutput, ExecError>;
 
+    /// Executes in a pinned namespace or on the host.
+    ///
+    /// The default supports existing host-only adapters and fails closed for
+    /// namespace targets. Adapters supporting namespaces must override it.
+    ///
+    /// # Errors
+    /// Returns an execution error or an unsupported-target error.
+    fn run_in(
+        &self,
+        target: ExecTarget<'_>,
+        program: Program,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<ExecOutput, ExecError> {
+        match target {
+            ExecTarget::Host => self.run(program, args, timeout),
+            ExecTarget::Netns(_) => Err(ExecError::spawn("namespace execution unsupported")),
+        }
+    }
+
+    /// Writes input bytes and closes stdin within the command's hard deadline.
+    /// Input is never added to argv, diagnostics or the environment.
+    /// The caller owns and must zeroize secret input bytes.
+    ///
+    /// # Errors
+    /// Returns an execution error; host-only legacy adapters reject stdin.
+    fn run_with_stdin(
+        &self,
+        _target: ExecTarget<'_>,
+        _program: Program,
+        _args: &[String],
+        _stdin: &[u8],
+        _timeout: Duration,
+    ) -> Result<ExecOutput, ExecError> {
+        Err(ExecError::spawn("stdin execution unsupported"))
+    }
+
+    /// Shared filesystem UAPI directories to check before namespace wg access.
+    fn wireguard_socket_dirs(&self) -> Vec<PathBuf> {
+        vec!["/var/run/wireguard".into(), "/run/wireguard".into()]
+    }
+
     /// Whole Unix seconds, saturating at zero before the epoch.
     fn now_unix_secs(&self) -> u64;
+}
+
+/// Refuses any shared UAPI pathname, including dangling symlinks. Read failures
+/// also fail closed. Namespace wg commands must name a single interface.
+pub(crate) fn check_wg_args(
+    sys: &(impl System + ?Sized),
+    args: &[String],
+) -> Result<(), ExecError> {
+    if args.first().is_some_and(|s| s == "pubkey") {
+        return Ok(());
+    }
+    let ifname = args
+        .get(1)
+        .ok_or_else(|| ExecError::spawn("wg interface required"))?;
+    scupper_core::rules::IfName::new(ifname)
+        .map_err(|_| ExecError::spawn("invalid wg interface"))?;
+    for dir in sys.wireguard_socket_dirs() {
+        let path = dir.join(format!("{ifname}.sock"));
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => return Err(ExecError::UserspaceWireguardSocket(path)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ExecError::spawn(&error.to_string())),
+        }
+    }
+    Ok(())
 }
 
 /// Executes the configured absolute paths in a minimal fixed environment.
 #[derive(Debug, Default)]
 pub struct RealSystem {
     programs: Programs,
+    wireguard_dirs: Option<Vec<PathBuf>>,
 }
 
 impl RealSystem {
     /// Uses validated executable paths, including any distro-specific overrides.
     #[must_use]
     pub const fn new(programs: Programs) -> Self {
-        Self { programs }
+        Self {
+            programs,
+            wireguard_dirs: None,
+        }
     }
 
-    fn command(&self, program: Program, args: &[String]) -> Command {
-        let mut command = Command::new(self.programs.path(program));
+    /// Overrides the shared UAPI directories, primarily for isolated tests.
+    #[must_use]
+    pub fn with_wireguard_socket_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
+        self.wireguard_dirs = Some(dirs);
+        self
+    }
+
+    fn command(&self, target: ExecTarget<'_>, program: Program, args: &[String]) -> Command {
+        let mut command = match target {
+            ExecTarget::Host => Command::new(self.programs.path(program)),
+            ExecTarget::Netns(handle) => {
+                let mut command = Command::new(self.programs.path(Program::Nsenter));
+                command
+                    .arg(format!("--net={}", handle.child_fd_path().display()))
+                    .arg("--")
+                    .arg(self.programs.path(program));
+                command
+            }
+        };
         command
             .args(args)
             .env_clear()
@@ -279,7 +422,16 @@ fn collect(
     started: Instant,
     timeout: Duration,
     readers: &mut Vec<thread::JoinHandle<()>>,
+    mut input: Option<&[u8]>,
 ) -> Result<ExecOutput, ExecError> {
+    // Nonblocking writes are interleaved with output draining and deadline
+    // checks. A full stdin pipe cannot block this thread or outlive the budget.
+    let mut stdin = child.stdin.take();
+    if let Some(pipe) = &stdin {
+        let flags = rustix::fs::fcntl_getfl(pipe)
+            .and_then(|flags| rustix::fs::fcntl_setfl(pipe, flags | rustix::fs::OFlags::NONBLOCK));
+        flags.map_err(|error| ExecError::spawn(&error.to_string()))?;
+    }
     let stdout = child
         .stdout
         .take()
@@ -314,13 +466,34 @@ fn collect(
         if started.elapsed() >= timeout {
             return Err(ExecError::Timeout { after: timeout });
         }
+        if let (Some(pipe), Some(bytes)) = (&mut stdin, &mut input) {
+            if bytes.is_empty() {
+                stdin.take(); // EOF is part of the stdin contract.
+            } else {
+                match pipe.write(&bytes[..bytes.len().min(64 * 1024)]) {
+                    Ok(0) => return Err(ExecError::spawn("stdin write made no progress")),
+                    Ok(count) => *bytes = &bytes[count..],
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+                        stdin.take();
+                    }
+                    Err(error) => return Err(ExecError::spawn(&error.to_string())),
+                }
+            }
+        }
         while let Ok((index, result)) = receiver.try_recv() {
             streams[index] = Some(result?);
         }
         let status = child
             .try_wait()
             .map_err(|error| ExecError::spawn(&error.to_string()))?;
-        if let (Some(status), [Some(stdout), Some(stderr)]) = (status, &mut streams) {
+        if let (Some(status), [Some(stdout), Some(stderr)]) = (status, &mut streams)
+            && stdin.is_none()
+        {
             return Ok(ExecOutput {
                 status: status.code(),
                 stdout: std::mem::take(stdout),
@@ -331,6 +504,71 @@ fn collect(
     }
 }
 
+impl RealSystem {
+    fn execute(
+        &self,
+        target: ExecTarget<'_>,
+        program: Program,
+        args: &[String],
+        input: Option<&[u8]>,
+        timeout: Duration,
+    ) -> Result<ExecOutput, ExecError> {
+        if let ExecTarget::Netns(handle) = target {
+            handle
+                .verify(handle.identity())
+                .map_err(|_| ExecError::NamespaceIdentity)?;
+            if program == Program::Wg {
+                check_wg_args(self, args)?;
+            }
+        }
+        self.execute_verified(target, program, args, input, timeout)
+    }
+
+    // Only reached after identity/socket checks. Kept separate so unprivileged
+    // unit tests can exercise nsenter failures with a synthetic held descriptor.
+    fn execute_verified(
+        &self,
+        target: ExecTarget<'_>,
+        program: Program,
+        args: &[String],
+        input: Option<&[u8]>,
+        timeout: Duration,
+    ) -> Result<ExecOutput, ExecError> {
+        let started = Instant::now();
+        let mut command = self.command(target, program, args);
+        if input.is_some() {
+            command.stdin(Stdio::piped());
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|error| ExecError::spawn(&error.to_string()))?;
+        let deadline = started + timeout + Duration::from_millis(900);
+        let mut readers = Vec::with_capacity(2);
+        let result = collect(&mut child, started, timeout, &mut readers, input);
+        if result.is_err() {
+            terminate(child, deadline);
+        }
+        join_readers(readers, deadline);
+        namespace_result(target, result)
+    }
+}
+
+fn namespace_result(
+    target: ExecTarget<'_>,
+    result: Result<ExecOutput, ExecError>,
+) -> Result<ExecOutput, ExecError> {
+    let output = result?;
+    if matches!(target, ExecTarget::Netns(_))
+        && output.status != Some(0)
+        && output.stderr.starts_with("nsenter:")
+    {
+        return Err(ExecError::NamespaceEnter {
+            status: output.status,
+        });
+    }
+    Ok(output)
+}
+
 impl System for RealSystem {
     fn run(
         &self,
@@ -338,20 +576,34 @@ impl System for RealSystem {
         args: &[String],
         timeout: Duration,
     ) -> Result<ExecOutput, ExecError> {
-        let started = Instant::now();
-        let mut child = self
-            .command(program, args)
-            .spawn()
-            .map_err(|error| ExecError::spawn(&error.to_string()))?;
-        // Reserve less than the permitted extra second for bounded cleanup.
-        let deadline = started + timeout + Duration::from_millis(900);
-        let mut readers = Vec::with_capacity(2);
-        let result = collect(&mut child, started, timeout, &mut readers);
-        if result.is_err() {
-            terminate(child, deadline);
-        }
-        join_readers(readers, deadline);
-        result
+        self.run_in(ExecTarget::Host, program, args, timeout)
+    }
+
+    fn run_in(
+        &self,
+        target: ExecTarget<'_>,
+        program: Program,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<ExecOutput, ExecError> {
+        self.execute(target, program, args, None, timeout)
+    }
+
+    fn run_with_stdin(
+        &self,
+        target: ExecTarget<'_>,
+        program: Program,
+        args: &[String],
+        stdin: &[u8],
+        timeout: Duration,
+    ) -> Result<ExecOutput, ExecError> {
+        self.execute(target, program, args, Some(stdin), timeout)
+    }
+
+    fn wireguard_socket_dirs(&self) -> Vec<PathBuf> {
+        self.wireguard_dirs
+            .clone()
+            .unwrap_or_else(|| vec!["/var/run/wireguard".into(), "/run/wireguard".into()])
     }
 
     fn now_unix_secs(&self) -> u64 {
@@ -367,7 +619,7 @@ impl System for RealSystem {
 pub mod testing {
     use std::{cell::RefCell, collections::BTreeMap, collections::VecDeque, time::Duration};
 
-    use super::{ExecError, ExecOutput, Program, System};
+    use super::{ExecError, ExecOutput, ExecTarget, Program, System};
 
     /// One recorded command, including its execution budget.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -376,11 +628,16 @@ pub mod testing {
         pub program: Program,
         /// Literal command arguments.
         pub args: Vec<String>,
+        /// Pinned namespace identity, or None for the host.
+        pub target_identity: Option<(u64, u64)>,
+        /// Input length only; secret input bytes are never recorded.
+        pub stdin_len: Option<usize>,
         /// Requested deadline.
         pub timeout: Duration,
     }
 
-    type Scripts = BTreeMap<(Program, Vec<String>), VecDeque<Result<ExecOutput, ExecError>>>;
+    type ScriptKey = (Option<(u64, u64)>, Program, Vec<String>);
+    type Scripts = BTreeMap<ScriptKey, VecDeque<Result<ExecOutput, ExecError>>>;
 
     /// Fixed clock and FIFO responses keyed by program and exact argv.
     #[derive(Debug)]
@@ -388,6 +645,7 @@ pub mod testing {
         now: u64,
         scripts: RefCell<Scripts>,
         calls: RefCell<Vec<Call>>,
+        wireguard_dirs: Option<Vec<std::path::PathBuf>>,
     }
 
     impl FakeSystem {
@@ -398,7 +656,15 @@ pub mod testing {
                 now: now_unix_secs,
                 scripts: RefCell::new(BTreeMap::new()),
                 calls: RefCell::new(Vec::new()),
+                wireguard_dirs: None,
             }
+        }
+
+        /// Sets isolated shared UAPI directories for dispatch tests.
+        #[must_use]
+        pub fn with_wireguard_socket_dirs(mut self, dirs: Vec<std::path::PathBuf>) -> Self {
+            self.wireguard_dirs = Some(dirs);
+            self
         }
 
         /// Appends a response for one exact command.
@@ -408,11 +674,46 @@ pub mod testing {
             args: &[String],
             response: Result<ExecOutput, ExecError>,
         ) {
+            self.push_in(ExecTarget::Host, program, args, response);
+        }
+
+        /// Appends a response for an exact namespace identity and command.
+        pub fn push_in(
+            &self,
+            target: ExecTarget<'_>,
+            program: Program,
+            args: &[String],
+            response: Result<ExecOutput, ExecError>,
+        ) {
             self.scripts
                 .borrow_mut()
-                .entry((program, args.to_vec()))
+                .entry((identity(target), program, args.to_vec()))
                 .or_default()
                 .push_back(response);
+        }
+
+        #[allow(clippy::panic)] // An unscripted command is a test failure by contract.
+        fn dispatch(
+            &self,
+            target: ExecTarget<'_>,
+            program: Program,
+            args: &[String],
+            stdin_len: Option<usize>,
+            timeout: Duration,
+        ) -> Result<ExecOutput, ExecError> {
+            let target_identity = identity(target);
+            self.calls.borrow_mut().push(Call {
+                program,
+                args: args.to_vec(),
+                timeout,
+                target_identity,
+                stdin_len,
+            });
+            self.scripts
+                .borrow_mut()
+                .get_mut(&(target_identity, program, args.to_vec()))
+                .and_then(VecDeque::pop_front)
+                .unwrap_or_else(|| panic!("unexpected or exhausted command: {program:?} {args:?}"))
         }
 
         /// Returns the ordered call history, including unexpected calls.
@@ -422,24 +723,48 @@ pub mod testing {
         }
     }
 
+    fn identity(target: ExecTarget<'_>) -> Option<(u64, u64)> {
+        match target {
+            ExecTarget::Host => None,
+            ExecTarget::Netns(handle) => Some(handle.identity()),
+        }
+    }
+
     impl System for FakeSystem {
-        #[allow(clippy::panic)] // An unscripted command is a test failure by contract.
         fn run(
             &self,
             program: Program,
             args: &[String],
             timeout: Duration,
         ) -> Result<ExecOutput, ExecError> {
-            self.calls.borrow_mut().push(Call {
-                program,
-                args: args.to_vec(),
-                timeout,
-            });
-            self.scripts
-                .borrow_mut()
-                .get_mut(&(program, args.to_vec()))
-                .and_then(VecDeque::pop_front)
-                .unwrap_or_else(|| panic!("unexpected or exhausted command: {program:?} {args:?}"))
+            self.run_in(ExecTarget::Host, program, args, timeout)
+        }
+
+        fn run_in(
+            &self,
+            target: ExecTarget<'_>,
+            program: Program,
+            args: &[String],
+            timeout: Duration,
+        ) -> Result<ExecOutput, ExecError> {
+            self.dispatch(target, program, args, None, timeout)
+        }
+
+        fn run_with_stdin(
+            &self,
+            target: ExecTarget<'_>,
+            program: Program,
+            args: &[String],
+            stdin: &[u8],
+            timeout: Duration,
+        ) -> Result<ExecOutput, ExecError> {
+            self.dispatch(target, program, args, Some(stdin.len()), timeout)
+        }
+
+        fn wireguard_socket_dirs(&self) -> Vec<std::path::PathBuf> {
+            self.wireguard_dirs
+                .clone()
+                .unwrap_or_else(|| vec!["/var/run/wireguard".into(), "/run/wireguard".into()])
         }
 
         fn now_unix_secs(&self) -> u64 {
@@ -463,6 +788,225 @@ mod tests {
     }
 
     #[test]
+    fn adapter_defaults_preserve_host_and_reject_unsupported_netns() -> Result<(), Box<dyn Error>> {
+        struct TargetAware;
+        impl System for TargetAware {
+            fn run(
+                &self,
+                program: Program,
+                args: &[String],
+                timeout: Duration,
+            ) -> Result<ExecOutput, ExecError> {
+                self.run_in(ExecTarget::Host, program, args, timeout)
+            }
+            fn run_in(
+                &self,
+                target: ExecTarget<'_>,
+                _program: Program,
+                _args: &[String],
+                _timeout: Duration,
+            ) -> Result<ExecOutput, ExecError> {
+                assert!(matches!(target, ExecTarget::Host));
+                Ok(ExecOutput {
+                    status: Some(0),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+            fn now_unix_secs(&self) -> u64 {
+                0
+            }
+        }
+        struct Legacy;
+        impl System for Legacy {
+            fn run(
+                &self,
+                program: Program,
+                args: &[String],
+                timeout: Duration,
+            ) -> Result<ExecOutput, ExecError> {
+                TargetAware.run(program, args, timeout)
+            }
+            fn now_unix_secs(&self) -> u64 {
+                0
+            }
+        }
+        assert_eq!(
+            TargetAware.run(Program::Ip, &[], EXEC_TIMEOUT)?.status,
+            Some(0)
+        );
+        assert_eq!(
+            Legacy
+                .run_in(ExecTarget::Host, Program::Ip, &[], EXEC_TIMEOUT)?
+                .status,
+            Some(0)
+        );
+        let handle = crate::netns::testing::handle()?;
+        assert!(
+            Legacy
+                .run_in(ExecTarget::Netns(&handle), Program::Ip, &[], EXEC_TIMEOUT)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn target_argv_is_exact() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::MetadataExt;
+        let handle = crate::netns::testing::handle()?;
+        let literal_path = format!("/proc/{}/fd/{}", std::process::id(), handle.raw_fd());
+        let stat = std::fs::metadata(&literal_path)?;
+        assert_eq!((stat.dev(), stat.ino()), handle.identity());
+        let sys = RealSystem::new(Programs::new([
+            (Program::Ip, "/custom/ip"),
+            (Program::Nsenter, "/custom/nsenter"),
+        ])?);
+        let arguments = args(&["-j", "link", "show"]);
+        let host = sys.command(ExecTarget::Host, Program::Ip, &arguments);
+        assert_eq!(host.get_program(), "/custom/ip");
+        assert_eq!(host.get_args().collect::<Vec<_>>(), ["-j", "link", "show"]);
+        let ns = sys.command(ExecTarget::Netns(&handle), Program::Ip, &arguments);
+        assert_eq!(ns.get_program(), "/custom/nsenter");
+        assert_eq!(
+            ns.get_args()
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            [
+                format!("--net=/proc/{}/fd/{}", std::process::id(), handle.raw_fd()),
+                "--".into(),
+                "/custom/ip".into(),
+                "-j".into(),
+                "link".into(),
+                "show".into(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_host_identity_before_exec() -> Result<(), Box<dyn Error>> {
+        let handle = crate::netns::testing::handle()?;
+        let sys = RealSystem::new(Programs::new([(Program::Nsenter, "/missing/nsenter")])?);
+        for input in [None, Some(b"secret".as_slice())] {
+            assert_eq!(
+                sys.execute(
+                    ExecTarget::Netns(&handle),
+                    Program::Ip,
+                    &[],
+                    input,
+                    EXEC_TIMEOUT
+                ),
+                Err(ExecError::NamespaceIdentity)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn nsenter_failure_is_not_a_target_failure() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("nsenter-test-{}", std::process::id()));
+        std::fs::create_dir(&dir)?;
+        let script = dir.join("nsenter");
+        let handle = crate::netns::testing::handle()?;
+        let sys = RealSystem::new(Programs::new([(Program::Nsenter, &script)])?);
+        for (stderr, code, expected) in [
+            (
+                "nsenter: cannot enter namespace: device absent",
+                1,
+                Some(ExecError::NamespaceEnter { status: Some(1) }),
+            ),
+            ("Unable to access interface: No such device", 1, None),
+            ("nsenter: harmless output", 0, None),
+        ] {
+            std::fs::write(
+                &script,
+                format!("#!/bin/sh\nprintf '%s' '{stderr}' >&2\nexit {code}\n"),
+            )?;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))?;
+            let result = sys.execute_verified(
+                ExecTarget::Netns(&handle),
+                Program::Ip,
+                &[],
+                None,
+                EXEC_TIMEOUT,
+            );
+            if let Some(error) = expected {
+                assert_eq!(result, Err(error));
+            } else {
+                let output = result?;
+                assert_eq!(output.status, Some(code));
+                assert_eq!(output.stderr, stderr);
+            }
+        }
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn broken_stdin_pipe_preserves_child_diagnostics() -> Result<(), Box<dyn Error>> {
+        let output = system("/bin/sh")?.run_with_stdin(
+            ExecTarget::Host,
+            Program::Wg,
+            &args(&[
+                "-c",
+                "exec 0<&-; printf 'invalid ruleset\\n' >&2; printf 'partial output\\n'; exit 7",
+            ]),
+            &vec![b'x'; 2 * OUTPUT_CAP],
+            EXEC_TIMEOUT,
+        )?;
+        assert_eq!(output.status, Some(7));
+        assert_eq!(output.stdout, "partial output\n");
+        assert_eq!(output.stderr, "invalid ruleset\n");
+        Ok(())
+    }
+
+    #[test]
+    fn stdin_delivery_eof_and_nonreader_deadline() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+        struct Scripts(PathBuf);
+        impl Drop for Scripts {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let scripts =
+            Scripts(std::env::temp_dir().join(format!("stdin-test-{}", std::process::id())));
+        std::fs::create_dir(&scripts.0)?;
+        let read = scripts.0.join("read");
+        let ignore = scripts.0.join("ignore");
+        for (path, body) in [
+            (&read, "#!/bin/sh\nexec /usr/bin/cat\n"),
+            (&ignore, "#!/bin/sh\nexec /usr/bin/sleep 30\n"),
+        ] {
+            std::fs::write(path, body)?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let sys = RealSystem::new(Programs::new([(Program::Wg, &read)])?);
+        for bytes in [Vec::new(), b"hello\n".to_vec(), vec![b'x'; 512 * 1024]] {
+            let output =
+                sys.run_with_stdin(ExecTarget::Host, Program::Wg, &[], &bytes, EXEC_TIMEOUT)?;
+            assert_eq!(output.status, Some(0));
+            assert_eq!(output.stdout.as_bytes(), bytes);
+        }
+        let sys = RealSystem::new(Programs::new([(Program::Wg, &ignore)])?);
+        let timeout = Duration::from_millis(100);
+        let started = Instant::now();
+        assert_eq!(
+            sys.run_with_stdin(
+                ExecTarget::Host,
+                Program::Wg,
+                &[],
+                &vec![b'x'; 2 * OUTPUT_CAP],
+                timeout
+            ),
+            Err(ExecError::Timeout { after: timeout })
+        );
+        assert!(started.elapsed() < timeout + Duration::from_secs(1));
+        Ok(())
+    }
+
+    #[test]
     fn exec_success_and_status() -> Result<(), Box<dyn Error>> {
         for (path, code) in [("/usr/bin/true", 0), ("/usr/bin/false", 1)] {
             let output = system(path)?.run(Program::Wg, &[], EXEC_TIMEOUT)?;
@@ -478,11 +1022,13 @@ mod tests {
         let sys = system("/usr/bin/sleep")?;
         let timeout = Duration::from_millis(200);
         let started = Instant::now();
-        let mut child = sys.command(Program::Wg, &args(&["5"])).spawn()?;
+        let mut child = sys
+            .command(ExecTarget::Host, Program::Wg, &args(&["5"]))
+            .spawn()?;
         let pid = child.id();
         let mut readers = vec![];
         assert_eq!(
-            collect(&mut child, started, timeout, &mut readers),
+            collect(&mut child, started, timeout, &mut readers, None),
             Err(ExecError::Timeout { after: timeout })
         );
         let deadline = started + timeout + Duration::from_millis(900);
@@ -536,15 +1082,11 @@ mod tests {
         #[cfg(target_os = "linux")]
         rustix::process::set_child_subreaper(Some(Pid::INIT))
             .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
-        let file = PidFile(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../target")
-                .join(format!(
-                    "exec-grandchild-{}-{}.pid",
-                    std::process::id(),
-                    SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-                )),
-        );
+        let file = PidFile(std::env::temp_dir().join(format!(
+            "exec-grandchild-{}-{}.pid",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        )));
         let timeout = Duration::from_millis(200);
         let started = Instant::now();
         // A shell is used only in this test to arrange an inherited-pipe tree.
@@ -691,6 +1233,9 @@ mod tests {
             Program::Tc,
             Program::Systemctl,
             Program::Unshare,
+            Program::Nsenter,
+            Program::Sysctl,
+            Program::Conntrack,
         ] {
             assert!(Programs::new([(program, "relative")]).is_err());
             assert_eq!(

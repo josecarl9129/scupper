@@ -439,6 +439,8 @@ pub fn filter_has_hooks(out: &str) -> Result<bool, ParseError> {
 /// Link details needed to distinguish fail-closed exits and netfilter bypasses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Link {
+    /// Detailed kernel link kind, such as wireguard or veth.
+    pub kind: Option<String>,
     /// Kernel interface name.
     pub name: String,
     /// Whether the flags include the administrative `UP` flag.
@@ -472,7 +474,24 @@ pub fn links(out: &str) -> Result<Vec<Link>, ParseError> {
                         == "UP";
                 }
             }
+            let kind = entry
+                .get("linkinfo")
+                .map(|info| {
+                    let info = info
+                        .as_object()
+                        .ok_or(ParseError::Topology("invalid linkinfo"))?;
+                    info.get("info_kind")
+                        .map(|kind| {
+                            kind.as_str()
+                                .map(str::to_owned)
+                                .ok_or(ParseError::Topology("invalid link kind"))
+                        })
+                        .transpose()
+                })
+                .transpose()?
+                .flatten();
             Ok(Link {
+                kind,
                 name,
                 up,
                 xdp: entry.get("xdp").is_some(),
@@ -591,3 +610,11 @@ pub fn allowed_ips_contain(out: &str, client: Ipv4Addr) -> Result<bool, ParseErr
     }
     Ok(contains)
 }
+
+mod kernel;
+mod udp;
+mod wireguard;
+
+pub use kernel::*;
+pub use udp::*;
+pub use wireguard::*;
