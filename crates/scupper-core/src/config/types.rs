@@ -52,6 +52,14 @@ text_type!(
     "A public `WireGuard` key. Its base64 text is public and safe to display."
 );
 
+impl ExitId {
+    /// Checks the same identifier syntax used by site validation.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        valid_id(self.as_str())
+    }
+}
+
 impl DurationStr {
     /// Converts a valid duration to seconds, checking arithmetic overflow.
     ///

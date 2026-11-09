@@ -11,6 +11,7 @@ testing = []
 
 [dependencies]
 scupper-core.workspace = true
+scupper-proto.workspace = true
 rustix = { workspace = true, features = ["stdio"] }
 thiserror.workspace = true
 socket2.workspace = true

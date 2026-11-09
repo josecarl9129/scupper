@@ -14,6 +14,7 @@ pub mod probe_child;
 pub mod system;
 pub mod v1_detect;
 
+pub mod events;
 pub mod lock;
 pub mod secrets;
 pub mod state;

@@ -429,6 +429,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "scupper-proto"
+version = "0.1.0"
+dependencies = [
+ "scupper-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "scupper-sys"
 version = "0.1.0"
 dependencies = [
@@ -437,6 +446,7 @@ dependencies = [
  "rustix",
  "rustls",
  "scupper-core",
+ "scupper-proto",
  "serde",
  "serde_json",
  "sha2",

@@ -10,6 +10,7 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [workspace.dependencies]
+scupper-proto = { version = "0.1.0", path = "crates/scupper-proto" }
 scupper-core = { version = "0.1.0", path = "crates/scupper-core" }
 scupper-sys = { version = "0.1.0", path = "crates/scupper-sys" }
 clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
