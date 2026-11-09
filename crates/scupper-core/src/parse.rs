@@ -15,7 +15,7 @@ use crate::rules::{ConfigError, IfName, V1Config};
 /// Invalid command output or an unexpected exit-tunnel peer count.
 ///
 /// Diagnostics describe the failure without echoing untrusted input.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error, serde::Serialize)]
 pub enum ParseError {
     /// Malformed topology output, without retaining untrusted input.
     #[error("invalid topology output: {0}")]
@@ -279,7 +279,7 @@ pub fn single_peer_handshake(out: &str) -> Result<Handshake, ParseError> {
 }
 
 /// Additional iproute2 route types that cannot identify a unicast output device.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum RouteType {
     /// A route for link-layer broadcast destinations.
     Broadcast,
@@ -294,7 +294,7 @@ pub enum RouteType {
 }
 
 /// The route selected for a forwarded client packet, including special types.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum RouteLookup {
     /// A route through the validated output interface.
     Dev(IfName),

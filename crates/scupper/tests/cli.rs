@@ -147,6 +147,9 @@ impl System for Harness {
     }
 }
 impl NamespaceReader for Harness {
+    fn gateway_marker(&self) -> io::Result<bool> {
+        Ok(false)
+    }
     fn read_namespace(&self, path: &Path) -> io::Result<PathBuf> {
         let value = if path == Path::new("/proc/self/ns/net") {
             self.self_netns
@@ -224,6 +227,9 @@ impl Harness {
         let code = cli::run_with(
             std::iter::once("scupper").chain(args.iter().copied()),
             &Dependencies {
+                state_root: Path::new("target/m1-without-head"),
+                config_root: Path::new("target/m1-without-head"),
+                probe_exec: &scupper::system::RealSystem::default(),
                 system: self,
                 namespaces: self,
                 fs: &self.fs,
@@ -751,4 +757,13 @@ fn canon_rejects_malformed_outer_namespace_before_system_calls() {
         }
         assert!(h.calls.borrow().is_empty());
     }
+}
+
+#[test]
+fn m1_json_check_is_rejected_without_running_host_checks() {
+    let h = Harness::default();
+    let (code, out, _) = h.run(&["check", "--json"]);
+    assert_eq!(code, 1);
+    assert!(out.contains("check --json requires an M2 layout"));
+    assert!(h.calls.borrow().is_empty());
 }

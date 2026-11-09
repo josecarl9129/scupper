@@ -12,7 +12,7 @@ use ipnet::IpNet;
 use crate::{
     config::ExitId,
     parse::{Handshake, RouteLookup, UdpSocket},
-    render::RouteTarget,
+    render::{Family, RouteTarget},
 };
 
 pub use super::super::v1::{Probe, ProbeError};
@@ -38,7 +38,7 @@ pub enum Selection {
 }
 
 /// Full filesystem identity from a namespace handle or boot record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct NetnsIdentity {
     /// Filesystem device number (`st_dev`).
     pub device: u64,
@@ -119,7 +119,7 @@ impl From<super::super::v1::RulesetObs> for RulesetObs {
 }
 
 /// A namespace default route, including absence and nonstandard route types.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum DefaultRouteObs {
     /// Default through a named link; raw names preserve foreign devices.
     Dev(String),
@@ -144,6 +144,8 @@ impl From<RouteAnswer> for DefaultRouteObs {
 /// Main-table inventory summarized by the collector, distinct from intent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DefaultRoutes {
+    /// Unexpected routes outside main, retaining table, destination and device.
+    pub violations: Vec<Violation>,
     /// The observed IPv4 default, or explicit absence.
     pub v4: DefaultRouteObs,
     /// The single observed IPv6 default, even in IPv4-only M2.
@@ -156,6 +158,14 @@ pub struct DefaultRoutes {
 /// Complete containment inventory, collected independently of default routes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopologyObs {
+    /// Host `WireGuard` links using the configured client port.
+    pub host_wireguard_on_client_port: Vec<String>,
+    /// Per-item observation failures; known violations still take precedence.
+    pub errors: Vec<ProbeError>,
+    /// Whether links were successfully inventoried (required for missing links).
+    pub links_complete: bool,
+    /// Whether the address inventory was successfully collected and matched links.
+    pub addresses_complete: bool,
     /// Namespace identity.
     pub netns: NetnsObs,
     /// Complete link inventory, optionally including loopback.
@@ -166,12 +176,12 @@ pub struct TopologyObs {
     pub ruleset: RulesetObs,
     /// RPDB entries differing from kernel defaults, including missing defaults.
     pub extra_rules: Vec<String>,
-    /// Interfaces with traffic control beyond the baseline (including tcx/XDP).
+    /// Interfaces with traffic control beyond the baseline or XDP.
     pub tc_hooks: Vec<String>,
 }
 
 /// Reason retained by the persisted quarantine latch.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum RepairKind {
     /// Containment drift exhausted its repair budget.
     SafetyDrift,
@@ -180,8 +190,14 @@ pub enum RepairKind {
 /// Forwarding and the listening side of the client tunnel, observed together.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Forwarding {
+    /// IPv4 forwarding on the client ingress device.
+    pub client_v4: i64,
+    /// UDP sockets read inside the held namespace.
+    pub netns_sockets: Vec<UdpSocket>,
     /// Exact IPv4 forwarding sysctl value; only 1 passes.
     pub v4: i64,
+    /// Hardening keys whose observed values differ from desired values.
+    pub hardening: Vec<String>,
     /// IPv6 forwarding value; not required in M2 (no IPv6 clients).
     pub v6: i64,
     /// Persisted quarantine latch, if set.
@@ -206,7 +222,7 @@ pub struct RouteObs {
 }
 
 /// Client listener disagreement; client reachability beyond the host is unproven.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum ClientFault {
     /// Client-facing link is administratively down.
     LinkDown,
@@ -214,7 +230,7 @@ pub enum ClientFault {
     PublicKey,
     /// `WireGuard` is listening on a different port.
     ListenPort,
-    /// No host UDP socket is bound to the configured port.
+    /// Host listener is absent or a socket uses the port inside the namespace.
     HostSocket,
 }
 
@@ -235,7 +251,7 @@ pub enum Supervisor {
 }
 
 /// Why a verified data path lacks required supervision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum SupervisorFault {
     /// Supervisor did not answer.
     Dead,
@@ -291,7 +307,7 @@ impl Default for Observations {
 }
 
 /// Nonempty findings; an unprotected verdict always explains at least one fact.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct NonEmpty<T>(Vec<T>);
 impl<T> NonEmpty<T> {
     /// Starts with one required finding.
@@ -318,8 +334,19 @@ impl<T> NonEmpty<T> {
 }
 
 /// Observed containment violations, all collected before availability decisions.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum Violation {
+    /// A parallel host `WireGuard` path uses the client listen port.
+    HostWireguardOnClientPort(String),
+    /// Unexpected local or other non-main route.
+    ExtraRoute {
+        /// Kernel table name or number.
+        table: String,
+        /// Destination prefix or default.
+        dst: String,
+        /// Output device, when present.
+        dev: Option<String>,
+    },
     /// Owned namespace does not exist.
     NetnsMissing,
     /// Namespace identity differs from the expected boot record inode.
@@ -353,7 +380,7 @@ pub enum Violation {
 }
 
 /// Availability failures after containment passed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum Degraded {
     /// Reserved for M2k multi-exit failover; unreachable in this engine.
     FailoverStuck {
@@ -366,7 +393,16 @@ pub enum Degraded {
     QuarantineNotEffective,
     /// Required IPv4 forwarding is not exactly 1.
     ForwardingDisabled,
-    /// Observed default or client lookup disagrees with required routing.
+    /// Observed family default disagrees with required routing.
+    DefaultRouteWrong {
+        /// Address family whose default is wrong.
+        family: Family,
+        /// Observed default.
+        got: DefaultRouteObs,
+        /// Required target.
+        want: RouteTarget,
+    },
+    /// Observed client lookup or extra main route disagrees with required routing.
     RouteWrong {
         /// Source being checked (gateway source for defaults).
         client: ClientAddr,
@@ -393,7 +429,7 @@ pub enum Degraded {
 }
 
 /// Contained but deliberately or necessarily unavailable.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum FailClosed {
     /// Kernel closure verified for administrative disconnect.
     AdminDisconnected,
@@ -414,7 +450,7 @@ pub enum FailClosed {
 }
 
 /// Caveats; M2 emits clock skew, stale clients and optional daemon death.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum Warning {
     /// Reserved for standby checks.
     StandbyUnhealthy(ExitId),
@@ -422,7 +458,7 @@ pub enum Warning {
     ClockSkew,
     /// Reserved for installer hardening observations.
     KeyFileMode(PathBuf),
-    /// Reserved for hardening collection.
+    /// Namespace hardening key differs from its desired value.
     HardeningSysctl(String),
     /// Reserved for host forwarding diagnostics.
     HostForwardingOn,
@@ -439,7 +475,7 @@ pub enum Warning {
 }
 
 /// Observation stage, in execution order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum Stage {
     /// Namespace containment inventory.
     Topology,
@@ -462,7 +498,7 @@ pub enum Stage {
 }
 
 /// Required observation failed; this can never assert a safe outcome.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, serde::Serialize)]
 #[error("{stage:?} observation failed: {source}")]
 pub struct CheckError {
     /// Failed stage.
@@ -479,7 +515,7 @@ impl CheckError {
 }
 
 /// Namespace health outcome. Code 5 requires the same data-path proof as 0.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum Verdict {
     /// All applicable M2 stages verified.
     Protected {
@@ -520,6 +556,7 @@ impl Verdict {
 
 /// Completed health report with caller-supplied time and applied config version.
 /// Each stage is verified at its observation time; this is not an atomic snapshot.
+/// JSON serialization includes the stable top-level `schema: 1` discriminator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Report {
     /// Completed verdict.
@@ -555,4 +592,31 @@ pub enum Next {
     Supervisor,
     /// Completed report or observation failure.
     Done(Result<Report, CheckError>),
+}
+
+impl serde::Serialize for Report {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut report = serializer.serialize_struct("Report", 5)?;
+        report.serialize_field("schema", &1_u32)?;
+        report.serialize_field("verdict", &self.verdict)?;
+        report.serialize_field("warnings", &self.warnings)?;
+        report.serialize_field("at", &self.at)?;
+        report.serialize_field("config_version", &self.config_version)?;
+        report.end()
+    }
+}
+
+impl std::fmt::Display for Verdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Protected { exit, exit_ip } => write!(f, "protected: {exit} ({exit_ip})"),
+            Self::Unprotected(violations) => write!(f, "UNPROTECTED: {:?}", violations.as_slice()),
+            Self::Degraded(reason) => write!(f, "degraded: {reason:?}"),
+            Self::FailClosed(reason) => write!(f, "fail closed: {reason:?}"),
+            Self::Unsupervised { exit, exit_ip, why } => {
+                write!(f, "unsupervised: {exit} ({exit_ip}): {why:?}")
+            }
+        }
+    }
 }

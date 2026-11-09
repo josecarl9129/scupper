@@ -83,7 +83,7 @@ fn every_namespace_fixture() -> Result<(), Box<dyn Error>> {
                 parse_tc_filter(&out).map(|entries| {
                     assert_eq!(entries, []);
                 })
-            } else if name.ends_with("-nft-ruleset.json") {
+            } else if name.ends_with("-nft-ruleset.json") || name == "want.json" {
                 counts[8] += 1;
                 parse_nft_ruleset(&out).map(|_| ())
             } else if name.ends_with("-proc-net-udp.txt") {
@@ -111,7 +111,7 @@ fn every_namespace_fixture() -> Result<(), Box<dyn Error>> {
             };
             assert!(result.is_ok(), "{}: {result:?}", path.display());
         }
-        assert_eq!(counts, [4, 4, 8, 4, 16, 32, 2, 10, 1, 2, 2]);
+        assert_eq!(counts, [4, 4, 8, 4, 16, 32, 2, 10, 2, 2, 2]);
     }
     Ok(())
 }

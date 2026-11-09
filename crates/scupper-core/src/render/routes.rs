@@ -3,7 +3,7 @@
 use crate::config::{ExitId, ExitIfname, GatewayId, ValidatedSite};
 
 /// Address family of a namespace default route.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum Family {
     /// IPv4 (the default family for `ip route`).
     V4,
@@ -12,7 +12,7 @@ pub enum Family {
 }
 
 /// The only permitted non-kernel route targets inside the namespace.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum RouteTarget {
     /// A validated exit interface; an uplink cannot inhabit this type.
     Exit(ExitIfname),

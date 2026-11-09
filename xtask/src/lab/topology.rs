@@ -119,6 +119,37 @@ impl Lab {
             &["-6", "route", "add", "default", "via", A.wan_v6],
         )?;
 
+        self.internet_uplink()?;
+        Ok(())
+    }
+    fn internet_uplink(&mut self) -> Result<()> {
+        self.start(
+            "",
+            "slirp4netns",
+            &[
+                "--configure",
+                "--disable-host-loopback",
+                "--mtu=1500",
+                "--netns-type=path",
+                "/run/netns/wan",
+                "lab-uplink",
+            ],
+            "internet-uplink",
+        )?;
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            self.ensure_services()?;
+            let routes = self.cmd("wan", "ip", &["-j", "route", "show", "default"])?;
+            if !scupper_core::parse::parse_ip_route(&routes)?.is_empty() {
+                break;
+            }
+            if Instant::now() >= until {
+                return fail("user-mode internet uplink did not become ready");
+            }
+            self.runner.dwell(Duration::from_millis(100))?;
+        }
+        self.runner.input(&super::command::Invocation::new("wan", "nft", &["-f", "-"]),
+            Some(b"table ip lab_internet { chain postrouting { type nat hook postrouting priority srcnat; policy accept; oifname \"lab-uplink\" masquerade;\n\t}\n}\n"))?;
         Ok(())
     }
     fn build_gateway(&mut self) -> Result<()> {
@@ -236,6 +267,7 @@ impl Lab {
                 "--keep-in-foreground",
                 "--conf-file=/dev/null",
                 "--no-resolv",
+                "--server=10.0.2.3",
                 "--no-hosts",
                 "--bind-interfaces",
                 "--interface=wgp",
@@ -330,7 +362,7 @@ impl Lab {
         }
         Ok(())
     }
-    fn wait_provider(&mut self) -> Result<()> {
+    pub(super) fn wait_provider(&mut self) -> Result<()> {
         self.runner.dwell(Duration::from_secs(2))?;
         // Keepalive initiates the exit handshake. Retry within a fixed setup
         // budget rather than treating the first asynchronous handshake as ready.
@@ -489,7 +521,7 @@ impl Lab {
         }
         Ok(())
     }
-    fn load_real_rules(&mut self) -> Result<()> {
+    pub(super) fn load_real_rules(&mut self) -> Result<()> {
         let path = self.rules.to_string_lossy().into_owned();
         self.cmd("scupper", "nft", &["-f", &path])?;
         Ok(())
@@ -510,7 +542,7 @@ impl Lab {
             Case::Uplink => self
                 .cmd("wan", "nft", &["delete", "table", "inet", "lab_inject"])
                 .map(|_| ()),
-            Case::Baseline => Ok(()),
+            Case::Baseline | Case::CheckV2 => Ok(()),
             Case::ProbeChild => self.restore_probe_child_routes(),
         };
         if let Err(error) = specific {
@@ -536,6 +568,9 @@ impl Lab {
         }
     }
     pub(super) fn case(&mut self, case: Case) -> Result<String> {
+        if case == Case::CheckV2 {
+            return self.check_v2_case();
+        }
         let stem = case.name();
         let mut markers = Vec::new();
         let fault = (|| {
@@ -544,6 +579,7 @@ impl Lab {
             match case {
                 Case::Baseline => self.service_check(&mut markers),
                 Case::ProbeChild => self.probe_child_case(),
+                Case::CheckV2 => self.check_v2_case().map(|_| ()),
                 Case::V6 => self.v6_fault(&mut markers),
                 Case::Bridge | Case::Permissive => self.bridge_fault(case, &mut markers),
                 Case::Uplink => self.uplink_fault(&mut markers),

@@ -8,15 +8,17 @@ use std::{fmt::Write, fs, path::Path};
 pub(super) enum Case {
     Baseline,
     ProbeChild,
+    CheckV2,
     V6,
     Bridge,
     Permissive,
     Uplink,
 }
 impl Case {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Baseline,
         Self::ProbeChild,
+        Self::CheckV2,
         Self::V6,
         Self::Bridge,
         Self::Permissive,
@@ -26,6 +28,7 @@ impl Case {
         match self {
             Self::Baseline => "baseline",
             Self::ProbeChild => "probe-child",
+            Self::CheckV2 => "check-v2",
             Self::V6 => "client-v6-dropped",
             Self::Bridge => "bridged-real-ruleset",
             Self::Permissive => "positive-control-permissive",
@@ -36,6 +39,7 @@ impl Case {
         match self {
             Self::Baseline => "clean",
             Self::ProbeChild => "unprivileged-exit-dns",
+            Self::CheckV2 => "0,3,0,2,0,4,0",
             Self::V6 => "v6-dropped",
             Self::Bridge => "bridge-contained",
             Self::Permissive | Self::Uplink => "leak-detected",

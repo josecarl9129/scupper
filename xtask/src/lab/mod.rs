@@ -1,5 +1,6 @@
 //! Disposable Linux network-namespace reference lab for the M2 leak suite.
 mod addresses;
+mod check_v2;
 mod cleanup;
 mod command;
 mod evidence;
@@ -284,6 +285,10 @@ impl Lab {
             .public_key
             .0
             .clone_from(&self.public_keys[3]);
+        fs::write(
+            self.private.join("runtime-site.toml"),
+            toml::to_string(&config)?,
+        )?;
         self.site = scupper_core::config::validate(config)
             .map_err(|errors| format!("runtime lab config: {errors:?}"))?;
         let rules = render_netns(

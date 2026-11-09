@@ -48,7 +48,7 @@ pub(crate) fn command(
     command_result(sys.run(program, args, timeout))
 }
 
-fn command_result(result: Result<ExecOutput, ExecError>) -> Probe<String> {
+pub(crate) fn command_result(result: Result<ExecOutput, ExecError>) -> Probe<String> {
     let output = result.map_err(|error| match error {
         ExecError::Timeout { .. } => ProbeError::Timeout,
         other if permission_failure(&other.to_string()) => ProbeError::setup(&other.to_string()),
@@ -180,28 +180,37 @@ fn isolated_ruleset(
     sys: &dyn System,
     path: &Path,
     outer_netns: &Path,
+    gateway_netns: Option<&Path>,
     read_namespace: impl Fn(&Path) -> io::Result<PathBuf>,
 ) -> Probe<String> {
-    let valid_outer = outer_netns
-        .to_str()
-        .and_then(|value| value.strip_prefix("net:["))
-        .and_then(|value| value.strip_suffix(']'))
-        .is_some_and(|digits| {
-            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
-        });
-    if !valid_outer {
-        return Err(ProbeError::setup(
-            "outer network namespace must be net:[<decimal digits>]",
-        ));
-    }
-    // Any read failure or equality aborts before nft.
-    let current = read_namespace(Path::new("/proc/self/ns/net"))
-        .map_err(|error| ProbeError::setup(&format!("read current network namespace: {error}")))?;
-    if current == outer_netns
-        || read_namespace(Path::new("/proc/1/ns/net")).is_ok_and(|host| current == host)
+    let valid_identity = |path: &Path| {
+        path.to_str()
+            .and_then(|value| value.strip_prefix("net:["))
+            .and_then(|value| value.strip_suffix(']'))
+            .is_some_and(|digits| {
+                !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+            })
+    };
+    if !valid_identity(outer_netns) || gateway_netns.is_some_and(|gateway| !valid_identity(gateway))
     {
         return Err(ProbeError::setup(
-            "canon refused to load rules in the outer or host network namespace",
+            "outer network namespace must be net:[<decimal digits>]; gateway identity must use the same format",
+        ));
+    }
+    // M2 requires proof against both the parent and PID 1, as well as the held
+    // gateway. The parent's namespace can itself be a lab host namespace.
+    let current = read_namespace(Path::new("/proc/self/ns/net"))
+        .map_err(|error| ProbeError::setup(&format!("read current network namespace: {error}")))?;
+    let host = read_namespace(Path::new("/proc/1/ns/net"));
+    if gateway_netns.is_some() && host.is_err() {
+        return Err(ProbeError::setup("cannot verify host network namespace"));
+    }
+    if gateway_netns.is_some_and(|gateway| current == gateway)
+        || current == outer_netns
+        || host.is_ok_and(|host| current == host)
+    {
+        return Err(ProbeError::setup(
+            "canon refused to load rules in the outer, gateway or host network namespace",
         ));
     }
     let before = command(
@@ -253,7 +262,7 @@ pub fn run_isolated(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> u8 {
-    match isolated_ruleset(sys, path, outer_netns, read_namespace) {
+    match isolated_ruleset(sys, path, outer_netns, None, read_namespace) {
         Ok(json) => match stdout.write_all(json.as_bytes()) {
             Ok(()) => 0,
             Err(error) => {
@@ -266,6 +275,68 @@ pub fn run_isolated(
             1
         }
     }
+}
+
+/// Canon child for M2: also refuses the held gateway namespace before any nft call.
+///
+/// # Errors
+/// Returns an observation error before loading rules on failed namespace guards.
+pub fn isolated_netns_ruleset(
+    sys: &dyn System,
+    path: &Path,
+    outer_netns: &Path,
+    gateway_netns: &Path,
+    read_namespace: impl Fn(&Path) -> io::Result<PathBuf>,
+) -> Probe<String> {
+    isolated_ruleset(sys, path, outer_netns, Some(gateway_netns), read_namespace)
+}
+
+/// Compares the entire held gateway namespace with a kernel-canonicalized render.
+/// Any semantic difference is confirmed with a second fresh comparison.
+///
+/// # Errors
+/// Returns command, namespace, temporary-file and JSON observation errors.
+pub fn observe_netns_ruleset(
+    sys: &dyn System,
+    handle: &crate::netns::NetnsHandle,
+    rendered: &str,
+) -> Probe<scupper_core::verdict::v2::RulesetObs> {
+    let once = || {
+        let live = crate::cmd::run_cmd(
+            sys,
+            crate::system::ExecTarget::Netns(handle),
+            &crate::cmd::KernelCmd::Nft(crate::cmd::NftCmd::ListRulesetJson),
+            EXEC_TIMEOUT,
+        );
+        if live
+            == Err(ExecError::OutputTooLarge {
+                stream: Stream::Stdout,
+            })
+        {
+            return Ok((oversized_live_ruleset(), false));
+        }
+        let executable = fs::read_link("/proc/self/exe").map_err(|error| file_error(&error))?;
+        let outer = fs::read_link("/proc/self/ns/net").map_err(|error| file_error(&error))?;
+        let file = PrivateRuleset::create(rendered)?;
+        let mut args = unshare_argv(&executable, &outer, &file.path())?;
+        args.splice(
+            6..6,
+            [
+                "--gateway-netns".into(),
+                format!("net:[{}]", handle.identity().1),
+            ],
+        );
+        let want = command(sys, Program::Unshare, &args, CANON_TIMEOUT)
+            .and_then(|text| Ok(canonicalize(&text)?));
+        let live = command_result(live).and_then(|text| Ok(canonicalize(&text)?));
+        match (want, live) {
+            (Ok(want), Ok(live)) => compare_rulesets(&want, &live),
+            (Err(first), Err(second)) => Err(combined_error(first, &[second])),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        }
+    };
+    let (observation, confirm) = once()?;
+    Ok(if confirm { once()?.0 } else { observation }.into())
 }
 
 // The boolean requests confirmation of an ordinary ruleset difference.

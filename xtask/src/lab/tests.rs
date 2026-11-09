@@ -142,7 +142,7 @@ fn policy_for_every_case_has_exact_endpoints_and_positive_evidence() {
         );
         assert!(value["arp"].as_bool().unwrap() && value["ndp"].as_bool().unwrap());
     }
-    assert_eq!(names.len(), 6);
+    assert_eq!(names.len(), 7);
     Policy::from_toml(&evidence::policy(&markers, true).unwrap()).unwrap();
 }
 fn capture(packets: &[Vec<u8>]) -> Vec<u8> {
@@ -637,5 +637,21 @@ fn bridge_policy_requires_arp_and_both_ping_exchanges() {
             .map(|(_, frame)| frame.clone())
             .collect();
         assert!(!evidence::contained(&classify_frames(&remaining)));
+    }
+}
+
+/// nft rejects `...; } }` on one line (a closing brace after a chain needs a newline);
+/// every inline ruleset in the lab must be written with newlines.
+#[test]
+fn inline_nft_rulesets_have_no_single_line_closing_braces() {
+    for (name, source) in [
+        ("topology.rs", include_str!("topology.rs")),
+        ("probe_child.rs", include_str!("probe_child.rs")),
+        ("check_v2.rs", include_str!("check_v2.rs")),
+    ] {
+        assert!(
+            !source.contains("; } }"),
+            "{name} contains a one-line nft ruleset"
+        );
     }
 }

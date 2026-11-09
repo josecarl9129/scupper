@@ -38,6 +38,7 @@ impl System for LoggedSystem {
         timeout: Duration,
     ) -> Result<ExecOutput, ExecError> {
         self.log.borrow_mut().push(match program {
+            Program::Cat => "cat",
             Program::Wg => "wg",
             Program::Ip => "ip",
             Program::Nft => "nft",
