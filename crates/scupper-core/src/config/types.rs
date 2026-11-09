@@ -216,7 +216,7 @@ pub(super) fn url_ref<'de, D: Deserializer<'de>>(d: D) -> Result<SecretName, D::
 }
 
 /// A validated exit interface, constructible only during site validation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ExitIfname(IfName);
 impl ExitIfname {
     pub(super) fn validated(text: &str) -> Option<Self> {

@@ -12,7 +12,7 @@ pub enum Family {
 }
 
 /// The only permitted non-kernel route targets inside the namespace.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum RouteTarget {
     /// A validated exit interface; an uplink cannot inhabit this type.
     Exit(ExitIfname),

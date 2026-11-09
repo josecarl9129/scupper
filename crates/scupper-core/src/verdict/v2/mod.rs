@@ -430,6 +430,9 @@ fn client_fault(f: &Forwarding, cfg: &HealthConfigV2) -> Option<ClientFault> {
 #[allow(clippy::too_many_lines)] // Linear stage order makes the safety gates auditable.
 pub fn next(obs: &Observations, cfg: &HealthConfigV2, now: u64) -> Next {
     let mut warnings = Vec::new();
+    if let Some(Ok(f)) = &obs.forwarding {
+        warnings.extend(f.hardening.iter().cloned().map(Warning::HardeningSysctl));
+    }
     if let Some(Ok(f)) = &obs.forwarding
         && let Some(reason) = &f.quarantine
     {

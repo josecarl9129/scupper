@@ -285,6 +285,18 @@ pub trait System {
         vec!["/var/run/wireguard".into(), "/run/wireguard".into()]
     }
 
+    /// Reads the host namespace UDP socket inventory; never called after setns.
+    ///
+    /// # Errors
+    /// Returns procfs read errors, including a missing IPv6 socket inventory.
+    fn read_host_udp(&self, ipv6: bool) -> std::io::Result<String> {
+        std::fs::read_to_string(if ipv6 {
+            "/proc/net/udp6"
+        } else {
+            "/proc/net/udp"
+        })
+    }
+
     /// Whole Unix seconds, saturating at zero before the epoch.
     fn now_unix_secs(&self) -> u64;
 }

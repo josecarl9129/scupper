@@ -130,6 +130,18 @@ pub struct VersionStore {
     interrupted: Vec<Version>,
 }
 impl VersionStore {
+    /// Constructs a read-only view without creating directories, taking writer
+    /// locks or recovering files. [`Self::head`] and [`Self::read`] still verify
+    /// committed metadata, content digests and configuration before returning it.
+    #[must_use]
+    pub fn read_only(root: &Path, mirror_root: &Path) -> Self {
+        Self {
+            root: root.into(),
+            mirror_root: mirror_root.into(),
+            interrupted: Vec::new(),
+        }
+    }
+
     /// Opens a store with its mirror at `root/scupper.toml`.
     /// Use [`Self::open_with_mirror_root`] to select `/etc/scupper` in production.
     /// A global writer guard enables stale-temp cleanup and stale-mirror recovery.

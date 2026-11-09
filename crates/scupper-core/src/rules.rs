@@ -5,7 +5,7 @@ use std::{fmt, net::Ipv4Addr, str::FromStr};
 use thiserror::Error;
 
 /// A configuration failure that prevents rendering unsafe or ambiguous rules.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error, serde::Serialize)]
 pub enum ConfigError {
     /// Rejects unsafe syntax before a name can enter any interface field.
     #[error("config: {} {reason}", field.unwrap_or("interface name"))]
@@ -39,7 +39,7 @@ pub enum ConfigError {
 /// A Linux interface name restricted to syntax safe inside nftables quotes.
 ///
 /// The private representation prevents callers from bypassing validation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct IfName(String);
 
 impl IfName {

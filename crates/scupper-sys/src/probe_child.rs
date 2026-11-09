@@ -335,6 +335,13 @@ pub fn child_main(json: &str) -> Result<ProbeOutcome, String> {
 /// Injectable parent execution; implementations must bound output and kill the
 /// whole process group on timeout, including descendants holding output pipes.
 pub trait ProbeExec {
+    /// Permits synthetic caller-namespace descriptors for in-process fake tests.
+    /// Production builds have no such bypass and always verify foreign handles.
+    #[cfg(any(test, feature = "testing"))]
+    fn accepts_test_namespace(&self) -> bool {
+        false
+    }
+
     /// Executes `/proc/self/exe probe <request>` with the namespace as stdin.
     ///
     /// # Errors
@@ -371,9 +378,15 @@ pub fn run_probe(
     request: &ProbeRequest,
 ) -> Probe<ProbeOutcome> {
     let budget = request.budget()?;
-    handle
-        .verify(request.expected_netns)
-        .map_err(|error| ProbeError::setup(&error.to_string()))?;
+    #[cfg(any(test, feature = "testing"))]
+    let synthetic = exec.accepts_test_namespace() && handle.identity() == request.expected_netns;
+    #[cfg(not(any(test, feature = "testing")))]
+    let synthetic = false;
+    if !synthetic {
+        handle
+            .verify(request.expected_netns)
+            .map_err(|error| ProbeError::setup(&error.to_string()))?;
+    }
     let file = handle
         .try_clone_file()
         .map_err(|error| ProbeError::setup(&error.to_string()))?;

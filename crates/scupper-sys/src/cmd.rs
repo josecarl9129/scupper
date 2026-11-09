@@ -37,6 +37,8 @@ pub enum IpCmd {
         /// Tables to inspect.
         table: RouteTable,
     },
+    /// Default routes for one family.
+    DefaultShowJson(Family),
     /// Policy rules for one family.
     RuleShowJson {
         /// Address family.
@@ -204,9 +206,15 @@ impl IpCmd {
                     RouteTable::All => "all",
                 },
             ]),
+            Self::DefaultShowJson(family) => {
+                strings(&["-j", family_flag(*family), "route", "show", "default"])
+            }
             Self::RuleShowJson { family } => strings(&["-j", family_flag(*family), "rule", "show"]),
             Self::RouteGet { dst, from, iif } => {
                 let mut args = strings(&["route", "get", &dst.to_string()]);
+                if dst.is_ipv6() {
+                    args.insert(0, "-6".into());
+                }
                 if let Some(from) = from {
                     args.extend(["from".into(), from.to_string()]);
                 }

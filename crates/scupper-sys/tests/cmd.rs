@@ -57,7 +57,7 @@ fn every_command_argv() -> Result<(), Box<dyn Error>> {
                 iif: None,
             }),
             Program::Ip,
-            vec!["route", "get", "2001:db8::1"],
+            vec!["-6", "route", "get", "2001:db8::1"],
         ),
         (
             KernelCmd::Ip(IpCmd::RouteReplace(Family::V4, RouteTarget::Unreachable)),
@@ -407,7 +407,7 @@ fn every_mutation_requires_namespace_only_dispatch() -> Result<(), Box<dyn Error
 fn shared_userspace_sockets_block_every_namespace_wg_device_command() -> Result<(), Box<dyn Error>>
 {
     use scupper_sys::system::{ExecError, ExecOutput, testing::FakeSystem};
-    use std::os::unix::net::UnixListener;
+    use std::os::{fd::AsRawFd, unix::net::UnixListener};
     let root = std::env::temp_dir().join(format!("wg-sockets-{}", std::process::id()));
     std::fs::create_dir(&root)?;
     let handle = scupper_sys::netns::testing::handle()?;
@@ -418,7 +418,11 @@ fn shared_userspace_sockets_block_every_namespace_wg_device_command() -> Result<
     let sys = FakeSystem::new(0).with_wireguard_socket_dirs(dirs.to_vec());
     for dir in &dirs {
         let path = dir.join("wg0.sock");
-        let socket = UnixListener::bind(&path)?;
+        // Keep the actual socket under TMPDIR even in long worktree paths;
+        // sockaddr_un cannot hold the complete absolute path on those systems.
+        let directory = std::fs::File::open(dir)?;
+        let socket =
+            UnixListener::bind(format!("/proc/self/fd/{}/wg0.sock", directory.as_raw_fd()))?;
         for (wg, _) in wg_cases()? {
             if wg == WgCmd::Pubkey {
                 continue;

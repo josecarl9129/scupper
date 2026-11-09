@@ -116,6 +116,7 @@ fn passing() -> Observations {
         active: RouteTarget::Exit(config().exit_iface),
         handshakes: Some(Ok(BTreeMap::from([(exit_id(), current())]))),
         forwarding: Some(Ok(Forwarding {
+            hardening: vec![],
             v4: 1,
             v6: 0,
             quarantine: None,

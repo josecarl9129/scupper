@@ -142,7 +142,7 @@ fn policy_for_every_case_has_exact_endpoints_and_positive_evidence() {
         );
         assert!(value["arp"].as_bool().unwrap() && value["ndp"].as_bool().unwrap());
     }
-    assert_eq!(names.len(), 6);
+    assert_eq!(names.len(), 7);
     Policy::from_toml(&evidence::policy(&markers, true).unwrap()).unwrap();
 }
 fn capture(packets: &[Vec<u8>]) -> Vec<u8> {

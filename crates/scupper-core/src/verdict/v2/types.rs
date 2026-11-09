@@ -38,7 +38,7 @@ pub enum Selection {
 }
 
 /// Full filesystem identity from a namespace handle or boot record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct NetnsIdentity {
     /// Filesystem device number (`st_dev`).
     pub device: u64,
@@ -119,7 +119,7 @@ impl From<super::super::v1::RulesetObs> for RulesetObs {
 }
 
 /// A namespace default route, including absence and nonstandard route types.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum DefaultRouteObs {
     /// Default through a named link; raw names preserve foreign devices.
     Dev(String),
@@ -171,7 +171,7 @@ pub struct TopologyObs {
 }
 
 /// Reason retained by the persisted quarantine latch.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum RepairKind {
     /// Containment drift exhausted its repair budget.
     SafetyDrift,
@@ -182,6 +182,8 @@ pub enum RepairKind {
 pub struct Forwarding {
     /// Exact IPv4 forwarding sysctl value; only 1 passes.
     pub v4: i64,
+    /// Hardening keys whose observed values differ from desired values.
+    pub hardening: Vec<String>,
     /// IPv6 forwarding value; not required in M2 (no IPv6 clients).
     pub v6: i64,
     /// Persisted quarantine latch, if set.
@@ -206,7 +208,7 @@ pub struct RouteObs {
 }
 
 /// Client listener disagreement; client reachability beyond the host is unproven.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum ClientFault {
     /// Client-facing link is administratively down.
     LinkDown,
@@ -235,7 +237,7 @@ pub enum Supervisor {
 }
 
 /// Why a verified data path lacks required supervision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum SupervisorFault {
     /// Supervisor did not answer.
     Dead,
@@ -291,7 +293,7 @@ impl Default for Observations {
 }
 
 /// Nonempty findings; an unprotected verdict always explains at least one fact.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct NonEmpty<T>(Vec<T>);
 impl<T> NonEmpty<T> {
     /// Starts with one required finding.
@@ -318,7 +320,7 @@ impl<T> NonEmpty<T> {
 }
 
 /// Observed containment violations, all collected before availability decisions.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum Violation {
     /// Owned namespace does not exist.
     NetnsMissing,
@@ -353,7 +355,7 @@ pub enum Violation {
 }
 
 /// Availability failures after containment passed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum Degraded {
     /// Reserved for M2k multi-exit failover; unreachable in this engine.
     FailoverStuck {
@@ -393,7 +395,7 @@ pub enum Degraded {
 }
 
 /// Contained but deliberately or necessarily unavailable.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum FailClosed {
     /// Kernel closure verified for administrative disconnect.
     AdminDisconnected,
@@ -414,7 +416,7 @@ pub enum FailClosed {
 }
 
 /// Caveats; M2 emits clock skew, stale clients and optional daemon death.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum Warning {
     /// Reserved for standby checks.
     StandbyUnhealthy(ExitId),
@@ -422,7 +424,7 @@ pub enum Warning {
     ClockSkew,
     /// Reserved for installer hardening observations.
     KeyFileMode(PathBuf),
-    /// Reserved for hardening collection.
+    /// Namespace hardening key differs from its desired value.
     HardeningSysctl(String),
     /// Reserved for host forwarding diagnostics.
     HostForwardingOn,
@@ -439,7 +441,7 @@ pub enum Warning {
 }
 
 /// Observation stage, in execution order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum Stage {
     /// Namespace containment inventory.
     Topology,
@@ -462,7 +464,7 @@ pub enum Stage {
 }
 
 /// Required observation failed; this can never assert a safe outcome.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, serde::Serialize)]
 #[error("{stage:?} observation failed: {source}")]
 pub struct CheckError {
     /// Failed stage.
@@ -479,7 +481,7 @@ impl CheckError {
 }
 
 /// Namespace health outcome. Code 5 requires the same data-path proof as 0.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum Verdict {
     /// All applicable M2 stages verified.
     Protected {
@@ -520,6 +522,7 @@ impl Verdict {
 
 /// Completed health report with caller-supplied time and applied config version.
 /// Each stage is verified at its observation time; this is not an atomic snapshot.
+/// JSON serialization includes the stable top-level `schema: 1` discriminator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Report {
     /// Completed verdict.
@@ -555,4 +558,31 @@ pub enum Next {
     Supervisor,
     /// Completed report or observation failure.
     Done(Result<Report, CheckError>),
+}
+
+impl serde::Serialize for Report {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut report = serializer.serialize_struct("Report", 5)?;
+        report.serialize_field("schema", &1_u32)?;
+        report.serialize_field("verdict", &self.verdict)?;
+        report.serialize_field("warnings", &self.warnings)?;
+        report.serialize_field("at", &self.at)?;
+        report.serialize_field("config_version", &self.config_version)?;
+        report.end()
+    }
+}
+
+impl std::fmt::Display for Verdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Protected { exit, exit_ip } => write!(f, "protected: {exit} ({exit_ip})"),
+            Self::Unprotected(violations) => write!(f, "UNPROTECTED: {:?}", violations.as_slice()),
+            Self::Degraded(reason) => write!(f, "degraded: {reason:?}"),
+            Self::FailClosed(reason) => write!(f, "fail closed: {reason:?}"),
+            Self::Unsupervised { exit, exit_ip, why } => {
+                write!(f, "unsupervised: {exit} ({exit_ip}): {why:?}")
+            }
+        }
+    }
 }

@@ -25,6 +25,9 @@ use crate::{
 #[derive(Parser)]
 #[command(name = "scupper", version, about = "Fail-closed VPN gateway")]
 struct Cli {
+    /// Render a schema-1 machine-readable report.
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -43,6 +46,9 @@ enum Command {
         /// Namespace inspected by the parent, which must never be modified.
         #[arg(long)]
         outer_netns: PathBuf,
+        /// Held gateway identity, also forbidden as a canonicalization target.
+        #[arg(long)]
+        gateway_netns: Option<PathBuf>,
         /// Rendered ruleset to load in the isolated namespace.
         path: std::path::PathBuf,
     },
@@ -79,6 +85,19 @@ pub trait NamespaceReader {
     /// # Errors
     /// Returns the symlink read error.
     fn read_namespace(&self, path: &Path) -> io::Result<PathBuf>;
+
+    /// Opens the owned namespace once; all later commands borrow this handle.
+    ///
+    /// # Errors
+    /// Returns invalid, host or inaccessible namespace errors; absence is None.
+    fn open_gateway(&self) -> Result<Option<scupper_sys::netns::NetnsHandle>, String> {
+        use scupper_sys::netns::{NetnsError, NetnsHandle};
+        match NetnsHandle::open("/run/netns/scupper") {
+            Ok(handle) => Ok(Some(handle)),
+            Err(NetnsError::Io(rustix::io::Errno::NOENT)) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
 }
 
 /// Reads namespace identities from procfs.
@@ -190,8 +209,14 @@ impl ExitProbe for UnimplementedExitProbe {
     }
 }
 
-/// Dependencies shared by all commands; configuration remains the fixed v1 default.
+/// Dependencies shared by commands; M2 checks read the validated immutable head.
 pub struct Dependencies<'a> {
+    /// Persistent M2 config, boot and state root.
+    pub state_root: &'a Path,
+    /// Gateway-id, mirror and secrets root; check never opens private keys.
+    pub config_root: &'a Path,
+    /// Namespace probe child execution.
+    pub probe_exec: &'a dyn scupper_sys::probe_child::ProbeExec,
     /// Command execution and clock.
     pub system: &'a dyn System,
     /// Network namespace identities for the canon safety guard.
@@ -220,6 +245,9 @@ where
     run_with(
         args,
         &Dependencies {
+            state_root: Path::new("/var/lib/scupper"),
+            config_root: Path::new("/etc/scupper"),
+            probe_exec: &RealSystem::default(),
             system: &RealSystem::default(),
             namespaces: &ProcNamespaces,
             fs: &RealFs,
@@ -261,9 +289,16 @@ where
             return 1;
         }
     };
-    match dispatch(cli.command, deps, stdout, stderr) {
+    match dispatch(cli.command, cli.json, deps, stdout, stderr) {
         Ok(code) => code,
         Err(error) => {
+            if cli.json {
+                let _ = serde_json::to_writer(
+                    &mut *stdout,
+                    &serde_json::json!({"schema": 1, "error": error}),
+                );
+                let _ = writeln!(stdout);
+            }
             let _ = writeln!(stderr, "scupper: {error}");
             1
         }
@@ -309,8 +344,10 @@ fn disconnect(
     }
 }
 
+#[allow(clippy::too_many_lines)] // Keep command dispatch and M1 behavior together.
 fn dispatch(
     command: Command,
+    json: bool,
     deps: &Dependencies<'_>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
@@ -323,7 +360,24 @@ fn dispatch(
             writeln!(stdout).map_err(output_error)?;
             Ok(0)
         }
-        Command::Canon { outer_netns, path } => Ok(canon::run_isolated(
+        Command::Canon {
+            outer_netns,
+            gateway_netns: Some(gateway),
+            path,
+        } => {
+            let text =
+                canon::isolated_netns_ruleset(deps.system, &path, &outer_netns, &gateway, |path| {
+                    deps.namespaces.read_namespace(path)
+                })
+                .map_err(|error| error.to_string())?;
+            write!(stdout, "{text}").map_err(output_error)?;
+            Ok(0)
+        }
+        Command::Canon {
+            outer_netns,
+            gateway_netns: None,
+            path,
+        } => Ok(canon::run_isolated(
             deps.system,
             &path,
             &outer_netns,
@@ -332,6 +386,13 @@ fn dispatch(
             stderr,
         )),
         Command::Status => {
+            match m2_config(deps) {
+                Ok(Some(config)) => return m2_check(deps, &config, true, json, stdout, stderr),
+                Err(error) => {
+                    return status_error(stdout, json, &error);
+                }
+                Ok(None) => {}
+            }
             // Status is informational, including when observations fail.
             let _ = writeln!(
                 stdout,
@@ -341,6 +402,9 @@ fn dispatch(
             Ok(0)
         }
         Command::Check => {
+            if let Some(config) = m2_config(deps)? {
+                return m2_check(deps, &config, false, json, stdout, stderr);
+            }
             let report = check::run_check(deps.system, deps.topology, deps.exit_probe, &cfg)
                 .map_err(|error| error.to_string())?;
             writeln!(stdout, "{}", report.verdict).map_err(output_error)?;
@@ -393,6 +457,154 @@ fn dispatch(
                 writeln!(stdout, "ruleset written and loaded").map_err(output_error)?;
             }
             Ok(0)
+        }
+    }
+}
+
+struct AppliedConfig {
+    site: scupper_core::config::ValidatedSite,
+    gateway: scupper_core::config::GatewayId,
+    stamp: scupper_core::render::VersionStamp,
+}
+
+fn m2_config(deps: &Dependencies<'_>) -> Result<Option<AppliedConfig>, String> {
+    let store = scupper_sys::store::VersionStore::read_only(deps.state_root, deps.config_root);
+    let Some(version) = store.head().map_err(|error| error.to_string())? else {
+        return Ok(None);
+    };
+    let (text, meta) = store.read(version).map_err(|error| error.to_string())?;
+    let site = scupper_core::config::parse_site(&text).map_err(|error| error.to_string())?;
+    let site = scupper_core::config::validate(site).map_err(|_| "invalid applied site")?;
+    let gateway = scupper_core::config::GatewayId(
+        RealFs
+            .read(&deps.config_root.join("gateway-id"))
+            .map_err(|error| format!("read gateway-id: {error}"))?
+            .trim()
+            .into(),
+    );
+    if site.gateway(&gateway).is_none() {
+        return Err("gateway-id is absent from applied site".into());
+    }
+    let mut sha256 = [0; 32];
+    for (index, byte) in sha256.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&meta.sha256[index * 2..index * 2 + 2], 16)
+            .map_err(|_| "invalid applied digest")?;
+    }
+    Ok(Some(AppliedConfig {
+        site,
+        gateway,
+        stamp: scupper_core::render::VersionStamp { version, sha256 },
+    }))
+}
+
+fn status_error(stdout: &mut dyn Write, json: bool, error: &str) -> Result<u8, String> {
+    if json {
+        serde_json::to_writer(
+            &mut *stdout,
+            &serde_json::json!({"schema": 1, "error": error}),
+        )
+        .map_err(|error| error.to_string())?;
+        writeln!(stdout).map_err(output_error)?;
+    } else {
+        writeln!(stdout, "M2 observations failed: {error}").map_err(output_error)?;
+    }
+    Ok(0)
+}
+
+fn status_json(
+    stdout: &mut dyn Write,
+    result: &Result<scupper_core::verdict::v2::Report, scupper_core::verdict::v2::CheckError>,
+    obs: &scupper_core::verdict::v2::Observations,
+) -> Result<(), String> {
+    // Status retains a diagnostic representation of every stage, including
+    // explicitly unrequested stages. Check's machine interface is the Report.
+    let value = serde_json::json!({"schema": 1, "report": result.as_ref().ok(),
+    "error": result.as_ref().err(), "observations": {
+        "topology": format!("{:?}", obs.topology),
+        "selection": format!("{:?}", obs.selection),
+        "active": format!("{:?}", obs.active),
+        "defaults": format!("{:?}", obs.defaults),
+        "handshakes": format!("{:?}", obs.handshakes),
+        "forwarding": format!("{:?}", obs.forwarding),
+        "routes": format!("{:?}", obs.routes),
+        "exit_probe": format!("{:?}", obs.exit_probe),
+        "standby_probe": format!("{:?}", obs.standby_probe),
+        "dns": format!("{:?}", obs.dns),
+        "supervisor": format!("{:?}", obs.supervisor),
+    }});
+    serde_json::to_writer(&mut *stdout, &value).map_err(|error| error.to_string())?;
+    writeln!(stdout).map_err(output_error)
+}
+
+fn m2_check(
+    deps: &Dependencies<'_>,
+    config: &AppliedConfig,
+    status: bool,
+    json: bool,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<u8, String> {
+    let handle = match deps.namespaces.open_gateway() {
+        Ok(handle) => handle,
+        Err(error) if status => {
+            return status_error(stdout, json, &error);
+        }
+        Err(error) => return Err(error),
+    };
+    let (result, observations) = scupper_sys::check_v2::run_with_observations(
+        &scupper_sys::check_v2::Dependencies {
+            system: deps.system,
+            probe_exec: deps.probe_exec,
+            handle: handle.as_ref(),
+            state_root: deps.state_root,
+        },
+        &scupper_sys::check_v2::Config {
+            site: &config.site,
+            gateway: &config.gateway,
+            stamp: config.stamp,
+        },
+    );
+    if status {
+        if json {
+            status_json(stdout, &result, &observations)?;
+            return Ok(0);
+        }
+        writeln!(
+            stdout,
+            "M2 observations (None = not requested):\n{observations:#?}"
+        )
+        .map_err(output_error)?;
+        match result {
+            Ok(report) => writeln!(stdout, "{}", report.verdict).map_err(output_error)?,
+            Err(error) => writeln!(stdout, "{error}").map_err(output_error)?,
+        }
+        return Ok(0);
+    }
+    match result {
+        Ok(report) => {
+            if json {
+                serde_json::to_writer(&mut *stdout, &report).map_err(|error| error.to_string())?;
+                writeln!(stdout).map_err(output_error)?;
+            } else {
+                writeln!(stdout, "{}", report.verdict).map_err(output_error)?;
+                for warning in &report.warnings {
+                    writeln!(stderr, "warning: {warning:?}").map_err(output_error)?;
+                }
+            }
+            Ok(report.verdict.exit_code())
+        }
+        Err(error) => {
+            if json {
+                serde_json::to_writer(
+                    &mut *stdout,
+                    &serde_json::json!({"schema": 1, "error": error}),
+                )
+                .map_err(|error| error.to_string())?;
+                writeln!(stdout).map_err(output_error)?;
+                Ok(1)
+            } else {
+                Err(error.to_string())
+            }
         }
     }
 }

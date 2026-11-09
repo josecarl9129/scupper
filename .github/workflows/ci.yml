@@ -54,7 +54,7 @@ jobs:
         run: timeout 600 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Test
-        run: timeout 900 cargo test --workspace --all-features --locked
+        run: timeout 600 cargo test --workspace --all-features --locked
 
       - name: Check nftables goldens without tunnel links
         run: |
@@ -206,12 +206,12 @@ jobs:
       - name: Install leak lab tools
         run: |
           sudo timeout 300 apt-get update
-          sudo timeout 300 apt-get install -y wireguard-tools nftables iproute2 tcpdump dnsmasq-base util-linux iputils-ping conntrack
+          sudo timeout 300 apt-get install -y wireguard-tools nftables iproute2 tcpdump dnsmasq-base util-linux iputils-ping conntrack slirp4netns
 
       - name: Build reference lab
         run: timeout 600 cargo build -p xtask --release --locked
 
-      - name: Build privilege-dropping probe child
+      - name: Build check and probe CLI
         run: timeout 600 cargo build -p scupper --locked
 
       - name: Run reference namespace lab

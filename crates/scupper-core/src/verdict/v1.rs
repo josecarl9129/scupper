@@ -27,7 +27,7 @@ pub type Probe<T> = Result<T, ProbeError>;
 /// device) use [`ProbeError::Setup`] and produce a [`CheckError`] at
 /// [`Stage::ExitProbe`] (code 1). Every other error at that stage is a path
 /// failure (code 3); errors at earlier stages are always observation errors.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error, serde::Serialize)]
 pub enum ProbeError {
     /// The observation did not complete within its deadline.
     #[error("probe timed out")]

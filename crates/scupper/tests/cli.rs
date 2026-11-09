@@ -224,6 +224,9 @@ impl Harness {
         let code = cli::run_with(
             std::iter::once("scupper").chain(args.iter().copied()),
             &Dependencies {
+                state_root: Path::new("target/m1-without-head"),
+                config_root: Path::new("target/m1-without-head"),
+                probe_exec: &scupper::system::RealSystem::default(),
                 system: self,
                 namespaces: self,
                 fs: &self.fs,
