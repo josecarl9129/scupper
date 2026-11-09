@@ -34,7 +34,8 @@ fn fail<T>(message: impl Into<String>) -> Result<T> {
     Err(message.into().into())
 }
 
-const NAMESPACES: [&str; 7] = [
+const NAMESPACES: [&str; 8] = [
+    "rulecap",
     "wan",
     "gwhost",
     "scupper",
@@ -127,6 +128,7 @@ fn run_inner(
         lab.preflight()?;
         lab.prepare()?;
         lab.build()?;
+        Lab::verify_handle_execution()?;
         lab.service_check(&mut Vec::new())?;
         if let Some(dir) = capture_fixtures {
             lab.fixtures(dir)?;

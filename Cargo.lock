@@ -432,6 +432,7 @@ name = "scupper-sys"
 version = "0.1.0"
 dependencies = [
  "dns-lookup",
+ "ipnet",
  "rustix",
  "rustls",
  "scupper-core",
@@ -765,6 +766,7 @@ dependencies = [
  "proptest",
  "rustix",
  "scupper-core",
+ "scupper-sys",
  "serde",
  "serde_json",
  "sha2",

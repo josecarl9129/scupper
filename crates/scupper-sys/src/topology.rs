@@ -140,7 +140,12 @@ fn exit_checks(
                     // gone, discard its errors and skip its remaining checks.
                     if collect(
                         &mut exit_errors,
-                        query(sys, Program::Ip, &["-j", "link", "show"], parse::links),
+                        query(
+                            sys,
+                            Program::Ip,
+                            &["-d", "-j", "link", "show"],
+                            parse::links,
+                        ),
                     )
                     .is_some_and(|links| {
                         !links
@@ -207,7 +212,12 @@ impl TopologySource for TopologyWithReader<'_> {
         };
         let links = collect(
             &mut errors,
-            query(sys, Program::Ip, &["-j", "link", "show"], parse::links),
+            query(
+                sys,
+                Program::Ip,
+                &["-d", "-j", "link", "show"],
+                parse::links,
+            ),
         );
         if let Some(links) = &links {
             for iface in [&cfg.client_iface, &cfg.uplink_iface] {
@@ -285,5 +295,38 @@ impl TopologySource for TopologyWithReader<'_> {
         } else {
             Err(combined_error(errors.remove(0), &errors))
         }
+    }
+}
+
+/// Failure to inspect host UDP bindings. An unreadable table is never absence.
+#[derive(Debug, thiserror::Error)]
+pub enum UdpBoundError {
+    /// A procfs read failed.
+    #[error("cannot read host UDP socket table: {0}")]
+    Io(#[from] std::io::Error),
+    /// A procfs table is malformed.
+    #[error(transparent)]
+    Parse(#[from] scupper_core::parse::ParseError),
+}
+
+/// Whether a UDP port is bound in the caller's (host) namespace, in either family.
+/// This performs no namespace switch; call it from the host process.
+///
+/// # Errors
+/// Returns read/parse failures rather than claiming the port is unbound.
+pub fn host_udp_bound(port: u16) -> Result<bool, UdpBoundError> {
+    use scupper_core::parse::{parse_proc_net_udp, parse_proc_net_udp6, udp_port_bound};
+    let v4 = parse_proc_net_udp(&std::fs::read_to_string("/proc/net/udp")?)?;
+    let v6 = parse_proc_net_udp6(&std::fs::read_to_string("/proc/net/udp6")?)?;
+    Ok(udp_port_bound(&v4, port) || udp_port_bound(&v6, port))
+}
+
+#[cfg(test)]
+mod udp_binding_tests {
+    #[test]
+    fn host_udp_binding_is_visible() -> Result<(), Box<dyn std::error::Error>> {
+        let socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+        assert!(super::host_udp_bound(socket.local_addr()?.port())?);
+        Ok(())
     }
 }

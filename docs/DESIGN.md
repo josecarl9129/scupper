@@ -218,7 +218,7 @@ Phases: **S** steady state, **F** failover, **A** apply, **B** boot,
 **I6 Secrets stay local**
 - Config holds `*_ref` names; keys are files `/etc/scupper/secrets/<kind>/<ref>`,
   root 0600, opened without following symlinks (§8). `wg set … private-key
-  <path>` passes keys by path, never argv or env. The exec layer has an
+  /dev/stdin` passes keys via stdin (`/dev/stdin`), never argv or env. The exec layer has an
   explicit allow-list of `wg` invocations (`show <if>` with
   `latest-handshakes`, `endpoints`, `allowed-ips`, `transfer`, `peers`,
   `listen-port`, `public-key`, `persistent-keepalive`; `set` with key files

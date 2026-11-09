@@ -44,6 +44,9 @@ impl System for LoggedSystem {
             Program::Tc => "tc",
             Program::Systemctl => "systemctl",
             Program::Unshare => "unshare",
+            Program::Nsenter => "nsenter",
+            Program::Sysctl => "sysctl",
+            Program::Conntrack => "conntrack",
         });
         self.fake.run(program, args, timeout)
     }
