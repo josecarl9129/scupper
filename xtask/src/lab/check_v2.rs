@@ -175,6 +175,23 @@ impl Lab {
         });
         evidence::save_results(&self.artifacts, &self.rows)?;
         if code != want && skip.is_none() {
+            // Diagnostic only: the namespace route tables at the time of the mismatch.
+            let mut dump = Vec::new();
+            for args in [
+                &["-d", "-j", "route", "show", "table", "all"][..],
+                &["-6", "-d", "-j", "route", "show", "table", "all"][..],
+                &["-j", "route", "show", "default"][..],
+                &["-6", "-j", "route", "show", "default"][..],
+            ] {
+                let out = self
+                    .cmd("scupper", "ip", args)
+                    .unwrap_or_else(|e| e.to_string());
+                dump.push(format!("== ip {}\n{out}", args.join(" ")));
+            }
+            fs::write(
+                self.artifacts.join(format!("check-v2-{name}.routes.txt")),
+                dump.join("\n"),
+            )?;
             return fail(format!(
                 "check-v2 {name}: wanted {want}, got {code}: {report}"
             ));
