@@ -114,6 +114,12 @@ pub trait StateStore {
     /// # Errors
     /// Returns read failure or timeout.
     fn read_until(&self, deadline: Instant) -> io::Result<State>;
+    /// Optional cheap applied-version snapshot, bounded independently of phase B.
+    /// Stores without a dedicated snapshot path defer their reads until after
+    /// containment; they must not implement this using an unbounded read.
+    fn applied_snapshot_until(&self, _deadline: Instant) -> Option<State> {
+        None
+    }
     /// Discard reads started before the current writer-lock acquisition.
     fn begin_tick(&self) {}
     /// Durably replace state under the global writer capability.
@@ -136,6 +142,12 @@ impl StateStore for StateFile {
         match Self::read_until(self, deadline)? {
             StateRead::Present(state) => Ok(state),
             StateRead::Missing => Err(io::Error::new(io::ErrorKind::NotFound, "missing state")),
+        }
+    }
+    fn applied_snapshot_until(&self, deadline: Instant) -> Option<State> {
+        match Self::read_until(self, deadline).ok()? {
+            StateRead::Present(state) => Some(state),
+            StateRead::Missing => None,
         }
     }
     fn write(&self, guard: &WriterGuard, state: &State) -> io::Result<()> {
@@ -181,6 +193,8 @@ impl Config {
 pub enum Escalation {
     /// Stop edge, call rebuild, then restart edge.
     RebuildRequired,
+    /// Re-open applied configuration before observing against an obsolete render.
+    ReinitializeRequired,
     /// Restart edge in the held namespace.
     RestartEdge,
     /// A host/namespace interface collision needs operator attention.
@@ -405,6 +419,10 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                     self.latch.clone_from(&observation.model.latch);
                 }
                 if state.applied_version != self.persisted.applied_version {
+                    // Reinitialization cannot discard a memory-only latch.
+                    if self.latch.is_none() || state.quarantine.is_some() {
+                        report.escalations.push(Escalation::ReinitializeRequired);
+                    }
                     report.complete = false;
                     observation.complete = false;
                     observation.model.ruleset = planner::Known::Unknown;
@@ -437,6 +455,48 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
     fn tick_locked(&mut self, guard: &WriterGuard, report: &mut TickReport) {
         self.store.begin_tick();
         self.kernel.begin_tick();
+        // Read the applied identity before comparing against this render. A
+        // concurrent writer holds the same lock, so it cannot race this check.
+        if let Some(mut latest) = self
+            .store
+            .applied_snapshot_until(Instant::now() + Duration::from_millis(25))
+            && latest.applied_version != self.persisted.applied_version
+        {
+            report.steps.push(Step::ForwardingOff);
+            let closed = self.execute_step(&Step::ForwardingOff, guard, report);
+            self.emit(
+                EventKind::Repair {
+                    kind: StepKind::ForwardingOff,
+                    class: scupper_proto::RepairClass::Tighten,
+                    result: if closed.is_ok() {
+                        Outcome::Succeeded
+                    } else {
+                        Outcome::Failed
+                    },
+                },
+                Actor::Daemon,
+                report,
+            );
+            if let Err(error) = closed {
+                report.complete = false;
+                report.failures.push((Step::ForwardingOff, error));
+                return;
+            }
+            // Never lose a memory-only quarantine while replacing the machine.
+            if let Some(latch) = &self.latch {
+                latest.quarantine = Some(Quarantine {
+                    reason: latch.reason.clone(),
+                    object: latch.object.clone(),
+                    since_unix: (self.clock)().1,
+                });
+                if self.store.write(guard, &latest).is_err() {
+                    self.persistence_failure(report);
+                    return;
+                }
+            }
+            report.escalations.push(Escalation::ReinitializeRequired);
+            return;
+        }
         self.tick_inner(guard, report);
         if self
             .deadline
@@ -445,8 +505,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             report.complete = false;
         }
         if self.kernel.checkpoint_owned(guard).is_err() {
-            report.complete = false;
-            self.persistence_failure(report);
+            self.boot_write_failure(report);
         }
         self.report_verdict(report);
     }
@@ -706,6 +765,15 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 report.failures.push((step, error));
             }
         }
+    }
+    fn boot_write_failure(&self, report: &mut TickReport) {
+        self.emit(
+            EventKind::PersistenceFailed {
+                reason: Reason::BootWrite,
+            },
+            Actor::Daemon,
+            report,
+        );
     }
     fn persistence_failure(&mut self, report: &mut TickReport) {
         self.budgets.persistence_failed = true;
@@ -1048,8 +1116,9 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                     ..
                 }
             )
+            && self.kernel.checkpoint_owned(guard).is_err()
         {
-            self.kernel.checkpoint_owned(guard)?;
+            self.boot_write_failure(report);
         }
         if result.is_ok() {
             match step {

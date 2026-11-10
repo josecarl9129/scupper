@@ -487,6 +487,9 @@ pub fn classify(capture: &[u8], policy: &Policy, limit: usize) -> Result<Report,
             decode::link(frame.unwrap_or_default(), capture.linktype)
         };
         match linked {
+            Ok(Link::Other) => {
+                packet.class = Class::Violation(Reason::UnparsableLinkLayer);
+            }
             Ok(Link::Arp(data)) => {
                 let wire_data = &record.data[record.data.len() - capture.fcs_len - data.len()..];
                 packet.class = match decode::arp(data) {
@@ -665,4 +668,60 @@ pub(crate) fn observe(bytes: &[u8]) -> Result<Vec<Observed>, Error> {
         }
     }
     Ok(observed)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod observation_tests {
+    use super::*;
+    fn capture(kind: u32, frame: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0xd4, 0xc3, 0xb2, 0xa1, 2, 0, 4, 0];
+        bytes.extend([0; 8]);
+        bytes.extend(65535_u32.to_le_bytes());
+        bytes.extend(kind.to_le_bytes());
+        bytes.extend(7_u32.to_le_bytes());
+        bytes.extend(123_u32.to_le_bytes());
+        let len = u32::try_from(frame.len()).unwrap();
+        bytes.extend(len.to_le_bytes());
+        bytes.extend(len.to_le_bytes());
+        bytes.extend(frame);
+        bytes
+    }
+    #[test]
+    fn raw_ethernet_and_stacked_vlan_observations_have_identical_packets() {
+        let mut ip = vec![
+            0x45, 0, 0, 32, 0, 0, 0, 0, 64, 17, 0, 0, 192, 0, 2, 1, 192, 0, 2, 2,
+        ];
+        ip.extend([0, 1, 0, 2, 0, 12, 0, 0]);
+        ip.extend(b"test");
+        for tags in [vec![], vec![0x8100_u16], vec![0x88a8, 0x8100]] {
+            let mut frame = vec![0; 12];
+            for tag in tags {
+                frame.extend(tag.to_be_bytes());
+                frame.extend([0, 1]);
+            }
+            frame.extend(0x0800_u16.to_be_bytes());
+            frame.extend(&ip);
+            let raw = observe(&capture(101, &ip)).unwrap();
+            let ethernet = observe(&capture(1, &frame)).unwrap();
+            assert_eq!(ethernet.len(), 1);
+            assert_eq!(ethernet[0].source, raw[0].source);
+            assert_eq!(ethernet[0].destination, raw[0].destination);
+            assert_eq!(ethernet[0].payload, raw[0].payload);
+            assert_eq!(ethernet[0].timestamp.seconds, raw[0].timestamp.seconds);
+            assert_eq!(
+                ethernet[0].timestamp.nanoseconds,
+                raw[0].timestamp.nanoseconds
+            );
+        }
+    }
+    #[test]
+    fn ethernet_control_frames_are_not_ip_and_truncated_headers_fail() {
+        let mut lldp = vec![0; 12];
+        lldp.extend(0x88cc_u16.to_be_bytes());
+        assert!(observe(&capture(1, &lldp)).unwrap().is_empty());
+        assert!(observe(&capture(1, &[0; 13])).is_err());
+        lldp[12..].copy_from_slice(&0x8100_u16.to_be_bytes());
+        assert!(observe(&capture(1, &lldp)).is_err());
+    }
 }

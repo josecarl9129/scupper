@@ -522,9 +522,8 @@ impl LogHandle {
     }
 
     /// Replay a memory-only ring into a newly opened disk log with fresh IDs.
-    /// The leading Recovery gap identifies the local sequence interval being
-    /// replaced. The following records retain order, kind, actor and version;
-    /// timestamps and identities are assigned by the recovered disk writer.
+    /// The leading `MemoryReplay` note identifies only the memory-local interval.
+    /// Records retain their original timestamps, order, kind, actor and version.
     ///
     /// # Errors
     /// Returns stopped/sequence exhaustion errors. Call only from the tick owner
@@ -534,26 +533,38 @@ impl LogHandle {
         if self.shared.persistent || !disk.shared.persistent {
             return Err(EmitError::Stopped);
         }
-        {
-            let mut target = disk.shared.lock();
-            target.seq = target.seq.max(queue.seq);
-        }
-        disk.emit(
-            EventKind::EventGap {
-                reason: Reason::Recovery,
-                dropped: queue.seq,
-                first_seq: u64::from(queue.seq > 0),
-                last_seq: queue.seq,
+        let mut target = disk.shared.lock();
+        // Local IDs have their own space and never describe a gap on disk.
+        target.seq = target.seq.max(queue.seq);
+        let replayed = queue
+            .events
+            .iter()
+            .filter(|e| !matches!(e.kind, EventKind::EventGap { .. }))
+            .count() as u64;
+        let note = disk.shared.event(
+            &mut target,
+            EventKind::MemoryReplay {
+                dropped: queue.dropped,
+                local_first: u64::from(queue.seq > 0),
+                local_last: queue.seq,
+                replayed,
             },
             Actor::Daemon,
             None,
         )?;
+        disk.shared.enqueue(&mut target, note);
         for event in &queue.events {
-            disk.emit(
+            if matches!(event.kind, EventKind::EventGap { .. }) {
+                continue;
+            }
+            let mut replay = disk.shared.event(
+                &mut target,
                 event.kind.clone(),
                 event.actor.clone(),
                 event.config_version,
             )?;
+            replay.at = event.at;
+            disk.shared.enqueue(&mut target, replay);
         }
         Ok(())
     }

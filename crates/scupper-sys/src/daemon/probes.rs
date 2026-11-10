@@ -8,6 +8,7 @@ use scupper_core::config::ExitId;
 use std::{
     collections::BTreeMap,
     fs::File,
+    net::IpAddr,
     path::PathBuf,
     sync::{
         Arc,
@@ -38,14 +39,17 @@ impl ProbeExec for ProbeCommand {
 /// Completed round, delivered atomically to its owner.
 #[derive(Debug)]
 pub struct Round {
-    /// Path results only; Setup and unobserved outcomes are omitted.
+    /// Path results, including failed child setup.
     pub paths: BTreeMap<ExitId, bool>,
     /// Exit-IP observations completed successfully.
     pub exit_ok: Option<bool>,
+    /// Number of child setup failures in this round.
+    pub setup_failures: u64,
 }
 /// Monotonic scheduler. Standby work is deliberately absent in M2.
 pub struct Probes {
     binary: PathBuf,
+    uplink: Vec<IpAddr>,
     path_at: Instant,
     exit_at: Instant,
     path: Option<Receiver<Round>>,
@@ -57,10 +61,38 @@ impl Probes {
     pub fn new(binary: PathBuf, now: Instant) -> Self {
         Self {
             binary,
+            uplink: Vec::new(),
             path_at: now,
             exit_at: now,
             path: None,
             exit: None,
+        }
+    }
+    /// Addresses which an exit-IP response must never report.
+    #[must_use]
+    pub fn with_uplink(mut self, uplink: Vec<IpAddr>) -> Self {
+        self.uplink = uplink;
+        self
+    }
+    fn launch(
+        &mut self,
+        held: &Arc<NetnsHandle>,
+        exit: &ExitId,
+        request: &ProbeRequest,
+    ) -> Receiver<Round> {
+        match spawn(
+            self.binary.clone(),
+            held.clone(),
+            vec![(exit.clone(), request.clone())],
+            self.uplink.clone(),
+        ) {
+            Ok(receiver) => receiver,
+            Err(error) => {
+                eprintln!("scupperd: probe worker setup: {error}");
+                let (send, receiver) = mpsc::sync_channel(1);
+                let _ = send.send(failed_round(exit, request.kind));
+                receiver
+            }
         }
     }
     /// Drain complete rounds without waiting; never split a round across ticks.
@@ -83,7 +115,8 @@ impl Probes {
     /// Schedule the active path (10 s / 2 s Suspect) and exit IP (60 s).
     ///
     /// # Errors
-    /// Returns worker creation failure; no tick waits for a child.
+    /// Reserved for scheduler errors. Worker creation failure is delivered as a
+    /// failed round so that health and audit observations are never lost.
     pub fn schedule(
         &mut self,
         now: Instant,
@@ -97,29 +130,33 @@ impl Probes {
         self.path_at = self.path_at.min(now + interval);
         if now >= self.path_at && self.path.is_none() {
             request.kind = ProbeKind::Path;
-            self.path = Some(spawn(
-                self.binary.clone(),
-                held.clone(),
-                vec![(exit.clone(), request.clone())],
-            )?);
+            self.path = Some(self.launch(held, exit, &request));
             self.path_at = now + interval;
         }
         if now >= self.exit_at && self.exit.is_none() {
             request.kind = ProbeKind::ExitIp;
-            self.exit = Some(spawn(
-                self.binary.clone(),
-                held.clone(),
-                vec![(exit.clone(), request)],
-            )?);
+            self.exit = Some(self.launch(held, exit, &request));
             self.exit_at = now + Duration::from_secs(60);
         }
         Ok(())
+    }
+}
+fn failed_round(exit: &ExitId, kind: ProbeKind) -> Round {
+    Round {
+        paths: if kind == ProbeKind::Path {
+            BTreeMap::from([(exit.clone(), false)])
+        } else {
+            BTreeMap::new()
+        },
+        exit_ok: (kind == ProbeKind::ExitIp).then_some(false),
+        setup_failures: 1,
     }
 }
 fn spawn(
     binary: PathBuf,
     held: Arc<NetnsHandle>,
     requests: Vec<(ExitId, ProbeRequest)>,
+    uplink: Vec<IpAddr>,
 ) -> std::io::Result<Receiver<Round>> {
     let (send, receive) = mpsc::sync_channel(1);
     std::thread::Builder::new()
@@ -129,23 +166,18 @@ fn spawn(
             let mut round = Round {
                 paths: BTreeMap::new(),
                 exit_ok: None,
+                setup_failures: 0,
             };
             for (exit, request) in requests {
                 let result =
                     probe_child::run_probe(&exec, &held, &request).map(|outcome| outcome.result);
+                let setup = matches!(&result, Ok(ProbeResult::Setup { .. }) | Err(_))
+                    && !matches!(&result, Err(crate::verdict::ProbeError::Timeout));
+                round.setup_failures += u64::from(setup);
                 if request.kind == ProbeKind::ExitIp {
-                    round.exit_ok = Some(matches!(result, Ok(ProbeResult::Success { .. })));
+                    round.exit_ok = Some(matches!(result, Ok(ProbeResult::Success { ip: Some(ip) }) if !uplink.is_empty() && !uplink.contains(&ip)));
                 } else {
-                    match result {
-                        Ok(ProbeResult::Success { .. }) => {
-                            round.paths.insert(exit, true);
-                        }
-                        Ok(ProbeResult::Path { .. } | ProbeResult::Timeout)
-                        | Err(crate::verdict::ProbeError::Timeout) => {
-                            round.paths.insert(exit, false);
-                        }
-                        _ => {} // Local setup failures cannot condemn an exit.
-                    }
+                    round.paths.insert(exit, matches!(result, Ok(ProbeResult::Success { .. })));
                 }
             }
             let _ = send.send(round);
@@ -214,6 +246,7 @@ mod tests {
                 (ExitId("one".into()), req.clone()),
                 (ExitId("two".into()), req),
             ],
+            Vec::new(),
         )
         .unwrap();
         assert!(matches!(
@@ -237,6 +270,7 @@ mod tests {
             binary.clone(),
             held.clone(),
             vec![(ExitId("one".into()), request(&held))],
+            Vec::new(),
         )
         .unwrap();
         let mut iterations = 0;
@@ -258,5 +292,67 @@ mod tests {
         std::thread::sleep(Duration::from_millis(1100));
         assert!(!binary.with_extension("survived").exists());
         fs::remove_dir_all(binary.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn setup_failures_are_delivered_for_both_probe_kinds() {
+        let held = Arc::new(crate::netns::testing::handle().unwrap());
+        for kind in [ProbeKind::Path, ProbeKind::ExitIp] {
+            let mut req = request(&held);
+            req.kind = kind;
+            let round = spawn(
+                PathBuf::from("/nonexistent/scupper-probe"),
+                held.clone(),
+                vec![(ExitId("one".into()), req)],
+                Vec::new(),
+            )
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap();
+            assert_eq!(round.setup_failures, 1);
+            if kind == ProbeKind::Path {
+                assert_eq!(round.paths.get(&ExitId("one".into())), Some(&false));
+            } else {
+                assert_eq!(round.exit_ok, Some(false));
+            }
+        }
+        let fallback = failed_round(&ExitId("one".into()), ProbeKind::Path);
+        assert_eq!(fallback.paths.get(&ExitId("one".into())), Some(&false));
+        assert_eq!(fallback.setup_failures, 1);
+    }
+    #[test]
+    fn exit_ip_must_differ_from_real_uplink_addresses() {
+        let held = Arc::new(crate::netns::testing::handle().unwrap());
+        for (observed, expected) in [("192.0.2.1", false), ("198.51.100.1", true)] {
+            let outcome = ProbeOutcome {
+                result: ProbeResult::Success {
+                    ip: Some(observed.parse().unwrap()),
+                },
+                credentials: Some(ProbeCredentials {
+                    uids: [99; 4],
+                    gids: [98; 4],
+                    no_new_privs: true,
+                    cap_bnd: 0,
+                }),
+                threads_before_setns: Some(1),
+            };
+            let binary = script(&format!(
+                "#!/bin/sh\nprintf '%s' '{}'\n",
+                serde_json::to_string(&outcome).unwrap()
+            ));
+            let mut req = request(&held);
+            req.kind = ProbeKind::ExitIp;
+            let round = spawn(
+                binary.clone(),
+                held.clone(),
+                vec![(ExitId("one".into()), req)],
+                vec!["192.0.2.1".parse().unwrap()],
+            )
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap();
+            assert_eq!(round.exit_ok, Some(expected));
+            assert_eq!(round.setup_failures, 0);
+            fs::remove_dir_all(binary.parent().unwrap()).unwrap();
+        }
     }
 }

@@ -492,6 +492,7 @@ impl Lab {
         }
     }
     pub(super) fn case(&mut self, case: Case) -> Result<String> {
+        self.daemon_clean_baseline()?;
         if case == Case::Daemon {
             return self.daemon_case();
         }

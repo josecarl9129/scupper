@@ -373,6 +373,9 @@ impl Kernel {
     }
 }
 impl System for Kernel {
+    fn canon_run_root(&self) -> &std::path::Path {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    }
     fn run(&self, p: Program, a: &[String], _: Duration) -> Result<ExecOutput, ExecError> {
         self.exec(ExecTarget::Host, p, a, None)
     }

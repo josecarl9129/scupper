@@ -243,6 +243,15 @@ pub trait System {
         None
     }
 
+    /// Explicit executable for the isolated canonicalization child.
+    fn canon_executable(&self) -> &Path {
+        Path::new("/usr/local/bin/scupper")
+    }
+    /// Private runtime directory for canonicalization misses.
+    fn canon_run_root(&self) -> &Path {
+        Path::new("/run/scupper")
+    }
+
     /// Executes one utility with literal arguments and a hard deadline.
     ///
     /// # Errors
@@ -343,6 +352,7 @@ pub(crate) fn check_wg_args(
 pub struct RealSystem {
     canon_cache: std::cell::RefCell<crate::canon::CanonCache>,
     programs: Programs,
+    canon_paths: Option<(PathBuf, PathBuf)>,
     wireguard_dirs: Option<Vec<PathBuf>>,
 }
 
@@ -352,9 +362,17 @@ impl RealSystem {
     pub fn new(programs: Programs) -> Self {
         Self {
             programs,
+            canon_paths: None,
             canon_cache: std::cell::RefCell::default(),
             wireguard_dirs: None,
         }
+    }
+
+    /// Set explicit child and runtime paths for the daemon or isolated execution.
+    #[must_use]
+    pub fn with_canon_paths(mut self, executable: PathBuf, run_root: PathBuf) -> Self {
+        self.canon_paths = Some((executable, run_root));
+        self
     }
 
     /// Overrides the shared UAPI directories, primarily for isolated tests.
@@ -632,6 +650,16 @@ fn namespace_result(
 }
 
 impl System for RealSystem {
+    fn canon_executable(&self) -> &Path {
+        self.canon_paths
+            .as_ref()
+            .map_or(Path::new("/usr/local/bin/scupper"), |p| &p.0)
+    }
+    fn canon_run_root(&self) -> &Path {
+        self.canon_paths
+            .as_ref()
+            .map_or(Path::new("/run/scupper"), |p| &p.1)
+    }
     fn canon_cache(&self) -> Option<(&std::cell::RefCell<crate::canon::CanonCache>, &Path)> {
         Some((&self.canon_cache, self.programs.path(Program::Nft)))
     }
@@ -685,7 +713,7 @@ impl System for RealSystem {
 pub mod testing {
     use std::{cell::RefCell, collections::BTreeMap, collections::VecDeque, time::Duration};
 
-    use super::{ExecError, ExecOutput, ExecTarget, Program, System};
+    use super::{ExecError, ExecOutput, ExecTarget, Path, Program, System};
 
     /// One recorded command, including its execution budget.
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -826,6 +854,12 @@ pub mod testing {
         }
     }
     impl System for RecordingSystem<'_> {
+        fn canon_executable(&self) -> &Path {
+            self.inner.canon_executable()
+        }
+        fn canon_run_root(&self) -> &Path {
+            self.inner.canon_run_root()
+        }
         fn run(
             &self,
             program: Program,

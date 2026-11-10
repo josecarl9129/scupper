@@ -788,6 +788,7 @@ dependencies = [
  "proptest",
  "rustix",
  "scupper-core",
+ "scupper-proto",
  "scupper-sys",
  "serde",
  "serde_json",

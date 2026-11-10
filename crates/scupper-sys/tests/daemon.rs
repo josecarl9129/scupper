@@ -1,7 +1,7 @@
 //! Daemon persistence recovery and canonical-cache boundaries.
 #![allow(clippy::unwrap_used)]
 use scupper_core::config::GatewayId;
-use scupper_proto::{Actor, EventKind, Reason};
+use scupper_proto::{Actor, EventKind};
 use scupper_sys::{
     canon::{CacheKey, CanonCache},
     daemon::{Audit, notify::Notify},
@@ -50,7 +50,9 @@ fn audit_open_failure_recovers_ring_with_fresh_sequences() {
         .collect::<io::Result<Vec<_>>>()
         .unwrap();
     assert!(events.windows(2).all(|v| v[0].seq < v[1].seq));
-    assert!(events.iter().any(|e| matches!(e.kind, EventKind::EventGap { reason: Reason::Recovery, last_seq, .. } if last_seq == old)));
+    assert!(events.iter().any(
+        |e| matches!(e.kind, EventKind::MemoryReplay { local_last, .. } if local_last == old)
+    ));
     let replay = events
         .iter()
         .find(|e| matches!(e.kind, EventKind::Flapping {}))
@@ -156,6 +158,9 @@ fn a_cached_difference_must_survive_a_fresh_kernel_canonicalization() {
         calls: Cell<usize>,
     }
     impl System for Cached {
+        fn canon_run_root(&self) -> &Path {
+            self.binary.parent().unwrap()
+        }
         fn canon_cache(&self) -> Option<(&RefCell<CanonCache>, &Path)> {
             Some((&self.cache, &self.binary))
         }

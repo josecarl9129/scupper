@@ -1,5 +1,5 @@
 //! Bounded systemd notification without a client library.
-use crate::reconcile::{Escalation, TickReport};
+use crate::reconcile::TickReport;
 use std::{
     ffi::OsStr,
     io,
@@ -18,6 +18,14 @@ pub struct Notify {
     ready: bool,
 }
 impl Notify {
+    /// Disabled endpoint used when service-manager configuration is invalid.
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self {
+            socket: None,
+            ready: false,
+        }
+    }
     /// Parse a filesystem or `@` abstract socket address.
     ///
     /// # Errors
@@ -40,20 +48,39 @@ impl Notify {
             ready: false,
         })
     }
-    /// Notify only after a complete iteration without a pending rebuild.
-    /// READY is retried until successfully sent, then emitted exactly once.
+    /// Announce entry into the main loop, independently of kernel health.
     ///
     /// # Errors
-    /// Returns a nonblocking send error; the next eligible tick retries.
-    pub fn completed(&mut self, report: &TickReport) -> io::Result<()> {
-        if !report.complete || report.escalations.contains(&Escalation::RebuildRequired) {
-            return Ok(());
-        }
+    /// Returns a nonblocking socket error; the next iteration retries.
+    pub fn started(&mut self) -> io::Result<()> {
         if !self.ready {
             self.send(b"READY=1")?;
             self.ready = true;
         }
-        self.send(b"WATCHDOG=1")
+        Ok(())
+    }
+    /// Notify completion of bounded loop work, including degraded work.
+    ///
+    /// # Errors
+    /// Returns a nonblocking send error.
+    pub fn iteration(&mut self, complete: bool, status: &str) -> io::Result<()> {
+        self.started()?;
+        self.send(format!("STATUS={status}").as_bytes())?;
+        if complete {
+            self.send(b"WATCHDOG=1")?;
+        }
+        Ok(())
+    }
+    /// Notify after a reconciler tick; rebuild decisions belong to the loop.
+    ///
+    /// # Errors
+    /// Returns a nonblocking send error.
+    pub fn completed(&mut self, report: &TickReport) -> io::Result<()> {
+        self.started()?;
+        if report.complete {
+            self.send(b"WATCHDOG=1")?;
+        }
+        Ok(())
     }
     fn send(&self, message: &[u8]) -> io::Result<()> {
         if let Some((socket, address)) = &self.socket {

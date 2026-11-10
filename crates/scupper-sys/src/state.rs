@@ -196,8 +196,8 @@ impl StateFile {
             durable_directory(root.as_ref())?;
             RealFs.cleanup_stale(root.as_ref())?;
         }
-        let path = canonical_root(root.as_ref())?.join("state.json");
-        let capacity = read_capacity(&path);
+        let path = root.as_ref().join("state.json");
+        let capacity = read_capacity(&canonical_root(root.as_ref())?.join("state.json"));
         Ok(Self {
             path,
             capacity,

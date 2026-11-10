@@ -35,6 +35,12 @@ struct SafetySystem<'a> {
     failed: Cell<bool>,
 }
 impl System for SafetySystem<'_> {
+    fn canon_executable(&self) -> &Path {
+        self.system.canon_executable()
+    }
+    fn canon_run_root(&self) -> &Path {
+        self.system.canon_run_root()
+    }
     fn canon_cache(&self) -> Option<(&std::cell::RefCell<crate::canon::CanonCache>, &Path)> {
         self.system.canon_cache()
     }

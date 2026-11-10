@@ -485,6 +485,9 @@ impl MemoryStore {
     }
 }
 impl StateStore for MemoryStore {
+    fn applied_snapshot_until(&self, _deadline: Instant) -> Option<State> {
+        Some(self.state())
+    }
     fn read(&self) -> io::Result<State> {
         Ok(self.state())
     }

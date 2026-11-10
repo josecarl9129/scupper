@@ -346,7 +346,8 @@ impl Kernel for RealKernel<'_> {
                 let crate::state::StateRead::Present(state) = state else {
                     return Err(StepError("state unavailable"));
                 };
-                if self.memory_latch.get()
+                if state.applied_version != Some(self.desired.applied_version())
+                    || self.memory_latch.get()
                     || state.quarantine.is_some()
                     || state.selection == scupper_core::verdict::v2::Selection::Disconnected
                     || !self.flushed.get()
@@ -362,6 +363,16 @@ impl Kernel for RealKernel<'_> {
             } => {
                 if *required != self.desired.fingerprint() || rendered != self.desired_rendered() {
                     return Err(StepError("unapplied ruleset refused"));
+                }
+                // The early version snapshot can time out. Never let that
+                // authorize loading an obsolete render during containment.
+                let state = self
+                    .state
+                    .read_until(Instant::now() + EXEC_TIMEOUT)
+                    .map_err(|_| StepError("applied version unavailable"))?;
+                if !matches!(state, crate::state::StateRead::Present(state) if state.applied_version == Some(self.desired.applied_version()))
+                {
+                    return Err(StepError("applied version changed"));
                 }
                 self.flushed.set(false);
                 for cmd in [NftCmd::CheckStdin, NftCmd::LoadStdin] {

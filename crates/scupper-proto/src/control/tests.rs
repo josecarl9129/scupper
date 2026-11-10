@@ -138,6 +138,9 @@ fn every_variant_roundtrips_and_keys_are_private() {
                 "dropped",
                 "first_seq",
                 "last_seq",
+                "local_first",
+                "local_last",
+                "replayed",
             ];
             assert!(
                 event_keys
@@ -214,6 +217,9 @@ fn every_variant_roundtrips_and_keys_are_private() {
         "dropped",
         "first_seq",
         "last_seq",
+        "local_first",
+        "local_last",
+        "replayed",
         "request_id",
         "op",
         "args",

@@ -47,6 +47,18 @@ impl FakeSystem {
     }
 }
 impl System for FakeSystem {
+    fn run_in(
+        &self,
+        _: scupper_sys::system::ExecTarget<'_>,
+        p: Program,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<ExecOutput, ExecError> {
+        self.run(p, args, timeout)
+    }
+    fn canon_run_root(&self) -> &Path {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+    }
     fn run(&self, p: Program, a: &[String], t: Duration) -> Result<ExecOutput, ExecError> {
         self.calls.borrow_mut().push((p, a.into(), t));
         if a == ["-j", "list", "ruleset"] {
@@ -178,7 +190,7 @@ fn isolated_canon_loads_then_lists_and_reports_failures() -> Result<(), Box<dyn 
 
 #[cfg(feature = "testing")]
 #[test]
-fn relative_temp_dir_is_setup_error() -> Result<(), Box<dyn Error>> {
+fn relative_tmpdir_does_not_affect_canonicalization() -> Result<(), Box<dyn Error>> {
     let output = std::process::Command::new(std::env::current_exe()?)
         .args([
             "--ignored",
@@ -206,19 +218,18 @@ fn relative_temp_dir_fixture() -> Result<(), Box<dyn Error>> {
     sys.live_results
         .borrow_mut()
         .push_back(Ok(output(r#"{"nftables":[]}"#)));
-    assert!(matches!(
-        scupper_sys::canon::netns_rulesets(
-            &sys,
-            &scupper_sys::netns::testing::handle()?,
-            "flush ruleset"
-        ),
-        Err(scupper_sys::verdict::ProbeError::Setup(_))
-    ));
+    sys.push(Program::Unshare, &[], Ok(output(r#"{"nftables":[]}"#)));
+    let (want, live) = scupper_sys::canon::netns_rulesets(
+        &sys,
+        &scupper_sys::netns::testing::handle()?,
+        "flush ruleset",
+    )?;
+    assert_eq!(want, live);
     assert!(
         sys.calls
             .borrow()
             .iter()
-            .all(|call| call.0 != Program::Unshare)
+            .any(|call| call.0 == Program::Unshare)
     );
     assert!(!Path::new("relative-canon-temp").exists());
     Ok(())

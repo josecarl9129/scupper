@@ -7,7 +7,7 @@ use std::{
     io::{self, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde_json::Value;
@@ -37,7 +37,11 @@ pub struct CacheKey {
 }
 /// One-entry, process-lifetime cache; no cache files are created.
 #[derive(Debug, Default)]
-pub struct CanonCache(Option<(CacheKey, Value)>);
+pub struct CanonCache {
+    cached: Option<(CacheKey, Value)>,
+    facts: Option<(Instant, CacheKey)>,
+    checked_at: Option<Instant>,
+}
 impl CanonCache {
     /// Return a cached value or replace it with a fresh canonicalization.
     /// A suspected difference must set `fresh` before it can be reported.
@@ -51,13 +55,13 @@ impl CanonCache {
         load: impl FnOnce() -> Probe<Value>,
     ) -> Probe<Value> {
         if !fresh
-            && let Some((old, value)) = &self.0
+            && let Some((old, value)) = &self.cached
             && *old == key
         {
             return Ok(value.clone());
         }
         let value = load()?;
-        self.0 = Some((key, value.clone()));
+        self.cached = Some((key, value.clone()));
         Ok(value)
     }
 }
@@ -132,7 +136,7 @@ fn file_error(error: &io::Error) -> ProbeError {
 struct PrivateRuleset(PathBuf);
 
 impl PrivateRuleset {
-    fn create(rendered: &str) -> Probe<Self> {
+    fn create(root: &Path, rendered: &str) -> Probe<Self> {
         // RandomState uses randomized hashing keys. Two hashes make the name
         // unpredictable without extra dependencies.
         let name = format!(
@@ -140,7 +144,7 @@ impl PrivateRuleset {
             RandomState::new().hash_one(std::process::id()),
             RandomState::new().hash_one(std::process::id()),
         );
-        let temp_dir = std::env::temp_dir();
+        let temp_dir = root;
         if !temp_dir.is_absolute() {
             return Err(ProbeError::setup(
                 "canonicalization temp directory must be absolute",
@@ -372,6 +376,41 @@ pub fn netns_rulesets(
     }
 }
 
+fn tool_facts(sys: &dyn System) -> Probe<CacheKey> {
+    use std::os::unix::fs::MetadataExt;
+    let (_, nft) = sys
+        .canon_cache()
+        .ok_or_else(|| ProbeError::setup("no canonical cache"))?;
+    let meta = fs::metadata(nft).map_err(|e| file_error(&e))?;
+    Ok(CacheKey {
+        rendered: [0; 32],
+        nft_version: command(sys, Program::Nft, &["--version".into()], EXEC_TIMEOUT)?,
+        nft_identity: (meta.dev(), meta.ino(), meta.mtime(), meta.mtime_nsec()),
+        kernel_release: fs::read_to_string("/proc/sys/kernel/osrelease")
+            .map_err(|e| file_error(&e))?,
+    })
+}
+
+/// Refresh tool identity outside safety observation, at most once per minute.
+/// Misses also refresh it before loading a canonical rendering.
+///
+/// # Errors
+/// Returns tool or metadata errors, retaining the last usable cache entry.
+pub fn refresh_tool_facts(sys: &dyn System, now: Instant) -> Probe<()> {
+    if let Some((cache, _)) = sys.canon_cache() {
+        let due = cache
+            .borrow()
+            .checked_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_secs(60));
+        if due {
+            cache.borrow_mut().checked_at = Some(now);
+            let facts = tool_facts(sys)?;
+            cache.borrow_mut().facts = Some((now, facts));
+        }
+    }
+    Ok(())
+}
+
 fn canonical_pair(
     sys: &dyn System,
     handle: &crate::netns::NetnsHandle,
@@ -379,38 +418,51 @@ fn canonical_pair(
     live: Result<ExecOutput, ExecError>,
     fresh: bool,
 ) -> Probe<(Value, Value)> {
-    let mut executable = fs::read_link("/proc/self/exe").map_err(|error| file_error(&error))?;
-    if executable.file_name().is_some_and(|n| n == "scupperd") {
-        executable.set_file_name("scupper");
-    }
-    let outer = fs::read_link("/proc/self/ns/net").map_err(|error| file_error(&error))?;
-    let file = PrivateRuleset::create(rendered)?;
-    let mut args = unshare_argv(&executable, &outer, &file.path())?;
-    args.splice(
-        6..6,
-        [
-            "--gateway-netns".into(),
-            format!("net:[{}]", handle.identity().1),
-        ],
-    );
+    use sha2::{Digest, Sha256};
+    let rendered_hash = Sha256::digest(rendered.as_bytes()).into();
     let load = || {
+        let outer = fs::read_link("/proc/self/ns/net").map_err(|error| file_error(&error))?;
+        let file = PrivateRuleset::create(sys.canon_run_root(), rendered)?;
+        let mut args = unshare_argv(sys.canon_executable(), &outer, &file.path())?;
+        args.splice(
+            6..6,
+            [
+                "--gateway-netns".into(),
+                format!("net:[{}]", handle.identity().1),
+            ],
+        );
         command(sys, Program::Unshare, &args, CANON_TIMEOUT)
             .and_then(|text| Ok(canonicalize(&text)?))
     };
-    let want = if let Some((cache, nft)) = sys.canon_cache() {
-        use sha2::{Digest, Sha256};
-        use std::os::unix::fs::MetadataExt;
-        let key = (|| {
-            let meta = fs::metadata(nft).map_err(|e| file_error(&e))?;
-            Ok(CacheKey {
-                rendered: Sha256::digest(rendered.as_bytes()).into(),
-                nft_version: command(sys, Program::Nft, &["--version".into()], EXEC_TIMEOUT)?,
-                nft_identity: (meta.dev(), meta.ino(), meta.mtime(), meta.mtime_nsec()),
-                kernel_release: fs::read_to_string("/proc/sys/kernel/osrelease")
-                    .map_err(|e| file_error(&e))?,
+    let want = if let Some((cache, _)) = sys.canon_cache() {
+        // The hit path uses memory only: even a failed miss must not poison it.
+        let hit = {
+            let cache = cache.borrow();
+            cache
+                .cached
+                .as_ref()
+                .filter(|(key, _)| {
+                    !fresh
+                        && key.rendered == rendered_hash
+                        && cache.facts.as_ref().is_some_and(|(_, facts)| {
+                            let mut facts = facts.clone();
+                            facts.rendered = rendered_hash;
+                            *key == facts
+                        })
+                })
+                .map(|(_, value)| value.clone())
+        };
+        if let Some(value) = hit {
+            Ok(value)
+        } else {
+            tool_facts(sys).and_then(|mut key| {
+                key.rendered = rendered_hash;
+                let now = Instant::now();
+                cache.borrow_mut().checked_at = Some(now);
+                cache.borrow_mut().facts = Some((now, key.clone()));
+                cache.borrow_mut().get_or_try(key, fresh, load)
             })
-        })();
-        key.and_then(|key| cache.borrow_mut().get_or_try(key, fresh, load))
+        }
     } else {
         load()
     };

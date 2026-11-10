@@ -3,6 +3,8 @@
 //! neither can submit failover inputs or execute a kernel repair.
 pub mod notify;
 pub mod probes;
+pub mod scheduler;
+pub use scheduler::{DaemonDeps, Iteration, run_with};
 
 use crate::{
     boot::{self, BootDeps, BootReport, GatewayNamespace},
@@ -54,6 +56,30 @@ impl Default for Options {
             probe_binary: "/usr/local/bin/scupper".into(),
         }
     }
+}
+fn uplink_addresses(system: &dyn crate::system::System) -> io::Result<Vec<std::net::IpAddr>> {
+    use crate::{
+        cmd::{IpCmd, KernelCmd, run_cmd},
+        system::{EXEC_TIMEOUT, ExecTarget},
+    };
+    let text = canon::command_result(run_cmd(
+        system,
+        ExecTarget::Host,
+        &KernelCmd::Ip(IpCmd::AddrShowJson),
+        EXEC_TIMEOUT,
+    ))
+    .map_err(io::Error::other)?;
+    let interfaces = scupper_core::parse::parse_ip_addr(&text).map_err(io::Error::other)?;
+    let addresses: Vec<_> = interfaces
+        .into_iter()
+        .flat_map(|i| i.addresses)
+        .map(|a| a.local)
+        .filter(|a| !a.is_loopback() && !a.is_unspecified())
+        .collect();
+    if addresses.is_empty() {
+        return Err(io::Error::other("no uplink addresses observed"));
+    }
+    Ok(addresses)
 }
 fn unix() -> u64 {
     SystemTime::now()
@@ -112,7 +138,7 @@ fn initialize(
             device: expected.dev,
             inode: expected.ino,
         },
-        vec![std::net::Ipv4Addr::UNSPECIFIED.into()],
+        uplink_addresses(deps.system)?,
         version,
     )
     .map_err(io::Error::other)?;
@@ -153,7 +179,7 @@ pub struct Audit {
     pending: Option<Receiver<Result<OpenedLog, crate::events::OpenError>>>,
 }
 impl Audit {
-    /// Open once, falling back to a bounded in-memory log.
+    /// Start in memory; the first disk open runs on the recovery worker.
     ///
     /// # Errors
     /// Returns invalid gateway errors from the fallback constructor.
@@ -162,13 +188,12 @@ impl Audit {
         gateway: GatewayId,
         now: Instant,
     ) -> Result<Self, crate::events::OpenError> {
-        let opened = EventLog::open(root, gateway.clone(), || UnixSeconds(unix()))
-            .or_else(|_| EventLog::memory_only(gateway.clone(), || UnixSeconds(unix())))?;
+        let opened = EventLog::memory_only(gateway.clone(), || UnixSeconds(unix()))?;
         Ok(Self {
             opened,
             root: root.into(),
             gateway,
-            retry_at: now + Duration::from_secs(60),
+            retry_at: now,
             pending: None,
         })
     }
@@ -222,6 +247,12 @@ impl Audit {
     }
 }
 
+impl Drop for Audit {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
+
 /// Run until SIGTERM/SIGINT sets `stop`, finishing any current tick first.
 /// Notification, probes and audit maintenance occur outside the writer lock.
 /// Shutdown never executes kernel operations, even if flushing fails.
@@ -237,21 +268,12 @@ pub fn run(options: &Options, stop: &AtomicBool) -> io::Result<()> {
             .trim()
             .into(),
     );
-    let system = RealSystem::default();
+    let system = RealSystem::default()
+        .with_canon_paths(options.probe_binary.clone(), options.run_root.clone());
     let namespace = GatewayNamespace;
-    let deps = || BootDeps {
-        system: &system,
-        namespace: &namespace,
-        state_root: &options.state_root,
-        config_root: &options.config_root,
-        run_root: &options.run_root,
-        #[cfg(feature = "testing")]
-        hook: None,
-        #[cfg(feature = "testing")]
-        secret_owner: 0,
-    };
     let mut audit =
         Audit::open(&options.state_root, gateway.clone(), origin).map_err(io::Error::other)?;
+    audit.poll(origin);
     let _ = audit.handle().emit(
         EventKind::DaemonStarted {
             version: Release {
@@ -263,48 +285,198 @@ pub fn run(options: &Options, stop: &AtomicBool) -> io::Result<()> {
         Actor::Daemon,
         None,
     );
-    let mut notify = notify::Notify::new(std::env::var_os("NOTIFY_SOCKET").as_deref())?;
-    let mut running = match initialize(deps(), gateway.clone(), audit.handle(), origin) {
-        Ok(machine) => Some(machine),
-        Err(error) => {
-            eprintln!("scupperd: reconciler startup refused: {error}");
-            let _ = audit.handle().emit(
-                EventKind::DriftDetected {
-                    object: scupper_proto::ObjectKind::Unknown,
-                    reason: scupper_proto::Reason::ObservationUnknown,
-                },
-                Actor::Daemon,
-                None,
-            );
-            None
-        }
+    let notify =
+        notify::Notify::new(std::env::var_os("NOTIFY_SOCKET").as_deref()).unwrap_or_else(|error| {
+            eprintln!("scupperd: notify setup: {error}");
+            notify::Notify::disabled()
+        });
+    let mut runtime = Runtime {
+        options,
+        system: &system,
+        namespace: &namespace,
+        gateway,
+        origin,
+        audit,
+        notify,
+        running: None,
+        probes: probes::Probes::new(options.probe_binary.clone(), origin)
+            .with_uplink(uplink_addresses(&system).unwrap_or_default()),
+        setup_at: None,
+        setup_rounds: 0,
+        edge_logged: false,
     };
-    let mut probes = probes::Probes::new(options.probe_binary.clone(), origin);
-    let mut rebuilds = std::collections::VecDeque::new();
-    let mut retry_at = origin;
-    let mut next_tick = origin;
-    let mut edge_logged = false;
-    while !stop.load(Ordering::Relaxed) {
-        let now = Instant::now();
-        if now < next_tick {
-            std::thread::sleep((next_tick - now).min(Duration::from_millis(50)));
-            continue;
+    run_with(&mut runtime, stop);
+    Ok(())
+}
+struct Runtime<'a> {
+    options: &'a Options,
+    system: &'a RealSystem,
+    namespace: &'a GatewayNamespace,
+    gateway: GatewayId,
+    origin: Instant,
+    audit: Audit,
+    notify: notify::Notify,
+    running: Option<(Machine<'a>, Arc<NetnsHandle>, Config)>,
+    probes: probes::Probes,
+    edge_logged: bool,
+    setup_at: Option<Instant>,
+    setup_rounds: u64,
+}
+impl<'a> Runtime<'a> {
+    fn deps(&self) -> BootDeps<'a> {
+        BootDeps {
+            system: self.system,
+            namespace: self.namespace,
+            state_root: &self.options.state_root,
+            config_root: &self.options.config_root,
+            run_root: &self.options.run_root,
+            #[cfg(feature = "testing")]
+            hook: None,
+            #[cfg(feature = "testing")]
+            secret_owner: 0,
         }
+    }
+}
+impl DaemonDeps for Runtime<'_> {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+    fn sleep(&mut self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+    fn started(&mut self) {
+        if let Err(error) = self.notify.started() {
+            eprintln!("scupperd: notify: {error}");
+        }
+    }
+    fn notify(&mut self, iteration: &Iteration) {
+        if let Err(error) = self.notify.iteration(iteration.complete, iteration.status) {
+            eprintln!("scupperd: notify: {error}");
+        }
+    }
+    fn shutdown(&mut self) {
+        self.running.take();
+        if let Err(error) = self.audit.shutdown() {
+            eprintln!("scupperd: event flush: {error}");
+        }
+    }
+    fn initialize(&mut self) {
+        self.running = match initialize(
+            self.deps(),
+            self.gateway.clone(),
+            self.audit.handle(),
+            self.origin,
+        ) {
+            Ok(machine) => Some(machine),
+            Err(error) => {
+                eprintln!("scupperd: reconciler startup refused: {error}");
+                let _ = self.audit.handle().emit(
+                    EventKind::DriftDetected {
+                        object: scupper_proto::ObjectKind::Unknown,
+                        reason: scupper_proto::Reason::ObservationUnknown,
+                    },
+                    Actor::Daemon,
+                    None,
+                );
+                None
+            }
+        };
+    }
+    fn run_root(&self) -> &Path {
+        &self.options.run_root
+    }
+    fn boot_time(&self) -> Duration {
+        let time = rustix::time::clock_gettime(rustix::time::ClockId::Boottime);
+        Duration::new(
+            time.tv_sec.unsigned_abs(),
+            u32::try_from(time.tv_nsec).unwrap_or(0),
+        )
+    }
+    fn budget_error(&mut self, error: &io::Error) {
+        eprintln!("scupperd: boot budget: {error}");
+        let _ = self.audit.handle().emit(
+            EventKind::PersistenceFailed {
+                reason: scupper_proto::Reason::BootWrite,
+            },
+            Actor::Daemon,
+            None,
+        );
+    }
+    fn close_only(&mut self) {
+        close_only(&self.deps(), self.options);
+    }
+    fn abandon_probes(&mut self) {
+        self.probes = probes::Probes::new(self.options.probe_binary.clone(), Instant::now())
+            .with_uplink(uplink_addresses(self.system).unwrap_or_default());
+    }
+    fn rebuild(&mut self) {
+        let deps = self.deps();
+        let report = if let Some((machine, _, _)) = &mut self.running {
+            machine.rebuild(&deps).ok()
+        } else {
+            Some(boot::boot(&deps))
+        };
+        if report.is_some_and(|report| report.succeeded()) {
+            self.initialize();
+        }
+    }
+    fn maintenance(&mut self) {
+        if let Err(error) = canon::refresh_tool_facts(self.system, Instant::now()) {
+            eprintln!("scupperd: canonical tool identity: {error}");
+        }
+    }
+    #[allow(clippy::too_many_lines)]
+    fn tick(&mut self, stop: &AtomicBool) -> Option<crate::reconcile::TickReport> {
+        let now = Instant::now();
+        #[cfg(feature = "testing")]
+        while self.options.run_root.join("stall-tick").exists() && !stop.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let Self {
+            audit,
+            running,
+            probes,
+            edge_logged,
+            setup_at,
+            setup_rounds,
+            ..
+        } = self;
         if audit.poll(now)
-            && let Some((machine, _, _)) = &mut running
+            && let Some((machine, _, _)) = running
         {
             machine.set_log(audit.handle());
         }
-        let mut rebuild = running.is_none();
-        if let Some((machine, held, config)) = &mut running {
+        if let Some((machine, held, config)) = running {
             for round in probes.collect() {
+                if round.setup_failures > 0 {
+                    *setup_rounds = setup_rounds.saturating_add(1);
+                    if setup_at.is_none_or(|at| {
+                        now.saturating_duration_since(at) >= Duration::from_secs(60)
+                    }) {
+                        eprintln!(
+                            "scupperd: probe setup failed; consecutive rounds={setup_rounds}"
+                        );
+                        let _ = audit.handle().emit(
+                            EventKind::DriftDetected {
+                                object: scupper_proto::ObjectKind::Unknown,
+                                reason: scupper_proto::Reason::ObservationUnknown,
+                            },
+                            Actor::Daemon,
+                            Some(config.stamp.version),
+                        );
+                        *setup_at = Some(now);
+                    }
+                } else {
+                    *setup_rounds = 0;
+                }
+
                 if !round.paths.is_empty() {
                     machine.submit_probe_round(round.paths);
                 }
-                if round.exit_ok == Some(false) {
+                if round.exit_ok == Some(false) && round.setup_failures == 0 {
                     let _ = audit.handle().emit(
                         EventKind::DriftDetected {
-                            object: scupper_proto::ObjectKind::Route,
+                            object: scupper_proto::ObjectKind::Unknown,
                             reason: scupper_proto::Reason::HealthFailure,
                         },
                         Actor::Daemon,
@@ -313,13 +485,16 @@ pub fn run(options: &Options, stop: &AtomicBool) -> io::Result<()> {
                 }
             }
             if stop.load(Ordering::Relaxed) {
-                break;
+                return Some(crate::reconcile::TickReport::default());
             }
             let report = machine.tick();
-            rebuild = report.escalations.contains(&Escalation::RebuildRequired);
-            if report.escalations.contains(&Escalation::RestartEdge) && !edge_logged {
+            let rebuild = report.escalations.contains(&Escalation::RebuildRequired)
+                || report
+                    .escalations
+                    .contains(&Escalation::ReinitializeRequired);
+            if report.escalations.contains(&Escalation::RestartEdge) && !*edge_logged {
                 eprintln!("scupperd: RestartEdge deferred until M4");
-                edge_logged = true;
+                *edge_logged = true;
             }
             if !stop.load(Ordering::Relaxed) && !rebuild {
                 let probe_exit = machine.probe_exit();
@@ -352,14 +527,27 @@ pub fn run(options: &Options, stop: &AtomicBool) -> io::Result<()> {
                                     .iter()
                                     .all(|(_, r)| *r == RouteTarget::Unreachable)
                             });
+                            let bind = match closed
+                                .then(|| scupper_core::rules::IfName::new(exit.ifname().as_str()))
+                                .transpose()
+                            {
+                                Ok(bind) => bind,
+                                Err(error) => {
+                                    eprintln!("scupperd: probe interface: {error}");
+                                    let _ = audit.handle().emit(
+                                        EventKind::DriftDetected {
+                                            object: scupper_proto::ObjectKind::Unknown,
+                                            reason: scupper_proto::Reason::ObservationUnknown,
+                                        },
+                                        Actor::Daemon,
+                                        Some(config.stamp.version),
+                                    );
+                                    return Some(report);
+                                }
+                            };
                             let request = crate::probe_child::ProbeRequest {
                                 kind: crate::probe_child::ProbeKind::Path,
-                                bind: closed
-                                    .then(|| {
-                                        scupper_core::rules::IfName::new(exit.ifname().as_str())
-                                    })
-                                    .transpose()
-                                    .map_err(io::Error::other)?,
+                                bind,
                                 expected_netns: held.identity(),
                                 dns,
                                 targets,
@@ -375,41 +563,12 @@ pub fn run(options: &Options, stop: &AtomicBool) -> io::Result<()> {
                         }
                     }
                 }
-                // Last operation of an entire successful iteration.
-                if let Err(error) = notify.completed(&report) {
-                    eprintln!("scupperd: notify: {error}");
-                }
             }
+            Some(report)
+        } else {
+            None
         }
-        if rebuild && !stop.load(Ordering::Relaxed) {
-            // Never adopt a mismatched boot identity. The fallback only tightens
-            // the named foreign namespace; ordered boot is retried under its lock.
-            if running.is_none() {
-                close_only(&deps(), options);
-            }
-            rebuilds.retain(|at| now.duration_since(*at) < Duration::from_secs(600));
-            if now >= retry_at && rebuilds.len() < 3 {
-                rebuilds.push_back(now);
-                let report = if let Some((machine, _, _)) = &mut running {
-                    machine.rebuild(&deps()).ok()
-                } else {
-                    Some(boot::boot(&deps()))
-                };
-                retry_at = now + Duration::from_secs(60);
-                if report.is_some_and(|report| report.succeeded()) {
-                    running = initialize(deps(), gateway.clone(), audit.handle(), origin).ok();
-                    probes = probes::Probes::new(options.probe_binary.clone(), now);
-                }
-            }
-        }
-        next_tick += Duration::from_secs(2);
-        // Coalesce overdue wakeups without adding another interval after a slow tick.
-        next_tick = next_tick.max(Instant::now());
     }
-    if let Err(error) = audit.shutdown() {
-        eprintln!("scupperd: event flush: {error}");
-    }
-    Ok(())
 }
 // An invalid handoff cannot authorize restoration. Close gates only, using the
 // same bounded kernel executor and writer lock as reconciliation.

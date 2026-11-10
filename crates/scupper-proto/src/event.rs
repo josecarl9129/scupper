@@ -46,6 +46,7 @@ vocabulary!(
     SafetyDrift,
     ExecutionFailed,
     StateWrite,
+    BootWrite,
     EventWrite,
     TornLine,
     Recovery,
@@ -186,6 +187,7 @@ event_kinds! {
     HeartbeatFailed { reason: Reason = Reason::EdgeDead },
     PersistenceFailed { reason: Reason = Reason::EventWrite },
     Flapping {},
+    MemoryReplay { dropped: u64 = 0, local_first: u64 = 1, local_last: u64 = 3, replayed: u64 = 3 },
     EventGap { reason: Reason = Reason::QueueOverflow, dropped: u64 = 3, first_seq: u64 = 1, last_seq: u64 = 3 },
 }
 

@@ -17,18 +17,211 @@ use std::{
     time::{Duration, Instant},
 };
 
+// Own both the daemon and fixture cleanup before any fallible fault operation.
+struct DaemonGuard<'a> {
+    lab: &'a mut Lab,
+    child: Option<Group>,
+    armed: bool,
+}
+impl DaemonGuard<'_> {
+    fn run(&mut self, case: &str) -> Result<String> {
+        let (child, notify, root) = self.lab.daemon_start(case)?;
+        self.child = Some(child);
+        self.lab
+            .daemon_wait("READY", Duration::from_secs(30), |lab| {
+                Ok(lab.notifications(&notify)?.iter().any(|s| s == "READY=1"))
+            })?;
+        self.lab.daemon_route_healthy(Duration::from_secs(60))?;
+        let child = self.child.as_mut().ok_or("missing daemon")?;
+        let observed = self.lab.daemon_fault(case, child, &notify, &root)?;
+        let before = self.lab.daemon_snapshot()?;
+        child.stop_timeout(Signal::TERM, Duration::from_secs(30))?;
+        if before != self.lab.daemon_snapshot()? {
+            return fail("SIGTERM changed kernel state");
+        }
+        if !root.join("var-lib/scupper/events/clean").exists() {
+            return fail("SIGTERM did not write clean event marker");
+        }
+        // L4 must also survive reopening the durable owned-link handoff.
+        if case == "L4" {
+            drop(self.child.take());
+            let binary = Lab::boot_binary()?.with_file_name("scupperd");
+            let notify_path = self.lab.private.join(format!("notify-{case}.sock"));
+            let env = format!("NOTIFY_SOCKET={}", notify_path.display());
+            self.lab.notifications(&notify)?;
+            self.child = Some(self.lab.runner.background(
+                &Invocation::new(
+                    "gwhost",
+                    "env",
+                    &[
+                        &env,
+                        binary.to_str().ok_or("daemon path")?,
+                        "--test-root",
+                        root.to_str().ok_or("root path")?,
+                    ],
+                ),
+                &self.lab.artifacts.join("daemon-restart.stdout"),
+            )?);
+            self.lab
+                .daemon_wait("restart READY", Duration::from_secs(30), |lab| {
+                    Ok(lab.notifications(&notify)?.iter().any(|s| s == "READY=1"))
+                })?;
+            self.lab.daemon_route_healthy(Duration::from_secs(60))?;
+        }
+        Ok(observed)
+    }
+    fn finish(&mut self) -> Result<()> {
+        if !self.armed {
+            return Ok(());
+        }
+        self.armed = false;
+        // Cleanup has its own deadline even after a case deadline/cancellation.
+        let cleanup = self.lab.runner.cleanup;
+        let phase = self.lab.runner.phase;
+        let whole = self.lab.runner.whole;
+        self.lab.runner.cleanup = true;
+        self.lab.runner.phase = Instant::now() + Duration::from_secs(90);
+        self.lab.runner.whole = self.lab.runner.phase;
+        if let Some(mut child) = self.child.take() {
+            child.signal(Signal::CONT);
+            let _ = child.stop_timeout(Signal::TERM, Duration::from_secs(5));
+            drop(child); // Group kills/reaps on any failed graceful stop.
+        }
+        let _ = fs::remove_file(self.lab.private.join("boot-root/run/scupper/stall-tick"));
+        let captures = self.lab.stop_captures();
+        // Absent resources are fine. Verify the baseline after ordered boot.
+        for (ns, program, args) in [
+            (
+                "scupper",
+                "tc",
+                vec!["qdisc", "del", "dev", "wg0", "clsact"],
+            ),
+            ("scupper", "ip", vec!["link", "del", "foreign0"]),
+            ("gwhost", "ip", vec!["link", "del", "foreign-host"]),
+            ("gwhost", "ip", vec!["link", "del", "foreign0"]),
+            (
+                "scupper",
+                "ip",
+                vec!["route", "del", "198.18.0.0/24", "dev", "ex-ch1"],
+            ),
+            (
+                "wan",
+                "nft",
+                vec!["delete", "table", "inet", "daemon_exit_down"],
+            ),
+            ("wan", "nft", vec!["delete", "table", "inet", "lab_inject"]),
+        ] {
+            let _ = self
+                .lab
+                .runner
+                .output(&Invocation::new(ns, program, &args), None);
+        }
+        let restored = self
+            .lab
+            .boot_gateway(&[], "daemon-restore")
+            .and_then(|_| self.lab.daemon_clean_baseline());
+        self.lab.runner.cleanup = cleanup;
+        self.lab.runner.phase = phase;
+        self.lab.runner.whole = whole;
+        captures.and(restored)
+    }
+}
+impl Drop for DaemonGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
+}
+
 impl Lab {
     pub(super) fn daemon_case(&mut self) -> Result<String> {
-        self.runner.phase = Instant::now() + Duration::from_secs(320);
+        let mut failures = Vec::new();
+        for case in [
+            "L6", "L7", "L13", "L16", "L17-V14", "L52", "V03", "L3", "L4",
+        ] {
+            self.runner.phase = Instant::now() + Duration::from_secs(180);
+            let started = Instant::now();
+            let observed = self
+                .daemon_clean_baseline()
+                .and_then(|()| self.daemon_trial(case));
+            self.rows.push(Row {
+                name: format!("daemon-{case}"),
+                wanted: daemon_wanted(case).into(),
+                got: observed
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|e| format!("failed: {e}")),
+                detail: format!(
+                    "elapsed_ms={}; isolated daemon; cleanup guard",
+                    started.elapsed().as_millis()
+                ),
+            });
+            evidence::save_results(&self.artifacts, &self.rows)?;
+            if let Err(error) = observed {
+                failures.push(format!("{case}: {error}"));
+            }
+        }
+        if !failures.is_empty() {
+            return fail(failures.join("; "));
+        }
+        Ok("all daemon cases verified; guarded cleanup, notify evidence and clean shutdown".into())
+    }
+    fn daemon_trial(&mut self, case: &str) -> Result<String> {
+        let mut guard = DaemonGuard {
+            lab: self,
+            child: None,
+            armed: true,
+        };
+        let result = guard.run(case);
+        let cleanup = guard.finish();
+        match (result, cleanup) {
+            (Ok(observed), Ok(())) => Ok(observed),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(cleanup)) => fail(format!("{error}; cleanup: {cleanup}")),
+        }
+    }
+    pub(super) fn daemon_clean_baseline(&mut self) -> Result<()> {
+        let links: serde_json::Value =
+            serde_json::from_str(&self.cmd("scupper", "ip", &["-j", "link", "show"])?)?;
+        if links.as_array().is_none_or(|links| {
+            links
+                .iter()
+                .any(|link| !matches!(link["ifname"].as_str(), Some("lo" | "wg0" | "ex-ch1")))
+        }) {
+            return fail("unclean baseline: foreign namespace links; operator attention required");
+        }
+        for direction in ["ingress", "egress"] {
+            let hooks = self.cmd(
+                "scupper",
+                "tc",
+                &["-j", "filter", "show", "dev", "wg0", direction],
+            )?;
+            if hooks.trim() != "[]" {
+                return fail(format!("unclean baseline: wg0 {direction} tc hooks"));
+            }
+        }
+        if self
+            .cmd("scupper", "ip", &["route", "show", "table", "main"])?
+            .contains("198.18.0.0/24")
+        {
+            return fail("unclean baseline: daemon extra route remains");
+        }
+        let tables = self.cmd("wan", "nft", &["list", "tables"])?;
+        if tables.contains("lab_inject") || tables.contains("daemon_exit_down") {
+            return fail("unclean baseline: daemon fault nft table remains");
+        }
+        self.service_check(&mut Vec::new())
+            .map_err(|e| format!("unclean baseline: service check: {e}").into())
+    }
+    fn daemon_start(&mut self, case: &str) -> Result<(Group, UnixDatagram, std::path::PathBuf)> {
         let root = self.prepare_check_v2()?;
         self.boot_gateway(&[], "daemon-boot")?;
         let binary = Self::boot_binary()?;
         let daemon = binary.with_file_name("scupperd");
-        let notify_path = self.private.join("notify.sock");
+        let notify_path = self.private.join(format!("notify-{case}.sock"));
         let notify = UnixDatagram::bind(&notify_path)?;
         notify.set_nonblocking(true)?;
         let env = format!("NOTIFY_SOCKET={}", notify_path.display());
-        let mut child = self.runner.background(
+        let child = self.runner.background(
             &Invocation::new(
                 "gwhost",
                 "env",
@@ -41,64 +234,7 @@ impl Lab {
             ),
             &self.artifacts.join("daemon.stdout"),
         )?;
-        let result: Result<()> = (|| {
-            self.daemon_wait("READY", Duration::from_secs(30), |lab| {
-                Ok(lab.notifications(&notify)?.iter().any(|s| s == "READY=1"))
-            })?;
-            self.daemon_route_healthy(Duration::from_secs(60))?;
-            for case in [
-                "L6", "L7", "L13", "L16", "L17-V14", "L52", "V03", "L3", "L4",
-            ] {
-                let started = Instant::now();
-                let observed = self.daemon_fault(case, &mut child, &notify, &root);
-                self.rows.push(Row { name: format!("daemon-{case}"), wanted: daemon_wanted(case).into(), got: observed.as_ref().cloned().unwrap_or_else(|e| format!("failed: {e}")), detail: format!("elapsed_ms={}; direct host-namespace daemon; individual capture and positive control", started.elapsed().as_millis()) });
-                evidence::save_results(&self.artifacts, &self.rows)?;
-                observed?;
-            }
-            Ok(())
-        })();
-        child.signal(Signal::CONT);
-        let shutdown_before = self.daemon_snapshot();
-        let stopped = child.stop_timeout(Signal::TERM, Duration::from_secs(30));
-        let clean = root.join("var-lib/scupper/events/clean").exists();
-        self.stop_captures()?;
-        // Boot is an explicit test restoration, after shutdown was inspected.
-        if result.is_err() {
-            self.boot_gateway(&[], "daemon-restore")?;
-        }
-        result?;
-        stopped?;
-        if shutdown_before? != self.daemon_snapshot()? {
-            return fail("SIGTERM changed kernel state");
-        }
-        if !clean {
-            return fail("SIGTERM did not write the clean event marker");
-        }
-        // Re-open the durable handoff after L4's actual interface recreation.
-        self.notifications(&notify)?;
-        let mut restarted = self.runner.background(
-            &Invocation::new(
-                "gwhost",
-                "env",
-                &[
-                    &env,
-                    daemon.to_str().ok_or("daemon path")?,
-                    "--test-root",
-                    root.to_str().ok_or("root path")?,
-                ],
-            ),
-            &self.artifacts.join("daemon-restart.stdout"),
-        )?;
-        let resumed = (|| {
-            self.daemon_wait("restart READY", Duration::from_secs(30), |lab| {
-                Ok(lab.notifications(&notify)?.iter().any(|s| s == "READY=1"))
-            })?;
-            self.daemon_route_healthy(Duration::from_secs(60))?;
-            self.service_check(&mut Vec::new())
-        })();
-        restarted.stop_timeout(Signal::TERM, Duration::from_secs(30))?;
-        resumed?;
-        Ok("all daemon cases verified; measured rows, notify.jsonl, clean shutdown and recreated-link restart".into())
+        Ok((child, notify, root))
     }
     fn daemon_snapshot(&mut self) -> Result<serde_json::Value> {
         Ok(serde_json::json!({
@@ -201,7 +337,22 @@ impl Lab {
         let start_port = self.exit_port;
         let measurement = match case {
             "L6" => {
-                child.signal(Signal::STOP);
+                self.daemon_wait("pre-stall watchdog", Duration::from_secs(8), |lab| {
+                    Ok(lab.notifications(notify)?.iter().any(|s| s == "WATCHDOG=1"))
+                })?;
+                self.daemon_wait(
+                    "watchdog follows the two-second tick cadence",
+                    Duration::from_secs(3),
+                    |lab| Ok(lab.notifications(notify)?.iter().any(|s| s == "WATCHDOG=1")),
+                )?;
+                let before = read_since(&root.join("var-lib/scupper"), 0, None)
+                    .filter_map(std::result::Result::ok)
+                    .map(|e| e.seq)
+                    .max()
+                    .unwrap_or(0);
+                let hook = root.join("run/scupper/stall-tick");
+                fs::write(&hook, b"stall")?;
+                self.runner.dwell(Duration::from_millis(2200))?;
                 self.notifications(notify)?;
                 self.cmd("scupper", "ip", &["route", "del", "default"])?;
                 let (code, report) = self.check_result(&Self::boot_binary()?, root)?;
@@ -222,11 +373,32 @@ impl Lab {
                         .iter()
                         .any(|s| s == "WATCHDOG=1")
                 {
-                    return fail("SIGSTOP: repair or watchdog continued");
+                    return fail("tick stall: repair or watchdog continued");
                 }
-                child.signal(Signal::CONT);
+                child.alive()?;
+                child.assert_not_stopped()?;
+                fs::remove_file(hook)?;
                 let repaired = self.daemon_route_healthy(Duration::from_secs(10))?;
-                format!("check=3; stopped_ms=2200; stopped_watchdogs=0; repair_ms={repaired}")
+                self.daemon_wait("post-stall watchdog", Duration::from_secs(8), |lab| {
+                    Ok(lab.notifications(notify)?.iter().any(|s| s == "WATCHDOG=1"))
+                })?;
+                self.daemon_wait("L6 route event", Duration::from_secs(5), |_| {
+                    Ok(read_since(&root.join("var-lib/scupper"), before, None)
+                        .filter_map(std::result::Result::ok)
+                        .any(|e| {
+                            matches!(
+                                e.kind,
+                                scupper_proto::EventKind::Repair {
+                                    kind: scupper_proto::StepKind::RouteReplace,
+                                    result: scupper_proto::Outcome::Succeeded,
+                                    ..
+                                }
+                            )
+                        }))
+                })?;
+                format!(
+                    "check=3; tick_stall_min_ms=4400; stopped_watchdogs=0; repair_ms={repaired}"
+                )
             }
             "L7" => {
                 let marker = Self::marker()?;
@@ -255,6 +427,21 @@ impl Lab {
                 if closed > 2000 {
                     return fail(format!("L7 closure {closed} ms exceeds 2s"));
                 }
+                self.daemon_wait(
+                    "L7 all forwarding gates closed",
+                    Duration::from_secs(2),
+                    |lab| {
+                        let values = lab.daemon_sysctls()?;
+                        Ok(values
+                            .iter()
+                            .filter(|(key, _)| {
+                                key.ends_with(".forwarding")
+                                    || key.as_str() == "net.ipv4.ip_forward"
+                            })
+                            .all(|(_, value)| value == "0"))
+                    },
+                )?;
+                let all_closed = started.elapsed().as_millis();
                 self.daemon_wait("L7 restored", Duration::from_secs(12), |lab| {
                     Ok(lab
                         .cmd("scupper", "sysctl", &["-n", "net.ipv4.ip_forward"])?
@@ -266,26 +453,22 @@ impl Lab {
                 let events: Vec<_> = read_since(&root.join("var-lib/scupper"), before, None)
                     .collect::<io::Result<_>>()?;
                 if !events.iter().any(|e| {
-                    serde_json::to_value(e).is_ok_and(|v| {
-                        v.to_string().contains("flush-conntrack")
-                            || v.to_string().contains("flush_conntrack")
-                    })
+                    matches!(
+                        e.kind,
+                        scupper_proto::EventKind::Repair {
+                            kind: scupper_proto::StepKind::FlushConntrack,
+                            result: scupper_proto::Outcome::Succeeded,
+                            ..
+                        }
+                    )
                 }) {
-                    // The typed event schema spells StepKind in kebab case.
-                    let text = serde_json::to_string(&events)?;
-                    if !text
-                        .to_ascii_lowercase()
-                        .replace(['-', '_'], "")
-                        .contains("flushconntrack")
-                    {
-                        return fail("L7 missing successful conntrack-flush event");
-                    }
+                    return fail("L7 missing successful conntrack-flush event");
                 }
                 format!(
-                    "forwarding_zero_ms={closed}; restored_ms={restored}; conntrack_flush_event=true"
+                    "forwarding_zero_ms={closed}; all_gates_zero_ms={all_closed}; restored_ms={restored}; conntrack_flush_event=true"
                 )
             }
-            "L13" => self.daemon_foreign(child, &mut markers, &stem)?,
+            "L13" => self.daemon_foreign(child, &mut markers, &stem, root)?,
             "L16" => {
                 self.cmd("scupper", "ip", &["link", "set", "ex-ch1", "down"])?;
                 let down = self.daemon_wait("L16 unreachable", Duration::from_secs(8), |lab| {
@@ -343,18 +526,24 @@ impl Lab {
                 )
             }
             "L52" => {
+                child.signal(Signal::STOP);
                 self.cmd(
                     "scupper",
                     "ip",
                     &["route", "add", "198.18.0.0/24", "dev", "ex-ch1"],
                 )?;
+                let (code, report) = self.check_result(&Self::boot_binary()?, root)?;
+                if code != 3 || report["verdict"]["Degraded"].get("RouteWrong").is_none() {
+                    return fail(format!("L52 expected check 3 RouteWrong: {code}: {report}"));
+                }
+                child.signal(Signal::CONT);
                 let elapsed =
                     self.daemon_wait("extra route removed", Duration::from_secs(8), |lab| {
                         Ok(!lab
                             .cmd("scupper", "ip", &["route", "show", "table", "main"])?
                             .contains("198.18.0.0/24"))
                     })?;
-                format!("extra_route_removed_ms={elapsed}")
+                format!("check=3 RouteWrong; extra_route_removed_ms={elapsed}")
             }
             "V03" => self.daemon_sysctl_fixture(child)?,
             "L3" | "L4" => self.daemon_dead_flow(case, &mut markers, &stem)?,
@@ -423,6 +612,7 @@ impl Lab {
         child: &mut Group,
         markers: &mut Vec<String>,
         stem: &str,
+        root: &Path,
     ) -> Result<String> {
         child.signal(Signal::STOP);
         self.cmd("gwhost", "sysctl", &["-q", "-w", "net.ipv4.ip_forward=1"])?;
@@ -452,10 +642,35 @@ impl Lab {
             "scupper",
             "tc",
             &[
-                "filter", "add", "dev", "wg0", "ingress", "protocol", "all", "pref", "1",
-                "matchall", "action", "mirred", "egress", "redirect", "dev", "foreign0",
+                "filter",
+                "add",
+                "dev",
+                "wg0",
+                "ingress",
+                "protocol",
+                "all",
+                "pref",
+                "1",
+                "matchall",
+                "action",
+                "vlan",
+                "push_eth",
+                "dst_mac",
+                "02:00:00:00:13:01",
+                "src_mac",
+                "02:00:00:00:13:02",
+                "action",
+                "mirred",
+                "egress",
+                "redirect",
+                "dev",
+                "foreign0",
             ],
         )?;
+        let (code, report) = self.check_result(&Self::boot_binary()?, root)?;
+        if code != 2 {
+            return fail(format!("L13 expected check 2: {code}: {report}"));
+        }
         let control_stem = format!("{stem}-foreign-control");
         self.capture("gwhost", "foreign-host", &control_stem)?;
         let marker = Self::marker()?;
@@ -522,7 +737,7 @@ impl Lab {
                 == "1")
         })?;
         Ok(format!(
-            "detection_and_containment_ms={down}; observed_window_ms={}; bound_ms=8000; foreign_capture_control=true; redirect_removed=true",
+            "check=2; detection_and_containment_ms={down}; observed_window_ms={window}; total_elapsed_ms={}; bound_ms=8000; foreign_capture_control=true; redirect_removed=true",
             start.elapsed().as_millis()
         ))
     }
@@ -531,14 +746,26 @@ impl Lab {
         let before = self.daemon_sysctls()?;
         self.cmd("scupper", "sysctl", &["-q", "-w", "net.ipv4.ip_forward=0"])?;
         let zero = self.daemon_sysctls()?;
-        self.cmd("scupper", "sysctl", &["-q", "-w", "net.ipv4.ip_forward=1"])?;
-        let one = self.daemon_sysctls()?;
+        self.cmd(
+            "scupper",
+            "sysctl",
+            &["-q", "-w", "net.ipv4.conf.wg0.accept_redirects=1"],
+        )?;
+        let at_resume = self.daemon_sysctls()?;
+        if !before
+            .iter()
+            .any(|(key, value)| !key.ends_with("forwarding") && at_resume.get(key) != Some(value))
+        {
+            return fail("V03 positive control: no hardening drift at resume");
+        }
         fs::write(
             self.artifacts.join("V03-ip-forward.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({"before":before,"zero":zero,"one":one}))?,
+            serde_json::to_vec_pretty(
+                &serde_json::json!({"before":before,"zero":zero,"at_resume":at_resume}),
+            )?,
         )?;
         for (key, before) in &before {
-            if (zero.get(key) != Some(before) || one.get(key) != Some(before))
+            if zero.get(key) != Some(before)
                 && key != "net.ipv4.ip_forward"
                 && !key.ends_with(".forwarding")
                 && !key.ends_with(".accept_redirects")
@@ -591,12 +818,17 @@ impl Lab {
         }
         keys.sort();
         keys.dedup();
-        for key in keys {
-            values.insert(
-                key.clone(),
-                self.cmd("scupper", "sysctl", &["-n", &key])?.trim().into(),
-            );
+        let mut args = vec!["-n"];
+        args.extend(keys.iter().map(String::as_str));
+        let output = self.cmd("scupper", "sysctl", &args)?;
+        let observed: Vec<_> = output.lines().map(str::trim).collect();
+        if observed.len() != keys.len() {
+            return fail("incomplete daemon sysctl inventory");
         }
+        values.extend(
+            keys.into_iter()
+                .zip(observed.into_iter().map(str::to_owned)),
+        );
         Ok(values)
     }
     fn daemon_dead_flow(
@@ -628,6 +860,8 @@ impl Lab {
                 Ok(true)
             },
         )?;
+        let server_log = artifact_root.join(format!("{stem}-server.jsonl"));
+        let sent_before = flow_counts(&server_log)?.0;
         let started = Instant::now();
         if case == "L3" {
             self.runner.input(&Invocation::new("wan", "nft", &["-f", "-"]), Some(b"table inet daemon_exit_down { chain forward { type filter hook forward priority -100; ip daddr 203.0.113.2 udp dport 51820 drop; } }\n"))?;
@@ -683,10 +917,16 @@ impl Lab {
                 .trim()
                 .parse()?;
         }
+        self.daemon_wait(
+            "remote sender continued after fault",
+            Duration::from_secs(3),
+            |_| Ok(flow_counts(&server_log)?.0 > sent_before),
+        )?;
         client.stop(Signal::TERM)?;
         server.stop(Signal::TERM)?;
+        let sent_after = flow_counts(&server_log)?.0;
         Ok(format!(
-            "fault_ms={}; persistent_bidirectional_control=true; remote_sender_continued=true",
+            "fault_ms={}; persistent_bidirectional_control=true; remote_sender_continued=true; remote_sent_before={sent_before}; remote_sent_after={sent_after}",
             started.elapsed().as_millis()
         ))
     }
@@ -717,12 +957,16 @@ fn contains_marker(bytes: &[u8], marker: &str) -> Result<bool> {
 
 fn daemon_wanted(case: &str) -> &'static str {
     match case {
-        "L6" => "check 3; SIGSTOP no repair/watchdog; SIGCONT route repaired <=10s",
+        "L6" => {
+            "check 3 and route event; tick-only stall stops watchdog while process lives; watchdog resumes; repair <=10s"
+        }
         "L7" => "forwarding 0 <=2000ms; exact restore and conntrack flush; zero uplink leaks",
-        "L13" => "foreign link down and redirect removed <=8000ms; foreign-side positive control",
+        "L13" => {
+            "check 2; foreign link down and redirect removed <=8000ms; packet window and total elapsed separate"
+        }
         "L16" => "single exit down 4 then active route/healthy service by itself",
         "L17-V14" => "name restored <=8000ms; identical inode; healthy traffic",
-        "L52" => "extra main route removed <=8000ms",
+        "L52" => "check 3 RouteWrong; extra main route removed <=8000ms",
         "V03" => "ip_forward changes only forwarding/accept_redirects; full hardening reapplied",
         "L3" | "L4" => "persistent established flow and remote sender; zero uplink leaks",
         _ => "unknown",

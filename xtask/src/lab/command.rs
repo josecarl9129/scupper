@@ -223,6 +223,24 @@ impl Group {
             let _ = kill_process_group(pid, signal);
         }
     }
+    pub fn assert_not_stopped(&self) -> Result<()> {
+        // timeout supervises the daemon; inspect its descendants as well.
+        let pid = self.child.id();
+        let children = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))?;
+        if children.split_whitespace().next().is_none() {
+            return fail("daemon supervisor has no child");
+        }
+        for child in children.split_whitespace() {
+            let stat = std::fs::read_to_string(format!("/proc/{child}/stat"))?;
+            if stat
+                .rsplit_once(") ")
+                .is_none_or(|(_, tail)| tail.starts_with(['T', 't', 'Z']))
+            {
+                return fail("daemon is stopped or exited during tick-only stall");
+            }
+        }
+        Ok(())
+    }
     pub fn alive(&mut self) -> Result<()> {
         if let Some(status) = self.child.try_wait()? {
             self.done = true;
