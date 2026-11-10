@@ -535,7 +535,6 @@ impl LogHandle {
         }
         let mut target = disk.shared.lock();
         // Local IDs have their own space and never describe a gap on disk.
-        target.seq = target.seq.max(queue.seq);
         let replayed = queue
             .events
             .iter()

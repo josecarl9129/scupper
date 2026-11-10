@@ -94,6 +94,7 @@ fn initialize(
     gateway: GatewayId,
     log: crate::events::LogHandle,
     origin: Instant,
+    canon_deadline: Instant,
 ) -> io::Result<(Machine<'_>, Arc<NetnsHandle>, Config)> {
     let state = StateFile::open(deps.state_root, None)?;
     let StateRead::Present(saved) = state.read()? else {
@@ -120,8 +121,11 @@ fn initialize(
             .map_err(io::Error::other)?,
     );
     let rendered = render_netns(&site, &gateway, &stamp).map_err(io::Error::other)?;
-    let (want, _) =
-        canon::netns_rulesets(deps.system, &held, &rendered).map_err(io::Error::other)?;
+    let want = canon::prepare_netns_ruleset(deps.system, &held, &rendered, canon_deadline)
+        .map_err(|error| match error {
+            crate::verdict::ProbeError::Timeout => io::Error::new(io::ErrorKind::TimedOut, error),
+            _ => io::Error::other(error),
+        })?;
     let fingerprint = canon::fingerprint(&want).map_err(io::Error::other)?;
     let config = Config {
         site,
@@ -158,7 +162,7 @@ fn initialize(
         run_root: config.run_root.clone(),
         lock_wait: config.lock_wait,
     };
-    let machine = Reconciler::new(
+    let mut machine = Reconciler::new(
         kernel,
         state,
         log,
@@ -166,6 +170,7 @@ fn initialize(
         held.clone(),
         Box::new(move || (MonoTime(origin.elapsed()), unix())) as Box<dyn Fn() -> (MonoTime, u64)>,
     )?;
+    machine.resume_existing();
     Ok((machine, held, config))
 }
 
@@ -299,6 +304,7 @@ pub fn run(options: &Options, stop: &AtomicBool) -> io::Result<()> {
         audit,
         notify,
         running: None,
+        pending_canon: false,
         probes: probes::Probes::new(options.probe_binary.clone(), origin)
             .with_uplink(uplink_addresses(&system).unwrap_or_default()),
         setup_at: None,
@@ -317,6 +323,7 @@ struct Runtime<'a> {
     audit: Audit,
     notify: notify::Notify,
     running: Option<(Machine<'a>, Arc<NetnsHandle>, Config)>,
+    pending_canon: bool,
     probes: probes::Probes,
     edge_logged: bool,
     setup_at: Option<Instant>,
@@ -335,6 +342,35 @@ impl<'a> Runtime<'a> {
             #[cfg(feature = "testing")]
             secret_owner: 0,
         }
+    }
+}
+impl Runtime<'_> {
+    fn initialize_until(&mut self, deadline: Instant) {
+        self.running = match initialize(
+            self.deps(),
+            self.gateway.clone(),
+            self.audit.handle(),
+            self.origin,
+            deadline,
+        ) {
+            Ok(machine) => {
+                self.pending_canon = false;
+                Some(machine)
+            }
+            Err(error) => {
+                self.pending_canon = error.kind() == io::ErrorKind::TimedOut;
+                eprintln!("scupperd: reconciler startup refused: {error}");
+                let _ = self.audit.handle().emit(
+                    EventKind::DriftDetected {
+                        object: scupper_proto::ObjectKind::Unknown,
+                        reason: scupper_proto::Reason::ObservationUnknown,
+                    },
+                    Actor::Daemon,
+                    None,
+                );
+                None
+            }
+        };
     }
 }
 impl DaemonDeps for Runtime<'_> {
@@ -361,26 +397,7 @@ impl DaemonDeps for Runtime<'_> {
         }
     }
     fn initialize(&mut self) {
-        self.running = match initialize(
-            self.deps(),
-            self.gateway.clone(),
-            self.audit.handle(),
-            self.origin,
-        ) {
-            Ok(machine) => Some(machine),
-            Err(error) => {
-                eprintln!("scupperd: reconciler startup refused: {error}");
-                let _ = self.audit.handle().emit(
-                    EventKind::DriftDetected {
-                        object: scupper_proto::ObjectKind::Unknown,
-                        reason: scupper_proto::Reason::ObservationUnknown,
-                    },
-                    Actor::Daemon,
-                    None,
-                );
-                None
-            }
-        };
+        self.initialize_until(Instant::now() + canon::CANON_TIMEOUT + crate::system::EXEC_TIMEOUT);
     }
     fn run_root(&self) -> &Path {
         &self.options.run_root
@@ -428,6 +445,15 @@ impl DaemonDeps for Runtime<'_> {
     #[allow(clippy::too_many_lines)]
     fn tick(&mut self, stop: &AtomicBool) -> Option<crate::reconcile::TickReport> {
         let now = Instant::now();
+        // A cold canonicalization timeout is Unknown, not an invalid boot
+        // handoff. Poll its existing worker and contain without consuming a boot.
+        if self.pending_canon && !stop.load(Ordering::Relaxed) {
+            self.initialize_until(now);
+            if self.pending_canon {
+                close_only(&self.deps(), self.options);
+                return Some(crate::reconcile::TickReport::default());
+            }
+        }
         #[cfg(feature = "testing")]
         while self.options.run_root.join("stall-tick").exists() && !stop.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(25));
@@ -471,7 +497,7 @@ impl DaemonDeps for Runtime<'_> {
                 }
 
                 if !round.paths.is_empty() {
-                    machine.submit_probe_round(round.paths);
+                    machine.submit_probe_outcomes(round.paths);
                 }
                 if round.exit_ok == Some(false) && round.setup_failures == 0 {
                     let _ = audit.handle().emit(

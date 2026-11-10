@@ -240,13 +240,14 @@ pub struct Reconciler<K, S, C> {
     persisted: State,
     held: Arc<NetnsHandle>,
     clock: C,
-    probe_rounds: Vec<BTreeMap<ExitId, bool>>,
+    probe_rounds: Vec<BTreeMap<ExitId, scupper_core::failover::ProbeOutcome>>,
     actions: Vec<FailoverAction>,
     verdict: Option<VerdictCode>,
     forwarding: bool,
     deadline: Option<Instant>,
     // Evidence only: no reservations or debounce are committed by emergency work.
     emergency_steps: Vec<Step>,
+    startup: bool,
 }
 impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
     /// Resume from durable selection/quarantine, starting failover qualification afresh.
@@ -295,6 +296,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             forwarding: false,
             deadline: None,
             emergency_steps: vec![],
+            startup: true,
         })
     }
     /// Adapter access for lifecycle updates such as edge's new namespace path.
@@ -328,7 +330,64 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
     }
     /// Queue one complete probe round, preserving batch boundaries and order.
     pub fn submit_probe_round(&mut self, batch: BTreeMap<ExitId, bool>) {
+        self.submit_probe_outcomes(
+            batch
+                .into_iter()
+                .map(|(id, result)| (id, result.into()))
+                .collect(),
+        );
+    }
+    /// Queue a complete round with explicit inconclusive setup outcomes.
+    pub fn submit_probe_outcomes(
+        &mut self,
+        batch: BTreeMap<ExitId, scupper_core::failover::ProbeOutcome>,
+    ) {
         self.probe_rounds.push(batch);
+    }
+    /// Verify a booted namespace and retain its live route on daemon attachment.
+    /// No kernel operations run here. Failed/unknown observations leave startup closed.
+    pub fn resume_existing(&mut self) {
+        if !std::mem::take(&mut self.startup)
+            || self.latch.is_some()
+            || self.persisted.selection == Selection::Disconnected
+        {
+            return;
+        }
+        let safety = self.kernel.observe(&self.held);
+        let observed =
+            self.kernel
+                .observe_rest(&self.held, safety, Instant::now() + Duration::from_secs(20));
+        if !observed.complete
+            || !observed.safety_complete
+            || observed.model.namespace != planner::NamespaceState::Ready
+        {
+            return;
+        }
+        for (exit, iface) in &self.failover_config.exits {
+            let route = scupper_core::render::RouteTarget::Exit(iface.clone());
+            let Ok(desired) = self.config.desired(&self.persisted.selection, &route) else {
+                continue;
+            };
+            let expected = KernelModel::desired(&desired);
+            if observed.model.default_v4 == expected.default_v4
+                && observed.model.default_v6 == expected.default_v6
+                && !safety_drift(&observed.model, &desired, false)
+                && observed.model.route_ready(&desired, &route)
+                && observed.handshakes.get(exit).is_some_and(|age| {
+                    age.is_some_and(|age| age <= self.failover_config.handshake_stale)
+                })
+                && observed
+                    .exit_links
+                    .get(exit)
+                    .is_some_and(|link| link.link_up && link.peer_present && link.key_present)
+                && self
+                    .failover
+                    .resume_verified((self.clock)().0, exit, &self.failover_config)
+            {
+                self.actions.clear();
+                break;
+            }
+        }
     }
     /// Current memory quarantine, including a latch whose durable write failed.
     pub fn latch(&self) -> Option<&Latch> {
@@ -350,6 +409,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
     /// Observe, plan and execute once, with bounded same-tick failure recovery.
     #[allow(clippy::manual_let_else, clippy::single_match_else)] // Keep lock-failure reporting together.
     pub fn tick(&mut self) -> TickReport {
+        self.startup = false;
         let mut report = TickReport {
             complete: true,
             ..TickReport::default()
@@ -560,7 +620,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             self.feed(now, FailoverInput::LinkState(exit, state));
         }
         for round in std::mem::take(&mut self.probe_rounds) {
-            self.feed(now, FailoverInput::PathProbe(round));
+            self.feed(now, FailoverInput::ProbeRound(round));
         }
         self.feed(now, FailoverInput::Tick);
         let Ok(desired) = self.desired() else {

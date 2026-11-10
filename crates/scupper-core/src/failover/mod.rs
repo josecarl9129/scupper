@@ -2,7 +2,8 @@
 //!
 //! The caller supplies nondecreasing monotonic times and public observations.
 //! No clocks, probes, route writes, key reads or other I/O occur here. Start closed
-//! with [`Failover::new`], then execute the returned actions in order. The executor
+//! with [`Failover::new`], or resume a verified live handoff with
+//! [`Failover::resume_verified`]. Otherwise execute the initial actions in order. The executor
 //! must also reapply [`Failover::desired_route`] on every reconciliation
 //! tick, including after route drift while closed. Every route
 //! target comes from the supplied configuration or is unreachable (I1).
@@ -49,8 +50,8 @@ pub struct Failover {
 
 impl Failover {
     /// Starts unreachable with Unknown health and a closure interval beginning at `now`.
-    /// Execute the initial route/flush actions on every start, including restarts
-    /// with persisted intent; Pin never inherits a previous process's exit route.
+    /// Execute the initial route/flush actions unless the caller verifies the live
+    /// handoff and calls `resume_verified` before the first step.
     #[must_use]
     pub fn new(
         now: MonoTime,
@@ -79,6 +80,26 @@ impl Failover {
             actions.push(FailoverAction::SetExitsDown);
         }
         (machine, actions)
+    }
+
+    /// Resume a verified live route without generating route or conntrack actions.
+    /// The caller must verify the namespace, policy, live defaults and exit readiness.
+    /// Returns false when the route conflicts with administrative selection.
+    pub fn resume_verified(&mut self, now: MonoTime, exit: &ExitId, cfg: &FailoverConfig) -> bool {
+        if !self.candidates(cfg).contains(&exit) {
+            return false;
+        }
+        let Some((_, iface)) = cfg.exits.iter().find(|(id, _)| id == exit) else {
+            return false;
+        };
+        self.active = RouteTarget::Exit(iface.clone());
+        self.active_exit = Some(exit.clone());
+        self.health
+            .insert(exit.clone(), ExitHealth::Healthy { since: now });
+        self.fail_closed_since = None;
+        self.closed_reason = None;
+        self.last_activation = Some(now);
+        true
     }
 
     /// Desired route to apply at startup and on every reconciliation tick, even
@@ -144,6 +165,27 @@ impl Failover {
     ) -> (Self, Vec<FailoverAction>) {
         let mut next = self.clone();
         next.sync_config(cfg);
+        let input = if let FailoverInput::ProbeRound(results) = input {
+            let mut paths = BTreeMap::new();
+            for (id, outcome) in results {
+                match outcome {
+                    ProbeOutcome::Inconclusive => {
+                        if let Some(signals) = next.signals.get_mut(&id) {
+                            signals.probe = None;
+                        }
+                    }
+                    ProbeOutcome::Success => {
+                        paths.insert(id, true);
+                    }
+                    ProbeOutcome::Failure => {
+                        paths.insert(id, false);
+                    }
+                }
+            }
+            FailoverInput::PathProbe(paths)
+        } else {
+            input
+        };
         next.switches
             .retain(|at| now.elapsed_since(*at) <= FLAP_WINDOW);
         if next
@@ -186,7 +228,7 @@ impl Failover {
                     signals.link = *link;
                 }
             }
-            FailoverInput::PathProbe(_) | FailoverInput::Tick => {}
+            FailoverInput::PathProbe(_) | FailoverInput::ProbeRound(_) | FailoverInput::Tick => {}
         }
         for (id, signals) in &mut self.signals {
             let Some(state) = self.health.get_mut(id) else {

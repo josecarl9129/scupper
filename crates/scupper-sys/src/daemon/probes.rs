@@ -4,7 +4,7 @@ use crate::{
     probe_child::{self, ProbeExec, ProbeKind, ProbeRequest, ProbeResult},
     system::{ExecError, ExecOutput},
 };
-use scupper_core::config::ExitId;
+use scupper_core::{config::ExitId, failover::ProbeOutcome};
 use std::{
     collections::BTreeMap,
     fs::File,
@@ -40,7 +40,7 @@ impl ProbeExec for ProbeCommand {
 #[derive(Debug)]
 pub struct Round {
     /// Path results, including failed child setup.
-    pub paths: BTreeMap<ExitId, bool>,
+    pub paths: BTreeMap<ExitId, ProbeOutcome>,
     /// Exit-IP observations completed successfully.
     pub exit_ok: Option<bool>,
     /// Number of child setup failures in this round.
@@ -143,11 +143,7 @@ impl Probes {
 }
 fn failed_round(exit: &ExitId, kind: ProbeKind) -> Round {
     Round {
-        paths: if kind == ProbeKind::Path {
-            BTreeMap::from([(exit.clone(), false)])
-        } else {
-            BTreeMap::new()
-        },
+        paths: BTreeMap::from([(exit.clone(), ProbeOutcome::Inconclusive)]),
         exit_ok: (kind == ProbeKind::ExitIp).then_some(false),
         setup_failures: 1,
     }
@@ -158,11 +154,18 @@ fn spawn(
     requests: Vec<(ExitId, ProbeRequest)>,
     uplink: Vec<IpAddr>,
 ) -> std::io::Result<Receiver<Round>> {
+    spawn_with(ProbeCommand(binary), held, requests, uplink)
+}
+fn spawn_with(
+    exec: impl ProbeExec + Send + 'static,
+    held: Arc<NetnsHandle>,
+    requests: Vec<(ExitId, ProbeRequest)>,
+    uplink: Vec<IpAddr>,
+) -> std::io::Result<Receiver<Round>> {
     let (send, receive) = mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("scupper-probe-wait".into())
         .spawn(move || {
-            let exec = ProbeCommand(binary);
             let mut round = Round {
                 paths: BTreeMap::new(),
                 exit_ok: None,
@@ -174,10 +177,13 @@ fn spawn(
                 let setup = matches!(&result, Ok(ProbeResult::Setup { .. }) | Err(_))
                     && !matches!(&result, Err(crate::verdict::ProbeError::Timeout));
                 round.setup_failures += u64::from(setup);
-                if request.kind == ProbeKind::ExitIp {
+                if setup || (request.kind == ProbeKind::ExitIp && uplink.is_empty()) {
+                    round.paths.insert(exit, ProbeOutcome::Inconclusive);
+                    if !setup { round.setup_failures += 1; }
+                } else if request.kind == ProbeKind::ExitIp {
                     round.exit_ok = Some(matches!(result, Ok(ProbeResult::Success { ip: Some(ip) }) if !uplink.is_empty() && !uplink.contains(&ip)));
                 } else {
-                    round.paths.insert(exit, matches!(result, Ok(ProbeResult::Success { .. })));
+                    round.paths.insert(exit, matches!(result, Ok(ProbeResult::Success { .. })).into());
                 }
             }
             let _ = send.send(round);
@@ -189,12 +195,38 @@ fn spawn(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::probe_child::{ProbeCredentials, ProbeOutcome, Url};
+    use crate::probe_child::{ProbeCredentials, ProbeOutcome as ChildOutcome, Url};
     use std::{
         fs,
         os::unix::fs::PermissionsExt,
         sync::atomic::{AtomicUsize, Ordering},
     };
+    // Interpret fixtures explicitly: concurrently forked children can briefly
+    // inherit an executable script's write fd and make direct exec fail ETXTBSY.
+    struct ShellProbe(PathBuf);
+    impl ProbeExec for ShellProbe {
+        fn accepts_test_namespace(&self) -> bool {
+            true
+        }
+        fn execute_probe(
+            &self,
+            json: &str,
+            namespace: File,
+            timeout: Duration,
+        ) -> Result<ExecOutput, ExecError> {
+            let mut command = std::process::Command::new("/bin/sh");
+            command.arg(&self.0).args(["probe", json]);
+            crate::system::execute_file_command(command, namespace, timeout)
+        }
+    }
+    fn spawn(
+        binary: PathBuf,
+        held: Arc<NetnsHandle>,
+        requests: Vec<(ExitId, ProbeRequest)>,
+        uplink: Vec<IpAddr>,
+    ) -> std::io::Result<Receiver<Round>> {
+        super::spawn_with(ShellProbe(binary), held, requests, uplink)
+    }
     fn script(contents: &str) -> PathBuf {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -223,7 +255,7 @@ mod tests {
     }
     #[test]
     fn round_is_delivered_once_after_every_child_completes() {
-        let outcome = ProbeOutcome {
+        let outcome = ChildOutcome {
             result: ProbeResult::Success { ip: None },
             credentials: Some(ProbeCredentials {
                 uids: [99; 4],
@@ -256,7 +288,10 @@ mod tests {
         let round = receiver.recv_timeout(Duration::from_secs(3)).unwrap();
         assert_eq!(
             round.paths,
-            BTreeMap::from([(ExitId("one".into()), true), (ExitId("two".into()), true)])
+            BTreeMap::from([
+                (ExitId("one".into()), ProbeOutcome::Success),
+                (ExitId("two".into()), ProbeOutcome::Success)
+            ])
         );
         assert!(receiver.try_recv().is_err());
         fs::remove_dir_all(binary.parent().unwrap()).unwrap();
@@ -287,7 +322,10 @@ mod tests {
             assert!(started.elapsed() < Duration::from_secs(3));
         };
         assert!(iterations > 10);
-        assert_eq!(round.paths, BTreeMap::from([(ExitId("one".into()), false)]));
+        assert_eq!(
+            round.paths,
+            BTreeMap::from([(ExitId("one".into()), ProbeOutcome::Failure)])
+        );
         assert!(started.elapsed() < Duration::from_secs(2));
         std::thread::sleep(Duration::from_millis(1100));
         assert!(!binary.with_extension("survived").exists());
@@ -309,21 +347,23 @@ mod tests {
             .recv_timeout(Duration::from_secs(3))
             .unwrap();
             assert_eq!(round.setup_failures, 1);
-            if kind == ProbeKind::Path {
-                assert_eq!(round.paths.get(&ExitId("one".into())), Some(&false));
-            } else {
-                assert_eq!(round.exit_ok, Some(false));
-            }
+            assert_eq!(
+                round.paths.get(&ExitId("one".into())),
+                Some(&ProbeOutcome::Inconclusive)
+            );
         }
         let fallback = failed_round(&ExitId("one".into()), ProbeKind::Path);
-        assert_eq!(fallback.paths.get(&ExitId("one".into())), Some(&false));
+        assert_eq!(
+            fallback.paths.get(&ExitId("one".into())),
+            Some(&ProbeOutcome::Inconclusive)
+        );
         assert_eq!(fallback.setup_failures, 1);
     }
     #[test]
     fn exit_ip_must_differ_from_real_uplink_addresses() {
         let held = Arc::new(crate::netns::testing::handle().unwrap());
         for (observed, expected) in [("192.0.2.1", false), ("198.51.100.1", true)] {
-            let outcome = ProbeOutcome {
+            let outcome = ChildOutcome {
                 result: ProbeResult::Success {
                     ip: Some(observed.parse().unwrap()),
                 },

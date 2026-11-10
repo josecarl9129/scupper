@@ -14,26 +14,184 @@ use std::{
     io::{self, Write},
     os::unix::net::UnixDatagram,
     path::Path,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
+
+const CASES: [&str; 9] = [
+    "L6", "L7", "L13", "L16", "L17-V14", "L52", "V03", "L3", "L4",
+];
+
+// Drain notifications continuously, including while fault commands or probes block.
+struct NotifyCapture {
+    messages: Arc<Mutex<Vec<String>>>,
+    stop: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<io::Result<()>>>,
+}
+impl NotifyCapture {
+    fn drain(&self) -> Result<Vec<String>> {
+        if self
+            .worker
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+        {
+            return fail("notify artifact worker stopped");
+        }
+        Ok(std::mem::take(
+            &mut *self.messages.lock().map_err(|_| "notify lock poisoned")?,
+        ))
+    }
+
+    fn start(socket: UnixDatagram, path: &Path) -> Result<Self> {
+        socket.set_read_timeout(Some(Duration::from_millis(25)))?;
+        let mut file = fs::File::create(path)?;
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let pending = messages.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = stop.clone();
+        let worker = std::thread::spawn(move || {
+            let mut bytes = vec![0; 65536];
+            loop {
+                match socket.recv(&mut bytes) {
+                    Ok(len) => {
+                        let message = String::from_utf8_lossy(&bytes[..len]).into_owned();
+                        writeln!(
+                            file,
+                            "{}",
+                            serde_json::json!({
+                                "at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis(),
+                                "message": message
+                            })
+                        )?;
+                        pending
+                            .lock()
+                            .map_err(|_| io::Error::other("notify lock poisoned"))?
+                            .push(message);
+                    }
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        if stopping.load(Ordering::Relaxed) {
+                            return file.sync_all();
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        });
+        Ok(Self {
+            messages,
+            stop,
+            worker: Some(worker),
+        })
+    }
+}
+impl Drop for NotifyCapture {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
 
 // Own both the daemon and fixture cleanup before any fallible fault operation.
 struct DaemonGuard<'a> {
     lab: &'a mut Lab,
     child: Option<Group>,
     armed: bool,
+    case: String,
+    notify: Option<NotifyCapture>,
 }
 impl DaemonGuard<'_> {
     fn run(&mut self, case: &str) -> Result<String> {
-        let (child, notify, root) = self.lab.daemon_start(case)?;
-        self.child = Some(child);
+        let root = self.lab.prepare_check_v2()?;
+        self.lab.boot_gateway(&[], "daemon-boot")?;
+        self.lab.service_check(&mut Vec::new())?;
+        let stem = format!("daemon-{case}-startup");
+        let marker = Lab::marker()?;
+        let port = 8082
+            + u16::try_from(
+                CASES
+                    .iter()
+                    .position(|c| *c == case)
+                    .ok_or("unknown daemon case")?,
+            )?;
+        let mut server = self
+            .lab
+            .daemon_flow_port("server", "internet", &marker, &stem, port)?;
         self.lab
-            .daemon_wait("READY", Duration::from_secs(30), |lab| {
-                Ok(lab.notifications(&notify)?.iter().any(|s| s == "READY=1"))
+            .daemon_wait("startup TCP listener", Duration::from_secs(5), |lab| {
+                Ok(lab
+                    .cmd("internet", "ss", &["-ltnH"])?
+                    .contains(&format!(":{port}")))
             })?;
-        self.lab.daemon_route_healthy(Duration::from_secs(60))?;
+        let mut client = self
+            .lab
+            .daemon_flow_port("client", "client", &marker, &stem, port)?;
+        let flow = self.lab.artifacts.join(format!("{stem}-client.jsonl"));
+        self.lab
+            .daemon_wait("pre-start established flow", Duration::from_secs(5), |_| {
+                Ok(flow_counts(&flow)?.1 >= 5)
+            })?;
+        let before = self.lab.daemon_snapshot()?;
+        let first_seq = read_since(&root.join("var-lib/scupper"), 0, None)
+            .filter_map(std::result::Result::ok)
+            .map(|event| event.seq)
+            .max()
+            .unwrap_or(0);
+        let (child, notify) = self.lab.daemon_start(case, &root)?;
+        self.child = Some(child);
+        self.notify = Some(notify);
+        let notify = self.notify.as_ref().ok_or("missing notify capture")?;
+        self.lab.daemon_ready_tick(notify)?;
+        self.lab.service_check(&mut Vec::new())?;
+        if before != self.lab.daemon_snapshot()? {
+            return fail("daemon start changed healthy kernel state");
+        }
+        self.child
+            .as_mut()
+            .ok_or("missing daemon")?
+            .stop_timeout(Signal::TERM, Duration::from_secs(30))?;
+        if before != self.lab.daemon_snapshot()? {
+            return fail("SIGTERM changed healthy kernel state");
+        }
+        notify.drain()?;
+        drop(self.child.take());
+        self.child = Some(self.lab.daemon_spawn(case, &root, "restart")?);
+        self.lab.daemon_ready_tick(notify)?;
+        self.lab.service_check(&mut Vec::new())?;
+        if before != self.lab.daemon_snapshot()? {
+            return fail("daemon restart changed healthy kernel state");
+        }
+        self.lab.runner.dwell(Duration::from_millis(500))?;
+        client.stop(Signal::TERM)?;
+        server.stop(Signal::TERM)?;
+        verify_continuity(&flow)?;
+        verify_continuity(&self.lab.artifacts.join(format!("{stem}-server.jsonl")))?;
+        for event in read_since(&root.join("var-lib/scupper"), first_seq, None)
+            .filter_map(std::result::Result::ok)
+        {
+            if matches!(
+                event.kind,
+                scupper_proto::EventKind::Repair {
+                    kind: scupper_proto::StepKind::ForwardingOff
+                        | scupper_proto::StepKind::RouteReplace
+                        | scupper_proto::StepKind::FlushConntrack,
+                    ..
+                }
+            ) {
+                return fail("daemon startup/restart executed a closing repair");
+            }
+        }
         let child = self.child.as_mut().ok_or("missing daemon")?;
-        let observed = self.lab.daemon_fault(case, child, &notify, &root)?;
+        let observed = self.lab.daemon_fault(case, child, notify, &root)?;
         let before = self.lab.daemon_snapshot()?;
         child.stop_timeout(Signal::TERM, Duration::from_secs(30))?;
         if before != self.lab.daemon_snapshot()? {
@@ -45,28 +203,10 @@ impl DaemonGuard<'_> {
         // L4 must also survive reopening the durable owned-link handoff.
         if case == "L4" {
             drop(self.child.take());
-            let binary = Lab::boot_binary()?.with_file_name("scupperd");
-            let notify_path = self.lab.private.join(format!("notify-{case}.sock"));
-            let env = format!("NOTIFY_SOCKET={}", notify_path.display());
-            self.lab.notifications(&notify)?;
-            self.child = Some(self.lab.runner.background(
-                &Invocation::new(
-                    "gwhost",
-                    "env",
-                    &[
-                        &env,
-                        binary.to_str().ok_or("daemon path")?,
-                        "--test-root",
-                        root.to_str().ok_or("root path")?,
-                    ],
-                ),
-                &self.lab.artifacts.join("daemon-restart.stdout"),
-            )?);
-            self.lab
-                .daemon_wait("restart READY", Duration::from_secs(30), |lab| {
-                    Ok(lab.notifications(&notify)?.iter().any(|s| s == "READY=1"))
-                })?;
-            self.lab.daemon_route_healthy(Duration::from_secs(60))?;
+            notify.drain()?;
+            self.child = Some(self.lab.daemon_spawn(case, &root, "recreated-restart")?);
+            self.lab.daemon_ready_tick(notify)?;
+            self.lab.service_check(&mut Vec::new())?;
         }
         Ok(observed)
     }
@@ -87,6 +227,16 @@ impl DaemonGuard<'_> {
             let _ = child.stop_timeout(Signal::TERM, Duration::from_secs(5));
             drop(child); // Group kills/reaps on any failed graceful stop.
         }
+        if let Some(notify) = self.notify.take() {
+            drop(notify);
+        }
+        let saved = save_event_artifacts(
+            &self.lab.private.join("boot-root/var-lib/scupper/events"),
+            &self
+                .lab
+                .artifacts
+                .join(format!("daemon-{}/events", self.case)),
+        );
         let _ = fs::remove_file(self.lab.private.join("boot-root/run/scupper/stall-tick"));
         let captures = self.lab.stop_captures();
         // Absent resources are fine. Verify the baseline after ordered boot.
@@ -123,7 +273,7 @@ impl DaemonGuard<'_> {
         self.lab.runner.cleanup = cleanup;
         self.lab.runner.phase = phase;
         self.lab.runner.whole = whole;
-        captures.and(restored)
+        saved.and(captures).and(restored)
     }
 }
 impl Drop for DaemonGuard<'_> {
@@ -135,9 +285,7 @@ impl Drop for DaemonGuard<'_> {
 impl Lab {
     pub(super) fn daemon_case(&mut self) -> Result<String> {
         let mut failures = Vec::new();
-        for case in [
-            "L6", "L7", "L13", "L16", "L17-V14", "L52", "V03", "L3", "L4",
-        ] {
+        for case in CASES {
             self.runner.phase = Instant::now() + Duration::from_secs(180);
             let started = Instant::now();
             let observed = self
@@ -170,6 +318,8 @@ impl Lab {
             lab: self,
             child: None,
             armed: true,
+            case: case.into(),
+            notify: None,
         };
         let result = guard.run(case);
         let cleanup = guard.finish();
@@ -212,16 +362,24 @@ impl Lab {
         self.service_check(&mut Vec::new())
             .map_err(|e| format!("unclean baseline: service check: {e}").into())
     }
-    fn daemon_start(&mut self, case: &str) -> Result<(Group, UnixDatagram, std::path::PathBuf)> {
-        let root = self.prepare_check_v2()?;
-        self.boot_gateway(&[], "daemon-boot")?;
-        let binary = Self::boot_binary()?;
-        let daemon = binary.with_file_name("scupperd");
+    fn daemon_start(&mut self, case: &str, root: &Path) -> Result<(Group, NotifyCapture)> {
+        let artifacts = self.artifacts.join(format!("daemon-{case}"));
+        fs::create_dir_all(&artifacts)?;
         let notify_path = self.private.join(format!("notify-{case}.sock"));
-        let notify = UnixDatagram::bind(&notify_path)?;
-        notify.set_nonblocking(true)?;
-        let env = format!("NOTIFY_SOCKET={}", notify_path.display());
-        let child = self.runner.background(
+        let notify = NotifyCapture::start(
+            UnixDatagram::bind(&notify_path)?,
+            &artifacts.join("notify.jsonl"),
+        )?;
+        let child = self.daemon_spawn(case, root, "start")?;
+        Ok((child, notify))
+    }
+    fn daemon_spawn(&mut self, case: &str, root: &Path, stage: &str) -> Result<Group> {
+        let daemon = Self::boot_binary()?.with_file_name("scupperd");
+        let env = format!(
+            "NOTIFY_SOCKET={}",
+            self.private.join(format!("notify-{case}.sock")).display()
+        );
+        self.runner.background(
             &Invocation::new(
                 "gwhost",
                 "env",
@@ -232,9 +390,24 @@ impl Lab {
                     root.to_str().ok_or("root path")?,
                 ],
             ),
-            &self.artifacts.join("daemon.stdout"),
+            &self.artifacts.join(format!("daemon-{case}/{stage}.stdout")),
+        )
+    }
+    fn daemon_ready_tick(&mut self, notify: &NotifyCapture) -> Result<()> {
+        let mut ready = false;
+        let mut complete = false;
+        self.daemon_wait(
+            "READY and first complete tick",
+            Duration::from_secs(40),
+            |_| {
+                for message in notify.drain()? {
+                    ready |= message == "READY=1";
+                    complete |= message == "WATCHDOG=1";
+                }
+                Ok(ready && complete)
+            },
         )?;
-        Ok((child, notify, root))
+        Ok(())
     }
     fn daemon_snapshot(&mut self) -> Result<serde_json::Value> {
         Ok(serde_json::json!({
@@ -244,28 +417,6 @@ impl Lab {
             "links": self.cmd("scupper", "ip", &["-j", "link", "show"])?,
             "sysctls": self.daemon_sysctls()?,
         }))
-    }
-    fn notifications(&self, socket: &UnixDatagram) -> Result<Vec<String>> {
-        let mut messages = Vec::new();
-        let mut bytes = [0; 128];
-        loop {
-            match socket.recv(&mut bytes) {
-                Ok(len) => {
-                    let message = std::str::from_utf8(&bytes[..len])?.to_owned();
-                    writeln!(
-                        fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(self.artifacts.join("notify.jsonl"))?,
-                        "{}",
-                        serde_json::json!({"at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis(), "message": message})
-                    )?;
-                    messages.push(message);
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(messages),
-                Err(e) => return Err(e.into()),
-            }
-        }
     }
     fn daemon_wait(
         &mut self,
@@ -295,11 +446,23 @@ impl Lab {
         })
     }
     fn daemon_flow(&mut self, mode: &str, ns: &str, marker: &str, stem: &str) -> Result<Group> {
-        let address = if mode == "udp" {
-            format!("{}:8080", A.internet.peer)
-        } else {
-            format!("{}:8081", A.internet.peer)
-        };
+        self.daemon_flow_port(
+            mode,
+            ns,
+            marker,
+            stem,
+            if mode == "udp" { 8080 } else { 8081 },
+        )
+    }
+    fn daemon_flow_port(
+        &mut self,
+        mode: &str,
+        ns: &str,
+        marker: &str,
+        stem: &str,
+        port: u16,
+    ) -> Result<Group> {
+        let address = format!("{}:{port}", A.internet.peer);
         self.runner.background(
             &Invocation::new(
                 ns,
@@ -327,7 +490,7 @@ impl Lab {
         &mut self,
         case: &str,
         child: &mut Group,
-        notify: &UnixDatagram,
+        notify: &NotifyCapture,
         root: &Path,
     ) -> Result<String> {
         let stem = format!("daemon-{case}");
@@ -337,13 +500,13 @@ impl Lab {
         let start_port = self.exit_port;
         let measurement = match case {
             "L6" => {
-                self.daemon_wait("pre-stall watchdog", Duration::from_secs(8), |lab| {
-                    Ok(lab.notifications(notify)?.iter().any(|s| s == "WATCHDOG=1"))
+                self.daemon_wait("pre-stall watchdog", Duration::from_secs(8), |_| {
+                    Ok(notify.drain()?.iter().any(|s| s == "WATCHDOG=1"))
                 })?;
                 self.daemon_wait(
                     "watchdog follows the two-second tick cadence",
                     Duration::from_secs(3),
-                    |lab| Ok(lab.notifications(notify)?.iter().any(|s| s == "WATCHDOG=1")),
+                    |_| Ok(notify.drain()?.iter().any(|s| s == "WATCHDOG=1")),
                 )?;
                 let before = read_since(&root.join("var-lib/scupper"), 0, None)
                     .filter_map(std::result::Result::ok)
@@ -353,7 +516,7 @@ impl Lab {
                 let hook = root.join("run/scupper/stall-tick");
                 fs::write(&hook, b"stall")?;
                 self.runner.dwell(Duration::from_millis(2200))?;
-                self.notifications(notify)?;
+                notify.drain()?;
                 self.cmd("scupper", "ip", &["route", "del", "default"])?;
                 let (code, report) = self.check_result(&Self::boot_binary()?, root)?;
                 if code != 3
@@ -368,10 +531,7 @@ impl Lab {
                     .cmd("scupper", "ip", &["route", "show", "default"])?
                     .trim()
                     .is_empty()
-                    || self
-                        .notifications(notify)?
-                        .iter()
-                        .any(|s| s == "WATCHDOG=1")
+                    || notify.drain()?.iter().any(|s| s == "WATCHDOG=1")
                 {
                     return fail("tick stall: repair or watchdog continued");
                 }
@@ -379,8 +539,8 @@ impl Lab {
                 child.assert_not_stopped()?;
                 fs::remove_file(hook)?;
                 let repaired = self.daemon_route_healthy(Duration::from_secs(10))?;
-                self.daemon_wait("post-stall watchdog", Duration::from_secs(8), |lab| {
-                    Ok(lab.notifications(notify)?.iter().any(|s| s == "WATCHDOG=1"))
+                self.daemon_wait("post-stall watchdog", Duration::from_secs(8), |_| {
+                    Ok(notify.drain()?.iter().any(|s| s == "WATCHDOG=1"))
                 })?;
                 self.daemon_wait("L6 route event", Duration::from_secs(5), |_| {
                     Ok(read_since(&root.join("var-lib/scupper"), before, None)
@@ -406,9 +566,9 @@ impl Lab {
                 let mut stream = self.daemon_flow("udp", "client", &marker, &stem)?;
                 self.runner.dwell(Duration::from_millis(300))?;
                 // Inject after a completed iteration and measure the actual closure.
-                self.notifications(notify)?;
-                self.daemon_wait("pre-flush watchdog", Duration::from_secs(8), |lab| {
-                    Ok(lab.notifications(notify)?.iter().any(|s| s == "WATCHDOG=1"))
+                notify.drain()?;
+                self.daemon_wait("pre-flush watchdog", Duration::from_secs(8), |_| {
+                    Ok(notify.drain()?.iter().any(|s| s == "WATCHDOG=1"))
                 })?;
                 let before = read_since(&root.join("var-lib/scupper"), 0, None)
                     .filter_map(std::result::Result::ok)
@@ -683,6 +843,7 @@ impl Lab {
             return fail("L13 foreign-side positive control was blind");
         }
         self.capture("gwhost", "foreign-host", &format!("{stem}-foreign"))?;
+        self.runner.dwell(Duration::from_millis(500))?;
         let start = Instant::now();
         let resumed_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -713,6 +874,15 @@ impl Lab {
         let foreign = crate::pcap::observe(&fs::read(
             self.artifacts.join(format!("{stem}-foreign.pcap")),
         )?)?;
+        if !foreign.iter().any(|p| {
+            p.protocol == 17
+                && p.payload.get(8..) == Some(marker.as_bytes())
+                && u128::from(p.timestamp.seconds) * 1_000_000_000
+                    + u128::from(p.timestamp.nanoseconds)
+                    <= resumed_at
+        }) {
+            return fail("L13 measurement capture missed pre-containment redirect packets");
+        }
         let last_packet = foreign
             .iter()
             .filter(|p| p.protocol == 17 && p.payload.get(8..) == Some(marker.as_bytes()))
@@ -721,7 +891,7 @@ impl Lab {
                     + u128::from(p.timestamp.nanoseconds)
             })
             .max()
-            .unwrap_or(resumed_at);
+            .ok_or("L13 measurement capture was blind to injected redirect packets")?;
         let window = last_packet.saturating_sub(resumed_at) / 1_000_000;
         if window > 8000 || window > down + 250 {
             return fail(format!(
@@ -931,6 +1101,44 @@ impl Lab {
         ))
     }
 }
+fn save_event_artifacts(source: &Path, target: &Path) -> Result<()> {
+    fs::create_dir_all(target)?;
+    if !source.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            fs::copy(entry.path(), target.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
+fn verify_continuity(path: &Path) -> Result<()> {
+    let mut previous = None;
+    let mut received = 0;
+    let mut last_record = 0;
+    for line in fs::read_to_string(path)?.lines() {
+        let value: serde_json::Value = serde_json::from_str(line)?;
+        last_record = value["elapsed_ms"].as_u64().ok_or("missing flow time")?;
+        if value["received"].as_u64().unwrap_or(0) > 0 {
+            let at = value["elapsed_ms"].as_u64().ok_or("missing flow time")?;
+            if previous.is_some_and(|before| at > before + 500) {
+                return fail("startup/restart interrupted established TCP traffic for over 500 ms");
+            }
+            previous = Some(at);
+            received += 1;
+        }
+    }
+    if previous.is_none_or(|at| last_record > at + 500) {
+        return fail("startup/restart traffic stopped before measurement ended");
+    }
+    if received < 10 {
+        return fail("startup continuity capture had too few replies");
+    }
+    Ok(())
+}
+
 fn flow_counts(path: &Path) -> Result<(u64, u64)> {
     let mut sent = 0;
     let mut received = 0;
@@ -970,5 +1178,40 @@ fn daemon_wanted(case: &str) -> &'static str {
         "V03" => "ip_forward changes only forwarding/accept_redirects; full hardening reapplied",
         "L3" | "L4" => "persistent established flow and remote sender; zero uplink leaks",
         _ => "unknown",
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notify_artifact_keeps_every_message_even_when_consumers_drain() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/daemon-notify-artifacts")
+            .join(std::process::id().to_string());
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("notify.jsonl");
+        let (send, receive) = UnixDatagram::pair().unwrap();
+        let capture = NotifyCapture::start(receive, &path).unwrap();
+        for number in 0..100 {
+            send.send(format!("STATUS={number}").as_bytes()).unwrap();
+            if number % 5 == 0 {
+                capture.drain().unwrap();
+            }
+        }
+        drop(capture);
+        let saved: Vec<serde_json::Value> = fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(saved.len(), 100);
+        for (number, value) in saved.iter().enumerate() {
+            assert_eq!(value["message"], format!("STATUS={number}"));
+            assert!(value["at"].is_number());
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 }

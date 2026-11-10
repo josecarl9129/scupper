@@ -243,6 +243,11 @@ pub trait System {
         None
     }
 
+    /// Owned executor for filesystem and canonicalization work off the tick thread.
+    fn canon_worker(&self) -> Option<Box<dyn System + Send>> {
+        None
+    }
+
     /// Explicit executable for the isolated canonicalization child.
     fn canon_executable(&self) -> &Path {
         Path::new("/usr/local/bin/scupper")
@@ -650,6 +655,15 @@ fn namespace_result(
 }
 
 impl System for RealSystem {
+    fn canon_worker(&self) -> Option<Box<dyn System + Send>> {
+        Some(Box::new(Self {
+            canon_cache: std::cell::RefCell::default(),
+            programs: self.programs.clone(),
+            canon_paths: self.canon_paths.clone(),
+            wireguard_dirs: self.wireguard_dirs.clone(),
+        }))
+    }
+
     fn canon_executable(&self) -> &Path {
         self.canon_paths
             .as_ref()
@@ -1082,12 +1096,8 @@ mod tests {
 
     #[test]
     fn nsenter_failure_is_not_a_target_failure() -> Result<(), Box<dyn Error>> {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("nsenter-test-{}", std::process::id()));
-        std::fs::create_dir(&dir)?;
-        let script = dir.join("nsenter");
         let handle = crate::netns::testing::handle()?;
-        let sys = RealSystem::new(Programs::new([(Program::Nsenter, &script)])?);
+        let sys = system("/bin/sh")?;
         for (stderr, code, expected) in [
             (
                 "nsenter: cannot enter namespace: device absent",
@@ -1097,17 +1107,13 @@ mod tests {
             ("Unable to access interface: No such device", 1, None),
             ("nsenter: harmless output", 0, None),
         ] {
-            std::fs::write(
-                &script,
-                format!("#!/bin/sh\nprintf '%s' '{stderr}' >&2\nexit {code}\n"),
-            )?;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))?;
-            let result = sys.execute_verified(
+            let result = namespace_result(
                 ExecTarget::Netns(&handle),
-                Program::Ip,
-                &[],
-                None,
-                EXEC_TIMEOUT,
+                sys.run(
+                    Program::Wg,
+                    &args(&["-c", &format!("printf '%s' '{stderr}' >&2; exit {code}")]),
+                    EXEC_TIMEOUT,
+                ),
             );
             if let Some(error) = expected {
                 assert_eq!(result, Err(error));
@@ -1117,7 +1123,6 @@ mod tests {
                 assert_eq!(output.stderr, stderr);
             }
         }
-        std::fs::remove_dir_all(dir)?;
         Ok(())
     }
 
@@ -1141,40 +1146,25 @@ mod tests {
 
     #[test]
     fn stdin_delivery_eof_and_nonreader_deadline() -> Result<(), Box<dyn Error>> {
-        use std::os::unix::fs::PermissionsExt;
-        struct Scripts(PathBuf);
-        impl Drop for Scripts {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let scripts =
-            Scripts(std::env::temp_dir().join(format!("stdin-test-{}", std::process::id())));
-        std::fs::create_dir(&scripts.0)?;
-        let read = scripts.0.join("read");
-        let ignore = scripts.0.join("ignore");
-        for (path, body) in [
-            (&read, "#!/bin/sh\nexec /usr/bin/cat\n"),
-            (&ignore, "#!/bin/sh\nexec /usr/bin/sleep 30\n"),
-        ] {
-            std::fs::write(path, body)?;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-        }
-        let sys = RealSystem::new(Programs::new([(Program::Wg, &read)])?);
+        let sys = system("/bin/sh")?;
         for bytes in [Vec::new(), b"hello\n".to_vec(), vec![b'x'; 512 * 1024]] {
-            let output =
-                sys.run_with_stdin(ExecTarget::Host, Program::Wg, &[], &bytes, EXEC_TIMEOUT)?;
+            let output = sys.run_with_stdin(
+                ExecTarget::Host,
+                Program::Wg,
+                &args(&["-c", "exec /usr/bin/cat"]),
+                &bytes,
+                EXEC_TIMEOUT,
+            )?;
             assert_eq!(output.status, Some(0));
             assert_eq!(output.stdout.as_bytes(), bytes);
         }
-        let sys = RealSystem::new(Programs::new([(Program::Wg, &ignore)])?);
         let timeout = Duration::from_millis(100);
         let started = Instant::now();
         assert_eq!(
             sys.run_with_stdin(
                 ExecTarget::Host,
                 Program::Wg,
-                &[],
+                &args(&["-c", "exec /usr/bin/sleep 30"]),
                 &vec![b'x'; 2 * OUTPUT_CAP],
                 timeout
             ),

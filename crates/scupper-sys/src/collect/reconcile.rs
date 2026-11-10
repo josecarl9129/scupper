@@ -35,6 +35,9 @@ struct SafetySystem<'a> {
     failed: Cell<bool>,
 }
 impl System for SafetySystem<'_> {
+    fn canon_worker(&self) -> Option<Box<dyn System + Send>> {
+        self.system.canon_worker()
+    }
     fn canon_executable(&self) -> &Path {
         self.system.canon_executable()
     }
@@ -355,7 +358,7 @@ pub(crate) fn observe(
     model.links.clear();
     model.ruleset = if safety.canon_cache().is_some() {
         known(
-            crate::canon::netns_rulesets(&safety, held, desired.rendered()).and_then(
+            crate::canon::netns_rulesets_safety(&safety, held, desired.rendered()).and_then(
                 |(want, live)| {
                     Ok(if live == want {
                         Ruleset::Verified(desired.fingerprint())

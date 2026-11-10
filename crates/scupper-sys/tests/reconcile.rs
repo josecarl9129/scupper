@@ -1856,8 +1856,12 @@ impl scupper_sys::daemon::DaemonDeps for DaemonRig<'_> {
         if let Some(probes) = &mut self.probes {
             for round in probes.collect() {
                 if !round.paths.is_empty() {
-                    assert!(round.paths.values().all(|success| !success));
-                    self.rig.machine().submit_probe_round(round.paths);
+                    assert!(
+                        round.paths.values().all(
+                            |outcome| *outcome != scupper_core::failover::ProbeOutcome::Success
+                        )
+                    );
+                    self.rig.machine().submit_probe_outcomes(round.paths);
                     self.probe_received = true;
                 }
             }

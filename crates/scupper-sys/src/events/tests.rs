@@ -1265,36 +1265,25 @@ fn memory_only_keeps_bounded_history_and_failure_without_committing() {
 }
 
 #[test]
-fn replay_reserves_large_local_sequence_jumps_before_append() {
+fn replay_uses_disk_sequence_space_even_when_local_ids_are_far_ahead() {
     let dir = TempDir::new();
     let memory = EventLog::memory_only(gateway(), || UnixSeconds(0)).unwrap();
     let base = UNCLEAN_SEQ_JUMP * 3;
     memory.handle.shared.lock().seq = base;
     emit(&memory.handle);
-    let sequence = dir.0.join("events/seq");
-    let opened = EventLog::open_with_hook(
-        &dir.0,
-        gateway(),
-        || UnixSeconds(0),
-        100,
-        move |step| {
-            if step == EventIoStep::Write {
-                let reserved: u64 = fs::read_to_string(&sequence)?
-                    .trim()
-                    .parse()
-                    .map_err(io::Error::other)?;
-                if reserved < base {
-                    return Err(io::Error::other("replay jump was not reserved"));
-                }
-            }
-            Ok(())
-        },
-    )
-    .unwrap();
+    let opened = EventLog::open(&dir.0, gateway(), || UnixSeconds(0)).unwrap();
     memory.handle.replay_into(&opened.handle).unwrap();
     flush(&opened.handle);
     let high = opened.handle.committed_seq();
-    assert!(high > base);
+    assert!(high < base);
+    let events: Vec<_> = read_since(&dir.0, 0, None).map(Result::unwrap).collect();
+    assert_eq!(
+        events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+        (1..=high).collect::<Vec<_>>()
+    );
+    assert!(
+        matches!(events[0].kind, EventKind::MemoryReplay { local_last, .. } if local_last == base + 1)
+    );
     drop(opened);
     fs::remove_file(dir.0.join("events/clean")).unwrap();
     let reopened = EventLog::open(&dir.0, gateway(), || UnixSeconds(0)).unwrap();
