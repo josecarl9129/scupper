@@ -673,6 +673,11 @@ fn assert_plan(d: &Desired, m: &KernelModel, p: &Plan, latch: Option<&Latch>) {
         } = s
         {
             assert!(d.exits().values().any(|n| n == name.as_str()));
+            assert_eq!(
+                current.links.get(name.as_str()).map(|link| &link.up),
+                Some(&Known::Value(true)),
+                "route Restore follows a LinkDown without a successful link Restore: {p:?}"
+            );
         }
         if let Step::WriteSysctl { key, .. } = s
             && let scupper_core::render::Scope::Link(name) = &key.sysctl().scope
@@ -2107,6 +2112,38 @@ fn inheritance_and_model_effects_expose_wrongly_emitted_steps() {
 
 proptest! {
     #![proptest_config(ProptestConfig {cases:128,failure_persistence:None,..ProptestConfig::default()})]
+    #[test]
+    fn plans_never_restore_routes_through_links_left_down(
+        modes in prop::collection::vec(0_u8..43, 0..12),
+        disconnected in any::<bool>(),
+    ) {
+        let connected = desired();
+        let mut model = random_model(&connected, &modes);
+        // Model the frozen lab injection before either current intent is planned.
+        if let Some(exit) = model.links.get_mut("ex-ch1") {
+            exit.up = Known::Value(true);
+        }
+        model.default_v4 = Known::Value(DefaultRouteObs::Dev("ex-ch1".into()));
+        let d = if disconnected {
+            desired_with("ch1", [7; 32], &Selection::Disconnected)
+        } else {
+            connected
+        };
+        let p = settled(&d, &model);
+        for step in &p.steps {
+            if let Step::RouteReplace { target: RouteTarget::Exit(name), .. } = step {
+                // A down/configure/up repair is permitted; routing while the
+                // plan's own LinkDown is still effective is never permitted.
+                prop_assert_eq!(
+                    model.links.get(name.as_str()).map(|link| &link.up),
+                    Some(&Known::Value(true)),
+                    "route Restore through a link left down: {:?}", p
+                );
+            }
+            model = model.apply(step);
+        }
+    }
+
     #[test]
     fn fighting_fresh_safety_identities_reach_latch_and_stay_closed(
         class in 0_u8..3, mixed in any::<bool>(), choices in prop::collection::vec((0_u8..3,any::<bool>()),16..40),

@@ -61,16 +61,7 @@ impl Rig {
             &Selection::Auto,
         )
         .unwrap();
-        let root = std::env::var_os("CARGO_TARGET_TMPDIR")
-            .map_or_else(
-                || {
-                    std::path::PathBuf::from(concat!(
-                        env!("CARGO_MANIFEST_DIR"),
-                        "/../../target/tmp"
-                    ))
-                },
-                std::path::PathBuf::from,
-            )
+        let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
             .join("reconcile-fs")
             .join(format!(
                 "scupper-reconcile-{}-{}",
@@ -2609,6 +2600,97 @@ fn control_requests_are_serviced_without_scheduler_sleep() {
     assert_eq!(deps.iterations, 7);
     assert_eq!(deps.control_calls, 7);
     assert_eq!(deps.now.duration_since(now), Duration::from_secs(21));
+}
+
+#[test]
+fn connect_supersedes_frozen_ineffective_disconnect_within_ten_seconds() {
+    for selection in [
+        Selection::Auto,
+        Selection::Prefer(scupper_core::config::ExitId("ch1".into())),
+        Selection::Pin(scupper_core::config::ExitId("ch1".into())),
+    ] {
+        let mut rig = Rig::new();
+        let guard = WriterLock::acquire(&rig.root).unwrap();
+        // The daemon's incomplete-tick hook skips reconciliation entirely.
+        // Persist intent through the same scheduler API, without draining actions.
+        rig.machine()
+            .set_intent_locked(&guard, Selection::Disconnected)
+            .unwrap();
+        rig.kernel.mutate(|model| {
+            model.links.get_mut("ex-ch1").unwrap().up = Known::Value(true);
+            model.default_v4 = Known::Value(DefaultRouteObs::Dev("ex-ch1".into()));
+        });
+        rig.time.set(rig.time.get() + 45);
+        assert_eq!(rig.store.state().selection, Selection::Disconnected);
+        assert_eq!(rig.kernel.history(), Vec::new());
+        assert_ne!(
+            rig.kernel.model().default_v4,
+            Known::Value(DefaultRouteObs::Unreachable),
+            "disconnect is still ineffective while ticks are frozen"
+        );
+        rig.machine().set_intent_locked(&guard, selection).unwrap();
+        drop(guard);
+        let start = rig.time.get();
+        for _ in 0..4 {
+            let report = rig.tick();
+            assert!(report.complete, "{report:?}");
+            assert!(report.failures.is_empty(), "{report:?}");
+            assert!(!report.steps.contains(&Step::LinkDown {
+                name: "ex-ch1".into()
+            }));
+            assert!(!matches!(
+                rig.machine().health()[&scupper_core::config::ExitId("ch1".into())],
+                scupper_core::failover::ExitHealth::Down { .. }
+            ));
+            let model = rig.kernel.model();
+            let desired = rig.machine().desired().unwrap();
+            if model.default_v4 == Known::Value(DefaultRouteObs::Dev("ex-ch1".into()))
+                && model.forwarding_v4 == Known::Value(1)
+                && safe(&model, &desired)
+            {
+                assert!(rig.time.get() - start < 10);
+                rig.safe_history();
+                assert_eq!(rig.tick().failures, Vec::new());
+                assert!(!matches!(
+                    rig.machine().health()[&scupper_core::config::ExitId("ch1".into())],
+                    scupper_core::failover::ExitHealth::Down { .. }
+                ));
+                break;
+            }
+            assert!(rig.time.get() - start < 8, "connect did not become ready");
+        }
+    }
+}
+
+#[test]
+fn frozen_disconnect_still_removes_injected_route_before_availability_reads() {
+    let mut rig = Rig::new();
+    let guard = WriterLock::acquire(&rig.root).unwrap();
+    rig.machine()
+        .set_intent_locked(&guard, Selection::Disconnected)
+        .unwrap();
+    drop(guard);
+    rig.kernel.mutate(|model| {
+        model.links.get_mut("ex-ch1").unwrap().up = Known::Value(true);
+        model.default_v4 = Known::Value(DefaultRouteObs::Dev("ex-ch1".into()));
+    });
+    let reads = rig.kernel.rest_reads();
+    rig.kernel
+        .observation_latency(Duration::ZERO, Duration::from_secs(20));
+    let report = rig.tick();
+    assert!(!report.complete);
+    assert_eq!(report.failures, Vec::new());
+    let model = rig.kernel.model();
+    assert_eq!(model.default_v4, Known::Value(DefaultRouteObs::Missing));
+    assert_eq!(model.links["ex-ch1"].up, Known::Value(false));
+    assert!(model.forwarding_off());
+    assert!(
+        rig.kernel
+            .step_rest_reads()
+            .iter()
+            .all(|count| *count == reads)
+    );
+    assert!(!raises(&report));
 }
 
 #[test]
