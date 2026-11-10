@@ -224,8 +224,6 @@ pub struct RouteObs {
 /// Client listener disagreement; client reachability beyond the host is unproven.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum ClientFault {
-    /// No configured client has established a tunnel session.
-    NoHandshake,
     /// Client-facing link is administratively down.
     LinkDown,
     /// Client-facing public identity differs or is unset.

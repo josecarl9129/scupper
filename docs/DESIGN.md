@@ -966,7 +966,8 @@ creating links. Each step is idempotent. Property: **every prefix of every
 plan satisfies `safe(state)`** (no forward path to a non-exit; forwarding on
 implies a verified ruleset). On a failed step, scupperd re-plans from the
 observed state toward the **previous** applied version and alerts;
-`applied_version` changes only after a verified full apply.
+`applied_version` is published under closed gates before the target boot. A failed
+live apply restores the previous version and reports its rollback result (§18).
 
 ---
 
@@ -2499,6 +2500,17 @@ several gateways (rejected in R1); `devices.*.gateways` is a list;
 ---
 
 ## 18. Failure modes
+
+A full apply closes forwarding before publishing its target version durably.
+If the process crashes before verification or rollback, the next start retries
+that target under the boot budget and remains closed on failure. The operator
+can recover with `scupper apply N` for the previous known-good version. A live
+failed apply reports whether the previous version was restored and verified,
+or rollback failed and forwarding was closed (or closure could not be verified).
+
+Local control clients must keep the write side open until they receive a reply;
+do not shut down the write side after sending a request. Queued disconnects
+still execute after a client hangs up because they only tighten policy.
 
 | Failure | Effect | Detection | Response |
 |---|---|---|---|

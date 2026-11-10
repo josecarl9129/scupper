@@ -260,6 +260,8 @@ impl WgCmd {
                     ifname.as_str(),
                     "peer",
                     public_key.as_str(),
+                    "preshared-key",
+                    "/dev/null",
                     "allowed-ips",
                     &allowed_ips
                         .iter()

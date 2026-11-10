@@ -108,7 +108,17 @@ pub struct ApiError {
 }
 impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self.code)
+        write!(f, "{:?}", self.code)?;
+        if let Some(rollback) = self.observation.as_ref().and_then(|o| o.get("rollback")) {
+            if rollback["verified"] == true {
+                write!(f, ": rolled back to {} (verified)", rollback["version"])?;
+            } else if rollback["closed"] == true {
+                write!(f, ": rollback failed: closed")?;
+            } else {
+                write!(f, ": rollback failed: closure unverified")?;
+            }
+        }
+        Ok(())
     }
 }
 impl std::error::Error for ApiError {}
@@ -198,6 +208,9 @@ pub enum OpResult, result_samples {
     Ping {
         /// Monotonic age in whole seconds, supplied by the supervisor.
         last_complete_iteration_age: Option<u64> = Some(2),
+        /// Age of the running tick in seconds; null while idle.
+        #[serde(default)]
+        current_iteration_age: Option<u64> = None,
         /// Identity of the supervisor's held namespace.
         netns: scupper_core::verdict::v2::NetnsIdentity = scupper_core::verdict::v2::NetnsIdentity { device: 1, inode: 2 },
         /// Applied immutable version.

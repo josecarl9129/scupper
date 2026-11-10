@@ -125,3 +125,37 @@ All five gates passed, each invoked under `timeout 600`:
 The final full workspace run passed with no failing targets. The prior broad run exposed a fixture error: its unknown peer reused the configured client's key and overwrote the test's roamed endpoint; the fixture now uses a distinct key. The final run includes the disconnected closed-gate adoption, configured-peer/session retention, rollback/restart, rollback-persistence refusal, stale-Ping/retry, abandoned-client, startup STATUS and quarantine-clear reopening regressions. `git diff --check` and the edit-scope audit passed.
 
 Privileged L10/L14/L43/L44/L50 and real-systemd watchdog runs were compiled but not executed. The supplied read-only artifacts cover 24.04; the historical 22.04 READY timeout cannot be assigned a cause from them. All scratch files are under CARGO_TARGET_TMPDIR in this worktree. No new crates or commits.
+
+## Fix round 4
+
+- N-2 / T-d → socket Check waits at most five seconds, then observes locally without lease or writer lock; stage 8 retains and advances the actual Ping age. Ping exposes the running tick age and skips queued checks after five seconds. L6's lab command bound is restored to 15 seconds. Tests: `hung_socket_check_falls_back_with_real_ping_age_within_six_seconds`, `ping_snapshot_does_not_wait_for_dispatch`, stale-Ping and retry regressions.
+- N-1 / second review / L14 → client keepalive is five seconds; recovery sends repeated UDP canaries and requires handshake plus delivery within a shared 30-second deadline. Real reboot verifies no process namespace or descriptor retains the old namespace before boot. Lab: L14.
+- Lab L14 adoption → forwarding changes now restore hardening, including accept_redirects reset by ip_forward, so an effective disconnect can be adopted without resetting client sessions. Test: `disconnected_reboot_preserves_client_sessions`.
+- N-3 / T-e → default forwarding values warn when inconsistent with their corresponding global gate, including closed-state consistency. Test: `forwarding_defaults_warn_only_when_inconsistent_with_global_gates`.
+- N-4 / T-a → apply tracks kernel/state mutation and only reattaches after changes; explicit unknown versions are rejected before runtime or persisted latch changes. Test: `runtime_dispatcher_failed_apply_rolls_back_and_unknown_version_keeps_attachment` (real Runtime via Dispatcher with injected System/BootNamespace).
+- N-5 → failed applies report verified rollback version versus failed rollback and verified/unverified closure; rollback emits Boot and ApplyFailed follows the outcome. Re-close or rollback failure drops the running attachment and invokes closure. Tests: `failed_apply_reports_reclose_and_rollback_failures`, `failed_apply_restores_version_without_drift_budget_or_latch_and_restart_boots_previous`, runtime dispatcher regression.
+- N-6 → documented crash-after-publication behavior and explicit previous-version recovery in DESIGN §18.
+- N-7 → a held lease permits boot success only when Ping identifies an initialized scupperd; refusal retains holder pid in diagnostics. Tests: `boot_under_held_lease_requires_initialized_ping`, `boot_refuses_unresponsive_lease_holder_before_kernel_calls`.
+- N-8 → queued Disconnect survives client hangup; protocol documents keeping the write side open until reply. Test: `dispatcher_disconnect_survives_peer_hangup`; abandoned connect regression retained.
+- N-9 → removed unused ClientFault::NoHandshake.
+- N-10 → removed any existing unused-writer lock files; CLI scratch root now uses runtime CARGO_TARGET_TMPDIR with an absolute workspace fallback. The named lock files are not tracked in this starting worktree; .gitignore is outside the allowed edit set.
+- N-11 → suppress FailClosedEnded while quarantine remains latched. Test: `repair_clear_reopens_forwarding_after_quarantined_restart` asserts no ended event in latched ticks.
+- N-12 → SetPeer explicitly clears stray preshared keys. Tests: `full_boot_updates_client_peers_without_resetting_sessions` (wider AllowedIPs narrowed, PSK reset argv), `full_boot_rotates_keys_and_reconfiguration_removes_unassigned_clients` (rotation, unassigned removal, other peers retained), `every_wg_variant_argv_and_forbidden_tokens`. The unassigned case uses the internal configuration builder because M2 release validation allows one gateway.
+- N-13 → DaemonStarted records once even if READY notification fails. Test: `broken_notify_still_records_daemon_started_once`.
+- Lab L44 → exit-only keepalive changes between 25 and 24 seconds, respecting the lab's 175-second stale-handshake bound. L14/L44 compare per-peer handshake timestamps across apply, allowing only a five-second keepalive tolerance. Test: `exit_only_keepalive_change_respects_lab_handshake_budget`; lab: L14, L44.
+- Lab L50 → expired disconnect verification returns DisconnectNotEffective even when its final worker failed. The lab freezes reconciliation before explicitly injecting and verifying the stuck route; reconnect qualification permits the configured recovery grace. Test: `disconnect_worker_failure_at_deadline_is_not_internal`.
+- Lab isolation → background services last through the whole suite deadline; each control case restores its original applied config, intent and rules, verifies socket/lease/writer release, flushes conntrack and proves the packet baseline before returning. Cleanup restores deadline state even when fixture reset fails. An unverified final baseline skips subsequent suites. Lab: daemon suite.
+
+### Round 4 verification
+
+All five gates passed, each under `timeout 600`:
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
+- `cargo test --workspace --all-features --locked --no-fail-fast`
+- `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked`
+- `cargo deny check`
+
+The final full workspace run passed 863 tests, with 8 existing subprocess fixtures ignored and no failing targets, including the hung-Check latency/real-age test, actual Runtime/Dispatcher apply rollback and unknown-version checks, default-forwarding consistency, client key/AllowedIPs/session retention, hangup disconnect, failed rollback closure, and broken-notify audit regressions. Boot command goldens include explicit PSK clearing. All temporary paths and gate logs are under CARGO_TARGET_TMPDIR in this worktree; no crate-local target files remain. Edit-scope audit and `git diff --check` passed. Final formatting runs after the gates.
+
+Privileged L6/L14/L44/L50 and suite-isolation scenarios were updated and compiled but not executed locally; a green privileged lab remains unverified. No new crates or commits.

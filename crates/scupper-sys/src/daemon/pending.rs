@@ -40,7 +40,7 @@ impl Operation {
             });
         if let Some(result) = result {
             self.receive = None;
-            if result.is_ok() || matches!(self.request.op, Op::Check {}) || now >= self.deadline {
+            if result.is_ok() || matches!(self.request.op, Op::Check {}) {
                 return Some(result);
             }
             self.retry_at = now + Duration::from_millis(100);
@@ -120,10 +120,11 @@ impl Dispatcher {
         backend: &mut impl Backend,
         now: Instant,
     ) {
-        if pending
-            .peer
-            .as_ref()
-            .is_some_and(|peer| !control::peer_connected(peer))
+        if !matches!(pending.request.op, Op::Disconnect {})
+            && pending
+                .peer
+                .as_ref()
+                .is_some_and(|peer| !control::peer_connected(peer))
         {
             return;
         }
@@ -438,3 +439,34 @@ mod tests {
 #[cfg(test)]
 #[path = "dispatcher_tests.rs"]
 mod dispatcher_tests;
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn disconnect_worker_failure_at_deadline_is_not_internal() {
+        let start = Instant::now();
+        for failed_worker in [false, true] {
+            let (send, receive) = mpsc::sync_channel(1);
+            if failed_worker {
+                drop(send);
+            } else {
+                send.send(Err(control::api(ApiErrorCode::Internal)))
+                    .unwrap();
+            }
+            let mut operation = Operation {
+                request: control::request(Op::Disconnect {}),
+                replies: Vec::new(),
+                deadline: start,
+                receive: Some(receive),
+                retry_at: start,
+                observed_at: None,
+            };
+            assert_eq!(
+                operation.poll(start).unwrap().unwrap_err().code,
+                ApiErrorCode::DisconnectNotEffective
+            );
+        }
+    }
+}

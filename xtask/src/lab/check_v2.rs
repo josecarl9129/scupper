@@ -203,7 +203,7 @@ impl Lab {
                 ],
             ),
             None,
-            90,
+            15,
         )?;
         let report = serde_json::from_str(&stdout)
             .map_err(|error| format!("check-v2 JSON: {error}; output: {stdout}"))?;

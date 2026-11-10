@@ -85,11 +85,16 @@ impl Harness {
     fn run(&self, args: &[&str]) -> (u8, String, String) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
-            "cli-harness-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        let root = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/tmp")),
+                PathBuf::from,
+            )
+            .join(format!(
+                "cli-harness-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
         std::fs::create_dir_all(&root).unwrap();
         let mut out = Vec::new();
         let mut err = Vec::new();

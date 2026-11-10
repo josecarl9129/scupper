@@ -237,6 +237,8 @@ impl Lab {
                 &format!("{}:51820", A.gwhost.peer),
                 "allowed-ips",
                 "0.0.0.0/0,::/0",
+                "persistent-keepalive",
+                "5",
             ],
         )?;
         self.address_up("client", "wg0", &format!("{}/32", A.client_inner), 1420)?;

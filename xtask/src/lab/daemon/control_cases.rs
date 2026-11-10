@@ -88,23 +88,69 @@ impl DaemonGuard<'_> {
         }
         Ok(())
     }
-    fn wait_client_handshake(&mut self) -> Result<()> {
+    fn recover_client(&mut self, markers: &mut Vec<String>) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let marker = Lab::marker()?;
+        markers.push(marker.clone());
+        let stem = format!("{}-recovery-{}", self.case, markers.len());
+        let mut traffic = self.lab.daemon_flow("udp", "client", &marker, &stem, 30)?;
+        let path = self.lab.artifacts.join(format!("{stem}-udp.jsonl"));
+        loop {
+            traffic.alive()?;
+            let delivered = flow_counts(&path).is_ok_and(|(_, replies)| replies > 0);
+            let handshake = self.client_session()?;
+            if delivered
+                && handshake.lines().any(|line| {
+                    line.split_whitespace()
+                        .nth(1)
+                        .and_then(|time| time.parse::<u64>().ok())
+                        .is_some_and(|time| time > 0)
+                })
+            {
+                self.lab.service_check(markers)?;
+                traffic.stop(Signal::TERM)?;
+                if Instant::now() <= deadline {
+                    return Ok(());
+                }
+            }
+            if Instant::now() >= deadline {
+                return fail("client handshake and delivery exceeded shared 30 s deadline");
+            }
+            self.lab.runner.dwell(Duration::from_millis(200))?;
+        }
+    }
+    fn client_session(&mut self) -> Result<String> {
         self.lab
-            .daemon_wait(
-                "client handshake after reboot",
-                Duration::from_secs(20),
-                |lab| {
-                    Ok(lab
-                        .cmd("scupper", "wg", &["show", "wg0", "latest-handshakes"])?
-                        .lines()
-                        .any(|line| {
-                            line.split_whitespace()
-                                .nth(1)
-                                .and_then(|age| age.parse::<u64>().ok())
-                                .is_some_and(|age| age > 0)
-                        }))
-                },
-            )
+            .cmd("scupper", "wg", &["show", "wg0", "latest-handshakes"])
+    }
+    fn assert_namespace_released(&mut self, identity: &str) -> Result<()> {
+        self.lab
+            .daemon_wait("old namespace released", Duration::from_secs(5), |_| {
+                for process in fs::read_dir("/proc")? {
+                    let process = process?.path();
+                    if process
+                        .file_name()
+                        .is_none_or(|name| name.to_string_lossy().parse::<u32>().is_err())
+                    {
+                        continue;
+                    }
+                    if fs::read_link(process.join("ns/net"))
+                        .is_ok_and(|link| link.to_string_lossy() == identity)
+                    {
+                        return Ok(false);
+                    }
+                    if let Ok(fds) = fs::read_dir(process.join("fd")) {
+                        for fd in fds {
+                            if fs::read_link(fd?.path())
+                                .is_ok_and(|link| link.to_string_lossy() == identity)
+                            {
+                                return Ok(false);
+                            }
+                        }
+                    }
+                }
+                Ok(true)
+            })
             .map(|_| ())
     }
     fn assert_forwarding_open(&mut self) -> Result<()> {
@@ -136,14 +182,7 @@ impl DaemonGuard<'_> {
         let store = VersionStore::open_with_mirror_root(&state_root, &config_root, Some(&guard))?;
         let head = store.head()?.ok_or("missing head")?;
         let (old, _) = store.read(head)?;
-        let text = if old.contains("keepalive = \"25s\"") {
-            old.replace("keepalive = \"25s\"", "keepalive = \"26s\"")
-        } else {
-            old.replace("keepalive = \"26s\"", "keepalive = \"25s\"")
-        };
-        if text == old {
-            return fail("exit-only change did not change keepalive");
-        }
+        let text = exit_change(&old)?;
         let version = store.commit(
             &guard,
             Some(head),
@@ -167,19 +206,27 @@ impl DaemonGuard<'_> {
         fs::write(&self.lab.rules, rules)?;
         Ok(())
     }
-    fn assert_client_session(&mut self) -> Result<()> {
-        if !self
-            .lab
-            .cmd("scupper", "wg", &["show", "wg0", "latest-handshakes"])?
-            .lines()
-            .any(|line| {
-                line.split_whitespace()
-                    .nth(1)
-                    .and_then(|age| age.parse::<u64>().ok())
-                    .is_some_and(|age| age > 0)
-            })
+    fn assert_client_session(&mut self, before: &str) -> Result<()> {
+        let after = self.client_session()?;
+        let sessions = |text: &str| {
+            text.lines()
+                .filter_map(|line| {
+                    let mut words = line.split_whitespace();
+                    Some((words.next()?.to_owned(), words.next()?.parse::<u64>().ok()?))
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let before = sessions(before);
+        let after = sessions(&after);
+        if before.is_empty()
+            || before.keys().ne(after.keys())
+            || before
+                .iter()
+                .any(|(key, time)| *time == 0 || after[key] < *time || after[key] - time > 5)
         {
-            return fail("apply reset the established client session");
+            return fail(format!(
+                "apply replaced the established client session: {before:?} -> {after:?}"
+            ));
         }
         Ok(())
     }
@@ -257,6 +304,25 @@ impl DaemonGuard<'_> {
         let guard = WriterLock::acquire(root.join("run/scupper"))?;
         let file = StateFile::open(root.join("var-lib/scupper"), Some(&guard))?;
         if let StateRead::Present(mut state) = file.read()? {
+            if let Some(version) = self.baseline_version {
+                state.applied_version = Some(version);
+                let store = VersionStore::read_only(
+                    &root.join("var-lib/scupper"),
+                    &root.join("etc/scupper"),
+                );
+                let (text, _) = store.read(version)?;
+                self.lab.site =
+                    validate(parse_site(&text)?).map_err(|e| format!("baseline config: {e:?}"))?;
+                let rules = render_netns(
+                    &self.lab.site,
+                    &GatewayId("gw1".into()),
+                    &VersionStamp {
+                        version,
+                        sha256: Sha256::digest(text.as_bytes()).into(),
+                    },
+                )?;
+                fs::write(&self.lab.rules, rules)?;
+            }
             state.selection = Selection::Auto;
             state.quarantine = None;
             file.write(&guard, &state)?;
@@ -292,6 +358,11 @@ impl DaemonGuard<'_> {
     #[allow(clippy::too_many_lines)] // Each fault retains its control and recovery assertions.
     pub(super) fn run_control(&mut self, case: &str) -> Result<String> {
         let root = self.lab.prepare_check_v2()?;
+        if let StateRead::Present(state) =
+            StateFile::open(root.join("var-lib/scupper"), None)?.read()?
+        {
+            self.baseline_version = state.applied_version;
+        }
         self.supervised_fixture(&root)?;
         self.lab.boot_gateway(&[], &format!("{case}-boot"))?;
         let (child, notify) = self.lab.daemon_start(case, &root)?;
@@ -400,15 +471,16 @@ impl DaemonGuard<'_> {
                 if code != 0 || !text.contains("transport: local socket") {
                     return fail(format!("L14 connect: {code}: {text}"));
                 }
-                self.wait_client_handshake()?;
+                self.recover_client(&mut markers)?;
                 self.expect_check(&root, 0, "connected")?;
                 self.lab.service_check(&mut markers)?;
+                let client_session = self.client_session()?;
                 self.stage_exit_change(&root)?;
                 let (code, text) = self.control_command(&root, &["apply"], "exit-only-apply")?;
                 if code != 0 {
                     return fail(format!("L14 apply: {code}: {text}"));
                 }
-                self.assert_client_session()?;
+                self.assert_client_session(&client_session)?;
                 self.lab.service_check(&mut markers)?;
                 // A real reboot necessarily loses the server session. Do not
                 // reset the client: its ordinary WireGuard rekey must recover.
@@ -418,7 +490,11 @@ impl DaemonGuard<'_> {
                     return fail(text);
                 }
                 self.control_stop(Signal::TERM)?;
+                let old_identity = self
+                    .lab
+                    .cmd("scupper", "readlink", &["/proc/self/ns/net"])?;
                 self.lab.cmd("", "ip", &["netns", "delete", "scupper"])?;
+                self.assert_namespace_released(old_identity.trim())?;
                 self.lab.boot_gateway(&[], "L14-real-reboot")?;
                 self.expect_check(&root, 4, "real-reboot-closed")?;
                 self.control_restart(&root, "real-reboot")?;
@@ -427,12 +503,7 @@ impl DaemonGuard<'_> {
                 if code != 0 {
                     return fail(text);
                 }
-                let recovered = Instant::now();
-                self.wait_client_handshake()?;
-                self.lab.service_check(&mut markers)?;
-                if recovered.elapsed() > Duration::from_secs(20) {
-                    return fail("L14 real reboot exceeded client rekey bound");
-                }
+                self.recover_client(&mut markers)?;
                 self.expect_check(&root, 0, "real-reboot-connected")?;
             }
             "L43" => {
@@ -506,10 +577,11 @@ impl DaemonGuard<'_> {
                 self.lab.daemon_route_healthy(Duration::from_secs(30))?;
                 self.assert_forwarding_open()?;
                 self.expect_check(&root, 0, "cleared")?;
-                self.wait_client_handshake()?;
+                self.recover_client(&mut markers)?;
                 self.lab.service_check(&mut markers)?;
             }
             "L44" => {
+                let client_session = self.client_session()?;
                 self.stage_exit_change(&root)?;
                 fs::write(root.join("run/scupper/pause-apply"), b"pause")?;
                 let binary = Lab::boot_binary()?;
@@ -635,7 +707,7 @@ impl DaemonGuard<'_> {
                     .daemon_ready_tick(self.notify.as_ref().ok_or("notify missing")?)?;
                 self.lab.daemon_route_healthy(Duration::from_secs(30))?;
                 self.expect_check(&root, 0, "one-writer-recovered")?;
-                self.assert_client_session()?;
+                self.assert_client_session(&client_session)?;
                 self.lab.service_check(&mut markers)?;
                 // Separately prove that a mutation queued during apply executes
                 // afterwards and that its reply follows effective closure.
@@ -734,8 +806,17 @@ impl DaemonGuard<'_> {
                 if code != 0 {
                     return fail(format!("L50 connect: {code}: {text}"));
                 }
-                self.lab.daemon_route_healthy(Duration::from_secs(30))?;
                 fs::write(root.join("run/scupper/incomplete-tick"), b"hold")?;
+                // Freeze reconciliation before injecting the ineffective route.
+                self.lab.runner.dwell(Duration::from_millis(2200))?;
+                self.lab
+                    .cmd("scupper", "ip", &["link", "set", "ex-ch1", "up"])?;
+                self.lab.cmd(
+                    "scupper",
+                    "ip",
+                    &["route", "replace", "default", "dev", "ex-ch1"],
+                )?;
+                self.lab.daemon_route_healthy(Duration::from_secs(2))?;
                 let (code, text) =
                     self.control_command(&root, &["disconnect"], "socket-ineffective")?;
                 fs::remove_file(root.join("run/scupper/incomplete-tick"))?;
@@ -752,7 +833,7 @@ impl DaemonGuard<'_> {
                         "L50 reconnect before ordering check: {code}: {text}"
                     ));
                 }
-                self.lab.daemon_route_healthy(Duration::from_secs(30))?;
+                self.lab.daemon_route_healthy(Duration::from_secs(60))?;
                 let (code, text) =
                     self.control_command(&root, &["disconnect"], "socket-tighten")?;
                 if code != 0 || !text.contains("transport: local socket") {
@@ -787,5 +868,33 @@ impl DaemonGuard<'_> {
         }
         self.lab.daemon_capture_control(&stem)?;
         Ok("positive_check=0; control_fault_verified=true; uplink_violations=0; saved JSON, command output, notify, events and pcap".into())
+    }
+}
+
+fn exit_change(old: &str) -> Result<String> {
+    let text = if old.contains("keepalive = \"25s\"") {
+        old.replace("keepalive = \"25s\"", "keepalive = \"24s\"")
+    } else {
+        old.replace("keepalive = \"24s\"", "keepalive = \"25s\"")
+    };
+    if text == old {
+        return fail("exit-only change did not change keepalive");
+    }
+    // Include the validator diagnostics if the fixture ever becomes invalid.
+    validate(parse_site(&text)?).map_err(|errors| format!("exit change: {errors:?}"))?;
+    Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn exit_only_keepalive_change_respects_lab_handshake_budget() {
+        let mut config = parse_site(include_str!("../../../lab/site-lab.toml")).unwrap();
+        config.health.handshake_stale = scupper_core::config::DurationStr("175s".into());
+        let original = toml::to_string(&config).unwrap();
+        let changed = exit_change(&original).unwrap();
+        assert!(changed.contains("keepalive = \"24s\""));
+        assert_eq!(exit_change(&changed).unwrap(), original);
     }
 }

@@ -350,7 +350,7 @@ fn dispatcher_drops_mutation_after_peer_hangup() {
     dispatcher.dispatch(
         control::Pending {
             peer: Some(server),
-            request: control::request(Op::Disconnect {}),
+            request: control::request(Op::Connect { exit: None }),
             uid: 0,
             until: now + Duration::from_secs(30),
             reply,
@@ -360,4 +360,34 @@ fn dispatcher_drops_mutation_after_peer_hangup() {
     );
     assert_eq!(rig.intents, [] as [Op; 0]);
     assert!(receive.recv().is_err());
+}
+
+#[test]
+fn dispatcher_disconnect_survives_peer_hangup() {
+    let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+    drop(client);
+    let mut dispatcher = Dispatcher::default();
+    let mut rig = Rig::default();
+    let (reply, receive) = mpsc::sync_channel(1);
+    let now = Instant::now();
+    dispatcher.dispatch(
+        control::Pending {
+            peer: Some(server),
+            request: control::request(Op::Disconnect {}),
+            uid: 0,
+            until: now + Duration::from_secs(30),
+            reply,
+        },
+        &mut rig,
+        now,
+    );
+    assert_eq!(rig.intents, [Op::Disconnect {}]);
+    dispatcher.poll_admin(&mut rig, now);
+    rig.workers
+        .borrow_mut()
+        .remove(0)
+        .send(Ok(report(&Op::Disconnect {})))
+        .unwrap();
+    dispatcher.poll_admin(&mut rig, now);
+    assert_eq!(receive.recv().unwrap().result, Ok(OpResult::Disconnect {}));
 }

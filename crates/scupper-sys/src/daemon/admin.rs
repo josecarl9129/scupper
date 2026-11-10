@@ -41,6 +41,7 @@ pub fn execute<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)>(
         Op::Ping {} => {
             return Ok(OpResult::Ping {
                 last_complete_iteration_age: age,
+                current_iteration_age: None,
                 netns: machine.netns_identity(),
                 version: machine.version(),
                 quarantined: machine.latch().is_some(),
@@ -77,6 +78,7 @@ pub fn execute_locked<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)>(
     match op {
         Op::Ping {} => Ok(OpResult::Ping {
             last_complete_iteration_age: age,
+            current_iteration_age: None,
             netns: machine.netns_identity(),
             version: machine.version(),
             quarantined: machine.latch().is_some(),
@@ -323,6 +325,32 @@ pub fn apply_locked(
     dry_run: bool,
     uid: u32,
 ) -> Result<OpResult, ApiError> {
+    apply_tracked(deps, log, guard, version, dry_run, uid).0
+}
+
+pub(crate) fn apply_tracked(
+    deps: &BootDeps<'_>,
+    log: &LogHandle,
+    guard: &WriterGuard,
+    version: Option<u64>,
+    dry_run: bool,
+    uid: u32,
+) -> (Result<OpResult, ApiError>, bool) {
+    let mut touched = false;
+    let result = apply_inner(deps, log, guard, version, dry_run, uid, &mut touched);
+    (result, touched)
+}
+
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+fn apply_inner(
+    deps: &BootDeps<'_>,
+    log: &LogHandle,
+    guard: &WriterGuard,
+    version: Option<u64>,
+    dry_run: bool,
+    uid: u32,
+    touched: &mut bool,
+) -> Result<OpResult, ApiError> {
     let store = VersionStore::read_only(deps.state_root, deps.config_root);
     let target = match version {
         Some(version) => Some(version),
@@ -355,6 +383,7 @@ pub fn apply_locked(
         });
     }
     if let Some(held) = deps.namespace.open().map_err(internal)? {
+        *touched = true;
         crate::reconcile::forwarding_gates(deps, &held, false, None).map_err(internal)?;
     }
     #[cfg(feature = "testing")]
@@ -373,6 +402,7 @@ pub fn apply_locked(
         return Err(api(ApiErrorCode::PersistenceUnavailable));
     };
     let previous = state.applied_version;
+    *touched = true;
     state.applied_version = Some(target);
     file.write(guard, &state)
         .map_err(|_| api(ApiErrorCode::PersistenceUnavailable))?;
@@ -386,9 +416,11 @@ pub fn apply_locked(
     );
     let report = crate::boot::boot_apply_with_guard(deps, guard, true);
     if !report.succeeded() {
-        if let Ok(Some(held)) = deps.namespace.open() {
-            let _ = crate::reconcile::forwarding_gates(deps, &held, false, None);
-        }
+        let reclosed = deps.namespace.open().is_ok_and(|held| {
+            held.is_some_and(|held| {
+                crate::reconcile::forwarding_gates(deps, &held, false, None).is_ok()
+            })
+        });
         state.applied_version = previous;
         let restored = file.write(guard, &state);
         let step = match report.steps.last().map(|step| step.step) {
@@ -398,6 +430,28 @@ pub fn apply_locked(
             Some(crate::boot::BootStep::Forwarding) => scupper_proto::StepKind::ForwardingOn,
             _ => scupper_proto::StepKind::VerifyRuleset,
         };
+        let rollback = if restored.is_ok() && reclosed && previous.is_some() {
+            Some(crate::boot::boot_with_guard(deps, guard))
+        } else {
+            None
+        };
+        let verified = rollback
+            .as_ref()
+            .is_some_and(crate::boot::BootReport::succeeded);
+        if let Some(rollback) = &rollback {
+            let _ = log.emit(
+                EventKind::Boot {
+                    result: if verified {
+                        scupper_proto::Outcome::Recovered
+                    } else {
+                        scupper_proto::Outcome::Failed
+                    },
+                    step: scupper_proto::StepKind::VerifyRuleset,
+                },
+                Actor::Local { uid },
+                rollback.applied_version,
+            );
+        }
         let _ = log.emit(
             EventKind::ApplyFailed {
                 version: Some(target),
@@ -407,13 +461,26 @@ pub fn apply_locked(
             Actor::Local { uid },
             previous,
         );
-        restored.map_err(|_| api(ApiErrorCode::PersistenceUnavailable))?;
-        // Reconverge known apply leftovers before attaching the old machine.
-        // This is operator recovery, outside drift detection and repair budgets.
-        if previous.is_some() {
-            let _ = crate::boot::boot_with_guard(deps, guard);
-        }
-        return Err(api(ApiErrorCode::Internal));
+        let closed = if verified {
+            false
+        } else {
+            deps.namespace.open().is_ok_and(|held| {
+                held.is_some_and(|held| {
+                    crate::reconcile::forwarding_gates(deps, &held, false, None).is_ok()
+                })
+            })
+        };
+        return Err(ApiError {
+            code: if verified {
+                ApiErrorCode::Internal
+            } else {
+                ApiErrorCode::PersistenceUnavailable
+            },
+            observation: Some(serde_json::json!({"rollback": {
+                "version": previous, "verified": verified, "closed": closed,
+                "reclosed": reclosed, "durable": restored.is_ok(),
+            }})),
+        });
     }
     if let Some(quarantine) = state.quarantine.take() {
         let latch = scupper_core::planner::Latch {

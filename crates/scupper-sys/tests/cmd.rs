@@ -255,6 +255,8 @@ fn wg_cases() -> Result<Vec<WgCase>, Box<dyn Error>> {
             "wg0".into(),
             "peer".into(),
             key()?.to_string(),
+            "preshared-key".into(),
+            "/dev/null".into(),
             "allowed-ips".into(),
             "10.99.0.2/32,fd00:99::2/128".into(),
             "endpoint".into(),
@@ -276,6 +278,8 @@ fn wg_cases() -> Result<Vec<WgCase>, Box<dyn Error>> {
             "wg0".into(),
             "peer".into(),
             key()?.to_string(),
+            "preshared-key".into(),
+            "/dev/null".into(),
             "allowed-ips".into(),
             String::new(),
         ],
@@ -289,8 +293,16 @@ fn every_wg_variant_argv_and_forbidden_tokens() -> Result<(), Box<dyn Error>> {
         let (program, args) = KernelCmd::Wg(cmd.clone()).render();
         assert_eq!(program, Program::Wg);
         assert_eq!(args, expected, "{cmd:?}");
-        for token in ["showconf", "dump", "preshared-keys", "preshared-key"] {
+        for token in ["showconf", "dump", "preshared-keys"] {
             assert!(!args.iter().any(|arg| arg == token), "{cmd:?}");
+        }
+        if matches!(cmd, WgCmd::SetPeer { .. }) {
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["preshared-key", "/dev/null"])
+            );
+        } else {
+            assert!(!args.iter().any(|arg| arg == "preshared-key"));
         }
         if matches!(cmd, WgCmd::SetPrivateKeyFromStdin { .. }) {
             assert_eq!(args, ["set", "wg0", "private-key", "/dev/stdin"]);

@@ -72,6 +72,7 @@ struct Lab {
     expected_rules: serde_json::Value,
     rows: Vec<Row>,
     cleaned: bool,
+    baseline_failure: Option<String>,
     next_source_port: u16,
     exit_port: u16,
 }
@@ -148,6 +149,7 @@ fn run_inner(
         expected_rules: serde_json::Value::Null,
         rows: Vec::new(),
         cleaned: false,
+        baseline_failure: None,
         next_source_port: 41000,
         exit_port: 51821,
     };
@@ -164,7 +166,11 @@ fn run_inner(
         let mut failures = Vec::new();
         for case in Case::ALL {
             lab.runner.phase = Instant::now() + Duration::from_secs(140);
-            let result = lab.case(case);
+            let result = if let Some(cause) = &lab.baseline_failure {
+                fail(format!("skipped: daemon baseline unavailable: {cause}"))
+            } else {
+                lab.case(case)
+            };
             let (got, detail) = match &result {
                 Ok(observed) => (
                     observed.clone(),

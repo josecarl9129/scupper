@@ -186,7 +186,9 @@ pub(super) enum ReadOutcome {
     Local(scupper_core::verdict::v2::Supervisor),
 }
 
-fn ping_supervisor(deps: &Dependencies<'_>) -> Option<scupper_core::verdict::v2::Supervisor> {
+fn ping_supervisor(
+    deps: &Dependencies<'_>,
+) -> Option<(scupper_core::verdict::v2::Supervisor, Option<u64>)> {
     use scupper_core::verdict::v2::Supervisor;
     let response = control::call(
         deps.writer_root,
@@ -196,16 +198,20 @@ fn ping_supervisor(deps: &Dependencies<'_>) -> Option<scupper_core::verdict::v2:
     .ok()?;
     let Ok(OpResult::Ping {
         last_complete_iteration_age,
+        current_iteration_age,
         netns,
         ..
     }) = response.result
     else {
         return None;
     };
-    Some(Supervisor::Alive {
-        netns,
-        iteration_age: Duration::from_secs(last_complete_iteration_age.unwrap_or(30)),
-    })
+    Some((
+        Supervisor::Alive {
+            netns,
+            iteration_age: Duration::from_secs(last_complete_iteration_age.unwrap_or(30)),
+        },
+        current_iteration_age,
+    ))
 }
 
 pub(super) fn read(
@@ -223,10 +229,12 @@ pub(super) fn read(
     if status {
         return local(err, Supervisor::Dead);
     }
-    let Some(supervisor) = ping_supervisor(deps) else {
+    let observed = Instant::now();
+    let Some((supervisor, busy_age)) = ping_supervisor(deps) else {
         return local(err, Supervisor::Dead);
     };
-    if matches!(supervisor, Supervisor::Alive {iteration_age, ..} if iteration_age >= Duration::from_secs(30))
+    if busy_age.is_some_and(|age| age >= 5)
+        || matches!(supervisor, Supervisor::Alive {iteration_age, ..} if iteration_age >= Duration::from_secs(30))
     {
         return local(err, supervisor);
     }
@@ -250,7 +258,7 @@ pub(super) fn read(
                     }),
                 ..
             }) if attempt == 0 => {
-                if !matches!(ping_supervisor(deps), Some(Supervisor::Alive {iteration_age, ..}) if iteration_age < Duration::from_secs(30))
+                if !matches!(ping_supervisor(deps), Some((Supervisor::Alive {iteration_age, ..}, _)) if iteration_age < Duration::from_secs(30))
                 {
                     break;
                 }
@@ -258,7 +266,17 @@ pub(super) fn read(
             _ => break,
         }
     }
-    local(err, Supervisor::Dead)
+    let supervisor = match supervisor {
+        Supervisor::Alive {
+            netns,
+            iteration_age,
+        } => Supervisor::Alive {
+            netns,
+            iteration_age: iteration_age + observed.elapsed(),
+        },
+        other => other,
+    };
+    local(err, supervisor)
 }
 
 fn render(response: Response, json: bool, out: &mut dyn Write) -> Result<u8, String> {

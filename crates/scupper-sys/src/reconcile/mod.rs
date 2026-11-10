@@ -864,6 +864,9 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                     );
                 }
                 FailoverAction::FlushConntrack => transition.push(Step::FlushConntrack),
+                FailoverAction::Emit(scupper_core::failover::FailoverEvent::FailClosedEnded {
+                    ..
+                }) if self.latch.is_some() => {}
                 FailoverAction::Emit(event) => self.emit(event.into(), Actor::Daemon, report),
                 FailoverAction::SetExitsDown => transition.extend(
                     desired

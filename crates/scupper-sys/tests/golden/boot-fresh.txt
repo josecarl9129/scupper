@@ -112,7 +112,7 @@ host Ip link set wg0 netns <netns-fd>
 netns Wg set wg0 private-key /dev/stdin stdin=45
 netns Wg show wg0 peers
 netns Wg set wg0 listen-port 51820
-netns Wg set wg0 peer AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM= allowed-ips 10.99.0.2/32 persistent-keepalive 0
+netns Wg set wg0 peer AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM= preshared-key /dev/null allowed-ips 10.99.0.2/32 persistent-keepalive 0
 netns Ip addr flush dev wg0
 netns Ip addr add 10.99.0.1/24 dev wg0
 netns Ip -d -j link show
@@ -183,7 +183,7 @@ host Ip link add ex-ch1 type wireguard
 host Ip link set ex-ch1 netns <netns-fd>
 netns Wg set ex-ch1 private-key /dev/stdin stdin=45
 netns Wg show ex-ch1 peers
-netns Wg set ex-ch1 peer AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI= allowed-ips 0.0.0.0/0 endpoint 203.0.113.2:51820 persistent-keepalive 25
+netns Wg set ex-ch1 peer AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI= preshared-key /dev/null allowed-ips 0.0.0.0/0 endpoint 203.0.113.2:51820 persistent-keepalive 25
 netns Ip addr flush dev ex-ch1
 netns Ip addr add 10.2.0.2/32 dev ex-ch1
 netns Ip -d -j link show

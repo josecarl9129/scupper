@@ -492,12 +492,13 @@ fn boot_is_hidden_root_only_and_reports_input_failure_without_kernel_writes() {
 }
 
 #[test]
-fn boot_defers_to_live_supervisor_before_kernel_calls() {
+fn boot_refuses_unresponsive_lease_holder_before_kernel_calls() {
     let h = Harness::new();
     let _lease = scupper_sys::lock::SupervisorLease::try_acquire(h.path.join("run")).unwrap();
     let (code, output, error) = h.run(&["boot"]);
-    assert_eq!(code, 0, "{output} {error}");
-    assert!(error.contains("scupperd owns the namespace"));
+    assert_eq!(code, 1, "{output} {error}");
+    assert!(error.contains("holder is not an initialized, responsive scupperd"));
+    assert!(error.contains("pid"));
     assert!(h.system.calls.borrow().is_empty());
     assert!(!h.path.join("state").exists());
 }

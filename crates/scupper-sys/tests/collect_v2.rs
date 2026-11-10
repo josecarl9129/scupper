@@ -838,3 +838,36 @@ fn supervised_check_reads_live_completion() {
     assert!(completed.get().unwrap() > old);
     assert_eq!(report.verdict.exit_code(), 0, "{report:?}");
 }
+
+#[test]
+fn forwarding_defaults_warn_only_when_inconsistent_with_global_gates() {
+    for runner in ["ubuntu-22.04", "ubuntu-24.04"] {
+        let handle = testing::handle().unwrap();
+        let site = site(runner);
+        let config = health(&site, &handle);
+        for global in ["0", "1"] {
+            for default in ["0", "1"] {
+                let sys = Script::new(runner);
+                for (key, value) in [
+                    ("net.ipv4.ip_forward", global),
+                    ("net.ipv6.conf.all.forwarding", global),
+                    ("net.ipv4.conf.default.forwarding", default),
+                    ("net.ipv6.conf.default.forwarding", default),
+                ] {
+                    sys.replace(&format!("scupper-sysctl-{key}.txt"), value);
+                }
+                let got = collect::forwarding(&sys, &handle, &config, &State::default()).unwrap();
+                for key in [
+                    "net.ipv4.conf.default.forwarding",
+                    "net.ipv6.conf.default.forwarding",
+                ] {
+                    assert_eq!(
+                        got.hardening.contains(&key.into()),
+                        global != default,
+                        "{global}/{default}: {got:?}"
+                    );
+                }
+            }
+        }
+    }
+}

@@ -26,13 +26,14 @@ use std::{
 pub const QUEUE_TIMEOUT: Duration = Duration::from_secs(180);
 /// Queue residence plus fresh verification and response margin.
 pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(240);
-/// One maximum tick plus fresh check budget and delivery margin.
-pub const CHECK_TIMEOUT: Duration = Duration::from_secs(60);
+/// Short socket wait before independent read-only observations.
+pub const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 pub(crate) struct Snapshot {
     pub ping: Option<OpResult>,
     pub last_complete: Option<Instant>,
+    pub current_iteration: Option<Instant>,
 }
 pub(crate) type SharedSnapshot = Arc<RwLock<Snapshot>>;
 
@@ -44,10 +45,12 @@ impl Snapshot {
             .ok_or_else(|| api(ApiErrorCode::SupervisorUnavailable))?;
         if let OpResult::Ping {
             last_complete_iteration_age,
+            current_iteration_age,
             ..
         } = &mut ping
         {
             *last_complete_iteration_age = self.last_complete.map(|at| at.elapsed().as_secs());
+            *current_iteration_age = self.current_iteration.map(|at| at.elapsed().as_secs());
         }
         Ok(ping)
     }
@@ -874,6 +877,7 @@ mod round_two_tests {
         let snapshot = SharedSnapshot::default();
         let ping = OpResult::Ping {
             last_complete_iteration_age: None,
+            current_iteration_age: None,
             netns: scupper_core::verdict::v2::NetnsIdentity {
                 device: 5,
                 inode: 7,
@@ -885,6 +889,7 @@ mod round_two_tests {
         *snapshot.write().unwrap() = Snapshot {
             ping: Some(ping),
             last_complete: Instant::now().checked_sub(Duration::from_secs(3)),
+            current_iteration: Instant::now().checked_sub(Duration::from_secs(6)),
         };
         let (send, receive) = mpsc::sync_channel(1);
         // No tick owner drains this queue. Ping still answers under writer contention.
@@ -897,6 +902,7 @@ mod round_two_tests {
                 version: 11,
                 quarantined: true,
                 last_complete_iteration_age: Some(3),
+                current_iteration_age: Some(6),
                 selection: scupper_core::verdict::v2::Selection::Disconnected,
                 ..
             })

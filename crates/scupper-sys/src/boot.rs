@@ -96,6 +96,10 @@ impl BootReport {
 
 /// Injectable namespace opening boundary. Creation itself uses the command trace.
 pub trait BootNamespace {
+    /// Published namespace name used by reconciliation after the handoff.
+    fn path(&self) -> &Path {
+        Path::new("/run/netns/scupper")
+    }
     /// Opens the owned namespace, distinguishing absence from invalid/host handles.
     ///
     /// # Errors
@@ -691,4 +695,26 @@ pub(crate) fn configured_names(cfg: &Inputs) -> Result<Vec<IfName>> {
         .chain(gw.exits().iter().map(|e| e.ifname().as_str()))
         .map(|name| IfName::new(name).map_err(|e| e.to_string()))
         .collect()
+}
+
+/// Internal fixture boundary for release-restricted multi-gateway configurations.
+#[cfg(feature = "testing")]
+pub mod testing {
+    /// Reconfigures the client link using the production peer/session path.
+    /// # Errors
+    /// Returns missing inputs, namespace or link configuration errors.
+    pub fn configure_clients(
+        deps: super::BootDeps<'_>,
+        site: scupper_core::config::ValidatedSite,
+    ) -> Result<(), String> {
+        let mut cfg =
+            super::inputs_for_link(&deps, &mut super::BootReport::default(), Some("wg0"))?;
+        cfg.site = site;
+        let held = deps
+            .namespace
+            .open()
+            .map_err(|error| error.to_string())?
+            .ok_or("missing namespace")?;
+        super::links::configure_one(&deps, &held, &cfg, "wg0")
+    }
 }

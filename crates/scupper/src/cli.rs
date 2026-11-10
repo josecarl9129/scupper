@@ -353,6 +353,22 @@ fn dispatch(
             let _lease = match scupper_sys::lock::SupervisorLease::try_acquire(deps.writer_root) {
                 Ok(lease) => lease,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    let ping = scupper_sys::daemon::control::call(
+                        deps.writer_root,
+                        &scupper_sys::daemon::control::request(scupper_proto::Op::Ping {}),
+                        std::time::Duration::from_secs(2),
+                    );
+                    if !matches!(
+                        ping,
+                        Ok(scupper_proto::Response {
+                            result: Ok(scupper_proto::OpResult::Ping { .. }),
+                            ..
+                        })
+                    ) {
+                        return Err(format!(
+                            "{error}; holder is not an initialized, responsive scupperd; boot refused"
+                        ));
+                    }
                     writeln!(stderr, "scupperd owns the namespace; boot skipped successfully; use scupper apply for a verified update").map_err(output_error)?;
                     return Ok(0);
                 }

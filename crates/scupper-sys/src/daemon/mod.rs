@@ -114,6 +114,10 @@ impl StartupRead {
                 let state_root = deps.state_root.to_path_buf();
                 let config_root = deps.config_root.to_path_buf();
                 let run_root = deps.run_root.to_path_buf();
+                #[cfg(not(feature = "testing"))]
+                let namespace_path = deps.namespace.path().to_path_buf();
+                #[cfg(feature = "testing")]
+                let test_held = deps.namespace.open().map_err(io::Error::other)?;
                 let (send, receive) = mpsc::sync_channel(1);
                 std::thread::Builder::new()
                     .name("scupper-startup-read".into())
@@ -135,9 +139,19 @@ impl StartupRead {
                             let expected = report.netns.ok_or_else(|| {
                                 io::Error::other("missing boot namespace identity")
                             })?;
+                            #[cfg(feature = "testing")]
+                            let held = if let Some(held) = test_held {
+                                if held.identity() != (expected.dev, expected.ino) {
+                                    return Err(io::Error::other("namespace identity mismatch"));
+                                }
+                                Arc::new(held)
+                            } else {
+                                return Err(io::Error::other("missing test namespace"));
+                            };
+                            #[cfg(not(feature = "testing"))]
                             let held = Arc::new(
                                 NetnsHandle::open_expected(
-                                    "/run/netns/scupper",
+                                    &namespace_path,
                                     Some((expected.dev, expected.ino)),
                                 )
                                 .map_err(io::Error::other)?,
@@ -203,11 +217,15 @@ fn initialize<'a>(
         .netns
         .ok_or_else(|| io::Error::other("missing boot namespace identity"))?;
     let rendered = render_netns(&site, &gateway, &stamp).map_err(io::Error::other)?;
-    let want = canon::prepare_netns_ruleset(deps.system, &held, &rendered, canon_deadline)
-        .map_err(|error| match error {
-            crate::verdict::ProbeError::Timeout => io::Error::new(io::ErrorKind::TimedOut, error),
-            _ => io::Error::other(error),
-        })?;
+    let want = if deps.system.canon_cache().is_some() {
+        canon::prepare_netns_ruleset(deps.system, &held, &rendered, canon_deadline)
+    } else {
+        canon::netns_rulesets(deps.system, &held, &rendered).map(|(want, _)| want)
+    }
+    .map_err(|error| match error {
+        crate::verdict::ProbeError::Timeout => io::Error::new(io::ErrorKind::TimedOut, error),
+        _ => io::Error::other(error),
+    })?;
     let fingerprint = canon::fingerprint(&want).map_err(io::Error::other)?;
     let config = Config {
         site,
@@ -414,6 +432,8 @@ fn run_notified(
         options,
         system: &system,
         namespace: &namespace,
+        #[cfg(feature = "testing")]
+        secret_owner: 0,
         gateway,
         origin,
         audit,
@@ -441,8 +461,10 @@ fn run_notified(
 }
 struct Runtime<'a> {
     options: &'a Options,
-    system: &'a RealSystem,
-    namespace: &'a GatewayNamespace,
+    system: &'a dyn crate::system::System,
+    namespace: &'a dyn crate::boot::BootNamespace,
+    #[cfg(feature = "testing")]
+    secret_owner: u32,
     gateway: GatewayId,
     origin: Instant,
     audit: Audit,
@@ -479,7 +501,7 @@ impl<'a> Runtime<'a> {
             #[cfg(feature = "testing")]
             hook: None,
             #[cfg(feature = "testing")]
-            secret_owner: 0,
+            secret_owner: self.secret_owner,
         }
     }
 }
@@ -495,6 +517,7 @@ impl Runtime<'_> {
                 .as_ref()
                 .map(|(machine, _, _)| scupper_proto::OpResult::Ping {
                     last_complete_iteration_age: None,
+                    current_iteration_age: None,
                     netns: machine.netns_identity(),
                     version: machine.version(),
                     quarantined: machine.latch().is_some(),
@@ -590,6 +613,12 @@ impl Runtime<'_> {
             let guard =
                 crate::lock::WriterLock::acquire_timeout(deps.run_root, Duration::from_secs(2))
                     .map_err(|_| control::api(ApiErrorCode::Conflict))?;
+            // Resolve request errors before persisting latch or resetting runtime state.
+            if let Some(target) = version {
+                VersionStore::read_only(deps.state_root, deps.config_root)
+                    .read(target)
+                    .map_err(|_| control::api(ApiErrorCode::NotFound))?;
+            }
             if !dry_run && let Some((machine, _, _)) = &mut self.running {
                 machine
                     .preserve_latch_locked(&guard)
@@ -606,9 +635,9 @@ impl Runtime<'_> {
             } else {
                 Vec::new()
             };
-            let mut result =
-                admin::apply_locked(&deps, &self.audit.handle(), &guard, version, dry_run, uid);
-            if !dry_run {
+            let (mut result, touched) =
+                admin::apply_tracked(&deps, &self.audit.handle(), &guard, version, dry_run, uid);
+            if touched {
                 self.abandon_probes();
                 self.startup_read = StartupRead::default();
                 self.running = if result
@@ -628,6 +657,9 @@ impl Runtime<'_> {
                     )
                     .ok()
                 };
+                if self.running.is_none() {
+                    close_only(&deps, self.options);
+                }
                 self.cached = None;
                 self.last_complete = None;
                 self.publish_snapshot();
@@ -738,7 +770,6 @@ impl DaemonDeps for Runtime<'_> {
         }
         if let Err(error) = self.notify.started() {
             eprintln!("scupperd: notify: {error}");
-            return;
         }
         if !self.started_event {
             self.started_event = true;
@@ -756,6 +787,10 @@ impl DaemonDeps for Runtime<'_> {
         }
     }
     fn notify(&mut self, iteration: &Iteration) {
+        self.snapshot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .current_iteration = None;
         if iteration.complete && self.running.is_some() {
             self.last_complete = Some(Instant::now());
         }
@@ -828,6 +863,10 @@ impl DaemonDeps for Runtime<'_> {
     #[allow(clippy::too_many_lines)]
     fn tick(&mut self, stop: &AtomicBool) -> Option<crate::reconcile::TickReport> {
         let now = Instant::now();
+        self.snapshot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .current_iteration = Some(now);
         #[cfg(feature = "testing")]
         if self.options.run_root.join("incomplete-tick").exists() {
             return Some(crate::reconcile::TickReport::default());
@@ -1389,5 +1428,149 @@ mod tests {
         writer.join().unwrap();
         assert!(reader.pending.is_none());
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+/// Integration boundary for exercising the production dispatcher and runtime.
+#[cfg(feature = "testing")]
+pub mod testing {
+    use super::{
+        Audit, BootDeps, DaemonDeps, Duration, EventKind, EventLog, GatewayId, Instant, Options,
+        Runtime, StartupRead, UnixSeconds, control, io, mpsc, notify, pending, probes, unix,
+    };
+    /// Drives one apply through the real runtime using injected kernel I/O.
+    /// Returns the response, Ping before/after, retained completion age, and next tick.
+    /// # Errors
+    /// Returns fixture initialization or channel failures.
+    #[allow(clippy::too_many_lines, clippy::type_complexity)]
+    pub fn dispatch_apply(
+        deps: BootDeps<'_>,
+        version: u64,
+    ) -> io::Result<(
+        scupper_proto::Response,
+        scupper_proto::OpResult,
+        scupper_proto::OpResult,
+        bool,
+        crate::reconcile::TickReport,
+    )> {
+        let options = Options {
+            state_root: deps.state_root.into(),
+            config_root: deps.config_root.into(),
+            run_root: deps.run_root.into(),
+            probe_binary: deps.run_root.join("unused-probe"),
+        };
+        let mut runtime = runtime(deps, &options)?;
+        let origin = runtime.origin;
+        runtime.last_complete = Some(origin);
+        runtime.publish_snapshot();
+        let before = runtime
+            .snapshot
+            .read()
+            .map_err(|_| io::Error::other("snapshot poisoned"))?
+            .ping
+            .clone()
+            .ok_or_else(|| io::Error::other("no Ping"))?;
+        let (reply, receive) = mpsc::sync_channel(1);
+        let mut dispatcher = pending::Dispatcher::default();
+        dispatcher.dispatch(
+            control::Pending {
+                request: control::request(scupper_proto::Op::Apply {
+                    version: Some(version),
+                    dry_run: false,
+                }),
+                uid: 0,
+                until: origin + Duration::from_secs(10),
+                reply,
+                peer: None,
+            },
+            &mut runtime,
+            origin,
+        );
+        let response = receive
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(io::Error::other)?;
+        let after = runtime
+            .snapshot
+            .read()
+            .map_err(|_| io::Error::other("snapshot poisoned"))?
+            .ping
+            .clone()
+            .ok_or_else(|| io::Error::other("runtime lost attachment"))?;
+        let retained_completion = runtime.last_complete == Some(origin);
+        let tick = runtime
+            .running
+            .as_mut()
+            .ok_or_else(|| io::Error::other("no machine"))?
+            .0
+            .tick();
+        Ok((response, before, after, retained_completion, tick))
+    }
+    fn runtime<'a>(deps: BootDeps<'a>, options: &'a Options) -> io::Result<Runtime<'a>> {
+        let origin = Instant::now();
+        let gateway = GatewayId("gw1".into());
+        let audit =
+            Audit::open(deps.state_root, gateway.clone(), origin).map_err(io::Error::other)?;
+        let mut runtime = Runtime {
+            options,
+            system: deps.system,
+            namespace: deps.namespace,
+            secret_owner: deps.secret_owner,
+            gateway,
+            origin,
+            audit,
+            notify: notify::Notify::disabled(),
+            started_event: false,
+            running: None,
+            pending_canon: false,
+            startup_read: StartupRead::default(),
+            probes: probes::Probes::new(options.probe_binary.clone(), origin),
+            setup_at: None,
+            setup_rounds: 0,
+            edge_logged: false,
+            control: None,
+            binding: None,
+            bind_retry: origin,
+            control_errors: control::FailureSummary::default(),
+            dispatcher: pending::Dispatcher::default(),
+            last_complete: None,
+            snapshot: control::SharedSnapshot::default(),
+            cached: None,
+        };
+        runtime.initialize_until(origin + Duration::from_secs(5));
+        if runtime.running.is_none() {
+            return Err(io::Error::other("fixture runtime did not initialize"));
+        }
+        Ok(runtime)
+    }
+
+    /// Counts startup audit events after two READY writes to a missing socket.
+    /// # Errors
+    /// Returns fixture initialization or audit persistence failures.
+    pub fn started_with_broken_notify(deps: BootDeps<'_>) -> io::Result<usize> {
+        let options = Options {
+            state_root: deps.state_root.into(),
+            config_root: deps.config_root.into(),
+            run_root: deps.run_root.into(),
+            probe_binary: deps.run_root.join("unused-probe"),
+        };
+        let mut runtime = runtime(deps, &options)?;
+        let missing = deps.run_root.join("missing-notify.sock");
+        runtime.notify = notify::Notify::new(Some(missing.as_os_str()))?;
+        runtime.started();
+        runtime.started();
+        let root = deps.state_root.join("started-audit");
+        let disk = EventLog::open(&root, GatewayId("gw1".into()), || UnixSeconds(unix()))
+            .map_err(io::Error::other)?;
+        runtime
+            .audit
+            .handle()
+            .replay_into(&disk.handle)
+            .map_err(io::Error::other)?;
+        disk.handle.flush_blocking(Duration::from_secs(5))?;
+        let events = crate::events::read_since(&root, 0, None).collect::<io::Result<Vec<_>>>()?;
+        Ok(events
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::DaemonStarted { .. }))
+            .count())
     }
 }

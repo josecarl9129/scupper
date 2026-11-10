@@ -2834,7 +2834,13 @@ fn repair_clear_reopens_forwarding_after_quarantined_restart() {
     rig.restart();
     for _ in 0..4 {
         rig.round(true);
-        rig.tick();
+        let tick = rig.tick();
+        assert!(
+            !tick
+                .events
+                .iter()
+                .any(|event| matches!(event, EventKind::FailClosedEnded { .. }))
+        );
     }
     assert!(rig.kernel.model().forwarding_off());
     rig.machine().clear_latch(Actor::Local { uid: 0 }).unwrap();

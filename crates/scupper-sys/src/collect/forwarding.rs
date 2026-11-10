@@ -83,6 +83,14 @@ pub fn forwarding(
         }
         values.push(value);
     }
+    for (index, global, key) in [
+        (2, 0, "net.ipv4.conf.default.forwarding"),
+        (3, 1, "net.ipv6.conf.default.forwarding"),
+    ] {
+        if values[index] != values[global] {
+            hardening.push(key.into());
+        }
+    }
     let client_v4 = parse_sysctl(&observe(
         sys,
         handle,

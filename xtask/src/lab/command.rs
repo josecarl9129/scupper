@@ -198,7 +198,13 @@ impl Runner {
         Ok(stdout)
     }
     pub fn background(&mut self, invocation: &Invocation, log: &Path) -> Result<Group> {
-        let mut cmd = self.command(invocation, 1050)?;
+        // Services must live through the whole suite, including fault recovery.
+        let seconds = self
+            .whole
+            .saturating_duration_since(Instant::now())
+            .as_secs()
+            + 2;
+        let mut cmd = self.command(invocation, seconds)?;
         cmd.stdin(Stdio::null())
             .stdout(File::create(log)?)
             .stderr(File::create(log.with_extension("stderr"))?);

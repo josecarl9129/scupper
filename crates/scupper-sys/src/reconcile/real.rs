@@ -146,7 +146,7 @@ impl<'a> RealKernel<'a> {
             held,
             config,
             health,
-            "/run/netns/scupper".into(),
+            deps.namespace.path().into(),
             None,
             state,
         )?;
@@ -577,6 +577,21 @@ pub(crate) fn forwarding(
                 return Err(StepError("partial forwarding raise"));
             }
             failed |= result.is_err();
+        }
+    }
+    // ip_forward toggles reset accept_redirects. Restore hardening even on
+    // closure, so a stopped disconnected machine remains safely adoptable.
+    if only.is_none() {
+        let names = links
+            .iter()
+            .filter_map(|link| IfName::new(&link.ifname).ok())
+            .collect::<Vec<_>>();
+        for setting in scupper_core::render::desired_sysctls(&names, on) {
+            if matches!(setting.key.name, "forwarding" | "ip_forward") {
+                continue;
+            }
+            failed |=
+                write_sysctl_verified(deps.system, held, &setting.key, 0, EXEC_TIMEOUT).is_err();
         }
     }
     if failed {

@@ -113,6 +113,7 @@ struct DaemonGuard<'a> {
     armed: bool,
     case: String,
     notify: Option<NotifyCapture>,
+    baseline_version: Option<u64>,
 }
 impl DaemonGuard<'_> {
     #[allow(clippy::too_many_lines)] // Keep start/restart continuity and fault cleanup ordering together.
@@ -266,6 +267,7 @@ impl DaemonGuard<'_> {
         }
         Ok(observed)
     }
+    #[allow(clippy::too_many_lines)] // Keep cleanup ordering and deadline restoration visible.
     fn finish(&mut self) -> Result<()> {
         if !self.armed {
             return Ok(());
@@ -357,12 +359,21 @@ impl DaemonGuard<'_> {
                 .runner
                 .output(&Invocation::new(ns, program, &args), None);
         }
-        self.reset_control_fixture()?;
         let restored = self
-            .lab
-            .boot_gateway(&[], "daemon-restore")
+            .reset_control_fixture()
+            .and_then(|()| self.lab.boot_gateway(&[], "daemon-restore"))
             .and_then(|_| self.lab.daemon_clean_baseline())
-            .and_then(|()| super::mounts::verify_restored_peers(None));
+            .and_then(|()| super::mounts::verify_restored_peers(None))
+            .and_then(|()| {
+                let run = self.lab.private.join("boot-root/run/scupper");
+                let _lease = scupper_sys::lock::SupervisorLease::try_acquire(&run)?;
+                let _writer = scupper_sys::lock::WriterLock::try_acquire(&run)?;
+                if run.join("control.sock").exists() {
+                    return fail("daemon cleanup left control socket");
+                }
+                self.lab.cmd("scupper", "conntrack", &["-F"])?;
+                Ok(())
+            });
         self.lab.runner.cleanup = cleanup;
         self.lab.runner.phase = phase;
         self.lab.runner.whole = whole;
@@ -380,8 +391,12 @@ impl Lab {
         let mut failures = Vec::new();
         let mut blocked = None;
         for case in CASES {
-            self.runner.phase =
-                Instant::now() + Duration::from_secs(if case == "L3" { 300 } else { 180 });
+            self.runner.phase = Instant::now()
+                + Duration::from_secs(if matches!(case, "L3" | "L50") {
+                    300
+                } else {
+                    180
+                });
             let started = Instant::now();
             let observed = if let Some(cause) = &blocked {
                 fail(format!("skipped: baseline unavailable after {cause}"))
@@ -409,6 +424,10 @@ impl Lab {
                 failures.push(format!("{case}: {error}"));
             }
         }
+        if let Err(error) = self.daemon_clean_baseline() {
+            self.baseline_failure = Some(error.to_string());
+            failures.push(format!("daemon suite final baseline: {error}"));
+        }
         if !failures.is_empty() {
             return fail(failures.join("; "));
         }
@@ -425,6 +444,7 @@ impl Lab {
             armed: true,
             case: case.into(),
             notify: None,
+            baseline_version: None,
         };
         let result = guard.run(case);
         let cleanup = guard.finish();
