@@ -24,6 +24,23 @@ pub(super) fn is_m2(case: &str) -> bool {
             | "L17-rebuild"
     )
 }
+fn capture_control(source: &str, destination: &str, protocol: u8) -> Result<Flow> {
+    Ok(Flow {
+        source: source.parse()?,
+        destination: destination.parse()?,
+        protocol,
+        ports: None,
+    })
+}
+
+fn wg_rx_errors(text: &str) -> Result<u64> {
+    let links: serde_json::Value = serde_json::from_str(text)?;
+    links[0]["stats64"]["rx"]["errors"]
+        .as_u64()
+        .or_else(|| links[0]["stats"]["rx"]["errors"].as_u64())
+        .ok_or_else(|| "wg0 rx error counter missing".into())
+}
+
 impl DaemonGuard<'_> {
     pub(super) fn run_m2(&mut self, case: &str) -> Result<String> {
         let root = self.lab.prepare_check_v2()?;
@@ -205,7 +222,7 @@ impl DaemonGuard<'_> {
         )?;
         for family in ["-4", "-6"] {
             self.lab.cmd("gwhost", "ip", &[family, "rule", "flush"])?;
-            for (pref, table) in [("0", "local"), ("32766", "main"), ("32767", "default")] {
+            for &(pref, table) in super::host_rule_defaults(family) {
                 let rules: serde_json::Value = serde_json::from_str(&self.lab.cmd(
                     "gwhost",
                     "ip",
@@ -298,13 +315,24 @@ impl DaemonGuard<'_> {
             for hook in ["prerouting", "input", "forward", "output", "postrouting"] {
                 write!(
                     rules,
-                    "chain {hook} {{ type filter hook {hook} priority filter; policy accept; udp sport {{ 51820, {} }} udp dport {{ 51820, {} }} counter; ip version 4 counter dup to {} device eth0;\n}}\n",
-                    self.lab.exit_port, self.lab.exit_port, A.gwhost.wan
+                    "chain {hook} {{ type filter hook {hook} priority filter; policy accept; udp sport {{ 51820, {} }} udp dport {{ 51820, {} }} counter; ",
+                    self.lab.exit_port, self.lab.exit_port
                 )?;
+                // Inbound copies would loop through the router. inet supports
+                // the counters/accept policy; dup is family-specific.
+                if family == "ip" && matches!(hook, "forward" | "output" | "postrouting") {
+                    write!(rules, "counter dup to {} device eth0; ", A.gwhost.wan)?;
+                }
+                rules.push_str("\n}\n");
             }
             rules.push_str("}\n");
         }
         rules.push_str("table ip m2_nat { chain post { type nat hook postrouting priority srcnat; ip saddr { 10.99.0.0/24, 10.2.0.0/24 } masquerade;\n}\n}\n");
+        fs::write(self.lab.artifacts.join("L8-host-ruleset.nft"), &rules)?;
+        self.lab.runner.input(
+            &Invocation::new("gwhost", "nft", &["-c", "-f", "-"]),
+            Some(rules.as_bytes()),
+        )?;
         self.lab.runner.input(
             &Invocation::new("gwhost", "nft", &["-f", "-"]),
             Some(rules.as_bytes()),
@@ -483,6 +511,7 @@ impl DaemonGuard<'_> {
                 protocol: 1,
                 ports: None,
             }],
+            &[capture_control(A.client_inner, A.internet.peer, 6)?],
         )?;
         fs::write(
             self.lab
@@ -503,10 +532,25 @@ impl DaemonGuard<'_> {
         let wg_capture = fs::read(self.lab.artifacts.join(format!("{stem}-wg0.pcap")))?;
         let destination = fs::read(self.lab.artifacts.join(format!("{stem}-destination.pcap")))?;
         let client2_capture = fs::read(self.lab.artifacts.join(format!("{stem}-sender.pcap")))?;
-        path::dropped(&wg_capture, &destination, &to_client)?;
-        path::dropped(&wg_capture, &client2_capture, &to_client2)?;
+        path::dropped(
+            &wg_capture,
+            &destination,
+            &to_client,
+            &[capture_control(A.client_inner, A.internet.peer, 6)?],
+        )?;
+        path::dropped(
+            &wg_capture,
+            &client2_capture,
+            &to_client2,
+            &[capture_control("10.99.0.3", A.gateway_inner, 1)?],
+        )?;
         let exit_capture = fs::read(self.lab.artifacts.join(format!("{stem}-exit.pcap")))?;
-        path::dropped(&exit_capture, &destination, &provider_queries)?;
+        path::dropped(
+            &exit_capture,
+            &destination,
+            &provider_queries,
+            &[capture_control(A.client_inner, A.internet.peer, 6)?],
+        )?;
         let transfers_after = self
             .lab
             .cmd("scupper", "wg", &["show", "wg0", "transfer"])?;
@@ -545,6 +589,13 @@ impl DaemonGuard<'_> {
         }
         Ok(())
     }
+    fn wg_rx_errors(&mut self) -> Result<u64> {
+        wg_rx_errors(
+            &self
+                .lab
+                .cmd("scupper", "ip", &["-s", "-j", "link", "show", "wg0"])?,
+        )
+    }
     #[allow(clippy::too_many_lines)] // Preserve the two source-validation layers and their trace ordering.
     fn spoof(&mut self, root: &Path, stem: &str) -> Result<()> {
         let forged: IpAddr = "198.18.12.2".parse()?;
@@ -556,7 +607,7 @@ impl DaemonGuard<'_> {
             .capture("scupper", "ex-ch1", &format!("{stem}-wg-exit"))?;
         self.lab
             .capture("gwhost", "eth0", &format!("{stem}-cipher-ingress"))?;
-        let rx_before = self.lab.boot_client_rx()?;
+        let rx_before = self.wg_rx_errors()?;
         let forged_length = self.raw_udp(
             "client",
             "wg0",
@@ -564,18 +615,28 @@ impl DaemonGuard<'_> {
             (40012, 8080),
             64,
         )?;
-        // Peer transfer accounting may exclude inner-source rejects. An
-        // authenticated echo control proves the live receive path as well.
-        self.ping("client", A.gateway_inner, true)?;
-        self.lab.runner.dwell(Duration::from_millis(300))?;
-        let rx_after = self.lab.boot_client_rx()?;
+        let mut rx_after = rx_before;
+        let rejected = self.lab.daemon_wait(
+            "L12 WireGuard source rejection",
+            Duration::from_secs(3),
+            |lab| {
+                rx_after = wg_rx_errors(&lab.cmd(
+                    "scupper",
+                    "ip",
+                    &["-s", "-j", "link", "show", "wg0"],
+                )?)?;
+                Ok(rx_after > rx_before)
+            },
+        );
         fs::write(
             self.lab.artifacts.join("L12-wireguard-rx.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({"before":rx_before,"after":rx_after}))?,
+            serde_json::to_vec_pretty(
+                &serde_json::json!({"rx_errors_before":rx_before,"rx_errors_after":rx_after}),
+            )?,
         )?;
-        if rx_after <= rx_before {
-            return fail("L12 gateway peer rx did not increase during forged-source trial");
-        }
+        rejected?;
+        // Independent capture liveness control, after measuring source rejection.
+        self.ping("client", A.gateway_inner, true)?;
         self.lab.stop_capture()?;
         self.lab.stop_capture()?;
         self.lab.stop_capture()?;
@@ -605,6 +666,7 @@ impl DaemonGuard<'_> {
             &fs::read(self.lab.artifacts.join(format!("{stem}-sender.pcap")))?,
             &fs::read(self.lab.artifacts.join(format!("{stem}-wg-filter.pcap")))?,
             std::slice::from_ref(&flow),
+            &[capture_control(A.client_inner, A.gateway_inner, 1)?],
         )?;
         self.child.as_mut().ok_or("daemon")?.signal(Signal::STOP);
         self.lab.cmd(
@@ -664,6 +726,7 @@ impl DaemonGuard<'_> {
                     .join(format!("{stem}-antispoof-exit.pcap")),
             )?,
             &[flow],
+            &[capture_control(A.exit_inner, A.internet.peer, 6)?],
         )?;
         let text = fs::read_to_string(trace_path)?;
         let ids: Vec<_> = text
@@ -697,7 +760,7 @@ impl DaemonGuard<'_> {
         self.child.as_mut().ok_or("daemon")?.signal(Signal::CONT);
         self.lab.daemon_complete_tick(root)
     }
-    #[allow(clippy::too_many_lines)] // Keep live-supervisor loss, gap evidence and recovery adjacent.
+    #[allow(clippy::too_many_lines)] // Keep daemon-down loss, gap evidence and recovery adjacent.
     fn rebuild(&mut self, root: &Path, case: &str) -> Result<()> {
         let marker = Lab::marker()?;
         self.lab.fault_markers.push(marker.clone());
@@ -711,22 +774,7 @@ impl DaemonGuard<'_> {
         let before = self
             .lab
             .cmd("scupper", "readlink", &["/proc/self/ns/net"])?;
-        let first_seq = super::read_since(&root.join("var-lib/scupper"), 0, None)
-            .filter_map(std::result::Result::ok)
-            .map(|e| e.seq)
-            .max()
-            .unwrap_or(0);
-        if case == "L17-rebuild" {
-            fs::write(root.join("run/scupper/release-namespace"), b"release")?;
-            self.lab.daemon_wait(
-                "running daemon relinquished namespace",
-                Duration::from_secs(8),
-                |_| Ok(root.join("run/scupper/namespace-released").exists()),
-            )?;
-            self.child.as_mut().ok_or("daemon")?.alive()?;
-        } else {
-            self.control_stop(Signal::TERM)?;
-        }
+        self.control_stop(Signal::TERM)?;
         self.lab.cmd(
             "scupper",
             "ip",
@@ -751,57 +799,9 @@ impl DaemonGuard<'_> {
                 &serde_json::json!({"namespace_missing":true,"sent_before":sent,"sent_during_gap":super::flow_counts(&flow)?.0}),
             )?,
         )?;
-        if case == "L17-rebuild" {
-            self.assert_namespace_released(before.trim())?;
-            fs::remove_file(root.join("run/scupper/release-namespace"))?;
-            self.lab.daemon_wait(
-                "next-tick supervised namespace rebuild",
-                Duration::from_secs(12),
-                |_| Ok(std::path::Path::new("/run/netns/scupper").exists()),
-            )?;
-            self.child.as_mut().ok_or("daemon")?.alive()?;
-        } else {
-            self.control_restart(root, "rebuild")?;
-        }
+        self.assert_namespace_released(before.trim())?;
+        self.control_restart(root, "rebuild")?;
         self.lab.daemon_complete_tick(root)?;
-        if case == "L17-rebuild" {
-            self.lab.daemon_wait(
-                "supervised loss recovered Boot event",
-                Duration::from_secs(5),
-                |_| {
-                    Ok(
-                        super::read_since(&root.join("var-lib/scupper"), first_seq, None)
-                            .filter_map(std::result::Result::ok)
-                            .any(|event| {
-                                matches!(
-                                    event.kind,
-                                    scupper_proto::EventKind::Boot {
-                                        result: scupper_proto::Outcome::Recovered,
-                                        ..
-                                    }
-                                )
-                            }),
-                    )
-                },
-            )?;
-            let events = super::read_since(&root.join("var-lib/scupper"), first_seq, None)
-                .collect::<std::io::Result<Vec<_>>>()?;
-            fs::write(
-                self.lab.artifacts.join("L17-rebuild-events.json"),
-                serde_json::to_vec_pretty(&events)?,
-            )?;
-            if !events.iter().any(|event| {
-                matches!(
-                    event.kind,
-                    scupper_proto::EventKind::Boot {
-                        result: scupper_proto::Outcome::Recovered,
-                        ..
-                    }
-                )
-            }) {
-                return fail("L17 supervised loss lacked recovered Boot event");
-            }
-        }
         let after = self
             .lab
             .cmd("", "stat", &["-Lc", "%i", "/run/netns/scupper"])?;

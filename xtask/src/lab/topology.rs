@@ -116,6 +116,7 @@ impl Lab {
             &["-6", "route", "add", "default", "via", A.wan_v6],
         )?;
 
+        self.internet_neighbors()?;
         self.internet_uplink()?;
         Ok(())
     }

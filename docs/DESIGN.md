@@ -2488,7 +2488,7 @@ retry limits are unchanged.
 | L14 | admin disconnect, then reboot simulation | stays closed until connect | M2 |
 | L15 | exit-IP probe returns an uplink address (fake target) | check 2 | M2 |
 | L16 | exit down then back (single exit): leave FailClosed by itself (rp_filter, bound probes with `unreachable` default) | 4, then 0 | M2 |
-| L17 | `ip netns del scupper` while edge runs; namespace inode loss with no holder | first: re-mount, no second netns, traffic unchanged; second: clean rebuild | M2 |
+| L17 | `ip netns del scupper` while edge runs; namespace loss with no holder (daemon down: stop → delete → start) | first: re-mount, no second netns, traffic unchanged; second: clean rebuild with a fresh namespace-local marker | M2 |
 | L18 | sysctl inheritance: host `rp_filter=2`, `ip_forward=1`, `accept_ra=1` before boot | netns values as §5.4 after boot and after every forwarding toggle | M2 |
 | L19 | meta: mutation runs (bugs 1-4) and bridged topology | suite fails on each mutation; nft layer blocks in bridged topology | M2 |
 | L20 | MTU/PMTU: oversized packets client→exit and exit→client | ICMP frag-needed / packet-too-big reach the sender; no other ICMP paths | M2 |

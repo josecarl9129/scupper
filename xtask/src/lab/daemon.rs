@@ -24,7 +24,7 @@ use std::{
 mod control_cases;
 mod m2_cases;
 
-pub(super) const CASES: [&str; 29] = [
+pub(super) const CASES: [&str; 28] = [
     "L1",
     "L2",
     "L5",
@@ -49,12 +49,35 @@ pub(super) const CASES: [&str; 29] = [
     "L4",
     "L10",
     "L14",
-    "L14-boot",
     "L43",
     "L44",
     "L50",
     "L9-host-link",
 ];
+
+pub(super) fn host_rule_defaults(family: &str) -> &'static [(&'static str, &'static str)] {
+    if family == "-4" {
+        &[("0", "local"), ("32766", "main"), ("32767", "default")]
+    } else {
+        &[("0", "local"), ("32766", "main")]
+    }
+}
+
+// READY and startup WATCHDOG notifications precede the first reconciler tick.
+fn startup_complete(
+    ready: bool,
+    result: Option<&std::result::Result<scupper_proto::OpResult, scupper_proto::ApiError>>,
+) -> bool {
+    ready
+        && matches!(
+            result,
+            Some(Ok(scupper_proto::OpResult::Ping {
+                last_complete_iteration_age: Some(0..=4),
+                operation: None,
+                ..
+            }))
+        )
+}
 
 // Drain notifications continuously, including while fault commands or probes block.
 struct NotifyCapture {
@@ -149,7 +172,7 @@ impl DaemonGuard<'_> {
         if m2_cases::is_m2(case) {
             return self.run_m2(case);
         }
-        if matches!(case, "L10" | "L14" | "L14-boot" | "L43" | "L44" | "L50") {
+        if matches!(case, "L10" | "L14" | "L43" | "L44" | "L50") {
             return self.run_control(case);
         }
         let root = self.lab.prepare_check_v2()?;
@@ -346,9 +369,7 @@ impl DaemonGuard<'_> {
                 .artifacts
                 .join(format!("daemon-{}/events", self.case)),
         );
-        for name in ["stall-tick", "release-namespace", "namespace-released"] {
-            let _ = fs::remove_file(self.lab.private.join("boot-root/run/scupper").join(name));
-        }
+        let _ = fs::remove_file(self.lab.private.join("boot-root/run/scupper/stall-tick"));
         let marker = if self
             .lab
             .private
@@ -399,6 +420,8 @@ impl DaemonGuard<'_> {
             .and_then(|()| self.lab.restore_host_rules())
             .and_then(|()| self.lab.boot_gateway(&[], "daemon-restore"))
             .and_then(|_| self.reset_m2_network())
+            .and_then(|()| self.lab.wait_provider())
+            .and_then(|()| self.lab.boot_fresh_client_handshake())
             .and_then(|()| self.lab.daemon_clean_baseline())
             .and_then(|()| super::mounts::verify_restored_peers(None))
             .and_then(|()| {
@@ -444,13 +467,15 @@ impl Lab {
         let mut failures = Vec::new();
         let mut blocked = None;
         for case in CASES.into_iter().filter(|case| *case == selected) {
-            self.runner.phase = Instant::now()
-                + Duration::from_secs(match case {
-                    "L9" => 1200,
-                    "L9b" => 900,
-                    "L3" | "L16" | "L50" | "L9-host-link" | "L11" => 300,
-                    _ => 180,
-                });
+            self.runner.phase = self.runner.phase.max(
+                Instant::now()
+                    + Duration::from_secs(match case {
+                        "L9" => 1200,
+                        "L9b" => 900,
+                        "L3" | "L16" | "L50" | "L9-host-link" | "L11" => 300,
+                        _ => 180,
+                    }),
+            );
             let started = Instant::now();
             let observed = if let Some(cause) = &blocked {
                 fail(format!("skipped: baseline unavailable after {cause}"))
@@ -630,7 +655,7 @@ impl Lab {
     }
     pub(super) fn restore_host_rules(&mut self) -> Result<()> {
         for family in ["-4", "-6"] {
-            for (pref, table) in [("0", "local"), ("32766", "main"), ("32767", "default")] {
+            for &(pref, table) in host_rule_defaults(family) {
                 let rules: serde_json::Value = serde_json::from_str(&self.cmd(
                     "gwhost",
                     "ip",
@@ -659,15 +684,15 @@ impl Lab {
                 "ip",
                 &[family, "-j", "rule", "show"],
             )?)?;
-            for table in ["local", "main", "default"] {
-                if !rules
-                    .as_array()
-                    .ok_or("host rules")?
-                    .iter()
-                    .any(|r| r["table"] == table)
-                {
+            for &(pref, table) in host_rule_defaults(family) {
+                if !rules.as_array().ok_or("host rules")?.iter().any(|r| {
+                    r["table"] == table
+                        && r["priority"]
+                            .as_u64()
+                            .is_some_and(|p| p.to_string() == pref)
+                }) {
                     return fail(format!(
-                        "unclean baseline: missing host {family} {table} rule"
+                        "unclean baseline: missing host {family} pref {pref} {table} rule"
                     ));
                 }
             }
@@ -768,18 +793,30 @@ impl Lab {
     }
     fn daemon_ready_tick(&mut self, notify: &NotifyCapture) -> Result<()> {
         let mut ready = false;
-        let mut complete = false;
-        self.daemon_wait(
+        let root = self.private.join("boot-root/run/scupper");
+        let mut last_ping = String::new();
+        let waited = self.daemon_wait(
             "READY and first complete tick",
             Duration::from_secs(40),
             |_| {
                 for message in notify.drain()? {
                     ready |= message == "READY=1";
-                    complete |= message == "WATCHDOG=1";
                 }
-                Ok(ready && complete)
+                let response = scupper_sys::daemon::control::call(
+                    &root,
+                    &scupper_sys::daemon::control::request(scupper_proto::Op::Ping {}),
+                    Duration::from_millis(500),
+                );
+                last_ping = format!("{response:?}");
+                Ok(startup_complete(
+                    ready,
+                    response.as_ref().ok().map(|r| &r.result),
+                ))
             },
-        )?;
+        );
+        if let Err(error) = waited {
+            return fail(format!("{error}; ready={ready}; last ping={last_ping}"));
+        }
         Ok(())
     }
     fn daemon_complete_tick(&mut self, root: &Path) -> Result<()> {
@@ -1799,11 +1836,11 @@ pub(super) fn daemon_wanted(case: &str) -> &'static str {
         "L15" => "real fake HTTPS exit-IP target: 0, uplink address 2, restored 0",
         "L18" => "host sysctl inheritance overridden; forwarding toggle reapplies hardening",
         "L20" => "supervised IPv4 PMTU; IPv6 renderer chain property, unsupervised",
-        "L17-rebuild" => "unheld namespace loss while daemon runs; fresh namespace marker; check 0",
-        "L10" => "SIGKILL/SIGSTOP: check 5, traffic continues; SIGCONT: check 0",
-        "L14" | "L14-boot" => {
-            "disconnect verifies closure; check 4 across reboot; connect restores 0"
+        "L17-rebuild" => {
+            "no-holder loss = daemon down; restart rebuilds; fresh namespace marker; check 0"
         }
+        "L10" => "SIGKILL/SIGSTOP: check 5, traffic continues; SIGCONT: check 0",
+        "L14" => "disconnect verifies closure; check 4 across reboot; connect restores 0",
         "L43" => {
             "recurring foreign link latches; forwarding stays 0 across restart/reboot; repair clear restores 0"
         }
@@ -1839,12 +1876,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn readiness_requires_ready_and_a_recent_completed_iteration() {
+        // Startup can send READY, STATUS=unconfirmed and WATCHDOG while Ping
+        // still has no completed iteration. Those notifications cannot pass.
+        let ping = |age| {
+            Ok(scupper_proto::OpResult::Ping {
+                last_complete_iteration_age: age,
+                current_iteration_age: None,
+                operation: None,
+                netns: scupper_core::verdict::v2::NetnsIdentity {
+                    device: 1,
+                    inode: 2,
+                },
+                version: 1,
+                quarantined: false,
+                selection: scupper_core::verdict::v2::Selection::Auto,
+            })
+        };
+        assert!(!startup_complete(false, Some(&ping(Some(0)))));
+        assert!(!startup_complete(true, None));
+        assert!(!startup_complete(true, Some(&ping(None))));
+        assert!(!startup_complete(true, Some(&ping(Some(5)))));
+        assert!(startup_complete(true, Some(&ping(Some(0)))));
+        assert!(startup_complete(true, Some(&ping(Some(4)))));
+        let mut applying = ping(Some(0));
+        if let Ok(scupper_proto::OpResult::Ping { operation, .. }) = &mut applying {
+            *operation = Some(scupper_proto::OperationProgress {
+                kind: scupper_proto::OperationKind::Rebuild,
+                from: 1,
+                to: 1,
+                age: 0,
+            });
+        }
+        assert!(!startup_complete(true, Some(&applying)));
+    }
+
+    #[test]
     fn copied_event_artifacts_are_readable_without_changing_sources() {
-        let root = std::env::var_os("CARGO_TARGET_TMPDIR")
-            .map_or_else(
-                || std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../target/tmp")),
-                std::path::PathBuf::from,
-            )
+        let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
             .join("daemon-event-artifacts")
             .join(std::process::id().to_string());
         let source = root.join("source");
@@ -1870,11 +1939,7 @@ mod tests {
     #[test]
     fn notify_capture_survives_idle_and_sender_restart() {
         use std::os::fd::AsRawFd;
-        let root = std::env::var_os("CARGO_TARGET_TMPDIR")
-            .map_or_else(
-                || std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../target/tmp")),
-                std::path::PathBuf::from,
-            )
+        let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
             .join(format!("notify-restart-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         let directory = fs::File::open(&root).unwrap();
@@ -1901,11 +1966,7 @@ mod tests {
 
     #[test]
     fn notify_artifact_keeps_every_message_even_when_consumers_drain() {
-        let root = std::env::var_os("CARGO_TARGET_TMPDIR")
-            .map_or_else(
-                || std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../target/tmp")),
-                std::path::PathBuf::from,
-            )
+        let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
             .join("daemon-notify-artifacts")
             .join(std::process::id().to_string());
         fs::create_dir_all(&root).unwrap();

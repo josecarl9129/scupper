@@ -68,6 +68,7 @@ pub(super) struct Runner {
     pub boot_point: Option<String>,
     pub boot_marker: Option<String>,
     trace: File,
+    last_stderr: String,
     background_groups: Vec<u32>,
 }
 impl Runner {
@@ -82,6 +83,7 @@ impl Runner {
             boot_point: None,
             boot_marker: None,
             trace,
+            last_stderr: String::new(),
             background_groups: Vec::new(),
         }
     }
@@ -196,6 +198,7 @@ impl Runner {
         let stdout = stdout.ok_or("missing command stdout")?;
         let stderr = stderr.ok_or("missing command stderr")?;
         group.done = true;
+        self.last_stderr = String::from_utf8_lossy(&stderr).into_owned();
         if !status.success() {
             writeln!(
                 self.trace,
@@ -212,7 +215,8 @@ impl Runner {
         let (status, stdout) = self.output(invocation, input)?;
         if !status.success() {
             return fail(format!(
-                "command failed ({status}): {invocation:?}; see commands.jsonl"
+                "command failed ({status}): {invocation:?}; {}; see commands.jsonl",
+                self.last_stderr
             ));
         }
         Ok(stdout)

@@ -102,7 +102,7 @@ pub(super) fn selected_recorded(shard: Shard, path: Option<&std::path::Path>) ->
 }
 fn recorded_catalog(path: Option<&std::path::Path>) -> Result<Vec<Spec>> {
     let mut cases = catalog();
-    let default = std::path::Path::new("xtask/lab/results.tsv");
+    let default = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/lab/results.tsv"));
     if let Some(path) = path.or_else(|| default.exists().then_some(default)) {
         apply_durations(&mut cases, &std::fs::read_to_string(path)?)?;
     }
@@ -227,7 +227,6 @@ mod tests {
         for extra in [
             "daemon-L9b",
             "daemon-L9-host-link",
-            "daemon-L14-boot",
             "daemon-L17-rebuild",
             "daemon-L43",
             "daemon-L44",
@@ -304,6 +303,16 @@ mod tests {
             for case in select(shard, cases.clone()) {
                 assert!(text.contains(&format!("{}\t{index}/4\t{}\n", case.id, case.seconds)));
             }
+        }
+        for index in 1..=4 {
+            let seconds: u64 = select(Shard { index, count: 4 }, cases.clone())
+                .iter()
+                .map(|case| case.seconds)
+                .sum();
+            assert!(
+                seconds + 300 <= 25 * 60,
+                "recorded shard {index}: {seconds}s"
+            );
         }
         for invalid in ["", "1", "0/4", "5/4", "1/0", "1/65", "1/2/3", "x/4"] {
             assert!(invalid.parse::<Shard>().is_err());

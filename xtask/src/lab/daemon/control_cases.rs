@@ -18,10 +18,7 @@ use std::fmt::Write as _;
 pub(super) fn verdict_reason(value: &serde_json::Value, reason: &str) -> bool {
     match value {
         serde_json::Value::String(s) => s == reason,
-        serde_json::Value::Object(map) => {
-            map.contains_key(reason) || map.values().any(|v| verdict_reason(v, reason))
-        }
-        serde_json::Value::Array(values) => values.iter().any(|v| verdict_reason(v, reason)),
+        serde_json::Value::Object(map) => map.len() == 1 && map.contains_key(reason),
         _ => false,
     }
 }
@@ -29,6 +26,18 @@ pub(super) fn verdict_reason(value: &serde_json::Value, reason: &str) -> bool {
 #[cfg(test)]
 mod verdict_tests {
     use super::verdict_reason;
+    #[test]
+    fn closure_requires_exactly_one_unreachable_default() {
+        use serde_json::json;
+        assert!(super::sole_unreachable(
+            &json!([{"type":"unreachable","dst":"default"}])
+        ));
+        assert!(!super::sole_unreachable(&json!([])));
+        assert!(!super::sole_unreachable(
+            &json!([{"type":"unreachable"},{"dev":"ex-ch1"}])
+        ));
+        assert!(!super::sole_unreachable(&json!([{"dev":"ex-ch1"}])));
+    }
     #[test]
     fn closed_for_the_wrong_reason_is_rejected() {
         let stale = serde_json::json!({"FailClosed":"NoHealthyExit"});
@@ -42,10 +51,24 @@ mod verdict_tests {
             "Quarantined"
         ));
         assert!(!verdict_reason(
+            &serde_json::json!({"NoHealthyExit":{"previous":"AdminDisconnected"}}),
+            "AdminDisconnected"
+        ));
+        assert!(!verdict_reason(
+            &serde_json::json!({"AdminDisconnected":null,"NoHealthyExit":null}),
+            "AdminDisconnected"
+        ));
+        assert!(!verdict_reason(
             &serde_json::Value::Null,
             "AdminDisconnected"
         ));
     }
+}
+
+fn sole_unreachable(routes: &serde_json::Value) -> bool {
+    routes
+        .as_array()
+        .is_some_and(|routes| routes.len() == 1 && routes[0]["type"] == "unreachable")
 }
 
 fn session_continues(before: &str, after: &str) -> bool {
@@ -117,8 +140,8 @@ impl DaemonGuard<'_> {
         let diagnostic = fs::read_to_string(output_path.with_extension("stderr"))?;
         if args.contains(&"disconnect") {
             let snapshot = serde_json::json!({
-                "v4": self.lab.cmd("scupper", "ip", &["-4", "route", "show", "default"] )?,
-                "v6": self.lab.cmd("scupper", "ip", &["-6", "route", "show", "default"] )?,
+                "v4": serde_json::from_str::<serde_json::Value>(&self.lab.cmd("scupper", "ip", &["-j", "-4", "route", "show", "default"] )?)?,
+                "v6": serde_json::from_str::<serde_json::Value>(&self.lab.cmd("scupper", "ip", &["-j", "-6", "route", "show", "default"] )?)?,
                 "exit": self.lab.cmd("scupper", "ip", &["-o", "link", "show", "ex-ch1"] )?,
             });
             fs::write(
@@ -139,12 +162,8 @@ impl DaemonGuard<'_> {
                 .artifacts
                 .join(format!("{}-{stem}-closure.json", self.case)),
         )?)?;
-        if !snapshot["v4"]
-            .as_str()
-            .is_some_and(|s| s.contains("unreachable"))
-            || !snapshot["v6"]
-                .as_str()
-                .is_some_and(|s| s.contains("unreachable"))
+        if !sole_unreachable(&snapshot["v4"])
+            || !sole_unreachable(&snapshot["v6"])
             || !snapshot["exit"]
                 .as_str()
                 .is_some_and(|s| !s.contains(",UP") && !s.contains("<UP"))
@@ -187,8 +206,8 @@ impl DaemonGuard<'_> {
         }
         if expected == Some(("FailClosed", "AdminDisconnected")) {
             let snapshot = serde_json::json!({
-                "v4": self.lab.cmd("scupper", "ip", &["-4", "route", "show", "default"])?,
-                "v6": self.lab.cmd("scupper", "ip", &["-6", "route", "show", "default"])?,
+                "v4": serde_json::from_str::<serde_json::Value>(&self.lab.cmd("scupper", "ip", &["-j", "-4", "route", "show", "default"])?)?,
+                "v6": serde_json::from_str::<serde_json::Value>(&self.lab.cmd("scupper", "ip", &["-j", "-6", "route", "show", "default"])?)?,
                 "exit": self.lab.cmd("scupper", "ip", &["-o", "link", "show", "ex-ch1"])?,
             });
             fs::write(
@@ -593,7 +612,7 @@ impl DaemonGuard<'_> {
                 self.control_restart(&root, "after-kill")?;
                 self.expect_check(&root, 0, None, "restarted")?;
             }
-            "L14" | "L14-boot" => {
+            "L14" => {
                 let (code, text) = self.control_command(&root, &["disconnect"], "disconnect")?;
                 if code != 0
                     || !text.contains("traffic is now blocked")
@@ -834,11 +853,15 @@ impl DaemonGuard<'_> {
                         if code == 4
                             && (!self
                                 .lab
-                                .cmd("scupper", "ip", &["-4", "route", "show", "default"])?
+                                .cmd("scupper", "ip", &["-j", "-4", "route", "show", "default"])?
                                 .contains("unreachable")
                                 || !self
                                     .lab
-                                    .cmd("scupper", "ip", &["-6", "route", "show", "default"])?
+                                    .cmd(
+                                        "scupper",
+                                        "ip",
+                                        &["-j", "-6", "route", "show", "default"],
+                                    )?
                                     .contains("unreachable"))
                         {
                             return fail("L44 fail-closed report had reachable defaults");

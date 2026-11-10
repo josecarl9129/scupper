@@ -35,10 +35,22 @@ pub(crate) fn attempted(bytes: &[u8], flows: &[Flow]) -> Result<(), Error> {
     Ok(())
 }
 /// Require attempted packets at the sending interface and none at the protected
-/// destination. Independent service controls make both captures non-blind.
-pub(crate) fn dropped(ingress: &[u8], destination: &[u8], flows: &[Flow]) -> Result<(), Error> {
+/// destination. Every required control flow must appear at the destination.
+pub(crate) fn dropped(
+    ingress: &[u8],
+    destination: &[u8],
+    flows: &[Flow],
+    controls: &[Flow],
+) -> Result<(), Error> {
     let ingress = observe(ingress)?;
     let destination = observe(destination)?;
+    if controls.is_empty()
+        || controls
+            .iter()
+            .any(|flow| !destination.iter().any(|p| flow.matches(p)))
+    {
+        return Err(error("drop trial lacks destination control"));
+    }
     for flow in flows {
         if !ingress.iter().any(|p| flow.matches(p)) {
             return Err(error("drop trial lacks ingress attempt"));
@@ -256,23 +268,37 @@ mod tests {
             ports: None,
         };
         let request = ip("10.99.0.3", "10.99.0.2", 1, &[8, 0, 0, 0, 0, 0, 0, 1]);
+        let control = Flow {
+            source: "10.99.0.2".parse().unwrap(),
+            destination: "10.99.0.1".parse().unwrap(),
+            protocol: 1,
+            ports: None,
+        };
+        let live = ip("10.99.0.2", "10.99.0.1", 1, &[8, 0, 0, 0, 0, 0, 0, 1]);
+        let ingress = capture(std::slice::from_ref(&request));
+        let flows = std::slice::from_ref(&flow);
+        let controls = std::slice::from_ref(&control);
         assert!(
             dropped(
-                &capture(std::slice::from_ref(&request)),
-                &capture(&[]),
-                std::slice::from_ref(&flow)
+                &ingress,
+                &capture(std::slice::from_ref(&live)),
+                flows,
+                controls
             )
             .is_ok()
         );
-        assert!(dropped(&capture(&[]), &capture(&[]), std::slice::from_ref(&flow)).is_err());
+        assert!(dropped(&ingress, &capture(&[]), flows, controls).is_err());
+        assert!(dropped(&ingress, &capture(std::slice::from_ref(&live)), flows, &[]).is_err());
         assert!(
             dropped(
-                &capture(std::slice::from_ref(&request)),
-                &capture(&[request]),
-                &[flow]
+                &capture(&[]),
+                &capture(std::slice::from_ref(&live)),
+                flows,
+                controls
             )
             .is_err()
         );
+        assert!(dropped(&ingress, &capture(&[request, live]), flows, controls).is_err());
     }
     #[test]
     fn pmtu_v4_v6_only_toward_sender_and_for_exact_flow() {

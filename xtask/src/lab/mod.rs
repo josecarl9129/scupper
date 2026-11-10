@@ -95,6 +95,7 @@ struct Lab {
     baseline_failure: Option<String>,
     daemon_host_baseline: Option<Vec<(String, String)>>,
     inheritance: Option<boot::InheritanceGuard>,
+    host_sysctls: Option<boot::InheritanceGuard>,
     fault_markers: Vec<String>,
     next_source_port: u16,
     exit_port: u16,
@@ -191,6 +192,7 @@ fn run_inner(
         baseline_failure: None,
         daemon_host_baseline: None,
         inheritance: None,
+        host_sysctls: None,
         fault_markers: Vec::new(),
         next_source_port: 20000,
         exit_port: 51821,
@@ -293,6 +295,10 @@ impl Lab {
         self.runner.run(&Invocation::new(ns, program, args))
     }
     fn preflight(&mut self) -> Result<()> {
+        if let Some(parent) = self.private.parent() {
+            boot::refuse_unrestored_sysctls(parent)?;
+        }
+
         for path in ["/etc/passwd", "/etc/group"] {
             if fs::read_to_string(path)?
                 .lines()
@@ -347,6 +353,9 @@ impl Lab {
         self.private_dir = Some(fs::File::open(&self.private)?);
         self.registry
             .register(Resource::Directory(self.private.clone()));
+        let mut host = boot::InheritanceGuard::save()?;
+        host.persist(self.private.join("host-sysctls.json"))?;
+        self.host_sysctls = Some(host);
         let resolver_dir = PathBuf::from("/etc/netns/scupper");
         fs::create_dir_all(&resolver_dir)?;
         self.registry
@@ -707,6 +716,14 @@ impl Lab {
             if let Err(error) = released {
                 failures.push(error.to_string());
             }
+        }
+        if let Some(host) = &mut self.host_sysctls
+            && let Err(error) = host.restore()
+        {
+            failures.push(format!("host sysctl restoration: {error}"));
+            // Keep the durable originals available to the next preflight.
+            self.registry
+                .unregister(&Resource::Directory(self.private.clone()));
         }
         match self.registry.cleanup(&mut self.runner) {
             Ok(reports) => notes.extend(reports),

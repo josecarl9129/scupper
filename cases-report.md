@@ -186,3 +186,54 @@ Privileged namespace trials cannot run in this unprivileged worktree environment
 no kernel/lab pass is claimed here. The appended first-run artifacts were used
 as read-only diagnostics; the IPv6 permissive-control correction still needs
 a fresh kernel run, alongside the other restored and strengthened lab cases.
+
+## Fix round 2
+
+This round supersedes the round-1 L17 hook, L14-boot duplication and tentative
+permissive-control diagnosis above.
+
+| Item | Change | Case / test |
+|---|---|---|
+| Decision 1 / N1 / N9 | Keep family-specific `dup` in the IPv4 table on forward/output/postrouting only; inet chains use counters and accept policy. Save the exact hostile text, require `nft -c -f -` before atomic loading, and include stderr in command failures. Retain nonzero UDP counters on every exercised hook in both families. | daemon-L8; L8-host-ruleset.nft/json; command_failure_preserves_stderr_in_case_error; privileged validation pending |
+| Decision 2 / N3 | Remove the testing release hook and unconditional recovered EventLog event. Stop daemon, mark old namespace, delete, require no holders, restart, and require a fresh namespace-local marker; retain gap traffic and inode diagnostics. Clarify the no-holder/daemon-down deviation in DESIGN L17. | daemon-L17-rebuild; daemon-L18; existing L17-V14 held-namespace case |
+| Decision 3 / N2 | After cleanup boot and network reset, wait for provider readiness and force/wait for a fresh client handshake before any baseline service check. The same guarded chain runs on success and failure. | DaemonGuard::finish; L9/L14/L17/L18 failure recovery |
+| Decision 4 / N4 | Save host originals at suite start, including all IPv4 conf values affected by ip_forward and changed IPv6 accept_ra values. Fsync a private snapshot; teardown skips disappeared paths, continues after other errors and retains failed snapshots. Next preflight refuses unresolved snapshots. | restore_continues_after_missing_interfaces_and_other_errors; interrupted-run preflight regression |
+| Decision 5 / N5 | Remove the identical L14-boot dispatch, catalog entry and explicit extra. L14 still boots both adopted and fresh namespaces from persisted Disconnected and explicitly requires FailClosed/AdminDisconnected. | daemon-L14 reboot-closed / real-reboot-closed; catalog completeness test |
+| Lab: every supervised check Dead | Shared startup/restart wait requires READY plus a fresh Ping reporting a completed iteration and no active operation. Startup WATCHDOG alone cannot satisfy it. Wait is bounded with readiness and last-Ping diagnostics. | readiness_requires_ready_and_a_recent_completed_iteration |
+| Lab: permissive control | Run-2 bridge pcap contains IPv6 SYNs from fd00:99::2 to the sink and router ICMPv6 type 1/code 3 replies, disproving a bridge-output/forwarding failure. commands.jsonl has no static sink neighbours. Links use addrgenmode none; sink neighbour setup previously ran only inside the separate IPv6 case. Initialize those neighbours in common topology setup and require WAN-to-sink IPv6 echo before the permissive probes. Missing output marker follows the earlier TCP failure, before the output probe executes. | positive-control-permissive; shard-4 bridge capture / commands.jsonl; privileged rerun pending |
+| N6 | Measure wg0 link rx_errors across only the forged datagram, wait for growth before sending the independent echo control, and retain ciphertext-size evidence. | daemon-L12; L12-wireguard-rx.json |
+| N7 | Require explicit control flows at every protected destination capture; empty, idle or wrong captures fail. | isolation_requires_attempt_and_detects_any_delivery; L11/L12 callers |
+| N8 | Restore and verify RPDB by exact preference/table: IPv4 0/local, 32766/main, 32767/default; IPv6 0/local, 32766/main. | daemon-L5; daemon_clean_baseline |
+| N10 | Keep this report in the requested worktree. Removing or moving it before a public squash remains a publication step; no commit or publication is part of this task. | worktree report retained |
+| N11 | Label accept_ra positive readback as compiled default, not inherited. | L18-pre-boot.json |
+| N12 | Match only the immediate reason variant; reject nested previous reasons or multiple keys. | closed_for_the_wrong_reason_is_rejected |
+| N13 | Save JSON route snapshots and require exactly one unreachable default per family. | closure_requires_exactly_one_unreachable_default; L14 closure snapshots |
+| N14 | Resolve default recorded durations from CARGO_MANIFEST_DIR and check the recorded four-shard balance bound too. | list_and_selection_agree_and_invalid_shards_fail |
+| N15 | Retain generous crash-phase bounds and never shorten a larger recorded outer deadline. Estimates still require successful kernel durations before they describe actual execution time. | L9/L9b/L9-host-link; recorded-duration tests |
+
+Test paths use compile-time `env!("CARGO_TARGET_TMPDIR")`. The xtask build script
+also supplies a directory under OUT_DIR for library unit tests when the caller
+does not set it (Cargo supplies the integration-test value automatically).
+
+All five gates passed, each under `timeout 600`:
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets --all-features --locked --offline -- -D warnings`
+- `cargo test --workspace --all-features --locked --offline`
+- `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked --offline`
+- `cargo deny --locked check` (advisories, bans, licenses and sources OK)
+
+The workspace test build used CARGO_TARGET_TMPDIR in this worktree. A final
+`timeout 600 cargo test -p xtask --all-features --locked --offline` also passed
+with no runtime CARGO_TARGET_TMPDIR: 53 library tests passed, one subprocess
+fixture was ignored as intended, and all integration suites passed. This rerun
+covers the final build-script, stderr and sink-liveness changes. Catalog
+completeness and recorded/default shard balance checks are green.
+`git diff --check` passed. Gate logs are in target/tmp/*-round2.log.
+`cargo fmt --all` is the final command. No commit was created.
+
+The attempted shard launch returned `leaktest requires root on a disposable
+Linux machine` (target/tmp/lab-round2.log). The process is uid 1000 with no
+effective capabilities; nft/tcpdump are absent. A green privileged lab rerun is
+still required for both CLI/daemon crash matrices, L8, L12, L17-rebuild, L18 and
+positive-control-permissive. No kernel pass is claimed.

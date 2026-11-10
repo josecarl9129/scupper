@@ -223,6 +223,11 @@ impl Lab {
         Ok(())
     }
     fn bridge_liveness(&mut self, case: Case) -> Result<()> {
+        if case == Case::Permissive {
+            // Independently verify the sink link before client forwarding and
+            // output probes: bridge-neighbour liveness alone cannot prove it.
+            self.cmd("wan", "ping", &["-6", "-c1", "-W2", A.internet_v6])?;
+        }
         for (family, address, wan, icmp) in [
             ("-4", A.bridge.peer, A.bridge.wan, "icmp"),
             ("-6", A.bridge_v6, A.bridge_wan_v6, "icmpv6"),

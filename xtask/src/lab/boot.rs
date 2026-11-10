@@ -19,9 +19,10 @@ use std::{
 // then restore only changed files after restoring ip_forward itself.
 pub(super) struct InheritanceGuard {
     saved: Vec<(PathBuf, String)>,
+    snapshot: Option<PathBuf>,
 }
 impl InheritanceGuard {
-    fn save() -> Result<Self> {
+    pub(super) fn save() -> Result<Self> {
         let mut paths = vec![PathBuf::from("/proc/sys/net/ipv4/ip_forward")];
         for interface in fs::read_dir("/proc/sys/net/ipv4/conf")? {
             for key in fs::read_dir(interface?.path())? {
@@ -40,14 +41,47 @@ impl InheritanceGuard {
                 Ok((p, value))
             })
             .collect::<Result<_>>()?;
-        Ok(Self { saved })
+        Ok(Self {
+            saved,
+            snapshot: None,
+        })
+    }
+    pub(super) fn persist(&mut self, path: PathBuf) -> Result<()> {
+        use std::io::Write as _;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        file.write_all(&serde_json::to_vec_pretty(&self.saved)?)?;
+        file.sync_all()?;
+        fs::File::open(path.parent().ok_or("snapshot parent")?)?.sync_all()?;
+        self.snapshot = Some(path);
+        Ok(())
     }
     pub(super) fn restore(&mut self) -> Result<()> {
+        let mut failures = Vec::new();
+        // ip_forward is first: writing it can rewrite the remaining values.
         for (path, value) in &self.saved {
-            if fs::read_to_string(path)? != *value {
-                fs::write(path, value)?;
+            let restored = match fs::read_to_string(path) {
+                Ok(current) if current != *value => fs::write(path, value),
+                Ok(_) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = restored {
+                // A disappearing interface must not prevent restoring all/default.
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    failures.push(format!("{}: {error}", path.display()));
+                }
             }
         }
+        if !failures.is_empty() {
+            return fail(failures.join("; "));
+        }
+        if let Some(path) = &self.snapshot {
+            fs::remove_file(path)?;
+        }
+        self.snapshot = None;
         self.saved.clear();
         Ok(())
     }
@@ -56,6 +90,24 @@ impl Drop for InheritanceGuard {
     fn drop(&mut self) {
         let _ = self.restore();
     }
+}
+
+pub(super) fn refuse_unrestored_sysctls(parent: &std::path::Path) -> Result<()> {
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("scupper-lab-")
+            && entry.path().join("host-sysctls.json").exists()
+        {
+            return fail(format!(
+                "unrestored host sysctls: {}; restore these originals before restarting the lab",
+                entry.path().join("host-sysctls.json").display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl Lab {
@@ -184,6 +236,10 @@ impl Lab {
                 ));
             }
         }
+        observed.insert(
+            "accept_ra_control".into(),
+            "compiled default, not inherited".into(),
+        );
         fs::write(
             self.artifacts.join("L18-pre-boot.json"),
             serde_json::to_vec_pretty(&observed)?,
@@ -505,4 +561,53 @@ pub(super) fn boot_canary_arrival(
         return fail("L9 UDP canary absent from gateway wg0 capture");
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod restore_tests {
+    use super::*;
+    #[test]
+    fn restore_continues_after_missing_interfaces_and_other_errors() {
+        let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("sysctl-restore-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let forward = root.join("ip_forward");
+        let bad = root.join("unreadable-value");
+        let rp_filter = root.join("rp_filter");
+        fs::write(&forward, "1").unwrap();
+        fs::write(&rp_filter, "2").unwrap();
+        fs::create_dir(&bad).unwrap();
+        let mut guard = InheritanceGuard {
+            saved: vec![
+                (forward.clone(), "0".into()),
+                (root.join("vanished-interface"), "0".into()),
+                (bad.clone(), "0".into()),
+                (rp_filter.clone(), "1".into()),
+            ],
+            snapshot: None,
+        };
+        let directory = root.join("scupper-lab-interrupted");
+        fs::create_dir(&directory).unwrap();
+        guard.persist(directory.join("host-sysctls.json")).unwrap();
+        assert!(refuse_unrestored_sysctls(&root).is_err());
+        assert!(
+            guard
+                .restore()
+                .unwrap_err()
+                .to_string()
+                .contains("unreadable-value")
+        );
+        assert_eq!(fs::read_to_string(&forward).unwrap(), "0");
+        assert_eq!(fs::read_to_string(&rp_filter).unwrap(), "1");
+        assert!(directory.join("host-sysctls.json").exists());
+        fs::remove_dir(&bad).unwrap();
+        fs::write(&bad, "2").unwrap();
+        guard.restore().unwrap();
+        assert_eq!(fs::read_to_string(bad).unwrap(), "0");
+        assert_eq!(guard.saved.len(), 0);
+        refuse_unrestored_sysctls(&root).unwrap();
+        guard.restore().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
 }

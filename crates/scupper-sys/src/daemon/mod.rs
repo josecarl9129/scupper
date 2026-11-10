@@ -883,14 +883,6 @@ impl DaemonDeps for Runtime<'_> {
             Some(boot::boot(&deps))
         };
         if report.is_some_and(|report| report.succeeded()) {
-            let _ = self.audit.handle().emit(
-                EventKind::Boot {
-                    result: scupper_proto::Outcome::Recovered,
-                    step: scupper_proto::StepKind::EventLog,
-                },
-                Actor::Daemon,
-                None,
-            );
             self.initialize();
         }
         self.end_operation();
@@ -909,24 +901,6 @@ impl DaemonDeps for Runtime<'_> {
             .current_iteration = Some(now);
         #[cfg(feature = "testing")]
         if self.options.run_root.join("incomplete-tick").exists() {
-            return Some(crate::reconcile::TickReport::default());
-        }
-        #[cfg(feature = "testing")]
-        if self.options.run_root.join("release-namespace").exists() {
-            if self.running.is_some() {
-                self.close_only();
-                self.running = None;
-                self.startup_read = StartupRead::default();
-                self.abandon_probes();
-                self.pending_canon = false;
-                self.cached = None;
-                if let Err(error) = std::fs::write(
-                    self.options.run_root.join("namespace-released"),
-                    b"released\n",
-                ) {
-                    eprintln!("scupperd: release checkpoint: {error}");
-                }
-            }
             return Some(crate::reconcile::TickReport::default());
         }
         // A cold canonicalization timeout is Unknown, not an invalid boot

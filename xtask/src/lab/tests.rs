@@ -329,14 +329,28 @@ fn every_external_program_uses_argv_namespace_entry_and_a_timeout() {
     }
 }
 fn test_dir(name: &str) -> PathBuf {
-    let path = std::env::var_os("CARGO_TARGET_TMPDIR")
-        .map_or_else(
-            || PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../target/tmp")),
-            PathBuf::from,
-        )
+    let path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("lab-test-{name}-{}", std::process::id()));
     fs::create_dir_all(&path).unwrap();
     path
+}
+#[test]
+fn command_failure_preserves_stderr_in_case_error() {
+    let dir = test_dir("stderr");
+    let mut runner = Runner::new(
+        fs::File::create(dir.join("trace")).unwrap(),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let error = runner
+        .input(
+            &Invocation::new("", "sh", &["-c", "cat >&2; exit 1"]),
+            Some(b"nft: unsupported expression\n"),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("nft: unsupported expression"));
+    assert!(error.contains("exit status: 1"));
+    fs::remove_dir_all(dir).unwrap();
 }
 #[test]
 fn command_deadline_kills_and_reaps_without_root() {
