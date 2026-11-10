@@ -30,11 +30,12 @@ impl Registry {
     pub fn unregister(&mut self, resource: &Resource) {
         self.resources.retain(|owned| owned != resource);
     }
-    pub fn cleanup(&mut self, runner: &mut Runner) -> Result<()> {
+    pub fn cleanup(&mut self, runner: &mut Runner) -> Result<Vec<String>> {
         runner.cleanup = true;
         runner.whole = Instant::now() + Duration::from_secs(90);
         runner.phase = runner.whole;
         let mut failures = Vec::new();
+        let mut reports = Vec::new();
         while let Some(resource) = self.resources.pop() {
             let outcome: Result<()> = (|| {
                 match &resource {
@@ -48,8 +49,28 @@ impl Registry {
                         }
                     }
                     Resource::Namespace(ns) => {
-                        if PathBuf::from(format!("/run/netns/{ns}")).exists() {
+                        let path = format!("/run/netns/{ns}");
+                        let mounts = || -> Result<usize> {
+                            Ok(super::mounts::count(
+                                &scupper_sys::netns::mountinfo::read("/proc/self/mountinfo")?,
+                                &path,
+                            )?)
+                        };
+                        let count = mounts()?;
+                        if count > 1 {
+                            reports.push(format!("{path}: tolerated {count} stacked mounts"));
+                            let detached = drain_mounts(mounts, || {
+                                runner.run(&Invocation::new("", "umount", &["--lazy", &path]))?;
+                                Ok(())
+                            })?;
+                            reports
+                                .push(format!("{path}: detached {detached} mounts before delete"));
+                        }
+                        if PathBuf::from(&path).exists() {
                             runner.run(&Invocation::new("", "ip", &["netns", "delete", ns]))?;
+                            if mounts()? != 0 || PathBuf::from(&path).exists() {
+                                return super::fail("namespace name survived deletion");
+                            }
                         }
                     }
                     Resource::Link(link) => {
@@ -82,11 +103,26 @@ impl Registry {
             }
         }
         if failures.is_empty() {
-            Ok(())
+            Ok(reports)
         } else {
-            super::fail(failures.join("; "))
+            super::fail([reports.join("; "), failures.join("; ")].join("; "))
         }
     }
+}
+
+fn drain_mounts(
+    mut count: impl FnMut() -> Result<usize>,
+    mut detach: impl FnMut() -> Result<()>,
+) -> Result<usize> {
+    let mut detached = 0;
+    while count()? != 0 {
+        if detached == 64 {
+            return super::fail("namespace mounts did not drain after 64 detaches");
+        }
+        detach()?;
+        detached += 1;
+    }
+    Ok(detached)
 }
 
 #[cfg(test)]
@@ -94,6 +130,29 @@ impl Registry {
 mod tests {
     use super::*;
     use std::sync::{Arc, atomic::AtomicBool};
+
+    #[test]
+    fn stacked_mount_cleanup_drains_every_layer_and_bounds_nonprogress() {
+        let mounts = std::cell::Cell::new(3);
+        assert_eq!(
+            drain_mounts(
+                || Ok(mounts.get()),
+                || {
+                    mounts.set(mounts.get() - 1);
+                    Ok(())
+                }
+            )
+            .unwrap(),
+            3
+        );
+        assert_eq!(
+            drain_mounts(|| Ok(0), || super::super::fail("unexpected detach")).unwrap(),
+            0
+        );
+        assert!(drain_mounts(|| Ok(2), || Ok(())).is_err());
+        assert!(drain_mounts(|| Ok(2), || super::super::fail("detach failed")).is_err());
+        assert!(drain_mounts(|| super::super::fail("mountinfo unreadable"), || Ok(())).is_err());
+    }
     #[test]
     fn successful_creation_deduplicates_and_cleans_idempotently() {
         let dir = std::env::current_dir()

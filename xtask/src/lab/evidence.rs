@@ -7,6 +7,7 @@ use std::{fmt::Write, fs, path::Path};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Case {
     Baseline,
+    Daemon,
     ProbeChild,
     CheckV2,
     V6,
@@ -15,10 +16,11 @@ pub(super) enum Case {
     Uplink,
 }
 impl Case {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Baseline,
         Self::ProbeChild,
         Self::CheckV2,
+        Self::Daemon,
         Self::V6,
         Self::Bridge,
         Self::Permissive,
@@ -27,6 +29,7 @@ impl Case {
     pub fn name(self) -> &'static str {
         match self {
             Self::Baseline => "baseline",
+            Self::Daemon => "daemon",
             Self::ProbeChild => "probe-child",
             Self::CheckV2 => "check-v2",
             Self::V6 => "client-v6-dropped",
@@ -38,6 +41,7 @@ impl Case {
     pub fn wanted(self) -> &'static str {
         match self {
             Self::Baseline => "clean",
+            Self::Daemon => "measured L3/L4/L6/L7/L13/L16/L17/L52/L52b/V-03/V-14",
             Self::ProbeChild => "unprivileged-exit-dns",
             Self::CheckV2 => "0,3,0,2,0,4,0",
             Self::V6 => "v6-dropped",
@@ -50,7 +54,11 @@ impl Case {
 pub(super) fn policy(markers: &[String], auxiliary: bool) -> Result<String> {
     policy_with_exit_port(markers, auxiliary, 51821)
 }
-fn policy_with_exit_port(markers: &[String], auxiliary: bool, exit_port: u16) -> Result<String> {
+pub(super) fn policy_with_exit_port(
+    markers: &[String],
+    auxiliary: bool,
+    exit_port: u16,
+) -> Result<String> {
     let mut text = format!(
         "uplink_addrs = {}\nforbidden_addrs = {}\ncanary_markers = {}\narp = true\nndp = true\nmin_packets = {}\nexpect = {}\n",
         serde_json::to_string(&if auxiliary {

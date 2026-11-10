@@ -24,11 +24,15 @@ fn dword(data: &[u8], start: usize) -> Parsed<u32> {
 pub(super) enum Link<'a> {
     Ip(&'a [u8]),
     Arp(&'a [u8]),
+    Other,
 }
 
 pub(super) fn link(data: &[u8], kind: u32) -> Parsed<Link<'_>> {
     let (mut offset, mut protocol) = match kind {
-        1 => (14, word(data, 12)?),
+        1 => {
+            bytes(data, 0, 14)?;
+            (14, word(data, 12)?)
+        }
         113 => {
             bytes(data, 0, 16)?;
             (16, word(data, 14)?)
@@ -49,8 +53,9 @@ pub(super) fn link(data: &[u8], kind: u32) -> Parsed<Link<'_>> {
         0x0800 if data.first().is_some_and(|b| b >> 4 == 4) => Ok(Link::Ip(data)),
         0x86dd if data.first().is_some_and(|b| b >> 4 == 6) => Ok(Link::Ip(data)),
         0x0800 | 0x86dd if data.is_empty() => Err(Reason::Truncated),
+        0x0800 | 0x86dd => Err(Reason::UnparsableLinkLayer),
         0x0806 => Ok(Link::Arp(data)),
-        _ => Err(Reason::UnparsableLinkLayer),
+        _ => Ok(Link::Other),
     }
 }
 

@@ -2,6 +2,7 @@
 
 mod real;
 pub use real::RealKernel;
+pub(crate) use real::forwarding as forwarding_gates;
 #[cfg(any(test, feature = "testing"))]
 pub mod fake;
 
@@ -54,6 +55,15 @@ pub struct StepError(pub &'static str);
 /// Namespace kernel adapter. Implementations must bound every exec to three seconds
 /// and collect safety first with a six-second shared deadline.
 pub trait Kernel {
+    /// Publish newly recreated owned link identities while holding the writer.
+    /// Called after safety work; failed publication is retried on later ticks.
+    ///
+    /// # Errors
+    /// Returns bounded boot-record publication failure.
+    fn checkpoint_owned(&self, _guard: &WriterGuard) -> Result<(), StepError> {
+        Ok(())
+    }
+
     /// Observe the original inode even if its mount name was removed or hijacked.
     fn observe(&self, held: &NetnsHandle) -> Observation;
     /// Complete non-safety observations after emergency containment, before deadline.
@@ -83,6 +93,18 @@ pub trait Kernel {
     /// # Errors
     /// Returns a mount or identity error.
     fn restore_name(&self, held: &NetnsHandle, guard: &WriterGuard) -> Result<(), StepError>;
+    /// Restore with directory-lock contention bounded by the tick deadline.
+    ///
+    /// # Errors
+    /// Returns a mount, identity or directory-lock timeout error.
+    fn restore_name_until(
+        &self,
+        held: &NetnsHandle,
+        guard: &WriterGuard,
+        _deadline: Instant,
+    ) -> Result<(), StepError> {
+        self.restore_name(held, guard)
+    }
     /// Install the effective process latch before any planned action.
     fn hold_latch(&self, _latch: Option<&Latch>) {}
     /// Refresh the adapter's independent durable latch view after a state read/write.
@@ -104,6 +126,12 @@ pub trait StateStore {
     /// # Errors
     /// Returns read failure or timeout.
     fn read_until(&self, deadline: Instant) -> io::Result<State>;
+    /// Optional cheap applied-version snapshot, bounded independently of phase B.
+    /// Stores without a dedicated snapshot path defer their reads until after
+    /// containment; they must not implement this using an unbounded read.
+    fn applied_snapshot_until(&self, _deadline: Instant) -> Option<State> {
+        None
+    }
     /// Discard reads started before the current writer-lock acquisition.
     fn begin_tick(&self) {}
     /// Durably replace state under the global writer capability.
@@ -126,6 +154,12 @@ impl StateStore for StateFile {
         match Self::read_until(self, deadline)? {
             StateRead::Present(state) => Ok(state),
             StateRead::Missing => Err(io::Error::new(io::ErrorKind::NotFound, "missing state")),
+        }
+    }
+    fn applied_snapshot_until(&self, deadline: Instant) -> Option<State> {
+        match Self::read_until(self, deadline).ok()? {
+            StateRead::Present(state) => Some(state),
+            StateRead::Missing => None,
         }
     }
     fn write(&self, guard: &WriterGuard, state: &State) -> io::Result<()> {
@@ -171,6 +205,8 @@ impl Config {
 pub enum Escalation {
     /// Stop edge, call rebuild, then restart edge.
     RebuildRequired,
+    /// Re-open applied configuration before observing against an obsolete render.
+    ReinitializeRequired,
     /// Restart edge in the held namespace.
     RestartEdge,
     /// A host/namespace interface collision needs operator attention.
@@ -200,7 +236,9 @@ pub struct TickReport {
     pub failover_actions: Vec<FailoverAction>,
 }
 
-/// One lifetime of the gateway writer. Time is supplied as (monotonic, Unix seconds).
+/// Owned exclusively by one tick thread; administrative transitions and probe
+/// submissions must run on that same thread. State read permits remain process-wide.
+/// Time is supplied as (monotonic, Unix seconds).
 pub struct Reconciler<K, S, C> {
     kernel: K,
     store: S,
@@ -214,13 +252,14 @@ pub struct Reconciler<K, S, C> {
     persisted: State,
     held: Arc<NetnsHandle>,
     clock: C,
-    probe_rounds: Vec<BTreeMap<ExitId, bool>>,
+    probe_rounds: Vec<BTreeMap<ExitId, scupper_core::failover::ProbeOutcome>>,
     actions: Vec<FailoverAction>,
     verdict: Option<VerdictCode>,
     forwarding: bool,
     deadline: Option<Instant>,
     // Evidence only: no reservations or debounce are committed by emergency work.
     emergency_steps: Vec<Step>,
+    startup: bool,
 }
 impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
     /// Resume from durable selection/quarantine, starting failover qualification afresh.
@@ -236,6 +275,17 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         clock: C,
     ) -> io::Result<Self> {
         let persisted = store.read()?;
+        Self::with_state(kernel, store, log, config, held, clock, persisted)
+    }
+    pub(crate) fn with_state(
+        kernel: K,
+        store: S,
+        log: LogHandle,
+        config: Config,
+        held: Arc<NetnsHandle>,
+        clock: C,
+        persisted: State,
+    ) -> io::Result<Self> {
         if persisted.applied_version != Some(config.stamp.version) {
             return Err(io::Error::other("applied version mismatch"));
         }
@@ -269,15 +319,157 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             forwarding: false,
             deadline: None,
             emergency_steps: vec![],
+            startup: true,
         })
     }
     /// Adapter access for lifecycle updates such as edge's new namespace path.
     pub fn kernel(&self) -> &K {
         &self.kernel
     }
+    /// Replace the nonblocking audit sender after memory-only log recovery.
+    pub fn set_log(&mut self, log: LogHandle) {
+        self.log = log;
+    }
+    /// Health snapshot used only by the single-threaded probe scheduler.
+    pub fn health(&self) -> &BTreeMap<ExitId, scupper_core::failover::ExitHealth> {
+        self.failover.health()
+    }
+    /// The retained active route still awaits path confirmation.
+    pub fn unconfirmed(&self) -> bool {
+        self.failover.unconfirmed()
+    }
+    /// Verdict from the most recent tick, including unconfirmed handoffs.
+    pub fn verdict(&self) -> Option<VerdictCode> {
+        self.verdict
+    }
+    /// Active exit to probe, or the selected recovery candidate while closed.
+    /// Deliberate disconnection does not schedule network work.
+    pub fn probe_exit(&self) -> Option<ExitId> {
+        let gateway = self.config.site.gateway(&self.config.gateway)?;
+        match self.failover.desired_route() {
+            scupper_core::render::RouteTarget::Exit(name) => gateway
+                .exits()
+                .iter()
+                .find(|exit| exit.ifname().as_str() == name.as_str())
+                .map(|exit| exit.id().clone()),
+            scupper_core::render::RouteTarget::Unreachable => match &self.persisted.selection {
+                Selection::Disconnected => None,
+                Selection::Pin(id) | Selection::Prefer(id) => Some(id.clone()),
+                Selection::Auto => self.config.site.policy().exits.first().cloned(),
+            },
+        }
+    }
     /// Queue one complete probe round, preserving batch boundaries and order.
     pub fn submit_probe_round(&mut self, batch: BTreeMap<ExitId, bool>) {
+        self.submit_probe_outcomes(
+            batch
+                .into_iter()
+                .map(|(id, result)| (id, result.into()))
+                .collect(),
+        );
+    }
+    /// Queue a complete round with explicit inconclusive setup outcomes.
+    pub fn submit_probe_outcomes(
+        &mut self,
+        batch: BTreeMap<ExitId, scupper_core::failover::ProbeOutcome>,
+    ) {
         self.probe_rounds.push(batch);
+    }
+    /// Verify a booted namespace and retain its live route on daemon attachment.
+    /// No kernel operations run here. Failed/unknown observations leave startup closed.
+    pub fn resume_existing(&mut self) {
+        if !std::mem::take(&mut self.startup)
+            || self.latch.is_some()
+            || self.persisted.selection == Selection::Disconnected
+        {
+            return;
+        }
+        let Ok(_guard) = WriterLock::acquire_timeout(&self.config.run_root, self.config.lock_wait)
+        else {
+            return;
+        };
+        self.kernel.begin_tick();
+        let safety = self.kernel.observe(&self.held);
+        let observed =
+            self.kernel
+                .observe_rest(&self.held, safety, Instant::now() + Duration::from_secs(20));
+        if !observed.complete
+            || !observed.safety_complete
+            || observed.model.namespace != planner::NamespaceState::Ready
+        {
+            return;
+        }
+        for (exit, iface) in &self.failover_config.exits {
+            let route = scupper_core::render::RouteTarget::Exit(iface.clone());
+            let Ok(desired) = self.config.desired(&self.persisted.selection, &route) else {
+                continue;
+            };
+            let expected = KernelModel::desired(&desired);
+            if observed.model.default_v4 == expected.default_v4
+                && observed.model.default_v6 == expected.default_v6
+                && !safety_drift(&observed.model, &desired, false)
+                && observed.model.route_ready(&desired, &route)
+                && observed.handshakes.get(exit).is_some_and(|age| {
+                    age.is_some_and(|age| age <= self.failover_config.handshake_stale)
+                })
+                && observed
+                    .exit_links
+                    .get(exit)
+                    .is_some_and(|link| link.link_up && link.peer_present && link.key_present)
+                && self
+                    .failover
+                    .resume_verified((self.clock)().0, exit, &self.failover_config)
+            {
+                self.actions.clear();
+                let _ = self.log.emit(
+                    EventKind::ExitHealthChanged {
+                        exit: scupper_proto::Identifier::from(exit),
+                        from: scupper_proto::Health::Unknown,
+                        to: scupper_proto::Health::Unconfirmed,
+                    },
+                    Actor::Daemon,
+                    self.persisted.applied_version,
+                );
+                break;
+            }
+        }
+    }
+    /// Complete an interrupted route transition before daemon readiness.
+    /// A normal start with no marker performs no conntrack operation.
+    ///
+    /// # Errors
+    /// Returns lock, marker inspection, flush or durable removal failures.
+    pub fn recover_route_switch(&self) -> io::Result<()> {
+        let _guard = WriterLock::acquire_timeout(&self.config.run_root, self.config.lock_wait)?;
+        match std::fs::symlink_metadata(self.config.run_root.join("route-switch")) {
+            Ok(_) => {
+                let result = self.kernel.execute(&Step::FlushConntrack);
+                let _ = self.log.emit(
+                    EventKind::Repair {
+                        kind: StepKind::FlushConntrack,
+                        class: repair_class(&Step::FlushConntrack),
+                        result: if result.is_ok() {
+                            Outcome::Succeeded
+                        } else {
+                            Outcome::Failed
+                        },
+                    },
+                    Actor::Daemon,
+                    self.persisted.applied_version,
+                );
+                result.map_err(|e| io::Error::other(e.0))?;
+                self.clear_route_switch()
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+    fn clear_route_switch(&self) -> io::Result<()> {
+        match std::fs::remove_file(self.config.run_root.join("route-switch")) {
+            Ok(()) => crate::fs::Fs::sync_dir(&crate::fs::RealFs, &self.config.run_root),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
     }
     /// Current memory quarantine, including a latch whose durable write failed.
     pub fn latch(&self) -> Option<&Latch> {
@@ -293,12 +485,32 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
     }
     fn feed(&mut self, now: MonoTime, input: FailoverInput) {
         let (next, actions) = self.failover.step(now, input, &self.failover_config);
+        for (exit, health) in next.health() {
+            let to = public_health(health);
+            let from = self
+                .failover
+                .health()
+                .get(exit)
+                .map_or(scupper_proto::Health::Unknown, public_health);
+            if from != to {
+                let _ = self.log.emit(
+                    EventKind::ExitHealthChanged {
+                        exit: scupper_proto::Identifier::from(exit),
+                        from,
+                        to,
+                    },
+                    Actor::Daemon,
+                    self.persisted.applied_version,
+                );
+            }
+        }
         self.failover = next;
         self.actions.extend(actions);
     }
     /// Observe, plan and execute once, with bounded same-tick failure recovery.
     #[allow(clippy::manual_let_else, clippy::single_match_else)] // Keep lock-failure reporting together.
     pub fn tick(&mut self) -> TickReport {
+        self.startup = false;
         let mut report = TickReport {
             complete: true,
             ..TickReport::default()
@@ -368,6 +580,10 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                     self.latch.clone_from(&observation.model.latch);
                 }
                 if state.applied_version != self.persisted.applied_version {
+                    // Reinitialization cannot discard a memory-only latch.
+                    if self.latch.is_none() || state.quarantine.is_some() {
+                        report.escalations.push(Escalation::ReinitializeRequired);
+                    }
                     report.complete = false;
                     observation.complete = false;
                     observation.model.ruleset = planner::Known::Unknown;
@@ -400,12 +616,57 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
     fn tick_locked(&mut self, guard: &WriterGuard, report: &mut TickReport) {
         self.store.begin_tick();
         self.kernel.begin_tick();
+        // Read the applied identity before comparing against this render. A
+        // concurrent writer holds the same lock, so it cannot race this check.
+        if let Some(mut latest) = self
+            .store
+            .applied_snapshot_until(Instant::now() + Duration::from_millis(25))
+            && latest.applied_version != self.persisted.applied_version
+        {
+            report.steps.push(Step::ForwardingOff);
+            let closed = self.execute_step(&Step::ForwardingOff, false, guard, report);
+            self.emit(
+                EventKind::Repair {
+                    kind: StepKind::ForwardingOff,
+                    class: scupper_proto::RepairClass::Tighten,
+                    result: if closed.is_ok() {
+                        Outcome::Succeeded
+                    } else {
+                        Outcome::Failed
+                    },
+                },
+                Actor::Daemon,
+                report,
+            );
+            if let Err(error) = closed {
+                report.complete = false;
+                report.failures.push((Step::ForwardingOff, error));
+                return;
+            }
+            // Never lose a memory-only quarantine while replacing the machine.
+            if let Some(latch) = &self.latch {
+                latest.quarantine = Some(Quarantine {
+                    reason: latch.reason.clone(),
+                    object: latch.object.clone(),
+                    since_unix: (self.clock)().1,
+                });
+                if self.store.write(guard, &latest).is_err() {
+                    self.persistence_failure(report);
+                    return;
+                }
+            }
+            report.escalations.push(Escalation::ReinitializeRequired);
+            return;
+        }
         self.tick_inner(guard, report);
         if self
             .deadline
             .is_some_and(|d| !self.kernel.within_deadline(d))
         {
             report.complete = false;
+        }
+        if self.kernel.checkpoint_owned(guard).is_err() {
+            self.boot_write_failure(report);
         }
         self.report_verdict(report);
     }
@@ -460,7 +721,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             self.feed(now, FailoverInput::LinkState(exit, state));
         }
         for round in std::mem::take(&mut self.probe_rounds) {
-            self.feed(now, FailoverInput::PathProbe(round));
+            self.feed(now, FailoverInput::ProbeRound(round));
         }
         self.feed(now, FailoverInput::Tick);
         let Ok(desired) = self.desired() else {
@@ -575,6 +836,28 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 .steps
                 .retain(|step| step.failure() != StepFailure::Stop);
         }
+        // A contained failure can skip a switch's flush after its route
+        // writes succeeded. Repay that debt on the next complete observation,
+        // after route repairs and before forwarding is restored.
+        if report.complete
+            && observed.complete
+            && !planned.steps.contains(&Step::FlushConntrack)
+            && self
+                .config
+                .run_root
+                .join("route-switch")
+                .try_exists()
+                .unwrap_or(false)
+        {
+            let before_forwarding = planned
+                .steps
+                .iter()
+                .position(|step| matches!(step, Step::ForwardingOn { .. }))
+                .unwrap_or(planned.steps.len());
+            planned
+                .steps
+                .insert(before_forwarding, Step::FlushConntrack);
+        }
         self.run_plan(planned, &desired, guard, report, true);
     }
     fn report_verdict(&mut self, report: &mut TickReport) {
@@ -586,6 +869,8 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             || *self.failover.desired_route() == scupper_core::render::RouteTarget::Unreachable
         {
             VerdictCode::FailClosed
+        } else if self.unconfirmed() {
+            VerdictCode::Degraded
         } else {
             VerdictCode::Protected
         };
@@ -621,7 +906,8 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 self.emergency_steps.push(step.clone());
             }
             report.steps.push(step.clone());
-            let result = self.execute_step(&step, guard, report);
+            let result =
+                self.execute_step(&step, steps.contains(&Step::FlushConntrack), guard, report);
             self.kernel.step_boundary(&step);
             if result.is_ok() && !matches!(step, Step::Emit(_)) {
                 *model = model.apply(&step);
@@ -666,6 +952,15 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             }
         }
     }
+    fn boot_write_failure(&self, report: &mut TickReport) {
+        self.emit(
+            EventKind::PersistenceFailed {
+                reason: Reason::BootWrite,
+            },
+            Actor::Daemon,
+            report,
+        );
+    }
     fn persistence_failure(&mut self, report: &mut TickReport) {
         self.budgets.persistence_failed = true;
         self.emit(
@@ -703,6 +998,53 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         report: &mut TickReport,
         recover: bool,
     ) {
+        // Safety reservations are charged only at the actual Restore attempt:
+        // ruleset load or foreign-link/tc reopening. Failed Tighten spends nothing.
+        let mut plan = plan;
+        let mut safety_reservations = Vec::new();
+        let now = (self.clock)().0;
+        for class in [
+            planner::SafetyClass::Ruleset,
+            planner::SafetyClass::ForeignLink,
+            planner::SafetyClass::TcHook,
+        ] {
+            let key = class.key();
+            let trigger = if class == planner::SafetyClass::Ruleset {
+                StepKind::LoadRuleset
+            } else {
+                StepKind::ForwardingOn
+            };
+            let previous: Vec<_> = self
+                .budgets
+                .attempts
+                .get(key)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|at| now.elapsed_since(*at) < Duration::from_secs(600))
+                .collect();
+            if plan
+                .budgets
+                .attempts
+                .get(key)
+                .is_some_and(|attempts| attempts.len() > previous.len())
+            {
+                if plan
+                    .steps
+                    .iter()
+                    .any(|step| StepKind::from(step) == trigger)
+                {
+                    safety_reservations.push((trigger, key.to_owned()));
+                }
+                // A prior containment failure may have removed all Stop steps
+                // from this plan. Discard its reservation even in that case.
+                if previous.is_empty() {
+                    plan.budgets.attempts.remove(key);
+                } else {
+                    plan.budgets.attempts.insert(key.to_owned(), previous);
+                }
+            }
+        }
         self.adopt(&plan); // In memory before step zero; no disk I/O here.
         let mut restore_name = false;
         for escalation in plan.escalations {
@@ -735,7 +1077,11 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         let mut contained = false;
         let mut may_recover = recover;
         let mut refresh_before_restore = false;
-        for step in plan.steps {
+        let last_flush = plan
+            .steps
+            .iter()
+            .rposition(|step| *step == Step::FlushConntrack);
+        for (index, step) in plan.steps.into_iter().enumerate() {
             // Namespace loss prevents kernel execution, but never drops a
             // planned audit or durable quarantine operation.
             if inode_gone && !matches!(step, Step::Emit(_) | Step::PersistLatch { .. }) {
@@ -761,8 +1107,24 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             if contained && step.failure() == StepFailure::Stop {
                 continue;
             }
+            let (charged, pending): (Vec<_>, Vec<_>) = std::mem::take(&mut safety_reservations)
+                .into_iter()
+                .partition(|(trigger, _)| *trigger == StepKind::from(&step));
+            safety_reservations = pending;
+            for (_, key) in charged {
+                self.budgets
+                    .attempts
+                    .entry(key)
+                    .or_default()
+                    .push((self.clock)().0);
+            }
             report.steps.push(step.clone());
-            let result = self.execute_step(&step, guard, report);
+            let result = self.execute_step(
+                &step,
+                last_flush.is_some_and(|flush| index < flush),
+                guard,
+                report,
+            );
             self.kernel.step_boundary(&step);
             if let Err(error) = result {
                 if step.failure() == StepFailure::NonFatal {
@@ -823,6 +1185,18 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                     (self.clock)().0,
                 );
                 if !observed.complete {
+                    // Full observations include routes/rules: preserve their alert
+                    // before projecting recovery down to safety-only operations.
+                    if recovery
+                        .steps
+                        .contains(&Step::Emit(planner::PlannerEvent::ObservationUnknown))
+                    {
+                        self.emit(
+                            planner::PlannerEvent::ObservationUnknown.into(),
+                            Actor::Daemon,
+                            report,
+                        );
+                    }
                     recovery
                         .steps
                         .retain(|s| emergency_allowed(s, &observed.model, desired));
@@ -830,7 +1204,6 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                     recovery.budgets.clone_from(&self.budgets);
                     recovery.debounce.clone_from(&self.debounce);
                 }
-                self.adopt(&recovery);
                 report.complete = false;
                 report.failures.push((step.clone(), error));
                 self.emit(
@@ -846,6 +1219,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                     may_recover = false;
                     self.run_plan(recovery, desired, guard, report, false);
                 } else {
+                    self.adopt_safety(&recovery);
                     // Bounded recovery may also fail partially. Execute its emergency
                     // closure and all remaining tightening, never recurse into Restore.
                     self.run_emergency(recovery.steps, &mut observed.model, desired, guard, report);
@@ -875,7 +1249,15 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         if !report.escalations.contains(&Escalation::RebindNamespace) {
             report.escalations.push(Escalation::RebindNamespace);
         }
-        if self.kernel.restore_name(&self.held, guard).is_err() {
+        if self
+            .kernel
+            .restore_name_until(
+                &self.held,
+                guard,
+                self.deadline.unwrap_or_else(Instant::now),
+            )
+            .is_err()
+        {
             report.complete = false;
             self.emit(
                 EventKind::DriftDetected {
@@ -890,6 +1272,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
     fn execute_step(
         &mut self,
         step: &Step,
+        flush_follows: bool,
         guard: &WriterGuard,
         report: &mut TickReport,
     ) -> Result<(), StepError> {
@@ -927,11 +1310,47 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             Step::ForwardingOn { .. } if self.latch.is_some() => {
                 Err(StepError("quarantine blocks forwarding"))
             }
+            // A route restore from fail-closed intentionally preserves conntrack.
+            // Only an interrupted switch with a planned flush needs recovery.
+            Step::RouteReplace { target, .. } if flush_follows => {
+                let bytes = format!("target={target:?}\ntime={}\n", (self.clock)().1);
+                crate::fs::durable_replace(
+                    &crate::fs::RealFs,
+                    &self.config.run_root.join("route-switch"),
+                    bytes.as_bytes(),
+                    0o600,
+                    &|_| Ok(()),
+                    &|_| Ok(()),
+                )
+                .map_err(|_| StepError("route switch marker write failed"))
+                .and_then(|()| self.kernel.execute(step))
+            }
+            Step::FlushConntrack => self.kernel.execute(step).and_then(|()| {
+                self.clear_route_switch()
+                    .map_err(|_| StepError("route switch marker removal failed"))
+            }),
             _ => self.kernel.execute(step),
         };
+        if result.is_ok()
+            && matches!(
+                step,
+                Step::LinkCreate {
+                    phase: planner::LinkPhase::Move,
+                    ..
+                }
+            )
+            && self.kernel.checkpoint_owned(guard).is_err()
+        {
+            self.boot_write_failure(report);
+        }
         if result.is_ok() {
             match step {
-                Step::ForwardingOn { .. } => self.forwarding = true,
+                Step::ForwardingOn { .. } => {
+                    self.forwarding = true;
+                    // This reopening consumed all preceding containment evidence.
+                    self.emergency_steps.clear();
+                    self.budgets.pending_safety.clear();
+                }
                 Step::ForwardingOff => self.forwarding = false,
                 _ => {}
             }
@@ -1218,4 +1637,20 @@ fn phase_a_unknown(model: &KernelModel) -> bool {
                 || link.ours == Known::Unknown
                 || link.up == Known::Unknown
         })
+}
+
+fn public_health(health: &scupper_core::failover::ExitHealth) -> scupper_proto::Health {
+    use scupper_core::failover::ExitHealth;
+    match health {
+        ExitHealth::Unknown => scupper_proto::Health::Unknown,
+        ExitHealth::Healthy {
+            confirmed: false, ..
+        } => scupper_proto::Health::Unconfirmed,
+        ExitHealth::Healthy {
+            confirmed: true, ..
+        } => scupper_proto::Health::Healthy,
+        ExitHealth::Suspect { .. } => scupper_proto::Health::Suspect,
+        ExitHealth::Down { .. } => scupper_proto::Health::Down,
+        ExitHealth::Recovering { .. } => scupper_proto::Health::Recovering,
+    }
 }

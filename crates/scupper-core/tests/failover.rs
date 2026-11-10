@@ -92,7 +92,10 @@ fn qualified(cfg: &FailoverConfig) -> Failover {
 fn healthy_since(machine: &Failover, index: usize, seconds: u64) {
     assert_eq!(
         machine.health()[&id(index)],
-        ExitHealth::Healthy { since: at(seconds) }
+        ExitHealth::Healthy {
+            since: at(seconds),
+            confirmed: true
+        }
     );
 }
 fn switch_event(from: usize, to: usize, failback: bool) -> FailoverAction {
@@ -1372,4 +1375,57 @@ proptest! {
         prop_assert!(coverage.failbacks >= 1, "no automatic failback: {coverage:?}");
         prop_assert!(coverage.flapping >= 1, "no probe-driven flapping: {coverage:?}");
     }
+}
+
+#[test]
+fn inconclusive_probes_preserve_initial_and_recovery_qualification() {
+    let cfg = config(1);
+    let inconclusive =
+        || FailoverInput::ProbeRound(BTreeMap::from([(id(0), ProbeOutcome::Inconclusive)]));
+    let mut initial = Failover::new(at(0), Selection::Auto, &cfg).0;
+    fresh(&mut initial, 0, &cfg);
+    advance(&mut initial, 0, probes(&[(0, true)]), &cfg);
+    advance(&mut initial, 1, inconclusive(), &cfg);
+    advance(&mut initial, 2, probes(&[(0, true)]), &cfg);
+    advance(&mut initial, 3, probes(&[(0, true)]), &cfg);
+    healthy_since(&initial, 0, 3);
+    advance(&mut initial, 4, handshakes(&cfg, None), &cfg);
+    fresh(&mut initial, 5, &cfg);
+    advance(&mut initial, 6, probes(&[(0, true)]), &cfg);
+    let health = initial.health().clone();
+    let actions = advance(&mut initial, 7, inconclusive(), &cfg);
+    assert_eq!(initial.health(), &health);
+    assert_eq!(actions, []);
+    advance(&mut initial, 20, probes(&[(0, true)]), &cfg);
+    advance(&mut initial, 36, probes(&[(0, true)]), &cfg);
+    healthy_since(&initial, 0, 36);
+}
+
+#[test]
+fn inconclusive_probe_neither_counts_as_failure_nor_witnesses_another_failure() {
+    let cfg = config(2);
+    let mut machine = qualified(&cfg);
+    let actions = advance(
+        &mut machine,
+        5,
+        FailoverInput::ProbeRound(BTreeMap::from([
+            (id(0), ProbeOutcome::Failure),
+            (id(1), ProbeOutcome::Inconclusive),
+        ])),
+        &cfg,
+    );
+    assert_eq!(actions, []);
+    healthy_since(&machine, 0, 4);
+    healthy_since(&machine, 1, 4);
+    let actions = advance(
+        &mut machine,
+        6,
+        FailoverInput::ProbeRound(BTreeMap::from([
+            (id(0), ProbeOutcome::Inconclusive),
+            (id(1), ProbeOutcome::Success),
+        ])),
+        &cfg,
+    );
+    assert_eq!(actions, []);
+    healthy_since(&machine, 0, 4);
 }

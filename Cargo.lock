@@ -457,6 +457,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "scupperd"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "scupper-sys",
+ "signal-hook",
+]
+
+[[package]]
 name = "serde"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -779,6 +788,7 @@ dependencies = [
  "proptest",
  "rustix",
  "scupper-core",
+ "scupper-proto",
  "scupper-sys",
  "serde",
  "serde_json",

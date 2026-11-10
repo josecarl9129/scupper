@@ -1,0 +1,14 @@
+# scupper-net.service
+[Unit]
+Description=scupper data-path namespace
+DefaultDependencies=no
+After=local-fs.target systemd-modules-load.service
+Before=network-pre.target scupperd.service
+Wants=network-pre.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/scupper boot
+# no ExecStop: stopping the unit never tears protection down
+[Install]
+WantedBy=multi-user.target

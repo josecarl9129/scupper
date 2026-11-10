@@ -4,9 +4,12 @@ mod boot;
 mod check_v2;
 mod cleanup;
 mod command;
+mod daemon;
 mod evidence;
 mod fixtures;
+mod flow;
 mod helpers;
+mod mounts;
 mod probe_child;
 mod topology;
 
@@ -14,6 +17,7 @@ use addresses::A;
 use cleanup::{Registry, Resource};
 use command::{Group, Invocation, Runner};
 use evidence::{Case, Row};
+pub use flow::flow;
 pub use helpers::{inject, probe, sink};
 use rustix::process::Signal;
 use scupper_core::{
@@ -94,7 +98,25 @@ pub fn run(artifacts: &Path, capture_fixtures: Option<&Path>) -> Result<()> {
     for signal in signals {
         signal_hook::low_level::unregister(signal);
     }
-    result
+    let readable = make_artifacts_readable(artifacts);
+    result.and(readable)
+}
+fn make_artifacts_readable(root: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if !root.exists() {
+        return Ok(());
+    }
+    fs::set_permissions(root, fs::Permissions::from_mode(0o755))?;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            make_artifacts_readable(&entry.path())?;
+        } else if kind.is_file() {
+            fs::set_permissions(entry.path(), fs::Permissions::from_mode(0o644))?;
+        }
+    }
+    Ok(())
 }
 fn run_inner(
     artifacts: &Path,
@@ -554,6 +576,10 @@ impl Lab {
         }
         self.cleaned = true;
         let mut failures = Vec::new();
+        let mut notes = Vec::new();
+        if let Err(error) = mounts::save(&self.artifacts, "before-teardown", None) {
+            failures.push(error.to_string());
+        }
         if let Err(error) = self.stop_captures() {
             failures.push(error.to_string());
         }
@@ -563,13 +589,14 @@ impl Lab {
             }
         }
         self.services.clear();
-        if let Err(error) = self.registry.cleanup(&mut self.runner) {
-            failures.push(error.to_string());
+        match self.registry.cleanup(&mut self.runner) {
+            Ok(reports) => notes.extend(reports),
+            Err(error) => failures.push(error.to_string()),
         }
         let text = if failures.is_empty() {
-            "ok\n".into()
+            format!("ok\n{}", notes.join("\n"))
         } else {
-            failures.join("\n")
+            [notes.join("\n"), failures.join("\n")].join("\n")
         };
         fs::write(self.artifacts.join("cleanup.txt"), &text)?;
         if failures.is_empty() {

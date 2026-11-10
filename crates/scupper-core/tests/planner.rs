@@ -200,12 +200,9 @@ fn repairs_table_exact_steps_and_classes() {
     }
     let mut m = good.clone();
     m.extra_routes = Known::Value(vec![extra_route()]);
-    let steps = closed_steps(
-        &d,
-        vec![Step::RouteDelete {
-            route: extra_route(),
-        }],
-    );
+    let steps = vec![Step::RouteDelete {
+        route: extra_route(),
+    }];
     cases.push(("extra route", m, steps.clone(), steps, RepairClass::Tighten));
     let mut m = good.clone();
     m.links.remove("wg0");

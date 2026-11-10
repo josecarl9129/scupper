@@ -14,6 +14,7 @@ toml.workspace = true
 ipnet.workspace = true
 thiserror.workspace = true
 scupper-core.workspace = true
+scupper-proto.workspace = true
 scupper-sys.workspace = true
 sha2.workspace = true
 socket2.workspace = true

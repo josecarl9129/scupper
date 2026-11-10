@@ -1503,3 +1503,116 @@ fn compressed_dns_canary_precedes_wireguard_on_port_53() {
     .unwrap();
     assert_eq!(r.packets[0].class, violation(Reason::CanaryMarker));
 }
+
+fn wireguard_only_policy() -> Policy {
+    Policy::from_toml(POLICY.split("[[host_allow]]").next().unwrap()).unwrap()
+}
+
+#[test]
+fn wireguard_icmp_errors_require_the_exact_reverse_listed_tuple() {
+    let policy = wireguard_only_policy();
+    let quote = ip4(PEER, LOCAL, 17, &udp(51820, 51820, &wg(4, 32)));
+    let mut error = icmp(3, &quote); // Complete quotation.
+    error[1] = 3;
+    let allowed_error = ip4(LOCAL, PEER, 1, &error);
+    let report = classify(&capture(101, &[allowed_error]), &policy, 10).unwrap();
+    assert_eq!(report.packets[0].class, allowed("wireguard_error[0]"));
+    // Echo, reversed outer direction, unknown gateway port, and a quotation
+    // going gateway -> peer must not be accepted by this exception.
+    let invalid = [
+        ip4(LOCAL, PEER, 1, &icmp(8, &quote)),
+        ip4(PEER, LOCAL, 1, &error),
+        ip4(
+            LOCAL,
+            PEER,
+            1,
+            &icmp(3, &ip4(PEER, LOCAL, 17, &udp(51820, 57794, &[]))),
+        ),
+        ip4(
+            LOCAL,
+            PEER,
+            1,
+            &icmp(3, &ip4(LOCAL, PEER, 17, &udp(51820, 51820, &[]))),
+        ),
+    ];
+    let report = classify(&capture(101, &invalid), &policy, 10).unwrap();
+    assert!(
+        report
+            .packets
+            .iter()
+            .all(|p| p.class == violation(Reason::NotAllowListed))
+    );
+
+    let policy = Policy::from_toml(&format!(
+        "{}\n[[wireguard]]\ngateway='192.0.2.1:57794'\npeer='198.51.100.2:51820'\n",
+        POLICY.split("[[host_allow]]").next().unwrap()
+    ))
+    .unwrap();
+    let old_port = ip4(
+        LOCAL,
+        PEER,
+        1,
+        &icmp(3, &ip4(PEER, LOCAL, 17, &udp(51820, 57794, &[]))),
+    );
+    let report = classify(&capture(101, &[old_port]), &policy, 10).unwrap();
+    assert_eq!(report.packets[0].class, allowed("wireguard_error[2]"));
+}
+
+#[test]
+fn wireguard_icmp_error_with_forbidden_inner_address_still_violates() {
+    let option = [7, 7, 4, CLIENT[0], CLIENT[1], CLIENT[2], CLIENT[3], 0];
+    let quotations = [
+        ip4(PEER, CLIENT, 17, &udp(51820, 51820, &[])),
+        // Even an exact allowed tuple cannot hide a forbidden option address.
+        with_options(ip4(PEER, LOCAL, 17, &udp(51820, 51820, &[])), &option),
+    ];
+    for quotation in quotations {
+        let error = ip4(LOCAL, PEER, 1, &icmp(3, &quotation));
+        let report = classify(&capture(101, &[error]), &wireguard_only_policy(), 10).unwrap();
+        assert_eq!(
+            report.packets[0].class,
+            violation(Reason::ForbiddenAddress {
+                addr: Ipv4Addr::from(CLIENT).into(),
+                location: Location::Quoted,
+            })
+        );
+    }
+}
+
+#[test]
+fn wireguard_icmp_error_to_non_peer_still_violates() {
+    let quote = ip4(PEER, LOCAL, 17, &udp(51820, 51820, &[]));
+    let error = ip4(LOCAL, [198, 51, 100, 3], 1, &icmp(3, &quote));
+    let report = classify(&capture(101, &[error]), &wireguard_only_policy(), 10).unwrap();
+    assert_eq!(report.packets[0].class, violation(Reason::NotAllowListed));
+}
+
+#[test]
+fn wireguard_icmpv6_errors_require_the_exact_reverse_listed_tuple() {
+    let local = "2001:db8::1";
+    let peer = "2001:db8:1::2";
+    let quote = ip6(peer, local, 17, &udp(51820, 51820, &wg(4, 32)));
+    let allowed_error = ip6(local, peer, 58, &icmp(1, &quote));
+    let forbidden = ip6(
+        local,
+        peer,
+        58,
+        &icmp(1, &ip6(peer, "2001:db8:99::2", 17, &udp(51820, 51820, &[]))),
+    );
+    let non_peer = ip6(local, "2001:db8:1::3", 58, &icmp(1, &quote));
+    let report = classify(
+        &capture(101, &[allowed_error, forbidden, non_peer]),
+        &wireguard_only_policy(),
+        10,
+    )
+    .unwrap();
+    assert_eq!(report.packets[0].class, allowed("wireguard_error[1]"));
+    assert_eq!(
+        report.packets[1].class,
+        violation(Reason::ForbiddenAddress {
+            addr: v6("2001:db8:99::2").into(),
+            location: Location::Quoted,
+        })
+    );
+    assert_eq!(report.packets[2].class, violation(Reason::NotAllowListed));
+}

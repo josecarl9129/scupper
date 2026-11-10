@@ -224,13 +224,24 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
+    let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    #[cfg(feature = "testing")]
+    let run_root = Cli::try_parse_from(args.clone())
+        .ok()
+        .and_then(|cli| cli.test_root.map(|root| root.join("run/scupper")))
+        .unwrap_or_else(|| PathBuf::from("/run/scupper"));
+    #[cfg(not(feature = "testing"))]
+    let run_root = PathBuf::from("/run/scupper");
+    let executable =
+        std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/usr/local/bin/scupper"));
+    let system = RealSystem::default().with_canon_paths(executable, run_root);
     run_with(
         args,
         &Dependencies {
             state_root: Path::new("/var/lib/scupper"),
             config_root: Path::new("/etc/scupper"),
-            probe_exec: &RealSystem::default(),
-            system: &RealSystem::default(),
+            probe_exec: &system,
+            system: &system,
             namespaces: &ProcNamespaces,
             privilege: &EffectiveUid,
             prompt: &TerminalPrompt,

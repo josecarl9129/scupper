@@ -159,13 +159,31 @@ fn read_capacity(path: &Path) -> Arc<ReadCapacity> {
     capacity
 }
 
+// Resolve existing ancestors as well, so initially absent roots have the same
+// process-wide capacity through symlink and dot-component aliases.
+fn canonical_root(root: &Path) -> io::Result<PathBuf> {
+    let absolute = std::path::absolute(root)?;
+    match std::fs::canonicalize(&absolute) {
+        Ok(path) => Ok(path),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let parent = absolute.parent().ok_or(e)?;
+            Ok(canonical_root(parent)?.join(
+                absolute
+                    .file_name()
+                    .ok_or_else(|| io::Error::other("invalid state root"))?,
+            ))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// State access rooted at `/var/lib/scupper` in production.
 #[derive(Debug)]
 pub struct StateFile {
     path: PathBuf,
     capacity: Arc<ReadCapacity>,
     pending_read: std::cell::RefCell<Option<PendingJob<Snapshot>>>,
-    pending_metadata: std::cell::RefCell<Option<PendingJob<Option<FileGeneration>>>>,
+    pending_metadata: std::cell::RefCell<Option<PendingJob<Option<StateRead>>>>,
 }
 impl StateFile {
     /// Chooses `root/state.json`. A writer guard enables stale-temp cleanup.
@@ -178,8 +196,8 @@ impl StateFile {
             durable_directory(root.as_ref())?;
             RealFs.cleanup_stale(root.as_ref())?;
         }
-        let path = std::path::absolute(root.as_ref().join("state.json"))?;
-        let capacity = read_capacity(&path);
+        let path = root.as_ref().join("state.json");
+        let capacity = read_capacity(&canonical_root(root.as_ref())?.join("state.json"));
         Ok(Self {
             path,
             capacity,
@@ -218,7 +236,8 @@ impl StateFile {
 
     /// Bound a background read by the tick deadline. A pending read survives
     /// timeouts; administrative writes invalidate its potentially stale result.
-    /// A subsequent call returns `TimedOut` immediately while a worker is busy.
+    /// Calls in the same generation wait on the worker until their own deadline;
+    /// calls for an invalidated generation only poll and discard its completion.
     ///
     /// # Errors
     /// Returns read errors or `TimedOut` without waiting for blocked disk I/O.
@@ -254,13 +273,31 @@ impl StateFile {
         if std::time::Instant::now() >= deadline {
             return Err(timeout());
         }
-        // A timed-out verification no longer has a waiting caller. Discard its
-        // completion before starting a fresh snapshot, but retain a blocked job.
+        // A snapshot and phase B share the current generation's worker. Phase B
+        // waits to its own deadline; only obsolete generations are polled.
         let mut metadata = self.pending_metadata.borrow_mut();
-        if let Some((_, receive)) = metadata.as_ref() {
-            match receive.try_recv() {
-                Err(TryRecvError::Empty) => return Err(timeout()),
-                Ok(_) | Err(TryRecvError::Disconnected) => *metadata = None,
+        if let Some((started, receive)) = metadata.as_ref() {
+            let started = *started;
+            let result = if started == Some(READ_GENERATION.load(Ordering::SeqCst)) {
+                receive.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            } else {
+                receive.try_recv().map_err(|error| match error {
+                    TryRecvError::Empty => RecvTimeoutError::Timeout,
+                    TryRecvError::Disconnected => RecvTimeoutError::Disconnected,
+                })
+            };
+            match result {
+                Err(RecvTimeoutError::Timeout) => return Err(timeout()),
+                Ok(result) => {
+                    *metadata = None;
+                    if started == Some(READ_GENERATION.load(Ordering::SeqCst)) {
+                        return result;
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    *metadata = None;
+                    return Err(io::Error::other("state metadata worker stopped"));
+                }
             }
         }
         drop(metadata);
@@ -290,7 +327,7 @@ impl StateFile {
             .as_ref()
             .ok_or_else(|| io::Error::other("missing read worker"))?;
         let started = *started;
-        let result = if new_worker {
+        let result = if started == Some(generation) {
             receive.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
         } else {
             receive.try_recv().map_err(|error| match error {
@@ -314,34 +351,20 @@ impl StateFile {
                 std::thread::Builder::new()
                     .name("state-generation".into())
                     .spawn(move || {
-                        let result = file_generation(&path);
+                        let result = file_generation(&path).map(|current| {
+                            if current == identity {
+                                Some(state)
+                            } else {
+                                None
+                            }
+                        });
                         drop(permit);
                         let _ = send.send(result);
                     })?;
-                let mut metadata = self.pending_metadata.borrow_mut();
-                *metadata = Some((Some(generation), receive));
-                let result = metadata
-                    .as_ref()
-                    .ok_or_else(|| io::Error::other("missing metadata worker"))?
-                    .1
-                    .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
-                let current = match result {
-                    Ok(result) => {
-                        *metadata = None;
-                        result?
-                    }
-                    Err(RecvTimeoutError::Timeout) => return Err(timeout()),
-                    Err(RecvTimeoutError::Disconnected) => {
-                        *metadata = None;
-                        return Err(io::Error::other("state metadata worker stopped"));
-                    }
-                };
-                if current != identity
-                    || generation != READ_GENERATION.load(std::sync::atomic::Ordering::SeqCst)
-                {
-                    return Ok(None);
-                }
-                Ok(Some(state))
+                *self.pending_metadata.borrow_mut() = Some((Some(generation), receive));
+                // Keep the snapshot with its verification worker so a later
+                // phase can reuse it rather than opening the file a second time.
+                Ok(None)
             }
             Err(RecvTimeoutError::Timeout) => Err(timeout()),
             Err(RecvTimeoutError::Disconnected) => {
@@ -467,6 +490,26 @@ mod tests {
                 .unwrap(),
             StateRead::Present(State::default())
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn worker_capacity_uses_canonical_roots() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/state-aliases")
+            .join(format!(
+                "{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::os::unix::fs::symlink("real", root.join("alias")).unwrap();
+        let a = StateFile::open(root.join("real"), None).unwrap();
+        let b = StateFile::open(root.join("alias/../alias/."), None).unwrap();
+        assert!(Arc::ptr_eq(&a.capacity, &b.capacity));
+        let permit = a.reserve_worker().unwrap();
+        assert!(b.reserve_worker().is_err());
+        drop(permit);
         std::fs::remove_dir_all(root).unwrap();
     }
 

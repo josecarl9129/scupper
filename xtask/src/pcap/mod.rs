@@ -259,6 +259,11 @@ fn decide(policy: &Policy, ip: &Ip<'_>) -> Result<String, Reason> {
     if policy.marker(ip.raw) {
         return Err(Reason::CanaryMarker);
     }
+    if let Some(quotation) = t.quotation
+        && let Some(rule) = wireguard_error(policy, ip, proto, payload[0], quotation)?
+    {
+        return Ok(rule);
+    }
     if proto == 58 && matches!(payload.first(), Some(131..=137 | 143)) {
         return if control::ndp(policy, ip, payload)? {
             Ok("ndp".into())
@@ -301,6 +306,79 @@ fn decide(policy: &Policy, ip: &Ip<'_>) -> Result<String, Reason> {
         return Err(Reason::CanaryMarker);
     }
     host_allowed(policy, ip, proto, payload, t.ports).ok_or(Reason::NotAllowListed)
+}
+
+// A complete quotation may contain just IP + UDP headers. Its tuple must be the
+// incoming direction of an explicitly listed WireGuard pair, including the
+// gateway's old listen port after recreation. All quotation safety checks run
+// before this exception, and errors never count as positive WireGuard traffic.
+fn wireguard_error(
+    policy: &Policy,
+    outer: &Ip<'_>,
+    protocol: u8,
+    kind: u8,
+    quotation: &[u8],
+) -> Result<Option<String>, Reason> {
+    if !matches!((protocol, kind), (1, 3 | 11 | 12) | (58, 1..=4)) {
+        return Ok(None);
+    }
+    let inner = decode::ip(quotation, true)?;
+    if inner.proto != 17 || inner.fragment.is_some() || !inner.trailer.is_empty() {
+        return Ok(None);
+    }
+    // Without both ports no WireGuard tuple can match; host_allow still applies.
+    if inner.payload.len() < 4 {
+        return Ok(None);
+    }
+    let src = SocketAddr::new(inner.src, decode::word(inner.payload, 0)?);
+    let dst = SocketAddr::new(inner.dst, decode::word(inner.payload, 2)?);
+    let Some((i, _)) = policy.wireguard.iter().enumerate().find(|(_, rule)| {
+        outer.src == rule.gateway.ip()
+            && outer.dst == rule.peer.ip()
+            && policy.uplink_addrs.contains(&outer.src)
+            && src == rule.peer
+            && dst == rule.gateway
+    }) else {
+        return Ok(None);
+    };
+    let header_len = inner.raw.len() - inner.payload.len();
+    let (base_header_len, quotation_limit) = if inner.src.is_ipv4() {
+        (20, 548)
+    } else {
+        (40, 1232)
+    };
+    // Peer WireGuard datagrams have no IP options or extension headers.
+    if header_len != base_header_len {
+        return Err(Reason::MalformedPacket);
+    }
+    let udp_len = usize::from(decode::word(inner.payload, 4)?);
+    // The IP and UDP lengths must agree, even when ICMP quotes only a prefix.
+    let ip_len = if inner.src.is_ipv4() {
+        usize::from(decode::word(quotation, 2)?)
+    } else {
+        40 + usize::from(decode::word(quotation, 4)?)
+    };
+    if udp_len < 8 || ip_len - header_len != udp_len {
+        return Err(Reason::MalformedPacket);
+    }
+    if inner.raw.len() != ip_len && quotation.len() != quotation_limit {
+        return Err(Reason::Truncated);
+    }
+    decode::bytes(inner.payload, 0, 8)?;
+    let body = &inner.payload[8..];
+    let full_len = udp_len - 8;
+    let valid_length = match body.first() {
+        Some(1) => full_len == 148,
+        Some(2) => full_len == 92,
+        Some(3) => full_len == 64,
+        Some(4) => full_len >= 32,
+        None => full_len == 0,
+        _ => false,
+    };
+    if !valid_length || (!body.is_empty() && (body.len() < 4 || body[1..4] != [0, 0, 0])) {
+        return Err(Reason::MalformedWireGuard);
+    }
+    Ok(Some(format!("wireguard_error[{i}]")))
 }
 
 fn host_allowed(
@@ -487,6 +565,9 @@ pub fn classify(capture: &[u8], policy: &Policy, limit: usize) -> Result<Report,
             decode::link(frame.unwrap_or_default(), capture.linktype)
         };
         match linked {
+            Ok(Link::Other) => {
+                packet.class = Class::Violation(Reason::UnparsableLinkLayer);
+            }
             Ok(Link::Arp(data)) => {
                 let wire_data = &record.data[record.data.len() - capture.fcs_len - data.len()..];
                 packet.class = match decode::arp(data) {
@@ -628,6 +709,7 @@ pub fn classify(capture: &[u8], policy: &Policy, limit: usize) -> Result<Report,
 // Decoded evidence for namespace-case preconditions and exact injected controls.
 // Reuse the oracle's framing/length validation; never search arbitrary pcap bytes.
 pub(crate) struct Observed {
+    pub timestamp: Timestamp,
     pub index: usize,
     pub source: IpAddr,
     pub destination: IpAddr,
@@ -654,6 +736,7 @@ pub(crate) fn observe(bytes: &[u8]) -> Result<Vec<Observed>, Error> {
                 return Err(Error::Capture("incomplete case datagram".into()));
             }
             observed.push(Observed {
+                timestamp: record.timestamp.clone(),
                 index: index + 1,
                 source: ip.src,
                 destination: ip.dst,
@@ -663,4 +746,60 @@ pub(crate) fn observe(bytes: &[u8]) -> Result<Vec<Observed>, Error> {
         }
     }
     Ok(observed)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod observation_tests {
+    use super::*;
+    fn capture(kind: u32, frame: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0xd4, 0xc3, 0xb2, 0xa1, 2, 0, 4, 0];
+        bytes.extend([0; 8]);
+        bytes.extend(65535_u32.to_le_bytes());
+        bytes.extend(kind.to_le_bytes());
+        bytes.extend(7_u32.to_le_bytes());
+        bytes.extend(123_u32.to_le_bytes());
+        let len = u32::try_from(frame.len()).unwrap();
+        bytes.extend(len.to_le_bytes());
+        bytes.extend(len.to_le_bytes());
+        bytes.extend(frame);
+        bytes
+    }
+    #[test]
+    fn raw_ethernet_and_stacked_vlan_observations_have_identical_packets() {
+        let mut ip = vec![
+            0x45, 0, 0, 32, 0, 0, 0, 0, 64, 17, 0, 0, 192, 0, 2, 1, 192, 0, 2, 2,
+        ];
+        ip.extend([0, 1, 0, 2, 0, 12, 0, 0]);
+        ip.extend(b"test");
+        for tags in [vec![], vec![0x8100_u16], vec![0x88a8, 0x8100]] {
+            let mut frame = vec![0; 12];
+            for tag in tags {
+                frame.extend(tag.to_be_bytes());
+                frame.extend([0, 1]);
+            }
+            frame.extend(0x0800_u16.to_be_bytes());
+            frame.extend(&ip);
+            let raw = observe(&capture(101, &ip)).unwrap();
+            let ethernet = observe(&capture(1, &frame)).unwrap();
+            assert_eq!(ethernet.len(), 1);
+            assert_eq!(ethernet[0].source, raw[0].source);
+            assert_eq!(ethernet[0].destination, raw[0].destination);
+            assert_eq!(ethernet[0].payload, raw[0].payload);
+            assert_eq!(ethernet[0].timestamp.seconds, raw[0].timestamp.seconds);
+            assert_eq!(
+                ethernet[0].timestamp.nanoseconds,
+                raw[0].timestamp.nanoseconds
+            );
+        }
+    }
+    #[test]
+    fn ethernet_control_frames_are_not_ip_and_truncated_headers_fail() {
+        let mut lldp = vec![0; 12];
+        lldp.extend(0x88cc_u16.to_be_bytes());
+        assert!(observe(&capture(1, &lldp)).unwrap().is_empty());
+        assert!(observe(&capture(1, &[0; 13])).is_err());
+        lldp[12..].copy_from_slice(&0x8100_u16.to_be_bytes());
+        assert!(observe(&capture(1, &lldp)).is_err());
+    }
 }

@@ -78,9 +78,21 @@ runs before the WireGuard decision; decoding failures are non-fatal for a packet
 that otherwise matches WireGuard. Data packets have no 16-byte length alignment
 requirement because Linux may cap padding at the MTU.
 
+The `wireguard_error[i]` exception admits ICMPv4 errors 3/11/12 and ICMPv6
+errors 1–4 only for an exact incoming WireGuard tuple quoted by its uplink
+gateway to the listed peer. Quoted IP and UDP lengths must agree; IPv4 options,
+IPv6 extension headers, fragments and trailers are excluded. A quotation must
+be complete or end exactly at 548 bytes (IPv4) or 1232 bytes (IPv6). Available
+message bytes must satisfy the same type, reserved-byte and length rules as
+positive WireGuard traffic. A complete empty UDP datagram is also permitted;
+a header-only prefix of a longer datagram is rejected. These framing checks
+apply after matching the tuple; other ICMP errors retain their host rules.
+
 Content inside allowed WireGuard/TLS flows is opaque: it is judged only by
 endpoints and shape, with plaintext canary detection as an additional check.
-The oracle cannot determine what encrypted content carries. Keep host rules
+A type-4 frame can carry arbitrary bytes after its framing, including plaintext
+or an embedded client header. L3/L4 therefore establish framing and address
+containment with opaque payloads, not payload confidentiality. Keep host rules
 narrow; an allowed SSH/TLS or UDP flow can carry tunneled traffic that endpoint
 and shape checks cannot distinguish.
 
@@ -284,6 +296,46 @@ injections, missing or extra violations, empty auxiliary captures, v6 on ex-ch1,
 antispoof trace correlation, explicit DNS decoding and local probe errors
 (including an occupied UDP source port through the CLI). The actual namespace
 suite runs in CI on both Ubuntu 24.04 and 22.04; it is not part of `cargo test`.
+
+L17-V14 waits for the held namespace inode to reappear, then requires exactly
+one mount on `/run/netns/scupper`. Restore leaves a single mount of the held
+inode alone, detaches a hijacked mount with `MNT_DETACH | UMOUNT_NOFOLLOW` before binding, and
+creates the mount-point file only when missing. Unexpected mount counts or a
+wrong inode after binding report an escalation. With scupperd stopped, a single
+`ip netns delete scupper` must detach that mount and remove the name. With the
+daemon running, deletion is temporary: the next audit restores the held inode.
+Restore requires an already shared parent mount and never rewrites propagation.
+Its directory flock uses non-blocking retries, capped at 100 ms and the tick
+deadline. A descriptor held through a deleted named mount is replaced as a bind
+source by a fresh `/proc/thread-self/ns/net` descriptor from a short-lived thread
+that enters the held network namespace. This avoids inheriting its old mount's `MNT_UMOUNT` flag
+on older kernels; the held namespace identity remains unchanged.
+
+The check wrapper uses `unshare --mount --propagation unchanged`. It makes only
+mounted overlay ancestors (`/`, `/etc`, `/var`, `/var/lib`) private, without
+recursion, before binding the lab's `/etc` and `/var/lib`. The two replacement
+mounts are also made private without recursion. It leaves all nsfs
+mounts and `/run/netns` propagation intact.
+
+The lab saves `/run/netns` mountinfo lines immediately after L17 restore,
+after its `ip netns exec` and fresh check, before
+each daemon case cleanup, and before final teardown (`*-host.mountinfo`,
+`*-daemon.mountinfo`, and `*-mounts.json`). Daemon snapshots read its procfs
+mountinfo directly and record whether its mount namespace differs from the
+host. Parent mount propagation fields and duplicate path entries are preserved.
+A stack or loss of shared nsfs peers fails the daemon case that left it. Shared
+peer shape is checked before stopping, before cleanup and after case cleanup,
+against the untouched `wan` namespace. Final cleanup reports stacked names
+in `cleanup.txt`, lazily unmounts every layer with a bounded loop, then deletes
+the name; ordinary single mounts are deleted directly and checked absent.
+
+L13 starts the foreign-side control capture and waits for tcpdump's listening
+acknowledgement before sending three distinct UDP control markers on fresh
+tuples, spaced by probe completion and 250 ms. At least one exact UDP payload
+must appear. The measurement uses a separate continuous marker and still
+requires a pre-containment packet, redirect removal and link-down within eight
+seconds, and no matching packet later than containment plus 250 ms (or eight
+seconds from resume). Packet-loss checks and the uplink leak oracle still apply.
 
 Boot rebuilds first close forwarding, disable every foreign or wrong-kind link
 using its raw kernel name, and clear clsact/ingress and XDP on all namespace links.

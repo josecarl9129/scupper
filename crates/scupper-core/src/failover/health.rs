@@ -14,6 +14,7 @@ pub(super) struct Signals {
     pub link: ExitLinkState,
     pub probe: Option<(MonoTime, bool)>,
     pub initial_successes: u8,
+    pub unconfirmed: bool,
 }
 
 impl Signals {
@@ -60,6 +61,10 @@ pub(super) fn probe(
     counted: bool,
     fresh: bool,
 ) {
+    let counted = counted || signals.unconfirmed;
+    if success {
+        signals.unconfirmed = false;
+    }
     if !success {
         signals.initial_successes = 0;
     }
@@ -67,16 +72,26 @@ pub(super) fn probe(
         ExitHealth::Unknown if success && fresh => {
             signals.initial_successes = signals.initial_successes.saturating_add(1).min(3);
             if signals.initial_successes == 3 {
-                ExitHealth::Healthy { since: now }
+                ExitHealth::Healthy {
+                    since: now,
+                    confirmed: true,
+                }
             } else {
                 ExitHealth::Unknown
             }
         }
+        ExitHealth::Healthy { since, .. } if success => ExitHealth::Healthy {
+            since,
+            confirmed: true,
+        },
         ExitHealth::Healthy { .. } if !success && counted => ExitHealth::Suspect {
             failures: 1,
             since: now,
         },
-        ExitHealth::Suspect { .. } if success => ExitHealth::Healthy { since: now },
+        ExitHealth::Suspect { .. } if success => ExitHealth::Healthy {
+            since: now,
+            confirmed: true,
+        },
         ExitHealth::Suspect { failures, since } if counted => {
             if failures >= 2 {
                 ExitHealth::Down {
@@ -100,7 +115,10 @@ pub(super) fn probe(
             let since = if successes == 0 { now } else { since };
             let successes = successes.saturating_add(1).min(3);
             if successes >= 3 && now.elapsed_since(since) >= RECOVERY_SPAN {
-                ExitHealth::Healthy { since: now }
+                ExitHealth::Healthy {
+                    since: now,
+                    confirmed: true,
+                }
             } else {
                 ExitHealth::Recovering { successes, since }
             }

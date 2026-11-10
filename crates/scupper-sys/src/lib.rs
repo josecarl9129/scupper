@@ -21,3 +21,5 @@ pub mod state;
 pub mod store;
 
 pub mod reconcile;
+
+pub mod daemon;

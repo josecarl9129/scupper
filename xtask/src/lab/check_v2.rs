@@ -7,7 +7,7 @@ use super::{
     fail,
 };
 use scupper_core::{
-    config::{GatewayId, HealthSettings, parse_site, validate},
+    config::{DurationStr, GatewayId, HealthSettings, parse_site, validate},
     render::{VersionStamp, render_netns},
 };
 use scupper_sys::{
@@ -22,12 +22,21 @@ use std::{
     path::{Path, PathBuf},
 };
 
-// Only these child mounts change. The original /etc, /var/lib, host network
-// routes, firewall and forwarding settings remain outside the mount namespace.
+// Keep /run/netns propagation intact. Isolate only the two overlay destinations
+// before binding: a recursive propagation change at / would include nsfs peers.
 const CHECK: &str = r#"
 set -eu
+# / is always a mount point; never let a missing or failing `mountpoint` skip it.
+mount --make-private /
+for path in /etc /var /var/lib; do
+    if mountpoint -q "$path"; then
+        mount --make-private "$path"
+    fi
+done
 mount --bind "$1/etc" /etc
+mount --make-private /etc
 mount --bind "$1/var-lib" /var/lib
+mount --make-private /var/lib
 exec nsenter --net=/run/netns/gwhost -- "$2" --test-root "$1" check --json
 "#;
 
@@ -132,6 +141,10 @@ impl Lab {
         let text = fs::read_to_string(self.private.join("runtime-site.toml"))?;
         let mut config = parse_site(&text)?;
         config.health.probe_targets = HealthSettings::default().probe_targets;
+        // Minimum allowed WireGuard rekey interval + slack. L3 must observe
+        // staleness with a single exit, rather than relying on probe failures.
+        config.health.handshake_stale = DurationStr("175s".into());
+        config.health.failover_grace = DurationStr("30s".into());
         config.health.require_daemon = false; // scupperd is deliberately absent in this lab.
         let text = toml::to_string(&config)?;
         self.site = validate(config).map_err(|errors| format!("check lab config: {errors:?}"))?;
@@ -179,7 +192,7 @@ impl Lab {
                 &[
                     "--mount",
                     "--propagation",
-                    "private",
+                    "unchanged",
                     "--",
                     "/bin/sh",
                     "-c",
@@ -377,8 +390,47 @@ impl Lab {
 
 #[cfg(test)]
 mod tests {
-    use super::verdict_matches;
+    use super::{CHECK, verdict_matches};
     use serde_json::json;
+
+    #[test]
+    fn check_isolates_only_mounted_overlay_ancestors() -> Result<(), Box<dyn std::error::Error>> {
+        // Exercise the actual shell decisions for ordinary and separately
+        // mounted /etc and /var layouts, without issuing privileged syscalls.
+        let setup = CHECK.split("exec nsenter").next().ok_or("missing setup")?;
+        for (points, private) in [
+            ("/", vec!["/"]),
+            ("/|/etc|/var", vec!["/", "/etc", "/var"]),
+            ("/|/var/lib", vec!["/", "/var/lib"]),
+        ] {
+            let script = format!(
+                r#"
+mountpoint() {{ case "$2" in {points}) return 0;; *) return 1;; esac; }}
+mount() {{ printf '%s\n' "$*"; }}
+{setup}
+"#
+            );
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", &script, "check-test", "/lab-root"])
+                .output()?;
+            assert!(output.status.success());
+            let mut expected: Vec<_> = private
+                .into_iter()
+                .map(|path| format!("--make-private {path}"))
+                .collect();
+            expected.extend([
+                "--bind /lab-root/etc /etc".into(),
+                "--make-private /etc".into(),
+                "--bind /lab-root/var-lib /var/lib".into(),
+                "--make-private /var/lib".into(),
+            ]);
+            assert_eq!(
+                String::from_utf8(output.stdout)?,
+                expected.join("\n") + "\n"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn lab_rows_require_specific_verdicts_and_healthy_exit_ip() {

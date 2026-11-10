@@ -218,10 +218,42 @@ pub(super) struct Group {
     done: bool,
 }
 impl Group {
-    fn signal(&self, signal: Signal) {
+    pub(super) fn supervised_pid(&self) -> Result<Option<u32>> {
+        if self.done {
+            return Ok(None);
+        }
+        let pid = self.child.id();
+        let children = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))?;
+        let mut children = children.split_whitespace();
+        let child = children.next().ok_or("supervisor has no child")?.parse()?;
+        if children.next().is_some() {
+            return fail("supervisor has multiple direct children");
+        }
+        Ok(Some(child))
+    }
+
+    pub(super) fn signal(&self, signal: Signal) {
         if let Some(pid) = Pid::from_raw(self.child.id().cast_signed()) {
             let _ = kill_process_group(pid, signal);
         }
+    }
+    pub fn assert_not_stopped(&self) -> Result<()> {
+        // timeout supervises the daemon; inspect its descendants as well.
+        let pid = self.child.id();
+        let children = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))?;
+        if children.split_whitespace().next().is_none() {
+            return fail("daemon supervisor has no child");
+        }
+        for child in children.split_whitespace() {
+            let stat = std::fs::read_to_string(format!("/proc/{child}/stat"))?;
+            if stat
+                .rsplit_once(") ")
+                .is_none_or(|(_, tail)| tail.starts_with(['T', 't', 'Z']))
+            {
+                return fail("daemon is stopped or exited during tick-only stall");
+            }
+        }
+        Ok(())
     }
     pub fn alive(&mut self) -> Result<()> {
         if let Some(status) = self.child.try_wait()? {
@@ -231,12 +263,15 @@ impl Group {
         Ok(())
     }
     pub fn stop(&mut self, signal: Signal) -> Result<()> {
+        self.stop_timeout(signal, Duration::from_secs(3))
+    }
+    pub(super) fn stop_timeout(&mut self, signal: Signal, timeout: Duration) -> Result<()> {
         if self.done {
             return Ok(());
         }
         self.alive()?;
         self.signal(signal);
-        let until = Instant::now() + Duration::from_secs(3);
+        let until = Instant::now() + timeout;
         while Instant::now() < until {
             if let Some(status) = self.child.try_wait()? {
                 self.done = true;

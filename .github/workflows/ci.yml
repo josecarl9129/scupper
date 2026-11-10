@@ -107,21 +107,25 @@ jobs:
           rustup target add x86_64-unknown-linux-musl
 
       - name: Build musl release
-        run: cargo build -p scupper --bin scupper --release --locked --target x86_64-unknown-linux-musl
+        run: cargo build -p scupper -p scupperd --bins --release --locked --target x86_64-unknown-linux-musl
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
 
       - name: Verify static x86-64 executable
         run: |
-          description=$(file target/x86_64-unknown-linux-musl/release/scupper)
+          for binary in scupper scupperd; do
+          description=$(file target/x86_64-unknown-linux-musl/release/$binary)
           printf '%s\n' "$description"
           [[ "$description" == *'ELF 64-bit LSB'* && "$description" == *'x86-64'* ]]
           [[ "$description" == *'statically linked'* || "$description" == *'static-pie linked'* ]]
+          done
 
       - uses: actions/upload-artifact@v4
         with:
           name: scupper-x86_64-linux-musl
-          path: target/x86_64-unknown-linux-musl/release/scupper
+          path: |
+            target/x86_64-unknown-linux-musl/release/scupper
+            target/x86_64-unknown-linux-musl/release/scupperd
           retention-days: 14
           if-no-files-found: error
 
@@ -150,11 +154,18 @@ jobs:
         run: timeout 600 cargo build -p xtask --release --locked
 
       - name: Build boot, check and probe testing CLI
-        run: timeout 600 cargo build -p scupper --features testing --locked
+        run: timeout 600 cargo build -p scupper -p scupperd --features testing --locked
 
       - name: Run boot-built namespace lab
         run: sudo timeout 1200 target/release/xtask leaktest --artifacts lab-out --capture-fixtures lab-out/fixtures
 
+      - name: Make lab diagnostics readable
+        if: always()
+        run: |
+          if [ -d lab-out ]; then
+            sudo find lab-out -type d -exec chmod a+rx {} +
+            sudo find lab-out -type f -exec chmod a+r {} +
+          fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:

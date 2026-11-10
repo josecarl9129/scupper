@@ -466,7 +466,7 @@ impl Lab {
             Case::Uplink => self
                 .cmd("wan", "nft", &["delete", "table", "inet", "lab_inject"])
                 .map(|_| ()),
-            Case::Baseline | Case::CheckV2 => Ok(()),
+            Case::Baseline | Case::CheckV2 | Case::Daemon => Ok(()),
             Case::ProbeChild => self.restore_probe_child_routes(),
         };
         if let Err(error) = specific {
@@ -492,6 +492,10 @@ impl Lab {
         }
     }
     pub(super) fn case(&mut self, case: Case) -> Result<String> {
+        self.daemon_clean_baseline()?;
+        if case == Case::Daemon {
+            return self.daemon_case();
+        }
         if case == Case::CheckV2 {
             return self.check_v2_case();
         }
@@ -501,6 +505,7 @@ impl Lab {
             self.capture("wan", A.gwhost.wan_if, stem)?;
             self.service_check(&mut markers)?;
             match case {
+                Case::Daemon => self.daemon_case().map(|_| ()),
                 Case::Baseline => self.service_check(&mut markers),
                 Case::ProbeChild => self.probe_child_case(),
                 Case::CheckV2 => self.check_v2_case().map(|_| ()),
@@ -624,7 +629,7 @@ impl Lab {
         }
         Ok(observed)
     }
-    fn uplink_fault(&mut self, markers: &mut Vec<String>) -> Result<()> {
+    pub(super) fn uplink_fault(&mut self, markers: &mut Vec<String>) -> Result<()> {
         self.runner.dwell(Duration::from_secs(3))?;
         let marker = Self::marker()?;
         markers.push(marker.clone());

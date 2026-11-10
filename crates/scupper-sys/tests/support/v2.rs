@@ -254,6 +254,9 @@ impl Script {
     }
 }
 impl System for Script {
+    fn canon_run_root(&self) -> &Path {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+    }
     fn run(&self, p: Program, args: &[String], _: Duration) -> Result<ExecOutput, ExecError> {
         self.execute(false, p, args)
     }

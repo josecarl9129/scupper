@@ -1,0 +1,18 @@
+[package]
+name = "scupperd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+testing = ["scupper-sys/testing"]
+
+[dependencies]
+scupper-sys.workspace = true
+clap.workspace = true
+signal-hook = "0.3"
+
+[lints]
+workspace = true

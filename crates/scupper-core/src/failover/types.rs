@@ -28,10 +28,12 @@ impl MonoTime {
 pub enum ExitHealth {
     /// Startup qualification is incomplete.
     Unknown,
-    /// Fresh handshake and qualified path.
+    /// Fresh handshake; a resumed path awaits its first successful probe.
     Healthy {
         /// Start of uninterrupted healthy time.
         since: MonoTime,
+        /// A successful path probe has confirmed this process's handoff.
+        confirmed: bool,
     },
     /// One or two consecutive counted path failures.
     Suspect {
@@ -92,6 +94,26 @@ impl Default for ExitLinkState {
     }
 }
 
+/// Result of a path observation, distinguished from our-side setup failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    /// The path answered successfully.
+    Success,
+    /// The observation completed and the path failed.
+    Failure,
+    /// Our-side setup failed; supplies no path-health evidence.
+    Inconclusive,
+}
+impl From<bool> for ProbeOutcome {
+    fn from(success: bool) -> Self {
+        if success {
+            Self::Success
+        } else {
+            Self::Failure
+        }
+    }
+}
+
 /// One observation batch or administrative request; unknown exit IDs are ignored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FailoverInput {
@@ -104,6 +126,8 @@ pub enum FailoverInput {
     /// comparison witness, including for other failures in this batch. This makes
     /// simultaneous common-mode failure independent of map iteration order.
     PathProbe(BTreeMap<ExitId, bool>),
+    /// Completed observations, including our-side failures which preserve qualification.
+    ProbeRound(BTreeMap<ExitId, ProbeOutcome>),
     /// Link, peer and key presence for one exit.
     LinkState(ExitId, ExitLinkState),
     /// Operator action only: re-evaluate even when intent is unchanged.

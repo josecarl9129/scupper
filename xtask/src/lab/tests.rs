@@ -142,7 +142,8 @@ fn policy_for_every_case_has_exact_endpoints_and_positive_evidence() {
         );
         assert!(value["arp"].as_bool().unwrap() && value["ndp"].as_bool().unwrap());
     }
-    assert_eq!(names.len(), 7);
+    assert_eq!(names.len(), 8);
+    assert!(names.contains("daemon"));
     Policy::from_toml(&evidence::policy(&markers, true).unwrap()).unwrap();
 }
 fn capture(packets: &[Vec<u8>]) -> Vec<u8> {
@@ -171,6 +172,28 @@ fn udp(source: [u8; 4], destination: [u8; 4], sport: u16, dport: u16, payload: &
     bytes[24..26].copy_from_slice(&u16::try_from(8 + payload.len()).unwrap().to_be_bytes());
     bytes.extend(payload);
     bytes
+}
+
+#[test]
+fn foreign_control_accepts_any_exact_udp_marker_but_rejects_silence_and_substrings() {
+    let markers: Vec<String> = ["control-first", "control-second", "control-third"]
+        .map(String::from)
+        .to_vec();
+    let packet = |payload: &[u8]| udp([10, 0, 0, 1], [10, 0, 0, 2], 40000, 8080, payload);
+    let check = |packets: &[Vec<u8>]| super::daemon::foreign_control(&capture(packets), &markers);
+    assert!(check(&[]).is_err());
+    assert!(check(&[packet(b"other")]).is_err());
+    assert!(check(&[packet(b"prefix-control-second-suffix")]).is_err());
+    for marker in &markers {
+        assert_eq!(check(&[packet(marker.as_bytes())]).unwrap(), 1);
+    }
+    let packets: Vec<_> = markers.iter().map(|m| packet(m.as_bytes())).collect();
+    assert_eq!(check(&packets).unwrap(), 3);
+    // Repeated packets prove one marker, and TCP cannot satisfy the UDP control.
+    assert_eq!(check(&[packets[1].clone(), packets[1].clone()]).unwrap(), 1);
+    let mut tcp = packet(markers[1].as_bytes());
+    tcp[9] = 6;
+    assert!(check(&[tcp]).is_err());
 }
 #[test]
 fn positive_controls_require_packet_evidence_and_reject_silence() {
@@ -640,19 +663,79 @@ fn bridge_policy_requires_arp_and_both_ping_exchanges() {
     }
 }
 
+fn bad_inline_nft_braces(source: &str) -> bool {
+    let adjacent = |text: &str| {
+        text.lines().any(|line| {
+            line.match_indices('}').any(|(at, _)| {
+                line[at + 1..]
+                    .trim_start_matches([' ', '\t', '\r'])
+                    .starts_with('}')
+            })
+        })
+    };
+    // Ordinary byte strings: preserve escaped quotes and decode line boundaries.
+    for start in source.match_indices("b\"").map(|(at, _)| at + 2) {
+        let mut literal = String::new();
+        let mut chars = source[start..].chars();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '"' => break,
+                '\\' => match chars.next() {
+                    Some('n') => literal.push('\n'),
+                    Some('t') => literal.push('\t'),
+                    Some('r') => literal.push('\r'),
+                    Some(ch) => literal.push(ch),
+                    None => break,
+                },
+                ch => literal.push(ch),
+            }
+        }
+        if adjacent(&literal) {
+            return true;
+        }
+    }
+    // Raw byte strings used by the topology fixtures.
+    source
+        .split("br#\"")
+        .skip(1)
+        .any(|tail| adjacent(tail.split("\"#").next().unwrap()))
+}
+
+#[test]
+fn inline_nft_guard_handles_spacing_and_escaped_quotes() {
+    for source in [
+        r#"Some(b"table { chain { } }")"#,
+        r#"Some(b"table { chain { }}")"#,
+        r#"Some(b"oifname \"eth0\"; }\t}")"#,
+    ] {
+        assert!(bad_inline_nft_braces(source), "{source}");
+    }
+    assert!(!bad_inline_nft_braces(r#"Some(b"table { chain { }\n}")"#));
+    assert!(!bad_inline_nft_braces("br#\"table { chain { }\n}\"#"));
+}
+
 /// nft rejects `...; } }` on one line (a closing brace after a chain needs a newline);
 /// every inline ruleset in the lab must be written with newlines.
 #[test]
 fn inline_nft_rulesets_have_no_single_line_closing_braces() {
-    for (name, source) in [
-        ("topology.rs", include_str!("topology.rs")),
-        ("probe_child.rs", include_str!("probe_child.rs")),
-        ("check_v2.rs", include_str!("check_v2.rs")),
-    ] {
-        assert!(
-            !source.contains("; } }"),
-            "{name} contains a one-line nft ruleset"
-        );
+    let mut directories = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/lab")];
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                directories.push(path);
+                continue;
+            }
+            if path.extension().is_none_or(|ext| ext != "rs") || path.ends_with("tests.rs") {
+                continue;
+            }
+            let source = fs::read_to_string(&path).unwrap();
+            assert!(
+                !bad_inline_nft_braces(&source),
+                "{} contains a one-line nft ruleset",
+                path.display()
+            );
+        }
     }
 }
 

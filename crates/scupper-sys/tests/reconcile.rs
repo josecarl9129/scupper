@@ -1800,3 +1800,541 @@ fn emergency_failure_replans_do_not_reserve_hardening_repairs() {
     assert_eq!(rig.kernel.model().hardening[&key], expected);
     assert!(rig.machine().latch().is_none());
 }
+
+// Drive the production scheduler with a real Reconciler<FakeKernel>, fake clock,
+// fake signal source and local notify socket. A shutdown kernel mutation fails
+// the final history comparison, even when it leaves final kernel state unchanged.
+struct DaemonRig<'a> {
+    rig: &'a mut Rig,
+    now: std::time::Instant,
+    origin: std::time::Instant,
+    offset: Duration,
+    limit: usize,
+    iterations: usize,
+    degraded: bool,
+    rebuild_pending: bool,
+    probes: Option<scupper_sys::daemon::probes::Probes>,
+    probe_received: bool,
+    longest_tick: Duration,
+    boots: usize,
+    closed: usize,
+    abandoned: usize,
+    initialized: usize,
+    notify: scupper_sys::daemon::notify::Notify,
+    notifications: Option<std::os::unix::net::UnixDatagram>,
+    messages: Vec<String>,
+    before_shutdown: Option<Vec<(Step, KernelModel)>>,
+    stop: &'a std::sync::atomic::AtomicBool,
+}
+impl scupper_sys::daemon::DaemonDeps for DaemonRig<'_> {
+    fn now(&self) -> std::time::Instant {
+        self.now
+    }
+    fn sleep(&mut self, duration: Duration) {
+        if self.probes.is_some() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.now += duration;
+    }
+    fn started(&mut self) {
+        self.notify.started().unwrap();
+    }
+    fn initialize(&mut self) {
+        self.initialized += 1;
+    }
+    fn tick(&mut self, _: &std::sync::atomic::AtomicBool) -> Option<TickReport> {
+        self.iterations += 1;
+        if self.degraded {
+            return None;
+        }
+        self.rig.kernel.timeouts(if self.iterations == 1 {
+            BTreeSet::from([ObservationItem::Ruleset])
+        } else {
+            BTreeSet::new()
+        });
+        let started = std::time::Instant::now();
+        if let Some(probes) = &mut self.probes {
+            for round in probes.collect() {
+                if !round.paths.is_empty() {
+                    assert!(
+                        round.paths.values().all(
+                            |outcome| *outcome != scupper_core::failover::ProbeOutcome::Success
+                        )
+                    );
+                    self.rig.machine().submit_probe_outcomes(round.paths);
+                    self.probe_received = true;
+                }
+            }
+        }
+        let mut report = self.rig.tick();
+        self.longest_tick = self.longest_tick.max(started.elapsed());
+        if self.rebuild_pending {
+            report.complete = false;
+            report.escalations.push(Escalation::RebuildRequired);
+        }
+        if self.iterations == self.limit {
+            // SIGTERM arrives during this tick: it must finish, then no kernel work.
+            self.stop.store(true, Ordering::Relaxed);
+            self.before_shutdown = Some(self.rig.kernel.history());
+        }
+        Some(report)
+    }
+    fn close_only(&mut self) {
+        use scupper_sys::reconcile::Kernel;
+        self.closed += 1;
+        self.rig.kernel.execute(&Step::ForwardingOff).unwrap();
+    }
+    fn abandon_probes(&mut self) {
+        self.abandoned += 1;
+    }
+    fn rebuild(&mut self) {
+        self.boots += 1;
+    }
+    fn run_root(&self) -> &std::path::Path {
+        &self.rig.root
+    }
+    fn boot_time(&self) -> Duration {
+        self.offset + self.now.duration_since(self.origin)
+    }
+    fn budget_error(&mut self, error: &std::io::Error) {
+        panic!("budget: {error}");
+    }
+    fn maintenance(&mut self) {
+        if self.iterations == self.limit {
+            self.stop.store(true, Ordering::Relaxed);
+        }
+    }
+    fn notify(&mut self, iteration: &scupper_sys::daemon::Iteration) {
+        self.notify
+            .iteration(iteration.complete, iteration.status)
+            .unwrap();
+        if let Some(socket) = &self.notifications {
+            self.messages.extend(drain_notify(socket));
+        }
+    }
+    fn shutdown(&mut self) {
+        self.rig.machine.take();
+    }
+}
+fn daemon_notify_socket() -> (PathBuf, std::os::unix::net::UnixDatagram) {
+    use std::os::{
+        linux::net::SocketAddrExt,
+        unix::net::{SocketAddr, UnixDatagram},
+    };
+    let name = format!(
+        "scupper-daemon-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    );
+    let address = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+    let socket = UnixDatagram::bind_addr(&address).unwrap();
+    (PathBuf::from(format!("@{name}")), socket)
+}
+fn drain_notify(socket: &std::os::unix::net::UnixDatagram) -> Vec<String> {
+    let mut messages = Vec::new();
+    let mut bytes = [0; 128];
+    while let Ok(len) = socket.recv(&mut bytes) {
+        messages.push(String::from_utf8(bytes[..len].to_vec()).unwrap());
+    }
+    messages
+}
+#[test]
+fn daemon_scheduler_notifies_and_sigterm_shutdown_has_no_kernel_steps() {
+    use scupper_sys::daemon::{notify::Notify, run_with};
+    use std::{sync::atomic::AtomicBool, time::Instant};
+    let mut rig = Rig::new();
+    rig.flush_rules();
+    let (socket_path, socket) = daemon_notify_socket();
+    socket.set_nonblocking(true).unwrap();
+    let stop = AtomicBool::new(false);
+    let now = Instant::now();
+    let mut deps = DaemonRig {
+        rig: &mut rig,
+        now,
+        origin: now,
+        offset: Duration::ZERO,
+        limit: 3,
+        iterations: 0,
+        degraded: false,
+        rebuild_pending: false,
+        probes: None,
+        probe_received: false,
+        longest_tick: Duration::ZERO,
+        boots: 0,
+        closed: 0,
+        abandoned: 0,
+        initialized: 0,
+        notify: Notify::new(Some(socket_path.as_os_str())).unwrap(),
+        notifications: Some(socket.try_clone().unwrap()),
+        messages: Vec::new(),
+        before_shutdown: None,
+        stop: &stop,
+    };
+    run_with(&mut deps, &stop);
+    assert_eq!(deps.iterations, 3);
+    assert_eq!(deps.now.duration_since(now), Duration::from_secs(4));
+    assert!(deps.rig.machine.is_none());
+    let before = deps.before_shutdown.take().unwrap();
+    assert!(
+        !before.is_empty(),
+        "control: kernel work actually ran before SIGTERM"
+    );
+    assert_eq!(
+        deps.rig.kernel.history(),
+        before,
+        "kernel operation after SIGTERM tick finished"
+    );
+    let messages = std::mem::take(&mut deps.messages);
+    assert_eq!(messages.iter().filter(|s| *s == "READY=1").count(), 1);
+    assert_eq!(messages.iter().filter(|s| *s == "WATCHDOG=1").count(), 2);
+}
+#[test]
+fn degraded_scheduler_feeds_watchdog_and_boot_budget_survives_restarts() {
+    use scupper_sys::daemon::{notify::Notify, run_with};
+    use std::{sync::atomic::AtomicBool, time::Instant};
+    let mut rig = Rig::new();
+    let (socket_path, socket) = daemon_notify_socket();
+    socket.set_nonblocking(true).unwrap();
+    let mut boots = 0;
+    for (offset, limit) in [
+        (0, 16),
+        (32, 16),
+        (64, 16),
+        (96, 16),
+        (128, 16),
+        (160, 16),
+        (598, 1),
+        (600, 1),
+    ] {
+        let stop = AtomicBool::new(false);
+        let now = Instant::now();
+        let mut deps = DaemonRig {
+            rig: &mut rig,
+            now,
+            origin: now,
+            offset: Duration::from_secs(offset),
+            limit,
+            iterations: 0,
+            degraded: true,
+            rebuild_pending: false,
+            probes: None,
+            probe_received: false,
+            longest_tick: Duration::ZERO,
+            boots: 0,
+            closed: 0,
+            abandoned: 0,
+            initialized: 0,
+            notify: Notify::new(Some(socket_path.as_os_str())).unwrap(),
+            notifications: Some(socket.try_clone().unwrap()),
+            messages: Vec::new(),
+            before_shutdown: None,
+            stop: &stop,
+        };
+        run_with(&mut deps, &stop);
+        boots += deps.boots;
+        assert_eq!(deps.closed, limit);
+        assert_eq!(deps.abandoned, limit);
+        assert_eq!(deps.initialized, 1);
+        assert!(boots <= if offset < 600 { 3 } else { 4 });
+        let messages = std::mem::take(&mut deps.messages);
+        assert_eq!(messages.iter().filter(|s| *s == "READY=1").count(), 1);
+        assert_eq!(
+            messages.iter().filter(|s| *s == "WATCHDOG=1").count(),
+            limit
+        );
+    }
+    assert_eq!(
+        boots, 4,
+        "three boots in first ten minutes; one when oldest expires"
+    );
+}
+
+#[test]
+fn rebuild_pending_scheduler_feeds_watchdog_while_retry_is_spaced() {
+    use scupper_sys::daemon::{notify::Notify, run_with};
+    use std::{sync::atomic::AtomicBool, time::Instant};
+    let mut rig = Rig::new();
+    let (socket_path, socket) = daemon_notify_socket();
+    socket.set_nonblocking(true).unwrap();
+    let stop = AtomicBool::new(false);
+    let now = Instant::now();
+    let mut deps = DaemonRig {
+        rig: &mut rig,
+        now,
+        origin: now,
+        offset: Duration::ZERO,
+        limit: 4,
+        iterations: 0,
+        degraded: false,
+        rebuild_pending: true,
+        probes: None,
+        probe_received: false,
+        longest_tick: Duration::ZERO,
+        boots: 0,
+        closed: 0,
+        abandoned: 0,
+        initialized: 0,
+        notify: Notify::new(Some(socket_path.as_os_str())).unwrap(),
+        notifications: Some(socket.try_clone().unwrap()),
+        messages: Vec::new(),
+        before_shutdown: None,
+        stop: &stop,
+    };
+    run_with(&mut deps, &stop);
+    assert_eq!(deps.boots, 1);
+    assert_eq!(deps.abandoned, 3); // SIGTERM skips recovery after the last tick.
+    let messages = std::mem::take(&mut deps.messages);
+    assert_eq!(messages.iter().filter(|s| *s == "READY=1").count(), 1);
+    assert_eq!(messages.iter().filter(|s| *s == "WATCHDOG=1").count(), 4);
+}
+
+#[test]
+fn persistent_tighten_failure_never_consumes_a_reopen_budget() {
+    for kind in [
+        StepKind::ForwardingOff,
+        StepKind::LinkDown,
+        StepKind::TcDelete,
+    ] {
+        let mut rig = Rig::new();
+        if kind == StepKind::ForwardingOff {
+            rig.flush_rules();
+        } else if kind == StepKind::LinkDown {
+            rig.kernel.mutate(foreign);
+        } else {
+            rig.kernel.mutate(|m| {
+                m.links.get_mut("wg0").unwrap().tc_hooks = Known::Value(vec!["root".into()]);
+            });
+        }
+        rig.kernel.inject(Fault {
+            step: kind,
+            remaining: None,
+            partial: false,
+        });
+        for _ in 0..20 {
+            let report = rig.tick();
+            assert!(
+                !report
+                    .steps
+                    .iter()
+                    .any(|s| matches!(s, Step::ForwardingOn { .. }))
+            );
+            assert!(
+                rig.machine().latch().is_none(),
+                "Tighten was budgeted: {kind:?}; latch={:?}; report={report:?}",
+                rig.machine().latch()
+            );
+        }
+    }
+}
+
+#[test]
+fn incomplete_failure_recovery_retains_route_and_rule_unknown_alerts() {
+    use scupper_sys::reconcile::{Kernel, Observation, StepError};
+    for rules in [false, true] {
+        struct Incomplete {
+            inner: FakeKernel,
+            reads: Cell<usize>,
+            rules: bool,
+        }
+        impl Kernel for Incomplete {
+            fn observe(&self, held: &NetnsHandle) -> Observation {
+                self.inner.observe(held)
+            }
+            fn observe_rest(
+                &self,
+                held: &NetnsHandle,
+                safety: Observation,
+                deadline: std::time::Instant,
+            ) -> Observation {
+                let mut observation = self.inner.observe_rest(held, safety, deadline);
+                self.reads.set(self.reads.get() + 1);
+                if self.reads.get() > 1 {
+                    observation.complete = false;
+                    if self.rules {
+                        observation.model.extra_rules = Known::Unknown;
+                    } else {
+                        observation.model.extra_routes = Known::Unknown;
+                    }
+                }
+                observation
+            }
+            fn restore_name(
+                &self,
+                held: &NetnsHandle,
+                guard: &scupper_sys::lock::WriterGuard,
+            ) -> Result<(), StepError> {
+                self.inner.restore_name(held, guard)
+            }
+            fn execute(&self, step: &Step) -> Result<(), StepError> {
+                self.inner.execute(step)
+            }
+            fn hold_latch(&self, latch: Option<&scupper_core::planner::Latch>) {
+                self.inner.hold_latch(latch);
+            }
+        }
+        let rig = Rig::new();
+        rig.kernel.inject(Fault {
+            step: StepKind::RouteReplace,
+            remaining: Some(1),
+            partial: false,
+        });
+        let mut machine = Reconciler::new(
+            Incomplete {
+                inner: rig.kernel.clone(),
+                reads: Cell::new(0),
+                rules,
+            },
+            rig.store.clone(),
+            rig.log.handle.clone(),
+            rig.config(),
+            rig.held.clone(),
+            || (MonoTime(Duration::from_secs(100)), 1000),
+        )
+        .unwrap();
+        let report = machine.tick();
+        assert!(!report.complete);
+        assert!(
+            report.events.iter().any(|event| matches!(
+                event,
+                EventKind::DriftDetected {
+                    reason: scupper_proto::Reason::ObservationUnknown,
+                    ..
+                }
+            )),
+            "lost routes/rules unknown alert: {report:?}"
+        );
+    }
+}
+
+#[test]
+fn successful_reopen_consumes_emergency_evidence_across_ticks() {
+    let mut rig = Rig::new();
+    for _ in 0..3 {
+        rig.kernel.mutate(|m| {
+            m.links.get_mut("wg0").unwrap().tc_hooks = Known::Value(vec!["root".into()]);
+        });
+        rig.kernel.inject(Fault {
+            step: StepKind::TcDelete,
+            remaining: Some(1),
+            partial: false,
+        });
+        rig.settle();
+        assert!(rig.machine().latch().is_none());
+        // Quiet ticks after the recovery must not charge its evidence again.
+        rig.settle();
+        assert!(rig.machine().latch().is_none());
+    }
+    rig.kernel
+        .mutate(|m| m.links.get_mut("wg0").unwrap().tc_hooks = Known::Value(vec!["root".into()]));
+    rig.tick();
+    assert!(rig.machine().latch().is_some());
+}
+
+#[test]
+fn probe_child_timeout_does_not_delay_fake_kernel_ticks() {
+    use scupper_sys::{
+        daemon::probes::Probes,
+        probe_child::{ProbeKind, ProbeRequest, Url},
+    };
+    use std::{os::unix::fs::PermissionsExt, time::Instant};
+    let mut rig = Rig::new();
+    let script = rig.root.join("hung-probe");
+    fs::write(&script, "#!/bin/sh\nexec sleep 30\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let start = Instant::now();
+    let mut probes = Probes::new(script, start);
+    probes
+        .schedule(
+            start,
+            false,
+            &scupper_core::config::ExitId("ch1".into()),
+            ProbeRequest {
+                kind: ProbeKind::Path,
+                bind: None,
+                expected_netns: rig.held.identity(),
+                dns: "10.2.0.1".parse().unwrap(),
+                targets: vec![Url::new("https://example.com/").unwrap()],
+                deadline_ms: 10,
+                identity: None,
+            },
+            &rig.held,
+        )
+        .unwrap();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let mut deps = DaemonRig {
+        rig: &mut rig,
+        now: start,
+        origin: start,
+        offset: Duration::ZERO,
+        limit: 12,
+        iterations: 0,
+        degraded: false,
+        rebuild_pending: false,
+        probes: Some(probes),
+        probe_received: false,
+        longest_tick: Duration::ZERO,
+        boots: 0,
+        closed: 0,
+        abandoned: 0,
+        initialized: 0,
+        notify: scupper_sys::daemon::notify::Notify::disabled(),
+        notifications: None,
+        messages: Vec::new(),
+        before_shutdown: None,
+        stop: &stop,
+    };
+    scupper_sys::daemon::run_with(&mut deps, &stop);
+    assert_eq!(deps.iterations, 12);
+    assert_eq!(deps.now.duration_since(start), Duration::from_secs(22));
+    assert!(
+        deps.probe_received,
+        "hung child result never reached the tick owner"
+    );
+    assert!(
+        deps.longest_tick < Duration::from_millis(500),
+        "tick waited on a child"
+    );
+    assert!(start.elapsed() < Duration::from_secs(6));
+}
+
+#[test]
+fn scheduler_probes_selected_recovery_candidate_and_stops_when_disconnected() {
+    let mut rig = Rig::with_site(multi_exit_site());
+    let second = scupper_core::config::ExitId("ch2".into());
+    rig.machine()
+        .set_selection(Selection::Pin(second.clone()), Actor::Local { uid: 0 })
+        .unwrap();
+    assert_eq!(rig.machine().probe_exit(), Some(second));
+    rig.machine()
+        .set_selection(Selection::Disconnected, Actor::Local { uid: 0 })
+        .unwrap();
+    assert_eq!(rig.machine().probe_exit(), None);
+}
+
+#[test]
+fn changed_applied_version_never_reloads_the_old_render() {
+    use scupper_sys::reconcile::StateStore;
+    let mut rig = Rig::new();
+    let mut state = rig.store.state();
+    state.applied_version = Some(2);
+    let guard = WriterLock::acquire(&rig.root).unwrap();
+    rig.store.write(&guard, &state).unwrap();
+    drop(guard);
+    rig.kernel.mutate(|model| {
+        model.ruleset = Known::Value(Ruleset::Verified([9; 32]));
+    });
+    rig.kernel.clear_history();
+    let report = rig.tick();
+    assert_eq!(report.escalations, vec![Escalation::ReinitializeRequired]);
+    assert_eq!(report.steps, vec![Step::ForwardingOff]);
+    assert_eq!(
+        rig.kernel.model().ruleset,
+        Known::Value(Ruleset::Verified([9; 32]))
+    );
+    assert!(
+        rig.kernel
+            .history()
+            .iter()
+            .all(|(step, _)| matches!(step, Step::ForwardingOff))
+    );
+}
