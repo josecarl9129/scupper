@@ -75,6 +75,7 @@ struct Kernel {
     script: Script,
     defaults: RefCell<BTreeMap<bool, String>>,
     wrong_readback: Cell<bool>,
+    state_failure_on_close: RefCell<Option<std::path::PathBuf>>,
     bad_canon: Cell<bool>,
     check_links: Cell<bool>,
 }
@@ -95,6 +96,7 @@ impl Kernel {
             script: Script::new("ubuntu-24.04"),
             defaults: RefCell::default(),
             wrong_readback: Cell::new(false),
+            state_failure_on_close: RefCell::new(None),
             bad_canon: Cell::new(false),
             check_links: Cell::new(true),
         }
@@ -195,7 +197,14 @@ impl Kernel {
                 stdout = Self::json_links(&map.borrow());
             }
             Program::Ip if args == ["-j", "addr", "show"] => {
-                stdout = Self::json_addresses(&map.borrow());
+                let mut addresses: Vec<serde_json::Value> =
+                    serde_json::from_str(&Self::json_addresses(&map.borrow())).unwrap();
+                if !ns {
+                    let uplinks: Vec<serde_json::Value> =
+                        serde_json::from_str(&self.script.text("gwhost--4-addr.json")).unwrap();
+                    addresses.extend(uplinks.into_iter().filter(|link| link["ifname"] == "eth0"));
+                }
+                stdout = serde_json::to_string(&addresses).unwrap();
             }
             Program::Ip if a(0) == "link" && a(1) == "add" => {
                 assert!(!ns);
@@ -237,6 +246,31 @@ impl Kernel {
                     links.get_mut(a(4)).unwrap().addresses.push(a(2).into());
                 }
             }
+            Program::Ip if a(0) == "-j" && a(2) == "route" && a(3) == "show" => {
+                let all = a(5) == "all" || a(5) == "local";
+                let filename = format!(
+                    "scupper-{}-{}.json",
+                    a(1),
+                    if all { "routes-all" } else { "route" }
+                );
+                let mut routes: Vec<serde_json::Value> =
+                    serde_json::from_str(&self.script.text(&filename)).unwrap();
+                if let Some(route) = self.defaults.borrow().get(&(a(1) == "-6")) {
+                    routes.retain(|r| r["dst"] != "default");
+                    routes.push(if route.contains("unreachable") {
+                        serde_json::json!({"dst":"default", "type":"unreachable"})
+                    } else {
+                        serde_json::json!({"dst":"default", "dev":"ex-ch1"})
+                    });
+                }
+                if a(4) == "default" {
+                    routes.retain(|r| r["dst"] == "default");
+                }
+                if a(5) == "local" {
+                    routes.retain(|r| r["table"] == "local");
+                }
+                stdout = serde_json::to_string(&routes).unwrap();
+            }
             Program::Ip if args.iter().any(|a| a == "replace") => {
                 assert!(ns);
                 if let Some(i) = args.iter().position(|word| word == "dev") {
@@ -253,8 +287,26 @@ impl Kernel {
                 assert!(ns);
                 if a(0) == "-w" {
                     let (k, v) = a(1).split_once('=').unwrap();
+                    if k == "net.ipv4.ip_forward"
+                        && v == "0"
+                        && let Some(path) = self.state_failure_on_close.borrow_mut().take()
+                    {
+                        fs::rename(&path, path.with_extension("saved")).unwrap();
+                        fs::create_dir(&path).unwrap();
+                    }
                     if v == "1" {
                         assert!(self.verified_this_run.get());
+                    }
+                    if k == "net.ipv4.ip_forward"
+                        && self.values.borrow().get(k).is_some_and(|old| old != v)
+                    {
+                        let mut values = self.values.borrow_mut();
+                        for scope in ["all", "default", "lo", "wg0", "ex-ch1"] {
+                            values.insert(
+                                format!("net.ipv4.conf.{scope}.accept_redirects"),
+                                "1".into(),
+                            );
+                        }
                     }
                     self.values.borrow_mut().insert(k.into(), v.into());
                 } else {
@@ -308,16 +360,20 @@ impl Kernel {
                     }
                     "peer" => {
                         let allowed = args.iter().position(|a| a == "allowed-ips").unwrap();
-                        let endpoint = args
-                            .iter()
-                            .position(|a| a == "endpoint")
-                            .map_or("(none)", |i| a(i + 1));
+                        let endpoint = args.iter().position(|a| a == "endpoint").map_or_else(
+                            || {
+                                link.peers
+                                    .get(a(3))
+                                    .map_or_else(|| "(none)".into(), |peer| peer.1.clone())
+                            },
+                            |i| a(i + 1).to_owned(),
+                        );
                         link.keepalive = args
                             .iter()
                             .position(|a| a == "persistent-keepalive")
                             .map_or(0, |i| a(i + 1).parse().unwrap());
                         link.peers
-                            .insert(a(3).into(), (a(allowed + 1).into(), endpoint.into()));
+                            .insert(a(3).into(), (a(allowed + 1).into(), endpoint));
                     }
                     _ => panic!("unexpected wg writer"),
                 }
@@ -373,6 +429,12 @@ impl Kernel {
     }
 }
 impl System for Kernel {
+    fn namespace_identity(&self, _: &std::path::Path) -> std::io::Result<(u64, u64)> {
+        testing::handle()
+            .map(|held| held.identity())
+            .map_err(std::io::Error::other)
+    }
+
     fn canon_run_root(&self) -> &std::path::Path {
         std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
     }
@@ -406,6 +468,20 @@ impl System for Kernel {
     }
 }
 impl BootNamespace for Kernel {
+    fn path(&self) -> &std::path::Path {
+        static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        PATH.get_or_init(|| {
+            std::env::var_os("CARGO_TARGET_TMPDIR")
+                .map_or_else(
+                    || {
+                        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                            .join("../../target/tmp")
+                    },
+                    std::path::PathBuf::from,
+                )
+                .join("boot-test-namespace")
+        })
+    }
     fn open(&self) -> Result<Option<NetnsHandle>, NetnsError> {
         if self.exists.get() {
             testing::handle().map(Some)
@@ -469,6 +545,25 @@ impl Fixture {
             hook,
             secret_owner: rustix::process::geteuid().as_raw(),
         })
+    }
+    fn check(&self) -> scupper_core::verdict::v2::Report {
+        let held = testing::handle().unwrap();
+        let site = support::site("ubuntu-24.04");
+        scupper_sys::check_v2::run_check_v2(
+            &scupper_sys::check_v2::Dependencies {
+                system: &self.kernel,
+                probe_exec: &self.kernel.script,
+                handle: Some(&held),
+                state_root: &self.root.path,
+                run_root: &self.root.path.join("run"),
+            },
+            &scupper_sys::check_v2::Config {
+                site: &site,
+                gateway: &scupper_core::config::GatewayId("gw1".into()),
+                stamp: self.root.stamp,
+            },
+        )
+        .unwrap()
     }
     fn state(&self, change: impl FnOnce(&mut scupper_sys::state::State)) {
         let guard = WriterLock::acquire(self.root.path.join("lock")).unwrap();
@@ -1564,4 +1659,928 @@ fn durable_boot_handoff_resumes_owned_links_and_guards_forwarding_intent() {
             .iter()
             .all(|s| !matches!(s, Step::ForwardingOn { .. }))
     );
+}
+
+#[test]
+fn control_commit_and_apply_use_one_writer_and_end_version_changes_in_full_boot() {
+    use scupper_proto::{ApiErrorCode, OpResult, Reason};
+    use scupper_sys::{daemon::admin, events::EventLog};
+    let fixture = Fixture::new();
+    assert!(fixture.run(None).succeeded());
+    let run_root = fixture.root.path.join("run");
+    let deps = BootDeps {
+        system: &fixture.kernel,
+        namespace: &fixture.kernel,
+        state_root: &fixture.root.path,
+        config_root: &fixture.root.path,
+        run_root: &run_root,
+        hook: None,
+        secret_owner: rustix::process::geteuid().as_raw(),
+    };
+    let log = EventLog::memory_only(scupper_core::config::GatewayId("gw1".into()), || {
+        scupper_proto::UnixSeconds(1000)
+    })
+    .unwrap();
+    let before = fs::read(fixture.root.path.join("state.json")).unwrap();
+    let calls = fixture.kernel.calls.borrow().len();
+    assert!(matches!(
+        admin::apply(&deps, &log.handle, None, true, 0).unwrap(),
+        OpResult::Apply {
+            dry_run: true,
+            version: 1,
+            ..
+        }
+    ));
+    assert_eq!(fixture.kernel.calls.borrow().len(), calls);
+    assert_eq!(
+        fs::read(fixture.root.path.join("state.json")).unwrap(),
+        before
+    );
+    assert_eq!(
+        admin::apply(&deps, &log.handle, Some(999), true, 0)
+            .unwrap_err()
+            .code,
+        ApiErrorCode::NotFound
+    );
+    assert_eq!(
+        admin::apply(&deps, &log.handle, None, false, 1000)
+            .unwrap_err()
+            .code,
+        ApiErrorCode::Unauthorized
+    );
+    let text = support::site_text("ubuntu-24.04");
+    assert_eq!(
+        admin::commit(&deps, &log.handle, Some(99), &text, Reason::Operator, 0)
+            .unwrap_err()
+            .code,
+        ApiErrorCode::Conflict
+    );
+    assert!(matches!(
+        admin::commit(&deps, &log.handle, Some(1), &text, Reason::Operator, 0).unwrap(),
+        OpResult::Commit { version: 2 }
+    ));
+    let guard = WriterLock::acquire(&run_root).unwrap();
+    assert!(admin::apply(&deps, &log.handle, None, false, 0).is_err());
+    drop(guard);
+    fixture.kernel.verified_this_run.set(false);
+    fixture.kernel.gates_closed.set(false);
+    fixture.kernel.began_live.set(true);
+    assert!(matches!(
+        admin::apply(&deps, &log.handle, None, false, 0).unwrap(),
+        OpResult::Apply {
+            version: 2,
+            dry_run: false,
+            ..
+        }
+    ));
+    let report: BootReport =
+        serde_json::from_slice(&fs::read(run_root.join("boot.json")).unwrap()).unwrap();
+    assert_eq!(report.applied_version, Some(2));
+    assert!(!report.adopted);
+    assert!(fixture.kernel.verified_this_run.get());
+}
+
+#[test]
+fn control_apply_keeps_quarantine_on_failure_and_clears_only_after_full_verification() {
+    use scupper_sys::{daemon::admin, events::EventLog};
+    let fixture = Fixture::new();
+    fixture.state(|s| {
+        s.quarantine = Some(Quarantine {
+            reason: "repair-budget".into(),
+            object: "safety:ruleset".into(),
+            since_unix: 1000,
+        });
+    });
+    assert!(fixture.run(None).succeeded());
+    let run_root = fixture.root.path.join("run");
+    let observed_open = Cell::new(false);
+    let verification = |point| {
+        assert!(
+            WriterLock::try_acquire(&run_root).is_err(),
+            "apply released its writer capability"
+        );
+        if point == BootPoint::After(BootStep::Forwarding) {
+            let file = StateFile::open(&fixture.root.path, None).unwrap();
+            let scupper_sys::state::StateRead::Present(state) = file.read().unwrap() else {
+                panic!("missing state");
+            };
+            assert!(
+                state.quarantine.is_some(),
+                "latch cleared before opening boot verified"
+            );
+            observed_open.set(true);
+        }
+        Ok(())
+    };
+    let deps = BootDeps {
+        system: &fixture.kernel,
+        namespace: &fixture.kernel,
+        state_root: &fixture.root.path,
+        config_root: &fixture.root.path,
+        run_root: &run_root,
+        hook: Some(&verification),
+        secret_owner: rustix::process::geteuid().as_raw(),
+    };
+    let log = EventLog::memory_only(scupper_core::config::GatewayId("gw1".into()), || {
+        scupper_proto::UnixSeconds(1000)
+    })
+    .unwrap();
+    *fixture.kernel.failure.borrow_mut() = Some((Program::Nft, "-f".into(), "injected".into()));
+    assert!(admin::apply(&deps, &log.handle, None, false, 0).is_err());
+    let file = StateFile::open(&fixture.root.path, None).unwrap();
+    let scupper_sys::state::StateRead::Present(state) = file.read().unwrap() else {
+        panic!("missing state");
+    };
+    assert!(state.quarantine.is_some());
+    assert_eq!(fixture.kernel.values.borrow()["net.ipv4.ip_forward"], "0");
+    // A failure in the boot that enables forwarding must leave durable quarantine intact.
+    *fixture.kernel.failure.borrow_mut() = Some((
+        Program::Sysctl,
+        "net.ipv6.conf.all.forwarding=1".into(),
+        "opening failed".into(),
+    ));
+    assert!(admin::apply(&deps, &log.handle, None, false, 0).is_err());
+    let scupper_sys::state::StateRead::Present(state) = file.read().unwrap() else {
+        panic!("missing state");
+    };
+    assert!(state.quarantine.is_some());
+    assert_eq!(fixture.kernel.values.borrow()["net.ipv4.ip_forward"], "0");
+    *fixture.kernel.failure.borrow_mut() = None;
+    fixture.kernel.calls.borrow_mut().clear();
+    assert!(admin::apply(&deps, &log.handle, None, false, 0).is_ok());
+    let scupper_sys::state::StateRead::Present(state) = file.read().unwrap() else {
+        panic!("missing state");
+    };
+    assert!(state.quarantine.is_none());
+    assert!(observed_open.get());
+    assert!(
+        !fixture
+            .kernel
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call.contains("wg0 down")
+                || (call.starts_with("netns Wg set wg0 peer") && call.ends_with("remove")))
+    );
+    assert_eq!(fixture.kernel.values.borrow()["net.ipv4.ip_forward"], "1");
+}
+
+#[test]
+fn disconnected_reboot_preserves_client_sessions() {
+    let f = Fixture::new();
+    assert!(f.run(None).succeeded());
+    f.state(|state| state.selection = Selection::Disconnected);
+    assert!(f.run(None).succeeded());
+    // Effective daemon disconnect closes the gates as well as exit links.
+    for key in [
+        "net.ipv4.ip_forward",
+        "net.ipv6.conf.all.forwarding",
+        "net.ipv4.conf.default.forwarding",
+        "net.ipv6.conf.default.forwarding",
+    ] {
+        f.kernel.values.borrow_mut().insert(key.into(), "0".into());
+    }
+    f.kernel.calls.borrow_mut().clear();
+    // A second boot sees exits already down, as after an effective disconnect.
+    let reboot = f.run(None);
+    assert!(reboot.succeeded() && reboot.adopted, "{reboot:?}");
+    assert!(
+        f.kernel
+            .defaults
+            .borrow()
+            .values()
+            .all(|route| route.contains("unreachable"))
+    );
+    assert_eq!(f.kernel.defaults.borrow().len(), 2);
+    assert!(!f.kernel.ns.borrow()["ex-ch1"].up);
+    assert_eq!(f.kernel.values.borrow()["net.ipv4.ip_forward"], "0");
+    assert_eq!(
+        f.kernel.values.borrow()["net.ipv6.conf.all.forwarding"],
+        "0"
+    );
+    assert_eq!(
+        f.check().verdict,
+        scupper_core::verdict::v2::Verdict::FailClosed(
+            scupper_core::verdict::v2::FailClosed::AdminDisconnected
+        )
+    );
+    let calls = f.kernel.calls.borrow();
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.starts_with("netns Wg set wg0"))
+    );
+    assert!(!calls.iter().any(|call| call.contains("wg0 down")));
+}
+
+#[test]
+fn explicit_apply_version_does_not_verify_unrelated_head() {
+    use scupper_sys::{daemon::admin, events::EventLog};
+    let f = Fixture::new();
+    assert!(f.run(None).succeeded());
+    // Head's committed version is now unavailable. The requested older version
+    // is still below that committed head and its own metadata verifies.
+    fs::write(f.root.path.join("config/head"), b"2\n").unwrap();
+    let run_root = f.root.path.join("run");
+    let deps = BootDeps {
+        system: &f.kernel,
+        namespace: &f.kernel,
+        state_root: &f.root.path,
+        config_root: &f.root.path,
+        run_root: &run_root,
+        hook: None,
+        secret_owner: rustix::process::geteuid().as_raw(),
+    };
+    let log = EventLog::memory_only(scupper_core::config::GatewayId("gw1".into()), || {
+        scupper_proto::UnixSeconds(1000)
+    })
+    .unwrap();
+    assert!(admin::apply(&deps, &log.handle, Some(1), true, 0).is_ok());
+    assert!(admin::apply(&deps, &log.handle, None, true, 0).is_err());
+}
+
+#[test]
+fn full_boot_updates_client_peers_without_resetting_sessions() {
+    let f = Fixture::new();
+    assert!(f.run(None).succeeded());
+    for peer in f
+        .kernel
+        .ns
+        .borrow_mut()
+        .get_mut("wg0")
+        .unwrap()
+        .peers
+        .values_mut()
+    {
+        peer.1 = "198.51.100.44:65000".into();
+    }
+    let peers = f.kernel.ns.borrow()["wg0"].peers.clone();
+    // Retained peers must lose an injected default AllowedIP in place.
+    for peer in f
+        .kernel
+        .ns
+        .borrow_mut()
+        .get_mut("wg0")
+        .unwrap()
+        .peers
+        .values_mut()
+    {
+        peer.0.push_str(",0.0.0.0/0");
+    }
+    f.kernel
+        .ns
+        .borrow_mut()
+        .get_mut("wg0")
+        .unwrap()
+        .peers
+        .insert(
+            "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk=".into(),
+            ("10.99.0.99/32".into(), "(none)".into()),
+        );
+    // A changed MTU forces a full boot over the existing link.
+    f.kernel.ns.borrow_mut().get_mut("wg0").unwrap().mtu = 1300;
+    f.kernel.calls.borrow_mut().clear();
+    let report = f.run(None);
+    assert!(report.succeeded() && !report.adopted, "{report:?}");
+    assert_eq!(f.kernel.ns.borrow()["wg0"].peers, peers);
+    let calls = f.kernel.calls.borrow();
+    assert!(!calls.iter().any(|call| {
+        peers
+            .keys()
+            .any(|key| call == &format!("netns Wg set wg0 peer {key} remove"))
+    }));
+    assert!(!calls.iter().any(|call| call.contains("wg0 down")));
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.starts_with("netns Wg set wg0 peer")
+                && call.contains("allowed-ips")
+                && call.contains("persistent-keepalive 0")
+                && call.contains("preshared-key /dev/null"))
+    );
+}
+
+#[test]
+fn disconnected_boot_closes_an_up_exit_and_foreign_default() {
+    let f = Fixture::new();
+    assert!(f.run(None).succeeded());
+    f.state(|state| state.selection = Selection::Disconnected);
+    f.kernel
+        .defaults
+        .borrow_mut()
+        .insert(false, "default dev foreign0".into());
+    let report = f.run(None);
+    assert!(report.succeeded(), "{report:?}");
+    assert!(!f.kernel.ns.borrow()["ex-ch1"].up);
+    assert!(
+        f.kernel
+            .defaults
+            .borrow()
+            .values()
+            .all(|route| route.contains("unreachable"))
+    );
+    assert_eq!(f.check().verdict.exit_code(), 4);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn failed_apply_restores_version_without_drift_budget_or_latch_and_restart_boots_previous() {
+    use scupper_proto::{EventKind, Op, OpResult};
+    use scupper_sys::{
+        daemon::admin,
+        events::EventLog,
+        store::{MetaInput, VersionStore},
+    };
+    let f = Fixture::new();
+    assert!(f.run(None).succeeded());
+    let run_root = f.root.path.join("run");
+    let guard = WriterLock::acquire(&run_root).unwrap();
+    VersionStore::open(&f.root.path, Some(&guard))
+        .unwrap()
+        .commit(
+            &guard,
+            Some(1),
+            &support::site_text("ubuntu-24.04").replace("mtu = 1420", "mtu = 1400"),
+            MetaInput {
+                actor: "test".into(),
+                at: 1000,
+                reason: "exit change".into(),
+            },
+        )
+        .unwrap();
+    drop(guard);
+    let fail_target = |point| {
+        let scupper_sys::state::StateRead::Present(state) =
+            StateFile::open(&f.root.path, None).unwrap().read().unwrap()
+        else {
+            unreachable!()
+        };
+        if point == BootPoint::After(BootStep::Ruleset) && state.applied_version == Some(2) {
+            assert!(f.kernel.verified_this_run.get());
+            return Err("target failed after loading ruleset".into());
+        }
+        Ok(())
+    };
+    let deps = || BootDeps {
+        system: &f.kernel,
+        namespace: &f.kernel,
+        state_root: &f.root.path,
+        config_root: &f.root.path,
+        run_root: &run_root,
+        hook: Some(&fail_target),
+        secret_owner: rustix::process::geteuid().as_raw(),
+    };
+    let log = EventLog::memory_only(scupper_core::config::GatewayId("gw1".into()), || {
+        scupper_proto::UnixSeconds(1000)
+    })
+    .unwrap();
+    for _ in 0..4 {
+        assert!(admin::apply(&deps(), &log.handle, Some(2), false, 0).is_err());
+        let scupper_sys::state::StateRead::Present(state) =
+            StateFile::open(&f.root.path, None).unwrap().read().unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(state.applied_version, Some(1));
+        assert!(state.quarantine.is_none());
+        let report: BootReport =
+            serde_json::from_slice(&fs::read(run_root.join("boot.json")).unwrap()).unwrap();
+        assert!(report.succeeded());
+        assert_eq!(report.applied_version, Some(1));
+        let site = support::site("ubuntu-24.04");
+        let stamp = f.root.stamp;
+        let held = std::sync::Arc::new(testing::handle().unwrap());
+        let (device, inode) = held.identity();
+        let health = scupper_core::verdict::v2::HealthConfigV2::new(
+            &site,
+            &scupper_core::config::GatewayId("gw1".into()),
+            scupper_core::verdict::v2::NetnsIdentity { device, inode },
+            vec!["203.0.113.1".parse().unwrap()],
+            1,
+        )
+        .unwrap();
+        let fingerprint = scupper_sys::canon::fingerprint(
+            &scupper_sys::canon::canonicalize(&f.kernel.script.text("want.json")).unwrap(),
+        )
+        .unwrap();
+        let config = scupper_sys::reconcile::Config {
+            site,
+            gateway: scupper_core::config::GatewayId("gw1".into()),
+            stamp,
+            fingerprint,
+            run_root: run_root.clone(),
+            lock_wait: Duration::from_millis(100),
+        };
+        let kernel = scupper_sys::reconcile::RealKernel::from_boot_file(
+            deps(),
+            held.clone(),
+            &config,
+            health,
+            "/proc/self/ns/net".into(),
+            None,
+        )
+        .unwrap();
+        let mut machine = scupper_sys::reconcile::Reconciler::new(
+            kernel,
+            StateFile::open(&f.root.path, None).unwrap(),
+            log.handle.clone(),
+            config,
+            held,
+            || (scupper_core::failover::MonoTime(Duration::ZERO), 1000),
+        )
+        .unwrap();
+        machine.resume_existing();
+        assert!(matches!(
+            admin::execute(&mut machine, Op::Ping {}, 0, Some(0), |_| unreachable!()).unwrap(),
+            OpResult::Ping {
+                version: 1,
+                quarantined: false,
+                ..
+            }
+        ));
+        let tick = machine.tick();
+        assert!(
+            !tick
+                .events
+                .iter()
+                .any(|event| matches!(event, EventKind::DriftDetected { .. }))
+        );
+        assert!(machine.latch().is_none());
+        drop(machine);
+        let restart = f.run(None);
+        assert!(restart.succeeded());
+        assert_eq!(restart.applied_version, Some(1));
+    }
+    assert!(!run_root.join("boot-attempts").exists());
+    let disk = EventLog::open(
+        &f.root.path,
+        scupper_core::config::GatewayId("gw1".into()),
+        || scupper_proto::UnixSeconds(1000),
+    )
+    .unwrap();
+    log.handle.replay_into(&disk.handle).unwrap();
+    disk.handle.flush_blocking(Duration::from_secs(2)).unwrap();
+    let events: Vec<_> = scupper_sys::events::read_since(&f.root.path, 0, None)
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::ApplyFailed { .. }))
+            .count(),
+        4
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event.kind,
+                EventKind::Boot {
+                    result: scupper_proto::Outcome::Recovered,
+                    ..
+                }
+            ))
+            .count(),
+        4
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::DriftDetected { .. }))
+    );
+}
+
+#[test]
+fn failed_apply_with_undurable_rollback_keeps_forwarding_closed() {
+    use scupper_sys::{daemon::admin, events::EventLog};
+    let f = Fixture::new();
+    assert!(f.run(None).succeeded());
+    let break_rollback = |point| {
+        if point == BootPoint::After(BootStep::Ruleset) {
+            fs::rename(
+                f.root.path.join("state.json"),
+                f.root.path.join("saved-state.json"),
+            )
+            .unwrap();
+            fs::create_dir(f.root.path.join("state.json")).unwrap();
+            return Err("boot failed and rollback publication unavailable".into());
+        }
+        Ok(())
+    };
+    let run_root = f.root.path.join("run");
+    let deps = BootDeps {
+        system: &f.kernel,
+        namespace: &f.kernel,
+        state_root: &f.root.path,
+        config_root: &f.root.path,
+        run_root: &run_root,
+        hook: Some(&break_rollback),
+        secret_owner: rustix::process::geteuid().as_raw(),
+    };
+    let log = EventLog::memory_only(scupper_core::config::GatewayId("gw1".into()), || {
+        scupper_proto::UnixSeconds(1000)
+    })
+    .unwrap();
+    let error = admin::apply(&deps, &log.handle, Some(1), false, 0).unwrap_err();
+    assert_eq!(error.code, scupper_proto::ApiErrorCode::RollbackFailed);
+    assert_eq!(f.kernel.values.borrow()["net.ipv4.ip_forward"], "0");
+    assert_eq!(
+        f.kernel.values.borrow()["net.ipv6.conf.all.forwarding"],
+        "0"
+    );
+    let report: BootReport =
+        serde_json::from_slice(&fs::read(run_root.join("boot.json")).unwrap()).unwrap();
+    assert!(!report.succeeded());
+}
+
+#[test]
+fn runtime_dispatcher_failed_apply_rolls_back_and_unknown_version_keeps_attachment() {
+    use scupper_sys::{
+        daemon::testing::dispatch_apply,
+        store::{MetaInput, VersionStore},
+    };
+    let f = Fixture::new();
+    assert!(f.run(None).succeeded());
+    let run = f.root.path.join("run");
+    let guard = WriterLock::acquire(&run).unwrap();
+    VersionStore::open(&f.root.path, Some(&guard))
+        .unwrap()
+        .commit(
+            &guard,
+            Some(1),
+            &support::site_text("ubuntu-24.04").replace("mtu = 1420", "mtu = 1400"),
+            MetaInput {
+                actor: "test".into(),
+                at: 1000,
+                reason: "failing target".into(),
+            },
+        )
+        .unwrap();
+    drop(guard);
+    for version in [99, 2] {
+        *f.kernel.failure.borrow_mut() =
+            Some((Program::Ip, "mtu 1400".into(), "target failure".into()));
+        let deps = BootDeps {
+            system: &f.kernel,
+            namespace: &f.kernel,
+            state_root: &f.root.path,
+            config_root: &f.root.path,
+            run_root: &run,
+            hook: None,
+            secret_owner: rustix::process::geteuid().as_raw(),
+        };
+        let (response, before, after, retained_completion, tick) =
+            dispatch_apply(deps, version).unwrap();
+        assert_eq!(
+            before, after,
+            "published attachment changed for apply {version}"
+        );
+        assert_eq!(retained_completion, version == 99);
+        let error = response.result.unwrap_err();
+        if version == 99 {
+            assert_eq!(error.code, scupper_proto::ApiErrorCode::NotFound);
+        } else {
+            assert_eq!(
+                error.observation.as_ref().unwrap()["rollback"]["verified"],
+                true
+            );
+            assert!(error.to_string().contains("rolled back to 1 (verified)"));
+        }
+        assert!(tick.complete, "apply {version}: {tick:?}");
+        assert!(
+            tick.events
+                .iter()
+                .all(|event| !matches!(event, scupper_proto::EventKind::DriftDetected { .. })),
+            "{tick:?}"
+        );
+    }
+}
+
+#[test]
+fn full_boot_rotates_keys_and_reconfiguration_removes_unassigned_clients() {
+    use scupper_core::config::{GatewayId, parse_site, validate};
+    use scupper_sys::store::{MetaInput, VersionStore};
+    let f = Fixture::new();
+    assert!(f.run(None).succeeded());
+    let mut config = parse_site(&support::site_text("ubuntu-24.04")).unwrap();
+    let mut other = config.devices["client"].clone();
+    other.public_key =
+        scupper_core::config::PublicKey("BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=".into());
+    other.address4 = "10.99.0.3/32".into();
+    config.devices.insert("other".into(), other.clone());
+    let run = f.root.path.join("run");
+    let publish = |config: &scupper_core::config::SiteConfig| {
+        let text = toml::to_string(config).unwrap();
+        validate(config.clone()).unwrap();
+        let guard = WriterLock::acquire(&run).unwrap();
+        let store = VersionStore::open(&f.root.path, Some(&guard)).unwrap();
+        let version = store
+            .commit(
+                &guard,
+                store.head().unwrap(),
+                &text,
+                MetaInput {
+                    actor: "test".into(),
+                    at: 1000,
+                    reason: "device update".into(),
+                },
+            )
+            .unwrap();
+        let file = StateFile::open(&f.root.path, None).unwrap();
+        let scupper_sys::state::StateRead::Present(mut state) = file.read().unwrap() else {
+            unreachable!()
+        };
+        state.applied_version = Some(version);
+        file.write(&guard, &state).unwrap();
+    };
+    publish(&config);
+    assert!(f.run(None).succeeded());
+    let old = config.devices["client"].public_key.0.clone();
+    let new = "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU=";
+    config.devices.get_mut("client").unwrap().public_key =
+        scupper_core::config::PublicKey(new.into());
+    f.kernel.calls.borrow_mut().clear();
+    publish(&config);
+    assert!(f.run(None).succeeded());
+    assert!(!f.kernel.ns.borrow()["wg0"].peers.contains_key(&old));
+    assert!(f.kernel.ns.borrow()["wg0"].peers.contains_key(new));
+    assert!(
+        f.kernel.ns.borrow()["wg0"]
+            .peers
+            .contains_key(&other.public_key.0)
+    );
+    assert!(
+        !f.kernel
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call == &format!("netns Wg set wg0 peer {} remove", other.public_key.0))
+    );
+    let mut gateway = config.gateways[&GatewayId("gw1".into())].clone();
+    gateway.endpoint = "198.51.100.3:51820".into();
+    config.gateways.insert(GatewayId("gw2".into()), gateway);
+    config.devices.get_mut("client").unwrap().gateways = vec![GatewayId("gw2".into())];
+    // M2 release validation permits one gateway only; exercise the shared
+    // production link configurator with an internal multi-gateway fixture.
+    let site = scupper_core::config::testing_build(config).unwrap();
+    scupper_sys::boot::testing::configure_clients(
+        BootDeps {
+            system: &f.kernel,
+            namespace: &f.kernel,
+            state_root: &f.root.path,
+            config_root: &f.root.path,
+            run_root: &run,
+            hook: None,
+            secret_owner: rustix::process::geteuid().as_raw(),
+        },
+        site,
+    )
+    .unwrap();
+    assert!(!f.kernel.ns.borrow()["wg0"].peers.contains_key(new));
+    assert!(
+        f.kernel.ns.borrow()["wg0"]
+            .peers
+            .contains_key(&other.public_key.0)
+    );
+}
+
+#[test]
+fn broken_notify_still_records_daemon_started_once() {
+    let f = Fixture::new();
+    assert!(f.run(None).succeeded());
+    let run = f.root.path.join("run");
+    let count = scupper_sys::daemon::testing::started_with_broken_notify(BootDeps {
+        system: &f.kernel,
+        namespace: &f.kernel,
+        state_root: &f.root.path,
+        config_root: &f.root.path,
+        run_root: &run,
+        hook: None,
+        secret_owner: rustix::process::geteuid().as_raw(),
+    })
+    .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn failed_apply_reports_reclose_and_rollback_failures() {
+    use scupper_sys::{daemon::admin, events::EventLog};
+    for fail_reclose in [false, true] {
+        let f = Fixture::new();
+        assert!(f.run(None).succeeded());
+        let inject = |point| {
+            if point == BootPoint::After(BootStep::Record) {
+                *f.kernel.failure.borrow_mut() = Some(if fail_reclose {
+                    (
+                        Program::Sysctl,
+                        "net.ipv4.ip_forward=0".into(),
+                        "stuck gate".into(),
+                    )
+                } else {
+                    (
+                        Program::Wg,
+                        "pubkey".into(),
+                        "rollback inputs failed".into(),
+                    )
+                });
+                return Err("target record failed".into());
+            }
+            Ok(())
+        };
+        let run = f.root.path.join("run");
+        let deps = BootDeps {
+            system: &f.kernel,
+            namespace: &f.kernel,
+            state_root: &f.root.path,
+            config_root: &f.root.path,
+            run_root: &run,
+            hook: Some(&inject),
+            secret_owner: rustix::process::geteuid().as_raw(),
+        };
+        let log = EventLog::memory_only(scupper_core::config::GatewayId("gw1".into()), || {
+            scupper_proto::UnixSeconds(1000)
+        })
+        .unwrap();
+        let error = admin::apply(&deps, &log.handle, Some(1), false, 0).unwrap_err();
+        assert_eq!(error.code, scupper_proto::ApiErrorCode::RollbackFailed);
+        let rollback = &error.observation.as_ref().unwrap()["rollback"];
+        assert_eq!(rollback["verified"], false);
+        assert_eq!(rollback["reclosed"], !fail_reclose);
+        assert_eq!(rollback["closed"], !fail_reclose);
+        assert!(error.to_string().contains(if fail_reclose {
+            "closure unverified"
+        } else {
+            "rollback failed: closed"
+        }));
+    }
+}
+
+#[test]
+fn post_mutation_gate_and_state_failures_report_recovery_outcome() {
+    use scupper_sys::{daemon::admin, events::EventLog};
+    for state_write in [false, true] {
+        let f = Fixture::new();
+        assert!(f.run(None).succeeded());
+        if state_write {
+            *f.kernel.state_failure_on_close.borrow_mut() = Some(f.root.path.join("state.json"));
+        } else {
+            *f.kernel.failure.borrow_mut() = Some((
+                Program::Sysctl,
+                "net.ipv4.ip_forward=0".into(),
+                "stuck gate".into(),
+            ));
+        }
+        let run = f.root.path.join("run");
+        let log = EventLog::memory_only(scupper_core::config::GatewayId("gw1".into()), || {
+            scupper_proto::UnixSeconds(1000)
+        })
+        .unwrap();
+        let error = admin::apply(
+            &BootDeps {
+                system: &f.kernel,
+                namespace: &f.kernel,
+                state_root: &f.root.path,
+                config_root: &f.root.path,
+                run_root: &run,
+                hook: None,
+                secret_owner: rustix::process::geteuid().as_raw(),
+            },
+            &log.handle,
+            Some(1),
+            false,
+            0,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, scupper_proto::ApiErrorCode::RollbackFailed);
+        let recovery = &error.observation.unwrap()["rollback"];
+        assert_eq!(recovery["verified"], false);
+        assert_eq!(recovery["closed"], state_write);
+        assert_eq!(recovery["reclosed"], state_write);
+        assert_eq!(recovery["durable"], !state_write);
+        assert_eq!(
+            f.kernel.values.borrow()["net.ipv6.conf.all.forwarding"],
+            "0"
+        );
+    }
+}
+
+#[test]
+fn hardening_write_failure_does_not_hide_verified_closed_gates() {
+    use scupper_core::{config::GatewayId, planner::Step};
+    use scupper_sys::reconcile::{Config, Kernel as _, RealKernel};
+    let f = Fixture::new();
+    assert!(f.run(None).succeeded());
+    let site = support::site("ubuntu-24.04");
+    let held = std::sync::Arc::new(testing::handle().unwrap());
+    let config = Config {
+        site: site.clone(),
+        gateway: GatewayId("gw1".into()),
+        stamp: f.root.stamp,
+        fingerprint: [7; 32],
+        run_root: f.root.path.join("run"),
+        lock_wait: Duration::ZERO,
+    };
+    let adapter = RealKernel::new(
+        BootDeps {
+            system: &f.kernel,
+            namespace: &f.kernel,
+            state_root: &f.root.path,
+            config_root: &f.root.path,
+            run_root: &config.run_root,
+            hook: None,
+            secret_owner: rustix::process::geteuid().as_raw(),
+        },
+        held.clone(),
+        &config,
+        support::health(&site, &held),
+        f.kernel.path().to_path_buf(),
+        None,
+    )
+    .unwrap();
+    *f.kernel.failure.borrow_mut() = Some((
+        Program::Sysctl,
+        "net.ipv4.conf.wg0.accept_redirects=0".into(),
+        "link changed".into(),
+    ));
+    adapter.execute(&Step::ForwardingOff).unwrap();
+    for key in [
+        "net.ipv4.ip_forward",
+        "net.ipv6.conf.all.forwarding",
+        "net.ipv4.conf.default.forwarding",
+        "net.ipv6.conf.default.forwarding",
+    ] {
+        assert_eq!(f.kernel.values.borrow()[key], "0");
+    }
+    let health = support::health(&site, &held);
+    let forwarding = scupper_sys::collect::forwarding(
+        &f.kernel,
+        &held,
+        &health,
+        &scupper_sys::state::State::default(),
+    )
+    .unwrap();
+    assert!(
+        forwarding
+            .hardening
+            .iter()
+            .any(|key| key == "net.ipv4.conf.wg0.accept_redirects")
+    );
+}
+
+#[test]
+fn corrupt_apply_target_preserves_attachment_and_error_kind() {
+    use scupper_sys::{
+        daemon::testing::dispatch_apply,
+        store::{MetaInput, VersionStore},
+    };
+    for directory_instead in [false, true] {
+        let f = Fixture::new();
+        assert!(f.run(None).succeeded());
+        let run = f.root.path.join("run");
+        let guard = WriterLock::acquire(&run).unwrap();
+        VersionStore::open(&f.root.path, Some(&guard))
+            .unwrap()
+            .commit(
+                &guard,
+                Some(1),
+                &support::site_text("ubuntu-24.04"),
+                MetaInput {
+                    actor: "test".into(),
+                    at: 1000,
+                    reason: "target".into(),
+                },
+            )
+            .unwrap();
+        drop(guard);
+        let target = f.root.path.join("config/versions/000002.toml");
+        if directory_instead {
+            fs::remove_file(&target).unwrap();
+            fs::create_dir(&target).unwrap();
+        } else {
+            fs::write(&target, "corrupt target").unwrap();
+        }
+        let (response, before, after, retained, _) = dispatch_apply(
+            BootDeps {
+                system: &f.kernel,
+                namespace: &f.kernel,
+                state_root: &f.root.path,
+                config_root: &f.root.path,
+                run_root: &run,
+                hook: None,
+                secret_owner: rustix::process::geteuid().as_raw(),
+            },
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            response.result.unwrap_err().code,
+            if directory_instead {
+                scupper_proto::ApiErrorCode::PersistenceUnavailable
+            } else {
+                scupper_proto::ApiErrorCode::Internal
+            }
+        );
+        assert_eq!(before, after);
+        assert!(retained);
+    }
 }

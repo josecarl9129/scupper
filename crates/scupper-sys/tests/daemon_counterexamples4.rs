@@ -34,8 +34,12 @@ use std::{
     time::{Duration, Instant},
 };
 fn root(name: &str) -> PathBuf {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/daemon-fix4-counterexamples")
+    let root = std::env::var_os("CARGO_TARGET_TMPDIR")
+        .map_or_else(
+            || std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/tmp")),
+            std::path::PathBuf::from,
+        )
+        .join("daemon-fix4-counterexamples")
         .join(format!("{}-{name}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).unwrap();

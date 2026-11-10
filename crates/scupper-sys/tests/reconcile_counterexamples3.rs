@@ -59,8 +59,12 @@ fn desired_for(site: &scupper_core::config::ValidatedSite) -> Desired {
     .unwrap()
 }
 fn root() -> PathBuf {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/reconcile-fix2-ce")
+    let root = std::env::var_os("CARGO_TARGET_TMPDIR")
+        .map_or_else(
+            || std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/tmp")),
+            std::path::PathBuf::from,
+        )
+        .join("reconcile-fix2-ce")
         .join(format!(
             "{}-{}",
             std::process::id(),

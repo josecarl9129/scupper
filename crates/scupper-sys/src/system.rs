@@ -238,6 +238,15 @@ pub enum ExecTarget<'a> {
 /// }
 /// ```
 pub trait System {
+    /// Identity currently published at a namespace path.
+    /// # Errors
+    /// Returns metadata errors, including a missing namespace name.
+    fn namespace_identity(&self, path: &Path) -> std::io::Result<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(path)?;
+        Ok((metadata.dev(), metadata.ino()))
+    }
+
     /// Remaining safety-group deadline, when called by the safety collector.
     fn canon_safety_deadline(&self) -> Option<std::time::Instant> {
         None
@@ -1254,11 +1263,23 @@ mod tests {
         #[cfg(target_os = "linux")]
         rustix::process::set_child_subreaper(Some(Pid::INIT))
             .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
-        let file = PidFile(std::env::temp_dir().join(format!(
-            "exec-grandchild-{}-{}.pid",
-            std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-        )));
+        let file = PidFile(
+            std::env::var_os("CARGO_TARGET_TMPDIR")
+                .map_or_else(
+                    || {
+                        std::path::PathBuf::from(concat!(
+                            env!("CARGO_MANIFEST_DIR"),
+                            "/../../target/tmp"
+                        ))
+                    },
+                    std::path::PathBuf::from,
+                )
+                .join(format!(
+                    "exec-grandchild-{}-{}.pid",
+                    std::process::id(),
+                    SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+                )),
+        );
         let timeout = Duration::from_millis(200);
         let started = Instant::now();
         // A shell is used only in this test to arrange an inherited-pipe tree.

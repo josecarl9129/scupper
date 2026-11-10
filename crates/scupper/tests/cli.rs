@@ -83,14 +83,27 @@ impl Harness {
         }));
     }
     fn run(&self, args: &[&str]) -> (u8, String, String) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/tmp")),
+                PathBuf::from,
+            )
+            .join(format!(
+                "cli-harness-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+        std::fs::create_dir_all(&root).unwrap();
         let mut out = Vec::new();
         let mut err = Vec::new();
         let code = cli::run_with(
             std::iter::once("scupper").chain(args.iter().copied()),
             &Dependencies {
-                state_root: Path::new("target/missing-store"),
-                config_root: Path::new("target/missing-config"),
-                writer_root: Path::new("target/unused-writer"),
+                state_root: &root.join("missing-store"),
+                config_root: &root.join("missing-config"),
+                writer_root: &root.join("unused-writer"),
                 probe_exec: &scupper::system::RealSystem::default(),
                 system: self,
                 namespaces: self,
@@ -100,6 +113,7 @@ impl Harness {
             &mut out,
             &mut err,
         );
+        std::fs::remove_dir_all(root).unwrap();
         (
             code,
             String::from_utf8(out).unwrap(),

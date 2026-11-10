@@ -38,7 +38,7 @@ pub enum Selection {
 }
 
 /// Full filesystem identity from a namespace handle or boot record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NetnsIdentity {
     /// Filesystem device number (`st_dev`).
     pub device: u64,
@@ -424,6 +424,13 @@ pub enum Degraded {
     },
     /// Reserved for multi-exit comparison; no switch on probe failure in M2.
     CommonModeProbeFailure,
+    /// Configuration transition is still in progress; no kernel comparison made.
+    OperationInProgress {
+        /// Last attached version.
+        from: u64,
+        /// Requested version.
+        to: u64,
+    },
     /// Reserved for the M4 DNS forwarder.
     DnsFailed(ProbeError),
 }

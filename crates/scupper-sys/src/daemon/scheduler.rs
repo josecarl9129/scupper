@@ -1,4 +1,4 @@
-//! Shared production/test loop. Only the tick owner performs work or notifies.
+//! Shared production/test loop; the scheduler owns reconciliation and bounded control work.
 use crate::reconcile::{Escalation, TickReport};
 use std::{
     io,
@@ -10,6 +10,8 @@ use std::{
 pub struct Iteration {
     /// All bounded work and retry decisions finished before their deadline.
     pub complete: bool,
+    /// Scheduler work stayed within its watchdog budget, including closed rebuild retries.
+    pub bounded: bool,
     /// Value-free status for the service manager.
     pub status: &'static str,
 }
@@ -19,6 +21,8 @@ pub trait DaemonDeps {
     fn now(&self) -> Instant;
     /// Wait for at most the requested duration.
     fn sleep(&mut self, duration: Duration);
+    /// Drain a bounded batch of control work, even when ticks exceed cadence.
+    fn control_requests(&mut self) {}
     /// Announce that the main loop is running.
     fn started(&mut self);
     /// Initialize the reconciler factory; refusal leaves the process degraded.
@@ -49,6 +53,7 @@ pub fn run_with(deps: &mut impl DaemonDeps, stop: &AtomicBool) {
     deps.initialize();
     let mut next = deps.now();
     while !stop.load(Ordering::Relaxed) {
+        deps.control_requests();
         let now = deps.now();
         if now < next {
             deps.sleep((next - now).min(Duration::from_millis(50)));
@@ -81,7 +86,10 @@ pub fn run_with(deps: &mut impl DaemonDeps, stop: &AtomicBool) {
         }
         deps.maintenance();
         let iteration = Iteration {
-            complete: (rebuild || report.as_ref().is_some_and(|r| r.complete))
+            complete: !rebuild
+                && report.as_ref().is_some_and(|r| r.complete)
+                && deps.now().saturating_duration_since(started) < Duration::from_secs(20),
+            bounded: (rebuild || report.as_ref().is_some_and(|r| r.complete))
                 && deps.now().saturating_duration_since(started) < Duration::from_secs(20),
             status: if rebuild {
                 "closed; boot retry pending"

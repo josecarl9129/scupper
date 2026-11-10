@@ -47,7 +47,11 @@ impl WriterLock {
     /// # Errors
     /// Returns `WouldBlock` when another descriptor holds the lock, or an I/O error.
     pub fn try_acquire(root: impl AsRef<Path>) -> io::Result<WriterGuard> {
-        Self::open(root.as_ref(), FlockOperation::NonBlockingLockExclusive)
+        Self::open(
+            root.as_ref(),
+            "writer.lock",
+            FlockOperation::NonBlockingLockExclusive,
+        )
     }
 
     /// Acquires the lock with a bounded wait, polling at most every ten milliseconds.
@@ -75,7 +79,7 @@ impl WriterLock {
         }
     }
 
-    fn open(root: &Path, operation: FlockOperation) -> io::Result<WriterGuard> {
+    fn open(root: &Path, name: &str, operation: FlockOperation) -> io::Result<WriterGuard> {
         fs::create_dir_all(root)?;
         let mut file = OpenOptions::new()
             .read(true)
@@ -84,7 +88,7 @@ impl WriterLock {
             .truncate(false)
             .mode(0o600)
             .custom_flags(OFlags::NOFOLLOW.bits().cast_signed())
-            .open(root.join("writer.lock"))?;
+            .open(root.join(name))?;
         if !file.metadata()?.is_file() {
             return Err(io::Error::other("writer lock is not a regular file"));
         }
@@ -95,8 +99,8 @@ impl WriterLock {
             let mut holder = String::new();
             let _ = (&file).take(32).read_to_string(&mut holder);
             let message = holder.trim().parse::<u32>().map_or_else(
-                |_| "writer lock held by another writer".to_owned(),
-                |pid| format!("writer lock held by pid {pid}"),
+                |_| format!("{name} held by another writer"),
+                |pid| format!("{name} held by pid {pid}"),
             );
             return Err(io::Error::new(io::ErrorKind::WouldBlock, message));
         }
@@ -106,5 +110,56 @@ impl WriterLock {
             file,
             _not_sync: std::marker::PhantomData,
         })
+    }
+}
+
+/// Lifetime supervisor exclusion, acquired before publishing a control socket.
+pub struct SupervisorLease {
+    _guard: WriterGuard,
+}
+impl SupervisorLease {
+    /// Wait for a local writer with a bounded retry and status callback.
+    /// # Errors
+    /// Returns a timeout or filesystem error.
+    pub fn acquire_timeout(
+        root: &Path,
+        timeout: Duration,
+        mut waiting: impl FnMut(),
+    ) -> io::Result<Self> {
+        let deadline = Instant::now() + timeout;
+        let mut next_notice = Instant::now();
+        loop {
+            match Self::try_acquire(root) {
+                Ok(lease) => return Ok(lease),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!("supervisor lease timeout: {error}"),
+                        ));
+                    }
+                    if Instant::now() >= next_notice {
+                        waiting();
+                        next_notice = Instant::now() + Duration::from_secs(5);
+                    }
+                    std::thread::sleep(
+                        Duration::from_millis(100)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    /// Acquire without waiting; local mutations must refuse a live supervisor.
+    /// # Errors
+    /// Returns contention or filesystem errors.
+    pub fn try_acquire(root: impl AsRef<Path>) -> io::Result<Self> {
+        WriterLock::open(
+            root.as_ref(),
+            "scupperd.lock",
+            FlockOperation::NonBlockingLockExclusive,
+        )
+        .map(|guard| Self { _guard: guard })
     }
 }

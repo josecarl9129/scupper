@@ -8,7 +8,7 @@ use std::{
     net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket},
     path::Path,
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
@@ -170,16 +170,15 @@ fn valid_marker(text: &str) -> bool {
         && text.len() <= 128
 }
 
-/// Runs a TCP or UDP marker sink for at most 1050 seconds.
+/// Runs a TCP or UDP marker sink until its owning suite stops the process.
 ///
 /// # Errors
 /// Returns socket, log or malformed-marker errors.
 pub fn sink(protocol: &str, bind: SocketAddr, log: &Path) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(1050);
     if protocol == "tcp" {
         let listener = TcpListener::bind(bind)?;
         listener.set_nonblocking(true)?;
-        while Instant::now() < deadline {
+        loop {
             match listener.accept() {
                 Ok((mut stream, peer)) => {
                     stream.set_read_timeout(Some(IO_TIMEOUT))?;
@@ -199,11 +198,12 @@ pub fn sink(protocol: &str, bind: SocketAddr, log: &Path) -> Result<()> {
                 Err(e) => return Err(e.into()),
             }
         }
-    } else if protocol == "udp" {
+    }
+    if protocol == "udp" {
         let socket = UdpSocket::bind(bind)?;
         socket.set_read_timeout(Some(Duration::from_millis(100)))?;
         let mut buffer = [0; 1024];
-        while Instant::now() < deadline {
+        loop {
             match socket.recv_from(&mut buffer) {
                 Ok((len, peer)) => {
                     let marker = std::str::from_utf8(&buffer[..len])?;
@@ -221,10 +221,8 @@ pub fn sink(protocol: &str, bind: SocketAddr, log: &Path) -> Result<()> {
                 Err(e) => return Err(e.into()),
             }
         }
-    } else {
-        return fail("protocol must be tcp or udp");
     }
-    fail("sink lifetime exceeded")
+    fail("protocol must be tcp or udp")
 }
 
 /// Sends one marker, prints its structured outcome, and returns whether acknowledged.

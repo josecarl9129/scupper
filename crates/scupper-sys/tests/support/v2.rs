@@ -26,7 +26,7 @@ pub fn fixture(runner: &str, name: &str) -> String {
         .unwrap()
         .join("scupper-sys/tests/fixtures/netns");
     fs::read_to_string(root.join(runner).join(name))
-        .unwrap()
+        .unwrap_or_else(|error| unreachable!("fixture {name}: {error}"))
         .replace("PUBKEY1", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
         .replace("PUBKEY2", "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=")
         .replace("PUBKEY3", "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=")
@@ -200,6 +200,10 @@ impl Script {
                 "scupper-route-get-public.txt".into()
             }
             Program::Ip if arg(0) == "-d" => {
+                if !netns {
+                    out.stdout = "[]".into();
+                    return Ok(out);
+                }
                 assert!(netns);
                 "scupper--4-link.json".into()
             }
@@ -340,7 +344,21 @@ pub struct Root {
 }
 impl Root {
     pub fn new(runner: &str, handle: &NetnsHandle) -> Self {
-        let path = std::env::temp_dir().join(format!(
+        Self::with_text(&site_text(runner), handle)
+    }
+    pub fn with_text(text: &str, handle: &NetnsHandle) -> Self {
+        // Keep fixture sockets below sockaddr_un's path limit in deep worktrees.
+        let temporary = Path::new(env!("CARGO_TARGET_TMPDIR"));
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let temporary = temporary.strip_prefix(workspace).map_or_else(
+            |_| temporary.to_path_buf(),
+            |path| Path::new("../..").join(path),
+        );
+        let path = temporary.join(format!(
             "scupper-v2-test-{}-{}",
             std::process::id(),
             unique()
@@ -348,12 +366,11 @@ impl Root {
         fs::create_dir_all(&path).unwrap();
         let writer = WriterLock::acquire(path.join("lock")).unwrap();
         let store = VersionStore::open(&path, Some(&writer)).unwrap();
-        let text = site_text(runner);
         let version = store
             .commit(
                 &writer,
                 None,
-                &text,
+                text,
                 MetaInput {
                     actor: "test".into(),
                     at: 1000,

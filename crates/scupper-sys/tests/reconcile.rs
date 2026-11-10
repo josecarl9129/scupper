@@ -61,8 +61,17 @@ impl Rig {
             &Selection::Auto,
         )
         .unwrap();
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/reconcile-fs")
+        let root = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || {
+                    std::path::PathBuf::from(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../target/tmp"
+                    ))
+                },
+                std::path::PathBuf::from,
+            )
+            .join("reconcile-fs")
             .join(format!(
                 "scupper-reconcile-{}-{}",
                 std::process::id(),
@@ -1804,6 +1813,7 @@ fn emergency_failure_replans_do_not_reserve_hardening_repairs() {
 // Drive the production scheduler with a real Reconciler<FakeKernel>, fake clock,
 // fake signal source and local notify socket. A shutdown kernel mutation fails
 // the final history comparison, even when it leaves final kernel state unchanged.
+#[allow(clippy::struct_excessive_bools)] // Independent injected scheduler faults.
 struct DaemonRig<'a> {
     rig: &'a mut Rig,
     now: std::time::Instant,
@@ -1811,6 +1821,10 @@ struct DaemonRig<'a> {
     offset: Duration,
     limit: usize,
     iterations: usize,
+    tick_duration: Duration,
+    control_calls: usize,
+    fail_control_bind: bool,
+    complete_iterations: usize,
     degraded: bool,
     rebuild_pending: bool,
     probes: Option<scupper_sys::daemon::probes::Probes>,
@@ -1830,6 +1844,15 @@ impl scupper_sys::daemon::DaemonDeps for DaemonRig<'_> {
     fn now(&self) -> std::time::Instant {
         self.now
     }
+    fn control_requests(&mut self) {
+        self.control_calls += 1;
+        if self.fail_control_bind {
+            assert!(
+                scupper_sys::daemon::control::Server::bind(&self.rig.root.join("unsafe-control"))
+                    .is_err()
+            );
+        }
+    }
     fn sleep(&mut self, duration: Duration) {
         if self.probes.is_some() {
             std::thread::sleep(Duration::from_millis(5));
@@ -1844,6 +1867,7 @@ impl scupper_sys::daemon::DaemonDeps for DaemonRig<'_> {
     }
     fn tick(&mut self, _: &std::sync::atomic::AtomicBool) -> Option<TickReport> {
         self.iterations += 1;
+        self.now += self.tick_duration;
         if self.degraded {
             return None;
         }
@@ -1905,8 +1929,9 @@ impl scupper_sys::daemon::DaemonDeps for DaemonRig<'_> {
         }
     }
     fn notify(&mut self, iteration: &scupper_sys::daemon::Iteration) {
+        self.complete_iterations += usize::from(iteration.complete);
         self.notify
-            .iteration(iteration.complete, iteration.status)
+            .iteration(iteration.bounded, iteration.status)
             .unwrap();
         if let Some(socket) = &self.notifications {
             self.messages.extend(drain_notify(socket));
@@ -1955,6 +1980,10 @@ fn daemon_scheduler_notifies_and_sigterm_shutdown_has_no_kernel_steps() {
         offset: Duration::ZERO,
         limit: 3,
         iterations: 0,
+        tick_duration: Duration::ZERO,
+        control_calls: 0,
+        fail_control_bind: false,
+        complete_iterations: 0,
         degraded: false,
         rebuild_pending: false,
         probes: None,
@@ -2015,6 +2044,10 @@ fn degraded_scheduler_feeds_watchdog_and_boot_budget_survives_restarts() {
             offset: Duration::from_secs(offset),
             limit,
             iterations: 0,
+            tick_duration: Duration::ZERO,
+            control_calls: 0,
+            fail_control_bind: false,
+            complete_iterations: 0,
             degraded: true,
             rebuild_pending: false,
             probes: None,
@@ -2065,6 +2098,10 @@ fn rebuild_pending_scheduler_feeds_watchdog_while_retry_is_spaced() {
         offset: Duration::ZERO,
         limit: 4,
         iterations: 0,
+        tick_duration: Duration::ZERO,
+        control_calls: 0,
+        fail_control_bind: false,
+        complete_iterations: 0,
         degraded: false,
         rebuild_pending: true,
         probes: None,
@@ -2082,6 +2119,7 @@ fn rebuild_pending_scheduler_feeds_watchdog_while_retry_is_spaced() {
     };
     run_with(&mut deps, &stop);
     assert_eq!(deps.boots, 1);
+    assert_eq!(deps.complete_iterations, 0);
     assert_eq!(deps.abandoned, 3); // SIGTERM skips recovery after the last tick.
     let messages = std::mem::take(&mut deps.messages);
     assert_eq!(messages.iter().filter(|s| *s == "READY=1").count(), 1);
@@ -2268,6 +2306,10 @@ fn probe_child_timeout_does_not_delay_fake_kernel_ticks() {
         offset: Duration::ZERO,
         limit: 12,
         iterations: 0,
+        tick_duration: Duration::ZERO,
+        control_calls: 0,
+        fail_control_bind: false,
+        complete_iterations: 0,
         degraded: false,
         rebuild_pending: false,
         probes: Some(probes),
@@ -2337,4 +2379,485 @@ fn changed_applied_version_never_reloads_the_old_render() {
             .iter()
             .all(|(step, _)| matches!(step, Step::ForwardingOff))
     );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep the operation table and independent closure oracle together.
+fn control_ops_use_fake_kernel_and_verify_disconnect_independently() {
+    use scupper_core::verdict::v2::{Degraded, FailClosed, Report, Verdict};
+    use scupper_proto::{ApiErrorCode, Op, OpResult};
+    use scupper_sys::daemon::admin::execute;
+    let mut rig = Rig::new();
+    let healthy = |_| {
+        Ok(Report {
+            verdict: Verdict::Protected {
+                exit: scupper_core::config::ExitId("ch1".into()),
+                exit_ip: "192.0.2.1".parse().unwrap(),
+            },
+            warnings: vec![],
+            at: 1000,
+            config_version: 1,
+        })
+    };
+    assert!(matches!(
+        execute(rig.machine(), Op::Ping {}, 0, Some(2), healthy).unwrap(),
+        OpResult::Ping {
+            last_complete_iteration_age: Some(2),
+            version: 1,
+            ..
+        }
+    ));
+    assert!(matches!(
+        execute(rig.machine(), Op::Check {}, 0, None, healthy).unwrap(),
+        OpResult::Check { .. }
+    ));
+    assert!(matches!(
+        execute(rig.machine(), Op::Connect { exit: None }, 0, None, healthy).unwrap(),
+        OpResult::Connect { .. }
+    ));
+    assert!(matches!(
+        execute(rig.machine(), Op::RepairStatus {}, 0, None, healthy).unwrap(),
+        OpResult::RepairStatus {
+            quarantined: false,
+            ..
+        }
+    ));
+    assert!(
+        execute(
+            rig.machine(),
+            Op::RepairClear { reason: None },
+            0,
+            None,
+            healthy
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        execute(rig.machine(), Op::Disconnect {}, 1000, None, healthy)
+            .unwrap_err()
+            .code,
+        ApiErrorCode::Unauthorized
+    );
+    let kernel = rig.kernel.clone();
+    let closed = |_| {
+        let model = kernel.model();
+        let effective = model.default_v4 == Known::Value(DefaultRouteObs::Unreachable)
+            && model.default_v6 == Known::Value(DefaultRouteObs::Unreachable)
+            && model.links["ex-ch1"].up == Known::Value(false);
+        Ok(Report {
+            verdict: if effective {
+                Verdict::FailClosed(FailClosed::AdminDisconnected)
+            } else {
+                Verdict::Degraded(Degraded::DisconnectNotEffective)
+            },
+            warnings: vec![],
+            at: 1000,
+            config_version: 1,
+        })
+    };
+    rig.kernel.inject(Fault {
+        step: StepKind::RouteReplace,
+        remaining: None,
+        partial: false,
+    });
+    let error = execute(rig.machine(), Op::Disconnect {}, 0, None, closed).unwrap_err();
+    assert_eq!(error.code, ApiErrorCode::DisconnectNotEffective);
+    assert!(error.observation.is_some());
+    assert_eq!(rig.store.state().selection, Selection::Disconnected);
+    assert_ne!(
+        rig.kernel.model().default_v4,
+        Known::Value(DefaultRouteObs::Unreachable)
+    );
+    let mut rig = Rig::new();
+    assert!(
+        execute(rig.machine(), Op::Disconnect {}, 0, None, |_| Ok(Report {
+            verdict: Verdict::FailClosed(FailClosed::AdminDisconnected),
+            warnings: vec![],
+            at: 1000,
+            config_version: 1
+        }))
+        .is_ok()
+    );
+    assert_eq!(
+        rig.kernel.model().default_v4,
+        Known::Value(DefaultRouteObs::Unreachable)
+    );
+    rig.store.fail_writes(true);
+    assert!(execute(rig.machine(), Op::Connect { exit: None }, 0, None, healthy).is_err());
+    assert_eq!(rig.store.state().selection, Selection::Disconnected);
+    assert!(
+        execute(rig.machine(), Op::Check {}, 0, None, |_| Err(
+            scupper_proto::ApiError {
+                code: ApiErrorCode::Internal,
+                observation: None
+            }
+        ))
+        .is_err()
+    );
+}
+
+#[test]
+fn control_apply_planner_previews_without_writes_then_repairs_without_auto_debounce() {
+    let mut rig = Rig::new();
+    rig.kernel
+        .mutate(|model| *model.hardening.values_mut().next().unwrap() = Known::Value("-1".into()));
+    let before = rig.kernel.history().len();
+    let preview = rig
+        .machine()
+        .apply_plan(true, Actor::Local { uid: 0 })
+        .unwrap();
+    assert!(preview.contains(&StepKind::WriteSysctl));
+    assert_eq!(rig.kernel.history().len(), before);
+    let executed = rig
+        .machine()
+        .apply_plan(false, Actor::Local { uid: 0 })
+        .unwrap();
+    assert!(executed.contains(&StepKind::WriteSysctl));
+    assert!(rig.kernel.history().len() > before);
+}
+
+#[test]
+fn control_repair_clear_preserves_another_writers_selection() {
+    use scupper_sys::reconcile::StateStore;
+    let mut rig = Rig::new();
+    let mut state = rig.store.state();
+    state.selection = Selection::Disconnected;
+    state.quarantine = Some(scupper_sys::state::Quarantine {
+        reason: "repair-budget".into(),
+        object: "safety:ruleset".into(),
+        since_unix: 1000,
+    });
+    let guard = WriterLock::acquire(&rig.root).unwrap();
+    rig.store.write(&guard, &state).unwrap();
+    drop(guard);
+    rig.machine().clear_latch(Actor::Local { uid: 0 }).unwrap();
+    assert_eq!(rig.store.state().selection, Selection::Disconnected);
+    assert!(rig.store.state().quarantine.is_none());
+    rig.tick();
+    assert_eq!(
+        rig.kernel.model().default_v4,
+        Known::Value(DefaultRouteObs::Unreachable)
+    );
+}
+
+#[test]
+fn verified_apply_clear_is_not_undone_by_a_stale_daemon_version_handoff() {
+    use scupper_sys::reconcile::StateStore;
+    let mut rig = Rig::new();
+    let guard = WriterLock::acquire(&rig.root).unwrap();
+    let mut state = rig.store.state();
+    state.quarantine = Some(scupper_sys::state::Quarantine {
+        reason: "repair-budget".into(),
+        object: "safety:ruleset".into(),
+        since_unix: 1000,
+    });
+    rig.store.write(&guard, &state).unwrap();
+    drop(guard);
+    rig.restart();
+    assert!(rig.machine().latch().is_some());
+    let guard = WriterLock::acquire(&rig.root).unwrap();
+    state.applied_version = Some(2);
+    state.quarantine = None;
+    rig.store.write(&guard, &state).unwrap();
+    drop(guard);
+    assert!(
+        rig.tick()
+            .escalations
+            .contains(&Escalation::ReinitializeRequired)
+    );
+    assert!(rig.store.state().quarantine.is_none());
+    assert!(rig.machine().latch().is_none());
+    assert!(rig.kernel.model().forwarding_off());
+}
+
+#[test]
+fn control_requests_are_serviced_without_scheduler_sleep() {
+    use scupper_sys::daemon::{notify::Notify, run_with};
+    use std::{sync::atomic::AtomicBool, time::Instant};
+    let mut rig = Rig::new();
+    let (socket_path, socket) = daemon_notify_socket();
+    socket.set_nonblocking(true).unwrap();
+    let stop = AtomicBool::new(false);
+    let now = Instant::now();
+    let mut deps = DaemonRig {
+        rig: &mut rig,
+        now,
+        origin: now,
+        offset: Duration::ZERO,
+        limit: 7,
+        iterations: 0,
+        tick_duration: Duration::from_secs(3),
+        control_calls: 0,
+        fail_control_bind: false,
+        complete_iterations: 0,
+        degraded: false,
+        rebuild_pending: false,
+        probes: None,
+        probe_received: false,
+        longest_tick: Duration::ZERO,
+        boots: 0,
+        closed: 0,
+        abandoned: 0,
+        initialized: 0,
+        notify: Notify::new(Some(socket_path.as_os_str())).unwrap(),
+        notifications: Some(socket.try_clone().unwrap()),
+        messages: Vec::new(),
+        before_shutdown: None,
+        stop: &stop,
+    };
+    run_with(&mut deps, &stop);
+    assert_eq!(deps.iterations, 7);
+    assert_eq!(deps.control_calls, 7);
+    assert_eq!(deps.now.duration_since(now), Duration::from_secs(21));
+}
+
+#[test]
+fn pending_connect_allows_ticks_to_qualify() {
+    let mut rig = Rig::new();
+    rig.machine()
+        .set_selection(Selection::Disconnected, Actor::Local { uid: 0 })
+        .unwrap();
+    for _ in 0..20 {
+        rig.tick();
+    }
+    let exit = scupper_core::config::ExitId("ch1".into());
+    rig.kernel.handshake(exit.clone(), None);
+    let guard = WriterLock::acquire(&rig.root).unwrap();
+    rig.machine()
+        .set_intent_locked(&guard, Selection::Auto)
+        .unwrap();
+    drop(guard);
+    assert_eq!(rig.store.state().selection, Selection::Auto);
+    assert!(rig.machine().probe_exit().is_some());
+    for _ in 0..2 {
+        rig.round(true);
+        rig.tick();
+    }
+    assert_eq!(
+        rig.kernel.model().default_v4,
+        Known::Value(DefaultRouteObs::Unreachable)
+    );
+    rig.kernel.handshake(exit, Some(Duration::from_secs(1)));
+    for _ in 0..6 {
+        rig.round(true);
+        rig.tick();
+    }
+    assert_eq!(
+        rig.machine().verdict(),
+        Some(scupper_proto::VerdictCode::Protected)
+    );
+}
+#[test]
+fn connect_rejects_unconfigured_exit_and_quarantine() {
+    use scupper_proto::{ApiErrorCode, Op};
+    use scupper_sys::{daemon::admin::execute, reconcile::StateStore};
+    let mut rig = Rig::new();
+    assert_eq!(
+        execute(
+            rig.machine(),
+            Op::Connect {
+                exit: Some(scupper_proto::Identifier::try_from("missing".to_owned()).unwrap())
+            },
+            0,
+            None,
+            |_| unreachable!()
+        )
+        .unwrap_err()
+        .code,
+        ApiErrorCode::InvalidRequest
+    );
+    let mut state = rig.store.state();
+    state.quarantine = Some(scupper_sys::state::Quarantine {
+        reason: "state write failed".into(),
+        object: "state".into(),
+        since_unix: 1000,
+    });
+    let guard = WriterLock::acquire(&rig.root).unwrap();
+    rig.store.write(&guard, &state).unwrap();
+    drop(guard);
+    rig.restart();
+    assert_eq!(
+        execute(
+            rig.machine(),
+            Op::Connect { exit: None },
+            0,
+            None,
+            |_| unreachable!()
+        )
+        .unwrap_err()
+        .code,
+        ApiErrorCode::Quarantined
+    );
+}
+
+#[test]
+fn repair_clear_retains_operator_context_and_actual_latch_reason() {
+    use scupper_proto::{Op, OpResult};
+    use scupper_sys::{daemon::admin::execute, reconcile::StateStore};
+    let mut rig = Rig::new();
+    let mut state = rig.store.state();
+    state.quarantine = Some(scupper_sys::state::Quarantine {
+        reason: "state write failed".into(),
+        object: "state".into(),
+        since_unix: 1000,
+    });
+    let guard = WriterLock::acquire(&rig.root).unwrap();
+    rig.store.write(&guard, &state).unwrap();
+    drop(guard);
+    rig.restart();
+    assert!(
+        matches!(execute(rig.machine(), Op::RepairStatus {}, 0, None, |_| unreachable!()).unwrap(), OpResult::RepairStatus { reason: Some(reason), .. } if reason == "state write failed")
+    );
+    execute(
+        rig.machine(),
+        Op::RepairClear {
+            reason: Some("operator inspected gateway".into()),
+        },
+        0,
+        None,
+        |_| unreachable!(),
+    )
+    .unwrap();
+    assert!(
+        !serde_json::to_string(&rig.store.state())
+            .unwrap()
+            .contains("last_repair_reason")
+    );
+    let disk = EventLog::open(&rig.root, GatewayId("gw1".into()), || UnixSeconds(1000)).unwrap();
+    rig.log.handle.replay_into(&disk.handle).unwrap();
+    disk.handle.flush_blocking(Duration::from_secs(2)).unwrap();
+    assert!(scupper_sys::events::read_since(&rig.root, 0, None).map(Result::unwrap).any(|event| matches!(&event.kind,
+        scupper_proto::EventKind::AdminAction { reason: Some(reason), .. } if reason == "operator inspected gateway")));
+}
+
+#[test]
+fn bind_failure_does_not_prevent_scheduler_ticks() {
+    use scupper_sys::daemon::{notify::Notify, run_with};
+    use std::os::unix::fs::PermissionsExt;
+    use std::{sync::atomic::AtomicBool, time::Instant};
+    let mut rig = Rig::new();
+    fs::create_dir_all(rig.root.join("unsafe-control")).unwrap();
+    fs::set_permissions(
+        rig.root.join("unsafe-control"),
+        fs::Permissions::from_mode(0o777),
+    )
+    .unwrap();
+    let (socket_path, socket) = daemon_notify_socket();
+    socket.set_nonblocking(true).unwrap();
+    let stop = AtomicBool::new(false);
+    let now = Instant::now();
+    let mut deps = DaemonRig {
+        rig: &mut rig,
+        now,
+        origin: now,
+        offset: Duration::ZERO,
+        limit: 3,
+        iterations: 0,
+        tick_duration: Duration::ZERO,
+        control_calls: 0,
+        fail_control_bind: true,
+        complete_iterations: 0,
+        degraded: false,
+        rebuild_pending: false,
+        probes: None,
+        probe_received: false,
+        longest_tick: Duration::ZERO,
+        boots: 0,
+        closed: 0,
+        abandoned: 0,
+        initialized: 0,
+        notify: Notify::new(Some(socket_path.as_os_str())).unwrap(),
+        notifications: Some(socket.try_clone().unwrap()),
+        messages: Vec::new(),
+        before_shutdown: None,
+        stop: &stop,
+    };
+    run_with(&mut deps, &stop);
+    assert_eq!(deps.iterations, 3);
+    assert!(deps.control_calls >= 3);
+    assert!(deps.complete_iterations > 0);
+}
+
+#[test]
+fn read_only_admin_ignores_writer_contention() {
+    use scupper_proto::{Op, OpResult};
+    let mut rig = Rig::new();
+    let guard = WriterLock::acquire(&rig.root).unwrap();
+    assert!(matches!(
+        scupper_sys::daemon::admin::execute(
+            rig.machine(),
+            Op::Ping {},
+            0,
+            Some(0),
+            |_| unreachable!()
+        )
+        .unwrap(),
+        OpResult::Ping { .. }
+    ));
+    assert!(matches!(
+        scupper_sys::daemon::admin::execute(
+            rig.machine(),
+            Op::RepairStatus {},
+            0,
+            None,
+            |_| unreachable!()
+        )
+        .unwrap(),
+        OpResult::RepairStatus { .. }
+    ));
+    drop(guard);
+}
+
+#[test]
+fn repair_clear_reopens_forwarding_after_quarantined_restart() {
+    let mut rig = Rig::new();
+    let mut state = rig.store.state();
+    state.quarantine = Some(scupper_sys::state::Quarantine {
+        reason: "repair budget".into(),
+        object: "safety:ruleset".into(),
+        since_unix: 1000,
+    });
+    let guard = WriterLock::acquire(&rig.root).unwrap();
+    scupper_sys::reconcile::StateStore::write(&rig.store, &guard, &state).unwrap();
+    drop(guard);
+    rig.kernel.mutate(|model| {
+        model.forwarding_v4 = Known::Value(0);
+        model.forwarding_v6 = Known::Value(0);
+        model.default_forwarding_v4 = Known::Value(0);
+        model.default_forwarding_v6 = Known::Value(0);
+        model.client_forwarding_v4 = Known::Value(0);
+        for link in model.links.values_mut() {
+            link.forwarding_v4 = Known::Value(0);
+            link.forwarding_v6 = Known::Value(0);
+        }
+    });
+    rig.restart();
+    for _ in 0..4 {
+        rig.round(true);
+        let tick = rig.tick();
+        assert!(
+            !tick
+                .events
+                .iter()
+                .any(|event| matches!(event, EventKind::FailClosedEnded { .. }))
+        );
+    }
+    assert!(rig.kernel.model().forwarding_off());
+    rig.machine().clear_latch(Actor::Local { uid: 0 }).unwrap();
+    for _ in 0..4 {
+        rig.round(true);
+        rig.tick();
+    }
+    let model = rig.kernel.model();
+    for gate in [
+        &model.forwarding_v4,
+        &model.forwarding_v6,
+        &model.default_forwarding_v4,
+        &model.default_forwarding_v6,
+        &model.client_forwarding_v4,
+    ] {
+        assert_eq!(*gate, Known::Value(1));
+    }
+    assert!(rig.store.state().quarantine.is_none());
+    assert!(rig.machine().latch().is_none());
 }

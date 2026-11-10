@@ -76,10 +76,20 @@ pub fn forwarding(
             handle,
             KernelCmd::Sysctl(SysctlCmd::Read(setting.key.clone())),
         )?)?;
-        if values.len() >= 2 && value.to_string() != setting.value {
+        if !matches!(setting.key.name, "forwarding" | "ip_forward")
+            && value.to_string() != setting.value
+        {
             hardening.push(setting.key.to_string());
         }
         values.push(value);
+    }
+    for (index, global, key) in [
+        (2, 0, "net.ipv4.conf.default.forwarding"),
+        (3, 1, "net.ipv6.conf.default.forwarding"),
+    ] {
+        if values[index] != values[global] {
+            hardening.push(key.into());
+        }
     }
     let client_v4 = parse_sysctl(&observe(
         sys,

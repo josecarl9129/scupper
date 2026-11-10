@@ -6,7 +6,17 @@ struct TempDir(PathBuf);
 impl TempDir {
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/event-tests");
+        let parent = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || {
+                    std::path::PathBuf::from(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../target/tmp"
+                    ))
+                },
+                std::path::PathBuf::from,
+            )
+            .join("event-tests");
         fs::create_dir_all(&parent).unwrap();
         let path = parent.join(format!(
             "{}-{}",

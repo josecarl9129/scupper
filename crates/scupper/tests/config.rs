@@ -1,4 +1,5 @@
 //! Configuration transactions and namespace rule previews, without host mutations.
+#![cfg(feature = "testing")]
 #![allow(clippy::unwrap_used)]
 #[path = "../../scupper-sys/tests/support/v2.rs"]
 mod support;
@@ -30,11 +31,21 @@ struct Harness {
 impl Harness {
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "scupper-config-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        let path = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || {
+                    std::path::PathBuf::from(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../target/tmp"
+                    ))
+                },
+                std::path::PathBuf::from,
+            )
+            .join(format!(
+                "scupper-config-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
         fs::create_dir(&path).unwrap();
         fs::create_dir(path.join("etc")).unwrap();
         fs::write(path.join("etc/gateway-id"), "gw1\n").unwrap();
@@ -479,4 +490,16 @@ fn boot_is_hidden_root_only_and_reports_input_failure_without_kernel_writes() {
     assert_eq!(report["steps"][1]["step"], "Inputs");
     assert_eq!(report["steps"][1]["error"], "no configuration");
     assert!(h.system.calls.borrow().is_empty());
+}
+
+#[test]
+fn boot_refuses_unresponsive_lease_holder_before_kernel_calls() {
+    let h = Harness::new();
+    let _lease = scupper_sys::lock::SupervisorLease::try_acquire(h.path.join("run")).unwrap();
+    let (code, output, error) = h.run(&["boot"]);
+    assert_eq!(code, 1, "{output} {error}");
+    assert!(error.contains("holder is not an initialized, responsive scupperd"));
+    assert!(error.contains("pid"));
+    assert!(h.system.calls.borrow().is_empty());
+    assert!(!h.path.join("state").exists());
 }

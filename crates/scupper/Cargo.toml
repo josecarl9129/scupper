@@ -12,12 +12,10 @@ testing = ["scupper-sys/testing"]
 [dependencies]
 scupper-core.workspace = true
 scupper-sys.workspace = true
+scupper-proto.workspace = true
 clap.workspace = true
 rustix.workspace = true
 serde_json.workspace = true
-
-[dev-dependencies]
-scupper-sys = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

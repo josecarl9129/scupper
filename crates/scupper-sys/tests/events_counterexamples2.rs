@@ -5,7 +5,7 @@ use scupper_proto::{Actor, EventKind, GatewayId, UnixSeconds};
 use scupper_sys::events::{EventIoStep, EventLog, LogHandle, OpenedLog};
 use std::{
     fs, io,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -18,8 +18,17 @@ struct TempDir(PathBuf);
 impl TempDir {
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/event-fix-counterexamples")
+        let path = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || {
+                    std::path::PathBuf::from(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../target/tmp"
+                    ))
+                },
+                std::path::PathBuf::from,
+            )
+            .join("event-fix-counterexamples")
             .join(format!(
                 "{}-{}",
                 std::process::id(),

@@ -1586,3 +1586,19 @@ fn exit_down_does_not_hide_foreign_or_extra_routes() {
         },
     );
 }
+
+#[test]
+fn clients_without_established_session_do_not_mask_later_stages() {
+    let mut obs = passing();
+    forwarding(&mut obs)
+        .client_handshakes
+        .insert([2; 32], Handshake::Never);
+    assert_eq!(report(&obs).verdict.exit_code(), 0);
+    obs.supervisor = Some(Supervisor::Dead);
+    assert_eq!(report(&obs).verdict.exit_code(), 5);
+    obs.routes = Some(vec![(CLIENT, route(dev("wg0")))]);
+    assert_eq!(report(&obs).verdict.exit_code(), 3);
+    obs.routes = passing().routes;
+    obs.exit_probe = Some(Ok(UPLINK));
+    assert_eq!(report(&obs).verdict.exit_code(), 2);
+}

@@ -155,9 +155,12 @@ mod tests {
     }
     #[test]
     fn successful_creation_deduplicates_and_cleans_idempotently() {
-        let dir = std::env::current_dir()
-            .unwrap()
-            .join(format!("target/lab-registry-test-{}", std::process::id()));
+        let dir = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../target/tmp")),
+                std::path::PathBuf::from,
+            )
+            .join(format!("lab-registry-test-{}", std::process::id()));
         fs::create_dir_all(dir.parent().unwrap()).unwrap();
         let mut registry = Registry::default();
         fs::create_dir(&dir).unwrap();

@@ -21,8 +21,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-const CASES: [&str; 10] = [
-    "L6", "L7", "L13", "L16", "L17-V14", "L52", "L52b", "V03", "L3", "L4",
+mod control_cases;
+
+const CASES: [&str; 15] = [
+    "L6", "L7", "L13", "L16", "L17-V14", "L52", "L52b", "V03", "L3", "L4", "L10", "L14", "L43",
+    "L44", "L50",
 ];
 
 // Drain notifications continuously, including while fault commands or probes block.
@@ -74,7 +77,9 @@ impl NotifyCapture {
                     Err(e)
                         if matches!(
                             e.kind(),
-                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                            io::ErrorKind::WouldBlock
+                                | io::ErrorKind::TimedOut
+                                | io::ErrorKind::Interrupted
                         ) =>
                     {
                         if stopping.load(Ordering::Relaxed) {
@@ -108,10 +113,14 @@ struct DaemonGuard<'a> {
     armed: bool,
     case: String,
     notify: Option<NotifyCapture>,
+    baseline_version: Option<u64>,
 }
 impl DaemonGuard<'_> {
     #[allow(clippy::too_many_lines)] // Keep start/restart continuity and fault cleanup ordering together.
     fn run(&mut self, case: &str) -> Result<String> {
+        if matches!(case, "L10" | "L14" | "L43" | "L44" | "L50") {
+            return self.run_control(case);
+        }
         let root = self.lab.prepare_check_v2()?;
         self.lab.boot_gateway(&[], "daemon-boot")?;
         self.lab.service_check(&mut Vec::new())?;
@@ -258,6 +267,7 @@ impl DaemonGuard<'_> {
         }
         Ok(observed)
     }
+    #[allow(clippy::too_many_lines)] // Keep cleanup ordering and deadline restoration visible.
     fn finish(&mut self) -> Result<()> {
         if !self.armed {
             return Ok(());
@@ -350,10 +360,21 @@ impl DaemonGuard<'_> {
                 .output(&Invocation::new(ns, program, &args), None);
         }
         let restored = self
-            .lab
-            .boot_gateway(&[], "daemon-restore")
+            .reset_control_fixture()
+            .and_then(|()| self.lab.daemon_restore_host())
+            .and_then(|()| self.lab.boot_gateway(&[], "daemon-restore"))
             .and_then(|_| self.lab.daemon_clean_baseline())
-            .and_then(|()| super::mounts::verify_restored_peers(None));
+            .and_then(|()| super::mounts::verify_restored_peers(None))
+            .and_then(|()| {
+                let run = self.lab.private.join("boot-root/run/scupper");
+                let _lease = scupper_sys::lock::SupervisorLease::try_acquire(&run)?;
+                let _writer = scupper_sys::lock::WriterLock::try_acquire(&run)?;
+                if run.join("control.sock").exists() {
+                    return fail("daemon cleanup left control socket");
+                }
+                self.lab.cmd("scupper", "conntrack", &["-F"])?;
+                Ok(())
+            });
         self.lab.runner.cleanup = cleanup;
         self.lab.runner.phase = phase;
         self.lab.runner.whole = whole;
@@ -368,14 +389,32 @@ impl Drop for DaemonGuard<'_> {
 
 impl Lab {
     pub(super) fn daemon_case(&mut self) -> Result<String> {
+        let first_group = self.runner.background_checkpoint();
+        self.daemon_host_baseline = Some(self.daemon_host_sysctls()?);
+        // Only this suite needs periodic client traffic during a real reboot.
+        let key = self.cmd("client", "wg", &["show", "wg0", "peers"])?;
+        let peer = key.trim();
+        self.cmd(
+            "client",
+            "wg",
+            &["set", "wg0", "peer", peer, "persistent-keepalive", "5"],
+        )?;
         let mut failures = Vec::new();
+        let mut blocked = None;
         for case in CASES {
-            self.runner.phase =
-                Instant::now() + Duration::from_secs(if case == "L3" { 300 } else { 180 });
+            self.runner.phase = Instant::now()
+                + Duration::from_secs(if matches!(case, "L3" | "L50") {
+                    300
+                } else {
+                    180
+                });
             let started = Instant::now();
-            let observed = self
-                .daemon_clean_baseline()
-                .and_then(|()| self.daemon_trial(case));
+            let observed = if let Some(cause) = &blocked {
+                fail(format!("skipped: baseline unavailable after {cause}"))
+            } else {
+                self.daemon_clean_baseline()
+                    .and_then(|()| self.daemon_trial(case))
+            };
             self.rows.push(Row {
                 name: format!("daemon-{case}"),
                 wanted: daemon_wanted(case).into(),
@@ -390,8 +429,42 @@ impl Lab {
             });
             evidence::save_results(&self.artifacts, &self.rows)?;
             if let Err(error) = observed {
+                if blocked.is_none() && self.daemon_clean_baseline().is_err() {
+                    blocked = Some(format!("{case}: {error}"));
+                }
                 failures.push(format!("{case}: {error}"));
             }
+        }
+        let saved_limits = (self.runner.cleanup, self.runner.phase, self.runner.whole);
+        self.runner.cleanup = true;
+        self.runner.phase = Instant::now() + Duration::from_secs(90);
+        self.runner.whole = self.runner.phase;
+        let isolation = (|| {
+            self.cmd(
+                "client",
+                "wg",
+                &["set", "wg0", "peer", peer, "persistent-keepalive", "0"],
+            )?;
+            self.daemon_wait("daemon processes released", Duration::from_secs(5), |lab| {
+                Ok(lab.runner.assert_background_released(first_group).is_ok())
+            })?;
+            // Every daemon stream listener is allocated from this range.
+            let sockets = self.cmd("internet", "ss", &["-H", "-lnt"])?;
+            for port in 8081..=8100 {
+                if sockets
+                    .split_whitespace()
+                    .any(|word| word.ends_with(&format!(":{port}")))
+                {
+                    return fail(format!("daemon suite left listener port {port} bound"));
+                }
+            }
+            self.cmd("gwhost", "conntrack", &["-F"])?;
+            self.daemon_clean_baseline()
+        })();
+        (self.runner.cleanup, self.runner.phase, self.runner.whole) = saved_limits;
+        if let Err(error) = isolation {
+            self.baseline_failure = Some(error.to_string());
+            failures.push(format!("daemon suite final baseline: {error}"));
         }
         if !failures.is_empty() {
             return fail(failures.join("; "));
@@ -399,12 +472,17 @@ impl Lab {
         Ok("all daemon cases verified; guarded cleanup, notify evidence and clean shutdown".into())
     }
     fn daemon_trial(&mut self, case: &str) -> Result<String> {
+        let events = self.private.join("boot-root/var-lib/scupper/events");
+        if events.exists() {
+            fs::remove_dir_all(events)?;
+        }
         let mut guard = DaemonGuard {
             lab: self,
             child: None,
             armed: true,
             case: case.into(),
             notify: None,
+            baseline_version: None,
         };
         let result = guard.run(case);
         let cleanup = guard.finish();
@@ -414,7 +492,56 @@ impl Lab {
             (Err(error), Err(cleanup)) => fail(format!("{error}; cleanup: {cleanup}")),
         }
     }
+    fn daemon_host_sysctls(&mut self) -> Result<Vec<(String, String)>> {
+        let mut values = Vec::new();
+        for key in [
+            "net.ipv4.ip_forward",
+            "net.ipv4.conf.all.rp_filter",
+            "net.ipv4.conf.default.rp_filter",
+            "net.ipv4.conf.all.send_redirects",
+            "net.ipv4.conf.default.send_redirects",
+            "net.ipv6.conf.all.forwarding",
+            "net.ipv6.conf.default.forwarding",
+            "net.ipv6.conf.all.accept_ra",
+            "net.ipv6.conf.default.accept_ra",
+            "net.ipv6.conf.all.autoconf",
+            "net.ipv6.conf.default.autoconf",
+        ] {
+            values.push((
+                key.to_owned(),
+                self.cmd("gwhost", "sysctl", &["-n", key])?
+                    .trim()
+                    .to_owned(),
+            ));
+        }
+        Ok(values)
+    }
+    fn daemon_restore_host(&mut self) -> Result<()> {
+        if let Some(values) = self.daemon_host_baseline.clone() {
+            for (key, value) in values {
+                self.cmd("gwhost", "sysctl", &["-q", "-w", &format!("{key}={value}")])?;
+            }
+        }
+        self.cmd("gwhost", "conntrack", &["-F"])?;
+        Ok(())
+    }
     pub(super) fn daemon_clean_baseline(&mut self) -> Result<()> {
+        if let Some(expected) = self.daemon_host_baseline.clone()
+            && self.daemon_host_sysctls()? != expected
+        {
+            return fail("unclean baseline: gwhost sysctls differ");
+        }
+        if super::mounts::count(
+            &fs::read_to_string("/proc/self/mountinfo")?,
+            super::mounts::SCUPPER,
+        )? != 1
+        {
+            return fail("unclean baseline: leftover scupper mounts");
+        }
+        let conntrack = self.cmd("gwhost", "conntrack", &["-L"])?;
+        if conntrack.contains("198.18.") || conntrack.contains("2001:db8:52:") {
+            return fail("unclean baseline: gwhost fault conntrack remains");
+        }
         let links: serde_json::Value =
             serde_json::from_str(&self.cmd("scupper", "ip", &["-j", "link", "show"])?)?;
         if links.as_array().is_none_or(|links| {
@@ -496,6 +623,30 @@ impl Lab {
                     complete |= message == "WATCHDOG=1";
                 }
                 Ok(ready && complete)
+            },
+        )?;
+        Ok(())
+    }
+    fn daemon_complete_tick(&mut self, root: &Path) -> Result<()> {
+        self.daemon_wait(
+            "first complete post-apply tick",
+            Duration::from_secs(40),
+            |_| {
+                Ok(matches!(
+                    scupper_sys::daemon::control::call(
+                        &root.join("run/scupper"),
+                        &scupper_sys::daemon::control::request(scupper_proto::Op::Ping {}),
+                        Duration::from_secs(2),
+                    ),
+                    Ok(scupper_proto::Response {
+                        result: Ok(scupper_proto::OpResult::Ping {
+                            last_complete_iteration_age: Some(0..=4),
+                            operation: None,
+                            ..
+                        }),
+                        ..
+                    })
+                ))
             },
         )?;
         Ok(())
@@ -1463,6 +1614,15 @@ pub(super) fn foreign_control(bytes: &[u8], markers: &[String]) -> Result<usize>
 
 fn daemon_wanted(case: &str) -> &'static str {
     match case {
+        "L10" => "SIGKILL/SIGSTOP: check 5, traffic continues; SIGCONT: check 0",
+        "L14" => "disconnect verifies closure; check 4 across reboot; connect restores 0",
+        "L43" => {
+            "recurring foreign link latches; forwarding stays 0 across restart/reboot; repair clear restores 0"
+        }
+        "L44" => "local apply races restart; writer contention bounded; samples closed or exact",
+        "L50" => {
+            "crash after durable Disconnected: check 3 while exit route exists; tightened closure gives 4"
+        }
         "L6" => {
             "check 3 and route event; tick-only stall stops watchdog while process lives; watchdog resumes; repair <=10s"
         }
@@ -1492,8 +1652,12 @@ mod tests {
 
     #[test]
     fn copied_event_artifacts_are_readable_without_changing_sources() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../target/daemon-event-artifacts")
+        let root = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../target/tmp")),
+                std::path::PathBuf::from,
+            )
+            .join("daemon-event-artifacts")
             .join(std::process::id().to_string());
         let source = root.join("source");
         let target = root.join("saved");
@@ -1516,9 +1680,45 @@ mod tests {
     }
 
     #[test]
+    fn notify_capture_survives_idle_and_sender_restart() {
+        use std::os::fd::AsRawFd;
+        let root = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../target/tmp")),
+                std::path::PathBuf::from,
+            )
+            .join(format!("notify-restart-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let directory = fs::File::open(&root).unwrap();
+        let path = format!("/proc/self/fd/{}/notify.sock", directory.as_raw_fd());
+        let receive = UnixDatagram::bind(&path).unwrap();
+        let capture = NotifyCapture::start(receive, &root.join("notify.jsonl")).unwrap();
+        for message in ["READY=1", "WATCHDOG=1", "READY=1", "WATCHDOG=1"] {
+            let sender = UnixDatagram::unbound().unwrap();
+            sender.send_to(message.as_bytes(), &path).unwrap();
+            drop(sender);
+            std::thread::sleep(Duration::from_millis(100));
+            assert_eq!(capture.drain().unwrap(), vec![message.to_owned()]);
+        }
+        drop(capture);
+        assert_eq!(
+            fs::read_to_string(root.join("notify.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            4
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn notify_artifact_keeps_every_message_even_when_consumers_drain() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../target/daemon-notify-artifacts")
+        let root = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../target/tmp")),
+                std::path::PathBuf::from,
+            )
+            .join("daemon-notify-artifacts")
             .join(std::process::id().to_string());
         fs::create_dir_all(&root).unwrap();
         let path = root.join("notify.jsonl");

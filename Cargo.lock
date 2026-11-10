@@ -411,6 +411,7 @@ dependencies = [
  "clap",
  "rustix",
  "scupper-core",
+ "scupper-proto",
  "scupper-sys",
  "serde_json",
 ]
@@ -452,6 +453,7 @@ dependencies = [
  "sha2",
  "socket2",
  "thiserror",
+ "toml",
  "webpki-roots",
  "zeroize",
 ]

@@ -72,6 +72,8 @@ struct Lab {
     expected_rules: serde_json::Value,
     rows: Vec<Row>,
     cleaned: bool,
+    baseline_failure: Option<String>,
+    daemon_host_baseline: Option<Vec<(String, String)>>,
     next_source_port: u16,
     exit_port: u16,
 }
@@ -148,7 +150,9 @@ fn run_inner(
         expected_rules: serde_json::Value::Null,
         rows: Vec::new(),
         cleaned: false,
-        next_source_port: 41000,
+        baseline_failure: None,
+        daemon_host_baseline: None,
+        next_source_port: 20000,
         exit_port: 51821,
     };
     let outcome: Result<()> = (|| {
@@ -164,7 +168,11 @@ fn run_inner(
         let mut failures = Vec::new();
         for case in Case::ALL {
             lab.runner.phase = Instant::now() + Duration::from_secs(140);
-            let result = lab.case(case);
+            let result = if let Some(cause) = &lab.baseline_failure {
+                fail(format!("skipped: daemon baseline unavailable: {cause}"))
+            } else {
+                lab.case(case)
+            };
             let (got, detail) = match &result {
                 Ok(observed) => (
                     observed.clone(),
@@ -409,6 +417,7 @@ impl Lab {
         self.next_source_port = self
             .next_source_port
             .checked_add(1)
+            .filter(|port| *port < 32768)
             .ok_or("probe source ports exhausted")?;
         let mut args = vec![
             "probe",
@@ -575,6 +584,9 @@ impl Lab {
             return Ok(());
         }
         self.cleaned = true;
+        self.runner.cleanup = true;
+        self.runner.whole = Instant::now() + Duration::from_secs(90);
+        self.runner.phase = self.runner.whole;
         let mut failures = Vec::new();
         let mut notes = Vec::new();
         if let Err(error) = mounts::save(&self.artifacts, "before-teardown", None) {
@@ -589,6 +601,31 @@ impl Lab {
             }
         }
         self.services.clear();
+        let released_by = Instant::now() + Duration::from_secs(5);
+        while let Err(error) = self.runner.assert_background_released(0) {
+            if Instant::now() >= released_by {
+                failures.push(error.to_string());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        if self.artifacts.join("sink.jsonl").exists() {
+            let released = self
+                .cmd("internet", "ss", &["-H", "-lntu"])
+                .and_then(|sockets| {
+                    if sockets
+                        .split_whitespace()
+                        .any(|word| word.ends_with(&format!(":{}", addresses::PORT)))
+                    {
+                        fail("suite left a marker sink port bound")
+                    } else {
+                        Ok(())
+                    }
+                });
+            if let Err(error) = released {
+                failures.push(error.to_string());
+            }
+        }
         match self.registry.cleanup(&mut self.runner) {
             Ok(reports) => notes.extend(reports),
             Err(error) => failures.push(error.to_string()),

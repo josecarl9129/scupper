@@ -96,6 +96,10 @@ impl BootReport {
 
 /// Injectable namespace opening boundary. Creation itself uses the command trace.
 pub trait BootNamespace {
+    /// Published namespace name used by reconciliation after the handoff.
+    fn path(&self) -> &Path {
+        Path::new("/run/netns/scupper")
+    }
     /// Opens the owned namespace, distinguishing absence from invalid/host handles.
     ///
     /// # Errors
@@ -126,6 +130,7 @@ pub enum BootPoint {
 }
 
 /// Boot's explicit I/O dependencies. Production roots are fixed by the CLI.
+#[derive(Clone, Copy)]
 pub struct BootDeps<'a> {
     /// Kernel executor and clock.
     pub system: &'a dyn System,
@@ -379,6 +384,8 @@ fn containment(
     }
 }
 
+// Fault-injection hooks share the fallible checkpoint signature in every build.
+#[cfg_attr(not(feature = "testing"), allow(clippy::unnecessary_wraps))]
 fn checkpoint(deps: &BootDeps<'_>, step: BootStep) -> Result<()> {
     #[cfg(feature = "testing")]
     if let Some(hook) = deps.hook {
@@ -425,8 +432,17 @@ pub fn boot(deps: &BootDeps<'_>) -> BootReport {
     boot_with_guard(deps, &guard)
 }
 
-pub(crate) fn boot_with_guard(deps: &BootDeps<'_>, _guard: &WriterGuard) -> BootReport {
-    let report = boot_locked(deps, BootReport::default());
+pub(crate) fn boot_with_guard(deps: &BootDeps<'_>, guard: &WriterGuard) -> BootReport {
+    boot_apply_with_guard(deps, guard, false)
+}
+
+/// Explicit apply may open the gate while durable quarantine remains until verification.
+pub(crate) fn boot_apply_with_guard(
+    deps: &BootDeps<'_>,
+    _guard: &WriterGuard,
+    open_quarantined: bool,
+) -> BootReport {
+    let report = boot_locked(deps, BootReport::default(), open_quarantined);
     if !report.succeeded() {
         let mut report = report;
         if let Err(error) = save_report(deps, &report) {
@@ -456,7 +472,7 @@ pub(crate) fn save_report_at(run_root: &Path, report: &BootReport) -> Result<()>
 }
 
 #[allow(clippy::too_many_lines)] // Keep the ordered build and its failure boundaries together.
-fn boot_locked(deps: &BootDeps<'_>, mut report: BootReport) -> BootReport {
+fn boot_locked(deps: &BootDeps<'_>, mut report: BootReport, open_quarantined: bool) -> BootReport {
     if !step(&mut report, deps, BootStep::Lock, false, || Ok(())) {
         return report;
     }
@@ -488,7 +504,9 @@ fn boot_locked(deps: &BootDeps<'_>, mut report: BootReport) -> BootReport {
             && !cfg.missing_state_alert
             && links::adoptable(deps, &handle, &cfg).is_ok()
             && containment(deps, &handle, &cfg, &mut owned_links).is_ok()
-            && sysctls(deps, &handle, &names, true, false).is_ok();
+            && (sysctls(deps, &handle, &names, true, false).is_ok()
+                || (cfg.state.selection == Selection::Disconnected
+                    && sysctls(deps, &handle, &names, false, false).is_ok()));
         let closed = if adopted {
             Ok(())
         } else {
@@ -650,7 +668,7 @@ fn boot_locked(deps: &BootDeps<'_>, mut report: BootReport) -> BootReport {
             deps,
             &handle,
             &configured_names(&cfg)?,
-            cfg.state.quarantine.is_none() && !cfg.missing_state_alert,
+            (cfg.state.quarantine.is_none() || open_quarantined) && !cfg.missing_state_alert,
             true,
         )
     }) {
@@ -679,4 +697,26 @@ pub(crate) fn configured_names(cfg: &Inputs) -> Result<Vec<IfName>> {
         .chain(gw.exits().iter().map(|e| e.ifname().as_str()))
         .map(|name| IfName::new(name).map_err(|e| e.to_string()))
         .collect()
+}
+
+/// Internal fixture boundary for release-restricted multi-gateway configurations.
+#[cfg(feature = "testing")]
+pub mod testing {
+    /// Reconfigures the client link using the production peer/session path.
+    /// # Errors
+    /// Returns missing inputs, namespace or link configuration errors.
+    pub fn configure_clients(
+        deps: super::BootDeps<'_>,
+        site: scupper_core::config::ValidatedSite,
+    ) -> Result<(), String> {
+        let mut cfg =
+            super::inputs_for_link(&deps, &mut super::BootReport::default(), Some("wg0"))?;
+        cfg.site = site;
+        let held = deps
+            .namespace
+            .open()
+            .map_err(|error| error.to_string())?
+            .ok_or("missing namespace")?;
+        super::links::configure_one(&deps, &held, &cfg, "wg0")
+    }
 }

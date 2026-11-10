@@ -146,7 +146,7 @@ impl<'a> RealKernel<'a> {
             held,
             config,
             health,
-            "/run/netns/scupper".into(),
+            deps.namespace.path().into(),
             None,
             state,
         )?;
@@ -463,7 +463,8 @@ impl Kernel for RealKernel<'_> {
                 self.run(KernelCmd::Ip(IpCmd::RouteReplace(*family, target.clone())))
             }
             Step::RouteDelete { route } => {
-                self.run(KernelCmd::Ip(IpCmd::RouteDelete(route.clone())))
+                crate::cmd::delete_observed_route(self.deps.system, &self.held, route)
+                    .map_err(|_| StepError("route deletion failed"))
             }
             Step::RuleDelete { rule } => {
                 crate::cmd::delete_observed_rule(self.deps.system, &self.held, rule)
@@ -578,6 +579,26 @@ pub(crate) fn forwarding(
             failed |= result.is_err();
         }
     }
+    // ip_forward toggles reset accept_redirects. Restore hardening even on
+    // closure, so a stopped disconnected machine remains safely adoptable.
+    if only.is_none() {
+        let names = links
+            .iter()
+            .filter_map(|link| IfName::new(&link.ifname).ok())
+            .collect::<Vec<_>>();
+        for setting in scupper_core::render::desired_sysctls(&names, on) {
+            if matches!(setting.key.name, "forwarding" | "ip_forward") {
+                continue;
+            }
+            if setting.value.parse::<i64>().map_or(true, |value| {
+                write_sysctl_verified(deps.system, held, &setting.key, value, EXEC_TIMEOUT).is_err()
+            }) {
+                // The gate result remains authoritative. The ordinary collector
+                // reports this drift as HardeningSysctl and plans its repair.
+                eprintln!("scupperd: HardeningSysctl: {:?}", setting.key);
+            }
+        }
+    }
     if failed {
         Err(StepError("forwarding write/readback failed"))
     } else {
@@ -610,8 +631,17 @@ mod tests {
     #[test]
     fn recreated_link_identity_survives_a_restart_and_refuses_wrong_namespace() {
         use crate::boot::{BootStep, NamespaceIdentity, StepResult};
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/owned-link-handoff")
+        let root = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || {
+                    std::path::PathBuf::from(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../target/tmp"
+                    ))
+                },
+                std::path::PathBuf::from,
+            )
+            .join("owned-link-handoff")
             .join(std::process::id().to_string());
         let guard = crate::lock::WriterLock::acquire(&root).unwrap();
         let report = BootReport {

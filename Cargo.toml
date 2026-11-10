@@ -14,7 +14,7 @@ scupper-proto = { version = "0.1.0", path = "crates/scupper-proto" }
 scupper-core = { version = "0.1.0", path = "crates/scupper-core" }
 scupper-sys = { version = "0.1.0", path = "crates/scupper-sys" }
 clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
-rustix = { version = "1", default-features = false, features = ["std", "process", "fs", "thread", "rand"] }
+rustix = { version = "1", default-features = false, features = ["std", "process", "fs", "thread", "rand", "net"] }
 thiserror = "2"
 socket2 = { version = "0.6", features = ["all"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }

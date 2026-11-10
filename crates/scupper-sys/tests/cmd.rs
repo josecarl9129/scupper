@@ -5,11 +5,12 @@ use scupper_core::{
     render::{Family, RouteTarget, Scope, SysctlFamily, SysctlKey},
     rules::IfName,
 };
-use scupper_sys::{
-    cmd::*,
-    system::{ExecTarget, Program},
-};
-use std::{error::Error, time::Duration};
+#[cfg(feature = "testing")]
+use scupper_sys::system::ExecTarget;
+use scupper_sys::{cmd::*, system::Program};
+use std::error::Error;
+#[cfg(feature = "testing")]
+use std::time::Duration;
 
 fn key() -> Result<PeerKey, scupper_core::parse::ParseError> {
     PeerKey::new(&format!("{}=", "A".repeat(43)))
@@ -255,6 +256,8 @@ fn wg_cases() -> Result<Vec<WgCase>, Box<dyn Error>> {
             "wg0".into(),
             "peer".into(),
             key()?.to_string(),
+            "preshared-key".into(),
+            "/dev/null".into(),
             "allowed-ips".into(),
             "10.99.0.2/32,fd00:99::2/128".into(),
             "endpoint".into(),
@@ -276,6 +279,8 @@ fn wg_cases() -> Result<Vec<WgCase>, Box<dyn Error>> {
             "wg0".into(),
             "peer".into(),
             key()?.to_string(),
+            "preshared-key".into(),
+            "/dev/null".into(),
             "allowed-ips".into(),
             String::new(),
         ],
@@ -289,8 +294,16 @@ fn every_wg_variant_argv_and_forbidden_tokens() -> Result<(), Box<dyn Error>> {
         let (program, args) = KernelCmd::Wg(cmd.clone()).render();
         assert_eq!(program, Program::Wg);
         assert_eq!(args, expected, "{cmd:?}");
-        for token in ["showconf", "dump", "preshared-keys", "preshared-key"] {
+        for token in ["showconf", "dump", "preshared-keys"] {
             assert!(!args.iter().any(|arg| arg == token), "{cmd:?}");
+        }
+        if matches!(cmd, WgCmd::SetPeer { .. }) {
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["preshared-key", "/dev/null"])
+            );
+        } else {
+            assert!(!args.iter().any(|arg| arg == "preshared-key"));
         }
         if matches!(cmd, WgCmd::SetPrivateKeyFromStdin { .. }) {
             assert_eq!(args, ["set", "wg0", "private-key", "/dev/stdin"]);
@@ -408,7 +421,12 @@ fn shared_userspace_sockets_block_every_namespace_wg_device_command() -> Result<
 {
     use scupper_sys::system::{ExecError, ExecOutput, testing::FakeSystem};
     use std::os::{fd::AsRawFd, unix::net::UnixListener};
-    let root = std::env::temp_dir().join(format!("wg-sockets-{}", std::process::id()));
+    let root = std::env::var_os("CARGO_TARGET_TMPDIR")
+        .map_or_else(
+            || std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/tmp")),
+            std::path::PathBuf::from,
+        )
+        .join(format!("wg-sockets-{}", std::process::id()));
     std::fs::create_dir(&root)?;
     let handle = scupper_sys::netns::testing::handle()?;
     let dirs = [root.join("var-run-wireguard"), root.join("run-wireguard")];
@@ -505,6 +523,88 @@ fn sysctl_readback_decides_success_across_procps_statuses() -> Result<(), Box<dy
             sys.calls()
                 .iter()
                 .all(|call| call.target_identity == Some(handle.identity()))
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "testing")]
+#[test]
+fn route_delete_requires_observed_absence() -> Result<(), Box<dyn Error>> {
+    use scupper_sys::system::{ExecError, ExecOutput, System};
+    struct Routes {
+        inventory: String,
+        fail_inventory: bool,
+    }
+    impl System for Routes {
+        fn now_unix_secs(&self) -> u64 {
+            1000
+        }
+        fn run(&self, _: Program, _: &[String], _: Duration) -> Result<ExecOutput, ExecError> {
+            unreachable!()
+        }
+        fn run_in(
+            &self,
+            target: ExecTarget<'_>,
+            program: Program,
+            args: &[String],
+            _: Duration,
+        ) -> Result<ExecOutput, ExecError> {
+            assert!(matches!(target, ExecTarget::Netns(_)));
+            assert_eq!(program, Program::Ip);
+            let deleting = args.iter().any(|arg| arg == "del");
+            Ok(ExecOutput {
+                status: Some(i32::from(deleting || self.fail_inventory)),
+                stdout: if deleting {
+                    String::new()
+                } else {
+                    self.inventory.clone()
+                },
+                stderr: "route disappeared".into(),
+            })
+        }
+    }
+    let entry = scupper_core::parse::parse_ip_route(r#"[{"dst":"198.18.0.0/24","dev":"foreign0","protocol":"kernel","scope":"link","prefsrc":"198.18.0.1"}]"#)?.remove(0);
+    let route = scupper_core::planner::RouteKey {
+        family: Family::V4,
+        entry: entry.clone(),
+    };
+    let held = scupper_sys::netns::testing::handle()?;
+    assert!(
+        delete_observed_route(
+            &Routes {
+                inventory: "[]".into(),
+                fail_inventory: false
+            },
+            &held,
+            &route
+        )
+        .is_ok()
+    );
+    let present = r#"[{"dst":"198.18.0.0/24","dev":"foreign0","protocol":"kernel","scope":"link","prefsrc":"198.18.0.1"}]"#;
+    assert!(
+        delete_observed_route(
+            &Routes {
+                inventory: present.into(),
+                fail_inventory: false
+            },
+            &held,
+            &route
+        )
+        .is_err()
+    );
+    let changed_flags = r#"[{"dst":"198.18.0.0/24","dev":"foreign0","protocol":"boot","scope":"global","prefsrc":"198.18.0.2","flags":["linkdown"]}]"#;
+    for (inventory, fail_inventory) in [("bad json", false), ("[]", true), (changed_flags, false)] {
+        assert!(
+            delete_observed_route(
+                &Routes {
+                    inventory: inventory.into(),
+                    fail_inventory
+                },
+                &held,
+                &route
+            )
+            .is_err()
         );
     }
     Ok(())

@@ -55,7 +55,17 @@ impl TempDir {
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         // All new test artifacts stay inside the current worktree.
-        let parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/persistence-tests");
+        let parent = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || {
+                    std::path::PathBuf::from(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../target/tmp"
+                    ))
+                },
+                std::path::PathBuf::from,
+            )
+            .join("persistence-tests");
         fs::create_dir_all(&parent).unwrap();
         loop {
             let path = parent.join(format!(
@@ -435,6 +445,10 @@ fn state_round_trip_and_fail_closed_reads() {
     for invalid in [
         "not JSON".into(),
         "{}".into(),
+        serde_json::to_string(&closed_state()).unwrap().replace(
+            "\"schema\":1",
+            "\"schema\":1,\"last_repair_reason\":\"round one context\"",
+        ),
         "{\"schema\":1,\"selection\":\"Auto\",\"quarantine\":null}".into(),
         "{\"schema\":1,\"selection\":\"Auto\",\"applied_version\":null}".into(),
         serde_json::to_string(&closed_state())

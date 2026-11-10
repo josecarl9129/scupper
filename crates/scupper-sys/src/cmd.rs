@@ -260,6 +260,8 @@ impl WgCmd {
                     ifname.as_str(),
                     "peer",
                     public_key.as_str(),
+                    "preshared-key",
+                    "/dev/null",
                     "allowed-ips",
                     &allowed_ips
                         .iter()
@@ -619,6 +621,48 @@ pub(crate) fn delete_observed_rule(
     )?;
     if output.status != Some(0) {
         return Err(ExecError::spawn("rule deletion failed"));
+    }
+    Ok(())
+}
+
+/// Delete an observed route, accepting a concurrent disappearance only after inventory.
+/// # Errors
+/// Returns command, inventory or parsing errors while the route remains unproved absent.
+pub fn delete_observed_route(
+    system: &dyn crate::system::System,
+    held: &crate::netns::NetnsHandle,
+    route: &scupper_core::planner::RouteKey,
+) -> Result<(), crate::verdict::ProbeError> {
+    if let Err(error) = crate::canon::command_result(run_netns_cmd(
+        system,
+        held,
+        &KernelCmd::Ip(IpCmd::RouteDelete(route.clone())),
+        crate::system::EXEC_TIMEOUT,
+    )) {
+        let text = crate::canon::command_result(run_netns_cmd(
+            system,
+            held,
+            &KernelCmd::Ip(IpCmd::RouteShowJson {
+                family: route.family,
+                table: RouteTable::All,
+            }),
+            crate::system::EXEC_TIMEOUT,
+        ))?;
+        if scupper_core::parse::parse_ip_route(&text)?
+            .iter()
+            .any(|entry| {
+                let old = &route.entry;
+                entry.table == old.table
+                    && entry.dst == old.dst
+                    && entry.kind == old.kind
+                    && entry.from == old.from
+                    && entry.dev == old.dev
+                    && entry.gateway == old.gateway
+                    && entry.metric == old.metric
+            })
+        {
+            return Err(error);
+        }
     }
     Ok(())
 }

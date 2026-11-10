@@ -280,7 +280,17 @@ mod tests {
 
     #[test]
     fn planted_fifo_does_not_block_open() -> Result<(), Box<dyn Error>> {
-        let path = std::env::temp_dir().join(format!("netns-fifo-{}", std::process::id()));
+        let path = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || {
+                    std::path::PathBuf::from(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../target/tmp"
+                    ))
+                },
+                std::path::PathBuf::from,
+            )
+            .join(format!("netns-fifo-{}", std::process::id()));
         assert!(
             std::process::Command::new("/usr/bin/mkfifo")
                 .arg(&path)
@@ -297,7 +307,17 @@ mod tests {
 
     #[test]
     fn regular_file_is_rejected() -> Result<(), Box<dyn Error>> {
-        let path = std::env::temp_dir().join(format!("netns-test-{}", std::process::id()));
+        let path = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || {
+                    std::path::PathBuf::from(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../target/tmp"
+                    ))
+                },
+                std::path::PathBuf::from,
+            )
+            .join(format!("netns-test-{}", std::process::id()));
         let file = File::create(&path)?;
         let result = NetnsHandle::open(&path);
         drop(file);

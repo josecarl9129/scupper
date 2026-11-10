@@ -966,7 +966,8 @@ creating links. Each step is idempotent. Property: **every prefix of every
 plan satisfies `safe(state)`** (no forward path to a non-exit; forwarding on
 implies a verified ruleset). On a failed step, scupperd re-plans from the
 observed state toward the **previous** applied version and alerts;
-`applied_version` changes only after a verified full apply.
+`applied_version` is published under closed gates before the target boot. A failed
+live apply restores the previous version and reports its rollback result (§18).
 
 ---
 
@@ -1659,6 +1660,15 @@ A full-screen TUI stays R2+.
 
 Scripts that page on any non-zero code page on 5; that is intended.
 
+Ping publishes an active apply or rebuild with its source and target versions
+and elapsed age. Check reports `Degraded::OperationInProgress` (3) during this
+transition, including rollback, without comparing the kernel to the version
+being published in state.json. This is an availability indication; no topology
+verdict is asserted until the transition publishes its attached snapshot.
+Only a Check with no reply before its deadline retains the first Ping's age
+for stage 8. Explicit refusal, EOF or SupervisorUnavailable uses a fresh Ping,
+with an unavailable supervisor treated as Dead.
+
 ### Check order (severity, safety before availability; costly stages run only if earlier ones passed)
 
 | Stage | Observation | Fails with |
@@ -1691,6 +1701,12 @@ and always adds `Warning::ClockSkew`, including beyond the skew bound,
 where it is stale. `check` run locally performs every
 stage itself; via the API, scupperd runs a fresh check. `status` may show
 cached observations, always with their age.
+
+`Warning::HardeningSysctl` includes a default forwarding sysctl that disagrees
+with its corresponding global gate. This consistency warning applies when
+the global gate is either open or closed. Hardening restoration failures do
+not override a successfully verified forwarding-gate result; subsequent
+observations retain the hardening drift for repair and warnings.
 
 **Coverage.** A gateway `check` = 0 states that the gateway side works:
 containment, the exit path, the gateway's DNS and the listening side of the
@@ -1760,6 +1776,7 @@ pub enum Degraded {
     ForwardingDisabled,
     RouteWrong { client: ClientAddr, got: RouteAnswer, want: RouteTarget },
     DisconnectNotEffective,
+    OperationInProgress { from: u64, to: u64 }, // snapshot transition; no kernel comparison
     ClientSideBroken(ClientFault),             // wg0 key, listen port or host socket
     ExitProbeFailed(ProbeError),               // the probe ran and the path failed (not a local setup error)
     ExitProbeImplausible { ip: IpAddr },       // exit IP cannot be a public exit address
@@ -2060,6 +2077,11 @@ the local link) and that nothing else does.
 
 ## 15. Install, boot, upgrades, migration, rebuild
 
+A manual boot defers only to an initialized supervisor holding the currently
+named namespace. If a local CLI writer holds the lease, boot fails; wait for
+that writer, or stop scupperd before rerunning after a stale namespace refusal.
+
+
 ### `scupper install` (basic in M2, hardened in M6)
 
 Idempotent and plan-based: `--plan` prints steps, `--check` exits non-zero
@@ -2109,7 +2131,7 @@ WantedBy=multi-user.target
 
 | Unit | Dependencies | Other |
 |---|---|---|
-| `scupperd.service` | `Wants=` + `After=scupper-net.service network-online.target`; `Upholds=scupper-edge.service` | `Type=notify`, `WatchdogSec=30`, `Restart=always`, `LimitCORE=0` (inherited by probe and delivery children). Deliberately `Wants=`, not `Requires=`: if boot failed, scupperd must still start to alert and to retry the boot procedure under its repair budget (which is the same ordered, closed procedure). |
+| `scupperd.service` | `Wants=` + `After=scupper-net.service network-online.target`; `Upholds=scupper-edge.service` | `Type=notify`, `WatchdogSec=30`, `Restart=always`, `RestartSec=2s`, `StartLimitIntervalSec=0`, `TimeoutStartSec=90` (covers the bounded 60 s wait for the supervisor lease at start), `LimitCORE=0` (inherited by probe and delivery children). scupperd holds a lifetime supervisor lease (`/run/scupper/scupperd.lock`); while it is held, `scupper boot` (and so a manual `systemctl restart scupper-net`) runs no kernel steps and exits 0 with a notice that scupperd owns the namespace, and the CLI never falls back to local mutation. Deliberately `Wants=`, not `Requires=`: if boot failed, scupperd must still start to alert and to retry the boot procedure under its repair budget (which is the same ordered, closed procedure). |
 | `scupper-edge.service` | `Requires=` + `BindsTo=` + `After=scupper-net.service` | `NetworkNamespacePath=/run/netns/scupper`, `User=scupper-edge`, `AmbientCapabilities=CAP_NET_BIND_SERVICE`, `CapabilityBoundingSet=CAP_NET_BIND_SERVICE`, `NoNewPrivileges=yes`, `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`, `TemporaryFileSystem=/run`, `BindPaths=/run/scupper/edge.sock`, `LimitCORE=0`, `WatchdogSec=30`, `Restart=always`. A failed namespace unit prevents edge from starting; after a rebuild scupperd restarts edge, and every tick it checks that edge runs in the held namespace (§7). |
 
 ### `scupper boot` (stops at the first failure; every prefix is closed)
@@ -2499,6 +2521,17 @@ several gateways (rejected in R1); `devices.*.gateways` is a list;
 ---
 
 ## 18. Failure modes
+
+A full apply closes forwarding before publishing its target version durably.
+If the process crashes before verification or rollback, the next start retries
+that target under the boot budget and remains closed on failure. The operator
+can recover with `scupper apply N` for the previous known-good version. A live
+failed apply reports whether the previous version was restored and verified,
+or rollback failed and forwarding was closed (or closure could not be verified).
+
+Local control clients must keep the write side open until they receive a reply;
+do not shut down the write side after sending a request. Queued disconnects
+still execute after a client hangs up because they only tighten policy.
 
 | Failure | Effect | Detection | Response |
 |---|---|---|---|

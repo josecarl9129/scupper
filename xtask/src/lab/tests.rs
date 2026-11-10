@@ -308,8 +308,12 @@ fn every_external_program_uses_argv_namespace_entry_and_a_timeout() {
     }
 }
 fn test_dir(name: &str) -> PathBuf {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join(format!("../target/lab-test-{name}-{}", std::process::id()));
+    let path = std::env::var_os("CARGO_TARGET_TMPDIR")
+        .map_or_else(
+            || PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../target/tmp")),
+            PathBuf::from,
+        )
+        .join(format!("lab-test-{name}-{}", std::process::id()));
     fs::create_dir_all(&path).unwrap();
     path
 }
@@ -371,6 +375,7 @@ fn background_processes_shutdown_cleanly_and_early_exit_fails() {
         fs::File::create(dir.join("trace")).unwrap(),
         Arc::clone(&cancel),
     );
+    let checkpoint = runner.background_checkpoint();
     let mut group = runner
         .background(
             &Invocation::new("", "sleep", &["5"]),
@@ -378,7 +383,9 @@ fn background_processes_shutdown_cleanly_and_early_exit_fails() {
         )
         .unwrap();
     group.alive().unwrap();
+    assert!(runner.assert_background_released(checkpoint).is_err());
     group.stop(rustix::process::Signal::TERM).unwrap();
+    runner.assert_background_released(checkpoint).unwrap();
     group.stop(rustix::process::Signal::TERM).unwrap();
     let mut group = runner
         .background(

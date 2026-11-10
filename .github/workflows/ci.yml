@@ -16,11 +16,15 @@ concurrency:
 env:
   CARGO_TERM_COLOR: never
   CARGO_INCREMENTAL: "0"
+  CARGO_TARGET_TMPDIR: ${{ github.workspace }}/target/tmp
   CARGO_DENY_VERSION: "0.20.2"
 
 jobs:
+  # On lab/** branches only the leak lab runs; the full gate runs locally before every
+  # lab push and again in CI on main.
   gate:
     name: fmt, clippy, test, doc, deny
+    if: ${{ !startsWith(github.ref, 'refs/heads/lab/') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -80,7 +84,26 @@ jobs:
       - name: Default-feature build
         run: timeout 600 cargo build --workspace --locked
 
+  production:
+    name: shipped startup without testing feature
+    if: ${{ !startsWith(github.ref, 'refs/heads/lab/') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Clippy without testing
+        run: timeout 600 cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Unit tests without testing
+        run: timeout 600 cargo test --workspace --lib --bins --locked
+      - name: Release daemon
+        run: timeout 600 cargo build -p scupperd --release --locked
+
   musl:
+    if: ${{ !startsWith(github.ref, 'refs/heads/lab/') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -133,9 +156,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-24.04, ubuntu-22.04]
+        # Lab branches run one runner to save CI minutes; main runs both.
+        runner: ${{ startsWith(github.ref, 'refs/heads/lab/') && fromJSON('["ubuntu-24.04"]') || fromJSON('["ubuntu-24.04", "ubuntu-22.04"]') }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 25
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with:
@@ -157,7 +181,7 @@ jobs:
         run: timeout 600 cargo build -p scupper -p scupperd --features testing --locked
 
       - name: Run boot-built namespace lab
-        run: sudo timeout 1200 target/release/xtask leaktest --artifacts lab-out --capture-fixtures lab-out/fixtures
+        run: sudo timeout 1800 target/release/xtask leaktest --artifacts lab-out --capture-fixtures lab-out/fixtures
 
       - name: Make lab diagnostics readable
         if: always()

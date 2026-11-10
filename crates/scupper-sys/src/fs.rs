@@ -396,11 +396,26 @@ mod tests {
                 let _ = fs::remove_dir_all(&self.0);
             }
         }
-        let directory = Directory(std::env::temp_dir().join(format!(
-            "scupper-exclusive-test-{}-{}", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                .map_err(io::Error::other)?.as_nanos()
-        )));
+        let directory = Directory(
+            std::env::var_os("CARGO_TARGET_TMPDIR")
+                .map_or_else(
+                    || {
+                        std::path::PathBuf::from(concat!(
+                            env!("CARGO_MANIFEST_DIR"),
+                            "/../../target/tmp"
+                        ))
+                    },
+                    std::path::PathBuf::from,
+                )
+                .join(format!(
+                    "scupper-exclusive-test-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_err(io::Error::other)?
+                        .as_nanos()
+                )),
+        );
         fs::create_dir(&directory.0)?;
         let path = directory.0.join(".scupper-1-0.tmp");
         let mut file = create_temp_file(&path)?;

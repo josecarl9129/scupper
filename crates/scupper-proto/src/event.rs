@@ -181,7 +181,8 @@ event_kinds! {
     Repair { kind: StepKind = StepKind::LoadRuleset, class: RepairClass = RepairClass::Restore, result: Outcome = Outcome::Succeeded },
     RepairSuppressed { object: ObjectKind = ObjectKind::Ruleset },
     VerdictChanged { from: VerdictCode = VerdictCode::Protected, to: VerdictCode = VerdictCode::FailClosed },
-    AdminAction { command: Command = Command::RepairClear },
+    AdminAction { command: Command = Command::RepairClear, reason: Option<String> = None },
+    ControlUnavailable { count: u64 = 1 },
     DaemonStarted { version: Release = Release {major: 0, minor: 1, patch: 0} },
     Boot { result: Outcome = Outcome::Recovered, step: StepKind = StepKind::EventLog },
     SinkFailed { sink: Identifier = Identifier("primary".into()), reason: Reason = Reason::ExecutionFailed },
@@ -271,6 +272,7 @@ impl From<PlannerEvent> for EventKind {
                 reason: Reason::ExecutionFailed,
             },
             PlannerEvent::AdminAction { action } => Self::AdminAction {
+                reason: None,
                 command: match action {
                     ClearLatch::RepairClear => Command::RepairClear,
                     ClearLatch::VerifiedFullApply => Command::Apply,

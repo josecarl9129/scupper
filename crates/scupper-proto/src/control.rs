@@ -61,8 +61,11 @@ pub enum Op, op_samples {
     },
     /// Inspect the persistent quarantine latch.
     RepairStatus {},
-    /// Explicitly clear quarantine. Optional CLI prose is reduced to an enum.
-    RepairClear {},
+    /// Explicitly clear quarantine and retain bounded operator context.
+    RepairClear {
+        /// One line, at most 1024 bytes; retained in durable safety state.
+        reason: Option<String> = Some("operator recovery".into()),
+    },
     /// Commit validated site TOML with an optimistic parent precondition.
     Commit {
         /// Expected head; None means a fresh store.
@@ -87,19 +90,36 @@ vocabulary!(
     Conflict,
     SupervisorUnavailable,
     PersistenceUnavailable,
+    RollbackFailed,
     Timeout,
-    Internal
+    Internal,
+    DisconnectNotEffective,
+    Quarantined,
+    NotReady
 );
 /// Public error with a stable code and no reflected input or diagnostic string.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApiError {
     /// Stable caller-visible classification.
     pub code: ApiErrorCode,
+    /// Fresh staged report when a disconnect could not prove kernel closure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<serde_json::Value>,
 }
 impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self.code)
+        write!(f, "{:?}", self.code)?;
+        if let Some(rollback) = self.observation.as_ref().and_then(|o| o.get("rollback")) {
+            if rollback["verified"] == true {
+                write!(f, ": rolled back to {} (verified)", rollback["version"])?;
+            } else if rollback["closed"] == true {
+                write!(f, ": rollback failed: closed")?;
+            } else {
+                write!(f, ": rollback failed: closure unverified")?;
+            }
+        }
+        Ok(())
     }
 }
 impl std::error::Error for ApiError {}
@@ -135,6 +155,74 @@ impl From<&crate::Report> for HealthSummary {
         }
     }
 }
+/// Cached public kernel facts; unknown values remain null.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KernelObservation {
+    /// Canonical match with the applied ruleset.
+    pub ruleset_exact: Option<bool>,
+    /// Observed global IPv4 forwarding gate.
+    pub forwarding_v4: Option<i64>,
+    /// Observed global IPv6 forwarding gate.
+    pub forwarding_v6: Option<i64>,
+    /// Observed IPv4 default, including missing and unreachable.
+    pub default_v4: Option<String>,
+    /// Observed IPv6 default, including missing and unreachable.
+    pub default_v6: Option<String>,
+    /// Observed link state without addresses, peer keys or endpoints.
+    pub links: Vec<LinkObservation>,
+}
+/// Cached operational state of one namespace link.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkObservation {
+    /// Kernel interface name, including foreign names.
+    pub name: String,
+    /// Whether the link was up.
+    pub up: Option<bool>,
+    /// Whether any peers were present.
+    pub peers_present: Option<bool>,
+}
+
+/// Last completed reconciler observation and attempted action categories.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TickObservation {
+    /// Whether all required tick observations completed.
+    pub complete: bool,
+    /// Safety observation time in milliseconds.
+    pub safety_ms: u64,
+    /// Attempted action categories, without addresses or command strings.
+    pub steps: Vec<crate::StepKind>,
+    /// Failed action categories.
+    pub failed_steps: Vec<crate::StepKind>,
+    /// Last kernel snapshot, independent of the actions attempted afterward.
+    pub kernel: Option<KernelObservation>,
+}
+
+/// A transition whose kernel configuration is not yet published as verified.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationProgress {
+    /// Apply or namespace rebuild.
+    pub kind: OperationKind,
+    /// Previously attached version.
+    pub from: u64,
+    /// Requested version.
+    pub to: u64,
+    /// Monotonic elapsed seconds.
+    pub age: u64,
+}
+
+/// Serialized transition kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OperationKind {
+    /// Full configuration apply, including rollback.
+    Apply,
+    /// Namespace replacement.
+    Rebuild,
+}
+
 sampled_enum! {
 /// Successful reply alphabet, with one result per operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,6 +232,20 @@ pub enum OpResult, result_samples {
     Ping {
         /// Monotonic age in whole seconds, supplied by the supervisor.
         last_complete_iteration_age: Option<u64> = Some(2),
+        /// Age of the running tick in seconds; null while idle.
+        #[serde(default)]
+        current_iteration_age: Option<u64> = None,
+        /// Active kernel transition; checks report it without comparing versions.
+        #[serde(default)]
+        operation: Option<OperationProgress> = None,
+        /// Identity of the supervisor's held namespace.
+        netns: scupper_core::verdict::v2::NetnsIdentity = scupper_core::verdict::v2::NetnsIdentity { device: 1, inode: 2 },
+        /// Applied immutable version.
+        version: u64 = 1,
+        /// Persistent quarantine state.
+        quarantined: bool = false,
+        /// Durable administrative intent.
+        selection: scupper_core::verdict::v2::Selection = scupper_core::verdict::v2::Selection::Auto,
     },
     /// Cached health and its age.
     Status {
@@ -151,11 +253,15 @@ pub enum OpResult, result_samples {
         health: HealthSummary = sample_health(),
         /// Monotonic age in seconds.
         age: u64 = 3,
+        /// Cached reconcile observations; this is not a fresh full check.
+        observations: TickObservation = TickObservation { kernel: Some(KernelObservation { links: vec![LinkObservation { name: "ex-ch1".into(), up: Some(true), peers_present: Some(true) }], ..KernelObservation::default() }), ..TickObservation::default() },
     },
     /// Fresh health summary.
     Check {
         /// Fresh result.
         health: HealthSummary = sample_health(),
+        /// Complete schema-1 staged report, retaining violation details.
+        report: serde_json::Value = serde_json::Value::Null,
     },
     /// Selected exit after connection was verified.
     Connect {
@@ -170,13 +276,17 @@ pub enum OpResult, result_samples {
         version: u64 = 2,
         /// True when no mutation was executed.
         dry_run: bool = false,
+        /// Same-version repair preview; never executed before the full boot.
+        repair_plan: Vec<crate::StepKind> = vec![crate::StepKind::WriteSysctl],
+        /// Ordered target-version boot operations, without kernel command text.
+        plan: Vec<crate::StepKind> = vec![crate::StepKind::VerifyRuleset],
     },
     /// Persistent quarantine summary.
     RepairStatus {
         /// Whether the latch is set.
         quarantined: bool = true,
         /// Bounded explanation when set.
-        reason: Option<Reason> = Some(Reason::RepairBudget),
+        reason: Option<String> = Some("safety repair budget exhausted".into()),
     },
     /// Quarantine was explicitly cleared.
     RepairClear {},
@@ -195,6 +305,12 @@ pub struct Response {
     pub request_id: Identifier,
     /// Fixed schema discriminator.
     pub schema: Schema,
+    /// True when the result is a retained outcome of an earlier execution.
+    #[serde(default)]
+    pub replayed: bool,
+    /// Wall-clock time of the original observation; cached claims retain this time.
+    #[serde(default)]
+    pub observed_at: Option<UnixSeconds>,
     /// Typed success or stable error.
     pub result: Result<OpResult, ApiError>,
 }
@@ -209,10 +325,12 @@ pub fn decode_request(line: &[u8]) -> Result<Request, ApiError> {
     if line.len() > MAX_REQUEST_SIZE {
         return Err(ApiError {
             code: ApiErrorCode::RequestTooLarge,
+            observation: None,
         });
     }
     let invalid = || ApiError {
         code: ApiErrorCode::InvalidRequest,
+        observation: None,
     };
     let body = line.strip_suffix(b"\n").unwrap_or(line);
     if body.contains(&b'\n') || body.contains(&b'\r') {
@@ -236,8 +354,15 @@ pub fn decode_request(line: &[u8]) -> Result<Request, ApiError> {
         | Op::Connect { .. }
         | Op::Disconnect {}
         | Op::Apply { .. }
-        | Op::RepairStatus {}
-        | Op::RepairClear {} => {}
+        | Op::RepairStatus {} => {}
+        Op::RepairClear { reason } => {
+            if reason
+                .as_ref()
+                .is_some_and(|text| text.len() > 1024 || text.contains(['\n', '\r']))
+            {
+                return Err(invalid());
+            }
+        }
     }
     Ok(request)
 }

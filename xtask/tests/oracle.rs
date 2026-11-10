@@ -782,9 +782,8 @@ fn golden_report_and_bounded_violation_samples() {
 
 #[test]
 fn cli_json_and_exit_codes() {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join(format!("cli-{}", std::process::id()));
+    let dir =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("cli-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("capture.pcap");
     let p = dir.join("policy.toml");
@@ -944,8 +943,7 @@ fn routing(kind: u8, address: &str, body: &[u8]) -> Vec<u8> {
 
 #[test]
 fn positive_evidence_is_required_and_controls_cli_exit() {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("positive-evidence-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("capture.pcap");

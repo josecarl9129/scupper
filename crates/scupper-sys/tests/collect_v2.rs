@@ -622,3 +622,252 @@ fn boot_identity_comes_only_from_the_injected_run_root() {
     );
     assert!(!run.join("state.json").exists());
 }
+
+#[test]
+fn supervised_check_uses_real_age_and_held_namespace() {
+    let sys = Script::new("ubuntu-24.04");
+    fresh(&sys);
+    let held = testing::handle().unwrap();
+    let root = Root::new(&sys.runner, &held);
+    let site = scupper_core::config::validate(
+        scupper_core::config::parse_site(
+            &support::site_text(&sys.runner)
+                .replace("require_daemon = false", "require_daemon = true"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let gateway = GatewayId("gw1".into());
+    let config = cfg(&site, &gateway, root.stamp);
+    let deps = Dependencies {
+        system: &sys,
+        probe_exec: &sys,
+        handle: Some(&held),
+        run_root: &root.path,
+        state_root: &root.path,
+    };
+    for (age, expected) in [(Some(29), 0), (Some(30), 5), (None, 5)] {
+        let report = check_v2::run_supervised(&deps, &config, age).unwrap();
+        assert_eq!(report.verdict.exit_code(), expected, "{report:?}");
+    }
+}
+
+struct NoNamespace;
+impl scupper_sys::boot::BootNamespace for NoNamespace {
+    fn open(
+        &self,
+    ) -> Result<Option<scupper_sys::netns::NetnsHandle>, scupper_sys::netns::NetnsError> {
+        Ok(None)
+    }
+}
+#[test]
+fn admin_check_independently_proves_disconnect() {
+    use scupper_core::verdict::v2::{Degraded, FailClosed, Selection, Verdict};
+    use scupper_sys::{
+        daemon::admin,
+        lock::WriterLock,
+        state::{StateFile, StateRead},
+    };
+    let sys = Script::new("ubuntu-24.04");
+    fresh(&sys);
+    let held = testing::handle().unwrap();
+    let root = Root::new(&sys.runner, &held);
+    let deps = scupper_sys::boot::BootDeps {
+        system: &sys,
+        namespace: &NoNamespace,
+        run_root: &root.path,
+        state_root: &root.path,
+        config_root: &root.path,
+        hook: None,
+        secret_owner: rustix::process::geteuid().as_raw(),
+    };
+    let config = scupper_sys::reconcile::Config {
+        site: site(&sys.runner),
+        gateway: GatewayId("gw1".into()),
+        stamp: root.stamp,
+        fingerprint: [0; 32],
+        run_root: root.path.clone(),
+        lock_wait: std::time::Duration::from_millis(100),
+    };
+    let file = StateFile::open(&root.path, None).unwrap();
+    let StateRead::Present(mut state) = file.read().unwrap() else {
+        unreachable!()
+    };
+    state.selection = Selection::Disconnected;
+    let guard = WriterLock::acquire(&root.path).unwrap();
+    file.write(&guard, &state).unwrap();
+    drop(guard);
+    assert_eq!(
+        admin::check(&deps, &sys, &held, &config, None, Some(0))
+            .unwrap()
+            .verdict,
+        Verdict::Degraded(Degraded::DisconnectNotEffective)
+    );
+    for family in ["4", "6"] {
+        for suffix in ["route", "routes-all"] {
+            let key = format!("scupper--{family}-{suffix}.json");
+            let mut rows: serde_json::Value = serde_json::from_str(&sys.text(&key)).unwrap();
+            for row in rows.as_array_mut().unwrap() {
+                if row["dst"] == "default" {
+                    *row = serde_json::json!({"dst":"default", "type":"unreachable"});
+                }
+            }
+            sys.replace(&key, &rows.to_string());
+        }
+    }
+    let mut links: serde_json::Value =
+        serde_json::from_str(&sys.text("scupper--4-link.json")).unwrap();
+    for link in links.as_array_mut().unwrap() {
+        if link["ifname"] == "ex-ch1" {
+            link["flags"] = serde_json::json!([]);
+            link["operstate"] = "DOWN".into();
+        }
+    }
+    sys.replace("scupper--4-link.json", &links.to_string());
+    assert_eq!(
+        admin::check(&deps, &sys, &held, &config, None, Some(0))
+            .unwrap()
+            .verdict,
+        Verdict::FailClosed(FailClosed::AdminDisconnected)
+    );
+}
+#[test]
+fn uninitialized_supervisor_persists_recovery_intent() {
+    use scupper_proto::Op;
+    use scupper_sys::{
+        daemon::admin,
+        state::{StateFile, StateRead},
+    };
+    let sys = Script::new("ubuntu-24.04");
+    fresh(&sys);
+    let held = testing::handle().unwrap();
+    let root = Root::new(&sys.runner, &held);
+    fs::remove_file(root.path.join("boot.json")).unwrap();
+    let deps = scupper_sys::boot::BootDeps {
+        system: &sys,
+        namespace: &NoNamespace,
+        run_root: &root.path,
+        state_root: &root.path,
+        config_root: &root.path,
+        hook: None,
+        secret_owner: rustix::process::geteuid().as_raw(),
+    };
+    admin::durable_intent(&deps, &Op::Disconnect {}, 0).unwrap();
+    let file = StateFile::open(&root.path, None).unwrap();
+    let StateRead::Present(state) = file.read().unwrap() else {
+        unreachable!()
+    };
+    assert_eq!(
+        state.selection,
+        scupper_core::verdict::v2::Selection::Disconnected
+    );
+    admin::durable_intent(
+        &deps,
+        &Op::RepairClear {
+            reason: Some("recovered initialization".into()),
+        },
+        0,
+    )
+    .unwrap();
+    let StateRead::Present(state) = file.read().unwrap() else {
+        unreachable!()
+    };
+    assert!(
+        !serde_json::to_string(&state)
+            .unwrap()
+            .contains("last_repair_reason")
+    );
+}
+
+#[test]
+fn supervised_check_reads_live_completion() {
+    use scupper_sys::probe_child::ProbeExec;
+    use std::{
+        cell::Cell,
+        time::{Duration, Instant},
+    };
+    struct CompletingProbe<'a> {
+        system: &'a Script,
+        completed: &'a Cell<Option<Instant>>,
+    }
+    impl ProbeExec for CompletingProbe<'_> {
+        fn accepts_test_namespace(&self) -> bool {
+            true
+        }
+        fn execute_probe(
+            &self,
+            json: &str,
+            namespace: fs::File,
+            timeout: Duration,
+        ) -> Result<scupper_sys::system::ExecOutput, scupper_sys::system::ExecError> {
+            let result = self.system.execute_probe(json, namespace, timeout);
+            self.completed.set(Some(Instant::now()));
+            result
+        }
+    }
+    let sys = Script::new("ubuntu-24.04");
+    fresh(&sys);
+    let held = testing::handle().unwrap();
+    let root = Root::new(&sys.runner, &held);
+    let site = scupper_core::config::validate(
+        scupper_core::config::parse_site(
+            &support::site_text(&sys.runner)
+                .replace("require_daemon = false", "require_daemon = true"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let gateway = GatewayId("gw1".into());
+    let config = cfg(&site, &gateway, root.stamp);
+    // This is the old timestamp at the end of a slow observation; stage 8 must
+    // instead see the iteration completed while the exit probe was running.
+    let old = Instant::now().checked_sub(Duration::from_secs(32)).unwrap();
+    let completed = Cell::new(Some(old));
+    let probe = CompletingProbe {
+        system: &sys,
+        completed: &completed,
+    };
+    let deps = Dependencies {
+        system: &sys,
+        probe_exec: &probe,
+        handle: Some(&held),
+        run_root: &root.path,
+        state_root: &root.path,
+    };
+    let report = check_v2::run_supervised_live(&deps, &config, &|| completed.get()).unwrap();
+    assert!(completed.get().unwrap() > old);
+    assert_eq!(report.verdict.exit_code(), 0, "{report:?}");
+}
+
+#[test]
+fn forwarding_defaults_warn_only_when_inconsistent_with_global_gates() {
+    for runner in ["ubuntu-22.04", "ubuntu-24.04"] {
+        let handle = testing::handle().unwrap();
+        let site = site(runner);
+        let config = health(&site, &handle);
+        for global in ["0", "1"] {
+            for default in ["0", "1"] {
+                let sys = Script::new(runner);
+                for (key, value) in [
+                    ("net.ipv4.ip_forward", global),
+                    ("net.ipv6.conf.all.forwarding", global),
+                    ("net.ipv4.conf.default.forwarding", default),
+                    ("net.ipv6.conf.default.forwarding", default),
+                ] {
+                    sys.replace(&format!("scupper-sysctl-{key}.txt"), value);
+                }
+                let got = collect::forwarding(&sys, &handle, &config, &State::default()).unwrap();
+                for key in [
+                    "net.ipv4.conf.default.forwarding",
+                    "net.ipv6.conf.default.forwarding",
+                ] {
+                    assert_eq!(
+                        got.hardening.contains(&key.into()),
+                        global != default,
+                        "{global}/{default}: {got:?}"
+                    );
+                }
+            }
+        }
+    }
+}

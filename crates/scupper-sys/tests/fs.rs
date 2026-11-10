@@ -10,11 +10,23 @@ struct Directory(PathBuf);
 impl Directory {
     fn new() -> io::Result<Self> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let directory = Self(std::env::temp_dir().join(format!(
-            "scupper-fs-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        )));
+        let directory = Self(
+            std::env::var_os("CARGO_TARGET_TMPDIR")
+                .map_or_else(
+                    || {
+                        std::path::PathBuf::from(concat!(
+                            env!("CARGO_MANIFEST_DIR"),
+                            "/../../target/tmp"
+                        ))
+                    },
+                    std::path::PathBuf::from,
+                )
+                .join(format!(
+                    "scupper-fs-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                )),
+        );
         fs::create_dir(&directory.0)?;
         Ok(directory)
     }

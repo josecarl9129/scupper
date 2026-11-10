@@ -13,6 +13,7 @@ use crate::{
 use clap::{Parser, Subcommand, error::ErrorKind};
 
 mod config;
+mod control;
 use config::ConfigCommand;
 
 #[derive(Parser)]
@@ -69,6 +70,20 @@ enum Command {
     Status,
     /// Check protection and return the verdict as an exit code.
     Check,
+    /// Clear disconnection and optionally prefer a configured exit.
+    Connect { exit: Option<String> },
+    /// Close the data path and independently verify kernel closure.
+    Disconnect,
+    /// Converge to the committed head configuration.
+    Apply {
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Inspect or explicitly clear persistent quarantine.
+    Repair {
+        #[command(subcommand)]
+        command: control::RepairCommand,
+    },
     /// Inspect and version the M2 site configuration.
     Config {
         #[command(subcommand)]
@@ -335,6 +350,28 @@ fn dispatch(
             trace,
         } => {
             require_root(deps, "boot")?;
+            let _lease = match scupper_sys::lock::SupervisorLease::try_acquire(deps.writer_root) {
+                Ok(lease) => lease,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    let ping = scupper_sys::daemon::control::call(
+                        deps.writer_root,
+                        &scupper_sys::daemon::control::request(scupper_proto::Op::Ping {}),
+                        std::time::Duration::from_secs(2),
+                    );
+                    let held = deps.namespaces.open_gateway().ok().flatten();
+                    let matching = matches!((ping, held),
+                        (Ok(scupper_proto::Response { result: Ok(scupper_proto::OpResult::Ping { netns, .. }), .. }), Some(held))
+                        if held.identity() == (netns.device, netns.inode));
+                    if !matching {
+                        return Err(format!(
+                            "{error}; holder is not an initialized, responsive scupperd attached to the named namespace; boot refused; stop scupperd, then rerun"
+                        ));
+                    }
+                    writeln!(stderr, "scupperd owns the namespace; boot skipped successfully; use scupper apply for a verified update").map_err(output_error)?;
+                    return Ok(0);
+                }
+                Err(error) => return Err(format!("supervisor lease unavailable: {error}")),
+            };
             #[cfg(feature = "testing")]
             let hook = |point: scupper_sys::boot::BootPoint| {
                 use scupper_sys::boot::BootPoint;
@@ -414,15 +451,39 @@ fn dispatch(
             stdout,
             stderr,
         )),
+        Command::Connect { exit } => {
+            control::mutation(deps, control::connect(deps, exit)?, json, stdout, stderr)
+        }
+        Command::Disconnect => {
+            control::mutation(deps, scupper_proto::Op::Disconnect {}, json, stdout, stderr)
+        }
+        Command::Apply { dry_run } => control::mutation(
+            deps,
+            scupper_proto::Op::Apply {
+                version: None,
+                dry_run,
+            },
+            json,
+            stdout,
+            stderr,
+        ),
+        Command::Repair { command } => control::repair(deps, command, json, stdout, stderr),
         Command::Status | Command::Check => {
             let status = matches!(command, Command::Status);
-            let config = match m2_config(deps) {
+            let (supervisor, version) = match control::read(deps, status, json, stdout, stderr)? {
+                control::ReadOutcome::Rendered(code) => return Ok(code),
+                control::ReadOutcome::Local {
+                    supervisor,
+                    version,
+                } => (supervisor, version),
+            };
+            let config = match m2_config_at(deps, version) {
                 Ok(Some(config)) => config,
                 Ok(None) => return Err("not an M2 gateway (no /var/lib/scupper store)".into()),
                 Err(error) if status => return status_error(stdout, json, &error),
                 Err(error) => return Err(error),
             };
-            m2_check(deps, &config, status, json, stdout, stderr)
+            m2_check(deps, &config, status, json, supervisor, stdout, stderr)
         }
         Command::Config { command } => config::run(command, deps, stdout),
         Command::Rules { diff } => config::rules(deps, diff, stdout),
@@ -436,6 +497,12 @@ struct AppliedConfig {
 }
 
 fn m2_config(deps: &Dependencies<'_>) -> Result<Option<AppliedConfig>, String> {
+    m2_config_at(deps, None)
+}
+fn m2_config_at(
+    deps: &Dependencies<'_>,
+    attached: Option<u64>,
+) -> Result<Option<AppliedConfig>, String> {
     let store = scupper_sys::store::VersionStore::read_only(deps.state_root, deps.config_root);
     let Some(version) = store.head().map_err(|error| error.to_string())? else {
         for path in [
@@ -468,6 +535,7 @@ fn m2_config(deps: &Dependencies<'_>) -> Result<Option<AppliedConfig>, String> {
         // The driver inventories containment before reporting missing/corrupt state.
         _ => version,
     };
+    let version = attached.unwrap_or(version);
     let (text, meta) = store.read(version).map_err(|error| error.to_string())?;
     let site = config::validate_text(&text)?;
     let gateway = config::gateway_id(deps, &site)?;
@@ -529,78 +597,119 @@ fn status_json(
     writeln!(stdout).map_err(output_error)
 }
 
+#[allow(clippy::too_many_lines)] // Keep the single bounded retry beside the final verdict.
 fn m2_check(
     deps: &Dependencies<'_>,
     config: &AppliedConfig,
     status: bool,
     json: bool,
+    supervisor: scupper_core::verdict::v2::Supervisor,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<u8, String> {
-    let handle = match deps.namespaces.open_gateway() {
-        Ok(handle) => handle,
-        Err(error) if status => {
-            return status_error(stdout, json, &error);
-        }
-        Err(error) => return Err(error),
-    };
-    let (result, mut observations) = scupper_sys::check_v2::run_with_observations(
-        &scupper_sys::check_v2::Dependencies {
+    let mut refreshed_config = None;
+    let mut supervisor = supervisor;
+    loop {
+        let config = refreshed_config.as_ref().unwrap_or(config);
+        let handle = match deps.namespaces.open_gateway() {
+            Ok(handle) => handle,
+            Err(error) if status => {
+                return status_error(stdout, json, &error);
+            }
+            Err(error) => return Err(error),
+        };
+        let check_deps = scupper_sys::check_v2::Dependencies {
             system: deps.system,
             probe_exec: deps.probe_exec,
             handle: handle.as_ref(),
             state_root: deps.state_root,
             run_root: deps.writer_root,
-        },
-        &scupper_sys::check_v2::Config {
+        };
+        let check_config = scupper_sys::check_v2::Config {
             site: &config.site,
             gateway: &config.gateway,
             stamp: config.stamp,
-        },
-    );
-    if status {
-        redact_endpoints(&mut observations);
-        if json {
-            status_json(stdout, &result, &observations)?;
+        };
+        let (result, mut observations) = if status {
+            scupper_sys::check_v2::run_with_observations(&check_deps, &check_config)
+        } else {
+            scupper_sys::check_v2::run_with_supervisor(&check_deps, &check_config, supervisor)
+        };
+        if status {
+            redact_endpoints(&mut observations);
+            if json {
+                status_json(stdout, &result, &observations)?;
+                return Ok(0);
+            }
+            writeln!(
+                stdout,
+                "M2 observations (None = not requested):\n{observations:#?}"
+            )
+            .map_err(output_error)?;
+            match result {
+                Ok(report) => writeln!(stdout, "{}", report.verdict).map_err(output_error)?,
+                Err(error) => writeln!(stdout, "{error}").map_err(output_error)?,
+            }
             return Ok(0);
         }
-        writeln!(
-            stdout,
-            "M2 observations (None = not requested):\n{observations:#?}"
-        )
-        .map_err(output_error)?;
-        match result {
-            Ok(report) => writeln!(stdout, "{}", report.verdict).map_err(output_error)?,
-            Err(error) => writeln!(stdout, "{error}").map_err(output_error)?,
-        }
-        return Ok(0);
-    }
-    match result {
-        Ok(report) => {
-            if json {
-                serde_json::to_writer(&mut *stdout, &report).map_err(|error| error.to_string())?;
-                writeln!(stdout).map_err(output_error)?;
-            } else {
-                writeln!(stdout, "{}", report.verdict).map_err(output_error)?;
-                for warning in &report.warnings {
-                    writeln!(stderr, "warning: {warning:?}").map_err(output_error)?;
+        return match result {
+            Ok(report) => {
+                if report.verdict.exit_code() == 2
+                    && matches!(
+                        supervisor,
+                        scupper_core::verdict::v2::Supervisor::Alive { .. }
+                    )
+                    && let Some(outcome) = control::transition_after_observation(
+                        deps,
+                        config.stamp.version,
+                        supervisor,
+                        json,
+                        stdout,
+                        stderr,
+                    )?
+                {
+                    match outcome {
+                        control::ReadOutcome::Rendered(code) => return Ok(code),
+                        control::ReadOutcome::Local {
+                            supervisor: fresh,
+                            version,
+                        } if refreshed_config.is_none() => {
+                            refreshed_config = Some(
+                                m2_config_at(deps, version)?
+                                    .ok_or("not an M2 gateway (no /var/lib/scupper store)")?,
+                            );
+                            supervisor = fresh;
+                            continue;
+                        }
+                        control::ReadOutcome::Local { .. } => {}
+                    }
                 }
+                if json {
+                    serde_json::to_writer(&mut *stdout, &report)
+                        .map_err(|error| error.to_string())?;
+                    writeln!(stdout).map_err(output_error)?;
+                } else {
+                    writeln!(stdout, "{}", report.verdict).map_err(output_error)?;
+                    for warning in &report.warnings {
+                        writeln!(stderr, "warning: {warning:?}").map_err(output_error)?;
+                    }
+                }
+                Ok(report.verdict.exit_code())
             }
-            Ok(report.verdict.exit_code())
-        }
-        Err(error) => {
-            if json {
-                serde_json::to_writer(
+            Err(error) => {
+                if json {
+                    serde_json::to_writer(
                     &mut *stdout,
                     &serde_json::json!({"schema": 1, "error": json_error(Some(error.stage), &error.source.to_string())}),
                 )
                 .map_err(|error| error.to_string())?;
-                writeln!(stdout).map_err(output_error)?;
-                Ok(1)
-            } else {
-                Err(error.to_string())
+                    writeln!(stdout).map_err(output_error)?;
+                    Ok(1)
+                } else {
+                    Err(error.to_string())
+                }
             }
-        }
+        };
     }
 }
 

@@ -23,16 +23,15 @@ use scupper_core::{
 use std::{
     cell::Cell,
     collections::BTreeMap,
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 /// Applies a shared safety deadline in addition to the per-exec bound.
-struct SafetySystem<'a> {
-    system: &'a dyn System,
-    deadline: Instant,
-    failed: Cell<bool>,
+pub(crate) struct SafetySystem<'a> {
+    pub(crate) system: &'a dyn System,
+    pub(crate) deadline: Instant,
+    pub(crate) failed: Cell<bool>,
 }
 impl System for SafetySystem<'_> {
     fn canon_safety_deadline(&self) -> Option<Instant> {
@@ -80,6 +79,9 @@ impl System for SafetySystem<'_> {
     }
     fn wireguard_socket_dirs(&self) -> Vec<PathBuf> {
         self.system.wireguard_socket_dirs()
+    }
+    fn read_host_udp(&self, ipv6: bool) -> std::io::Result<String> {
+        self.system.read_host_udp(ipv6)
     }
 }
 fn read(sys: &dyn System, held: &NetnsHandle, cmd: &KernelCmd) -> Probe<String> {
@@ -328,10 +330,8 @@ pub(crate) fn observe(
     let mut model = KernelModel::desired(desired);
     model.conntrack_flushed = false;
     model.latch = None;
-    model.namespace = match std::fs::metadata(namespace) {
-        Ok(metadata) if (metadata.dev(), metadata.ino()) == held.identity() => {
-            NamespaceState::Ready
-        }
+    model.namespace = match sys.namespace_identity(namespace) {
+        Ok(identity) if identity == held.identity() => NamespaceState::Ready,
         Ok(_) => NamespaceState::NameGone,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => NamespaceState::NameGone,
         Err(_) => {
@@ -340,8 +340,8 @@ pub(crate) fn observe(
         }
     };
     if let Some(path) = edge {
-        match std::fs::metadata(path) {
-            Ok(metadata) if (metadata.dev(), metadata.ino()) != held.identity() => {
+        match sys.namespace_identity(path) {
+            Ok(identity) if identity != held.identity() => {
                 if model.namespace == NamespaceState::Ready {
                     model.namespace = NamespaceState::EdgeElsewhere;
                 }
