@@ -1,4 +1,5 @@
 //! CLI routing, non-TTY output and schema checks through the real M2 driver.
+#![cfg(feature = "testing")]
 #![allow(clippy::unwrap_used)]
 #[path = "../../scupper-sys/tests/support/v2.rs"]
 mod support;
@@ -358,6 +359,7 @@ fn stage_eight_socket_age_table_uses_the_strict_thirty_second_boundary() {
                         },
                         last_complete_iteration_age: age,
                         current_iteration_age: None,
+                        operation: None,
                         version: 1,
                         quarantined: false,
                         selection: scupper_core::verdict::v2::Selection::Auto,
@@ -460,6 +462,7 @@ fn stale_ping_skips_socket_check_and_preserves_stale_supervision() {
             vec![Ok(OpResult::Ping {
                 last_complete_iteration_age: age,
                 current_iteration_age: None,
+                operation: None,
                 netns: scupper_core::verdict::v2::NetnsIdentity { device, inode },
                 version: 1,
                 quarantined: false,
@@ -531,6 +534,7 @@ fn socket_check_error_uses_local_observations() {
                 Ok(OpResult::Ping {
                     last_complete_iteration_age: Some(0),
                     current_iteration_age: None,
+                    operation: None,
                     netns: scupper_core::verdict::v2::NetnsIdentity { device, inode },
                     version: 1,
                     quarantined: false,
@@ -558,7 +562,7 @@ fn socket_check_error_uses_local_observations() {
             }
         });
         let (code, out, err) = run(&sys, &root, &["check", "--json"]);
-        assert_eq!(code, 0, "{out}: {err}");
+        assert_eq!(code, 5, "{out}: {err}");
         assert!(err.contains("transport: local observations"));
         worker.join().unwrap();
     }
@@ -622,6 +626,7 @@ fn check_retries_once_after_apply_invalidates_worker() {
         Ok(OpResult::Ping {
             last_complete_iteration_age: Some(0),
             current_iteration_age: None,
+            operation: None,
             netns: scupper_core::verdict::v2::NetnsIdentity { device, inode },
             version: 1,
             quarantined: false,
@@ -688,6 +693,7 @@ fn hung_socket_check_falls_back_with_real_ping_age_within_six_seconds() {
                     result: Ok(OpResult::Ping {
                         last_complete_iteration_age: Some(age),
                         current_iteration_age: busy,
+                        operation: None,
                         netns: scupper_core::verdict::v2::NetnsIdentity { device, inode },
                         version: 1,
                         quarantined: false,
@@ -723,28 +729,134 @@ fn hung_socket_check_falls_back_with_real_ping_age_within_six_seconds() {
 fn boot_under_held_lease_requires_initialized_ping() {
     use scupper_proto::OpResult;
     use std::os::unix::net::UnixListener;
+    for wrong_inode in [false, true] {
+        let sys = Script::new("ubuntu-24.04");
+        fresh(&sys);
+        let held = testing::handle().unwrap();
+        let root = Root::new(&sys.runner, &held);
+        let _lease = scupper_sys::lock::SupervisorLease::try_acquire(&root.path).unwrap();
+        let listener = UnixListener::bind(root.path.join("control.sock")).unwrap();
+        let (device, inode) = held.identity();
+        let worker = serve_sequence(
+            listener,
+            vec![Ok(OpResult::Ping {
+                last_complete_iteration_age: Some(0),
+                current_iteration_age: None,
+                operation: None,
+                netns: scupper_core::verdict::v2::NetnsIdentity {
+                    device,
+                    inode: inode + u64::from(wrong_inode),
+                },
+                version: 1,
+                quarantined: false,
+                selection: scupper_core::verdict::v2::Selection::Auto,
+            })],
+        );
+        let calls = sys.calls.borrow().len();
+        let (code, out, err) = run(&sys, &root, &["boot"]);
+        assert_eq!(code, u8::from(wrong_inode), "{out} {err}");
+        assert!(err.contains(if wrong_inode {
+            "stop scupperd, then rerun"
+        } else {
+            "scupperd owns the namespace"
+        }));
+        assert_eq!(sys.calls.borrow().len(), calls);
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn applying_ping_never_compares_kernel_with_unreached_state_version() {
+    use scupper_proto::{OpResult, OperationKind, OperationProgress};
+    use std::os::unix::net::UnixListener;
+    for operation in [
+        Some(OperationProgress {
+            kind: OperationKind::Apply,
+            from: 1,
+            to: 2,
+            age: 6,
+        }),
+        None,
+    ] {
+        let sys = Script::new("ubuntu-24.04");
+        fresh(&sys);
+        let held = testing::handle().unwrap();
+        let root = Root::new(&sys.runner, &held);
+        let path = root.path.join("state.json");
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        state["applied_version"] = 2.into();
+        std::fs::write(path, serde_json::to_vec(&state).unwrap()).unwrap();
+        let (device, inode) = held.identity();
+        let listener = UnixListener::bind(root.path.join("control.sock")).unwrap();
+        // Keep the listener alive but never dispatch Check. An older snapshot
+        // without the operation flag also must not compare state version 2.
+        let ping_listener = listener.try_clone().unwrap();
+        let worker = serve_sequence(
+            ping_listener,
+            vec![Ok(OpResult::Ping {
+                last_complete_iteration_age: Some(0),
+                current_iteration_age: None,
+                operation,
+                netns: scupper_core::verdict::v2::NetnsIdentity { device, inode },
+                version: 1,
+                quarantined: false,
+                selection: scupper_core::verdict::v2::Selection::Auto,
+            })],
+        );
+        let (code, out, err) = run(&sys, &root, &["check", "--json"]);
+        assert_eq!(code, 3, "{out}: {err}");
+        assert!(err.contains("apply in progress (from 1 to 2"));
+        let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(report["config_version"], 1);
+        assert!(
+            report["verdict"]["Degraded"]
+                .get("OperationInProgress")
+                .is_some()
+        );
+        worker.join().unwrap();
+        drop(listener);
+    }
+}
+
+#[test]
+fn ping_followed_by_connection_refused_is_unsupervised() {
+    use scupper_proto::OpResult;
+    use std::{io::Write, os::unix::net::UnixListener};
     let sys = Script::new("ubuntu-24.04");
     fresh(&sys);
     let held = testing::handle().unwrap();
-    let root = Root::new(&sys.runner, &held);
-    let _lease = scupper_sys::lock::SupervisorLease::try_acquire(&root.path).unwrap();
-    let listener = UnixListener::bind(root.path.join("control.sock")).unwrap();
+    let text =
+        support::site_text(&sys.runner).replace("require_daemon = false", "require_daemon = true");
+    let root = Root::with_text(&text, &held);
     let (device, inode) = held.identity();
-    let worker = serve_sequence(
-        listener,
-        vec![Ok(OpResult::Ping {
-            last_complete_iteration_age: Some(0),
-            current_iteration_age: None,
-            netns: scupper_core::verdict::v2::NetnsIdentity { device, inode },
-            version: 1,
-            quarantined: false,
-            selection: scupper_core::verdict::v2::Selection::Auto,
-        })],
-    );
-    let calls = sys.calls.borrow().len();
-    let (code, out, err) = run(&sys, &root, &["boot"]);
-    assert_eq!(code, 0, "{out} {err}");
-    assert!(err.contains("scupperd owns the namespace"));
-    assert_eq!(sys.calls.borrow().len(), calls);
+    let listener = UnixListener::bind(root.path.join("control.sock")).unwrap();
+    let worker = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request = scupper_sys::daemon::control::read_request(&stream).unwrap();
+        drop(listener); // The next connect gets ECONNREFUSED before any request.
+        serde_json::to_writer(
+            &mut stream,
+            &scupper_proto::Response {
+                request_id: request.request_id,
+                schema: scupper_proto::Schema,
+                replayed: false,
+                observed_at: None,
+                result: Ok(OpResult::Ping {
+                    last_complete_iteration_age: Some(0),
+                    current_iteration_age: None,
+                    operation: None,
+                    netns: scupper_core::verdict::v2::NetnsIdentity { device, inode },
+                    version: 1,
+                    quarantined: false,
+                    selection: scupper_core::verdict::v2::Selection::Auto,
+                }),
+            },
+        )
+        .unwrap();
+        stream.write_all(b"\n").unwrap();
+    });
+    let (code, out, err) = run(&sys, &root, &["check", "--json"]);
+    assert_eq!(code, 5, "{out}: {err}");
     worker.join().unwrap();
 }

@@ -238,6 +238,15 @@ pub enum ExecTarget<'a> {
 /// }
 /// ```
 pub trait System {
+    /// Identity currently published at a namespace path.
+    /// # Errors
+    /// Returns metadata errors, including a missing namespace name.
+    fn namespace_identity(&self, path: &Path) -> std::io::Result<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(path)?;
+        Ok((metadata.dev(), metadata.ino()))
+    }
+
     /// Remaining safety-group deadline, when called by the safety collector.
     fn canon_safety_deadline(&self) -> Option<std::time::Instant> {
         None

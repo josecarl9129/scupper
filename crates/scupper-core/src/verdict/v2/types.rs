@@ -424,6 +424,13 @@ pub enum Degraded {
     },
     /// Reserved for multi-exit comparison; no switch on probe failure in M2.
     CommonModeProbeFailure,
+    /// Configuration transition is still in progress; no kernel comparison made.
+    OperationInProgress {
+        /// Last attached version.
+        from: u64,
+        /// Requested version.
+        to: u64,
+    },
     /// Reserved for the M4 DNS forwarder.
     DnsFailed(ProbeError),
 }

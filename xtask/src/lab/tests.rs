@@ -375,6 +375,7 @@ fn background_processes_shutdown_cleanly_and_early_exit_fails() {
         fs::File::create(dir.join("trace")).unwrap(),
         Arc::clone(&cancel),
     );
+    let checkpoint = runner.background_checkpoint();
     let mut group = runner
         .background(
             &Invocation::new("", "sleep", &["5"]),
@@ -382,7 +383,9 @@ fn background_processes_shutdown_cleanly_and_early_exit_fails() {
         )
         .unwrap();
     group.alive().unwrap();
+    assert!(runner.assert_background_released(checkpoint).is_err());
     group.stop(rustix::process::Signal::TERM).unwrap();
+    runner.assert_background_released(checkpoint).unwrap();
     group.stop(rustix::process::Signal::TERM).unwrap();
     let mut group = runner
         .background(

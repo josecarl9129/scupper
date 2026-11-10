@@ -42,6 +42,7 @@ pub fn execute<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)>(
             return Ok(OpResult::Ping {
                 last_complete_iteration_age: age,
                 current_iteration_age: None,
+                operation: None,
                 netns: machine.netns_identity(),
                 version: machine.version(),
                 quarantined: machine.latch().is_some(),
@@ -79,6 +80,7 @@ pub fn execute_locked<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)>(
         Op::Ping {} => Ok(OpResult::Ping {
             last_complete_iteration_age: age,
             current_iteration_age: None,
+            operation: None,
             netns: machine.netns_identity(),
             version: machine.version(),
             quarantined: machine.latch().is_some(),
@@ -357,9 +359,7 @@ fn apply_inner(
         None => store.head().map_err(internal)?,
     }
     .ok_or_else(|| api(ApiErrorCode::NotFound))?;
-    store
-        .read(target)
-        .map_err(|_| api(ApiErrorCode::NotFound))?;
+    store.read(target).map_err(store_error)?;
     // Across versions the final operation is always a complete boot. Closing
     // before publishing the version makes a crash leave the old handoff closed.
     let plan = vec![
@@ -382,54 +382,81 @@ fn apply_inner(
             plan,
         });
     }
-    if let Some(held) = deps.namespace.open().map_err(internal)? {
-        *touched = true;
-        crate::reconcile::forwarding_gates(deps, &held, false, None).map_err(internal)?;
-    }
-    #[cfg(feature = "testing")]
-    if deps.run_root.join("pause-apply").exists() {
-        std::fs::write(
-            deps.run_root.join("apply-paused"),
-            b"writer held; gates closed",
-        )
-        .map_err(internal)?;
-        while deps.run_root.join("pause-apply").exists() {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
+    // Load recovery inputs before the first mutation, including a partial close.
     let file = StateFile::open(deps.state_root, None).map_err(internal)?;
     let StateRead::Present(mut state) = file.read().map_err(internal)? else {
         return Err(api(ApiErrorCode::PersistenceUnavailable));
     };
+    let original = state.clone();
     let previous = state.applied_version;
-    *touched = true;
-    state.applied_version = Some(target);
-    file.write(guard, &state)
-        .map_err(|_| api(ApiErrorCode::PersistenceUnavailable))?;
-    let _ = log.emit(
-        EventKind::AdminAction {
-            reason: None,
-            command: Command::Apply,
-        },
-        Actor::Local { uid },
-        Some(target),
-    );
-    let report = crate::boot::boot_apply_with_guard(deps, guard, true);
-    if !report.succeeded() {
+    let mut step = scupper_proto::StepKind::ForwardingOff;
+    let attempt = (|| {
+        if let Some(held) = deps.namespace.open().map_err(internal)? {
+            *touched = true;
+            crate::reconcile::forwarding_gates(deps, &held, false, None).map_err(internal)?;
+        }
+        #[cfg(feature = "testing")]
+        if deps.run_root.join("pause-apply").exists() {
+            std::fs::write(
+                deps.run_root.join("apply-paused"),
+                b"writer held; gates closed",
+            )
+            .map_err(internal)?;
+            while deps.run_root.join("pause-apply").exists() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        *touched = true;
+        state.applied_version = Some(target);
+        file.write(guard, &state)
+            .map_err(|_| api(ApiErrorCode::PersistenceUnavailable))?;
+        let _ = log.emit(
+            EventKind::AdminAction {
+                reason: None,
+                command: Command::Apply,
+            },
+            Actor::Local { uid },
+            Some(target),
+        );
+        let report = crate::boot::boot_apply_with_guard(deps, guard, true);
+        if !report.succeeded() {
+            step = match report.steps.last().map(|step| step.step) {
+                Some(crate::boot::BootStep::Ruleset) => scupper_proto::StepKind::LoadRuleset,
+                Some(crate::boot::BootStep::Links) => scupper_proto::StepKind::LinkReconfigure,
+                Some(crate::boot::BootStep::Routes) => scupper_proto::StepKind::RouteReplace,
+                Some(crate::boot::BootStep::Forwarding) => scupper_proto::StepKind::ForwardingOn,
+                _ => scupper_proto::StepKind::VerifyRuleset,
+            };
+
+            return Err(api(ApiErrorCode::Internal));
+        }
+        if let Some(quarantine) = state.quarantine.take() {
+            let latch = scupper_core::planner::Latch {
+                reason: quarantine.reason,
+                object: quarantine.object,
+            };
+            let cleared = scupper_core::planner::clear_latch(
+                &latch,
+                scupper_core::planner::ClearLatch::VerifiedFullApply,
+                &scupper_core::planner::Budgets::default(),
+            );
+            file.write(guard, &state)
+                .map_err(|_| api(ApiErrorCode::PersistenceUnavailable))?;
+            let _ = log.emit(cleared.event.into(), Actor::Local { uid }, Some(target));
+        }
+        Ok(())
+    })();
+    if let Err(failure) = attempt {
+        if !*touched {
+            return Err(failure);
+        }
         let reclosed = deps.namespace.open().is_ok_and(|held| {
             held.is_some_and(|held| {
                 crate::reconcile::forwarding_gates(deps, &held, false, None).is_ok()
             })
         });
-        state.applied_version = previous;
+        state = original;
         let restored = file.write(guard, &state);
-        let step = match report.steps.last().map(|step| step.step) {
-            Some(crate::boot::BootStep::Ruleset) => scupper_proto::StepKind::LoadRuleset,
-            Some(crate::boot::BootStep::Links) => scupper_proto::StepKind::LinkReconfigure,
-            Some(crate::boot::BootStep::Routes) => scupper_proto::StepKind::RouteReplace,
-            Some(crate::boot::BootStep::Forwarding) => scupper_proto::StepKind::ForwardingOn,
-            _ => scupper_proto::StepKind::VerifyRuleset,
-        };
         let rollback = if restored.is_ok() && reclosed && previous.is_some() {
             Some(crate::boot::boot_with_guard(deps, guard))
         } else {
@@ -472,9 +499,9 @@ fn apply_inner(
         };
         return Err(ApiError {
             code: if verified {
-                ApiErrorCode::Internal
+                failure.code
             } else {
-                ApiErrorCode::PersistenceUnavailable
+                ApiErrorCode::RollbackFailed
             },
             observation: Some(serde_json::json!({"rollback": {
                 "version": previous, "verified": verified, "closed": closed,
@@ -482,29 +509,22 @@ fn apply_inner(
             }})),
         });
     }
-    if let Some(quarantine) = state.quarantine.take() {
-        let latch = scupper_core::planner::Latch {
-            reason: quarantine.reason,
-            object: quarantine.object,
-        };
-        let cleared = scupper_core::planner::clear_latch(
-            &latch,
-            scupper_core::planner::ClearLatch::VerifiedFullApply,
-            &scupper_core::planner::Budgets::default(),
-        );
-        if file.write(guard, &state).is_err() {
-            if let Ok(Some(held)) = deps.namespace.open() {
-                let _ = crate::reconcile::forwarding_gates(deps, &held, false, None);
-            }
-            return Err(api(ApiErrorCode::PersistenceUnavailable));
-        }
-        let _ = log.emit(cleared.event.into(), Actor::Local { uid }, Some(target));
-    }
     Ok(OpResult::Apply {
         version: target,
         dry_run,
         repair_plan: Vec::new(),
         plan,
+    })
+}
+
+pub(super) fn store_error(error: crate::store::StoreError) -> ApiError {
+    api(match error {
+        crate::store::StoreError::NotCommitted(_) => ApiErrorCode::NotFound,
+        crate::store::StoreError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            ApiErrorCode::NotFound
+        }
+        crate::store::StoreError::Io(_) => ApiErrorCode::PersistenceUnavailable,
+        _ => ApiErrorCode::Internal,
     })
 }
 

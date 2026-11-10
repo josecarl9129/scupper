@@ -90,6 +90,7 @@ vocabulary!(
     Conflict,
     SupervisorUnavailable,
     PersistenceUnavailable,
+    RollbackFailed,
     Timeout,
     Internal,
     DisconnectNotEffective,
@@ -199,6 +200,29 @@ pub struct TickObservation {
     pub kernel: Option<KernelObservation>,
 }
 
+/// A transition whose kernel configuration is not yet published as verified.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationProgress {
+    /// Apply or namespace rebuild.
+    pub kind: OperationKind,
+    /// Previously attached version.
+    pub from: u64,
+    /// Requested version.
+    pub to: u64,
+    /// Monotonic elapsed seconds.
+    pub age: u64,
+}
+
+/// Serialized transition kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OperationKind {
+    /// Full configuration apply, including rollback.
+    Apply,
+    /// Namespace replacement.
+    Rebuild,
+}
+
 sampled_enum! {
 /// Successful reply alphabet, with one result per operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +235,9 @@ pub enum OpResult, result_samples {
         /// Age of the running tick in seconds; null while idle.
         #[serde(default)]
         current_iteration_age: Option<u64> = None,
+        /// Active kernel transition; checks report it without comparing versions.
+        #[serde(default)]
+        operation: Option<OperationProgress> = None,
         /// Identity of the supervisor's held namespace.
         netns: scupper_core::verdict::v2::NetnsIdentity = scupper_core::verdict::v2::NetnsIdentity { device: 1, inode: 2 },
         /// Applied immutable version.

@@ -170,12 +170,12 @@ fn valid_marker(text: &str) -> bool {
         && text.len() <= 128
 }
 
-/// Runs a TCP or UDP marker sink for at most 1050 seconds.
+/// Runs a TCP or UDP marker sink for at most 1800 seconds.
 ///
 /// # Errors
 /// Returns socket, log or malformed-marker errors.
 pub fn sink(protocol: &str, bind: SocketAddr, log: &Path) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(1050);
+    let deadline = Instant::now() + Duration::from_mins(30);
     if protocol == "tcp" {
         let listener = TcpListener::bind(bind)?;
         listener.set_nonblocking(true)?;

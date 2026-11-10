@@ -1,4 +1,5 @@
 //! Configuration transactions and namespace rule previews, without host mutations.
+#![cfg(feature = "testing")]
 #![allow(clippy::unwrap_used)]
 #[path = "../../scupper-sys/tests/support/v2.rs"]
 mod support;

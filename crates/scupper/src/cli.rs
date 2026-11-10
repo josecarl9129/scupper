@@ -358,15 +358,13 @@ fn dispatch(
                         &scupper_sys::daemon::control::request(scupper_proto::Op::Ping {}),
                         std::time::Duration::from_secs(2),
                     );
-                    if !matches!(
-                        ping,
-                        Ok(scupper_proto::Response {
-                            result: Ok(scupper_proto::OpResult::Ping { .. }),
-                            ..
-                        })
-                    ) {
+                    let held = deps.namespaces.open_gateway().ok().flatten();
+                    let matching = matches!((ping, held),
+                        (Ok(scupper_proto::Response { result: Ok(scupper_proto::OpResult::Ping { netns, .. }), .. }), Some(held))
+                        if held.identity() == (netns.device, netns.inode));
+                    if !matching {
                         return Err(format!(
-                            "{error}; holder is not an initialized, responsive scupperd; boot refused"
+                            "{error}; holder is not an initialized, responsive scupperd attached to the named namespace; boot refused; stop scupperd, then rerun"
                         ));
                     }
                     writeln!(stderr, "scupperd owns the namespace; boot skipped successfully; use scupper apply for a verified update").map_err(output_error)?;
@@ -472,11 +470,14 @@ fn dispatch(
         Command::Repair { command } => control::repair(deps, command, json, stdout, stderr),
         Command::Status | Command::Check => {
             let status = matches!(command, Command::Status);
-            let supervisor = match control::read(deps, status, json, stdout, stderr)? {
+            let (supervisor, version) = match control::read(deps, status, json, stdout, stderr)? {
                 control::ReadOutcome::Rendered(code) => return Ok(code),
-                control::ReadOutcome::Local(supervisor) => supervisor,
+                control::ReadOutcome::Local {
+                    supervisor,
+                    version,
+                } => (supervisor, version),
             };
-            let config = match m2_config(deps) {
+            let config = match m2_config_at(deps, version) {
                 Ok(Some(config)) => config,
                 Ok(None) => return Err("not an M2 gateway (no /var/lib/scupper store)".into()),
                 Err(error) if status => return status_error(stdout, json, &error),
@@ -496,6 +497,12 @@ struct AppliedConfig {
 }
 
 fn m2_config(deps: &Dependencies<'_>) -> Result<Option<AppliedConfig>, String> {
+    m2_config_at(deps, None)
+}
+fn m2_config_at(
+    deps: &Dependencies<'_>,
+    attached: Option<u64>,
+) -> Result<Option<AppliedConfig>, String> {
     let store = scupper_sys::store::VersionStore::read_only(deps.state_root, deps.config_root);
     let Some(version) = store.head().map_err(|error| error.to_string())? else {
         for path in [
@@ -528,6 +535,7 @@ fn m2_config(deps: &Dependencies<'_>) -> Result<Option<AppliedConfig>, String> {
         // The driver inventories containment before reporting missing/corrupt state.
         _ => version,
     };
+    let version = attached.unwrap_or(version);
     let (text, meta) = store.read(version).map_err(|error| error.to_string())?;
     let site = config::validate_text(&text)?;
     let gateway = config::gateway_id(deps, &site)?;
@@ -641,6 +649,21 @@ fn m2_check(
     }
     match result {
         Ok(report) => {
+            if report.verdict.exit_code() == 2
+                && matches!(
+                    supervisor,
+                    scupper_core::verdict::v2::Supervisor::Alive { .. }
+                )
+                && let Some(code) = control::transition_after_observation(
+                    deps,
+                    config.stamp.version,
+                    json,
+                    stdout,
+                    stderr,
+                )?
+            {
+                return Ok(code);
+            }
             if json {
                 serde_json::to_writer(&mut *stdout, &report).map_err(|error| error.to_string())?;
                 writeln!(stdout).map_err(output_error)?;

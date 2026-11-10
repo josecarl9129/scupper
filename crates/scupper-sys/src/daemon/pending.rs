@@ -19,6 +19,7 @@ pub(super) struct Operation {
     receive: Option<Receiver<Result<Report, ApiError>>>,
     retry_at: Instant,
     observed_at: Option<scupper_proto::UnixSeconds>,
+    last_verified: Option<ApiError>,
 }
 
 impl Operation {
@@ -31,7 +32,13 @@ impl Operation {
                     if let Ok(report) = &report {
                         self.observed_at = Some(scupper_proto::UnixSeconds(report.at));
                     }
-                    Some(report.and_then(|report| verified(&self.request.op, report)))
+                    Some(report.and_then(|report| {
+                        let result = verified(&self.request.op, report);
+                        if let Err(error) = &result {
+                            self.last_verified = Some(error.clone());
+                        }
+                        result
+                    }))
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     Some(Err(control::api(ApiErrorCode::Internal)))
@@ -46,12 +53,10 @@ impl Operation {
             self.retry_at = now + Duration::from_millis(100);
         }
         if now >= self.deadline {
-            let code = match self.request.op {
-                Op::Connect { .. } => ApiErrorCode::NotReady,
-                Op::Disconnect {} => ApiErrorCode::DisconnectNotEffective,
-                _ => ApiErrorCode::Timeout,
-            };
-            return Some(Err(control::api(code)));
+            return Some(Err(self
+                .last_verified
+                .clone()
+                .unwrap_or_else(|| control::api(ApiErrorCode::Timeout))));
         }
         None
     }
@@ -230,6 +235,7 @@ impl Dispatcher {
             receive: None,
             retry_at: now,
             observed_at: None,
+            last_verified: None,
         });
     }
     pub(super) fn poll_admin(&mut self, backend: &mut impl Backend, now: Instant) {
@@ -239,7 +245,10 @@ impl Dispatcher {
                 self.finish_admin(operation, result, now);
                 continue;
             }
-            if operation.receive.is_none() && now >= operation.retry_at {
+            if operation.receive.is_none()
+                && now >= operation.retry_at
+                && operation.deadline.saturating_duration_since(now) >= control::CHECK_TIMEOUT
+            {
                 operation.receive = backend.check(operation.deadline);
                 if operation.receive.is_none() && matches!(operation.request.op, Op::Check {}) {
                     self.finish_admin(
@@ -279,6 +288,7 @@ impl Dispatcher {
                 );
             } else {
                 operation.receive = None;
+                operation.last_verified = None;
                 operation.retry_at = now;
                 operation.deadline = now
                     + Duration::from_secs(if matches!(operation.request.op, Op::Connect { .. }) {
@@ -394,6 +404,7 @@ mod tests {
             receive: Some(receive),
             retry_at: start,
             observed_at: None,
+            last_verified: None,
         };
         assert!(operation.poll(start).is_none());
         assert!(start.elapsed() < Duration::from_millis(100));
@@ -447,7 +458,9 @@ mod deadline_tests {
     #[allow(clippy::unwrap_used)]
     fn disconnect_worker_failure_at_deadline_is_not_internal() {
         let start = Instant::now();
-        for failed_worker in [false, true] {
+        for (failed_worker, observed) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
             let (send, receive) = mpsc::sync_channel(1);
             if failed_worker {
                 drop(send);
@@ -458,15 +471,41 @@ mod deadline_tests {
             let mut operation = Operation {
                 request: control::request(Op::Disconnect {}),
                 replies: Vec::new(),
-                deadline: start,
-                receive: Some(receive),
+                deadline: start + Duration::from_secs(1),
+                receive: None,
                 retry_at: start,
                 observed_at: None,
+                last_verified: None,
             };
+            if observed {
+                let (first, observed_receive) = mpsc::sync_channel(1);
+                first
+                    .send(Ok(Report {
+                        verdict: Verdict::Degraded(
+                            scupper_core::verdict::v2::Degraded::DisconnectNotEffective,
+                        ),
+                        warnings: Vec::new(),
+                        at: 1000,
+                        config_version: 1,
+                    }))
+                    .unwrap();
+                operation.receive = Some(observed_receive);
+                assert!(operation.poll(start).is_none());
+            }
+            operation.receive = Some(receive);
+            let error = operation
+                .poll(start + Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err();
             assert_eq!(
-                operation.poll(start).unwrap().unwrap_err().code,
-                ApiErrorCode::DisconnectNotEffective
+                error.code,
+                if observed {
+                    ApiErrorCode::DisconnectNotEffective
+                } else {
+                    ApiErrorCode::Timeout
+                }
             );
+            assert_eq!(error.observation.is_some(), observed);
         }
     }
 }

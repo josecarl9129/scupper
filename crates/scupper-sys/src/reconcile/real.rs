@@ -590,8 +590,13 @@ pub(crate) fn forwarding(
             if matches!(setting.key.name, "forwarding" | "ip_forward") {
                 continue;
             }
-            failed |=
-                write_sysctl_verified(deps.system, held, &setting.key, 0, EXEC_TIMEOUT).is_err();
+            if setting.value.parse::<i64>().map_or(true, |value| {
+                write_sysctl_verified(deps.system, held, &setting.key, value, EXEC_TIMEOUT).is_err()
+            }) {
+                // The gate result remains authoritative. The ordinary collector
+                // reports this drift as HardeningSysctl and plans its repair.
+                eprintln!("scupperd: HardeningSysctl: {:?}", setting.key);
+            }
         }
     }
     if failed {

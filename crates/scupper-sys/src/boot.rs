@@ -384,6 +384,8 @@ fn containment(
     }
 }
 
+// Fault-injection hooks share the fallible checkpoint signature in every build.
+#[cfg_attr(not(feature = "testing"), allow(clippy::unnecessary_wraps))]
 fn checkpoint(deps: &BootDeps<'_>, step: BootStep) -> Result<()> {
     #[cfg(feature = "testing")]
     if let Some(hook) = deps.hook {

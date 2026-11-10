@@ -23,7 +23,6 @@ use scupper_core::{
 use std::{
     cell::Cell,
     collections::BTreeMap,
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -331,10 +330,8 @@ pub(crate) fn observe(
     let mut model = KernelModel::desired(desired);
     model.conntrack_flushed = false;
     model.latch = None;
-    model.namespace = match std::fs::metadata(namespace) {
-        Ok(metadata) if (metadata.dev(), metadata.ino()) == held.identity() => {
-            NamespaceState::Ready
-        }
+    model.namespace = match sys.namespace_identity(namespace) {
+        Ok(identity) if identity == held.identity() => NamespaceState::Ready,
         Ok(_) => NamespaceState::NameGone,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => NamespaceState::NameGone,
         Err(_) => {
@@ -343,8 +340,8 @@ pub(crate) fn observe(
         }
     };
     if let Some(path) = edge {
-        match std::fs::metadata(path) {
-            Ok(metadata) if (metadata.dev(), metadata.ino()) != held.identity() => {
+        match sys.namespace_identity(path) {
+            Ok(identity) if identity != held.identity() => {
                 if model.namespace == NamespaceState::Ready {
                     model.namespace = NamespaceState::EdgeElsewhere;
                 }

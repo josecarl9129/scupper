@@ -1660,6 +1660,15 @@ A full-screen TUI stays R2+.
 
 Scripts that page on any non-zero code page on 5; that is intended.
 
+Ping publishes an active apply or rebuild with its source and target versions
+and elapsed age. Check reports `Degraded::OperationInProgress` (3) during this
+transition, including rollback, without comparing the kernel to the version
+being published in state.json. This is an availability indication; no topology
+verdict is asserted until the transition publishes its attached snapshot.
+Only a Check with no reply before its deadline retains the first Ping's age
+for stage 8. Explicit refusal, EOF or SupervisorUnavailable uses a fresh Ping,
+with an unavailable supervisor treated as Dead.
+
 ### Check order (severity, safety before availability; costly stages run only if earlier ones passed)
 
 | Stage | Observation | Fails with |
@@ -1692,6 +1701,12 @@ and always adds `Warning::ClockSkew`, including beyond the skew bound,
 where it is stale. `check` run locally performs every
 stage itself; via the API, scupperd runs a fresh check. `status` may show
 cached observations, always with their age.
+
+`Warning::HardeningSysctl` includes a default forwarding sysctl that disagrees
+with its corresponding global gate. This consistency warning applies when
+the global gate is either open or closed. Hardening restoration failures do
+not override a successfully verified forwarding-gate result; subsequent
+observations retain the hardening drift for repair and warnings.
 
 **Coverage.** A gateway `check` = 0 states that the gateway side works:
 containment, the exit path, the gateway's DNS and the listening side of the
@@ -1761,6 +1776,7 @@ pub enum Degraded {
     ForwardingDisabled,
     RouteWrong { client: ClientAddr, got: RouteAnswer, want: RouteTarget },
     DisconnectNotEffective,
+    OperationInProgress { from: u64, to: u64 }, // snapshot transition; no kernel comparison
     ClientSideBroken(ClientFault),             // wg0 key, listen port or host socket
     ExitProbeFailed(ProbeError),               // the probe ran and the path failed (not a local setup error)
     ExitProbeImplausible { ip: IpAddr },       // exit IP cannot be a public exit address
@@ -2060,6 +2076,11 @@ the local link) and that nothing else does.
 ---
 
 ## 15. Install, boot, upgrades, migration, rebuild
+
+A manual boot defers only to an initialized supervisor holding the currently
+named namespace. If a local CLI writer holds the lease, boot fails; wait for
+that writer, or stop scupperd before rerunning after a stale namespace refusal.
+
 
 ### `scupper install` (basic in M2, hardened in M6)
 

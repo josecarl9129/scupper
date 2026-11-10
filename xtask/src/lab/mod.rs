@@ -73,6 +73,7 @@ struct Lab {
     rows: Vec<Row>,
     cleaned: bool,
     baseline_failure: Option<String>,
+    daemon_host_baseline: Option<Vec<(String, String)>>,
     next_source_port: u16,
     exit_port: u16,
 }
@@ -150,7 +151,8 @@ fn run_inner(
         rows: Vec::new(),
         cleaned: false,
         baseline_failure: None,
-        next_source_port: 41000,
+        daemon_host_baseline: None,
+        next_source_port: 20000,
         exit_port: 51821,
     };
     let outcome: Result<()> = (|| {
@@ -415,6 +417,7 @@ impl Lab {
         self.next_source_port = self
             .next_source_port
             .checked_add(1)
+            .filter(|port| *port < 32768)
             .ok_or("probe source ports exhausted")?;
         let mut args = vec![
             "probe",

@@ -256,6 +256,7 @@ fn every_variant_roundtrips_and_keys_are_private() {
         "peers_present",
         "last_complete_iteration_age",
         "current_iteration_age",
+        "operation",
         "quarantined",
         "selection",
         "plan",

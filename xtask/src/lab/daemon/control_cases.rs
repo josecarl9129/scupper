@@ -13,6 +13,33 @@ use scupper_sys::{
     store::{MetaInput, VersionStore},
 };
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
+
+fn session_continues(before: &str, after: &str) -> bool {
+    let sessions = |text: &str| {
+        text.lines()
+            .filter_map(|line| {
+                let fields = line.split_whitespace().collect::<Vec<_>>();
+                Some((
+                    fields.first()?.to_string(),
+                    (
+                        fields.get(1)?.parse::<u64>().ok()?,
+                        fields.get(2)?.parse::<u64>().ok()?,
+                        fields.get(3)?.parse::<u64>().ok()?,
+                    ),
+                ))
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let before = sessions(before);
+    let after = sessions(after);
+    !before.is_empty()
+        && before.keys().eq(after.keys())
+        && before.iter().all(|(key, (time, rx, tx))| {
+            let (next_time, next_rx, next_tx) = after[key];
+            *time > 0 && next_time >= *time && next_rx > *rx && next_tx > *tx
+        })
+}
 
 impl DaemonGuard<'_> {
     fn control_command(&mut self, root: &Path, args: &[&str], stem: &str) -> Result<(i32, String)> {
@@ -112,6 +139,7 @@ impl DaemonGuard<'_> {
                 if Instant::now() <= deadline {
                     return Ok(());
                 }
+                return fail("client handshake and delivery exceeded shared 30 s deadline");
             }
             if Instant::now() >= deadline {
                 return fail("client handshake and delivery exceeded shared 30 s deadline");
@@ -120,8 +148,25 @@ impl DaemonGuard<'_> {
         }
     }
     fn client_session(&mut self) -> Result<String> {
-        self.lab
-            .cmd("scupper", "wg", &["show", "wg0", "latest-handshakes"])
+        let handshakes = self
+            .lab
+            .cmd("scupper", "wg", &["show", "wg0", "latest-handshakes"])?;
+        let transfers = self
+            .lab
+            .cmd("scupper", "wg", &["show", "wg0", "transfer"])?;
+        let times = handshakes
+            .lines()
+            .filter_map(|line| line.split_once(char::is_whitespace))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut sample = String::new();
+        for line in transfers.lines() {
+            let (peer, counters) = line
+                .split_once(char::is_whitespace)
+                .ok_or("invalid peer counters")?;
+            let time = times.get(peer).ok_or("missing peer handshake")?.trim();
+            writeln!(sample, "{peer} {time} {}", counters.trim())?;
+        }
+        Ok(sample)
     }
     fn assert_namespace_released(&mut self, identity: &str) -> Result<()> {
         self.lab
@@ -147,6 +192,19 @@ impl DaemonGuard<'_> {
                                 return Ok(false);
                             }
                         }
+                    }
+                }
+                let inode = identity.trim_start_matches("net:[").trim_end_matches(']');
+                for line in fs::read_to_string("/proc/self/mountinfo")?.lines() {
+                    let fields = line.split_whitespace().collect::<Vec<_>>();
+                    if line.contains(" - nsfs ")
+                        && fields.get(4).is_some_and(|path| {
+                            fs::metadata(path).is_ok_and(|meta| {
+                                std::os::unix::fs::MetadataExt::ino(&meta).to_string() == inode
+                            })
+                        })
+                    {
+                        return Ok(false);
                     }
                 }
                 Ok(true)
@@ -181,7 +239,10 @@ impl DaemonGuard<'_> {
         let guard = WriterLock::acquire(root.join("run/scupper"))?;
         let store = VersionStore::open_with_mirror_root(&state_root, &config_root, Some(&guard))?;
         let head = store.head()?.ok_or("missing head")?;
-        let (old, _) = store.read(head)?;
+        let StateRead::Present(state) = StateFile::open(&state_root, None)?.read()? else {
+            return fail("missing applied state");
+        };
+        let (old, _) = store.read(state.applied_version.ok_or("missing applied version")?)?;
         let text = exit_change(&old)?;
         let version = store.commit(
             &guard,
@@ -208,24 +269,9 @@ impl DaemonGuard<'_> {
     }
     fn assert_client_session(&mut self, before: &str) -> Result<()> {
         let after = self.client_session()?;
-        let sessions = |text: &str| {
-            text.lines()
-                .filter_map(|line| {
-                    let mut words = line.split_whitespace();
-                    Some((words.next()?.to_owned(), words.next()?.parse::<u64>().ok()?))
-                })
-                .collect::<std::collections::BTreeMap<_, _>>()
-        };
-        let before = sessions(before);
-        let after = sessions(&after);
-        if before.is_empty()
-            || before.keys().ne(after.keys())
-            || before
-                .iter()
-                .any(|(key, time)| *time == 0 || after[key] < *time || after[key] - time > 5)
-        {
+        if !session_continues(before, &after) {
             return fail(format!(
-                "apply replaced the established client session: {before:?} -> {after:?}"
+                "apply reset client transfer counters: {before:?} -> {after:?}"
             ));
         }
         Ok(())
@@ -634,7 +680,11 @@ impl DaemonGuard<'_> {
                     if forwarding.trim() != "0" || forwarding6.trim() != "0" {
                         let (code, report) = self.lab.check_result(&Lab::boot_binary()?, &root)?;
                         saw_open = true;
-                        if !matches!(code, 0 | 4 | 5) {
+                        let transitioning = code == 3
+                            && report["verdict"]["Degraded"]
+                                .get("OperationInProgress")
+                                .is_some();
+                        if !matches!(code, 0 | 4 | 5) && !transitioning {
                             return fail(format!("L44 open unsafe sample {sample}: {report}"));
                         }
                         if code == 5 {
@@ -703,8 +753,7 @@ impl DaemonGuard<'_> {
                         "L44 apply failed without writer contention: {status}: {output}: {diagnostic}"
                     ));
                 }
-                self.lab
-                    .daemon_ready_tick(self.notify.as_ref().ok_or("notify missing")?)?;
+                self.lab.daemon_complete_tick(&root)?;
                 self.lab.daemon_route_healthy(Duration::from_secs(30))?;
                 self.expect_check(&root, 0, "one-writer-recovered")?;
                 self.assert_client_session(&client_session)?;
@@ -827,13 +876,21 @@ impl DaemonGuard<'_> {
                 {
                     return fail(format!("L50 socket ineffective disconnect: {code}: {text}"));
                 }
-                let (code, text) = self.control_command(&root, &["connect"], "socket-reconnect")?;
-                if code != 0 {
-                    return fail(format!(
-                        "L50 reconnect before ordering check: {code}: {text}"
-                    ));
+                let deadline = Instant::now() + Duration::from_secs(60);
+                loop {
+                    let (code, text) =
+                        self.control_command(&root, &["connect"], "socket-reconnect")?;
+                    if code == 0 {
+                        break;
+                    }
+                    if code != 3 || !text.contains("NotReady") || Instant::now() >= deadline {
+                        return fail(format!(
+                            "L50 reconnect before ordering check: {code}: {text}"
+                        ));
+                    }
+                    self.lab.runner.dwell(Duration::from_millis(200))?;
                 }
-                self.lab.daemon_route_healthy(Duration::from_secs(60))?;
+                self.lab.daemon_route_healthy(Duration::from_secs(5))?;
                 let (code, text) =
                     self.control_command(&root, &["disconnect"], "socket-tighten")?;
                 if code != 0 || !text.contains("transport: local socket") {
@@ -896,5 +953,23 @@ mod tests {
         let changed = exit_change(&original).unwrap();
         assert!(changed.contains("keepalive = \"24s\""));
         assert_eq!(exit_change(&changed).unwrap(), original);
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::session_continues;
+    #[test]
+    fn counters_allow_rekeys_and_reject_session_resets_or_idle_traffic() {
+        let before = "peer 100 1000 2000\n";
+        assert!(session_continues(before, "peer 220 1100 2100"));
+        for after in [
+            "peer 220 1 2100",
+            "peer 100 1100 2000",
+            "other 100 1100 2100",
+            "peer 99 1100 2100",
+        ] {
+            assert!(!session_continues(before, after));
+        }
     }
 }

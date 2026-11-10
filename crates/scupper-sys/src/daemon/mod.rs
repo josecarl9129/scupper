@@ -518,11 +518,37 @@ impl Runtime<'_> {
                 .map(|(machine, _, _)| scupper_proto::OpResult::Ping {
                     last_complete_iteration_age: None,
                     current_iteration_age: None,
+                    operation: None,
                     netns: machine.netns_identity(),
                     version: machine.version(),
                     quarantined: machine.latch().is_some(),
                     selection: machine.selection(),
                 });
+    }
+    fn begin_operation(&self, kind: scupper_proto::OperationKind, target: Option<u64>) {
+        let from = self
+            .running
+            .as_ref()
+            .map_or(0, |(machine, _, _)| machine.version());
+        self.snapshot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .operation = Some((
+            scupper_proto::OperationProgress {
+                kind,
+                from,
+                to: target.unwrap_or(from),
+                age: 0,
+            },
+            Instant::now(),
+        ));
+    }
+    fn end_operation(&self) {
+        self.publish_snapshot();
+        self.snapshot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .operation = None;
     }
     fn control_failure(&mut self, error: &str) {
         let Some(count) = self.control_errors.record(Instant::now()) else {
@@ -617,7 +643,7 @@ impl Runtime<'_> {
             if let Some(target) = version {
                 VersionStore::read_only(deps.state_root, deps.config_root)
                     .read(target)
-                    .map_err(|_| control::api(ApiErrorCode::NotFound))?;
+                    .map_err(admin::store_error)?;
             }
             if !dry_run && let Some((machine, _, _)) = &mut self.running {
                 machine
@@ -635,6 +661,9 @@ impl Runtime<'_> {
             } else {
                 Vec::new()
             };
+            if !dry_run {
+                self.begin_operation(scupper_proto::OperationKind::Apply, target);
+            }
             let (mut result, touched) =
                 admin::apply_tracked(&deps, &self.audit.handle(), &guard, version, dry_run, uid);
             if touched {
@@ -642,7 +671,7 @@ impl Runtime<'_> {
                 self.startup_read = StartupRead::default();
                 self.running = if result
                     .as_ref()
-                    .is_err_and(|error| error.code == ApiErrorCode::PersistenceUnavailable)
+                    .is_err_and(|error| error.code == ApiErrorCode::RollbackFailed)
                 {
                     None
                 } else {
@@ -667,6 +696,7 @@ impl Runtime<'_> {
             if let Ok(OpResult::Apply { repair_plan, .. }) = &mut result {
                 *repair_plan = prefix;
             }
+            self.end_operation();
             return result;
         }
         if matches!(op, Op::RepairClear { .. }) && self.running.is_none() {
@@ -845,6 +875,7 @@ impl DaemonDeps for Runtime<'_> {
             .with_uplink(uplink_addresses(self.system).unwrap_or_default());
     }
     fn rebuild(&mut self) {
+        self.begin_operation(scupper_proto::OperationKind::Rebuild, None);
         let deps = self.deps();
         let report = if let Some((machine, _, _)) = &mut self.running {
             machine.rebuild(&deps).ok()
@@ -854,6 +885,7 @@ impl DaemonDeps for Runtime<'_> {
         if report.is_some_and(|report| report.succeeded()) {
             self.initialize();
         }
+        self.end_operation();
     }
     fn maintenance(&mut self) {
         if let Err(error) = canon::refresh_tool_facts(self.system, Instant::now()) {

@@ -159,3 +159,41 @@ All five gates passed, each under `timeout 600`:
 The final full workspace run passed 863 tests, with 8 existing subprocess fixtures ignored and no failing targets, including the hung-Check latency/real-age test, actual Runtime/Dispatcher apply rollback and unknown-version checks, default-forwarding consistency, client key/AllowedIPs/session retention, hangup disconnect, failed rollback closure, and broken-notify audit regressions. Boot command goldens include explicit PSK clearing. All temporary paths and gate logs are under CARGO_TARGET_TMPDIR in this worktree; no crate-local target files remain. Edit-scope audit and `git diff --check` passed. Final formatting runs after the gates.
 
 Privileged L6/L14/L44/L50 and suite-isolation scenarios were updated and compiled but not executed locally; a green privileged lab remains unverified. No new crates or commits.
+
+## Fix round 5
+
+- M-1 / L-1 → Ping publishes apply/rebuild kind, source/target versions and elapsed age before mutation, through rollback and snapshot publication. Check reports OperationInProgress (3) without evaluating a transitional kernel. A fallback pins configuration to the attached Ping version, detects differing Ping/state versions, and rechecks transitions before emitting a topology alarm. Tests: `applying_ping_never_compares_kernel_with_unreached_state_version`, snapshot and Runtime apply regressions.
+- M-2 → only a Check response timeout retains and advances Ping age; explicit refusal, EOF and unavailable/error replies use a fresh Ping, defaulting to Dead. Tests: `socket_check_error_uses_local_observations` restored to 5, `ping_followed_by_connection_refused_is_unsupervised`, hung-Check regression.
+- M-3 / second reviewer → per-peer rx and tx must strictly increase while canary traffic flows; peer set and nondecreasing handshake retained, normal rekeys allowed. Test: `counters_allow_rekeys_and_reject_session_resets_or_idle_traffic`; privileged L14/L44 pending.
+- Second reviewer apply outcomes / L-5 → read recovery inputs before gate writes; partial gate and state-write failures share boot failure recovery and report verified rollback or closure. Dedicated RollbackFailed drops an unverified attachment without claiming a persistence failure. Tests: `post_mutation_gate_and_state_failures_report_recovery_outcome`, existing rollback and Runtime regressions.
+- Second reviewer lab configuration → edit the applied version's contents, with HEAD used only as commit parent, so cleanup cannot turn L44 into a no-op. Test: exit-only keepalive regression; lab L14/L44.
+- M-4 → production CI job runs no-feature clippy, unit/binary tests and scupperd release build, all under timeout 600. Removed the CLI dev-dependency feature unification and explicitly gated its fake-namespace integration suites, so default workspace runs actually exclude testing. Local validation tracked below.
+- Lab L44 → saved events show Protected at version 7 after apply; the harness incorrectly waited for another startup READY. Post-apply wait now checks Ping for a completed iteration, independent of startup READY. Privileged confirmation pending.
+- Lab L14 / isolation → deterministic probe source ports use 20000–32767, outside ephemeral canary allocations; marker sinks outlive the whole run rather than expiring at 1050 s. Track daemon-suite process groups and assert their release and listener-port release at suite exit. Keepalive is scoped to daemon tests and restored afterward. Requested shutdown accepts GNU timeout's signal-forwarding status 124; unexpected expiry remains a failure. Privileged confirmation pending.
+- Lab L50 → retry the same durable Connect intent for the configured recovery grace on NotReady, then require a healthy route before ordering checks. Privileged confirmation pending.
+- L-2 → retain the last actual verification failure with its observation at the deadline; no observation returns Timeout (1); do not launch retries with less than a Check budget remaining. Test: `disconnect_worker_failure_at_deadline_is_not_internal` covers prior observation followed by worker failure and never-observed cases.
+- L-3 → hardening restoration uses each desired value and reports HardeningSysctl drift independently from successful forwarding-gate writes. Ordinary collection plans repair and reports warnings. Test: `hardening_write_failure_does_not_hide_verified_closed_gates`.
+- L-6 → boot requires Ping's held identity to match the named namespace and supplies stop/rerun recovery instructions; DESIGN §15 documents local writer contention. Tests: held-lease boot regressions.
+- L-7 → namespace release also checks nsfs bind mounts; recovery returns its shared deadline error after a late service check. Cleanup restores saved gwhost sysctls, flushes gwhost conntrack and checks fault entries and namespace mounts; final cleanup has an independent deadline. Test: `background_processes_shutdown_cleanly_and_early_exit_fails`; privileged baseline confirmation pending.
+- L-8 → apply maps only missing/uncommitted versions to NotFound, corrupt store to Internal and other I/O to PersistenceUnavailable. Test: `corrupt_apply_target_preserves_attachment_and_error_kind` (corrupt content and unreadable version object).
+- L-9 → fake boot namespace rebind target is under CARGO_TARGET_TMPDIR, never procfs. Tests: boot/rebind regressions.
+- N-3 decision → DESIGN §12 documents default/global forwarding consistency warnings in both open and closed states.
+- L-4 → the supplied artifacts do not measure real-droplet queue/probe latency; no droplet execution is available in this worktree. Five-second fallback remains bounded; operational measurement remains pending.
+
+### Round 5 verification
+
+No-feature validation passed under timeout 600: workspace/all-target clippy with -D warnings, workspace library/binary unit tests (183 passed, 7 existing ignored), and the optimized scupperd build. The default workspace feature tree contains no testing feature. The production check also found and fixed conditional-import warnings and retained the fallible checkpoint signature for test hooks.
+
+All five gates passed, each under timeout 600:
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
+- `cargo test --workspace --all-features --locked --no-fail-fast`
+- `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked`
+- `cargo deny check`
+
+The final workspace run passed 869 tests, with 8 existing ignored fixtures and no failing targets. It includes the apply-in-progress and hung-Check cases, refused/unavailable supervision, snapshot age, partial-gate and post-close state-write recovery, rollback outcomes, hardening drift, corrupt-target classification, prior disconnect observation followed by worker failure, rekey/counter continuity and background-process release assertions.
+
+`git diff --check` and the edit-scope audit passed. Gate logs and temporary files are under CARGO_TARGET_TMPDIR in this worktree. Final `cargo fmt --all` runs after the gates. No new crates or commits.
+
+Privileged L14/L44/L50 and suite-isolation runs remain unverified locally. The saved L44 events support a harness READY-wait error rather than stalled reconciliation; the port-allocation and sink-lifetime fixes still need a green privileged lab. Real-droplet queue/probe timing (L-4) also remains pending.

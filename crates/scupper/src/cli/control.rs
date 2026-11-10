@@ -183,12 +183,19 @@ pub(super) fn mutation(
 
 pub(super) enum ReadOutcome {
     Rendered(u8),
-    Local(scupper_core::verdict::v2::Supervisor),
+    Local {
+        supervisor: scupper_core::verdict::v2::Supervisor,
+        version: Option<u64>,
+    },
 }
 
-fn ping_supervisor(
-    deps: &Dependencies<'_>,
-) -> Option<(scupper_core::verdict::v2::Supervisor, Option<u64>)> {
+struct PingObservation {
+    supervisor: scupper_core::verdict::v2::Supervisor,
+    busy_age: Option<u64>,
+    operation: Option<scupper_proto::OperationProgress>,
+    version: u64,
+}
+fn ping_supervisor(deps: &Dependencies<'_>) -> Option<PingObservation> {
     use scupper_core::verdict::v2::Supervisor;
     let response = control::call(
         deps.writer_root,
@@ -199,19 +206,23 @@ fn ping_supervisor(
     let Ok(OpResult::Ping {
         last_complete_iteration_age,
         current_iteration_age,
+        operation,
         netns,
+        version,
         ..
     }) = response.result
     else {
         return None;
     };
-    Some((
-        Supervisor::Alive {
+    Some(PingObservation {
+        supervisor: Supervisor::Alive {
             netns,
             iteration_age: Duration::from_secs(last_complete_iteration_age.unwrap_or(30)),
         },
-        current_iteration_age,
-    ))
+        busy_age: current_iteration_age,
+        operation,
+        version,
+    })
 }
 
 pub(super) fn read(
@@ -222,21 +233,39 @@ pub(super) fn read(
     err: &mut dyn Write,
 ) -> Result<ReadOutcome, String> {
     use scupper_core::verdict::v2::Supervisor;
-    let local = |err: &mut dyn Write, supervisor| {
+    let mut local = |err: &mut dyn Write, supervisor, version: Option<u64>| {
+        if let Some(operation) =
+            version.and_then(|from| version_transition(from, applied_version(deps)))
+        {
+            return operation_report(&operation, json, out, err);
+        }
         writeln!(err, "transport: local observations").map_err(output_error)?;
-        Ok(ReadOutcome::Local(supervisor))
+        Ok(ReadOutcome::Local {
+            supervisor,
+            version,
+        })
     };
     if status {
-        return local(err, Supervisor::Dead);
+        return local(err, Supervisor::Dead, None);
     }
-    let observed = Instant::now();
-    let Some((supervisor, busy_age)) = ping_supervisor(deps) else {
-        return local(err, Supervisor::Dead);
+    let mut observed = Instant::now();
+    let Some(PingObservation {
+        mut supervisor,
+        busy_age,
+        operation,
+        version,
+    }) = ping_supervisor(deps)
+    else {
+        return local(err, Supervisor::Dead, None);
     };
+    let mut version = Some(version);
+    if let Some(operation) = operation {
+        return operation_report(&operation, json, out, err);
+    }
     if busy_age.is_some_and(|age| age >= 5)
         || matches!(supervisor, Supervisor::Alive {iteration_age, ..} if iteration_age >= Duration::from_secs(30))
     {
-        return local(err, supervisor);
+        return local(err, supervisor, version);
     }
     let deadline = Instant::now() + control::CHECK_TIMEOUT;
     for attempt in 0..2 {
@@ -250,20 +279,43 @@ pub(super) fn read(
                 writeln!(err, "transport: local socket").map_err(output_error)?;
                 return render(response, json, out).map(ReadOutcome::Rendered);
             }
-            Ok(Response {
-                result:
-                    Err(scupper_proto::ApiError {
-                        code: scupper_proto::ApiErrorCode::SupervisorUnavailable,
-                        ..
-                    }),
-                ..
-            }) if attempt == 0 => {
-                if !matches!(ping_supervisor(deps), Some((Supervisor::Alive {iteration_age, ..}, _)) if iteration_age < Duration::from_secs(30))
+            Err(ClientError::OutcomeUnknown(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                break;
+            }
+            other => {
+                let fresh = ping_supervisor(deps);
+                if let Some(PingObservation {
+                    operation: Some(operation),
+                    ..
+                }) = fresh.as_ref()
                 {
-                    break;
+                    return operation_report(operation, json, out, err);
+                }
+                version = fresh.as_ref().map(|ping| ping.version);
+                supervisor = fresh.map_or(Supervisor::Dead, |ping| ping.supervisor);
+                observed = Instant::now();
+                let unavailable = matches!(
+                    other,
+                    Ok(Response {
+                        result: Err(scupper_proto::ApiError {
+                            code: scupper_proto::ApiErrorCode::SupervisorUnavailable,
+                            ..
+                        }),
+                        ..
+                    })
+                );
+                if attempt != 0
+                    || !unavailable
+                    || !matches!(supervisor, Supervisor::Alive {iteration_age, ..} if iteration_age < Duration::from_secs(30))
+                {
+                    return local(err, supervisor, version);
                 }
             }
-            _ => break,
         }
     }
     let supervisor = match supervisor {
@@ -276,7 +328,95 @@ pub(super) fn read(
         },
         other => other,
     };
-    local(err, supervisor)
+    local(err, supervisor, version)
+}
+
+pub(super) fn transition_after_observation(
+    deps: &Dependencies<'_>,
+    version: u64,
+    json: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<Option<u8>, String> {
+    let ping = ping_supervisor(deps);
+    let state_version = applied_version(deps);
+    let target = ping
+        .as_ref()
+        .map(|ping| ping.version)
+        .filter(|target| *target != version)
+        .or(state_version.filter(|target| *target != version));
+    let operation = ping
+        .and_then(|ping| ping.operation)
+        .or_else(|| version_transition(version, target));
+    if let Some(operation) = operation {
+        operation_report(&operation, json, out, err)?;
+        return Ok(Some(3));
+    }
+    Ok(None)
+}
+
+fn applied_version(deps: &Dependencies<'_>) -> Option<u64> {
+    let scupper_sys::state::StateRead::Present(state) =
+        scupper_sys::state::StateFile::open(deps.state_root, None)
+            .and_then(|file| file.read())
+            .ok()?
+    else {
+        return None;
+    };
+    state.applied_version
+}
+fn version_transition(from: u64, target: Option<u64>) -> Option<scupper_proto::OperationProgress> {
+    target
+        .filter(|to| *to != from)
+        .map(|to| scupper_proto::OperationProgress {
+            kind: scupper_proto::OperationKind::Apply,
+            from,
+            to,
+            age: 0,
+        })
+}
+
+fn operation_report(
+    operation: &scupper_proto::OperationProgress,
+    json: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<ReadOutcome, String> {
+    let message = format!(
+        "{} in progress (from {} to {}, {} s)",
+        match operation.kind {
+            scupper_proto::OperationKind::Apply => "apply",
+            scupper_proto::OperationKind::Rebuild => "rebuild",
+        },
+        operation.from,
+        operation.to,
+        operation.age
+    );
+    writeln!(err, "{message}").map_err(output_error)?;
+    if json {
+        let report = scupper_core::verdict::v2::Report {
+            verdict: scupper_core::verdict::v2::Verdict::Degraded(
+                scupper_core::verdict::v2::Degraded::OperationInProgress {
+                    from: operation.from,
+                    to: operation.to,
+                },
+            ),
+            warnings: Vec::new(),
+            at: unix_seconds(),
+            config_version: operation.from,
+        };
+        serde_json::to_writer(&mut *out, &report).map_err(|error| error.to_string())?;
+        writeln!(out).map_err(output_error)?;
+    } else {
+        writeln!(out, "{message}").map_err(output_error)?;
+    }
+    Ok(ReadOutcome::Rendered(3))
+}
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn render(response: Response, json: bool, out: &mut dyn Write) -> Result<u8, String> {

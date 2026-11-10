@@ -17,8 +17,5 @@ clap.workspace = true
 rustix.workspace = true
 serde_json.workspace = true
 
-[dev-dependencies]
-scupper-sys = { workspace = true, features = ["testing"] }
-
 [lints]
 workspace = true

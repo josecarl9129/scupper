@@ -5,11 +5,12 @@ use scupper_core::{
     render::{Family, RouteTarget, Scope, SysctlFamily, SysctlKey},
     rules::IfName,
 };
-use scupper_sys::{
-    cmd::*,
-    system::{ExecTarget, Program},
-};
-use std::{error::Error, time::Duration};
+#[cfg(feature = "testing")]
+use scupper_sys::system::ExecTarget;
+use scupper_sys::{cmd::*, system::Program};
+use std::error::Error;
+#[cfg(feature = "testing")]
+use std::time::Duration;
 
 fn key() -> Result<PeerKey, scupper_core::parse::ParseError> {
     PeerKey::new(&format!("{}=", "A".repeat(43)))

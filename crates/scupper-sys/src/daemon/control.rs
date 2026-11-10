@@ -34,6 +34,7 @@ pub(crate) struct Snapshot {
     pub ping: Option<OpResult>,
     pub last_complete: Option<Instant>,
     pub current_iteration: Option<Instant>,
+    pub operation: Option<(scupper_proto::OperationProgress, Instant)>,
 }
 pub(crate) type SharedSnapshot = Arc<RwLock<Snapshot>>;
 
@@ -46,11 +47,17 @@ impl Snapshot {
         if let OpResult::Ping {
             last_complete_iteration_age,
             current_iteration_age,
+            operation,
             ..
         } = &mut ping
         {
             *last_complete_iteration_age = self.last_complete.map(|at| at.elapsed().as_secs());
             *current_iteration_age = self.current_iteration.map(|at| at.elapsed().as_secs());
+            *operation = self.operation.as_ref().map(|(progress, start)| {
+                let mut progress = progress.clone();
+                progress.age = start.elapsed().as_secs();
+                progress
+            });
         }
         Ok(ping)
     }
@@ -878,6 +885,7 @@ mod round_two_tests {
         let ping = OpResult::Ping {
             last_complete_iteration_age: None,
             current_iteration_age: None,
+            operation: None,
             netns: scupper_core::verdict::v2::NetnsIdentity {
                 device: 5,
                 inode: 7,
@@ -887,6 +895,7 @@ mod round_two_tests {
             selection: scupper_core::verdict::v2::Selection::Disconnected,
         };
         *snapshot.write().unwrap() = Snapshot {
+            operation: None,
             ping: Some(ping),
             last_complete: Instant::now().checked_sub(Duration::from_secs(3)),
             current_iteration: Instant::now().checked_sub(Duration::from_secs(6)),
@@ -909,12 +918,27 @@ mod round_two_tests {
         ));
         assert!(receive.try_recv().is_err());
         snapshot.write().unwrap().last_complete = None;
+        snapshot.write().unwrap().operation = Some((
+            scupper_proto::OperationProgress {
+                kind: scupper_proto::OperationKind::Apply,
+                from: 11,
+                to: 12,
+                age: 0,
+            },
+            Instant::now().checked_sub(Duration::from_secs(7)).unwrap(),
+        ));
         assert!(matches!(
             answer(request(Op::Ping {}), 0, &send, &snapshot, None)
                 .unwrap()
                 .result,
             Ok(OpResult::Ping {
                 last_complete_iteration_age: None,
+                operation: Some(scupper_proto::OperationProgress {
+                    from: 11,
+                    to: 12,
+                    age: 7,
+                    ..
+                }),
                 ..
             })
         ));

@@ -65,6 +65,7 @@ pub(super) struct Runner {
     pub phase: Instant,
     pub cleanup: bool,
     trace: File,
+    background_groups: Vec<u32>,
 }
 impl Runner {
     pub fn new(trace: File, cancel: Arc<AtomicBool>) -> Self {
@@ -75,6 +76,7 @@ impl Runner {
             phase: now + Duration::from_secs(180),
             cleanup: false,
             trace,
+            background_groups: Vec::new(),
         }
     }
     pub fn check(&self) -> Result<()> {
@@ -208,10 +210,33 @@ impl Runner {
         cmd.stdin(Stdio::null())
             .stdout(File::create(log)?)
             .stderr(File::create(log.with_extension("stderr"))?);
-        Ok(Group {
-            child: cmd.spawn()?,
-            done: false,
-        })
+        let child = cmd.spawn()?;
+        self.background_groups.push(child.id());
+        Ok(Group { child, done: false })
+    }
+    pub fn background_checkpoint(&self) -> usize {
+        self.background_groups.len()
+    }
+    pub fn assert_background_released(&self, checkpoint: usize) -> Result<()> {
+        for entry in std::fs::read_dir("/proc")? {
+            let path = entry?.path().join("stat");
+            let Ok(stat) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let Some((_, fields)) = stat.rsplit_once(") ") else {
+                continue;
+            };
+            let fields = fields.split_whitespace().collect::<Vec<_>>();
+            if fields.first() == Some(&"Z") {
+                continue;
+            }
+            if let Some(group) = fields.get(2).and_then(|value| value.parse::<u32>().ok())
+                && self.background_groups[checkpoint..].contains(&group)
+            {
+                return fail(format!("daemon suite left process group {group} running"));
+            }
+        }
+        Ok(())
     }
 }
 fn receive(channel: &mpsc::Receiver<std::io::Result<Vec<u8>>>) -> Result<Option<Vec<u8>>> {
@@ -271,6 +296,7 @@ impl Group {
     }
     pub fn alive(&mut self) -> Result<()> {
         if let Some(status) = self.child.try_wait()? {
+            self.signal(Signal::KILL);
             self.done = true;
             return fail(format!("background process exited: {status}"));
         }
@@ -278,7 +304,10 @@ impl Group {
     }
     pub(super) fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>> {
         let status = self.child.try_wait()?;
-        self.done |= status.is_some();
+        if status.is_some() {
+            self.signal(Signal::KILL);
+            self.done = true;
+        }
         Ok(status)
     }
     /// Wait for completion without sending a signal; retain the cleanup guard.
@@ -286,6 +315,7 @@ impl Group {
         let until = Instant::now() + timeout;
         loop {
             if let Some(status) = self.child.try_wait()? {
+                self.signal(Signal::KILL);
                 self.done = true;
                 return Ok(status);
             }
@@ -307,9 +337,12 @@ impl Group {
         let until = Instant::now() + timeout;
         while Instant::now() < until {
             if let Some(status) = self.child.try_wait()? {
+                self.signal(Signal::KILL);
                 self.done = true;
-                // timeout returns the child's status when stopped by a signal.
+                // GNU timeout may return 124 after forwarding our explicit
+                // stop signal; only this requested-stop path accepts it.
                 if status.success()
+                    || status.code() == Some(124)
                     || status.signal() == Some(signal.as_raw())
                     || status.code() == Some(128 + signal.as_raw())
                 {

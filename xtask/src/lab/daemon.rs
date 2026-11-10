@@ -361,6 +361,7 @@ impl DaemonGuard<'_> {
         }
         let restored = self
             .reset_control_fixture()
+            .and_then(|()| self.lab.daemon_restore_host())
             .and_then(|()| self.lab.boot_gateway(&[], "daemon-restore"))
             .and_then(|_| self.lab.daemon_clean_baseline())
             .and_then(|()| super::mounts::verify_restored_peers(None))
@@ -388,6 +389,16 @@ impl Drop for DaemonGuard<'_> {
 
 impl Lab {
     pub(super) fn daemon_case(&mut self) -> Result<String> {
+        let first_group = self.runner.background_checkpoint();
+        self.daemon_host_baseline = Some(self.daemon_host_sysctls()?);
+        // Only this suite needs periodic client traffic during a real reboot.
+        let key = self.cmd("client", "wg", &["show", "wg0", "peers"])?;
+        let peer = key.trim();
+        self.cmd(
+            "client",
+            "wg",
+            &["set", "wg0", "peer", peer, "persistent-keepalive", "5"],
+        )?;
         let mut failures = Vec::new();
         let mut blocked = None;
         for case in CASES {
@@ -424,7 +435,34 @@ impl Lab {
                 failures.push(format!("{case}: {error}"));
             }
         }
-        if let Err(error) = self.daemon_clean_baseline() {
+        let saved_limits = (self.runner.cleanup, self.runner.phase, self.runner.whole);
+        self.runner.cleanup = true;
+        self.runner.phase = Instant::now() + Duration::from_secs(90);
+        self.runner.whole = self.runner.phase;
+        let isolation = (|| {
+            self.cmd(
+                "client",
+                "wg",
+                &["set", "wg0", "peer", peer, "persistent-keepalive", "0"],
+            )?;
+            self.daemon_wait("daemon processes released", Duration::from_secs(5), |lab| {
+                Ok(lab.runner.assert_background_released(first_group).is_ok())
+            })?;
+            // Every daemon stream listener is allocated from this range.
+            let sockets = self.cmd("internet", "ss", &["-H", "-lnt"])?;
+            for port in 8081..=8100 {
+                if sockets
+                    .split_whitespace()
+                    .any(|word| word.ends_with(&format!(":{port}")))
+                {
+                    return fail(format!("daemon suite left listener port {port} bound"));
+                }
+            }
+            self.cmd("gwhost", "conntrack", &["-F"])?;
+            self.daemon_clean_baseline()
+        })();
+        (self.runner.cleanup, self.runner.phase, self.runner.whole) = saved_limits;
+        if let Err(error) = isolation {
             self.baseline_failure = Some(error.to_string());
             failures.push(format!("daemon suite final baseline: {error}"));
         }
@@ -454,7 +492,56 @@ impl Lab {
             (Err(error), Err(cleanup)) => fail(format!("{error}; cleanup: {cleanup}")),
         }
     }
+    fn daemon_host_sysctls(&mut self) -> Result<Vec<(String, String)>> {
+        let mut values = Vec::new();
+        for key in [
+            "net.ipv4.ip_forward",
+            "net.ipv4.conf.all.rp_filter",
+            "net.ipv4.conf.default.rp_filter",
+            "net.ipv4.conf.all.send_redirects",
+            "net.ipv4.conf.default.send_redirects",
+            "net.ipv6.conf.all.forwarding",
+            "net.ipv6.conf.default.forwarding",
+            "net.ipv6.conf.all.accept_ra",
+            "net.ipv6.conf.default.accept_ra",
+            "net.ipv6.conf.all.autoconf",
+            "net.ipv6.conf.default.autoconf",
+        ] {
+            values.push((
+                key.to_owned(),
+                self.cmd("gwhost", "sysctl", &["-n", key])?
+                    .trim()
+                    .to_owned(),
+            ));
+        }
+        Ok(values)
+    }
+    fn daemon_restore_host(&mut self) -> Result<()> {
+        if let Some(values) = self.daemon_host_baseline.clone() {
+            for (key, value) in values {
+                self.cmd("gwhost", "sysctl", &["-q", "-w", &format!("{key}={value}")])?;
+            }
+        }
+        self.cmd("gwhost", "conntrack", &["-F"])?;
+        Ok(())
+    }
     pub(super) fn daemon_clean_baseline(&mut self) -> Result<()> {
+        if let Some(expected) = self.daemon_host_baseline.clone()
+            && self.daemon_host_sysctls()? != expected
+        {
+            return fail("unclean baseline: gwhost sysctls differ");
+        }
+        if super::mounts::count(
+            &fs::read_to_string("/proc/self/mountinfo")?,
+            super::mounts::SCUPPER,
+        )? != 1
+        {
+            return fail("unclean baseline: leftover scupper mounts");
+        }
+        let conntrack = self.cmd("gwhost", "conntrack", &["-L"])?;
+        if conntrack.contains("198.18.") || conntrack.contains("2001:db8:52:") {
+            return fail("unclean baseline: gwhost fault conntrack remains");
+        }
         let links: serde_json::Value =
             serde_json::from_str(&self.cmd("scupper", "ip", &["-j", "link", "show"])?)?;
         if links.as_array().is_none_or(|links| {
@@ -536,6 +623,30 @@ impl Lab {
                     complete |= message == "WATCHDOG=1";
                 }
                 Ok(ready && complete)
+            },
+        )?;
+        Ok(())
+    }
+    fn daemon_complete_tick(&mut self, root: &Path) -> Result<()> {
+        self.daemon_wait(
+            "first complete post-apply tick",
+            Duration::from_secs(40),
+            |_| {
+                Ok(matches!(
+                    scupper_sys::daemon::control::call(
+                        &root.join("run/scupper"),
+                        &scupper_sys::daemon::control::request(scupper_proto::Op::Ping {}),
+                        Duration::from_secs(2),
+                    ),
+                    Ok(scupper_proto::Response {
+                        result: Ok(scupper_proto::OpResult::Ping {
+                            last_complete_iteration_age: Some(0..=4),
+                            operation: None,
+                            ..
+                        }),
+                        ..
+                    })
+                ))
             },
         )?;
         Ok(())

@@ -75,6 +75,7 @@ struct Kernel {
     script: Script,
     defaults: RefCell<BTreeMap<bool, String>>,
     wrong_readback: Cell<bool>,
+    state_failure_on_close: RefCell<Option<std::path::PathBuf>>,
     bad_canon: Cell<bool>,
     check_links: Cell<bool>,
 }
@@ -95,6 +96,7 @@ impl Kernel {
             script: Script::new("ubuntu-24.04"),
             defaults: RefCell::default(),
             wrong_readback: Cell::new(false),
+            state_failure_on_close: RefCell::new(None),
             bad_canon: Cell::new(false),
             check_links: Cell::new(true),
         }
@@ -285,6 +287,13 @@ impl Kernel {
                 assert!(ns);
                 if a(0) == "-w" {
                     let (k, v) = a(1).split_once('=').unwrap();
+                    if k == "net.ipv4.ip_forward"
+                        && v == "0"
+                        && let Some(path) = self.state_failure_on_close.borrow_mut().take()
+                    {
+                        fs::rename(&path, path.with_extension("saved")).unwrap();
+                        fs::create_dir(&path).unwrap();
+                    }
                     if v == "1" {
                         assert!(self.verified_this_run.get());
                     }
@@ -420,6 +429,12 @@ impl Kernel {
     }
 }
 impl System for Kernel {
+    fn namespace_identity(&self, _: &std::path::Path) -> std::io::Result<(u64, u64)> {
+        testing::handle()
+            .map(|held| held.identity())
+            .map_err(std::io::Error::other)
+    }
+
     fn canon_run_root(&self) -> &std::path::Path {
         std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
     }
@@ -454,7 +469,18 @@ impl System for Kernel {
 }
 impl BootNamespace for Kernel {
     fn path(&self) -> &std::path::Path {
-        std::path::Path::new("/proc/self/ns/net")
+        static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        PATH.get_or_init(|| {
+            std::env::var_os("CARGO_TARGET_TMPDIR")
+                .map_or_else(
+                    || {
+                        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                            .join("../../target/tmp")
+                    },
+                    std::path::PathBuf::from,
+                )
+                .join("boot-test-namespace")
+        })
     }
     fn open(&self) -> Result<Option<NetnsHandle>, NetnsError> {
         if self.exists.get() {
@@ -2156,10 +2182,7 @@ fn failed_apply_with_undurable_rollback_keeps_forwarding_closed() {
     })
     .unwrap();
     let error = admin::apply(&deps, &log.handle, Some(1), false, 0).unwrap_err();
-    assert_eq!(
-        error.code,
-        scupper_proto::ApiErrorCode::PersistenceUnavailable
-    );
+    assert_eq!(error.code, scupper_proto::ApiErrorCode::RollbackFailed);
     assert_eq!(f.kernel.values.borrow()["net.ipv4.ip_forward"], "0");
     assert_eq!(
         f.kernel.values.borrow()["net.ipv6.conf.all.forwarding"],
@@ -2379,10 +2402,7 @@ fn failed_apply_reports_reclose_and_rollback_failures() {
         })
         .unwrap();
         let error = admin::apply(&deps, &log.handle, Some(1), false, 0).unwrap_err();
-        assert_eq!(
-            error.code,
-            scupper_proto::ApiErrorCode::PersistenceUnavailable
-        );
+        assert_eq!(error.code, scupper_proto::ApiErrorCode::RollbackFailed);
         let rollback = &error.observation.as_ref().unwrap()["rollback"];
         assert_eq!(rollback["verified"], false);
         assert_eq!(rollback["reclosed"], !fail_reclose);
@@ -2392,5 +2412,175 @@ fn failed_apply_reports_reclose_and_rollback_failures() {
         } else {
             "rollback failed: closed"
         }));
+    }
+}
+
+#[test]
+fn post_mutation_gate_and_state_failures_report_recovery_outcome() {
+    use scupper_sys::{daemon::admin, events::EventLog};
+    for state_write in [false, true] {
+        let f = Fixture::new();
+        assert!(f.run(None).succeeded());
+        if state_write {
+            *f.kernel.state_failure_on_close.borrow_mut() = Some(f.root.path.join("state.json"));
+        } else {
+            *f.kernel.failure.borrow_mut() = Some((
+                Program::Sysctl,
+                "net.ipv4.ip_forward=0".into(),
+                "stuck gate".into(),
+            ));
+        }
+        let run = f.root.path.join("run");
+        let log = EventLog::memory_only(scupper_core::config::GatewayId("gw1".into()), || {
+            scupper_proto::UnixSeconds(1000)
+        })
+        .unwrap();
+        let error = admin::apply(
+            &BootDeps {
+                system: &f.kernel,
+                namespace: &f.kernel,
+                state_root: &f.root.path,
+                config_root: &f.root.path,
+                run_root: &run,
+                hook: None,
+                secret_owner: rustix::process::geteuid().as_raw(),
+            },
+            &log.handle,
+            Some(1),
+            false,
+            0,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, scupper_proto::ApiErrorCode::RollbackFailed);
+        let recovery = &error.observation.unwrap()["rollback"];
+        assert_eq!(recovery["verified"], false);
+        assert_eq!(recovery["closed"], state_write);
+        assert_eq!(recovery["reclosed"], state_write);
+        assert_eq!(recovery["durable"], !state_write);
+        assert_eq!(
+            f.kernel.values.borrow()["net.ipv6.conf.all.forwarding"],
+            "0"
+        );
+    }
+}
+
+#[test]
+fn hardening_write_failure_does_not_hide_verified_closed_gates() {
+    use scupper_core::{config::GatewayId, planner::Step};
+    use scupper_sys::reconcile::{Config, Kernel as _, RealKernel};
+    let f = Fixture::new();
+    assert!(f.run(None).succeeded());
+    let site = support::site("ubuntu-24.04");
+    let held = std::sync::Arc::new(testing::handle().unwrap());
+    let config = Config {
+        site: site.clone(),
+        gateway: GatewayId("gw1".into()),
+        stamp: f.root.stamp,
+        fingerprint: [7; 32],
+        run_root: f.root.path.join("run"),
+        lock_wait: Duration::ZERO,
+    };
+    let adapter = RealKernel::new(
+        BootDeps {
+            system: &f.kernel,
+            namespace: &f.kernel,
+            state_root: &f.root.path,
+            config_root: &f.root.path,
+            run_root: &config.run_root,
+            hook: None,
+            secret_owner: rustix::process::geteuid().as_raw(),
+        },
+        held.clone(),
+        &config,
+        support::health(&site, &held),
+        f.kernel.path().to_path_buf(),
+        None,
+    )
+    .unwrap();
+    *f.kernel.failure.borrow_mut() = Some((
+        Program::Sysctl,
+        "net.ipv4.conf.wg0.accept_redirects=0".into(),
+        "link changed".into(),
+    ));
+    adapter.execute(&Step::ForwardingOff).unwrap();
+    for key in [
+        "net.ipv4.ip_forward",
+        "net.ipv6.conf.all.forwarding",
+        "net.ipv4.conf.default.forwarding",
+        "net.ipv6.conf.default.forwarding",
+    ] {
+        assert_eq!(f.kernel.values.borrow()[key], "0");
+    }
+    let health = support::health(&site, &held);
+    let forwarding = scupper_sys::collect::forwarding(
+        &f.kernel,
+        &held,
+        &health,
+        &scupper_sys::state::State::default(),
+    )
+    .unwrap();
+    assert!(
+        forwarding
+            .hardening
+            .iter()
+            .any(|key| key == "net.ipv4.conf.wg0.accept_redirects")
+    );
+}
+
+#[test]
+fn corrupt_apply_target_preserves_attachment_and_error_kind() {
+    use scupper_sys::{
+        daemon::testing::dispatch_apply,
+        store::{MetaInput, VersionStore},
+    };
+    for directory_instead in [false, true] {
+        let f = Fixture::new();
+        assert!(f.run(None).succeeded());
+        let run = f.root.path.join("run");
+        let guard = WriterLock::acquire(&run).unwrap();
+        VersionStore::open(&f.root.path, Some(&guard))
+            .unwrap()
+            .commit(
+                &guard,
+                Some(1),
+                &support::site_text("ubuntu-24.04"),
+                MetaInput {
+                    actor: "test".into(),
+                    at: 1000,
+                    reason: "target".into(),
+                },
+            )
+            .unwrap();
+        drop(guard);
+        let target = f.root.path.join("config/versions/000002.toml");
+        if directory_instead {
+            fs::remove_file(&target).unwrap();
+            fs::create_dir(&target).unwrap();
+        } else {
+            fs::write(&target, "corrupt target").unwrap();
+        }
+        let (response, before, after, retained, _) = dispatch_apply(
+            BootDeps {
+                system: &f.kernel,
+                namespace: &f.kernel,
+                state_root: &f.root.path,
+                config_root: &f.root.path,
+                run_root: &run,
+                hook: None,
+                secret_owner: rustix::process::geteuid().as_raw(),
+            },
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            response.result.unwrap_err().code,
+            if directory_instead {
+                scupper_proto::ApiErrorCode::PersistenceUnavailable
+            } else {
+                scupper_proto::ApiErrorCode::Internal
+            }
+        );
+        assert_eq!(before, after);
+        assert!(retained);
     }
 }
