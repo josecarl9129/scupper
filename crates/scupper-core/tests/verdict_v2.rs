@@ -1671,6 +1671,8 @@ fn bound_probe_only_check_diff_is_golden() {
 
 #[test]
 #[cfg(not(feature = "lab-mutation"))]
+// Test-only process and file I/O: the pure-core lint bans it in library code, not here.
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 fn default_build_ignores_probe_mutation_in_the_real_engine() {
     for mutation in ["M-ct", "M-probe"] {
         let sentinel = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
@@ -1693,6 +1695,8 @@ fn default_build_ignores_probe_mutation_in_the_real_engine() {
 
 #[test]
 #[cfg(not(feature = "lab-mutation"))]
+// Test-only process and file I/O: the pure-core lint bans it in library code, not here.
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 fn default_build_route_child() {
     let Some(sentinel) = std::env::var_os("SCUPPER_DEFAULT_ROUTE_CHILD") else {
         return;

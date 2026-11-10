@@ -20,7 +20,7 @@ env:
   CARGO_DENY_VERSION: "0.20.2"
 
 jobs:
-  # On lab/** branches only the leak lab runs; the full gate runs locally before every
+  # On lab/** branches only the leak lab and the no-feature build run; the full gate runs locally before every
   # lab push and again in CI on main.
   gate:
     name: fmt, clippy, test, doc, deny
@@ -86,7 +86,6 @@ jobs:
 
   production:
     name: shipped startup without testing feature
-    if: ${{ !startsWith(github.ref, 'refs/heads/lab/') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
