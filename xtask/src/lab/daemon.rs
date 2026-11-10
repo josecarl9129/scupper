@@ -22,13 +22,14 @@ use std::{
 };
 
 mod control_cases;
+mod heartbeat;
 mod m2_cases;
 
 pub(super) fn short_boot_root(case: &str) -> std::path::PathBuf {
     Path::new("/run/scupper-lab").join(format!("{}-{case}", std::process::id()))
 }
 
-pub(super) const CASES: [&str; 28] = [
+pub(super) const CASES: [&str; 30] = [
     "L1",
     "L2",
     "L5",
@@ -52,6 +53,8 @@ pub(super) const CASES: [&str; 28] = [
     "L3",
     "L4",
     "L10",
+    "L53",
+    "heartbeat",
     "L14",
     "L43",
     "L44",
@@ -173,6 +176,9 @@ struct DaemonGuard<'a> {
 impl DaemonGuard<'_> {
     #[allow(clippy::too_many_lines)] // Keep start/restart continuity and fault cleanup ordering together.
     fn run(&mut self, case: &str) -> Result<String> {
+        if matches!(case, "L53" | "heartbeat") {
+            return self.run_heartbeat(case);
+        }
         if m2_cases::is_m2(case) {
             return self.run_m2(case);
         }
@@ -400,6 +406,13 @@ impl DaemonGuard<'_> {
             ),
             ("gwhost", "ip", vec!["link", "del", "foreign-host"]),
             ("gwhost", "ip", vec!["link", "del", "foreign0"]),
+            ("gwhost", "tc", vec!["qdisc", "del", "dev", "eth0", "root"]),
+            ("wan", "ip", vec!["route", "del", "198.51.100.10/32"]),
+            (
+                "internet",
+                "ip",
+                vec!["addr", "del", "198.51.100.10/32", "dev", "lo"],
+            ),
             (
                 "scupper",
                 "ip",
@@ -479,7 +492,7 @@ impl Lab {
                     + Duration::from_secs(match case {
                         "L9" => 1200,
                         "L9b" => 900,
-                        "L3" | "L16" | "L50" | "L9-host-link" | "L11" => 300,
+                        "L3" | "L16" | "L50" | "L9-host-link" | "L11" | "L10" => 300,
                         _ => 180,
                     }),
             );
@@ -1333,6 +1346,9 @@ impl Lab {
         new_port: u16,
     ) -> Result<()> {
         let mut text = evidence::policy_for_case(markers, false, old_port, stem == "daemon-L11")?;
+        if stem.contains("heartbeat") || stem == "control-L10" {
+            text = format!("heartbeat = \"{}:443\"\n{text}", heartbeat::ENDPOINT);
+        }
         let combined: Vec<_> = markers.iter().chain(&self.fault_markers).collect();
         text = text
             .lines()
@@ -1910,7 +1926,13 @@ pub(super) fn daemon_wanted(case: &str) -> &'static str {
         "L17-rebuild" => {
             "no-holder loss = daemon down; restart rebuilds; fresh namespace marker; check 0"
         }
-        "L10" => "SIGKILL/SIGSTOP: check 5, traffic continues; SIGCONT: check 0",
+        "L10" => {
+            "SIGKILL/SIGSTOP: check 5, traffic continues, heartbeat stops; SIGCONT resumes heartbeat"
+        }
+        "L53" => "orphan delivery on delayed host uplink: no ClientHello after verdict deadline",
+        "heartbeat" => {
+            "healthy heartbeat control, failing ok_only suppression, status code suffixes 0-4 and never 5"
+        }
         "L14" => "disconnect verifies closure; check 4 across reboot; connect restores 0",
         "L43" => {
             "recurring foreign link latches; forwarding stays 0 across restart/reboot; repair clear restores 0"

@@ -16,6 +16,9 @@ use std::{
 /// Returns invalid mode, setup, or evidence-write errors.
 pub fn flow(mode: &str, address: SocketAddr, marker: &str, log: &Path, seconds: u64) -> Result<()> {
     let mut log = OpenOptions::new().create(true).append(true).open(log)?;
+    if mode == "heartbeat-sink" {
+        return heartbeat_sink(address, &mut log, seconds);
+    }
     let start = Instant::now();
     let payload = format!("{marker}\n");
     let mut tcp = match mode {
@@ -73,6 +76,30 @@ pub fn flow(mode: &str, address: SocketAddr, marker: &str, log: &Path, seconds: 
         )?;
         log.flush()?;
         thread::sleep(Duration::from_millis(25));
+    }
+    Ok(())
+}
+
+// A TCP observer only: records ClientHello receipt, never terminates TLS or
+// decrypts a request, and needs no lab certificate in the delivery binary.
+fn heartbeat_sink(address: SocketAddr, log: &mut std::fs::File, seconds: u64) -> Result<()> {
+    let listener = TcpListener::bind(address)?;
+    listener.set_nonblocking(true)?;
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(seconds) {
+        if let Ok((mut stream, peer)) = listener.accept() {
+            stream.set_read_timeout(Some(Duration::from_millis(250)))?;
+            let mut bytes = [0; 4096];
+            let count = stream.read(&mut bytes).unwrap_or(0);
+            let hello = count >= 6 && bytes[0] == 22 && bytes[1] == 3 && bytes[5] == 1;
+            writeln!(
+                log,
+                "{}",
+                serde_json::json!({"hello":hello, "peer":peer, "bytes":count})
+            )?;
+            log.flush()?;
+        }
+        thread::sleep(Duration::from_millis(10));
     }
     Ok(())
 }

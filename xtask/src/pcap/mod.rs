@@ -389,6 +389,24 @@ fn host_allowed(
     payload: &[u8],
     ports: Option<(u16, u16)>,
 ) -> Option<String> {
+    if proto == 6
+        && let (Some(endpoint), Some((source, destination))) = (policy.heartbeat, ports)
+    {
+        for (local, remote) in [
+            (
+                SocketAddr::new(ip.src, source),
+                SocketAddr::new(ip.dst, destination),
+            ),
+            (
+                SocketAddr::new(ip.dst, destination),
+                SocketAddr::new(ip.src, source),
+            ),
+        ] {
+            if policy.uplink_addrs.contains(&local.ip()) && remote == endpoint {
+                return Some("heartbeat".into());
+            }
+        }
+    }
     for (i, rule) in policy.host_allow.iter().enumerate() {
         if matches!(proto, 1 | 58)
             && !rule.types.as_ref().map_or_else(
@@ -775,6 +793,43 @@ pub(crate) fn observe(bytes: &[u8]) -> Result<Vec<Observed>, Error> {
     }
     observed.sort_by_key(|packet| packet.index);
     Ok(observed)
+}
+
+/// Extract outbound heartbeat `ClientHello` timestamps for one configured endpoint.
+/// The host uplink source must match exactly; namespace/client sources fail.
+///
+/// # Errors
+/// Rejects malformed captures and `ClientHello` traffic from a different source.
+pub fn heartbeat_hellos(
+    bytes: &[u8],
+    host: IpAddr,
+    endpoint: SocketAddr,
+) -> Result<Vec<Timestamp>, Error> {
+    let mut timestamps = Vec::new();
+    for packet in observe(bytes)? {
+        if packet.protocol != 6 || packet.destination != endpoint.ip() || packet.payload.len() < 20
+        {
+            continue;
+        }
+        let port = u16::from_be_bytes([packet.payload[2], packet.payload[3]]);
+        if port != endpoint.port() {
+            continue;
+        }
+        let offset = usize::from(packet.payload[12] >> 4) * 4;
+        let payload = packet
+            .payload
+            .get(offset..)
+            .ok_or_else(|| Error::Capture("heartbeat TCP header".into()))?;
+        if payload.len() >= 6 && payload[0] == 22 && payload[1] == 3 && payload[5] == 1 {
+            if packet.source != host {
+                return Err(Error::Capture(
+                    "heartbeat ClientHello from non-host source".into(),
+                ));
+            }
+            timestamps.push(packet.timestamp);
+        }
+    }
+    Ok(timestamps)
 }
 
 #[cfg(test)]

@@ -1816,6 +1816,7 @@ struct DaemonRig<'a> {
     control_calls: usize,
     fail_control_bind: bool,
     complete_iterations: usize,
+    heartbeat_calls: usize,
     degraded: bool,
     rebuild_pending: bool,
     probes: Option<scupper_sys::daemon::probes::Probes>,
@@ -1928,6 +1929,45 @@ impl scupper_sys::daemon::DaemonDeps for DaemonRig<'_> {
             self.messages.extend(drain_notify(socket));
         }
     }
+    fn heartbeat(&mut self) {
+        use scupper_core::heartbeat::{CompleteIteration, Decision, SkipReason, decide};
+        self.heartbeat_calls += 1;
+        assert!(self.complete_iterations > 0);
+        let settings: scupper_core::config::HeartbeatSettings = serde_json::from_value(serde_json::json!({
+            "kind": "healthchecks", "url_ref": "check", "interval": "60s", "report": "status_code"
+        })).unwrap();
+        let now = MonoTime(self.now.duration_since(self.origin));
+        assert_eq!(
+            decide(&settings, now, None, None),
+            Decision::Skip(SkipReason::NoIteration)
+        );
+        assert_eq!(
+            decide(
+                &settings,
+                now,
+                Some(CompleteIteration {
+                    at: now,
+                    full_fresh_check: true,
+                    code: 5
+                }),
+                None
+            ),
+            Decision::Skip(SkipReason::InvalidCode)
+        );
+        assert!(matches!(
+            decide(
+                &settings,
+                now,
+                Some(CompleteIteration {
+                    at: now,
+                    full_fresh_check: true,
+                    code: 0
+                }),
+                None
+            ),
+            Decision::Send { .. }
+        ));
+    }
     fn shutdown(&mut self) {
         self.rig.machine.take();
     }
@@ -1975,6 +2015,7 @@ fn daemon_scheduler_notifies_and_sigterm_shutdown_has_no_kernel_steps() {
         control_calls: 0,
         fail_control_bind: false,
         complete_iterations: 0,
+        heartbeat_calls: 0,
         degraded: false,
         rebuild_pending: false,
         probes: None,
@@ -1992,6 +2033,10 @@ fn daemon_scheduler_notifies_and_sigterm_shutdown_has_no_kernel_steps() {
     };
     run_with(&mut deps, &stop);
     assert_eq!(deps.iterations, 3);
+    assert_eq!(
+        deps.heartbeat_calls, 1,
+        "only completed work before shutdown authorizes a heartbeat check"
+    );
     assert_eq!(deps.now.duration_since(now), Duration::from_secs(4));
     assert!(deps.rig.machine.is_none());
     let before = deps.before_shutdown.take().unwrap();
@@ -2039,6 +2084,7 @@ fn degraded_scheduler_feeds_watchdog_and_boot_budget_survives_restarts() {
             control_calls: 0,
             fail_control_bind: false,
             complete_iterations: 0,
+            heartbeat_calls: 0,
             degraded: true,
             rebuild_pending: false,
             probes: None,
@@ -2093,6 +2139,7 @@ fn rebuild_pending_scheduler_feeds_watchdog_while_retry_is_spaced() {
         control_calls: 0,
         fail_control_bind: false,
         complete_iterations: 0,
+        heartbeat_calls: 0,
         degraded: false,
         rebuild_pending: true,
         probes: None,
@@ -2111,6 +2158,7 @@ fn rebuild_pending_scheduler_feeds_watchdog_while_retry_is_spaced() {
     run_with(&mut deps, &stop);
     assert_eq!(deps.boots, 1);
     assert_eq!(deps.complete_iterations, 0);
+    assert_eq!(deps.heartbeat_calls, 0);
     assert_eq!(deps.abandoned, 3); // SIGTERM skips recovery after the last tick.
     let messages = std::mem::take(&mut deps.messages);
     assert_eq!(messages.iter().filter(|s| *s == "READY=1").count(), 1);
@@ -2301,6 +2349,7 @@ fn probe_child_timeout_does_not_delay_fake_kernel_ticks() {
         control_calls: 0,
         fail_control_bind: false,
         complete_iterations: 0,
+        heartbeat_calls: 0,
         degraded: false,
         rebuild_pending: false,
         probes: Some(probes),
@@ -2581,6 +2630,7 @@ fn control_requests_are_serviced_without_scheduler_sleep() {
         control_calls: 0,
         fail_control_bind: false,
         complete_iterations: 0,
+        heartbeat_calls: 0,
         degraded: false,
         rebuild_pending: false,
         probes: None,
@@ -2839,6 +2889,7 @@ fn bind_failure_does_not_prevent_scheduler_ticks() {
         control_calls: 0,
         fail_control_bind: true,
         complete_iterations: 0,
+        heartbeat_calls: 0,
         degraded: false,
         rebuild_pending: false,
         probes: None,

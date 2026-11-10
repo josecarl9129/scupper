@@ -3,6 +3,7 @@
 //! neither can submit failover inputs or execute a kernel repair.
 pub mod admin;
 pub mod control;
+mod heartbeat;
 pub mod notify;
 mod pending;
 pub mod probes;
@@ -453,6 +454,7 @@ fn run_notified(
         control_errors: control::FailureSummary::default(),
         dispatcher: pending::Dispatcher::default(),
         last_complete: None,
+        heartbeat: crate::daemon::heartbeat::Heartbeat::default(),
         snapshot: control::SharedSnapshot::default(),
         cached: None,
     };
@@ -481,6 +483,7 @@ struct Runtime<'a> {
     control_errors: control::FailureSummary,
     dispatcher: pending::Dispatcher,
     last_complete: Option<Instant>,
+    heartbeat: heartbeat::Heartbeat,
     snapshot: control::SharedSnapshot,
     cached: Option<(
         Instant,
@@ -727,6 +730,10 @@ impl Runtime<'_> {
                 health: health.clone(),
                 age: at.elapsed().as_secs(),
                 observations: observations.clone(),
+                heartbeat_last_success_age: self
+                    .heartbeat
+                    .last_success
+                    .map(|at| at.elapsed().as_secs()),
             });
         }
         let Some((machine, held, config)) = &mut self.running else {
@@ -825,6 +832,7 @@ impl DaemonDeps for Runtime<'_> {
             self.last_complete = Some(Instant::now());
         }
         self.publish_snapshot();
+        self.heartbeat_iteration(false);
         let Some((machine, _, _)) = &self.running else {
             return;
         };
@@ -836,6 +844,9 @@ impl DaemonDeps for Runtime<'_> {
         if let Err(error) = self.notify.iteration(iteration.bounded, status) {
             eprintln!("scupperd: notify: {error}");
         }
+    }
+    fn heartbeat(&mut self) {
+        self.heartbeat_iteration(true);
     }
     fn shutdown(&mut self) {
         self.running.take();
@@ -871,6 +882,7 @@ impl DaemonDeps for Runtime<'_> {
         close_only(&self.deps(), self.options);
     }
     fn abandon_probes(&mut self) {
+        self.heartbeat.abandon_check();
         self.probes = probes::Probes::new(self.options.probe_binary.clone(), Instant::now())
             .with_uplink(uplink_addresses(self.system).unwrap_or_default());
     }
@@ -1584,6 +1596,7 @@ pub mod testing {
             control_errors: control::FailureSummary::default(),
             dispatcher: pending::Dispatcher::default(),
             last_complete: None,
+            heartbeat: crate::daemon::heartbeat::Heartbeat::default(),
             snapshot: control::SharedSnapshot::default(),
             cached: None,
         };

@@ -45,6 +45,8 @@ pub trait DaemonDeps {
     fn maintenance(&mut self);
     /// Send status and a watchdog only for completed bounded work.
     fn notify(&mut self, iteration: &Iteration);
+    /// Schedule fresh heartbeat work only after a completed watchdog iteration.
+    fn heartbeat(&mut self) {}
     /// Release the reconciler and flush audit data; no kernel work is permitted.
     fn shutdown(&mut self);
 }
@@ -98,6 +100,9 @@ pub fn run_with(deps: &mut impl DaemonDeps, stop: &AtomicBool) {
             },
         };
         deps.notify(&iteration);
+        if iteration.complete && !stop.load(Ordering::Relaxed) {
+            deps.heartbeat();
+        }
         next = (next + Duration::from_secs(2)).max(deps.now());
     }
     deps.shutdown();

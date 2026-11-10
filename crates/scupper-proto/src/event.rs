@@ -52,7 +52,11 @@ vocabulary!(
     Recovery,
     UncleanStop,
     QueueOverflow,
-    UnknownObject
+    UnknownObject,
+    HeartbeatSecret,
+    HeartbeatAccount,
+    HeartbeatHttp,
+    HeartbeatDeadline
 );
 vocabulary!(
     ObjectKind,

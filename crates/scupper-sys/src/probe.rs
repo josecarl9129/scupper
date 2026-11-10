@@ -162,6 +162,27 @@ pub(crate) mod linux {
         address: Ipv4Addr,
         deadline: Instant,
     ) -> Probe<Vec<u8>> {
+        exchange(socket, target, address, deadline, false)
+    }
+
+    // Heartbeats need only the status line/headers, not an IP response body.
+    pub(crate) fn exchange_status_socket(
+        socket: Socket,
+        target: &Target,
+        address: Ipv4Addr,
+        deadline: Instant,
+    ) -> Probe<Vec<u8>> {
+        exchange(socket, target, address, deadline, true)
+    }
+
+    fn exchange(
+        socket: Socket,
+        target: &Target,
+        address: Ipv4Addr,
+        deadline: Instant,
+        status_only: bool,
+    ) -> Probe<Vec<u8>> {
+        remaining(deadline)?;
         socket
             .connect_timeout(
                 &SocketAddr::from((address, 443)).into(),
@@ -205,9 +226,15 @@ pub(crate) mod linux {
         let connection = ClientConnection::new(Arc::new(config), name)
             .map_err(|error| ProbeError::io(&error.to_string()))?;
         let mut tls = StreamOwned::new(connection, stream);
-        tls.write_all(&target.request_bytes())
-            .and_then(|()| tls.flush())
-            .map_err(|error| io_failure(IoOperation::Path, &error))?;
+        // Finish the handshake before accepting application bytes. In particular,
+        // a handshake delayed beyond the verdict deadline must never queue a GET.
+        while tls.conn.is_handshaking() {
+            remaining(deadline)?;
+            tls.conn
+                .complete_io(&mut tls.sock)
+                .map_err(|error| io_failure(IoOperation::Path, &error))?;
+        }
+        write_request(&mut tls, target, deadline)?;
         let mut bytes = Vec::new();
         let mut buffer = [0; 2048];
         loop {
@@ -226,10 +253,19 @@ pub(crate) mod linux {
             }
             bytes.extend_from_slice(&buffer[..count]);
             // Framed responses need not wait for the peer to close TLS.
-            if parse_complete(&bytes) {
+            if (status_only && bytes.windows(4).any(|w| w == b"\r\n\r\n")) || parse_complete(&bytes)
+            {
                 return Ok(bytes);
             }
         }
+    }
+
+    fn write_request(writer: &mut impl Write, target: &Target, deadline: Instant) -> Probe<()> {
+        remaining(deadline)?;
+        writer
+            .write_all(&target.request_bytes())
+            .and_then(|()| writer.flush())
+            .map_err(|error| io_failure(IoOperation::Path, &error))
     }
 
     fn parse_complete(bytes: &[u8]) -> bool {
@@ -268,6 +304,38 @@ pub(crate) mod linux {
         fn flush(&mut self) -> io::Result<()> {
             self.set_timeouts()?;
             self.stream.flush()
+        }
+    }
+    #[cfg(test)]
+    mod deadline_tests {
+        use super::*;
+        use socket2::{Domain, Protocol, Type};
+        use std::time::Duration;
+        #[test]
+        fn expired_before_connect_never_uses_socket() {
+            let target = Target::new("heartbeat.invalid", "/secret-path").unwrap();
+            let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+            let result = exchange_status_socket(
+                socket,
+                &target,
+                Ipv4Addr::LOCALHOST,
+                Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+            );
+            assert!(matches!(result, Err(ProbeError::Timeout)));
+        }
+        #[test]
+        fn handshake_finishing_after_deadline_never_writes_request() {
+            let target = Target::new("heartbeat.invalid", "/secret-path").unwrap();
+            let mut bytes = Vec::new();
+            let deadline = Instant::now();
+            std::thread::sleep(Duration::from_millis(2));
+            assert!(matches!(
+                write_request(&mut bytes, &target, deadline),
+                Err(ProbeError::Timeout)
+            ));
+            assert_eq!(bytes, [] as [u8; 0]);
+            write_request(&mut bytes, &target, Instant::now() + Duration::from_secs(1)).unwrap();
+            assert!(bytes.starts_with(b"GET /secret-path HTTP/1.1\r\n"));
         }
     }
 }

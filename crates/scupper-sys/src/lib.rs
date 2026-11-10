@@ -8,6 +8,7 @@ pub mod check_v2;
 pub mod cmd;
 pub mod collect;
 pub mod fs;
+pub mod heartbeat;
 pub mod netns;
 pub mod probe;
 pub mod probe_child;

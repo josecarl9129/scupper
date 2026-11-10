@@ -527,6 +527,9 @@ impl DaemonGuard<'_> {
         let (text, _) = store.read(state.applied_version.ok_or("missing applied version")?)?;
         let mut site = parse_site(&text)?;
         site.health.require_daemon = true;
+        if matches!(self.case.as_str(), "L10" | "L53" | "heartbeat") {
+            Self::heartbeat_fixture(root, &mut site)?;
+        }
         let text = toml::to_string(&site)?;
         self.lab.site = validate(site).map_err(|e| format!("supervised fixture: {e:?}"))?;
         let version = store.commit(
@@ -564,6 +567,8 @@ impl DaemonGuard<'_> {
             "pause-apply",
             "apply-paused",
             "incomplete-tick",
+            "heartbeat-pause",
+            "heartbeat-status",
         ] {
             let _ = fs::remove_file(root.join("run/scupper").join(marker));
         }
@@ -631,6 +636,11 @@ impl DaemonGuard<'_> {
         }
         self.supervised_fixture(&root)?;
         self.lab.boot_gateway(&[], &format!("{case}-boot"))?;
+        let _heartbeat_sink = if case == "L10" {
+            Some(self.start_heartbeat_sink()?)
+        } else {
+            None
+        };
         let (child, notify) = self.lab.daemon_start(case, &root)?;
         self.child = Some(child);
         self.notify = Some(notify);
@@ -661,6 +671,7 @@ impl DaemonGuard<'_> {
         };
         match case {
             "L10" => {
+                self.wait_heartbeat(0)?;
                 let marker = Lab::marker()?;
                 markers.push(marker.clone());
                 let mut flow = self.lab.daemon_flow("udp", "client", &marker, &stem, 90)?;
@@ -676,6 +687,7 @@ impl DaemonGuard<'_> {
                 if code != 5 || !text.contains("transport: local observations") {
                     return fail(format!("L10 responsive stale supervisor: {code}: {text}"));
                 }
+                self.assert_heartbeat_quiet(Duration::ZERO, Duration::from_secs(5))?;
                 fs::remove_file(root.join("run/scupper/incomplete-tick"))?;
                 self.lab.runner.dwell(Duration::from_secs(3))?;
                 self.expect_check(&root, 0, None, "fresh-again")?;
@@ -696,11 +708,14 @@ impl DaemonGuard<'_> {
                     Duration::from_secs(3),
                     |_| Ok(flow_counts(&path)?.1 > before),
                 )?;
+                self.assert_heartbeat_quiet(Duration::from_secs(32), Duration::from_secs(5))?;
+                let heartbeat_before = self.heartbeat_count()?;
                 self.child
                     .as_ref()
                     .ok_or("daemon missing")?
                     .signal(Signal::CONT);
                 self.expect_check(&root, 0, None, "continued")?;
+                self.wait_heartbeat(heartbeat_before)?;
                 self.control_stop(Signal::KILL)?;
                 let before = flow_counts(&path)?.1;
                 self.expect_check(&root, 5, None, "killed")?;
@@ -709,8 +724,10 @@ impl DaemonGuard<'_> {
                     Duration::from_secs(3),
                     |_| Ok(flow_counts(&path)?.1 > before),
                 )?;
+                self.assert_heartbeat_quiet(Duration::from_secs(32), Duration::from_secs(5))?;
                 flow.stop(Signal::TERM)?;
                 self.control_restart(&root, "after-kill")?;
+                self.wait_heartbeat(self.heartbeat_count()?)?;
                 self.expect_check(&root, 0, None, "restarted")?;
             }
             "L14" => {
