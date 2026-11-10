@@ -841,7 +841,15 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         }
         // Route intent is authoritative on every tick. Failover transitions additionally
         // require an immediate route write and flush, bypassing drift debounce.
-        let actions = std::mem::take(&mut self.actions);
+        // Intent changes can accumulate while ticks are paused. Like route
+        // actions below, exit closure must respect the latest desired state;
+        // replaying a superseded disconnect would invalidate Restore readiness.
+        let actions = std::mem::take(&mut self.actions)
+            .into_iter()
+            .filter(|action| {
+                desired.disconnected() || !matches!(action, FailoverAction::SetExitsDown)
+            })
+            .collect::<Vec<_>>();
         let mut transition = Vec::new();
         report.failover_actions.extend(actions.clone());
         for action in actions {
