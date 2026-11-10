@@ -426,8 +426,17 @@ pub fn boot(deps: &BootDeps<'_>) -> BootReport {
     boot_with_guard(deps, &guard)
 }
 
-pub(crate) fn boot_with_guard(deps: &BootDeps<'_>, _guard: &WriterGuard) -> BootReport {
-    let report = boot_locked(deps, BootReport::default());
+pub(crate) fn boot_with_guard(deps: &BootDeps<'_>, guard: &WriterGuard) -> BootReport {
+    boot_apply_with_guard(deps, guard, false)
+}
+
+/// Explicit apply may open the gate while durable quarantine remains until verification.
+pub(crate) fn boot_apply_with_guard(
+    deps: &BootDeps<'_>,
+    _guard: &WriterGuard,
+    open_quarantined: bool,
+) -> BootReport {
+    let report = boot_locked(deps, BootReport::default(), open_quarantined);
     if !report.succeeded() {
         let mut report = report;
         if let Err(error) = save_report(deps, &report) {
@@ -457,7 +466,7 @@ pub(crate) fn save_report_at(run_root: &Path, report: &BootReport) -> Result<()>
 }
 
 #[allow(clippy::too_many_lines)] // Keep the ordered build and its failure boundaries together.
-fn boot_locked(deps: &BootDeps<'_>, mut report: BootReport) -> BootReport {
+fn boot_locked(deps: &BootDeps<'_>, mut report: BootReport, open_quarantined: bool) -> BootReport {
     if !step(&mut report, deps, BootStep::Lock, false, || Ok(())) {
         return report;
     }
@@ -651,7 +660,7 @@ fn boot_locked(deps: &BootDeps<'_>, mut report: BootReport) -> BootReport {
             deps,
             &handle,
             &configured_names(&cfg)?,
-            cfg.state.quarantine.is_none() && !cfg.missing_state_alert,
+            (cfg.state.quarantine.is_none() || open_quarantined) && !cfg.missing_state_alert,
             true,
         )
     }) {

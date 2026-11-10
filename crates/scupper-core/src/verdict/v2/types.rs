@@ -38,7 +38,7 @@ pub enum Selection {
 }
 
 /// Full filesystem identity from a namespace handle or boot record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NetnsIdentity {
     /// Filesystem device number (`st_dev`).
     pub device: u64,

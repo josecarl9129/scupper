@@ -152,14 +152,27 @@ pub fn run_with_observations(
     deps: &Dependencies<'_>,
     cfg: &Config<'_>,
 ) -> (Result<Report, CheckError>, Observations) {
-    run_driver(deps, cfg, false, None)
+    run_driver(deps, cfg, None)
 }
 
 /// Fresh stages 1–7 on the supervisor tick owner; no recursive socket Ping.
 /// # Errors
 /// Returns required-observation failures from stages 1–7.
-pub fn run_supervised(deps: &Dependencies<'_>, cfg: &Config<'_>) -> Result<Report, CheckError> {
-    run_driver(deps, cfg, true, None).0
+pub fn run_supervised(
+    deps: &Dependencies<'_>,
+    cfg: &Config<'_>,
+    age: Option<u64>,
+) -> Result<Report, CheckError> {
+    let supervisor = age
+        .zip(deps.handle)
+        .map_or(v2::Supervisor::Dead, |(age, held)| {
+            let (device, inode) = held.identity();
+            v2::Supervisor::Alive {
+                iteration_age: std::time::Duration::from_secs(age),
+                netns: v2::NetnsIdentity { device, inode },
+            }
+        });
+    run_driver(deps, cfg, Some(supervisor)).0
 }
 
 /// Local fallback after a bounded control request already failed. Reuse that
@@ -168,16 +181,17 @@ pub fn run_after_unavailable(
     deps: &Dependencies<'_>,
     cfg: &Config<'_>,
 ) -> (Result<Report, CheckError>, Observations) {
-    run_driver(deps, cfg, false, Some(v2::Supervisor::Dead))
+    run_driver(deps, cfg, Some(v2::Supervisor::Dead))
 }
 
 #[allow(clippy::too_many_lines)] // Keep the staged observation dispatch together.
 fn run_driver(
     deps: &Dependencies<'_>,
     cfg: &Config<'_>,
-    supervised: bool,
     supervisor: Option<v2::Supervisor>,
 ) -> (Result<Report, CheckError>, Observations) {
+    let started = std::time::Instant::now();
+    let original_supervisor = supervisor;
     let mut obs = Observations {
         supervisor,
         ..Observations::default()
@@ -200,6 +214,17 @@ fn run_driver(
     }
     let mut seen = Vec::new();
     loop {
+        if health.require_daemon
+            && let Some(v2::Supervisor::Alive {
+                iteration_age,
+                netns,
+            }) = original_supervisor
+        {
+            obs.supervisor = Some(v2::Supervisor::Alive {
+                iteration_age: iteration_age + started.elapsed(),
+                netns,
+            });
+        }
         let request = v2::next(&obs, &health, deps.system.now_unix_secs());
         if let Next::Done(result) = request {
             return (result, obs);
@@ -261,14 +286,7 @@ fn run_driver(
                 ));
             }
             Next::Supervisor => {
-                obs.supervisor = Some(if supervised {
-                    v2::Supervisor::Alive {
-                        iteration_age: std::time::Duration::ZERO,
-                        netns: health.expected_netns,
-                    }
-                } else {
-                    socket_supervisor(deps.run_root, health.expected_netns)
-                });
+                obs.supervisor = Some(socket_supervisor(deps.run_root));
             }
             Next::StandbyProbe | Next::Dns | Next::Done(_) => {
                 return (
@@ -296,7 +314,7 @@ fn done(obs: &Observations, cfg: &HealthConfigV2, sys: &dyn System) -> Result<Re
 /// Stage 8: a failed or stale Ping is supervision loss, never an observation
 /// error that hides an earlier safety violation.
 #[must_use]
-pub fn socket_supervisor(root: &Path, netns: v2::NetnsIdentity) -> v2::Supervisor {
+pub fn socket_supervisor(root: &Path) -> v2::Supervisor {
     use crate::daemon::control::{call, request};
     match call(
         root,
@@ -307,6 +325,7 @@ pub fn socket_supervisor(root: &Path, netns: v2::NetnsIdentity) -> v2::Superviso
             result:
                 Ok(scupper_proto::OpResult::Ping {
                     last_complete_iteration_age: Some(age),
+                    netns,
                     ..
                 }),
             ..

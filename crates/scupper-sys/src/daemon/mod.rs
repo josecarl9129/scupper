@@ -4,6 +4,7 @@
 pub mod admin;
 pub mod control;
 pub mod notify;
+mod pending;
 pub mod probes;
 pub mod scheduler;
 pub use scheduler::{DaemonDeps, Iteration, run_with};
@@ -183,6 +184,7 @@ fn initialize<'a>(
     origin: Instant,
     canon_deadline: Instant,
     inputs: &mut StartupRead,
+    guard: Option<(&crate::lock::WriterGuard, bool)>,
 ) -> io::Result<(Machine<'a>, Arc<NetnsHandle>, Config)> {
     let loaded = inputs.load(&deps, canon_deadline)?;
     let site = validate(parse_site(&loaded.text).map_err(io::Error::other)?)
@@ -255,8 +257,15 @@ fn initialize<'a>(
         Box::new(move || (MonoTime(origin.elapsed()), unix())) as Box<dyn Fn() -> (MonoTime, u64)>,
         loaded.saved,
     )?;
-    machine.recover_route_switch()?;
-    machine.resume_existing();
+    if let Some((guard, recover)) = guard {
+        if recover {
+            machine.recover_route_switch_locked(guard)?;
+        }
+        machine.resume_existing_locked(guard);
+    } else {
+        machine.recover_route_switch()?;
+        machine.resume_existing();
+    }
     Ok((machine, held, config))
 }
 
@@ -371,6 +380,7 @@ impl Drop for Audit {
 /// Returns invalid identity/configuration roots or notify socket setup errors.
 #[allow(clippy::too_many_lines)]
 pub fn run(options: &Options, stop: &AtomicBool) -> io::Result<()> {
+    let _lease = crate::lock::SupervisorLease::try_acquire(&options.run_root)?;
     let origin = Instant::now();
     let gateway = GatewayId(
         RealFs
@@ -416,10 +426,13 @@ pub fn run(options: &Options, stop: &AtomicBool) -> io::Result<()> {
         setup_at: None,
         setup_rounds: 0,
         edge_logged: false,
-        control: control::Server::bind(&options.run_root)?,
+        control: None,
+        binding: None,
+        bind_retry: Instant::now(),
         dedupe: control::Dedupe::default(),
         last_complete: None,
         cached: None,
+        pending_admin: Vec::new(),
     };
     run_with(&mut runtime, stop);
     Ok(())
@@ -437,7 +450,9 @@ struct Runtime<'a> {
     startup_read: StartupRead,
     probes: probes::Probes,
     edge_logged: bool,
-    control: control::Server,
+    control: Option<control::Server>,
+    binding: Option<Receiver<io::Result<control::Server>>>,
+    bind_retry: Instant,
     dedupe: control::Dedupe,
     last_complete: Option<Instant>,
     cached: Option<(
@@ -447,6 +462,7 @@ struct Runtime<'a> {
     )>,
     setup_at: Option<Instant>,
     setup_rounds: u64,
+    pending_admin: Vec<pending::Operation>,
 }
 impl<'a> Runtime<'a> {
     fn deps(&self) -> BootDeps<'a> {
@@ -464,14 +480,101 @@ impl<'a> Runtime<'a> {
     }
 }
 impl Runtime<'_> {
+    fn control_failure(&self, error: &str) {
+        eprintln!("scupperd: control listener: {error}");
+        let _ = self.audit.handle().emit(
+            EventKind::DriftDetected {
+                object: scupper_proto::ObjectKind::Unknown,
+                reason: scupper_proto::Reason::ObservationUnknown,
+            },
+            Actor::Daemon,
+            None,
+        );
+    }
+    fn maintain_control(&mut self) {
+        if let Some(server) = &self.control {
+            while let Ok(error) = server.errors.try_recv() {
+                self.control_failure(&error);
+            }
+            if !server.alive() {
+                self.control_failure("listener exited; rebinding");
+                self.control = None;
+            }
+        }
+        if let Some(binding) = &self.binding {
+            match binding.try_recv() {
+                Ok(Ok(server)) => {
+                    self.control = Some(server);
+                    self.binding = None;
+                }
+                Ok(Err(error)) => {
+                    self.control_failure(&error.to_string());
+                    self.binding = None;
+                    self.bind_retry = Instant::now() + Duration::from_secs(1);
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.binding = None;
+                    self.bind_retry = Instant::now() + Duration::from_secs(1);
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if self.control.is_none() && self.binding.is_none() && Instant::now() >= self.bind_retry {
+            let root = self.options.run_root.clone();
+            let (send, receive) = mpsc::sync_channel(1);
+            self.binding = Some(receive);
+            let _ = std::thread::Builder::new()
+                .name("scupper-control-bind".into())
+                .spawn(move || {
+                    let _ = send.send(control::Server::bind(&root));
+                });
+        }
+    }
     fn control_requests(&mut self) {
-        // Bound request work between safety ticks. Dedupe is owned by this thread.
-        if let Ok(pending) = self.control.receive.try_recv() {
+        self.maintain_control();
+        self.poll_admin();
+        for _ in 0..4 {
+            let Some(server) = &self.control else { break };
+            let Ok(pending) = server.receive.try_recv() else {
+                break;
+            };
+            if Instant::now() > pending.until {
+                let _ = pending.reply.send(control::response(
+                    pending.request.request_id,
+                    Err(control::api(scupper_proto::ApiErrorCode::Timeout)),
+                ));
+                continue;
+            }
+            if let Some(response) = self.dedupe.lookup(&pending.request, Instant::now()) {
+                let _ = pending.reply.send(response);
+                continue;
+            }
+            if let Some(inflight) = self
+                .pending_admin
+                .iter_mut()
+                .find(|op| op.request.request_id == pending.request.request_id)
+            {
+                if inflight.request.op == pending.request.op {
+                    inflight.replies.push(pending.reply);
+                } else {
+                    let _ = pending.reply.send(control::response(
+                        pending.request.request_id,
+                        Err(control::api(scupper_proto::ApiErrorCode::Conflict)),
+                    ));
+                }
+                continue;
+            }
+            if matches!(
+                pending.request.op,
+                scupper_proto::Op::Check {}
+                    | scupper_proto::Op::Connect { .. }
+                    | scupper_proto::Op::Disconnect {}
+            ) {
+                self.begin_admin(pending);
+                continue;
+            }
             let mut dedupe = std::mem::take(&mut self.dedupe);
             let response = dedupe.execute(pending.request, Instant::now(), |op| {
-                if Instant::now() > pending.until {
-                    return Err(control::api(scupper_proto::ApiErrorCode::Timeout));
-                }
                 self.operation(op, pending.uid)
             });
             self.dedupe = dedupe;
@@ -497,30 +600,56 @@ impl Runtime<'_> {
             return admin::commit(&deps, &self.audit.handle(), parent, &toml, reason, uid);
         }
         if let Op::Apply { version, dry_run } = op {
+            let _keepalive = notify::ApplyKeepalive::start();
+            let guard =
+                crate::lock::WriterLock::acquire_timeout(deps.run_root, Duration::from_secs(2))
+                    .map_err(|_| control::api(ApiErrorCode::Conflict))?;
+            if !dry_run && let Some((machine, _, _)) = &mut self.running {
+                machine
+                    .preserve_latch_locked(&guard)
+                    .map_err(|_| control::api(ApiErrorCode::PersistenceUnavailable))?;
+            }
             let target = version.or(VersionStore::read_only(deps.state_root, deps.config_root)
                 .head()
                 .map_err(|_| control::api(ApiErrorCode::Internal))?);
-            let prefix = if let Some((machine, _, _)) = &mut self.running
-                && Some(machine.version()) == target
-            {
-                machine
-                    .apply_plan(dry_run, Actor::Local { uid })
-                    .map_err(|_| control::api(ApiErrorCode::Internal))?
+            let prefix = if dry_run {
+                admin::preview_locked(&deps, &guard, target)?
             } else {
                 Vec::new()
             };
-            let mut result = admin::apply(&deps, &self.audit.handle(), version, dry_run, uid);
+            let mut result =
+                admin::apply_locked(&deps, &self.audit.handle(), &guard, version, dry_run, uid);
             if !dry_run {
-                self.initialize();
-                if result.is_ok() && self.running.is_none() {
-                    return Err(control::api(ApiErrorCode::Internal));
-                }
+                self.abandon_probes();
+                self.startup_read.ready = None;
+                self.running = initialize(
+                    deps,
+                    self.gateway.clone(),
+                    self.audit.handle(),
+                    self.origin,
+                    Instant::now() + canon::CANON_TIMEOUT + crate::system::EXEC_TIMEOUT,
+                    &mut self.startup_read,
+                    Some((&guard, true)),
+                )
+                .ok();
                 self.cached = None;
+                self.last_complete = None;
             }
-            if let Ok(OpResult::Apply { plan, .. }) = &mut result {
-                plan.splice(0..0, prefix);
+            if let Ok(OpResult::Apply { repair_plan, .. }) = &mut result {
+                *repair_plan = prefix;
             }
             return result;
+        }
+        if matches!(op, Op::RepairClear { .. }) && self.running.is_none() {
+            admin::durable_intent(&deps, &op, uid)?;
+            let _ = self.audit.handle().emit(
+                EventKind::AdminAction {
+                    command: scupper_proto::Command::RepairClear,
+                },
+                Actor::Local { uid },
+                None,
+            );
+            return Ok(OpResult::RepairClear {});
         }
         if matches!(op, Op::RepairStatus {}) && self.running.is_none() {
             return admin::repair_status(deps.state_root);
@@ -539,6 +668,7 @@ impl Runtime<'_> {
         let Some((machine, held, config)) = &mut self.running else {
             return Err(control::api(ApiErrorCode::SupervisorUnavailable));
         };
+        let age = self.last_complete.map(|at| at.elapsed().as_secs());
         admin::execute(
             machine,
             op,
@@ -551,6 +681,7 @@ impl Runtime<'_> {
                     held,
                     config,
                     deadline,
+                    age,
                 )
             },
         )
@@ -563,6 +694,7 @@ impl Runtime<'_> {
             self.origin,
             deadline,
             &mut self.startup_read,
+            None,
         ) {
             Ok(machine) => {
                 self.pending_canon = false;
@@ -590,7 +722,9 @@ impl DaemonDeps for Runtime<'_> {
     }
     fn sleep(&mut self, duration: Duration) {
         std::thread::sleep(duration);
-        self.control_requests();
+    }
+    fn control_requests(&mut self) {
+        Runtime::control_requests(self);
     }
     fn started(&mut self) {
         if self.running.is_none() {
@@ -612,7 +746,7 @@ impl DaemonDeps for Runtime<'_> {
         } else {
             iteration.status
         };
-        if let Err(error) = self.notify.iteration(iteration.complete, status) {
+        if let Err(error) = self.notify.iteration(iteration.bounded, status) {
             eprintln!("scupperd: notify: {error}");
         }
     }
@@ -672,6 +806,10 @@ impl DaemonDeps for Runtime<'_> {
     #[allow(clippy::too_many_lines)]
     fn tick(&mut self, stop: &AtomicBool) -> Option<crate::reconcile::TickReport> {
         let now = Instant::now();
+        #[cfg(feature = "testing")]
+        if self.options.run_root.join("incomplete-tick").exists() {
+            return Some(crate::reconcile::TickReport::default());
+        }
         // A cold canonicalization timeout is Unknown, not an invalid boot
         // handoff. Poll its existing worker and contain without consuming a boot.
         if self.pending_canon && !stop.load(Ordering::Relaxed) {
@@ -1063,6 +1201,7 @@ mod tests {
                 Instant::now(),
                 Instant::now() + wait,
                 inputs,
+                None,
             )
         };
         let error = attempt(&mut inputs, Duration::from_millis(5))

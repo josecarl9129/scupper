@@ -19,18 +19,59 @@ impl DaemonGuard<'_> {
         let binary = Lab::boot_binary()?;
         let mut command = vec!["--test-root", root.to_str().ok_or("root path")?];
         command.extend_from_slice(args);
-        let (status, output) = self.lab.runner.output(
+        let output_path = self
+            .lab
+            .artifacts
+            .join(format!("{}-{stem}.stdout", self.case));
+        let mut child = self.lab.runner.background(
             &Invocation::new("gwhost", binary.to_str().ok_or("binary path")?, &command),
-            None,
+            &output_path,
         )?;
-        fs::write(
+        let status = child.wait_timeout(Duration::from_secs(55))?;
+        let output = fs::read_to_string(&output_path)?;
+        let diagnostic = fs::read_to_string(output_path.with_extension("stderr"))?;
+        if args.contains(&"disconnect") {
+            let snapshot = serde_json::json!({
+                "v4": self.lab.cmd("scupper", "ip", &["-4", "route", "show", "default"] )?,
+                "v6": self.lab.cmd("scupper", "ip", &["-6", "route", "show", "default"] )?,
+                "exit": self.lab.cmd("scupper", "ip", &["-o", "link", "show", "ex-ch1"] )?,
+            });
+            fs::write(
+                self.lab
+                    .artifacts
+                    .join(format!("{}-{stem}-closure.json", self.case)),
+                serde_json::to_vec_pretty(&snapshot)?,
+            )?;
+        }
+        Ok((
+            status.code().unwrap_or(-1),
+            format!("{output}\n{diagnostic}"),
+        ))
+    }
+    fn assert_disconnect_snapshot(&self, stem: &str) -> Result<()> {
+        let snapshot: serde_json::Value = serde_json::from_slice(&fs::read(
             self.lab
                 .artifacts
-                .join(format!("{}-{stem}.stdout", self.case)),
-            &output,
-        )?;
-        Ok((status.code().unwrap_or(-1), output))
+                .join(format!("{}-{stem}-closure.json", self.case)),
+        )?)?;
+        if !snapshot["v4"]
+            .as_str()
+            .is_some_and(|s| s.contains("unreachable"))
+            || !snapshot["v6"]
+                .as_str()
+                .is_some_and(|s| s.contains("unreachable"))
+            || !snapshot["exit"]
+                .as_str()
+                .is_some_and(|s| !s.contains(",UP") && !s.contains("<UP"))
+        {
+            return fail(format!(
+                "{} message preceded verified closure: {snapshot}",
+                self.case
+            ));
+        }
+        Ok(())
     }
+
     fn expect_check(&mut self, root: &Path, code: i32, stem: &str) -> Result<()> {
         let (got, report) = self.lab.check_result(&Lab::boot_binary()?, root)?;
         fs::write(
@@ -110,7 +151,12 @@ impl DaemonGuard<'_> {
             return Ok(());
         }
         let root = self.lab.private.join("boot-root");
-        for marker in ["crash-after-selection", "pause-apply", "apply-paused"] {
+        for marker in [
+            "crash-after-selection",
+            "pause-apply",
+            "apply-paused",
+            "incomplete-tick",
+        ] {
             let _ = fs::remove_file(root.join("run/scupper").join(marker));
         }
         let guard = WriterLock::acquire(root.join("run/scupper"))?;
@@ -191,6 +237,16 @@ impl DaemonGuard<'_> {
                     .daemon_wait("L10 canary control", Duration::from_secs(5), |_| {
                         Ok(flow_counts(&path)?.1 > 10)
                     })?;
+                fs::write(root.join("run/scupper/incomplete-tick"), b"hold")?;
+                self.lab.runner.dwell(Duration::from_secs(32))?;
+                let (code, text) =
+                    self.control_command(&root, &["check", "--json"], "responsive-stale")?;
+                if code != 5 || !text.contains("transport: local socket") {
+                    return fail(format!("L10 responsive stale supervisor: {code}: {text}"));
+                }
+                fs::remove_file(root.join("run/scupper/incomplete-tick"))?;
+                self.lab.runner.dwell(Duration::from_secs(3))?;
+                self.expect_check(&root, 0, "fresh-again")?;
                 self.child
                     .as_ref()
                     .ok_or("daemon missing")?
@@ -227,17 +283,14 @@ impl DaemonGuard<'_> {
             }
             "L14" => {
                 let (code, text) = self.control_command(&root, &["disconnect"], "disconnect")?;
-                if code != 0 || !text.contains("traffic is now blocked") {
+                if code != 0
+                    || !text.contains("traffic is now blocked")
+                    || !text.contains("transport: local socket")
+                {
                     return fail(format!("L14 disconnect: {code}: {text}"));
                 }
+                self.assert_disconnect_snapshot("disconnect")?;
                 self.expect_check(&root, 4, "disconnected")?;
-                if !self
-                    .lab
-                    .cmd("scupper", "ip", &["route", "show", "default"])?
-                    .contains("unreachable")
-                {
-                    return fail("L14 blocked message before closure");
-                }
                 self.control_stop(Signal::TERM)?;
                 self.lab.boot_gateway(&[], "L14-reboot")?;
                 self.expect_check(&root, 4, "reboot-closed")?;
@@ -300,14 +353,13 @@ impl DaemonGuard<'_> {
                     &["repair", "clear", "--reason", "lab recovery"],
                     "clear",
                 )?;
-                if code != 0 {
+                if code != 0 || !text.contains("transport: local socket") {
                     return fail(format!("L43 clear: {code}: {text}"));
                 }
                 self.lab.daemon_route_healthy(Duration::from_secs(30))?;
                 self.expect_check(&root, 0, "cleared")?;
             }
             "L44" => {
-                self.control_stop(Signal::TERM)?;
                 fs::write(root.join("run/scupper/pause-apply"), b"pause")?;
                 let binary = Lab::boot_binary()?;
                 let mut apply = self.lab.runner.background(
@@ -319,25 +371,39 @@ impl DaemonGuard<'_> {
                     &self.lab.artifacts.join("L44-apply.stdout"),
                 )?;
                 self.lab.daemon_wait(
-                    "L44 local apply holds writer",
+                    "L44 socket apply holds writer",
                     Duration::from_secs(5),
                     |_| Ok(root.join("run/scupper/apply-paused").exists()),
                 )?;
                 if WriterLock::try_acquire(root.join("run/scupper")).is_ok() {
-                    return fail("L44 local apply did not hold the writer lock");
+                    return fail("L44 socket apply did not hold the writer lock");
                 }
-                self.child = Some(self.lab.daemon_spawn(case, &root, "racing-apply")?);
+                let (code, text) = self.control_command(&root, &["disconnect"], "busy-refusal")?;
+                if code != 1
+                    || !text.contains("scupperd is alive but unresponsive")
+                    || text.contains("traffic is now blocked")
+                {
+                    return fail(format!("L44 busy daemon allowed fallback: {code}: {text}"));
+                }
                 let mut samples = Vec::new();
-                for sample in 0..8 {
+                for sample in 0..16 {
+                    if sample == 4 {
+                        fs::remove_file(root.join("run/scupper/pause-apply"))?;
+                    }
                     let forwarding =
                         self.lab
                             .cmd("scupper", "sysctl", &["-n", "net.ipv4.ip_forward"])?;
+                    let forwarding6 = self.lab.cmd(
+                        "scupper",
+                        "sysctl",
+                        &["-n", "net.ipv6.conf.all.forwarding"],
+                    )?;
                     samples.push(
-                        serde_json::json!({"sample": sample, "forwarding_v4": forwarding.trim()}),
+                        serde_json::json!({"sample": sample, "forwarding_v4": forwarding.trim(), "forwarding_v6": forwarding6.trim()}),
                     );
-                    if forwarding.trim() != "0" {
+                    if forwarding.trim() != "0" || forwarding6.trim() != "0" {
                         let (code, report) = self.lab.check_result(&Lab::boot_binary()?, &root)?;
-                        if code == 2 {
+                        if code != 0 {
                             return fail(format!("L44 open unsafe sample {sample}: {report}"));
                         }
                     }
@@ -347,7 +413,6 @@ impl DaemonGuard<'_> {
                     self.lab.artifacts.join("L44-intermediate-samples.json"),
                     serde_json::to_vec_pretty(&samples)?,
                 )?;
-                fs::remove_file(root.join("run/scupper/pause-apply"))?;
                 // A completed apply or a bounded writer refusal is acceptable;
                 // final convergence must be exact and connected.
                 let status = apply.wait_timeout(Duration::from_secs(30))?;
@@ -378,12 +443,39 @@ impl DaemonGuard<'_> {
                 {
                     return fail("L50 crash injection did not retain live exit route");
                 }
-                self.expect_check(&root, 3, "intent-only")?;
+                let (code, report) = self.lab.check_result(&Lab::boot_binary()?, &root)?;
+                if code != 3 || !report.to_string().contains("DisconnectNotEffective") {
+                    return fail(format!("L50 wrong intent-only failure: {code}: {report}"));
+                }
                 let (code, text) = self.control_command(&root, &["disconnect"], "tighten")?;
                 if code != 0 || !text.contains("traffic is now blocked") {
                     return fail("L50 tightening did not verify closure");
                 }
                 self.expect_check(&root, 4, "tightened")?;
+                self.control_restart(&root, "socket-closure")?;
+                let (code, text) = self.control_command(&root, &["connect"], "socket-connect")?;
+                if code != 0 {
+                    return fail(format!("L50 connect: {code}: {text}"));
+                }
+                self.lab.daemon_route_healthy(Duration::from_secs(30))?;
+                fs::write(root.join("run/scupper/incomplete-tick"), b"hold")?;
+                let (code, text) =
+                    self.control_command(&root, &["disconnect"], "socket-ineffective")?;
+                fs::remove_file(root.join("run/scupper/incomplete-tick"))?;
+                if code != 3
+                    || !text.contains("DisconnectNotEffective")
+                    || !text.contains("transport: local socket")
+                    || text.contains("traffic is now blocked")
+                {
+                    return fail(format!("L50 socket ineffective disconnect: {code}: {text}"));
+                }
+                let (code, text) =
+                    self.control_command(&root, &["disconnect"], "socket-tighten")?;
+                if code != 0 || !text.contains("transport: local socket") {
+                    return fail(format!("L50 socket closure: {code}: {text}"));
+                }
+                self.assert_disconnect_snapshot("socket-tighten")?;
+                self.expect_check(&root, 4, "socket-closed")?;
             }
             _ => return fail("unknown control case"),
         }

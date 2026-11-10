@@ -89,7 +89,7 @@ pub(super) fn repair(
             {
                 return Err("repair reason must be one line, at most 1024 bytes".into());
             }
-            Op::RepairClear {}
+            Op::RepairClear { reason }
         }
     };
     mutation(deps, op, json, out, err)
@@ -109,19 +109,29 @@ pub(super) fn mutation(
         &control::request(Op::Ping {}),
         Duration::from_secs(2),
     );
-    let delivery = if ping.is_ok() {
-        control::call(deps.writer_root, &request, Duration::from_secs(50))
-    } else {
-        Err(ClientError::Unavailable(std::io::Error::other(
-            "supervisor unavailable",
-        )))
+    let delivery = match ping {
+        Ok(_) => control::call(deps.writer_root, &request, Duration::from_secs(50)),
+        Err(ClientError::Unavailable(error))
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Err(ClientError::Unavailable(error))
+        }
+        Err(_) => return Err("scupperd is alive but unresponsive".into()),
     };
     let response = match delivery {
         Ok(response) => {
             writeln!(err, "transport: local socket").map_err(output_error)?;
             response
         }
-        Err(ClientError::Unavailable(_)) => {
+        Err(ClientError::Unavailable(error))
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
             writeln!(err, "transport: local writer").map_err(output_error)?;
             let result = admin::local(
                 scupper_sys::boot::BootDeps {
@@ -145,7 +155,7 @@ pub(super) fn mutation(
                 Err(admin::LocalError::Startup(message)) => {
                     writeln!(err, "scupper: {message}").map_err(output_error)?;
                     Err(scupper_proto::ApiError {
-                        code: scupper_proto::ApiErrorCode::Conflict,
+                        code: scupper_proto::ApiErrorCode::Internal,
                         observation: None,
                     })
                 }
@@ -153,24 +163,16 @@ pub(super) fn mutation(
             Response {
                 request_id: request.request_id,
                 schema: Schema,
+                replayed: false,
+                observed_at: None,
                 result,
             }
         }
-        Err(ClientError::OutcomeUnknown(error)) => {
-            writeln!(
-                err,
-                "control outcome unknown for {}: {error}; do not replay the mutation",
-                String::from(request.request_id.clone())
-            )
-            .map_err(output_error)?;
-            Response {
-                request_id: request.request_id,
-                schema: Schema,
-                result: Err(scupper_proto::ApiError {
-                    code: scupper_proto::ApiErrorCode::Timeout,
-                    observation: None,
-                }),
-            }
+        Err(ClientError::Unavailable(_) | ClientError::OutcomeUnknown(_)) => {
+            return Err(format!(
+                "scupperd is alive but unresponsive; control outcome unknown for {}; retry with the same request id",
+                String::from(request.request_id)
+            ));
         }
     };
     render(response, json, out)
@@ -183,7 +185,11 @@ pub(super) fn read(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<Option<u8>, String> {
-    let request = control::request(if status { Op::Status {} } else { Op::Check {} });
+    if status {
+        writeln!(err, "transport: local observations").map_err(output_error)?;
+        return Ok(None);
+    }
+    let request = control::request(Op::Check {});
     let ping = control::call(
         deps.writer_root,
         &control::request(Op::Ping {}),
@@ -228,6 +234,15 @@ fn render(response: Response, json: bool, out: &mut dyn Write) -> Result<u8, Str
         Err(_) => 1,
         _ => 0,
     };
+    if response.replayed && !json {
+        writeln!(
+            out,
+            "replayed outcome observed at {:?}: {:?}",
+            response.observed_at, response.result
+        )
+        .map_err(output_error)?;
+        return Ok(code);
+    }
     if json {
         // Keep check's established full Report wire format for local and socket runs.
         if let Ok(OpResult::Check { report, .. }) = &response.result {
@@ -241,6 +256,7 @@ fn render(response: Response, json: bool, out: &mut dyn Write) -> Result<u8, Str
         match response.result {
             Ok(OpResult::Disconnect {}) => writeln!(out, "traffic is now blocked"),
             Ok(OpResult::Connect { exit }) => writeln!(out, "connected via {}", String::from(exit)),
+            Ok(OpResult::Apply { version, dry_run, repair_plan, plan }) => writeln!(out, "version {version}; dry run: {dry_run}\nRepair preview: {repair_plan:?}\nTarget boot: {plan:?}"),
             Ok(result) => writeln!(out, "{result:?}"),
             Err(error) => writeln!(out, "{error}"),
         }

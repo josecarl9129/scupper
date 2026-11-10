@@ -82,10 +82,74 @@ impl Notify {
         }
         Ok(())
     }
+    /// Extend a bounded full apply and keep its service watchdog alive.
+    /// # Errors
+    /// Returns a nonblocking socket error.
+    pub fn extend_apply(&self) -> io::Result<()> {
+        self.send(b"EXTEND_TIMEOUT_USEC=30000000")?;
+        self.send(b"WATCHDOG=1")
+    }
     fn send(&self, message: &[u8]) -> io::Result<()> {
         if let Some((socket, address)) = &self.socket {
             socket.send_to_addr(message, address)?;
         }
         Ok(())
+    }
+}
+
+/// Notification lifetime for an explicit apply on the tick owner.
+pub(crate) struct ApplyKeepalive {
+    stop: std::sync::mpsc::Sender<()>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+impl ApplyKeepalive {
+    pub(crate) fn start() -> Self {
+        let (stop, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let notify = Notify::new(std::env::var_os("NOTIFY_SOCKET").as_deref())
+                .unwrap_or_else(|_| Notify::disabled());
+            loop {
+                let _ = notify.extend_apply();
+                if receive
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+        });
+        Self {
+            stop,
+            worker: Some(worker),
+        }
+    }
+}
+impl Drop for ApplyKeepalive {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    #[test]
+    fn apply_extends_service_timeout_and_feeds_watchdog() {
+        let name = format!("scupper-apply-notify-{}", std::process::id());
+        let address = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        let socket = UnixDatagram::bind_addr(&address).unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let notify = Notify::new(Some(OsStr::new(&format!("@{name}")))).unwrap();
+        notify.extend_apply().unwrap();
+        let mut buffer = [0; 128];
+        let len = socket.recv(&mut buffer).unwrap();
+        assert_eq!(&buffer[..len], b"EXTEND_TIMEOUT_USEC=30000000");
+        let len = socket.recv(&mut buffer).unwrap();
+        assert_eq!(&buffer[..len], b"WATCHDOG=1");
     }
 }

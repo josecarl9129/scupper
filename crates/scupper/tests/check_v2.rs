@@ -332,7 +332,13 @@ fn stage_eight_socket_age_table_uses_the_strict_thirty_second_boundary() {
         .unwrap(),
     )
     .unwrap();
-    for (age, expected) in [(Some(29), 0), (Some(30), 5), (None, 5)] {
+    let (device, inode) = held.identity();
+    for (age, wrong_inode, expected) in [
+        (Some(29), false, 0),
+        (Some(30), false, 5),
+        (None, false, 5),
+        (Some(1), true, 2),
+    ] {
         let path = root.path.join("control.sock");
         let listener = UnixListener::bind(&path).unwrap();
         let worker = std::thread::spawn(move || {
@@ -343,7 +349,13 @@ fn stage_eight_socket_age_table_uses_the_strict_thirty_second_boundary() {
                 &Response {
                     request_id: request.request_id,
                     schema: Schema,
+                    replayed: false,
+                    observed_at: None,
                     result: Ok(OpResult::Ping {
+                        netns: scupper_core::verdict::v2::NetnsIdentity {
+                            device,
+                            inode: inode + u64::from(wrong_inode),
+                        },
                         last_complete_iteration_age: age,
                         version: 1,
                         quarantined: false,
@@ -373,4 +385,159 @@ fn stage_eight_socket_age_table_uses_the_strict_thirty_second_boundary() {
         worker.join().unwrap();
         std::fs::remove_file(path).unwrap();
     }
+}
+
+#[test]
+fn live_supervisor_lease_refuses_fallback_without_changing_state() {
+    let sys = Script::new("ubuntu-24.04");
+    fresh(&sys);
+    let root = Root::new(&sys.runner, &testing::handle().unwrap());
+    let before = std::fs::read(root.path.join("state.json")).unwrap();
+    let _lease = scupper_sys::lock::SupervisorLease::try_acquire(&root.path).unwrap();
+    let (code, out, err) = run(&sys, &root, &["disconnect"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("scupperd is alive but unresponsive"), "{err}");
+    assert!(!out.contains("traffic is now blocked"));
+    assert_eq!(before, std::fs::read(root.path.join("state.json")).unwrap());
+}
+
+#[test]
+fn local_dry_run_includes_hardening_repair_preview() {
+    let sys = Script::new("ubuntu-24.04");
+    fresh(&sys);
+    let root = Root::new(&sys.runner, &testing::handle().unwrap());
+    let file = scupper_sys::state::StateFile::open(&root.path, None).unwrap();
+    let scupper_sys::state::StateRead::Present(mut state) = file.read().unwrap() else {
+        unreachable!()
+    };
+    state.applied_version = Some(1);
+    let guard = scupper_sys::lock::WriterLock::acquire(&root.path).unwrap();
+    file.write(&guard, &state).unwrap();
+    drop(guard);
+    sys.replace(
+        "scupper-sysctl-net.ipv4.conf.all.accept_redirects.txt",
+        "1\n",
+    );
+    for family in ["ipv4", "ipv6"] {
+        for link in ["lo", "wg0", "ex-ch1"] {
+            sys.replace(
+                &format!("scupper-sysctl-net.{family}.conf.{link}.forwarding.txt"),
+                "1\n",
+            );
+        }
+    }
+    let before = std::fs::read(root.path.join("state.json")).unwrap();
+    let (code, out, err) = run(&sys, &root, &["apply", "--dry-run"]);
+    assert_eq!(code, 0, "{out}: {err}");
+    assert!(out.contains("Repair preview:"), "{out}: {err}");
+    assert!(
+        out.lines()
+            .any(|line| line.starts_with("Repair preview:") && line.contains("WriteSysctl")),
+        "{out}: {err}"
+    );
+    assert!(out.contains("Target boot:"), "{out}: {err}");
+    assert_eq!(before, std::fs::read(root.path.join("state.json")).unwrap());
+}
+#[test]
+fn socket_check_with_stale_age_returns_five() {
+    use scupper_proto::{OpResult, Response, Schema};
+    use std::{io::Write, os::unix::net::UnixListener};
+    let sys = Script::new("ubuntu-24.04");
+    fresh(&sys);
+    let held = testing::handle().unwrap();
+    let root = Root::new(&sys.runner, &held);
+    let site = scupper_core::config::validate(
+        scupper_core::config::parse_site(
+            &support::site_text(&sys.runner)
+                .replace("require_daemon = false", "require_daemon = true"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let report = scupper_sys::check_v2::run_supervised(
+        &scupper_sys::check_v2::Dependencies {
+            system: &sys,
+            probe_exec: &sys,
+            handle: Some(&held),
+            run_root: &root.path,
+            state_root: &root.path,
+        },
+        &scupper_sys::check_v2::Config {
+            site: &site,
+            gateway: &scupper_core::config::GatewayId("gw1".into()),
+            stamp: root.stamp,
+        },
+        Some(30),
+    )
+    .unwrap();
+    let listener = UnixListener::bind(root.path.join("control.sock")).unwrap();
+    let (device, inode) = held.identity();
+    let worker = std::thread::spawn(move || {
+        for result in [
+            OpResult::Ping {
+                last_complete_iteration_age: Some(30),
+                netns: scupper_core::verdict::v2::NetnsIdentity { device, inode },
+                version: 1,
+                quarantined: false,
+                selection: scupper_core::verdict::v2::Selection::Auto,
+            },
+            OpResult::Check {
+                health: (&report).into(),
+                report: serde_json::to_value(report).unwrap(),
+            },
+        ] {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = scupper_sys::daemon::control::read_request(&stream).unwrap();
+            serde_json::to_writer(
+                &mut stream,
+                &Response {
+                    request_id: request.request_id,
+                    schema: Schema,
+                    replayed: false,
+                    observed_at: None,
+                    result: Ok(result),
+                },
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+        }
+    });
+    let (code, out, err) = run(&sys, &root, &["check", "--json"]);
+    assert_eq!(code, 5, "{out}: {err}");
+    assert!(err.contains("transport: local socket"));
+    worker.join().unwrap();
+}
+#[test]
+fn timed_out_ping_with_live_lease_never_runs_local_mutation() {
+    use std::os::unix::net::UnixListener;
+    let sys = Script::new("ubuntu-24.04");
+    fresh(&sys);
+    let root = Root::new(&sys.runner, &testing::handle().unwrap());
+    let before = std::fs::read(root.path.join("state.json")).unwrap();
+    let _lease = scupper_sys::lock::SupervisorLease::try_acquire(&root.path).unwrap();
+    let listener = UnixListener::bind(root.path.join("control.sock")).unwrap();
+    let worker = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        scupper_sys::daemon::control::read_request(&stream).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2200));
+    });
+    let (code, out, err) = run(&sys, &root, &["disconnect"]);
+    assert_eq!(code, 1, "{out}: {err}");
+    assert!(err.contains("scupperd is alive but unresponsive"));
+    assert!(!out.contains("traffic is now blocked"));
+    assert_eq!(before, std::fs::read(root.path.join("state.json")).unwrap());
+    worker.join().unwrap();
+}
+#[test]
+fn status_with_responsive_uninitialized_socket_keeps_local_schema() {
+    use std::os::unix::net::UnixListener;
+    let sys = Script::new("ubuntu-24.04");
+    fresh(&sys);
+    let root = Root::new(&sys.runner, &testing::handle().unwrap());
+    let _listener = UnixListener::bind(root.path.join("control.sock")).unwrap();
+    let (code, out, _) = run(&sys, &root, &["status", "--json"]);
+    assert_eq!(code, 0);
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(value.get("observations").is_some());
+    assert!(value.get("request_id").is_none());
 }

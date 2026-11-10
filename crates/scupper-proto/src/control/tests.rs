@@ -172,6 +172,8 @@ fn every_variant_roundtrips_and_keys_are_private() {
         let response = Response {
             request_id: id(),
             schema: Schema,
+            replayed: false,
+            observed_at: None,
             result,
         };
         let value = serde_json::to_value(&response).unwrap();
@@ -254,6 +256,11 @@ fn every_variant_roundtrips_and_keys_are_private() {
         "quarantined",
         "selection",
         "plan",
+        "repair_plan",
+        "observed_at",
+        "netns",
+        "device",
+        "inode",
     ];
     let denied = [
         "dst",

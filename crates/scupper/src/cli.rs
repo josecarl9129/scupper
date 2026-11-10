@@ -579,7 +579,12 @@ fn m2_check(
         }
         Err(error) => return Err(error),
     };
-    let (result, mut observations) = scupper_sys::check_v2::run_after_unavailable(
+    let driver = if status {
+        scupper_sys::check_v2::run_with_observations
+    } else {
+        scupper_sys::check_v2::run_after_unavailable
+    };
+    let (result, mut observations) = driver(
         &scupper_sys::check_v2::Dependencies {
             system: deps.system,
             probe_exec: deps.probe_exec,

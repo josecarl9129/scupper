@@ -61,8 +61,11 @@ pub enum Op, op_samples {
     },
     /// Inspect the persistent quarantine latch.
     RepairStatus {},
-    /// Explicitly clear quarantine. Optional CLI prose is reduced to an enum.
-    RepairClear {},
+    /// Explicitly clear quarantine and retain bounded operator context.
+    RepairClear {
+        /// One line, at most 1024 bytes; retained in durable safety state.
+        reason: Option<String> = Some("operator recovery".into()),
+    },
     /// Commit validated site TOML with an optimistic parent precondition.
     Commit {
         /// Expected head; None means a fresh store.
@@ -90,6 +93,7 @@ vocabulary!(
     Timeout,
     Internal,
     DisconnectNotEffective,
+    Quarantined,
     NotReady
 );
 /// Public error with a stable code and no reflected input or diagnostic string.
@@ -194,6 +198,8 @@ pub enum OpResult, result_samples {
     Ping {
         /// Monotonic age in whole seconds, supplied by the supervisor.
         last_complete_iteration_age: Option<u64> = Some(2),
+        /// Identity of the supervisor's held namespace.
+        netns: scupper_core::verdict::v2::NetnsIdentity = scupper_core::verdict::v2::NetnsIdentity { device: 1, inode: 2 },
         /// Applied immutable version.
         version: u64 = 1,
         /// Persistent quarantine state.
@@ -230,7 +236,9 @@ pub enum OpResult, result_samples {
         version: u64 = 2,
         /// True when no mutation was executed.
         dry_run: bool = false,
-        /// Ordered operation categories, without kernel command text.
+        /// Same-version repair preview; never executed before the full boot.
+        repair_plan: Vec<crate::StepKind> = vec![crate::StepKind::WriteSysctl],
+        /// Ordered target-version boot operations, without kernel command text.
         plan: Vec<crate::StepKind> = vec![crate::StepKind::VerifyRuleset],
     },
     /// Persistent quarantine summary.
@@ -238,7 +246,7 @@ pub enum OpResult, result_samples {
         /// Whether the latch is set.
         quarantined: bool = true,
         /// Bounded explanation when set.
-        reason: Option<Reason> = Some(Reason::RepairBudget),
+        reason: Option<String> = Some("safety repair budget exhausted".into()),
     },
     /// Quarantine was explicitly cleared.
     RepairClear {},
@@ -257,6 +265,12 @@ pub struct Response {
     pub request_id: Identifier,
     /// Fixed schema discriminator.
     pub schema: Schema,
+    /// True when the result is a retained outcome of an earlier execution.
+    #[serde(default)]
+    pub replayed: bool,
+    /// Wall-clock time of the original observation; cached claims retain this time.
+    #[serde(default)]
+    pub observed_at: Option<UnixSeconds>,
     /// Typed success or stable error.
     pub result: Result<OpResult, ApiError>,
 }
@@ -300,8 +314,15 @@ pub fn decode_request(line: &[u8]) -> Result<Request, ApiError> {
         | Op::Connect { .. }
         | Op::Disconnect {}
         | Op::Apply { .. }
-        | Op::RepairStatus {}
-        | Op::RepairClear {} => {}
+        | Op::RepairStatus {} => {}
+        Op::RepairClear { reason } => {
+            if reason
+                .as_ref()
+                .is_some_and(|text| text.len() > 1024 || text.contains(['\n', '\r']))
+            {
+                return Err(invalid());
+            }
+        }
     }
     Ok(request)
 }

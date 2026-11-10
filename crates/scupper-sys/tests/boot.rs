@@ -1658,13 +1658,32 @@ fn control_apply_keeps_quarantine_on_failure_and_clears_only_after_full_verifica
     });
     assert!(fixture.run(None).succeeded());
     let run_root = fixture.root.path.join("run");
+    let observed_open = Cell::new(false);
+    let verification = |point| {
+        assert!(
+            WriterLock::try_acquire(&run_root).is_err(),
+            "apply released its writer capability"
+        );
+        if point == BootPoint::After(BootStep::Forwarding) {
+            let file = StateFile::open(&fixture.root.path, None).unwrap();
+            let scupper_sys::state::StateRead::Present(state) = file.read().unwrap() else {
+                panic!("missing state");
+            };
+            assert!(
+                state.quarantine.is_some(),
+                "latch cleared before opening boot verified"
+            );
+            observed_open.set(true);
+        }
+        Ok(())
+    };
     let deps = BootDeps {
         system: &fixture.kernel,
         namespace: &fixture.kernel,
         state_root: &fixture.root.path,
         config_root: &fixture.root.path,
         run_root: &run_root,
-        hook: None,
+        hook: Some(&verification),
         secret_owner: rustix::process::geteuid().as_raw(),
     };
     let log = EventLog::memory_only(scupper_core::config::GatewayId("gw1".into()), || {
@@ -1679,11 +1698,24 @@ fn control_apply_keeps_quarantine_on_failure_and_clears_only_after_full_verifica
     };
     assert!(state.quarantine.is_some());
     assert_eq!(fixture.kernel.values.borrow()["net.ipv4.ip_forward"], "0");
+    // A failure in the boot that enables forwarding must leave durable quarantine intact.
+    *fixture.kernel.failure.borrow_mut() = Some((
+        Program::Sysctl,
+        "net.ipv6.conf.all.forwarding=1".into(),
+        "opening failed".into(),
+    ));
+    assert!(admin::apply(&deps, &log.handle, None, false, 0).is_err());
+    let scupper_sys::state::StateRead::Present(state) = file.read().unwrap() else {
+        panic!("missing state");
+    };
+    assert!(state.quarantine.is_some());
+    assert_eq!(fixture.kernel.values.borrow()["net.ipv4.ip_forward"], "0");
     *fixture.kernel.failure.borrow_mut() = None;
     assert!(admin::apply(&deps, &log.handle, None, false, 0).is_ok());
     let scupper_sys::state::StateRead::Present(state) = file.read().unwrap() else {
         panic!("missing state");
     };
     assert!(state.quarantine.is_none());
+    assert!(observed_open.get());
     assert_eq!(fixture.kernel.values.borrow()["net.ipv4.ip_forward"], "1");
 }

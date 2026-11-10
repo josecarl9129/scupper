@@ -4,7 +4,7 @@ use super::{StartupRead, initialize, unix};
 use crate::{
     boot::BootDeps,
     events::LogHandle,
-    lock::WriterLock,
+    lock::{SupervisorLease, WriterGuard, WriterLock},
     reconcile::{Config, Kernel, Reconciler, StateStore},
     state::{StateFile, StateRead},
     store::{MetaInput, VersionStore},
@@ -32,6 +32,21 @@ pub fn execute<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)>(
     op: Op,
     uid: u32,
     age: Option<u64>,
+    check: impl FnMut(Option<Instant>) -> Result<Report, ApiError>,
+) -> Result<OpResult, ApiError> {
+    let guard = machine.writer_guard().map_err(internal)?;
+    execute_locked(machine, &guard, op, uid, age, check)
+}
+/// Execute using one writer capability for the whole operation.
+/// # Errors
+/// Returns validation, observation or persistence failures.
+#[allow(clippy::too_many_lines)]
+pub fn execute_locked<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)>(
+    machine: &mut Reconciler<K, S, C>,
+    guard: &WriterGuard,
+    op: Op,
+    uid: u32,
+    age: Option<u64>,
     mut check: impl FnMut(Option<Instant>) -> Result<Report, ApiError>,
 ) -> Result<OpResult, ApiError> {
     if !super::control::authorized(uid) {
@@ -41,6 +56,7 @@ pub fn execute<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)>(
     match op {
         Op::Ping {} => Ok(OpResult::Ping {
             last_complete_iteration_age: age,
+            netns: machine.netns_identity(),
             version: machine.version(),
             quarantined: machine.latch().is_some(),
             selection: machine.selection(),
@@ -54,20 +70,36 @@ pub fn execute<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)>(
         }
         Op::RepairStatus {} => Ok(OpResult::RepairStatus {
             quarantined: machine.latch().is_some(),
-            reason: machine.latch().map(|_| scupper_proto::Reason::RepairBudget),
+            reason: machine.latch().map(|latch| latch.reason.clone()),
         }),
-        Op::RepairClear {} => {
+        Op::RepairClear { reason } => {
             machine
-                .clear_latch(actor)
+                .clear_latch_with_reason_locked(
+                    guard,
+                    actor,
+                    scupper_core::planner::ClearLatch::RepairClear,
+                    reason,
+                )
                 .map_err(|_| api(ApiErrorCode::PersistenceUnavailable))?;
-            machine.tick();
+            machine.tick_with_guard(guard);
             Ok(OpResult::RepairClear {})
         }
         Op::Connect { exit } => {
             let selection = exit.map_or(Selection::Auto, |id| {
                 Selection::Prefer(scupper_core::config::ExitId(String::from(id)))
             });
-            machine.set_selection(selection, actor).map_err(internal)?;
+            if machine.latch().is_some() {
+                return Err(api(ApiErrorCode::Quarantined));
+            }
+            machine
+                .set_selection_locked(guard, selection, actor)
+                .map_err(|e| {
+                    if e.to_string() == "unconfigured exit" {
+                        api(ApiErrorCode::InvalidRequest)
+                    } else {
+                        internal(e)
+                    }
+                })?;
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
                 if let Ok(report) = check(Some(deadline))
@@ -81,11 +113,12 @@ pub fn execute<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)>(
                 if Instant::now() >= deadline {
                     return Err(api(ApiErrorCode::NotReady));
                 }
+                machine.tick_with_guard(guard);
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
         Op::Disconnect {} => {
-            let closed = machine.set_selection(Selection::Disconnected, actor);
+            let closed = machine.set_selection_locked(guard, Selection::Disconnected, actor);
             let report = check(None)?;
             if closed.is_ok()
                 && report.verdict == Verdict::FailClosed(FailClosed::AdminDisconnected)
@@ -131,12 +164,16 @@ impl crate::probe_child::ProbeExec for DeadlineProbe<'_> {
 }
 
 // BootDeps has a generic System, so callers supply the independent probe boundary.
-pub(super) fn check(
+/// Run a fresh bounded staged check through the held namespace.
+/// # Errors
+/// Returns observation or probe failures.
+pub fn check(
     deps: &BootDeps<'_>,
     probe: &dyn crate::probe_child::ProbeExec,
     held: &crate::netns::NetnsHandle,
     config: &Config,
     deadline: Option<Instant>,
+    age: Option<u64>,
 ) -> Result<Report, ApiError> {
     let bounded = crate::collect::reconcile::SafetySystem {
         system: deps.system,
@@ -160,6 +197,7 @@ pub(super) fn check(
             gateway: &config.gateway,
             stamp: config.stamp,
         },
+        age,
     )
     .map_err(internal)
 }
@@ -180,12 +218,25 @@ pub fn commit(
     }
     let guard =
         WriterLock::acquire_timeout(deps.run_root, Duration::from_secs(2)).map_err(internal)?;
-    let store =
-        VersionStore::open_with_mirror_root(deps.state_root, deps.config_root, Some(&guard))
-            .map_err(internal)?;
+    commit_locked(deps, log, &guard, parent, toml, reason, uid)
+}
+/// Commit while retaining a caller-owned writer lock.
+/// # Errors
+/// Returns validation, CAS or durability errors.
+pub fn commit_locked(
+    deps: &BootDeps<'_>,
+    log: &LogHandle,
+    guard: &WriterGuard,
+    parent: Option<u64>,
+    toml: &str,
+    reason: scupper_proto::Reason,
+    uid: u32,
+) -> Result<OpResult, ApiError> {
+    let store = VersionStore::open_with_mirror_root(deps.state_root, deps.config_root, Some(guard))
+        .map_err(internal)?;
     let version = store
         .commit(
-            &guard,
+            guard,
             parent,
             toml,
             MetaInput {
@@ -222,6 +273,21 @@ pub fn apply(
     if !super::control::authorized(uid) {
         return Err(api(ApiErrorCode::Unauthorized));
     }
+    let guard =
+        WriterLock::acquire_timeout(deps.run_root, Duration::from_secs(2)).map_err(internal)?;
+    apply_locked(deps, log, &guard, version, dry_run, uid)
+}
+/// Full apply with a caller-owned writer capability.
+/// # Errors
+/// Returns version, verification or persistence errors.
+pub fn apply_locked(
+    deps: &BootDeps<'_>,
+    log: &LogHandle,
+    guard: &WriterGuard,
+    version: Option<u64>,
+    dry_run: bool,
+    uid: u32,
+) -> Result<OpResult, ApiError> {
     let store = VersionStore::read_only(deps.state_root, deps.config_root);
     let target = version
         .or(store.head().map_err(internal)?)
@@ -233,9 +299,12 @@ pub fn apply(
     // before publishing the version makes a crash leave the old handoff closed.
     let plan = vec![
         scupper_proto::StepKind::ForwardingOff,
+        scupper_proto::StepKind::WriteSysctl,
+        scupper_proto::StepKind::ReadBackSysctls,
         scupper_proto::StepKind::LoadRuleset,
         scupper_proto::StepKind::VerifyRuleset,
         scupper_proto::StepKind::FlushConntrack,
+        scupper_proto::StepKind::LinkCreate,
         scupper_proto::StepKind::LinkReconfigure,
         scupper_proto::StepKind::RouteReplace,
         scupper_proto::StepKind::ForwardingOn,
@@ -244,11 +313,10 @@ pub fn apply(
         return Ok(OpResult::Apply {
             version: target,
             dry_run,
+            repair_plan: Vec::new(),
             plan,
         });
     }
-    let guard =
-        WriterLock::acquire_timeout(deps.run_root, Duration::from_secs(2)).map_err(internal)?;
     if let Some(held) = deps.namespace.open().map_err(internal)? {
         crate::reconcile::forwarding_gates(deps, &held, false, None).map_err(internal)?;
     }
@@ -259,8 +327,7 @@ pub fn apply(
             b"writer held; gates closed",
         )
         .map_err(internal)?;
-        let until = Instant::now() + Duration::from_secs(8);
-        while deps.run_root.join("pause-apply").exists() && Instant::now() < until {
+        while deps.run_root.join("pause-apply").exists() {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -269,7 +336,7 @@ pub fn apply(
         return Err(api(ApiErrorCode::PersistenceUnavailable));
     };
     state.applied_version = Some(target);
-    file.write(&guard, &state)
+    file.write(guard, &state)
         .map_err(|_| api(ApiErrorCode::PersistenceUnavailable))?;
     let _ = log.emit(
         EventKind::AdminAction {
@@ -278,7 +345,10 @@ pub fn apply(
         Actor::Local { uid },
         Some(target),
     );
-    if !crate::boot::boot_with_guard(deps, &guard).succeeded() {
+    if !crate::boot::boot_apply_with_guard(deps, guard, true).succeeded() {
+        if let Ok(Some(held)) = deps.namespace.open() {
+            let _ = crate::reconcile::forwarding_gates(deps, &held, false, None);
+        }
         return Err(api(ApiErrorCode::Internal));
     }
     if let Some(quarantine) = state.quarantine.take() {
@@ -291,20 +361,149 @@ pub fn apply(
             scupper_core::planner::ClearLatch::VerifiedFullApply,
             &scupper_core::planner::Budgets::default(),
         );
-        file.write(&guard, &state)
-            .map_err(|_| api(ApiErrorCode::PersistenceUnavailable))?;
-        let _ = log.emit(cleared.event.into(), Actor::Local { uid }, Some(target));
-        // Boot verified every object with the latch held. Re-verify under the
-        // same writer capability before enabling the gate after explicit clear.
-        if !crate::boot::boot_with_guard(deps, &guard).succeeded() {
-            return Err(api(ApiErrorCode::Internal));
+        if file.write(guard, &state).is_err() {
+            if let Ok(Some(held)) = deps.namespace.open() {
+                let _ = crate::reconcile::forwarding_gates(deps, &held, false, None);
+            }
+            return Err(api(ApiErrorCode::PersistenceUnavailable));
         }
+        let _ = log.emit(cleared.event.into(), Actor::Local { uid }, Some(target));
     }
     Ok(OpResult::Apply {
         version: target,
         dry_run,
+        repair_plan: Vec::new(),
         plan,
     })
+}
+
+/// Read-only same-version repair plan, independent of daemon attachment or probe qualification.
+/// # Errors
+/// Returns immutable configuration or observation failures.
+#[allow(clippy::too_many_lines)] // Keep the read-only observation and planner inputs together.
+pub fn preview_locked(
+    deps: &BootDeps<'_>,
+    _guard: &WriterGuard,
+    target: Option<u64>,
+) -> Result<Vec<scupper_proto::StepKind>, ApiError> {
+    use scupper_core::{
+        planner::{Budgets, Debounce, Desired, Latch},
+        render::{RouteTarget, VersionStamp, render_netns},
+        verdict::v2::{HealthConfigV2, NetnsIdentity},
+    };
+    use sha2::{Digest, Sha256};
+    let file = StateFile::open(deps.state_root, None).map_err(internal)?;
+    let StateRead::Present(state) = file.read().map_err(internal)? else {
+        return Ok(Vec::new());
+    };
+    let Some(version) = state
+        .applied_version
+        .filter(|version| Some(*version) == target)
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(held) = deps.namespace.open().map_err(internal)? else {
+        return Ok(Vec::new());
+    };
+    let (text, _) = VersionStore::read_only(deps.state_root, deps.config_root)
+        .read(version)
+        .map_err(internal)?;
+    let site =
+        scupper_core::config::validate(scupper_core::config::parse_site(&text).map_err(internal)?)
+            .map_err(|_| api(ApiErrorCode::Internal))?;
+    let gateway = scupper_core::config::GatewayId(
+        std::fs::read_to_string(deps.config_root.join("gateway-id"))
+            .map_err(internal)?
+            .trim()
+            .into(),
+    );
+    let stamp = VersionStamp {
+        version,
+        sha256: Sha256::digest(text.as_bytes()).into(),
+    };
+    let rendered = render_netns(&site, &gateway, &stamp).map_err(internal)?;
+    let want = if deps.system.canon_cache().is_some() {
+        crate::canon::prepare_netns_ruleset(
+            deps.system,
+            &held,
+            &rendered,
+            Instant::now() + Duration::from_secs(6),
+        )
+    } else {
+        crate::canon::netns_rulesets(deps.system, &held, &rendered).map(|(want, _)| want)
+    }
+    .map_err(internal)?;
+    let fingerprint = crate::canon::fingerprint(&want).map_err(internal)?;
+    let (device, inode) = held.identity();
+    let health = HealthConfigV2::new(
+        &site,
+        &gateway,
+        NetnsIdentity { device, inode },
+        super::uplink_addresses(deps.system).map_err(internal)?,
+        version,
+    )
+    .map_err(internal)?;
+    let target = if state.selection == Selection::Disconnected {
+        RouteTarget::Unreachable
+    } else {
+        RouteTarget::Exit(health.exit_iface.clone())
+    };
+    let desired = Desired::new(
+        &site,
+        &gateway,
+        &stamp,
+        fingerprint,
+        &target,
+        &state.selection,
+    )
+    .map_err(internal)?;
+    let report: Option<crate::boot::BootReport> = std::fs::read(deps.run_root.join("boot.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let owned = report.map_or_else(std::collections::BTreeMap::new, |report| report.owned_links);
+    let safety = crate::collect::reconcile::observe(
+        deps.system,
+        &held,
+        &desired,
+        &health,
+        &held.fd_path(),
+        None,
+        &owned,
+    );
+    let observed = crate::collect::reconcile::observe_rest(
+        deps.system,
+        &held,
+        &desired,
+        &health,
+        safety,
+        Instant::now() + Duration::from_secs(6),
+    );
+    let latch = state.quarantine.map(|q| Latch {
+        reason: q.reason,
+        object: q.object,
+    });
+    let budgets = Budgets::default();
+    let first = scupper_core::planner::plan(
+        &desired,
+        &observed.model,
+        &budgets,
+        latch.as_ref(),
+        &Debounce::default(),
+        MonoTime(Duration::ZERO),
+    );
+    let planned = scupper_core::planner::plan(
+        &desired,
+        &observed.model,
+        &budgets,
+        latch.as_ref(),
+        &first.debounce,
+        MonoTime(Duration::ZERO),
+    );
+    Ok(planned
+        .steps
+        .iter()
+        .map(scupper_proto::StepKind::from)
+        .collect())
 }
 
 pub(super) fn repair_status(root: &std::path::Path) -> Result<OpResult, ApiError> {
@@ -314,10 +513,69 @@ pub(super) fn repair_status(root: &std::path::Path) -> Result<OpResult, ApiError
     };
     Ok(OpResult::RepairStatus {
         quarantined: state.quarantine.is_some(),
-        reason: state
-            .quarantine
-            .map(|_| scupper_proto::Reason::RepairBudget),
+        reason: state.quarantine.map(|quarantine| quarantine.reason),
     })
+}
+
+/// Persist administrative recovery intent even before a reconciler can initialize.
+/// # Errors
+/// Returns validation or durable state failures.
+pub fn durable_intent(deps: &BootDeps<'_>, op: &Op, uid: u32) -> Result<(), ApiError> {
+    if !super::control::authorized(uid) {
+        return Err(api(ApiErrorCode::Unauthorized));
+    }
+    let guard =
+        WriterLock::acquire_timeout(deps.run_root, Duration::from_secs(2)).map_err(internal)?;
+    let file = StateFile::open(deps.state_root, None).map_err(internal)?;
+    let StateRead::Present(mut state) = file.read().map_err(internal)? else {
+        return Err(api(ApiErrorCode::PersistenceUnavailable));
+    };
+    match op {
+        Op::Disconnect {} => {
+            state.selection = Selection::Disconnected;
+        }
+        Op::RepairClear { reason } => {
+            state.quarantine = None;
+            state.last_repair_reason.clone_from(reason);
+        }
+        Op::Connect { exit } => {
+            if state.quarantine.is_some() {
+                return Err(api(ApiErrorCode::Quarantined));
+            }
+            if let Some(id) = exit {
+                let version = state
+                    .applied_version
+                    .ok_or_else(|| api(ApiErrorCode::NotFound))?;
+                let (text, _) = VersionStore::read_only(deps.state_root, deps.config_root)
+                    .read(version)
+                    .map_err(internal)?;
+                let site = scupper_core::config::validate(
+                    scupper_core::config::parse_site(&text).map_err(internal)?,
+                )
+                .map_err(|_| api(ApiErrorCode::Internal))?;
+                let gateway = std::fs::read_to_string(deps.config_root.join("gateway-id"))
+                    .map_err(internal)?;
+                if !site
+                    .gateway(&scupper_core::config::GatewayId(gateway.trim().into()))
+                    .is_some_and(|gw| {
+                        gw.exits()
+                            .iter()
+                            .any(|exit| exit.id().as_str() == String::from(id.clone()))
+                    })
+                {
+                    return Err(api(ApiErrorCode::InvalidRequest));
+                }
+            }
+            state.selection = exit.as_ref().map_or(Selection::Auto, |id| {
+                Selection::Prefer(scupper_core::config::ExitId(String::from(id.clone())))
+            });
+            // This is only a durable transition; readiness is verified asynchronously.
+        }
+        _ => return Err(api(ApiErrorCode::InvalidRequest)),
+    }
+    file.write(&guard, &state)
+        .map_err(|_| api(ApiErrorCode::PersistenceUnavailable))?;
+    Ok(())
 }
 
 /// Distinguishes startup diagnostics from typed operation outcomes.
@@ -357,9 +615,10 @@ pub fn local(
     if matches!(op, Op::RepairStatus {}) {
         return repair_status(deps.state_root).map_err(LocalError::Api);
     }
+    let _lease = SupervisorLease::try_acquire(deps.run_root)
+        .map_err(|e| format!("scupperd is alive but unresponsive: {e}"))?;
     let guard = WriterLock::acquire_timeout(deps.run_root, Duration::from_secs(2))
         .map_err(|e| format!("another writer holds the writer lock: {e}"))?;
-    drop(guard);
     let gateway = scupper_core::config::GatewayId(
         std::fs::read_to_string(deps.config_root.join("gateway-id"))
             .map_err(|e| e.to_string())?
@@ -376,43 +635,25 @@ pub fn local(
         reason,
     } = op
     {
-        return commit(&deps, &log.handle, parent, &toml, reason, uid).map_err(LocalError::Api);
+        return commit_locked(&deps, &log.handle, &guard, parent, &toml, reason, uid)
+            .map_err(LocalError::Api);
     }
-    let applied = if let Op::Apply { version, dry_run } = op {
+    if let Op::Apply { version, dry_run } = op {
         let target = version.or(VersionStore::read_only(deps.state_root, deps.config_root)
             .head()
             .map_err(|e| e.to_string())?);
         let prefix = if dry_run {
-            Vec::new()
-        } else if let Ok((mut machine, _, _)) = initialize(
-            deps,
-            gateway.clone(),
-            log.handle.clone(),
-            Instant::now(),
-            Instant::now() + Duration::from_secs(30),
-            &mut StartupRead::default(),
-        ) {
-            if Some(machine.version()) == target {
-                machine
-                    .apply_plan(false, Actor::Local { uid })
-                    .map_err(|e| e.to_string())?
-            } else {
-                Vec::new()
-            }
+            preview_locked(&deps, &guard, target)?
         } else {
             Vec::new()
         };
-        let mut result = apply(&deps, &log.handle, version, dry_run, uid)?;
-        if let OpResult::Apply { plan, .. } = &mut result {
-            plan.splice(0..0, prefix);
+        let mut result = apply_locked(&deps, &log.handle, &guard, version, dry_run, uid)?;
+        if let OpResult::Apply { repair_plan, .. } = &mut result {
+            *repair_plan = prefix;
         }
-        if dry_run {
-            return Ok(result);
-        }
-        Some(result)
-    } else {
-        None
-    };
+        let _ = log.handle.flush_blocking(Duration::from_secs(2));
+        return Ok(result);
+    }
     let (mut machine, held, config) = initialize(
         deps,
         gateway,
@@ -420,16 +661,12 @@ pub fn local(
         Instant::now(),
         Instant::now() + Duration::from_secs(30),
         &mut StartupRead::default(),
+        Some((&guard, true)),
     )
     .map_err(|e| e.to_string())?;
-    let result = if let Some(result) = applied {
-        machine.tick();
-        Ok(result)
-    } else {
-        execute(&mut machine, op, uid, None, |deadline| {
-            check(&deps, probe, &held, &config, deadline)
-        })
-    };
+    let result = execute_locked(&mut machine, &guard, op, uid, None, |deadline| {
+        check(&deps, probe, &held, &config, deadline, None)
+    });
     let _ = log.handle.flush_blocking(Duration::from_secs(2));
     result.map_err(LocalError::Api)
 }

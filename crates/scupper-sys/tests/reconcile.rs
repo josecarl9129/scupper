@@ -1804,6 +1804,7 @@ fn emergency_failure_replans_do_not_reserve_hardening_repairs() {
 // Drive the production scheduler with a real Reconciler<FakeKernel>, fake clock,
 // fake signal source and local notify socket. A shutdown kernel mutation fails
 // the final history comparison, even when it leaves final kernel state unchanged.
+#[allow(clippy::struct_excessive_bools)] // Independent injected scheduler faults.
 struct DaemonRig<'a> {
     rig: &'a mut Rig,
     now: std::time::Instant,
@@ -1811,6 +1812,10 @@ struct DaemonRig<'a> {
     offset: Duration,
     limit: usize,
     iterations: usize,
+    tick_duration: Duration,
+    control_calls: usize,
+    fail_control_bind: bool,
+    complete_iterations: usize,
     degraded: bool,
     rebuild_pending: bool,
     probes: Option<scupper_sys::daemon::probes::Probes>,
@@ -1830,6 +1835,15 @@ impl scupper_sys::daemon::DaemonDeps for DaemonRig<'_> {
     fn now(&self) -> std::time::Instant {
         self.now
     }
+    fn control_requests(&mut self) {
+        self.control_calls += 1;
+        if self.fail_control_bind {
+            assert!(
+                scupper_sys::daemon::control::Server::bind(&self.rig.root.join("unsafe-control"))
+                    .is_err()
+            );
+        }
+    }
     fn sleep(&mut self, duration: Duration) {
         if self.probes.is_some() {
             std::thread::sleep(Duration::from_millis(5));
@@ -1844,6 +1858,7 @@ impl scupper_sys::daemon::DaemonDeps for DaemonRig<'_> {
     }
     fn tick(&mut self, _: &std::sync::atomic::AtomicBool) -> Option<TickReport> {
         self.iterations += 1;
+        self.now += self.tick_duration;
         if self.degraded {
             return None;
         }
@@ -1905,8 +1920,9 @@ impl scupper_sys::daemon::DaemonDeps for DaemonRig<'_> {
         }
     }
     fn notify(&mut self, iteration: &scupper_sys::daemon::Iteration) {
+        self.complete_iterations += usize::from(iteration.complete);
         self.notify
-            .iteration(iteration.complete, iteration.status)
+            .iteration(iteration.bounded, iteration.status)
             .unwrap();
         if let Some(socket) = &self.notifications {
             self.messages.extend(drain_notify(socket));
@@ -1955,6 +1971,10 @@ fn daemon_scheduler_notifies_and_sigterm_shutdown_has_no_kernel_steps() {
         offset: Duration::ZERO,
         limit: 3,
         iterations: 0,
+        tick_duration: Duration::ZERO,
+        control_calls: 0,
+        fail_control_bind: false,
+        complete_iterations: 0,
         degraded: false,
         rebuild_pending: false,
         probes: None,
@@ -2015,6 +2035,10 @@ fn degraded_scheduler_feeds_watchdog_and_boot_budget_survives_restarts() {
             offset: Duration::from_secs(offset),
             limit,
             iterations: 0,
+            tick_duration: Duration::ZERO,
+            control_calls: 0,
+            fail_control_bind: false,
+            complete_iterations: 0,
             degraded: true,
             rebuild_pending: false,
             probes: None,
@@ -2065,6 +2089,10 @@ fn rebuild_pending_scheduler_feeds_watchdog_while_retry_is_spaced() {
         offset: Duration::ZERO,
         limit: 4,
         iterations: 0,
+        tick_duration: Duration::ZERO,
+        control_calls: 0,
+        fail_control_bind: false,
+        complete_iterations: 0,
         degraded: false,
         rebuild_pending: true,
         probes: None,
@@ -2082,6 +2110,7 @@ fn rebuild_pending_scheduler_feeds_watchdog_while_retry_is_spaced() {
     };
     run_with(&mut deps, &stop);
     assert_eq!(deps.boots, 1);
+    assert_eq!(deps.complete_iterations, 0);
     assert_eq!(deps.abandoned, 3); // SIGTERM skips recovery after the last tick.
     let messages = std::mem::take(&mut deps.messages);
     assert_eq!(messages.iter().filter(|s| *s == "READY=1").count(), 1);
@@ -2268,6 +2297,10 @@ fn probe_child_timeout_does_not_delay_fake_kernel_ticks() {
         offset: Duration::ZERO,
         limit: 12,
         iterations: 0,
+        tick_duration: Duration::ZERO,
+        control_calls: 0,
+        fail_control_bind: false,
+        complete_iterations: 0,
         degraded: false,
         rebuild_pending: false,
         probes: Some(probes),
@@ -2380,7 +2413,16 @@ fn control_ops_use_fake_kernel_and_verify_disconnect_independently() {
             ..
         }
     ));
-    assert!(execute(rig.machine(), Op::RepairClear {}, 0, None, healthy).is_ok());
+    assert!(
+        execute(
+            rig.machine(),
+            Op::RepairClear { reason: None },
+            0,
+            None,
+            healthy
+        )
+        .is_ok()
+    );
     assert_eq!(
         execute(rig.machine(), Op::Disconnect {}, 1000, None, healthy)
             .unwrap_err()
@@ -2517,4 +2559,206 @@ fn verified_apply_clear_is_not_undone_by_a_stale_daemon_version_handoff() {
     assert!(rig.store.state().quarantine.is_none());
     assert!(rig.machine().latch().is_none());
     assert!(rig.kernel.model().forwarding_off());
+}
+
+#[test]
+fn control_requests_are_serviced_without_scheduler_sleep() {
+    use scupper_sys::daemon::{notify::Notify, run_with};
+    use std::{sync::atomic::AtomicBool, time::Instant};
+    let mut rig = Rig::new();
+    let (socket_path, socket) = daemon_notify_socket();
+    socket.set_nonblocking(true).unwrap();
+    let stop = AtomicBool::new(false);
+    let now = Instant::now();
+    let mut deps = DaemonRig {
+        rig: &mut rig,
+        now,
+        origin: now,
+        offset: Duration::ZERO,
+        limit: 7,
+        iterations: 0,
+        tick_duration: Duration::from_secs(3),
+        control_calls: 0,
+        fail_control_bind: false,
+        complete_iterations: 0,
+        degraded: false,
+        rebuild_pending: false,
+        probes: None,
+        probe_received: false,
+        longest_tick: Duration::ZERO,
+        boots: 0,
+        closed: 0,
+        abandoned: 0,
+        initialized: 0,
+        notify: Notify::new(Some(socket_path.as_os_str())).unwrap(),
+        notifications: Some(socket.try_clone().unwrap()),
+        messages: Vec::new(),
+        before_shutdown: None,
+        stop: &stop,
+    };
+    run_with(&mut deps, &stop);
+    assert_eq!(deps.iterations, 7);
+    assert_eq!(deps.control_calls, 7);
+    assert_eq!(deps.now.duration_since(now), Duration::from_secs(21));
+}
+
+#[test]
+fn pending_connect_allows_ticks_to_qualify() {
+    let mut rig = Rig::new();
+    rig.machine()
+        .set_selection(Selection::Disconnected, Actor::Local { uid: 0 })
+        .unwrap();
+    for _ in 0..20 {
+        rig.tick();
+    }
+    let exit = scupper_core::config::ExitId("ch1".into());
+    rig.kernel.handshake(exit.clone(), None);
+    let guard = WriterLock::acquire(&rig.root).unwrap();
+    rig.machine()
+        .set_intent_locked(&guard, Selection::Auto)
+        .unwrap();
+    drop(guard);
+    assert_eq!(rig.store.state().selection, Selection::Auto);
+    assert!(rig.machine().probe_exit().is_some());
+    for _ in 0..2 {
+        rig.round(true);
+        rig.tick();
+    }
+    assert_eq!(
+        rig.kernel.model().default_v4,
+        Known::Value(DefaultRouteObs::Unreachable)
+    );
+    rig.kernel.handshake(exit, Some(Duration::from_secs(1)));
+    for _ in 0..6 {
+        rig.round(true);
+        rig.tick();
+    }
+    assert_eq!(
+        rig.machine().verdict(),
+        Some(scupper_proto::VerdictCode::Protected)
+    );
+}
+#[test]
+fn connect_rejects_unconfigured_exit_and_quarantine() {
+    use scupper_proto::{ApiErrorCode, Op};
+    use scupper_sys::{daemon::admin::execute, reconcile::StateStore};
+    let mut rig = Rig::new();
+    assert_eq!(
+        execute(
+            rig.machine(),
+            Op::Connect {
+                exit: Some(scupper_proto::Identifier::try_from("missing".to_owned()).unwrap())
+            },
+            0,
+            None,
+            |_| unreachable!()
+        )
+        .unwrap_err()
+        .code,
+        ApiErrorCode::InvalidRequest
+    );
+    let mut state = rig.store.state();
+    state.quarantine = Some(scupper_sys::state::Quarantine {
+        reason: "state write failed".into(),
+        object: "state".into(),
+        since_unix: 1000,
+    });
+    let guard = WriterLock::acquire(&rig.root).unwrap();
+    rig.store.write(&guard, &state).unwrap();
+    drop(guard);
+    rig.restart();
+    assert_eq!(
+        execute(
+            rig.machine(),
+            Op::Connect { exit: None },
+            0,
+            None,
+            |_| unreachable!()
+        )
+        .unwrap_err()
+        .code,
+        ApiErrorCode::Quarantined
+    );
+}
+
+#[test]
+fn repair_clear_retains_operator_context_and_actual_latch_reason() {
+    use scupper_proto::{Op, OpResult};
+    use scupper_sys::{daemon::admin::execute, reconcile::StateStore};
+    let mut rig = Rig::new();
+    let mut state = rig.store.state();
+    state.quarantine = Some(scupper_sys::state::Quarantine {
+        reason: "state write failed".into(),
+        object: "state".into(),
+        since_unix: 1000,
+    });
+    let guard = WriterLock::acquire(&rig.root).unwrap();
+    rig.store.write(&guard, &state).unwrap();
+    drop(guard);
+    rig.restart();
+    assert!(
+        matches!(execute(rig.machine(), Op::RepairStatus {}, 0, None, |_| unreachable!()).unwrap(), OpResult::RepairStatus { reason: Some(reason), .. } if reason == "state write failed")
+    );
+    execute(
+        rig.machine(),
+        Op::RepairClear {
+            reason: Some("operator inspected gateway".into()),
+        },
+        0,
+        None,
+        |_| unreachable!(),
+    )
+    .unwrap();
+    assert_eq!(
+        rig.store.state().last_repair_reason.as_deref(),
+        Some("operator inspected gateway")
+    );
+}
+
+#[test]
+fn bind_failure_does_not_prevent_scheduler_ticks() {
+    use scupper_sys::daemon::{notify::Notify, run_with};
+    use std::os::unix::fs::PermissionsExt;
+    use std::{sync::atomic::AtomicBool, time::Instant};
+    let mut rig = Rig::new();
+    fs::create_dir_all(rig.root.join("unsafe-control")).unwrap();
+    fs::set_permissions(
+        rig.root.join("unsafe-control"),
+        fs::Permissions::from_mode(0o777),
+    )
+    .unwrap();
+    let (socket_path, socket) = daemon_notify_socket();
+    socket.set_nonblocking(true).unwrap();
+    let stop = AtomicBool::new(false);
+    let now = Instant::now();
+    let mut deps = DaemonRig {
+        rig: &mut rig,
+        now,
+        origin: now,
+        offset: Duration::ZERO,
+        limit: 3,
+        iterations: 0,
+        tick_duration: Duration::ZERO,
+        control_calls: 0,
+        fail_control_bind: true,
+        complete_iterations: 0,
+        degraded: false,
+        rebuild_pending: false,
+        probes: None,
+        probe_received: false,
+        longest_tick: Duration::ZERO,
+        boots: 0,
+        closed: 0,
+        abandoned: 0,
+        initialized: 0,
+        notify: Notify::new(Some(socket_path.as_os_str())).unwrap(),
+        notifications: Some(socket.try_clone().unwrap()),
+        messages: Vec::new(),
+        before_shutdown: None,
+        stop: &stop,
+    };
+    run_with(&mut deps, &stop);
+    assert_eq!(deps.iterations, 3);
+    assert!(deps.control_calls >= 3);
+    assert!(deps.complete_iterations > 0);
 }

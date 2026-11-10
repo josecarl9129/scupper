@@ -47,7 +47,11 @@ impl WriterLock {
     /// # Errors
     /// Returns `WouldBlock` when another descriptor holds the lock, or an I/O error.
     pub fn try_acquire(root: impl AsRef<Path>) -> io::Result<WriterGuard> {
-        Self::open(root.as_ref(), FlockOperation::NonBlockingLockExclusive)
+        Self::open(
+            root.as_ref(),
+            "writer.lock",
+            FlockOperation::NonBlockingLockExclusive,
+        )
     }
 
     /// Acquires the lock with a bounded wait, polling at most every ten milliseconds.
@@ -75,7 +79,7 @@ impl WriterLock {
         }
     }
 
-    fn open(root: &Path, operation: FlockOperation) -> io::Result<WriterGuard> {
+    fn open(root: &Path, name: &str, operation: FlockOperation) -> io::Result<WriterGuard> {
         fs::create_dir_all(root)?;
         let mut file = OpenOptions::new()
             .read(true)
@@ -84,7 +88,7 @@ impl WriterLock {
             .truncate(false)
             .mode(0o600)
             .custom_flags(OFlags::NOFOLLOW.bits().cast_signed())
-            .open(root.join("writer.lock"))?;
+            .open(root.join(name))?;
         if !file.metadata()?.is_file() {
             return Err(io::Error::other("writer lock is not a regular file"));
         }
@@ -106,5 +110,23 @@ impl WriterLock {
             file,
             _not_sync: std::marker::PhantomData,
         })
+    }
+}
+
+/// Lifetime supervisor exclusion, acquired before publishing a control socket.
+pub struct SupervisorLease {
+    _guard: WriterGuard,
+}
+impl SupervisorLease {
+    /// Acquire without waiting; local mutations must refuse a live supervisor.
+    /// # Errors
+    /// Returns contention or filesystem errors.
+    pub fn try_acquire(root: impl AsRef<Path>) -> io::Result<Self> {
+        WriterLock::open(
+            root.as_ref(),
+            "scupperd.lock",
+            FlockOperation::NonBlockingLockExclusive,
+        )
+        .map(|guard| Self { _guard: guard })
     }
 }

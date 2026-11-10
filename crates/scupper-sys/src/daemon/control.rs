@@ -1,13 +1,16 @@
 //! Root-only M2 local control transport. Even read operations require uid 0;
 //! scupper-admin ownership prepares installation, but grants no M2 authorization.
-//! Socket workers only decode and enqueue: the tick owner executes every request.
+//! Socket workers decode and enqueue; the scheduler owns mutations and starts read-only checks.
+use std::os::fd::AsRawFd;
+static BIND_NEXT: AtomicUsize = AtomicUsize::new(0);
+
 use scupper_proto::{ApiError, ApiErrorCode, Identifier, Op, OpResult, Request, Response, Schema};
 use std::{
     collections::VecDeque,
     fs,
     io::{self, BufRead, BufReader, Read, Write},
     os::unix::{
-        fs::{FileTypeExt, MetadataExt, PermissionsExt},
+        fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
         net::{UnixListener, UnixStream},
     },
     path::Path,
@@ -48,6 +51,23 @@ pub fn read_request(reader: impl Read) -> io::Result<Request> {
     scupper_proto::decode_request(&line).map_err(io::Error::other)
 }
 
+fn validate_directory(meta: &fs::Metadata) -> io::Result<()> {
+    if !meta.is_dir() || meta.uid() != 0 || meta.mode() & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "control directory must be root-owned and not writable by group or others",
+        ));
+    }
+    Ok(())
+}
+struct SocketStage(std::path::PathBuf);
+impl Drop for SocketStage {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(self.0.join("control.sock"));
+        let _ = fs::remove_dir(&self.0);
+    }
+}
+
 pub(crate) struct Pending {
     pub request: Request,
     pub uid: u32,
@@ -58,16 +78,34 @@ pub(crate) struct Pending {
 /// Listener lifetime. Shutdown never unlinks a replacement socket.
 pub struct Server {
     pub(crate) receive: Receiver<Pending>,
+    pub(crate) errors: Receiver<String>,
     stop: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 impl Server {
+    pub(crate) fn alive(&self) -> bool {
+        self.worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+    }
     /// Bind the root-owned local socket. A stale root-owned socket may be removed;
     /// any other existing filesystem object is refused. Missing group uses root.
     /// # Errors
     /// Returns ownership, bind, permission or thread-start errors.
+    #[allow(clippy::too_many_lines)] // Keep guarded publication and listener ownership together.
     pub fn bind(root: &Path) -> io::Result<Self> {
         fs::create_dir_all(root)?;
+        let directory = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(
+                (rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::NOFOLLOW)
+                    .bits()
+                    .cast_signed(),
+            )
+            .open(root)?;
+        validate_directory(&directory.metadata()?)?;
+        // Resolve through the held directory, so replacing a parent path cannot redirect writes.
+        let root = std::path::PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
         let path = root.join("control.sock");
         match fs::symlink_metadata(&path) {
             Ok(meta) if meta.file_type().is_socket() && meta.uid() == 0 => {
@@ -93,7 +131,16 @@ impl Server {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        let listener = UnixListener::bind(&path)?;
+        let temporary = root.join(format!(
+            ".control-{}-{}",
+            std::process::id(),
+            BIND_NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&temporary)?;
+        let stage = SocketStage(temporary);
+        let staged = stage.0.join("control.sock");
+        let listener = UnixListener::bind(&staged)?;
+        let bound = fs::symlink_metadata(&staged)?;
         let gid = fs::read_to_string("/etc/group")?
             .lines()
             .find_map(|line| {
@@ -103,43 +150,53 @@ impl Server {
                     .flatten()
             })
             .unwrap_or(0);
-        std::os::unix::fs::chown(&path, Some(0), Some(gid))?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o660))?;
+        std::os::unix::fs::chown(&staged, Some(0), Some(gid))?;
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o660))?;
+        fs::rename(&staged, &path)?;
         let identity = fs::symlink_metadata(&path)?;
+        if identity.dev() != bound.dev()
+            || identity.ino() != bound.ino()
+            || !identity.file_type().is_socket()
+        {
+            return Err(io::Error::other(
+                "control socket identity changed during bind",
+            ));
+        }
+        drop(stage);
         listener.set_nonblocking(true)?;
         let (send, receive) = mpsc::sync_channel(16);
+        let (errors_send, errors) = mpsc::sync_channel(8);
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
         let active = Arc::new(AtomicUsize::new(0));
         let worker = std::thread::Builder::new()
             .name("scupper-control".into())
             .spawn(move || {
-                while !stopping.load(Ordering::Relaxed) {
-                    match listener.accept() {
-                        Ok((stream, _)) => {
-                            if active.load(Ordering::Relaxed) >= 16 {
-                                continue;
-                            }
-                            let send = send.clone();
-                            let count = active.clone();
-                            count.fetch_add(1, Ordering::Relaxed);
-                            if std::thread::Builder::new()
-                                .name("scupper-control-peer".into())
-                                .spawn(move || {
-                                    let _ = serve(stream, &send);
-                                    count.fetch_sub(1, Ordering::Relaxed);
-                                })
-                                .is_err()
-                            {
-                                active.fetch_sub(1, Ordering::Relaxed);
-                            }
+                let _directory = directory;
+                accept_loop(
+                    &stopping,
+                    || listener.accept().map(|(stream, _)| stream),
+                    |stream| {
+                        if !reserve_peer(&stream, &active) {
+                            return;
                         }
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(Duration::from_millis(10));
+                        let send = send.clone();
+                        let count = active.clone();
+                        if std::thread::Builder::new()
+                            .name("scupper-control-peer".into())
+                            .spawn(move || {
+                                let _ = serve(stream, &send);
+                                count.fetch_sub(1, Ordering::Relaxed);
+                            })
+                            .is_err()
+                        {
+                            active.fetch_sub(1, Ordering::Relaxed);
                         }
-                        Err(_) => break,
-                    }
-                }
+                    },
+                    |error| {
+                        let _ = errors_send.try_send(error.to_string());
+                    },
+                );
                 if fs::symlink_metadata(&path)
                     .is_ok_and(|m| m.dev() == identity.dev() && m.ino() == identity.ino())
                 {
@@ -148,6 +205,7 @@ impl Server {
             })?;
         Ok(Self {
             receive,
+            errors,
             stop,
             worker: Some(worker),
         })
@@ -178,6 +236,37 @@ impl Read for DeadlineRead<'_> {
         self.stream.read(buffer)
     }
 }
+fn accept_loop(
+    stop: &AtomicBool,
+    mut accept: impl FnMut() -> io::Result<UnixStream>,
+    mut serve: impl FnMut(UnixStream),
+    mut error: impl FnMut(&io::Error),
+) {
+    while !stop.load(Ordering::Relaxed) {
+        match accept() {
+            Ok(stream) => serve(stream),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => {
+                error(&e);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+}
+fn reserve_authorized_peer(uid: u32, active: &AtomicUsize) -> bool {
+    if !authorized(uid) || active.load(Ordering::Relaxed) >= 16 {
+        return false;
+    }
+    active.fetch_add(1, Ordering::Relaxed);
+    true
+}
+fn reserve_peer(stream: &UnixStream, active: &AtomicUsize) -> bool {
+    rustix::net::sockopt::socket_peercred(stream)
+        .is_ok_and(|peer| reserve_authorized_peer(peer.uid.as_raw(), active))
+}
+
 fn serve(mut stream: UnixStream, send: &SyncSender<Pending>) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
@@ -202,6 +291,8 @@ fn serve(mut stream: UnixStream, send: &SyncSender<Pending>) -> io::Result<()> {
         Response {
             request_id: request.request_id,
             schema: Schema,
+            replayed: false,
+            observed_at: None,
             result: Err(api(ApiErrorCode::Unauthorized)),
         }
     };
@@ -209,34 +300,68 @@ fn serve(mut stream: UnixStream, send: &SyncSender<Pending>) -> io::Result<()> {
     stream.write_all(b"\n")
 }
 
-/// Tick-owned response cache, including failures, for ten-minute retry deduplication.
+pub(crate) fn response(request_id: Identifier, result: Result<OpResult, ApiError>) -> Response {
+    Response {
+        request_id,
+        schema: Schema,
+        replayed: false,
+        observed_at: Some(scupper_proto::UnixSeconds(super::unix())),
+        result,
+    }
+}
+
+/// Tick-owned bounded outcomes retained for ten-minute retry deduplication.
 #[derive(Default)]
 pub struct Dedupe {
-    entries: VecDeque<(Instant, Response)>,
+    entries: VecDeque<(Instant, Op, Response)>,
 }
 impl Dedupe {
-    /// Execute at most once for an identifier within the retention window.
+    pub(crate) fn lookup(&mut self, request: &Request, now: Instant) -> Option<Response> {
+        self.entries
+            .retain(|(at, _, _)| now.saturating_duration_since(*at) < Duration::from_secs(600));
+        self.entries
+            .iter()
+            .find(|(_, _, r)| r.request_id == request.request_id)
+            .map(|(_, op, cached)| {
+                if op == &request.op {
+                    let mut replay = cached.clone();
+                    replay.replayed = true;
+                    replay
+                } else {
+                    response(request.request_id.clone(), Err(api(ApiErrorCode::Conflict)))
+                }
+            })
+    }
+    pub(crate) fn remember(&mut self, request: Request, response: Response, now: Instant) {
+        if matches!(
+            response.result,
+            Err(ApiError {
+                code: ApiErrorCode::Timeout | ApiErrorCode::SupervisorUnavailable,
+                ..
+            })
+        ) || matches!(
+            request.op,
+            Op::Ping {} | Op::Check {} | Op::Status {} | Op::RepairStatus {}
+        ) {
+            return;
+        }
+        while self.entries.len() >= 256 {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((now, request.op, response));
+    }
+    /// Execute at most once per identifier and operation within the retention window.
     pub fn execute(
         &mut self,
         request: Request,
         now: Instant,
         run: impl FnOnce(Op) -> Result<OpResult, ApiError>,
     ) -> Response {
-        self.entries
-            .retain(|(at, _)| now.saturating_duration_since(*at) < Duration::from_secs(600));
-        if let Some((_, response)) = self
-            .entries
-            .iter()
-            .find(|(_, r)| r.request_id == request.request_id)
-        {
-            return response.clone();
+        if let Some(cached) = self.lookup(&request, now) {
+            return cached;
         }
-        let response = Response {
-            request_id: request.request_id,
-            schema: Schema,
-            result: run(request.op),
-        };
-        self.entries.push_back((now, response.clone()));
+        let response = response(request.request_id.clone(), run(request.op.clone()));
+        self.remember(request, response.clone(), now);
         response
     }
 }
@@ -309,9 +434,24 @@ pub fn call(root: &Path, request: &Request, timeout: Duration) -> Result<Respons
     }
     let response: Response = serde_json::from_slice(&line)
         .map_err(|e| ClientError::OutcomeUnknown(io::Error::other(e)))?;
-    if response.request_id != request.request_id {
+    if response.request_id != request.request_id
+        || response.result.as_ref().is_ok_and(|result| {
+            !matches!(
+                (&request.op, result),
+                (Op::Ping {}, OpResult::Ping { .. })
+                    | (Op::Status {}, OpResult::Status { .. })
+                    | (Op::Check {}, OpResult::Check { .. })
+                    | (Op::Connect { .. }, OpResult::Connect { .. })
+                    | (Op::Disconnect {}, OpResult::Disconnect {})
+                    | (Op::Apply { .. }, OpResult::Apply { .. })
+                    | (Op::Commit { .. }, OpResult::Commit { .. })
+                    | (Op::RepairStatus {}, OpResult::RepairStatus { .. })
+                    | (Op::RepairClear { .. }, OpResult::RepairClear {})
+            )
+        })
+    {
         return Err(ClientError::OutcomeUnknown(io::Error::other(
-            "control response id mismatch",
+            "control response id or operation mismatch",
         )));
     }
     Ok(response)
@@ -319,15 +459,27 @@ pub fn call(root: &Path, request: &Request, timeout: Duration) -> Result<Respons
 /// Generate a non-secret, unique operational request id without credentials.
 #[must_use]
 pub fn request(op: Op) -> Request {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let value = format!("r-{:x}-{:x}", nanos, NEXT.fetch_add(1, Ordering::Relaxed));
+    let mut random = [0u8; 8];
+    let _ = rustix::rand::getrandom(&mut random, rustix::rand::GetRandomFlags::empty());
+    let hash = Sha256::new()
+        .chain_update(std::process::id().to_ne_bytes())
+        .chain_update(nanos.to_ne_bytes())
+        .chain_update(random)
+        .chain_update(NEXT.fetch_add(1, Ordering::Relaxed).to_ne_bytes())
+        .finalize();
+    let mut value = String::from("r-");
+    for byte in &hash[..15] {
+        let _ = write!(value, "{byte:02x}");
+    }
     Request {
-        request_id: Identifier::try_from(value)
-            .unwrap_or_else(|_| Identifier::from(&scupper_core::config::ExitId("request".into()))),
+        request_id: Identifier::from(&scupper_core::config::ExitId(value)),
         op,
     }
 }
@@ -366,17 +518,19 @@ mod tests {
         let duplicate = cache.execute(original.clone(), now + Duration::from_secs(599), |_| {
             unreachable!("dedupe executed twice")
         });
-        assert_eq!(first, duplicate);
+        assert!(!first.replayed);
+        assert!(duplicate.replayed);
+        assert_eq!(first.result, duplicate.result);
+        assert_eq!(first.observed_at, duplicate.observed_at);
         let expired = cache.execute(original.clone(), now + Duration::from_secs(600), |_| {
             Err(api(ApiErrorCode::DisconnectNotEffective))
         });
         assert!(expired.result.is_err());
-        assert_eq!(
-            expired,
-            cache.execute(original, now + Duration::from_secs(601), |_| unreachable!(
-                "failed response reexecuted"
-            ))
-        );
+        let replay = cache.execute(original, now + Duration::from_secs(601), |_| {
+            unreachable!("failed response reexecuted")
+        });
+        assert!(replay.replayed);
+        assert_eq!(expired.result, replay.result);
     }
     #[test]
     fn socket_client_timeout_is_bounded_and_marks_uncertain_delivery() {
@@ -422,6 +576,8 @@ mod tests {
                 .send(Response {
                     request_id: pending.request.request_id,
                     schema: Schema,
+                    replayed: false,
+                    observed_at: None,
                     result: Ok(OpResult::Disconnect {}),
                 })
                 .unwrap();
@@ -449,5 +605,110 @@ mod tests {
         });
         assert!(result.is_err());
         assert!(start.elapsed() < Duration::from_millis(300));
+    }
+    #[test]
+    fn dedupe_conflict_timeout_retry_and_capacity() {
+        let now = Instant::now();
+        let mut cache = Dedupe::default();
+        let original = request(Op::Disconnect {});
+        cache.execute(original.clone(), now, |_| Ok(OpResult::Disconnect {}));
+        let mut different = original.clone();
+        different.op = Op::Connect { exit: None };
+        assert_eq!(
+            cache
+                .execute(different, now, |_| unreachable!())
+                .result
+                .unwrap_err()
+                .code,
+            ApiErrorCode::Conflict
+        );
+        let delayed = request(Op::Disconnect {});
+        assert!(
+            cache
+                .execute(delayed.clone(), now, |_| Err(api(ApiErrorCode::Timeout)))
+                .result
+                .is_err()
+        );
+        assert!(
+            cache
+                .execute(delayed, now, |_| Ok(OpResult::Disconnect {}))
+                .result
+                .is_ok()
+        );
+        let unavailable = request(Op::Disconnect {});
+        cache.execute(unavailable.clone(), now, |_| {
+            Err(api(ApiErrorCode::SupervisorUnavailable))
+        });
+        assert!(
+            cache
+                .execute(unavailable, now, |_| Ok(OpResult::Disconnect {}))
+                .result
+                .is_ok()
+        );
+        for _ in 0..300 {
+            cache.execute(request(Op::Disconnect {}), now, |_| {
+                Ok(OpResult::Disconnect {})
+            });
+        }
+        assert_eq!(cache.entries.len(), 256);
+        assert!(cache.lookup(&original, now).is_none());
+    }
+    #[test]
+    fn accept_errors_retry_until_shutdown() {
+        let stop = AtomicBool::new(false);
+        let count = AtomicUsize::new(0);
+        accept_loop(
+            &stop,
+            || Err(io::Error::from_raw_os_error(24)),
+            |_| unreachable!(),
+            |_| {
+                if count.fetch_add(1, Ordering::Relaxed) == 2 {
+                    stop.store(true, Ordering::Relaxed);
+                }
+            },
+        );
+        assert_eq!(count.load(Ordering::Relaxed), 3);
+    }
+    #[test]
+    fn unauthorized_peers_are_rejected_without_reading_or_using_slots() {
+        let (stream, _client_with_no_request) = UnixStream::pair().unwrap();
+        let started = Instant::now();
+        let active = AtomicUsize::new(0);
+        assert_eq!(
+            reserve_peer(&stream, &active),
+            rustix::process::geteuid().as_raw() == 0
+        );
+        assert!(started.elapsed() < Duration::from_millis(100));
+        let active = AtomicUsize::new(0);
+        for _ in 0..64 {
+            for uid in [1, 1000, 65534] {
+                assert!(!reserve_authorized_peer(uid, &active));
+            }
+        }
+        assert_eq!(active.load(Ordering::Relaxed), 0);
+        for _ in 0..16 {
+            assert!(reserve_authorized_peer(0, &active));
+        }
+        assert!(!reserve_authorized_peer(0, &active));
+        assert_eq!(active.load(Ordering::Relaxed), 16);
+    }
+    #[test]
+    fn unsafe_control_directory_is_refused() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("unsafe-control-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(Server::bind(&root).is_err());
+        assert!(!root.join("control.sock").exists());
+        fs::remove_dir(root).unwrap();
+    }
+    #[test]
+    fn generated_request_ids_are_valid_unique_and_bounded() {
+        let ids: std::collections::BTreeSet<_> = (0..512)
+            .map(|_| String::from(request(Op::Ping {}).request_id))
+            .collect();
+        assert_eq!(ids.len(), 512);
+        assert!(ids.iter().all(|id| id.len() == 32 && id != "invalid-id"));
     }
 }

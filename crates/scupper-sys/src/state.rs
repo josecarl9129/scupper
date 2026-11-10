@@ -42,6 +42,9 @@ pub struct State {
     /// Persistent quarantine latch, cleared only by explicit administrative action.
     #[serde(deserialize_with = "required_option")]
     pub quarantine: Option<Quarantine>,
+    /// Bounded context from the last explicit repair clear.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_repair_reason: Option<String>,
 }
 fn required_option<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
     d: D,
@@ -55,6 +58,7 @@ impl Default for State {
             applied_version: None,
             selection: Selection::Auto,
             quarantine: None,
+            last_repair_reason: None,
         }
     }
 }
@@ -447,7 +451,12 @@ impl StateFile {
     }
 }
 fn check_schema(state: &State) -> io::Result<()> {
-    if state.schema == 1 {
+    if state.schema == 1
+        && !state
+            .last_repair_reason
+            .as_ref()
+            .is_some_and(|text| text.len() > 1024 || text.contains(['\n', '\r']))
+    {
         Ok(())
     } else {
         Err(io::Error::other("unsupported state.json schema"))
