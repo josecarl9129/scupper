@@ -99,12 +99,24 @@ jobs:
         run: timeout 600 cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Unit tests without testing
         run: timeout 600 cargo test --workspace --lib --bins --locked
+      - name: Default-feature integration fencing
+        run: |
+          timeout 600 cargo test -p xtask --test mutation --locked
+          timeout 600 cargo test -p scupper --test mutation --locked
+          timeout 600 cargo test -p scupper-core --test verdict_v2 --locked default_build
+      - name: Reject release mutation feature
+        run: |
+          if timeout 600 cargo build --release -p scupper-core --features lab-mutation --locked; then
+            exit 1
+          else
+            test "$?" -eq 101
+          fi
       - name: Release CLI and daemon
         run: timeout 600 cargo build -p scupper -p scupperd --release --locked
       - name: Verify testing hooks absent from release artifacts
         run: |
           for binary in scupper scupperd; do
-            if grep -aEq 'SCUPPER_TEST_BOOT_POINT|SCUPPER_TEST_CA_DER|injected boot stop' target/release/$binary; then
+            if grep -aEq 'SCUPPER_TEST_BOOT_POINT|SCUPPER_TEST_CA_DER|SCUPPER_LAB_MUTATION|injected boot stop' target/release/$binary; then
               echo "testing hook found in release $binary"
               exit 1
             fi
@@ -149,7 +161,7 @@ jobs:
           printf '%s\n' "$description"
           [[ "$description" == *'ELF 64-bit LSB'* && "$description" == *'x86-64'* ]]
           [[ "$description" == *'statically linked'* || "$description" == *'static-pie linked'* ]]
-            if grep -aEq 'SCUPPER_TEST_BOOT_POINT|SCUPPER_TEST_CA_DER|injected boot stop' target/x86_64-unknown-linux-musl/release/$binary; then
+            if grep -aEq 'SCUPPER_TEST_BOOT_POINT|SCUPPER_TEST_CA_DER|SCUPPER_LAB_MUTATION|injected boot stop' target/x86_64-unknown-linux-musl/release/$binary; then
               echo "testing hook found in musl $binary"
               exit 1
             fi
@@ -211,5 +223,52 @@ jobs:
         with:
           name: leaktest-${{ matrix.runner }}-shard-${{ matrix.shard }}
           path: lab-out
+          retention-days: 14
+          if-no-files-found: warn
+
+  mutations:
+    strategy:
+      fail-fast: false
+      matrix:
+        mutation: [M-src, M-ct, M-out, M-probe]
+        runner: ${{ startsWith(github.ref, 'refs/heads/lab/') && fromJSON('["ubuntu-24.04"]') || fromJSON('["ubuntu-24.04", "ubuntu-22.04"]') }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Cache mutation builds
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            target
+          key: ${{ runner.os }}-${{ matrix.runner }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-mutations-${{ matrix.mutation }}
+      - name: Install lab tools
+        run: |
+          sudo timeout 300 apt-get update
+          sudo timeout 300 apt-get install -y wireguard-tools nftables iproute2 tcpdump dnsmasq-base util-linux iputils-ping conntrack slirp4netns openssl
+      - name: Build mutation lab and testing binaries
+        run: |
+          timeout 600 cargo build -p xtask --features lab-mutation --locked
+          timeout 600 cargo build -p scupper -p scupperd --features testing,lab-mutation --locked
+      - name: Require healthy control and expected mutant failure
+        run: sudo --preserve-env=CARGO_TARGET_TMPDIR timeout 600 target/debug/xtask leaktest --mutation ${{ matrix.mutation }} --artifacts mutation-out
+      - name: Make diagnostics readable
+        if: always()
+        run: |
+          if [ -d mutation-out ]; then
+            sudo find mutation-out -type d -exec chmod a+rx {} +
+            sudo find mutation-out -type f -exec chmod a+r {} +
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutation-${{ matrix.runner }}-${{ matrix.mutation }}
+          path: mutation-out
           retention-days: 14
           if-no-files-found: warn

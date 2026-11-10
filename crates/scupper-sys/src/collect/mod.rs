@@ -178,9 +178,16 @@ pub fn exit_probe(
             }
         })
         .ok_or_else(|| ProbeError::setup("active exit has no IPv4 DNS server"))?;
+    #[cfg(not(feature = "lab-mutation"))]
+    let bind = None;
+    #[cfg(feature = "lab-mutation")]
+    let bind = scupper_core::lab_mutation::probe_binding(
+        scupper_core::lab_mutation::active(),
+        exit.ifname().ifname(),
+    );
     let request = ProbeRequest {
         kind: ProbeKind::ExitIp,
-        bind: None,
+        bind,
         expected_netns: handle.identity(),
         dns,
         targets: site

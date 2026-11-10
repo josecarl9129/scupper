@@ -163,7 +163,8 @@ fn policy_for_every_case_has_exact_endpoints_and_positive_evidence() {
         );
         assert!(value["arp"].as_bool().unwrap() && value["ndp"].as_bool().unwrap());
     }
-    assert_eq!(names.len(), 8);
+    assert_eq!(names.len(), 9);
+    assert!(names.contains("L19"));
     assert!(names.contains("daemon"));
     Policy::from_toml(&evidence::policy(&markers, true).unwrap()).unwrap();
 }

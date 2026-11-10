@@ -860,7 +860,7 @@ impl Lab {
             "sysctls": self.daemon_sysctls()?,
         }))
     }
-    fn daemon_wait(
+    pub(super) fn daemon_wait(
         &mut self,
         label: &str,
         bound: Duration,
@@ -887,7 +887,7 @@ impl Lab {
                 .contains("dev ex-ch1"))
         })
     }
-    fn daemon_flow(
+    pub(super) fn daemon_flow(
         &mut self,
         mode: &str,
         ns: &str,
@@ -1788,7 +1788,7 @@ fn verify_continuity(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn flow_counts(path: &Path) -> Result<(u64, u64)> {
+pub(super) fn flow_counts(path: &Path) -> Result<(u64, u64)> {
     let mut sent = 0;
     let mut received = 0;
     let text = match fs::read_to_string(path) {

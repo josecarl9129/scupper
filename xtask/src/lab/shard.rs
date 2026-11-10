@@ -250,13 +250,16 @@ mod tests {
             let id = line.split('|').nth(1).unwrap().trim();
             if let Some(n) = id.strip_prefix('L').and_then(|v| v.parse::<u8>().ok())
                 && (1..=20).contains(&n)
-                && n != 19
             {
                 rows.insert(n);
-                expected.insert(format!("daemon-{}", if n == 17 { "L17-V14" } else { id }));
+                expected.insert(if n == 19 {
+                    "L19".into()
+                } else {
+                    format!("daemon-{}", if n == 17 { "L17-V14" } else { id })
+                });
             }
         }
-        assert_eq!(rows, (1..=20).filter(|n| *n != 19).collect());
+        assert_eq!(rows, (1..=20).collect());
         for extra in [
             "daemon-L9b",
             "daemon-L9-host-link",
@@ -351,4 +354,27 @@ mod tests {
             assert!(invalid.parse::<Shard>().is_err());
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn l19_detectors_remain_in_regular_shards() {
+    let catalog = catalog();
+    assert!(
+        catalog
+            .iter()
+            .any(|s| s.id == "L19" && matches!(s.kind, Kind::Legacy(Case::Meta)))
+    );
+    let count: usize = (1..=4)
+        .map(|index| {
+            select(Shard { index, count: 4 }, catalog.clone())
+                .iter()
+                .filter(|s| s.id == "L19")
+                .count()
+        })
+        .sum();
+    assert_eq!(
+        count, 1,
+        "R1 isolation leaves only L19 detecting bugs 2 and 3"
+    );
 }

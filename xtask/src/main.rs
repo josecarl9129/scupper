@@ -11,6 +11,9 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// L19 namespace policy drift check (lab only).
+    #[command(hide = true)]
+    RouteCheck { root: PathBuf, binary: PathBuf },
     /// Namespace-local raw datagram used by fault trials.
     #[command(hide = true)]
     SendPacket {
@@ -52,6 +55,12 @@ enum Command {
         shard: Option<String>,
         #[arg(long)]
         list: bool,
+        /// Run a historical fault and require a named, expected catch.
+        #[arg(long, conflicts_with_all = ["shard", "list", "case", "capture_fixtures", "durations"])]
+        mutation: Option<scupper_core::lab_mutation::Mutation>,
+        /// Run one catalog case.
+        #[arg(long, conflicts_with = "shard")]
+        case: Option<String>,
         /// Shared previous results.tsv; use the same file for every shard.
         #[arg(long)]
         durations: Option<PathBuf>,
@@ -91,8 +100,9 @@ enum Command {
         marker: String,
     },
 }
-fn run() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    match Args::parse().command {
+fn run(command: Command) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    match command {
+        Command::RouteCheck { .. } => Err("route-check requires Linux".into()),
         #[cfg(target_os = "linux")]
         Command::SendPacket { interface, file } => {
             xtask::lab::send_packet(&interface, &file)?;
@@ -126,7 +136,13 @@ fn run() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
             shard,
             list,
             durations,
+            mutation,
+            case,
         } => {
+            if let Some(mutation) = mutation {
+                xtask::lab::run_mutation(&artifacts, mutation)?;
+                return Ok(true);
+            }
             if list {
                 print!(
                     "{}",
@@ -146,6 +162,7 @@ fn run() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
                     .transpose()?
                     .unwrap_or_default(),
                 durations.as_deref(),
+                case.as_deref(),
             )?;
             Ok(true)
         }
@@ -178,7 +195,18 @@ fn run() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     }
 }
 fn main() -> ExitCode {
-    match run() {
+    let command = Args::parse().command;
+    #[cfg(target_os = "linux")]
+    if let Command::RouteCheck { root, binary } = &command {
+        return match xtask::lab::route_check(root, binary) {
+            Ok(code) => ExitCode::from(code),
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    match run(command) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
         Err(error) => {

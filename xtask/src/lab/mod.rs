@@ -10,6 +10,11 @@ mod fixtures;
 mod flow;
 mod helpers;
 mod mounts;
+mod mutation;
+mod policy_fixture;
+mod route_fixture;
+pub use mutation::run_mutation;
+pub use route_fixture::route_check;
 mod probe_child;
 mod shard;
 pub use shard::{Shard, list, list_with_durations};
@@ -115,6 +120,7 @@ pub fn run(
     capture_fixtures: Option<&Path>,
     shard: Shard,
     durations: Option<&Path>,
+    only: Option<&str>,
 ) -> Result<()> {
     if !rustix::process::geteuid().is_root() {
         return fail("leaktest requires root on a disposable Linux machine");
@@ -128,12 +134,22 @@ pub fn run(
     .into_iter()
     .map(|signal| signal_hook::flag::register(signal, Arc::clone(&cancel)))
     .collect::<std::io::Result<_>>()?;
-    let result = run_inner(artifacts, capture_fixtures, cancel, shard, durations);
+    let result = run_inner(artifacts, capture_fixtures, cancel, shard, durations, only);
     for signal in signals {
         signal_hook::low_level::unregister(signal);
     }
-    let readable = make_artifacts_readable(artifacts);
-    result.and(readable)
+    let result = mutation::finish(result, make_artifacts_readable(artifacts));
+    if let Some(caught) = result
+        .as_ref()
+        .err()
+        .and_then(|e| e.downcast_ref::<mutation::Caught>())
+    {
+        fs::write(
+            artifacts.join("caught.json"),
+            serde_json::to_vec_pretty(caught)?,
+        )?;
+    }
+    result
 }
 fn make_artifacts_readable(root: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -159,11 +175,18 @@ fn run_inner(
     cancel: Arc<AtomicBool>,
     shard: Shard,
     durations: Option<&Path>,
+    only: Option<&str>,
 ) -> Result<()> {
     fs::create_dir_all(artifacts)?;
     let artifacts = fs::canonicalize(artifacts)?;
     let mut runner = Runner::new(fs::File::create(artifacts.join("commands.jsonl"))?, cancel);
-    let selected = shard::selected_recorded(shard, durations)?;
+    let mut selected = shard::selected_recorded(shard, durations)?;
+    if let Some(only) = only {
+        selected.retain(|spec| spec.id == only);
+        if selected.is_empty() {
+            return fail(format!("unknown or unselected case {only}"));
+        }
+    }
     runner.whole = Instant::now()
         + Duration::from_secs(selected.iter().map(|case| case.seconds).sum::<u64>() * 2 + 600);
     let config = scupper_core::config::parse_site(SITE)?;
@@ -251,17 +274,26 @@ fn run_inner(
             });
             evidence::save_results(&lab.artifacts, &lab.rows)?;
             if let Err(error) = result {
-                failures.push(format!("{}: {error}", spec.id));
+                failures.push(error);
                 lab.runner.phase = Instant::now() + Duration::from_secs(90);
                 if let Err(cause) = lab.daemon_clean_baseline() {
+                    failures.push(format!("post-case baseline failed: {cause}").into());
                     lab.baseline_failure = Some(cause.to_string());
                 }
             }
         }
         if failures.is_empty() {
             Ok(())
+        } else if failures.len() == 1 {
+            Err(failures.remove(0))
         } else {
-            fail(failures.join("; "))
+            fail(
+                failures
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            )
         }
     })();
     if let Err(error) = &outcome {

@@ -2601,3 +2601,24 @@ fn crash_checkpoints_persist_exact_numeric_and_host_link_evidence() {
         assert_eq!(fs::read_to_string(&path).unwrap(), expected);
     }
 }
+
+#[test]
+fn boot_never_adds_source_policy_rules_or_nonbaseline_rules() {
+    for disconnected in [false, true] {
+        let f = Fixture::new();
+        if disconnected {
+            f.state(|s| s.selection = Selection::Disconnected);
+        }
+        assert!(f.run(None).succeeded());
+        for call in f.kernel.calls.borrow().iter() {
+            let words: Vec<_> = call.split_whitespace().collect();
+            if words.contains(&"Ip") && words.contains(&"rule") {
+                assert!(
+                    words.contains(&"show"),
+                    "boot must only observe baseline rules: {call}"
+                );
+                assert!(!words.contains(&"from"), "source policy rule: {call}");
+            }
+        }
+    }
+}

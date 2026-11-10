@@ -468,6 +468,16 @@ fn client_fault(f: &Forwarding, cfg: &HealthConfigV2) -> Option<ClientFault> {
 #[must_use]
 #[allow(clippy::too_many_lines)] // Linear stage order makes the safety gates auditable.
 pub fn next(obs: &Observations, cfg: &HealthConfigV2, now: u64) -> Next {
+    #[cfg(feature = "lab-mutation")]
+    let adjusted = if crate::lab_mutation::active() == Some(crate::lab_mutation::Mutation::Probe) {
+        let mut adjusted = obs.clone();
+        crate::lab_mutation::trust_bound_probe(&mut adjusted, cfg);
+        Some(adjusted)
+    } else {
+        None
+    };
+    #[cfg(feature = "lab-mutation")]
+    let obs = adjusted.as_ref().unwrap_or(obs);
     let mut warnings = Vec::new();
     if let Some(Ok(f)) = &obs.forwarding {
         warnings.extend(f.hardening.iter().cloned().map(Warning::HardeningSysctl));

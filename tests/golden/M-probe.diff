@@ -1,0 +1,2 @@
+-defaults=true; routes=true; bind=None
++defaults=true; routes=false; bind=Some("ex-ch1")

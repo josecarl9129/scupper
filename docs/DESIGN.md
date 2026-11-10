@@ -2453,10 +2453,15 @@ several gateways (rejected in R1); `devices.*.gateways` is a list;
   restarts. Production exits use ephemeral ports; after a crash, the provider may briefly send to a
   stale port and the host answers ICMP port-unreachable quoting only WireGuard ciphertext. That is
   not a leak (no client-derived plaintext), but the lab does not exercise it.
-- **Meta-tests:** mutation runs reintroduce each historical bug (source-based
-  classification, non-directional ct accept, missing output containment,
-  bound-probe-only check) and the suite must fail; a deliberately
-  bridged/veth-connected namespace proves the nft layer alone still blocks.
+- **Meta-tests:** product mutations reintroduce non-directional ct accept,
+  missing output containment and the bound-probe-only check. M-src is a
+  bug-1 symptom oracle control (lab layout): it proves gateway replies are
+  visible on the exit and that `iif` keeps them on wg0; it does not exercise
+  product code. Planner/renderer and boot trace tests check bug 1's structural
+  exclusion: no source-selected rules and no policy rules beyond the baseline.
+  Behind R1 namespace isolation, existing L3/L4 are blind to M-ct/M-out.
+  Only L19-L3/L4 detect bugs 2 and 3, so L19 must stay in the regular shards;
+  the catalog test asserts this requirement.
 - **CI:** fmt, clippy `-D warnings`, tests, cargo-deny (licences,
   advisories, duplicates), goldens + `nft -c`, leak suite, musl builds for
   both arches (arm64 unit tests under QEMU), reproducibility check (build
@@ -2472,6 +2477,19 @@ exact M2 rules and resumes it; M2 configuration still refuses IPv6. L9
 crash prefixes are independent simulated boots: their lab-private `/run`
 boot-attempt budgets are saved and reset between prefixes; production
 retry limits are unchanged.
+L19 replays source policy routing in a lab-only table (R1 production has no
+client policy rule), and extends L2/L3/L4/L6 with focused provenance, established-flow,
+local-output and route-stage subtrials. L3/L4 deliberately add a preferred veth
+route so topology isolation cannot mask an nft mutation. The bound-probe-only
+mutation forges only forwarded route observations; default inventory and the
+real bound exit probe remain required. A preinstalled policy rule would fail
+baseline-rule inventory first (checked with the fake system), so an xtask-only
+System wrapper installs `iif wg0 unreachable` at the first forwarding read,
+after topology/default inventory. This models policy drift between check stages
+without weakening policy-rule containment. The main default stays intact;
+the control requires IPv4 client `RouteWrong(Unreachable)` / exit 3 and the
+mutant requires Protected / exit 0. Live policy and independent forwarded
+lookups after check prove that the fault remains active in both runs.
 
 ### Leak-test list, staged
 
@@ -2495,7 +2513,7 @@ retry limits are unchanged.
 | L16 | exit down then back (single exit): leave FailClosed by itself (rp_filter, bound probes with `unreachable` default) | 4, then 0 | M2 |
 | L17 | `ip netns del scupper` while edge runs; namespace loss with no holder (daemon down: stop → delete → start) | first: re-mount, no second netns, traffic unchanged; second: clean rebuild with a fresh namespace-local marker | M2 |
 | L18 | sysctl inheritance: host `rp_filter=2`, `ip_forward=1`, `accept_ra=1` before boot | netns values as §5.4 after boot and after every forwarding toggle | M2 |
-| L19 | meta: mutation runs (bugs 1-4) and bridged topology | suite fails on each mutation; nft layer blocks in bridged topology | M2 |
+| L19 | bug-1 symptom oracle control (lab layout), product mutations (bugs 2-4), bridged topology | typed catches with live evidence; regular-shard nft detectors for bugs 2/3 | M2 |
 | L20 | MTU/PMTU: oversized packets client→exit and exit→client | ICMP frag-needed / packet-too-big reach the sender; no other ICMP paths | M2 |
 | L21 | failover under load: kill provA | switch ≤ 20 s; zero canaries on uplink; event and alert | M3 |
 | L22 | all exits down, then provB returns | 4, then 0 after qualification; fail-closed duration recorded | M3 |
