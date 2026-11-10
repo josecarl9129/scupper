@@ -180,6 +180,50 @@ pub(crate) fn pmtu_receiver(bytes: &[u8], flow: &Flow) -> Result<(), Error> {
 #[allow(clippy::unwrap_used, clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
+    #[test]
+    fn l11_complete_health_probe_fragments_do_not_hide_forbidden_delivery() {
+        let tls = include_bytes!("../../tests/fixtures/run5-l11-tls-fragments.pcap");
+        let flow = Flow {
+            source: "34.160.111.145".parse().unwrap(),
+            destination: "10.2.0.2".parse().unwrap(),
+            protocol: 6,
+            ports: Some((443, 56472)),
+        };
+        assert!(attempted(tls, std::slice::from_ref(&flow)).is_ok());
+        // A complete fragmented datagram must still count as delivery when its
+        // reassembled tuple is forbidden, rather than being skipped as noise.
+        assert!(
+            dropped(
+                tls,
+                tls,
+                std::slice::from_ref(&flow),
+                std::slice::from_ref(&flow)
+            )
+            .is_err()
+        );
+        assert!(pmtu_receiver(tls, &flow).is_err());
+    }
+
+    #[test]
+    fn l20_host_unreachable_is_never_pmtu_success() {
+        let capture = include_bytes!("../../tests/fixtures/run5-l20-host-unreachable.pcap");
+        let expected = Pmtu {
+            router: "10.99.0.1".parse().unwrap(),
+            flow: Flow {
+                source: "10.99.0.2".parse().unwrap(),
+                destination: "10.2.0.1".parse().unwrap(),
+                protocol: 17,
+                ports: Some((40020, 8080)),
+            },
+            mtu: 1280,
+        };
+        assert!(
+            pmtu_sender(capture, &expected)
+                .unwrap_err()
+                .to_string()
+                .contains("ICMP took an unapproved path")
+        );
+    }
     fn ip(src: &str, dst: &str, proto: u8, body: &[u8]) -> Vec<u8> {
         let src: IpAddr = src.parse().unwrap();
         let dst: IpAddr = dst.parse().unwrap();

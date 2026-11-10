@@ -1,8 +1,84 @@
 //! Exact DF/IPv6 datagrams exercise both sides of each tunnel's MTU boundary.
 use super::{A, DaemonGuard, Duration, Flow, Invocation, IpAddr, Path, Result, Signal, fail, fs};
 use crate::pcap::path::{Pmtu, pmtu_receiver, pmtu_sender};
+use scupper_core::{
+    config::{GatewayId, parse_site, validate},
+    render::{VersionStamp, render_netns},
+};
+use scupper_sys::{
+    lock::WriterLock,
+    state::{StateFile, StateRead},
+    store::{MetaInput, VersionStore},
+};
+use sha2::{Digest, Sha256};
+
+fn mtu_config(text: &str, client_mtu: u32, exit_mtu: u32) -> Result<String> {
+    let mut site = parse_site(text)?;
+    let gateway = site
+        .gateways
+        .get_mut(&GatewayId("gw1".into()))
+        .ok_or("PMTU gateway")?;
+    gateway.client_tunnel.mtu = client_mtu;
+    gateway
+        .exits
+        .iter_mut()
+        .find(|exit| exit.ifname == "ex-ch1")
+        .ok_or("PMTU exit")?
+        .mtu = exit_mtu;
+    validate(site.clone()).map_err(|errors| format!("PMTU config: {errors:?}"))?;
+    Ok(toml::to_string(&site)?)
+}
 
 impl DaemonGuard<'_> {
+    fn configure_pmtu(&mut self, root: &Path, client_mtu: u32, exit_mtu: u32) -> Result<()> {
+        {
+            let guard = WriterLock::acquire(root.join("run/scupper"))?;
+            let store = VersionStore::open_with_mirror_root(
+                root.join("var-lib/scupper"),
+                root.join("etc/scupper"),
+                Some(&guard),
+            )?;
+            let StateRead::Present(state) =
+                StateFile::open(root.join("var-lib/scupper"), None)?.read()?
+            else {
+                return fail("PMTU missing applied state");
+            };
+            let (text, _) = store.read(state.applied_version.ok_or("PMTU applied version")?)?;
+            let text = mtu_config(&text, client_mtu, exit_mtu)?;
+            let version = store.commit(
+                &guard,
+                store.head()?,
+                &text,
+                MetaInput {
+                    actor: "lab".into(),
+                    at: 3,
+                    reason: "supervised PMTU fixture".into(),
+                },
+            )?;
+            self.lab.site = validate(parse_site(&text)?)
+                .map_err(|errors| format!("PMTU config: {errors:?}"))?;
+            let rules = render_netns(
+                &self.lab.site,
+                &GatewayId("gw1".into()),
+                &VersionStamp {
+                    version,
+                    sha256: Sha256::digest(text.as_bytes()).into(),
+                },
+            )?;
+            store.write_rendered(&guard, version, &rules)?;
+            fs::write(&self.lab.rules, rules)?;
+        }
+        let (code, output) =
+            self.control_command(root, &["apply"], &format!("pmtu-{client_mtu}-{exit_mtu}"))?;
+        if code != 0 {
+            return fail(format!("PMTU apply: {code}: {output}"));
+        }
+        self.lab.daemon_complete_tick(root)?;
+        self.lab.daemon_route_healthy(Duration::from_secs(30))?;
+        self.lab.wait_provider()?;
+        self.lab.assert_transport_ports()?;
+        self.expect_check(root, 0, None, "pmtu-configured")
+    }
     pub(super) fn raw_udp(
         &mut self,
         ns: &str,
@@ -34,9 +110,14 @@ impl DaemonGuard<'_> {
         Ok(length)
     }
     pub(super) fn pmtu_trial(&mut self, root: &Path, stem: &str) -> Result<()> {
-        // Supported IPv4 stays under active supervision. Require a completed
-        // tick while each MTU fault is present, then verify the service verdict.
+        // Configure the smaller MTU through apply. An out-of-band MTU change is
+        // real drift: reconciliation lowers the link while restoring it.
         for reverse in [false, true] {
+            self.configure_pmtu(
+                root,
+                if reverse { 1280 } else { 1420 },
+                if reverse { 1420 } else { 1280 },
+            )?;
             self.pmtu_direction(stem, false, reverse)?;
             self.lab.daemon_complete_tick(root)?;
             let iface = if reverse { "wg0" } else { "ex-ch1" };
@@ -52,7 +133,7 @@ impl DaemonGuard<'_> {
                 serde_json::to_vec_pretty(&links)?,
             )?;
             if links[0]["mtu"] != 1280 {
-                return fail("L20 IPv4 MTU fault did not survive the supervised tick");
+                return fail("L20 configured IPv4 MTU did not survive the supervised tick");
             }
             self.expect_check(
                 root,
@@ -65,6 +146,7 @@ impl DaemonGuard<'_> {
                 },
             )?;
         }
+        self.configure_pmtu(root, 1420, 1420)?;
         self.reset_m2_network()?;
         // M2 refuses IPv6 configuration. This separate fixture checks renderer
         // chains only, with reconciliation suspended until exact restoration.
@@ -162,8 +244,10 @@ impl DaemonGuard<'_> {
             ("wg0", if reverse { "1280" } else { "1420" }),
             ("ex-ch1", if reverse { "1420" } else { "1280" }),
         ] {
-            self.lab
-                .cmd("scupper", "ip", &["link", "set", iface, "mtu", mtu])?;
+            if v6 {
+                self.lab
+                    .cmd("scupper", "ip", &["link", "set", iface, "mtu", mtu])?;
+            }
         }
         // A small request creates the NAT tuple required for a genuine related
         // return. Keep its client port bound so no unrelated ICMP is generated.
@@ -355,6 +439,7 @@ impl DaemonGuard<'_> {
                 .cmd("client2", "ip", &["link", "set", "wg0", "down"])?;
             self.lab
                 .cmd("client2", "ip", &["link", "set", "wg0", "up"])?;
+            self.lab.assert_transport_ports()?;
             let peer = self.lab.public_keys[4].clone();
             self.lab
                 .cmd("scupper", "wg", &["set", "wg0", "peer", &peer, "remove"])?;
@@ -435,6 +520,20 @@ fn datagram(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn supervised_pmtu_fixture_configures_each_direction_without_disabling_supervision() {
+        let mut site = scupper_core::config::parse_site(super::super::super::super::SITE).unwrap();
+        site.health.require_daemon = true;
+        let text = toml::to_string(&site).unwrap();
+        for (client_mtu, exit_mtu) in [(1420, 1280), (1280, 1420), (1420, 1420)] {
+            let text = super::mtu_config(&text, client_mtu, exit_mtu).unwrap();
+            let site = scupper_core::config::parse_site(&text).unwrap();
+            let gateway = &site.gateways[&scupper_core::config::GatewayId("gw1".into())];
+            assert_eq!(gateway.client_tunnel.mtu, client_mtu);
+            assert_eq!(gateway.exits[0].mtu, exit_mtu);
+            assert!(site.health.require_daemon);
+        }
+    }
     #[test]
     fn small_raw_v4_v6_controls_keep_the_complete_canary_marker() {
         let marker = b"scupper-canary-00112233445566778899aabbccddeeff";

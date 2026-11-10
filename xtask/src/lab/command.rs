@@ -67,6 +67,7 @@ pub(super) struct Runner {
     pub probe_ca: Option<String>,
     pub boot_point: Option<String>,
     pub boot_marker: Option<String>,
+    pub wg_fixture: Option<std::path::PathBuf>,
     trace: File,
     last_stderr: String,
     background_groups: Vec<u32>,
@@ -82,6 +83,7 @@ impl Runner {
             probe_ca: None,
             boot_point: None,
             boot_marker: None,
+            wg_fixture: None,
             trace,
             last_stderr: String::new(),
             background_groups: Vec::new(),
@@ -106,6 +108,27 @@ impl Runner {
     }
     fn command(&mut self, invocation: &Invocation, seconds: u64) -> Result<Command> {
         self.check()?;
+        let wrapped;
+        let invocation = if let Some(fixture) = &self.wg_fixture
+            && invocation.program == "nsenter"
+            && invocation
+                .args
+                .get(if invocation.args.get(2).is_some_and(|arg| arg == "env") {
+                    4
+                } else {
+                    2
+                })
+                .is_some_and(|arg| {
+                    matches!(
+                        Path::new(arg).file_name().and_then(|name| name.to_str()),
+                        Some("scupper" | "scupperd")
+                    )
+                }) {
+            wrapped = super::transport::overlay(invocation, fixture);
+            &wrapped
+        } else {
+            invocation
+        };
         writeln!(
             self.trace,
             "{}",

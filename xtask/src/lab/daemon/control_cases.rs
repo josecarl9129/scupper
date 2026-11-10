@@ -32,9 +32,27 @@ pub(super) fn verdict_reason(value: &serde_json::Value, reason: &str) -> bool {
     }
 }
 
+fn verdict_matches(report: &serde_json::Value, kind: &str, reason: &str) -> bool {
+    let payload = &report["verdict"][kind];
+    if kind == "Unsupervised" && !reason.is_empty() {
+        verdict_reason(&payload["why"], reason)
+    } else {
+        verdict_reason(payload, reason)
+    }
+}
+
 #[cfg(test)]
 mod verdict_tests {
     use super::verdict_reason;
+    #[test]
+    fn unsupervised_matches_why_from_l10_stopped_report() {
+        let report = serde_json::json!({"at":1_794_335_538_u64,"config_version":7,"schema":1,
+            "verdict":{"Unsupervised":{"exit":"ch1","exit_ip":"3.42.157.37","why":"Dead"}},
+            "warnings":["ClientHandshakesStale"]});
+        assert!(super::verdict_matches(&report, "Unsupervised", "Dead"));
+        assert!(!super::verdict_matches(&report, "Unsupervised", "Stale"));
+        assert!(!super::verdict_matches(&report, "Protected", ""));
+    }
     #[test]
     fn closure_requires_exactly_one_unreachable_default() {
         use serde_json::json;
@@ -46,6 +64,36 @@ mod verdict_tests {
             &json!([{"type":"unreachable"},{"dev":"ex-ch1"}])
         ));
         assert!(!super::sole_unreachable(&json!([{"dev":"ex-ch1"}])));
+        // Run 5 used text here. Keep its exact kernel forms as regressions,
+        // including the loopback device printed for IPv6 unreachable routes.
+        for route in [
+            json!("unreachable default \n"),
+            json!("unreachable default dev lo metric 1024 pref medium\n"),
+            json!([{"type":"unreachable","dst":"default","dev":"lo","metric":1024,"pref":"medium"}]),
+        ] {
+            assert!(super::sole_unreachable(&route));
+        }
+        assert!(!super::sole_unreachable(&json!("default dev ex-ch1\n")));
+        assert!(!super::sole_unreachable(&json!(
+            "unreachable default\ndefault dev ex-ch1\n"
+        )));
+    }
+    #[test]
+    fn l44_kernel_snapshot_is_closed_including_ipv6_loopback_route() {
+        use serde_json::json;
+        let mut snapshot = json!({
+            "exit":"6: ex-ch1: <POINTOPOINT,NOARP> mtu 1420 qdisc noqueue state DOWN mode DEFAULT group default qlen 1000\\    link/none \n",
+            "v4":"unreachable default \n",
+            "v6":"unreachable default dev lo metric 1024 pref medium\n",
+        });
+        assert!(super::disconnect_snapshot_closed(&snapshot));
+        snapshot["v4"] = json!([{"type":"unreachable","dst":"default"}]);
+        snapshot["v6"] = json!([{"type":"unreachable","dst":"default","dev":"lo","metric":1024,"pref":"medium"}]);
+        assert!(super::disconnect_snapshot_closed(&snapshot));
+        snapshot["exit"] = json!("6: ex-ch1: <POINTOPOINT,NOARP,UP> state UNKNOWN");
+        assert!(!super::disconnect_snapshot_closed(&snapshot));
+        snapshot["exit"] = json!("");
+        assert!(!super::disconnect_snapshot_closed(&snapshot));
     }
     #[test]
     fn closed_for_the_wrong_reason_is_rejected() {
@@ -92,9 +140,37 @@ mod verdict_tests {
 }
 
 fn sole_unreachable(routes: &serde_json::Value) -> bool {
-    routes
-        .as_array()
-        .is_some_and(|routes| routes.len() == 1 && routes[0]["type"] == "unreachable")
+    // Accept old saved text snapshots as well as the current `ip -j` output.
+    if let Some(text) = routes.as_str() {
+        return matches!(
+            text.split_whitespace().collect::<Vec<_>>().as_slice(),
+            ["unreachable", "default"]
+                | [
+                    "unreachable",
+                    "default",
+                    "dev",
+                    "lo",
+                    "metric",
+                    "1024",
+                    "pref",
+                    "medium"
+                ]
+        );
+    }
+    routes.as_array().is_some_and(|routes| {
+        routes.len() == 1 && routes[0]["type"] == "unreachable" && routes[0]["dst"] == "default"
+    })
+}
+
+fn disconnect_snapshot_closed(snapshot: &serde_json::Value) -> bool {
+    sole_unreachable(&snapshot["v4"])
+        && sole_unreachable(&snapshot["v6"])
+        && snapshot["exit"].as_str().is_some_and(|s| {
+            s.contains("ex-ch1:")
+                && s.contains("state DOWN")
+                && !s.contains(",UP")
+                && !s.contains("<UP")
+        })
 }
 
 fn session_continues(before: &str, after: &str) -> bool {
@@ -136,7 +212,12 @@ fn compare_sessions(before: &str, after: &str, traffic: bool) -> bool {
 }
 
 impl DaemonGuard<'_> {
-    fn control_command(&mut self, root: &Path, args: &[&str], stem: &str) -> Result<(i32, String)> {
+    pub(super) fn control_command(
+        &mut self,
+        root: &Path,
+        args: &[&str],
+        stem: &str,
+    ) -> Result<(i32, String)> {
         let binary = Lab::boot_binary()?;
         let mut command = vec!["--test-root", root.to_str().ok_or("root path")?];
         command.extend_from_slice(args);
@@ -188,12 +269,7 @@ impl DaemonGuard<'_> {
                 .artifacts
                 .join(format!("{}-{stem}-closure.json", self.case)),
         )?)?;
-        if !sole_unreachable(&snapshot["v4"])
-            || !sole_unreachable(&snapshot["v6"])
-            || !snapshot["exit"]
-                .as_str()
-                .is_some_and(|s| !s.contains(",UP") && !s.contains("<UP"))
-        {
+        if !disconnect_snapshot_closed(&snapshot) {
             return fail(format!(
                 "{} message preceded verified closure: {snapshot}",
                 self.case
@@ -222,8 +298,7 @@ impl DaemonGuard<'_> {
             _ => None,
         });
         if got != code
-            || expected
-                .is_some_and(|(kind, reason)| !verdict_reason(&report["verdict"][kind], reason))
+            || expected.is_some_and(|(kind, reason)| !verdict_matches(&report, kind, reason))
         {
             return fail(format!(
                 "{} {stem}: expected {code}, got {got}: {report}",
@@ -968,8 +1043,8 @@ impl DaemonGuard<'_> {
                     return fail("L44 disconnect omitted effective-closure reply");
                 }
                 let snapshot = serde_json::json!({
-                    "v4":self.lab.cmd("scupper","ip",&["-4","route","show","default"])?,
-                    "v6":self.lab.cmd("scupper","ip",&["-6","route","show","default"])?,
+                    "v4":serde_json::from_str::<serde_json::Value>(&self.lab.cmd("scupper","ip",&["-j","-4","route","show","default"])?)?,
+                    "v6":serde_json::from_str::<serde_json::Value>(&self.lab.cmd("scupper","ip",&["-j","-6","route","show","default"])?)?,
                     "exit":self.lab.cmd("scupper","ip",&["-o","link","show","ex-ch1"])?,
                 });
                 fs::write(

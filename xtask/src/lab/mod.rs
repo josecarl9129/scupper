@@ -14,6 +14,7 @@ mod probe_child;
 mod shard;
 pub use shard::{Shard, list, list_with_durations};
 mod topology;
+mod transport;
 
 use addresses::A;
 use cleanup::{Registry, Resource};
@@ -101,6 +102,7 @@ struct Lab {
     fault_markers: Vec<String>,
     next_source_port: u16,
     exit_port: u16,
+    client_ports_ready: bool,
 }
 
 /// Runs the reference namespace lab, preserving captures, policies and reports.
@@ -200,6 +202,7 @@ fn run_inner(
         fault_markers: Vec::new(),
         next_source_port: 20000,
         exit_port: 51821,
+        client_ports_ready: false,
     };
     let outcome: Result<()> = (|| {
         lab.preflight()?;
@@ -357,6 +360,7 @@ impl Lab {
         self.private_dir = Some(fs::File::open(&self.private)?);
         self.registry
             .register(Resource::Directory(self.private.clone()));
+        self.prepare_transport()?;
         let mut host = boot::InheritanceGuard::save()?;
         host.persist(self.private.join("host-sysctls.json"))?;
         self.host_sysctls = Some(host);

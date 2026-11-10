@@ -294,6 +294,8 @@ impl Lab {
         )?;
         self.address_up("client2", "wg0", "10.99.0.3/32", 1420)?;
         self.cmd("client2", "ip", &["route", "add", "default", "dev", "wg0"])?;
+        self.client_ports_ready = true;
+        self.assert_transport_ports()?;
         Ok(())
     }
     fn start_sinks(&mut self) -> Result<()> {

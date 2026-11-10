@@ -824,6 +824,7 @@ impl Lab {
         if let Err(error) = waited {
             return fail(format!("{error}; ready={ready}; last ping={last_ping}"));
         }
+        self.assert_transport_ports()?;
         Ok(())
     }
     fn daemon_complete_tick(&mut self, root: &Path) -> Result<()> {

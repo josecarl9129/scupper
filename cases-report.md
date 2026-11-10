@@ -267,3 +267,37 @@ test (one test executed). Gate logs are in `target/tmp/*-round3.log`.
 
 Privileged namespace trials cannot run here (uid 1000); no kernel/lab pass is
 claimed. No commit was created.
+
+## Fix round 4
+
+Read-only diagnosis used run 5's four `results.tsv` and `failure.txt` files,
+then the failing cases' saved JSON, events and packet captures.
+
+| Case | Diagnosis and change | Regression evidence |
+|---|---|---|
+| L10 | The stopped report returned check 5 correctly. Match `Unsupervised` reasons through its `why` field; retain empty-reason and violation-array behavior. | Unit test uses the actual run-5 report (`exit=ch1`, `exit_ip=3.42.157.37`, `why=Dead`) and rejects a different reason. |
+| L9 / L9-host-link | The stale destination port was on the gateway's provider-facing WireGuard client (`203.0.113.2:51820` to `198.51.100.2:57195` in L9; stale port 43892 in L9-host-link), followed by ICMP port-unreachable. The two end clients already listen on 51820. Pin the provider-facing client to 51821 before configuring peers or raising the link. A lab-only executable overlay adds that ListenPort to `wg set ex-ch1` inside gateway processes' private mount namespaces, preserving `/run/netns` propagation and forwarding every other argument to the original executable. Assert all three client ports after successful boot, daemon start/restart, PMTU apply and client session resets. | Fixture regression checks exit-port injection and unchanged client/server arguments. Existing exact endpoint-policy regressions remain; no arbitrary ports or extra ICMP are allowed by the uplink oracle. |
+| L44 | The queued-disconnect snapshot accidentally saved route text while the predicate expected JSON. Save routes using `ip -j`. Closure accepts the IPv6 unreachable route's `dev lo`/metric/pref attributes and the exact legacy text forms. | Test uses all three exact snapshot strings from run 5, then the corresponding JSON routes; reachable/extra defaults and an UP or missing exit fail. |
+| L20 | The sender capture contains ICMP type 3/code 1 (host-unreachable), not PMTU type 3/code 4. Its link snapshot has `ex-ch1` DOWN; events show `LinkDown` and `LinkReconfigure` while restoring the manually changed MTU. Apply each IPv4 direction's desired MTUs through the supervised configuration before probing, and restore 1420 through apply before the separate IPv6 fixture. Keep the completed-tick, configured-MTU and check-0 requirements. | Retained run-5 sender capture must still fail PMTU validation. Configuration regression covers both directions and restoration with supervision required. Existing wrong-flow, wrong-router, wrong-direction and delivered-datagram negatives remain. |
+| L11 | The exit capture has three complete IPv4 fragment pairs for a health-probe HTTPS response (`34.160.111.145:443` to `10.2.0.2:56472`), not truncated case probes. Reassemble complete case datagrams with the existing strict fragment assembly before evaluating path predicates. | A retained real fragment pair is accepted as an observed flow; forbidden fragmented delivery still fails. Missing, overlapping and truncated fragments fail. The uplink classifier is unchanged. |
+
+These failures demonstrate lab fixture or evidence-predicate defects, not a
+product defect. No production code under `crates/**` changed. No new crates
+were added. New temporary test files use `env!("CARGO_TARGET_TMPDIR")`.
+
+All five gates passed, each under `timeout 600`:
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets --all-features --locked --offline -- -D warnings`
+- `cargo test --workspace --all-features --locked --offline`
+- `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked --offline`
+- `cargo deny --locked check` (advisories, bans, licenses and sources OK)
+
+The final workspace run includes 64 passing xtask library tests and one ignored
+subprocess fixture, plus all integration suites and documentation tests.
+Gate logs are in `target/tmp/*-round4.log`. `git diff --check` passed.
+`cargo fmt --all` is the final command. No commit was created.
+
+Privileged namespace trials were not run: this process is uid 1000 with no
+effective capabilities, and nft/tcpdump are absent. A privileged run is still
+needed to verify the six cases against the kernel; no lab pass is claimed.

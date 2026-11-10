@@ -168,6 +168,7 @@ impl Lab {
             .cmd("scupper", "wg", &["show", "ex-ch1", "listen-port"])?
             .trim()
             .parse()?;
+        self.assert_transport_ports()?;
         Ok(report)
     }
     pub(super) fn boot_adopt(&mut self) -> Result<()> {
@@ -329,6 +330,7 @@ impl Lab {
         // Down/up discards the old client session even if the gateway survived.
         self.cmd("client", "ip", &["link", "set", "wg0", "down"])?;
         self.cmd("client", "ip", &["link", "set", "wg0", "up"])?;
+        self.assert_transport_ports()?;
         for family in ["-4", "-6"] {
             self.cmd(
                 "client",
