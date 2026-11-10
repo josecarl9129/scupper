@@ -37,6 +37,7 @@ pub struct RealKernel<'a> {
     edge_path: RefCell<Option<PathBuf>>,
     owned_links: RefCell<std::collections::BTreeMap<String, u32>>,
     memory_latch: Cell<bool>,
+    owned_dirty: Cell<bool>,
     flushed: Cell<bool>,
     state: crate::state::StateFile,
     key_read: RefCell<
@@ -87,6 +88,7 @@ impl<'a> RealKernel<'a> {
             edge_path: RefCell::new(edge_path),
             owned_links: RefCell::new(std::collections::BTreeMap::new()),
             memory_latch: Cell::new(false),
+            owned_dirty: Cell::new(false),
             flushed: Cell::new(false),
             state,
             key_read: RefCell::new(None),
@@ -148,6 +150,20 @@ impl<'a> RealKernel<'a> {
         .map_err(|_| StepError("kernel operation failed"))
     }
     fn verify(&self, required: [u8; 32]) -> Result<(), StepError> {
+        if self.deps.system.canon_cache().is_some() {
+            return if required == self.desired.fingerprint()
+                && crate::canon::netns_rulesets(
+                    self.deps.system,
+                    &self.held,
+                    self.desired.rendered(),
+                )
+                .is_ok_and(|(want, live)| want == live)
+            {
+                Ok(())
+            } else {
+                Err(StepError("ruleset verification failed"))
+            };
+        }
         let live = command_result(run_netns_cmd(
             self.deps.system,
             &self.held,
@@ -162,67 +178,7 @@ impl<'a> RealKernel<'a> {
         }
     }
     fn forwarding(&self, on: bool, only: Option<&str>) -> Result<(), StepError> {
-        let mut failed = false;
-        // Close both global gates before inventory or per-device work. A failed
-        // family write never prevents attempting the other family or later gates.
-        if only.is_none() {
-            for (family, scope, name) in [
-                (SysctlFamily::Ipv4, Scope::Global, "ip_forward"),
-                (SysctlFamily::Ipv6, Scope::All, "forwarding"),
-                (SysctlFamily::Ipv4, Scope::Default, "forwarding"),
-                (SysctlFamily::Ipv6, Scope::Default, "forwarding"),
-            ] {
-                let result = write_sysctl_verified(
-                    self.deps.system,
-                    &self.held,
-                    &SysctlKey {
-                        family,
-                        scope,
-                        name,
-                    },
-                    i64::from(on),
-                    EXEC_TIMEOUT,
-                );
-                if on && result.is_err() {
-                    return Err(StepError("partial forwarding raise"));
-                }
-                failed |= result.is_err();
-            }
-        }
-        let links = boot::inventory(&self.deps, &self.held)
-            .map_err(|_| StepError("link inventory failed"))?;
-        for link in links
-            .iter()
-            .filter(|l| only.is_none_or(|name| name == l.ifname))
-        {
-            let Ok(name) = IfName::new(&link.ifname) else {
-                failed = true;
-                continue;
-            };
-            for family in [SysctlFamily::Ipv4, SysctlFamily::Ipv6] {
-                let key = SysctlKey {
-                    family,
-                    scope: Scope::Link(name.clone()),
-                    name: "forwarding",
-                };
-                let result = write_sysctl_verified(
-                    self.deps.system,
-                    &self.held,
-                    &key,
-                    i64::from(on),
-                    EXEC_TIMEOUT,
-                );
-                if on && result.is_err() {
-                    return Err(StepError("partial forwarding raise"));
-                }
-                failed |= result.is_err();
-            }
-        }
-        if failed {
-            Err(StepError("forwarding write/readback failed"))
-        } else {
-            Ok(())
-        }
+        forwarding(&self.deps, &self.held, on, only)
     }
     fn link_step(&self, step: &Step) -> Result<(), StepError> {
         let name = match step {
@@ -276,6 +232,7 @@ impl<'a> RealKernel<'a> {
                     self.owned_links
                         .borrow_mut()
                         .insert(link.ifname, link.ifindex);
+                    self.owned_dirty.set(true);
                 }
             }
         }
@@ -286,6 +243,20 @@ impl<'a> RealKernel<'a> {
     }
 }
 impl Kernel for RealKernel<'_> {
+    fn checkpoint_owned(&self, guard: &WriterGuard) -> Result<(), StepError> {
+        if !self.owned_dirty.get() {
+            return Ok(());
+        }
+        publish_owned(
+            self.deps.run_root,
+            self.held.identity(),
+            &self.owned_links.borrow(),
+            guard,
+        )?;
+        self.owned_dirty.set(false);
+        Ok(())
+    }
+
     fn invalidate_state(&self) {
         self.state.invalidate_reads();
     }
@@ -486,5 +457,135 @@ impl Kernel for RealKernel<'_> {
     fn restore_name(&self, held: &NetnsHandle, guard: &WriterGuard) -> Result<(), StepError> {
         restore_mount(held, &self.namespace_path, guard)
             .map_err(|_| StepError("namespace rebind failed"))
+    }
+}
+
+pub(crate) fn forwarding(
+    deps: &BootDeps<'_>,
+    held: &NetnsHandle,
+    on: bool,
+    only: Option<&str>,
+) -> Result<(), StepError> {
+    let mut failed = false;
+    // Close both global gates before inventory or per-device work. A failed
+    // family write never prevents attempting the other family or later gates.
+    if only.is_none() {
+        for (family, scope, name) in [
+            (SysctlFamily::Ipv4, Scope::Global, "ip_forward"),
+            (SysctlFamily::Ipv6, Scope::All, "forwarding"),
+            (SysctlFamily::Ipv4, Scope::Default, "forwarding"),
+            (SysctlFamily::Ipv6, Scope::Default, "forwarding"),
+        ] {
+            let result = write_sysctl_verified(
+                deps.system,
+                held,
+                &SysctlKey {
+                    family,
+                    scope,
+                    name,
+                },
+                i64::from(on),
+                EXEC_TIMEOUT,
+            );
+            if on && result.is_err() {
+                return Err(StepError("partial forwarding raise"));
+            }
+            failed |= result.is_err();
+        }
+    }
+    let links = boot::inventory(deps, held).map_err(|_| StepError("link inventory failed"))?;
+    for link in links
+        .iter()
+        .filter(|l| only.is_none_or(|name| name == l.ifname))
+    {
+        let Ok(name) = IfName::new(&link.ifname) else {
+            failed = true;
+            continue;
+        };
+        for family in [SysctlFamily::Ipv4, SysctlFamily::Ipv6] {
+            let key = SysctlKey {
+                family,
+                scope: Scope::Link(name.clone()),
+                name: "forwarding",
+            };
+            let result =
+                write_sysctl_verified(deps.system, held, &key, i64::from(on), EXEC_TIMEOUT);
+            if on && result.is_err() {
+                return Err(StepError("partial forwarding raise"));
+            }
+            failed |= result.is_err();
+        }
+    }
+    if failed {
+        Err(StepError("forwarding write/readback failed"))
+    } else {
+        Ok(())
+    }
+}
+
+// Publish only under the global writer capability and only for the held inode.
+fn publish_owned(
+    root: &std::path::Path,
+    identity: crate::netns::NetnsId,
+    links: &std::collections::BTreeMap<String, u32>,
+    _guard: &WriterGuard,
+) -> Result<(), StepError> {
+    let bytes = std::fs::read(root.join("boot.json"))
+        .map_err(|_| StepError("boot identity read failed"))?;
+    let mut report: BootReport =
+        serde_json::from_slice(&bytes).map_err(|_| StepError("boot identity invalid"))?;
+    if report.netns.map(|n| (n.dev, n.ino)) != Some(identity) || !report.succeeded() {
+        return Err(StepError("boot identity changed"));
+    }
+    report.owned_links.clone_from(links);
+    boot::save_report_at(root, &report).map_err(|_| StepError("boot identity write failed"))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    #[test]
+    fn recreated_link_identity_survives_a_restart_and_refuses_wrong_namespace() {
+        use crate::boot::{BootStep, NamespaceIdentity, StepResult};
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/owned-link-handoff")
+            .join(std::process::id().to_string());
+        let guard = crate::lock::WriterLock::acquire(&root).unwrap();
+        let report = BootReport {
+            applied_version: Some(1),
+            netns: Some(NamespaceIdentity { dev: 1, ino: 2 }),
+            owned_links: std::collections::BTreeMap::from([("wg0".into(), 3)]),
+            steps: [
+                BootStep::Lock,
+                BootStep::Inputs,
+                BootStep::Close,
+                BootStep::Ruleset,
+                BootStep::Links,
+                BootStep::Routes,
+                BootStep::Forwarding,
+                BootStep::Record,
+            ]
+            .into_iter()
+            .map(|step| StepResult {
+                step,
+                error: None,
+                adopted: false,
+            })
+            .collect(),
+            ..BootReport::default()
+        };
+        boot::save_report_at(&root, &report).unwrap();
+        let links = std::collections::BTreeMap::from([("wg0".into(), 42)]);
+        publish_owned(&root, (1, 2), &links, &guard).unwrap();
+        let restarted: BootReport =
+            serde_json::from_slice(&std::fs::read(root.join("boot.json")).unwrap()).unwrap();
+        assert_eq!(restarted.owned_links, links);
+        assert!(restarted.succeeded());
+        assert!(publish_owned(&root, (1, 99), &report.owned_links, &guard).is_err());
+        let unchanged: BootReport =
+            serde_json::from_slice(&std::fs::read(root.join("boot.json")).unwrap()).unwrap();
+        assert_eq!(unchanged.owned_links, links);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

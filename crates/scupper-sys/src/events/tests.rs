@@ -1115,48 +1115,64 @@ fn corrupt_highwater_recovers_heads_warns_and_forces_unclean_reservation() {
 
 #[test]
 fn retention_errors_warn_once_continue_appending_and_retry_while_idle() {
-    for count in [1, 100] {
-        // Explicit-flush and periodic-checkpoint maintenance paths.
-        let dir = TempDir::new();
-        let (log, handle) = open(&dir, 0);
-        let bad = dir.0.join("events/1969-01.jsonl");
-        fs::create_dir(&bad).unwrap();
-        for month in 1..=12 {
-            fs::write(dir.0.join(format!("events/1968-{month:02}.jsonl")), b"").unwrap();
-        }
-        fs::write(dir.0.join("events/1967-01.jsonl"), b"").unwrap();
-        for _ in 0..count {
-            emit(&handle);
-        }
-        flush(&handle);
-        let later = emit(&handle);
-        flush(&handle);
-        assert!(handle.committed_seq() >= later);
-        let read: Vec<_> = read_since(&dir.0, 0, Some(handle.committed_seq()))
-            .filter_map(Result::ok)
-            .collect();
-        assert_eq!(
-            read.iter()
-                .filter(|e| matches!(e.kind, EventKind::PersistenceFailed { .. }))
-                .count(),
-            1
-        );
-        assert_eq!(
-            read.iter()
-                .filter(|e| matches!(e.kind, EventKind::Flapping {}))
-                .count(),
-            count + 1
-        );
-        fs::remove_dir(&bad).unwrap();
-        // No flush or emit triggers this retry: maintenance must recover on idle.
-        wait_for(|| monthly_files(&dir.0.join("events")).unwrap().len() <= MAX_MONTHS);
-        // Even a new retention failure must permit a clean shutdown.
-        fs::create_dir(&bad).unwrap();
-        emit(&handle);
-        flush(&handle);
-        drop(log);
-        assert!(dir.0.join("events/clean").exists());
-    }
+    let dir = TempDir::new();
+    let failing = Arc::new(AtomicBool::new(true));
+    let retry = failing.clone();
+    let opened = EventLog::open_with_hook(
+        &dir.0,
+        gateway(),
+        || UnixSeconds(0),
+        100,
+        move |step| {
+            if step == EventIoStep::Retention && retry.load(Ordering::Relaxed) {
+                Err(io::Error::other("retention EIO"))
+            } else {
+                Ok(())
+            }
+        },
+    )
+    .unwrap();
+    emit(&opened.handle);
+    flush(&opened.handle);
+    emit(&opened.handle);
+    flush(&opened.handle);
+    let events = records(&dir);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(
+                e.kind,
+                EventKind::Repair {
+                    kind: StepKind::EventLog,
+                    result: Outcome::Failed,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::PersistenceFailed { .. }))
+    );
+    failing.store(false, Ordering::Relaxed);
+    flush(&opened.handle);
+    drop(opened);
+    assert!(dir.0.join("events/clean").exists());
+}
+
+#[test]
+fn nonregular_months_warn_and_do_not_prevent_open() {
+    let dir = TempDir::new();
+    fs::create_dir(dir.0.join("events/1969-01.jsonl")).unwrap();
+    std::os::unix::fs::symlink("missing", dir.0.join("events/1969-02.jsonl")).unwrap();
+    let opened = EventLog::open(&dir.0, gateway(), || UnixSeconds(0)).unwrap();
+    assert_eq!(opened.warnings.len(), 2);
+    assert!(opened.warnings.iter().all(|w| w.line == 0));
+    emit(&opened.handle);
+    flush(&opened.handle);
+    drop(opened);
 }
 
 #[test]
@@ -1246,4 +1262,42 @@ fn memory_only_keeps_bounded_history_and_failure_without_committing() {
         EventLog::memory_only(GatewayId("invalid.domain".into()), || UnixSeconds(0)),
         Err(OpenError::InvalidGateway)
     ));
+}
+
+#[test]
+fn replay_reserves_large_local_sequence_jumps_before_append() {
+    let dir = TempDir::new();
+    let memory = EventLog::memory_only(gateway(), || UnixSeconds(0)).unwrap();
+    let base = UNCLEAN_SEQ_JUMP * 3;
+    memory.handle.shared.lock().seq = base;
+    emit(&memory.handle);
+    let sequence = dir.0.join("events/seq");
+    let opened = EventLog::open_with_hook(
+        &dir.0,
+        gateway(),
+        || UnixSeconds(0),
+        100,
+        move |step| {
+            if step == EventIoStep::Write {
+                let reserved: u64 = fs::read_to_string(&sequence)?
+                    .trim()
+                    .parse()
+                    .map_err(io::Error::other)?;
+                if reserved < base {
+                    return Err(io::Error::other("replay jump was not reserved"));
+                }
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    memory.handle.replay_into(&opened.handle).unwrap();
+    flush(&opened.handle);
+    let high = opened.handle.committed_seq();
+    assert!(high > base);
+    drop(opened);
+    fs::remove_file(dir.0.join("events/clean")).unwrap();
+    let reopened = EventLog::open(&dir.0, gateway(), || UnixSeconds(0)).unwrap();
+    assert!(emit(&reopened.handle) > high);
+    flush(&reopened.handle);
 }

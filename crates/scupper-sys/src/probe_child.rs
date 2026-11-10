@@ -342,7 +342,7 @@ pub trait ProbeExec {
         false
     }
 
-    /// Executes `/proc/self/exe probe <request>` with the namespace as stdin.
+    /// Executes `scupper probe <request>` with the namespace as stdin.
     ///
     /// # Errors
     /// Returns spawn, capture or process-group timeout errors.

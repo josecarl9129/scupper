@@ -23,6 +23,45 @@ pub use scupper_core::canon::{
 };
 use scupper_core::canon::{compare_rulesets, oversized_live_ruleset};
 
+/// Complete toolchain identity for an in-memory canonical rendering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheKey {
+    /// SHA-256 of the rendered source.
+    pub rendered: [u8; 32],
+    /// Exact nft version output.
+    pub nft_version: String,
+    /// nft device, inode, modification seconds and nanoseconds.
+    pub nft_identity: (u64, u64, i64, i64),
+    /// Kernel release (the value returned by uname -r).
+    pub kernel_release: String,
+}
+/// One-entry, process-lifetime cache; no cache files are created.
+#[derive(Debug, Default)]
+pub struct CanonCache(Option<(CacheKey, Value)>);
+impl CanonCache {
+    /// Return a cached value or replace it with a fresh canonicalization.
+    /// A suspected difference must set `fresh` before it can be reported.
+    ///
+    /// # Errors
+    /// Propagates canonicalization errors without caching failures.
+    pub fn get_or_try(
+        &mut self,
+        key: CacheKey,
+        fresh: bool,
+        load: impl FnOnce() -> Probe<Value>,
+    ) -> Probe<Value> {
+        if !fresh
+            && let Some((old, value)) = &self.0
+            && *old == key
+        {
+            return Ok(value.clone());
+        }
+        let value = load()?;
+        self.0 = Some((key, value.clone()));
+        Ok(value)
+    }
+}
+
 fn permission_failure(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     [
@@ -282,7 +321,7 @@ pub fn observe_netns_ruleset(
     handle: &crate::netns::NetnsHandle,
     rendered: &str,
 ) -> Probe<scupper_core::verdict::v2::RulesetObs> {
-    let once = || {
+    let once = |fresh| {
         let live = crate::cmd::run_cmd(
             sys,
             crate::system::ExecTarget::Netns(handle),
@@ -296,11 +335,11 @@ pub fn observe_netns_ruleset(
         {
             return Ok((oversized_live_ruleset(), false));
         }
-        let (want, live) = canonical_pair(sys, handle, rendered, live)?;
+        let (want, live) = canonical_pair(sys, handle, rendered, live, fresh)?;
         compare_rulesets(&want, &live)
     };
-    let (observation, confirm) = once()?;
-    Ok(if confirm { once()?.0 } else { observation }.into())
+    let (observation, confirm) = once(false)?;
+    Ok(if confirm { once(true)?.0 } else { observation }.into())
 }
 
 /// Reads canonical rendered and live rulesets for a held namespace.
@@ -319,7 +358,7 @@ pub fn netns_rulesets(
         &crate::cmd::KernelCmd::Nft(crate::cmd::NftCmd::ListRulesetJson),
         EXEC_TIMEOUT,
     );
-    let (want, live) = canonical_pair(sys, handle, rendered, live)?;
+    let (want, live) = canonical_pair(sys, handle, rendered, live, false)?;
     if compare_rulesets(&want, &live)?.1 {
         let live = crate::cmd::run_cmd(
             sys,
@@ -327,7 +366,7 @@ pub fn netns_rulesets(
             &crate::cmd::KernelCmd::Nft(crate::cmd::NftCmd::ListRulesetJson),
             EXEC_TIMEOUT,
         );
-        canonical_pair(sys, handle, rendered, live)
+        canonical_pair(sys, handle, rendered, live, true)
     } else {
         Ok((want, live))
     }
@@ -338,8 +377,12 @@ fn canonical_pair(
     handle: &crate::netns::NetnsHandle,
     rendered: &str,
     live: Result<ExecOutput, ExecError>,
+    fresh: bool,
 ) -> Probe<(Value, Value)> {
-    let executable = fs::read_link("/proc/self/exe").map_err(|error| file_error(&error))?;
+    let mut executable = fs::read_link("/proc/self/exe").map_err(|error| file_error(&error))?;
+    if executable.file_name().is_some_and(|n| n == "scupperd") {
+        executable.set_file_name("scupper");
+    }
     let outer = fs::read_link("/proc/self/ns/net").map_err(|error| file_error(&error))?;
     let file = PrivateRuleset::create(rendered)?;
     let mut args = unshare_argv(&executable, &outer, &file.path())?;
@@ -350,8 +393,27 @@ fn canonical_pair(
             format!("net:[{}]", handle.identity().1),
         ],
     );
-    let want = command(sys, Program::Unshare, &args, CANON_TIMEOUT)
-        .and_then(|text| Ok(canonicalize(&text)?));
+    let load = || {
+        command(sys, Program::Unshare, &args, CANON_TIMEOUT)
+            .and_then(|text| Ok(canonicalize(&text)?))
+    };
+    let want = if let Some((cache, nft)) = sys.canon_cache() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::MetadataExt;
+        let key = (|| {
+            let meta = fs::metadata(nft).map_err(|e| file_error(&e))?;
+            Ok(CacheKey {
+                rendered: Sha256::digest(rendered.as_bytes()).into(),
+                nft_version: command(sys, Program::Nft, &["--version".into()], EXEC_TIMEOUT)?,
+                nft_identity: (meta.dev(), meta.ino(), meta.mtime(), meta.mtime_nsec()),
+                kernel_release: fs::read_to_string("/proc/sys/kernel/osrelease")
+                    .map_err(|e| file_error(&e))?,
+            })
+        })();
+        key.and_then(|key| cache.borrow_mut().get_or_try(key, fresh, load))
+    } else {
+        load()
+    };
     let live = command_result(live).and_then(|text| Ok(canonicalize(&text)?));
     match (want, live) {
         (Ok(want), Ok(live)) => Ok((want, live)),

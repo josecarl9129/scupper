@@ -1,0 +1,14 @@
+# scupperd.service
+[Unit]
+Description=scupper reconciler
+Wants=scupper-net.service network-online.target
+After=scupper-net.service network-online.target
+[Service]
+Type=notify
+WatchdogSec=30
+Restart=always
+LimitCORE=0
+# Keep the host mount namespace: restore_mount needs /run/netns propagation.
+ExecStart=/usr/local/bin/scupperd
+[Install]
+WantedBy=multi-user.target

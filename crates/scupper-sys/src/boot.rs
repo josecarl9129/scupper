@@ -440,10 +440,13 @@ pub(crate) fn boot_with_guard(deps: &BootDeps<'_>, _guard: &WriterGuard) -> Boot
 }
 
 fn save_report(deps: &BootDeps<'_>, report: &BootReport) -> Result<()> {
+    save_report_at(deps.run_root, report)
+}
+pub(crate) fn save_report_at(run_root: &Path, report: &BootReport) -> Result<()> {
     let bytes = serde_json::to_vec(report).map_err(|e| e.to_string())?;
     durable_replace(
         &RealFs,
-        &deps.run_root.join("boot.json"),
+        &run_root.join("boot.json"),
         &bytes,
         0o644,
         &|_| Ok(()),

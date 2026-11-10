@@ -238,6 +238,11 @@ pub enum ExecTarget<'a> {
 /// }
 /// ```
 pub trait System {
+    /// Optional process-local canonical cache and the exact nft executable path.
+    fn canon_cache(&self) -> Option<(&std::cell::RefCell<crate::canon::CanonCache>, &Path)> {
+        None
+    }
+
     /// Executes one utility with literal arguments and a hard deadline.
     ///
     /// # Errors
@@ -336,6 +341,7 @@ pub(crate) fn check_wg_args(
 /// Executes the configured absolute paths in a minimal fixed environment.
 #[derive(Debug, Default)]
 pub struct RealSystem {
+    canon_cache: std::cell::RefCell<crate::canon::CanonCache>,
     programs: Programs,
     wireguard_dirs: Option<Vec<PathBuf>>,
 }
@@ -343,9 +349,10 @@ pub struct RealSystem {
 impl RealSystem {
     /// Uses validated executable paths, including any distro-specific overrides.
     #[must_use]
-    pub const fn new(programs: Programs) -> Self {
+    pub fn new(programs: Programs) -> Self {
         Self {
             programs,
+            canon_cache: std::cell::RefCell::default(),
             wireguard_dirs: None,
         }
     }
@@ -625,6 +632,10 @@ fn namespace_result(
 }
 
 impl System for RealSystem {
+    fn canon_cache(&self) -> Option<(&std::cell::RefCell<crate::canon::CanonCache>, &Path)> {
+        Some((&self.canon_cache, self.programs.path(Program::Nft)))
+    }
+
     fn run(
         &self,
         program: Program,

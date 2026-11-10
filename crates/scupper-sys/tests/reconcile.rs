@@ -1800,3 +1800,256 @@ fn emergency_failure_replans_do_not_reserve_hardening_repairs() {
     assert_eq!(rig.kernel.model().hardening[&key], expected);
     assert!(rig.machine().latch().is_none());
 }
+
+#[test]
+fn daemon_notify_requires_complete_tick_and_shutdown_has_no_kernel_steps() {
+    use scupper_sys::daemon::{Audit, notify::Notify};
+    use std::{os::unix::net::UnixDatagram, time::Instant};
+    let mut rig = Rig::new();
+    fs::create_dir_all("target").unwrap();
+    let socket_path = PathBuf::from("target").join(format!(
+        "daemon-notify-{}-{}.sock",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let socket = UnixDatagram::bind(&socket_path).unwrap();
+    socket.set_nonblocking(true).unwrap();
+    let mut notify = Notify::new(Some(socket_path.as_os_str())).unwrap();
+    rig.kernel
+        .timeouts(BTreeSet::from([ObservationItem::Ruleset]));
+    notify.completed(&rig.tick()).unwrap();
+    let mut bytes = [0; 64];
+    assert!(socket.recv(&mut bytes).is_err());
+    rig.kernel.timeouts(BTreeSet::new());
+    let report = rig.tick();
+    assert!(report.complete);
+    notify.completed(&report).unwrap();
+    let len = socket.recv(&mut bytes).unwrap();
+    assert_eq!(&bytes[..len], b"READY=1");
+    let len = socket.recv(&mut bytes).unwrap();
+    assert_eq!(&bytes[..len], b"WATCHDOG=1");
+    notify.completed(&rig.tick()).unwrap();
+    let len = socket.recv(&mut bytes).unwrap();
+    assert_eq!(&bytes[..len], b"WATCHDOG=1");
+    assert!(socket.recv(&mut bytes).is_err());
+    let mut rebuild = rig.tick();
+    rebuild.escalations.push(Escalation::RebuildRequired);
+    notify.completed(&rebuild).unwrap();
+    assert!(socket.recv(&mut bytes).is_err());
+
+    let audit_root = rig.root.join("audit");
+    let audit = Audit::open(&audit_root, GatewayId("gw1".into()), Instant::now()).unwrap();
+    rig.machine().set_log(audit.handle());
+    let before = rig.kernel.history();
+    audit.shutdown().unwrap();
+    drop(audit);
+    assert!(audit_root.join("events/clean").exists());
+    assert_eq!(rig.kernel.history(), before);
+    fs::remove_file(socket_path).unwrap();
+}
+
+#[test]
+fn persistent_tighten_failure_never_consumes_a_reopen_budget() {
+    for kind in [
+        StepKind::ForwardingOff,
+        StepKind::LinkDown,
+        StepKind::TcDelete,
+    ] {
+        let mut rig = Rig::new();
+        if kind == StepKind::ForwardingOff {
+            rig.flush_rules();
+        } else if kind == StepKind::LinkDown {
+            rig.kernel.mutate(foreign);
+        } else {
+            rig.kernel.mutate(|m| {
+                m.links.get_mut("wg0").unwrap().tc_hooks = Known::Value(vec!["root".into()]);
+            });
+        }
+        rig.kernel.inject(Fault {
+            step: kind,
+            remaining: None,
+            partial: false,
+        });
+        for _ in 0..20 {
+            let report = rig.tick();
+            assert!(
+                !report
+                    .steps
+                    .iter()
+                    .any(|s| matches!(s, Step::ForwardingOn { .. }))
+            );
+            assert!(
+                rig.machine().latch().is_none(),
+                "Tighten was budgeted: {kind:?}; latch={:?}; report={report:?}",
+                rig.machine().latch()
+            );
+        }
+    }
+}
+
+#[test]
+fn incomplete_failure_recovery_retains_route_and_rule_unknown_alerts() {
+    use scupper_sys::reconcile::{Kernel, Observation, StepError};
+    for rules in [false, true] {
+        struct Incomplete {
+            inner: FakeKernel,
+            reads: Cell<usize>,
+            rules: bool,
+        }
+        impl Kernel for Incomplete {
+            fn observe(&self, held: &NetnsHandle) -> Observation {
+                self.inner.observe(held)
+            }
+            fn observe_rest(
+                &self,
+                held: &NetnsHandle,
+                safety: Observation,
+                deadline: std::time::Instant,
+            ) -> Observation {
+                let mut observation = self.inner.observe_rest(held, safety, deadline);
+                self.reads.set(self.reads.get() + 1);
+                if self.reads.get() > 1 {
+                    observation.complete = false;
+                    if self.rules {
+                        observation.model.extra_rules = Known::Unknown;
+                    } else {
+                        observation.model.extra_routes = Known::Unknown;
+                    }
+                }
+                observation
+            }
+            fn restore_name(
+                &self,
+                held: &NetnsHandle,
+                guard: &scupper_sys::lock::WriterGuard,
+            ) -> Result<(), StepError> {
+                self.inner.restore_name(held, guard)
+            }
+            fn execute(&self, step: &Step) -> Result<(), StepError> {
+                self.inner.execute(step)
+            }
+            fn hold_latch(&self, latch: Option<&scupper_core::planner::Latch>) {
+                self.inner.hold_latch(latch);
+            }
+        }
+        let rig = Rig::new();
+        rig.kernel.inject(Fault {
+            step: StepKind::RouteReplace,
+            remaining: Some(1),
+            partial: false,
+        });
+        let mut machine = Reconciler::new(
+            Incomplete {
+                inner: rig.kernel.clone(),
+                reads: Cell::new(0),
+                rules,
+            },
+            rig.store.clone(),
+            rig.log.handle.clone(),
+            rig.config(),
+            rig.held.clone(),
+            || (MonoTime(Duration::from_secs(100)), 1000),
+        )
+        .unwrap();
+        let report = machine.tick();
+        assert!(!report.complete);
+        assert!(
+            report.events.iter().any(|event| matches!(
+                event,
+                EventKind::DriftDetected {
+                    reason: scupper_proto::Reason::ObservationUnknown,
+                    ..
+                }
+            )),
+            "lost routes/rules unknown alert: {report:?}"
+        );
+    }
+}
+
+#[test]
+fn successful_reopen_consumes_emergency_evidence_across_ticks() {
+    let mut rig = Rig::new();
+    for _ in 0..3 {
+        rig.kernel.mutate(|m| {
+            m.links.get_mut("wg0").unwrap().tc_hooks = Known::Value(vec!["root".into()]);
+        });
+        rig.kernel.inject(Fault {
+            step: StepKind::TcDelete,
+            remaining: Some(1),
+            partial: false,
+        });
+        rig.settle();
+        assert!(rig.machine().latch().is_none());
+        // Quiet ticks after the recovery must not charge its evidence again.
+        rig.settle();
+        assert!(rig.machine().latch().is_none());
+    }
+    rig.kernel
+        .mutate(|m| m.links.get_mut("wg0").unwrap().tc_hooks = Known::Value(vec!["root".into()]));
+    rig.tick();
+    assert!(rig.machine().latch().is_some());
+}
+
+#[test]
+fn probe_child_timeout_does_not_delay_fake_kernel_ticks() {
+    use scupper_sys::{
+        daemon::probes::Probes,
+        probe_child::{ProbeKind, ProbeRequest, Url},
+    };
+    use std::{os::unix::fs::PermissionsExt, time::Instant};
+    let mut rig = Rig::new();
+    let script = rig.root.join("hung-probe");
+    fs::write(&script, "#!/bin/sh\nexec sleep 30\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let start = Instant::now();
+    let mut probes = Probes::new(script, start);
+    probes
+        .schedule(
+            start,
+            false,
+            &scupper_core::config::ExitId("ch1".into()),
+            ProbeRequest {
+                kind: ProbeKind::Path,
+                bind: None,
+                expected_netns: rig.held.identity(),
+                dns: "10.2.0.1".parse().unwrap(),
+                targets: vec![Url::new("https://example.com/").unwrap()],
+                deadline_ms: 10,
+                identity: None,
+            },
+            &rig.held,
+        )
+        .unwrap();
+    let mut ticks = 0;
+    let mut received = false;
+    while !received {
+        let tick_at = Instant::now();
+        assert!(rig.tick().complete);
+        assert!(tick_at.elapsed() < Duration::from_millis(200));
+        ticks += 1;
+        for round in probes.collect() {
+            if !round.paths.is_empty() {
+                assert_eq!(round.paths.values().copied().collect::<Vec<_>>(), [false]);
+                rig.machine().submit_probe_round(round.paths);
+                received = true;
+            }
+        }
+        assert!(start.elapsed() < Duration::from_secs(3));
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(ticks >= 10);
+}
+
+#[test]
+fn scheduler_probes_selected_recovery_candidate_and_stops_when_disconnected() {
+    let mut rig = Rig::with_site(multi_exit_site());
+    let second = scupper_core::config::ExitId("ch2".into());
+    rig.machine()
+        .set_selection(Selection::Pin(second.clone()), Actor::Local { uid: 0 })
+        .unwrap();
+    assert_eq!(rig.machine().probe_exit(), Some(second));
+    rig.machine()
+        .set_selection(Selection::Disconnected, Actor::Local { uid: 0 })
+        .unwrap();
+    assert_eq!(rig.machine().probe_exit(), None);
+}

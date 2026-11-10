@@ -2,6 +2,7 @@
 
 mod real;
 pub use real::RealKernel;
+pub(crate) use real::forwarding as forwarding_gates;
 #[cfg(any(test, feature = "testing"))]
 pub mod fake;
 
@@ -54,6 +55,15 @@ pub struct StepError(pub &'static str);
 /// Namespace kernel adapter. Implementations must bound every exec to three seconds
 /// and collect safety first with a six-second shared deadline.
 pub trait Kernel {
+    /// Publish newly recreated owned link identities while holding the writer.
+    /// Called after safety work; failed publication is retried on later ticks.
+    ///
+    /// # Errors
+    /// Returns bounded boot-record publication failure.
+    fn checkpoint_owned(&self, _guard: &WriterGuard) -> Result<(), StepError> {
+        Ok(())
+    }
+
     /// Observe the original inode even if its mount name was removed or hijacked.
     fn observe(&self, held: &NetnsHandle) -> Observation;
     /// Complete non-safety observations after emergency containment, before deadline.
@@ -200,7 +210,9 @@ pub struct TickReport {
     pub failover_actions: Vec<FailoverAction>,
 }
 
-/// One lifetime of the gateway writer. Time is supplied as (monotonic, Unix seconds).
+/// Owned exclusively by one tick thread; administrative transitions and probe
+/// submissions must run on that same thread. State read permits remain process-wide.
+/// Time is supplied as (monotonic, Unix seconds).
 pub struct Reconciler<K, S, C> {
     kernel: K,
     store: S,
@@ -274,6 +286,31 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
     /// Adapter access for lifecycle updates such as edge's new namespace path.
     pub fn kernel(&self) -> &K {
         &self.kernel
+    }
+    /// Replace the nonblocking audit sender after memory-only log recovery.
+    pub fn set_log(&mut self, log: LogHandle) {
+        self.log = log;
+    }
+    /// Health snapshot used only by the single-threaded probe scheduler.
+    pub fn health(&self) -> &BTreeMap<ExitId, scupper_core::failover::ExitHealth> {
+        self.failover.health()
+    }
+    /// Active exit to probe, or the selected recovery candidate while closed.
+    /// Deliberate disconnection does not schedule network work.
+    pub fn probe_exit(&self) -> Option<ExitId> {
+        let gateway = self.config.site.gateway(&self.config.gateway)?;
+        match self.failover.desired_route() {
+            scupper_core::render::RouteTarget::Exit(name) => gateway
+                .exits()
+                .iter()
+                .find(|exit| exit.ifname().as_str() == name.as_str())
+                .map(|exit| exit.id().clone()),
+            scupper_core::render::RouteTarget::Unreachable => match &self.persisted.selection {
+                Selection::Disconnected => None,
+                Selection::Pin(id) | Selection::Prefer(id) => Some(id.clone()),
+                Selection::Auto => self.config.site.policy().exits.first().cloned(),
+            },
+        }
     }
     /// Queue one complete probe round, preserving batch boundaries and order.
     pub fn submit_probe_round(&mut self, batch: BTreeMap<ExitId, bool>) {
@@ -406,6 +443,10 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             .is_some_and(|d| !self.kernel.within_deadline(d))
         {
             report.complete = false;
+        }
+        if self.kernel.checkpoint_owned(guard).is_err() {
+            report.complete = false;
+            self.persistence_failure(report);
         }
         self.report_verdict(report);
     }
@@ -703,6 +744,53 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         report: &mut TickReport,
         recover: bool,
     ) {
+        // Safety reservations are charged only at the actual Restore attempt:
+        // ruleset load or foreign-link/tc reopening. Failed Tighten spends nothing.
+        let mut plan = plan;
+        let mut safety_reservations = Vec::new();
+        let now = (self.clock)().0;
+        for class in [
+            planner::SafetyClass::Ruleset,
+            planner::SafetyClass::ForeignLink,
+            planner::SafetyClass::TcHook,
+        ] {
+            let key = class.key();
+            let trigger = if class == planner::SafetyClass::Ruleset {
+                StepKind::LoadRuleset
+            } else {
+                StepKind::ForwardingOn
+            };
+            let previous: Vec<_> = self
+                .budgets
+                .attempts
+                .get(key)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|at| now.elapsed_since(*at) < Duration::from_secs(600))
+                .collect();
+            if plan
+                .budgets
+                .attempts
+                .get(key)
+                .is_some_and(|attempts| attempts.len() > previous.len())
+            {
+                if plan
+                    .steps
+                    .iter()
+                    .any(|step| StepKind::from(step) == trigger)
+                {
+                    safety_reservations.push((trigger, key.to_owned()));
+                }
+                // A prior containment failure may have removed all Stop steps
+                // from this plan. Discard its reservation even in that case.
+                if previous.is_empty() {
+                    plan.budgets.attempts.remove(key);
+                } else {
+                    plan.budgets.attempts.insert(key.to_owned(), previous);
+                }
+            }
+        }
         self.adopt(&plan); // In memory before step zero; no disk I/O here.
         let mut restore_name = false;
         for escalation in plan.escalations {
@@ -760,6 +848,17 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             }
             if contained && step.failure() == StepFailure::Stop {
                 continue;
+            }
+            let (charged, pending): (Vec<_>, Vec<_>) = std::mem::take(&mut safety_reservations)
+                .into_iter()
+                .partition(|(trigger, _)| *trigger == StepKind::from(&step));
+            safety_reservations = pending;
+            for (_, key) in charged {
+                self.budgets
+                    .attempts
+                    .entry(key)
+                    .or_default()
+                    .push((self.clock)().0);
             }
             report.steps.push(step.clone());
             let result = self.execute_step(&step, guard, report);
@@ -823,6 +922,18 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                     (self.clock)().0,
                 );
                 if !observed.complete {
+                    // Full observations include routes/rules: preserve their alert
+                    // before projecting recovery down to safety-only operations.
+                    if recovery
+                        .steps
+                        .contains(&Step::Emit(planner::PlannerEvent::ObservationUnknown))
+                    {
+                        self.emit(
+                            planner::PlannerEvent::ObservationUnknown.into(),
+                            Actor::Daemon,
+                            report,
+                        );
+                    }
                     recovery
                         .steps
                         .retain(|s| emergency_allowed(s, &observed.model, desired));
@@ -830,7 +941,6 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                     recovery.budgets.clone_from(&self.budgets);
                     recovery.debounce.clone_from(&self.debounce);
                 }
-                self.adopt(&recovery);
                 report.complete = false;
                 report.failures.push((step.clone(), error));
                 self.emit(
@@ -846,6 +956,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                     may_recover = false;
                     self.run_plan(recovery, desired, guard, report, false);
                 } else {
+                    self.adopt_safety(&recovery);
                     // Bounded recovery may also fail partially. Execute its emergency
                     // closure and all remaining tightening, never recurse into Restore.
                     self.run_emergency(recovery.steps, &mut observed.model, desired, guard, report);
@@ -929,9 +1040,25 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             }
             _ => self.kernel.execute(step),
         };
+        if result.is_ok()
+            && matches!(
+                step,
+                Step::LinkCreate {
+                    phase: planner::LinkPhase::Move,
+                    ..
+                }
+            )
+        {
+            self.kernel.checkpoint_owned(guard)?;
+        }
         if result.is_ok() {
             match step {
-                Step::ForwardingOn { .. } => self.forwarding = true,
+                Step::ForwardingOn { .. } => {
+                    self.forwarding = true;
+                    // This reopening consumed all preceding containment evidence.
+                    self.emergency_steps.clear();
+                    self.budgets.pending_safety.clear();
+                }
                 Step::ForwardingOff => self.forwarding = false,
                 _ => {}
             }

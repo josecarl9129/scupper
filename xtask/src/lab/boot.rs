@@ -20,7 +20,7 @@ use std::{
 };
 
 impl Lab {
-    fn boot_binary() -> Result<PathBuf> {
+    pub(super) fn boot_binary() -> Result<PathBuf> {
         Ok(fs::canonicalize(
             std::env::current_exe()?
                 .parent()

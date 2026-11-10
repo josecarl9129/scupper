@@ -628,6 +628,7 @@ pub fn classify(capture: &[u8], policy: &Policy, limit: usize) -> Result<Report,
 // Decoded evidence for namespace-case preconditions and exact injected controls.
 // Reuse the oracle's framing/length validation; never search arbitrary pcap bytes.
 pub(crate) struct Observed {
+    pub timestamp: Timestamp,
     pub index: usize,
     pub source: IpAddr,
     pub destination: IpAddr,
@@ -654,6 +655,7 @@ pub(crate) fn observe(bytes: &[u8]) -> Result<Vec<Observed>, Error> {
                 return Err(Error::Capture("incomplete case datagram".into()));
             }
             observed.push(Observed {
+                timestamp: record.timestamp.clone(),
                 index: index + 1,
                 source: ip.src,
                 destination: ip.dst,

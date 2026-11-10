@@ -4,7 +4,7 @@
 //! Keep the `EventLog` alive while using its handles. Drop waits at most one
 //! second, then detaches a stalled worker holding the writer lock. Shutdown is
 //! best effort; the owner must call `LogHandle::flush_blocking` before drop for
-//! a clean marker. The 2o shutdown path will do so.
+//! a clean marker. The daemon shutdown path calls this before dropping the owner.
 use crate::{
     fs::{DurableStep, Fs, RealFs, durable_directory, durable_replace},
     lock::{WriterGuard, WriterLock},
@@ -40,6 +40,8 @@ type Hook = Arc<dyn Fn(EventIoStep) -> io::Result<()> + Send + Sync>;
 /// Fault injection boundaries for event append and high-water persistence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventIoStep {
+    /// Before retention maintenance, independent of append durability.
+    Retention,
     /// Before reserving sequence state during open.
     OpenCheckpoint,
     /// After the open reservation rename, before synchronizing its directory.
@@ -99,7 +101,8 @@ pub enum OpenError {
 pub struct RecoveryWarning {
     /// Monthly file containing the record, or the corrupt `seq` file.
     pub path: PathBuf,
-    /// One-based line number (one for the high-water file).
+    /// One-based line number (one for the high-water file). Zero denotes a
+    /// skipped non-regular monthly entry.
     pub line: u64,
 }
 
@@ -109,7 +112,7 @@ pub struct OpenedLog {
     pub log: EventLog,
     /// Sender for the opened writer.
     pub handle: LogHandle,
-    /// Malformed record heads and corrupt high-water state found during recovery.
+    /// Malformed records, corrupt high-water state and skipped non-regular months.
     pub warnings: Vec<RecoveryWarning>,
 }
 
@@ -250,7 +253,7 @@ impl Shared {
 /// Owns the audit writer thread and its exclusive per-root writer lock.
 ///
 /// The owner must call [`LogHandle::flush_blocking`] before drop for a clean
-/// marker; 2o will do this on normal shutdown. Drop has a one-second budget.
+/// marker; the daemon does this on normal shutdown. Drop has a one-second budget.
 /// Unclean opens durably advance the high-water before assigning identities.
 /// Across disk-backed runs, uniqueness holds while one run assigns fewer than
 /// 2^24 sequences without a durable checkpoint. Memory-only identities are
@@ -262,7 +265,7 @@ pub struct EventLog {
 /// Cloneable bounded memory sender. No method except `flush_blocking` waits on I/O.
 ///
 /// The owner must call [`Self::flush_blocking`] before dropping [`EventLog`] for
-/// a clean marker (2o will). See [`EventLog`] for the sequence uniqueness bound.
+/// a clean marker. See [`EventLog`] for the sequence uniqueness bound.
 #[derive(Clone)]
 pub struct LogHandle {
     shared: Arc<Shared>,
@@ -512,6 +515,49 @@ impl LogHandle {
         self.shared.enqueue(&mut queue, event);
         Ok(seq)
     }
+    /// Whether this sender has a disk worker.
+    #[must_use]
+    pub fn is_persistent(&self) -> bool {
+        self.shared.persistent
+    }
+
+    /// Replay a memory-only ring into a newly opened disk log with fresh IDs.
+    /// The leading Recovery gap identifies the local sequence interval being
+    /// replaced. The following records retain order, kind, actor and version;
+    /// timestamps and identities are assigned by the recovered disk writer.
+    ///
+    /// # Errors
+    /// Returns stopped/sequence exhaustion errors. Call only from the tick owner
+    /// after all producers have been quiesced, then replace their handles.
+    pub fn replay_into(&self, disk: &Self) -> Result<(), EmitError> {
+        let queue = self.shared.lock();
+        if self.shared.persistent || !disk.shared.persistent {
+            return Err(EmitError::Stopped);
+        }
+        {
+            let mut target = disk.shared.lock();
+            target.seq = target.seq.max(queue.seq);
+        }
+        disk.emit(
+            EventKind::EventGap {
+                reason: Reason::Recovery,
+                dropped: queue.seq,
+                first_seq: u64::from(queue.seq > 0),
+                last_seq: queue.seq,
+            },
+            Actor::Daemon,
+            None,
+        )?;
+        for event in &queue.events {
+            disk.emit(
+                event.kind.clone(),
+                event.actor.clone(),
+                event.config_version,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Highest committed event sequence. Advances only after the line and any
     /// newly created directory entry have been synchronized successfully.
     /// Pass this bound to [`read_since`] for alert and other cursor consumers.
@@ -585,6 +631,11 @@ struct Disk {
 }
 impl Disk {
     fn append(&mut self, event: &Event) -> io::Result<()> {
+        // Replay can jump over a long outage's local sequence space. Reserve
+        // that jump before appending, preserving the unclean-restart guarantee.
+        if event.seq.saturating_sub(self.checkpointed) >= UNCLEAN_SEQ_JUMP {
+            self.checkpoint(event.seq)?;
+        }
         if self.last_written >= event.seq {
             return Ok(());
         }
@@ -779,13 +830,16 @@ fn run_writer(
 fn maintain_retention(shared: &Shared, disk: &mut Disk) {
     let failed = try_retention(shared, disk).is_err();
     if failed && !disk.retention_failed {
+        eprintln!("event log: retention maintenance failed");
         // Maintenance diagnostics must not hold the current append or mark the
         // persistence queue failed. Retry on later checkpoints or idle ticks.
         let mut queue = shared.lock();
         if let Ok(event) = shared.event(
             &mut queue,
-            EventKind::PersistenceFailed {
-                reason: Reason::EventWrite,
+            EventKind::Repair {
+                kind: StepKind::EventLog,
+                class: scupper_proto::RepairClass::Tighten,
+                result: Outcome::Failed,
             },
             Actor::Daemon,
             None,
@@ -797,6 +851,7 @@ fn maintain_retention(shared: &Shared, disk: &mut Disk) {
 }
 
 fn try_retention(shared: &Shared, disk: &Disk) -> io::Result<()> {
+    (disk.hook)(EventIoStep::Retention)?;
     if retention_needed(&disk.directory, MAX_MONTHS, MAX_SIZE)? {
         retain(
             &disk.directory,
@@ -837,6 +892,12 @@ fn month_key(name: &str) -> Option<(u64, u8)> {
         .then_some((year.parse().ok()?, month))
 }
 fn monthly_files(directory: &Path) -> io::Result<Vec<PathBuf>> {
+    monthly_files_warn(directory, &mut Vec::new())
+}
+fn monthly_files_warn(
+    directory: &Path,
+    warnings: &mut Vec<RecoveryWarning>,
+) -> io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
@@ -846,10 +907,18 @@ fn monthly_files(directory: &Path) -> io::Result<Vec<PathBuf>> {
     for entry in entries {
         let entry = entry?;
         if entry.file_name().to_str().and_then(month_key).is_some() {
-            RealFs.check_target(&entry.path())?;
             if !entry.file_type()?.is_file() {
-                return Err(io::Error::other("event month is not a regular file"));
+                eprintln!(
+                    "event log: skipping non-regular month {}",
+                    entry.path().display()
+                );
+                warnings.push(RecoveryWarning {
+                    path: entry.path(),
+                    line: 0,
+                });
+                continue;
             }
+            RealFs.check_target(&entry.path())?;
             files.push(entry.path());
         }
     }
@@ -928,7 +997,8 @@ fn recover(directory: &Path, gateway: &Identifier) -> Result<Recovery, OpenError
         Err(error) if error.kind() == io::ErrorKind::InvalidData => (0, false, true),
         Err(error) => return Err(error.into()),
     };
-    let files = monthly_files(directory)?;
+    let mut skipped = Vec::new();
+    let files = monthly_files_warn(directory, &mut skipped)?;
     let mut recovery = Recovery {
         seq: highwater,
         highwater,
@@ -945,6 +1015,7 @@ fn recover(directory: &Path, gateway: &Identifier) -> Result<Recovery, OpenError
             Vec::new()
         },
     };
+    recovery.warnings.extend(skipped);
     for path in files {
         let mut reader = BufReader::new(File::open(&path)?);
         let mut offset = 0;

@@ -159,6 +159,24 @@ fn read_capacity(path: &Path) -> Arc<ReadCapacity> {
     capacity
 }
 
+// Resolve existing ancestors as well, so initially absent roots have the same
+// process-wide capacity through symlink and dot-component aliases.
+fn canonical_root(root: &Path) -> io::Result<PathBuf> {
+    let absolute = std::path::absolute(root)?;
+    match std::fs::canonicalize(&absolute) {
+        Ok(path) => Ok(path),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let parent = absolute.parent().ok_or(e)?;
+            Ok(canonical_root(parent)?.join(
+                absolute
+                    .file_name()
+                    .ok_or_else(|| io::Error::other("invalid state root"))?,
+            ))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// State access rooted at `/var/lib/scupper` in production.
 #[derive(Debug)]
 pub struct StateFile {
@@ -178,7 +196,7 @@ impl StateFile {
             durable_directory(root.as_ref())?;
             RealFs.cleanup_stale(root.as_ref())?;
         }
-        let path = std::path::absolute(root.as_ref().join("state.json"))?;
+        let path = canonical_root(root.as_ref())?.join("state.json");
         let capacity = read_capacity(&path);
         Ok(Self {
             path,
@@ -467,6 +485,26 @@ mod tests {
                 .unwrap(),
             StateRead::Present(State::default())
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn worker_capacity_uses_canonical_roots() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/state-aliases")
+            .join(format!(
+                "{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::os::unix::fs::symlink("real", root.join("alias")).unwrap();
+        let a = StateFile::open(root.join("real"), None).unwrap();
+        let b = StateFile::open(root.join("alias/../alias/."), None).unwrap();
+        assert!(Arc::ptr_eq(&a.capacity, &b.capacity));
+        let permit = a.reserve_worker().unwrap();
+        assert!(b.reserve_worker().is_err());
+        drop(permit);
         std::fs::remove_dir_all(root).unwrap();
     }
 

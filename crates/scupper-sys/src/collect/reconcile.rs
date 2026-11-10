@@ -35,6 +35,10 @@ struct SafetySystem<'a> {
     failed: Cell<bool>,
 }
 impl System for SafetySystem<'_> {
+    fn canon_cache(&self) -> Option<(&std::cell::RefCell<crate::canon::CanonCache>, &Path)> {
+        self.system.canon_cache()
+    }
+
     fn run(&self, p: Program, args: &[String], timeout: Duration) -> Result<ExecOutput, ExecError> {
         self.run_in(ExecTarget::Host, p, args, timeout)
     }
@@ -343,23 +347,43 @@ pub(crate) fn observe(
         vec![]
     });
     model.links.clear();
-    model.ruleset = known(
-        read(&safety, held, &KernelCmd::Nft(NftCmd::ListRulesetJson)).and_then(|s| {
-            let canon = canonicalize(&s)?;
-            let live = fingerprint(&canon)?;
-            Ok(if live == desired.fingerprint() {
-                Ruleset::Verified(live)
-            } else if canon
-                .get("nftables")
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(Vec::is_empty)
-            {
-                Ruleset::Absent
-            } else {
-                Ruleset::Unverified(live)
-            })
-        }),
-    );
+    model.ruleset = if safety.canon_cache().is_some() {
+        known(
+            crate::canon::netns_rulesets(&safety, held, desired.rendered()).and_then(
+                |(want, live)| {
+                    Ok(if live == want {
+                        Ruleset::Verified(desired.fingerprint())
+                    } else if live
+                        .get("nftables")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(Vec::is_empty)
+                    {
+                        Ruleset::Absent
+                    } else {
+                        Ruleset::Unverified(fingerprint(&live)?)
+                    })
+                },
+            ),
+        )
+    } else {
+        known(
+            read(&safety, held, &KernelCmd::Nft(NftCmd::ListRulesetJson)).and_then(|s| {
+                let canon = canonicalize(&s)?;
+                let live = fingerprint(&canon)?;
+                Ok(if live == desired.fingerprint() {
+                    Ruleset::Verified(live)
+                } else if canon
+                    .get("nftables")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(Vec::is_empty)
+                {
+                    Ruleset::Absent
+                } else {
+                    Ruleset::Unverified(live)
+                })
+            }),
+        )
+    };
     model.forwarding_v4 = gate(
         &safety,
         held,

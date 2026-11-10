@@ -4,8 +4,10 @@ mod boot;
 mod check_v2;
 mod cleanup;
 mod command;
+mod daemon;
 mod evidence;
 mod fixtures;
+mod flow;
 mod helpers;
 mod probe_child;
 mod topology;
@@ -14,6 +16,7 @@ use addresses::A;
 use cleanup::{Registry, Resource};
 use command::{Group, Invocation, Runner};
 use evidence::{Case, Row};
+pub use flow::flow;
 pub use helpers::{inject, probe, sink};
 use rustix::process::Signal;
 use scupper_core::{

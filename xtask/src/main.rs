@@ -11,6 +11,18 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Continuous namespace-local fault canary.
+    #[command(hide = true)]
+    Flow {
+        #[arg(long)]
+        mode: String,
+        #[arg(long)]
+        address: SocketAddr,
+        #[arg(long)]
+        marker: String,
+        #[arg(long)]
+        log: PathBuf,
+    },
     /// Check every uplink packet against an explicit allow-list.
     Classify {
         file: PathBuf,
@@ -64,6 +76,16 @@ enum Command {
 }
 fn run() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     match Args::parse().command {
+        #[cfg(target_os = "linux")]
+        Command::Flow {
+            mode,
+            address,
+            marker,
+            log,
+        } => {
+            xtask::lab::flow(&mode, address, &marker, &log)?;
+            Ok(true)
+        }
         Command::Classify {
             file,
             policy,

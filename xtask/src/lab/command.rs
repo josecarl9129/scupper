@@ -218,7 +218,7 @@ pub(super) struct Group {
     done: bool,
 }
 impl Group {
-    fn signal(&self, signal: Signal) {
+    pub(super) fn signal(&self, signal: Signal) {
         if let Some(pid) = Pid::from_raw(self.child.id().cast_signed()) {
             let _ = kill_process_group(pid, signal);
         }
@@ -231,12 +231,15 @@ impl Group {
         Ok(())
     }
     pub fn stop(&mut self, signal: Signal) -> Result<()> {
+        self.stop_timeout(signal, Duration::from_secs(3))
+    }
+    pub(super) fn stop_timeout(&mut self, signal: Signal, timeout: Duration) -> Result<()> {
         if self.done {
             return Ok(());
         }
         self.alive()?;
         self.signal(signal);
-        let until = Instant::now() + Duration::from_secs(3);
+        let until = Instant::now() + timeout;
         while Instant::now() < until {
             if let Some(status) = self.child.try_wait()? {
                 self.done = true;

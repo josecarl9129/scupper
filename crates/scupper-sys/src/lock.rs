@@ -18,9 +18,18 @@ pub struct WriterLock;
 /// twice: independent file descriptions can deadlock even within one process.
 #[derive(Debug)]
 pub struct WriterGuard {
-    _file: File,
+    file: File,
     // A capability may move between threads but cannot authorize concurrent writes.
     _not_sync: std::marker::PhantomData<std::cell::Cell<()>>,
+}
+
+impl Drop for WriterGuard {
+    fn drop(&mut self) {
+        // A concurrent fork can briefly inherit this open file description
+        // before exec closes CLOEXEC descriptors. Explicit unlock ends ownership
+        // at the guard boundary instead of waiting for that unrelated exec.
+        let _ = flock(&self.file, FlockOperation::Unlock);
+    }
 }
 
 impl WriterLock {
@@ -94,7 +103,7 @@ impl WriterLock {
         file.set_len(0)?;
         writeln!(file, "{}", std::process::id())?;
         Ok(WriterGuard {
-            _file: file,
+            file,
             _not_sync: std::marker::PhantomData,
         })
     }
