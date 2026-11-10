@@ -22,6 +22,29 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Linux pathname Unix socket capacity, including the terminating NUL byte.
+pub const SOCKET_PATH_LIMIT: usize = 108;
+
+/// Report whether a run root's control socket path fits in `sun_path` when used directly. The
+/// daemon and the CLI never use the path directly (they resolve through a held directory
+/// descriptor), so this is for diagnostics and lab path checks only.
+/// # Errors
+/// Returns an invalid-input error naming paths that do not fit in `sun_path`.
+pub fn validate_socket_path(root: &Path) -> io::Result<()> {
+    let path = root.join("control.sock");
+    let length = path.as_os_str().len();
+    if length >= SOCKET_PATH_LIMIT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "control socket path '{}' is {length} bytes; Unix socket path must be shorter than {SOCKET_PATH_LIMIT} bytes (including space for the terminating NUL)",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Maximum queue residence, including a bounded full apply and tick margin.
 pub const QUEUE_TIMEOUT: Duration = Duration::from_secs(180);
 /// Queue residence plus fresh verification and response margin.
@@ -191,7 +214,7 @@ impl Server {
             .open(root)?;
         validate_directory(&directory.metadata()?, owner)?;
         // Resolve through the held directory, so replacing a parent path cannot redirect writes.
-        let root = std::path::PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+        let root = std::path::PathBuf::from(format!("/proc/self/fd/{}/.", directory.as_raw_fd()));
         let path = root.join("control.sock");
         match fs::symlink_metadata(&path) {
             Ok(meta) if meta.file_type().is_socket() && meta.uid() == owner => {
@@ -496,10 +519,20 @@ pub enum ClientError {
 /// # Errors
 /// Distinguishes unavailable transport from an uncertain delivered outcome.
 pub fn call(root: &Path, request: &Request, timeout: Duration) -> Result<Response, ClientError> {
+    // Connect through a held directory descriptor so the run root's length never meets the
+    // 108-byte `sun_path` limit; the descriptor stays open until the connect returns.
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::DIRECTORY.bits().cast_signed())
+        .open(root)
+        .map_err(ClientError::Unavailable)?;
     let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
         .map_err(ClientError::Unavailable)?;
-    let address =
-        socket2::SockAddr::unix(root.join("control.sock")).map_err(ClientError::Unavailable)?;
+    let address = socket2::SockAddr::unix(format!(
+        "/proc/self/fd/{}/control.sock",
+        directory.as_raw_fd()
+    ))
+    .map_err(ClientError::Unavailable)?;
     let deadline = Instant::now() + timeout;
     socket
         .connect_timeout(&address, timeout.min(Duration::from_secs(2)))
@@ -606,6 +639,39 @@ pub fn request(op: Op) -> Request {
 mod tests {
     use super::*;
     #[test]
+    fn client_connects_through_run_roots_longer_than_sun_path() {
+        let temporary = Path::new(env!("CARGO_TARGET_TMPDIR"));
+        let root = temporary.join(format!(
+            "long-{}-{}",
+            std::process::id(),
+            "x".repeat(SOCKET_PATH_LIMIT)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        assert!(root.join("control.sock").as_os_str().len() >= SOCKET_PATH_LIMIT);
+        assert!(validate_socket_path(&root).is_err());
+        let directory = fs::File::open(&root).unwrap();
+        let listener = UnixListener::bind(format!(
+            "/proc/self/fd/{}/control.sock",
+            directory.as_raw_fd()
+        ))
+        .unwrap();
+        let accepted = std::thread::spawn(move || listener.accept().is_ok());
+        // The listener never answers: a delivered request is OutcomeUnknown, never Unavailable.
+        let result = call(&root, &request(Op::Ping {}), Duration::from_millis(300));
+        assert!(
+            matches!(result, Err(ClientError::OutcomeUnknown(_))),
+            "long run root must still connect: {result:?}"
+        );
+        assert!(accepted.join().unwrap());
+        fs::remove_dir_all(&root).unwrap();
+        for (bytes, valid) in [(107, true), (108, false)] {
+            let root = std::path::PathBuf::from(format!("/{}", "x".repeat(bytes - 14)));
+            assert_eq!(root.join("control.sock").as_os_str().len(), bytes);
+            assert_eq!(validate_socket_path(&root).is_ok(), valid);
+        }
+    }
+
+    #[test]
     fn bounds_ids_and_unknown_fields() {
         for line in [
             b"".as_slice(),
@@ -663,7 +729,10 @@ mod tests {
             )
             .join(format!("ct-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
-        let listener = UnixListener::bind(root.join("control.sock")).unwrap();
+        let directory = fs::File::open(&root).unwrap();
+        let socket_root =
+            std::path::PathBuf::from(format!("/proc/self/fd/{}/.", directory.as_raw_fd()));
+        let listener = UnixListener::bind(socket_root.join("control.sock")).unwrap();
         let worker = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             read_request(&stream).unwrap();
@@ -671,7 +740,11 @@ mod tests {
         });
         let start = Instant::now();
         assert!(matches!(
-            call(&root, &request(Op::Ping {}), Duration::from_millis(50)),
+            call(
+                &socket_root,
+                &request(Op::Ping {}),
+                Duration::from_millis(50)
+            ),
             Err(ClientError::OutcomeUnknown(_))
         ));
         assert!(start.elapsed() < Duration::from_millis(180));
@@ -834,15 +907,21 @@ mod tests {
             .join(format!("unsafe-control-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o777)).unwrap();
+        let directory = fs::File::open(&root).unwrap();
+        let socket_root =
+            std::path::PathBuf::from(format!("/proc/self/fd/{}/.", directory.as_raw_fd()));
         let owner = rustix::process::geteuid().as_raw();
-        assert!(
+        assert_eq!(
             Server::bind_owned(
-                &root,
+                &socket_root,
                 SharedSnapshot::default(),
                 owner,
                 Some(rustix::process::getegid().as_raw())
             )
-            .is_err()
+            .err()
+            .unwrap()
+            .kind(),
+            io::ErrorKind::PermissionDenied
         );
         assert_eq!(fs::metadata(&root).unwrap().uid(), owner);
         assert!(!root.join("control.sock").exists());
@@ -953,8 +1032,8 @@ mod round_two_tests {
         let group = Some(rustix::process::getegid().as_raw());
         // Bind via a directory capability to keep sockaddr_un short in deep worktrees.
         let dir = fs::File::open(&root).unwrap();
-        let path = std::path::PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()))
-            .join("control.sock");
+        let socket_root = std::path::PathBuf::from(format!("/proc/self/fd/{}/.", dir.as_raw_fd()));
+        let path = socket_root.join("control.sock");
         drop(UnixListener::bind(&path).unwrap());
         if let Err(error) = fs::set_permissions(&path, fs::Permissions::from_mode(0o660)) {
             // Some shared worktree filesystems cannot chmod Unix sockets.
@@ -966,7 +1045,7 @@ mod round_two_tests {
                 ),
                 "{error}"
             );
-            let error = Server::bind_owned(&root, SharedSnapshot::default(), owner, group)
+            let error = Server::bind_owned(&socket_root, SharedSnapshot::default(), owner, group)
                 .err()
                 .unwrap();
             assert!(
@@ -993,12 +1072,13 @@ mod round_two_tests {
             fs::remove_dir_all(root).unwrap();
             return;
         }
-        let first = Server::bind_owned(&root, SharedSnapshot::default(), owner, group).unwrap();
+        let first =
+            Server::bind_owned(&socket_root, SharedSnapshot::default(), owner, group).unwrap();
         assert!(first.alive());
         let metadata = fs::metadata(&path).unwrap();
         assert_eq!(metadata.uid(), owner);
         assert_eq!(metadata.mode() & 0o777, 0o660);
-        assert!(Server::bind_owned(&root, SharedSnapshot::default(), owner, group).is_err());
+        assert!(Server::bind_owned(&socket_root, SharedSnapshot::default(), owner, group).is_err());
         // A listener must not unlink a replacement when it dies.
         fs::remove_file(&path).unwrap();
         let replacement = UnixListener::bind(&path).unwrap();
@@ -1006,7 +1086,8 @@ mod round_two_tests {
         drop(first);
         assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
         drop(replacement);
-        let second = Server::bind_owned(&root, SharedSnapshot::default(), owner, group).unwrap();
+        let second =
+            Server::bind_owned(&socket_root, SharedSnapshot::default(), owner, group).unwrap();
         second.stop.store(true, Ordering::Relaxed);
         let deadline = Instant::now() + Duration::from_secs(2);
         while second.alive() {
@@ -1014,7 +1095,8 @@ mod round_two_tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         drop(second);
-        let third = Server::bind_owned(&root, SharedSnapshot::default(), owner, group).unwrap();
+        let third =
+            Server::bind_owned(&socket_root, SharedSnapshot::default(), owner, group).unwrap();
         assert!(third.alive());
         drop(third);
         assert!(!path.exists());

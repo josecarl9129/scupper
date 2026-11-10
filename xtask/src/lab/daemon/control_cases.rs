@@ -15,6 +15,164 @@ use scupper_sys::{
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 
+/// Whether a verdict payload carries `reason`.
+///
+/// A reason is a unit variant (`"X"`) or a single-variant object (`{"X": ..}`). `Unprotected`
+/// carries a list of violations, which matches when any element carries the reason. The empty
+/// reason means "any payload": `Protected` is a struct (`{"exit", "exit_ip"}`), not a variant.
+pub(super) fn verdict_reason(value: &serde_json::Value, reason: &str) -> bool {
+    if reason.is_empty() {
+        return !value.is_null();
+    }
+    match value {
+        serde_json::Value::String(s) => s == reason,
+        serde_json::Value::Object(map) => map.len() == 1 && map.contains_key(reason),
+        serde_json::Value::Array(items) => items.iter().any(|item| verdict_reason(item, reason)),
+        _ => false,
+    }
+}
+
+fn verdict_matches(report: &serde_json::Value, kind: &str, reason: &str) -> bool {
+    let payload = &report["verdict"][kind];
+    if kind == "Unsupervised" && !reason.is_empty() {
+        verdict_reason(&payload["why"], reason)
+    } else {
+        verdict_reason(payload, reason)
+    }
+}
+
+#[cfg(test)]
+mod verdict_tests {
+    use super::verdict_reason;
+    #[test]
+    fn unsupervised_matches_why_from_l10_stopped_report() {
+        let report = serde_json::json!({"at":1_794_335_538_u64,"config_version":7,"schema":1,
+            "verdict":{"Unsupervised":{"exit":"ch1","exit_ip":"3.42.157.37","why":"Dead"}},
+            "warnings":["ClientHandshakesStale"]});
+        assert!(super::verdict_matches(&report, "Unsupervised", "Dead"));
+        assert!(!super::verdict_matches(&report, "Unsupervised", "Stale"));
+        assert!(!super::verdict_matches(&report, "Protected", ""));
+    }
+    #[test]
+    fn closure_requires_exactly_one_unreachable_default() {
+        use serde_json::json;
+        assert!(super::sole_unreachable(
+            &json!([{"type":"unreachable","dst":"default"}])
+        ));
+        assert!(!super::sole_unreachable(&json!([])));
+        assert!(!super::sole_unreachable(
+            &json!([{"type":"unreachable"},{"dev":"ex-ch1"}])
+        ));
+        assert!(!super::sole_unreachable(&json!([{"dev":"ex-ch1"}])));
+        // Run 5 used text here. Keep its exact kernel forms as regressions,
+        // including the loopback device printed for IPv6 unreachable routes.
+        for route in [
+            json!("unreachable default \n"),
+            json!("unreachable default dev lo metric 1024 pref medium\n"),
+            json!([{"type":"unreachable","dst":"default","dev":"lo","metric":1024,"pref":"medium"}]),
+        ] {
+            assert!(super::sole_unreachable(&route));
+        }
+        assert!(!super::sole_unreachable(&json!("default dev ex-ch1\n")));
+        assert!(!super::sole_unreachable(&json!(
+            "unreachable default\ndefault dev ex-ch1\n"
+        )));
+    }
+    #[test]
+    fn l44_kernel_snapshot_is_closed_including_ipv6_loopback_route() {
+        use serde_json::json;
+        let mut snapshot = json!({
+            "exit":"6: ex-ch1: <POINTOPOINT,NOARP> mtu 1420 qdisc noqueue state DOWN mode DEFAULT group default qlen 1000\\    link/none \n",
+            "v4":"unreachable default \n",
+            "v6":"unreachable default dev lo metric 1024 pref medium\n",
+        });
+        assert!(super::disconnect_snapshot_closed(&snapshot));
+        snapshot["v4"] = json!([{"type":"unreachable","dst":"default"}]);
+        snapshot["v6"] = json!([{"type":"unreachable","dst":"default","dev":"lo","metric":1024,"pref":"medium"}]);
+        assert!(super::disconnect_snapshot_closed(&snapshot));
+        snapshot["exit"] = json!("6: ex-ch1: <POINTOPOINT,NOARP,UP> state UNKNOWN");
+        assert!(!super::disconnect_snapshot_closed(&snapshot));
+        snapshot["exit"] = json!("");
+        assert!(!super::disconnect_snapshot_closed(&snapshot));
+    }
+    #[test]
+    fn closed_for_the_wrong_reason_is_rejected() {
+        let stale = serde_json::json!({"FailClosed":"NoHealthyExit"});
+        assert!(!verdict_reason(&stale["FailClosed"], "AdminDisconnected"));
+        assert!(verdict_reason(
+            &serde_json::json!("AdminDisconnected"),
+            "AdminDisconnected"
+        ));
+        assert!(verdict_reason(
+            &serde_json::json!({"Quarantined":{"reason":"SafetyDrift"}}),
+            "Quarantined"
+        ));
+        assert!(!verdict_reason(
+            &serde_json::json!({"NoHealthyExit":{"previous":"AdminDisconnected"}}),
+            "AdminDisconnected"
+        ));
+        assert!(!verdict_reason(
+            &serde_json::json!({"AdminDisconnected":null,"NoHealthyExit":null}),
+            "AdminDisconnected"
+        ));
+        assert!(!verdict_reason(
+            &serde_json::Value::Null,
+            "AdminDisconnected"
+        ));
+    }
+    #[test]
+    fn protected_and_violation_lists_match_real_reports() {
+        use serde_json::json;
+        let protected = json!({"Protected":{"exit":"ch1","exit_ip":"20.64.174.66"}});
+        assert!(verdict_reason(&protected["Protected"], ""));
+        assert!(!verdict_reason(&protected["Unprotected"], ""));
+        let violations = json!({"Unprotected":[
+            {"ForeignLink":"foreign0"},{"LinkKind":"foreign0"},{"TrafficControlHook":"wg0"}
+        ]});
+        assert!(verdict_reason(&violations["Unprotected"], "ForeignLink"));
+        assert!(verdict_reason(
+            &violations["Unprotected"],
+            "TrafficControlHook"
+        ));
+        assert!(!verdict_reason(&violations["Unprotected"], "PeerDiffers"));
+        assert!(!verdict_reason(&json!([]), "ForeignLink"));
+    }
+}
+
+fn sole_unreachable(routes: &serde_json::Value) -> bool {
+    // Accept old saved text snapshots as well as the current `ip -j` output.
+    if let Some(text) = routes.as_str() {
+        return matches!(
+            text.split_whitespace().collect::<Vec<_>>().as_slice(),
+            ["unreachable", "default"]
+                | [
+                    "unreachable",
+                    "default",
+                    "dev",
+                    "lo",
+                    "metric",
+                    "1024",
+                    "pref",
+                    "medium"
+                ]
+        );
+    }
+    routes.as_array().is_some_and(|routes| {
+        routes.len() == 1 && routes[0]["type"] == "unreachable" && routes[0]["dst"] == "default"
+    })
+}
+
+fn disconnect_snapshot_closed(snapshot: &serde_json::Value) -> bool {
+    sole_unreachable(&snapshot["v4"])
+        && sole_unreachable(&snapshot["v6"])
+        && snapshot["exit"].as_str().is_some_and(|s| {
+            s.contains("ex-ch1:")
+                && s.contains("state DOWN")
+                && !s.contains(",UP")
+                && !s.contains("<UP")
+        })
+}
+
 fn session_continues(before: &str, after: &str) -> bool {
     compare_sessions(before, after, false)
 }
@@ -54,7 +212,12 @@ fn compare_sessions(before: &str, after: &str, traffic: bool) -> bool {
 }
 
 impl DaemonGuard<'_> {
-    fn control_command(&mut self, root: &Path, args: &[&str], stem: &str) -> Result<(i32, String)> {
+    pub(super) fn control_command(
+        &mut self,
+        root: &Path,
+        args: &[&str],
+        stem: &str,
+    ) -> Result<(i32, String)> {
         let binary = Lab::boot_binary()?;
         let mut command = vec!["--test-root", root.to_str().ok_or("root path")?];
         command.extend_from_slice(args);
@@ -84,8 +247,8 @@ impl DaemonGuard<'_> {
         let diagnostic = fs::read_to_string(output_path.with_extension("stderr"))?;
         if args.contains(&"disconnect") {
             let snapshot = serde_json::json!({
-                "v4": self.lab.cmd("scupper", "ip", &["-4", "route", "show", "default"] )?,
-                "v6": self.lab.cmd("scupper", "ip", &["-6", "route", "show", "default"] )?,
+                "v4": serde_json::from_str::<serde_json::Value>(&self.lab.cmd("scupper", "ip", &["-j", "-4", "route", "show", "default"] )?)?,
+                "v6": serde_json::from_str::<serde_json::Value>(&self.lab.cmd("scupper", "ip", &["-j", "-6", "route", "show", "default"] )?)?,
                 "exit": self.lab.cmd("scupper", "ip", &["-o", "link", "show", "ex-ch1"] )?,
             });
             fs::write(
@@ -106,16 +269,7 @@ impl DaemonGuard<'_> {
                 .artifacts
                 .join(format!("{}-{stem}-closure.json", self.case)),
         )?)?;
-        if !snapshot["v4"]
-            .as_str()
-            .is_some_and(|s| s.contains("unreachable"))
-            || !snapshot["v6"]
-                .as_str()
-                .is_some_and(|s| s.contains("unreachable"))
-            || !snapshot["exit"]
-                .as_str()
-                .is_some_and(|s| !s.contains(",UP") && !s.contains("<UP"))
-        {
+        if !disconnect_snapshot_closed(&snapshot) {
             return fail(format!(
                 "{} message preceded verified closure: {snapshot}",
                 self.case
@@ -124,7 +278,13 @@ impl DaemonGuard<'_> {
         Ok(())
     }
 
-    fn expect_check(&mut self, root: &Path, code: i32, stem: &str) -> Result<()> {
+    pub(super) fn expect_check(
+        &mut self,
+        root: &Path,
+        code: i32,
+        expected: Option<(&str, &str)>,
+        stem: &str,
+    ) -> Result<()> {
         let (got, report) = self.lab.check_result(&Lab::boot_binary()?, root)?;
         fs::write(
             self.lab
@@ -132,11 +292,32 @@ impl DaemonGuard<'_> {
                 .join(format!("{}-{stem}.json", self.case)),
             serde_json::to_vec_pretty(&report)?,
         )?;
-        if got != code {
+        let expected = expected.or(match code {
+            0 => Some(("Protected", "")),
+            5 => Some(("Unsupervised", "Dead")),
+            _ => None,
+        });
+        if got != code
+            || expected.is_some_and(|(kind, reason)| !verdict_matches(&report, kind, reason))
+        {
             return fail(format!(
                 "{} {stem}: expected {code}, got {got}: {report}",
                 self.case
             ));
+        }
+        if expected == Some(("FailClosed", "AdminDisconnected")) {
+            let snapshot = serde_json::json!({
+                "v4": serde_json::from_str::<serde_json::Value>(&self.lab.cmd("scupper", "ip", &["-j", "-4", "route", "show", "default"])?)?,
+                "v6": serde_json::from_str::<serde_json::Value>(&self.lab.cmd("scupper", "ip", &["-j", "-6", "route", "show", "default"])?)?,
+                "exit": self.lab.cmd("scupper", "ip", &["-o", "link", "show", "ex-ch1"])?,
+            });
+            fs::write(
+                self.lab
+                    .artifacts
+                    .join(format!("{}-{stem}-closure.json", self.case)),
+                serde_json::to_vec_pretty(&snapshot)?,
+            )?;
+            self.assert_disconnect_snapshot(stem)?;
         }
         Ok(())
     }
@@ -184,7 +365,10 @@ impl DaemonGuard<'_> {
             .filter_map(|line| line.split_once(char::is_whitespace))
             .collect::<std::collections::BTreeMap<_, _>>();
         let mut sample = String::new();
-        for line in transfers.lines() {
+        for line in transfers
+            .lines()
+            .filter(|line| line.split_whitespace().next() == Some(self.lab.public_keys[3].as_str()))
+        {
             let (peer, counters) = line
                 .split_once(char::is_whitespace)
                 .ok_or("invalid peer counters")?;
@@ -193,7 +377,7 @@ impl DaemonGuard<'_> {
         }
         Ok(sample)
     }
-    fn assert_namespace_released(&mut self, identity: &str) -> Result<()> {
+    pub(super) fn assert_namespace_released(&mut self, identity: &str) -> Result<()> {
         self.lab
             .daemon_wait("old namespace released", Duration::from_secs(5), |_| {
                 for process in fs::read_dir("/proc")? {
@@ -312,7 +496,7 @@ impl DaemonGuard<'_> {
         }
         Ok(())
     }
-    fn control_restart(&mut self, root: &Path, stage: &str) -> Result<()> {
+    pub(super) fn control_restart(&mut self, root: &Path, stage: &str) -> Result<()> {
         if let Some(mut child) = self.child.take() {
             child.signal(Signal::CONT);
             child.stop_timeout(Signal::TERM, Duration::from_secs(30))?;
@@ -324,20 +508,23 @@ impl DaemonGuard<'_> {
         self.lab
             .daemon_ready_tick(self.notify.as_ref().ok_or("missing notify")?)
     }
-    fn control_stop(&mut self, signal: Signal) -> Result<()> {
+    pub(super) fn control_stop(&mut self, signal: Signal) -> Result<()> {
         if let Some(mut child) = self.child.take() {
             child.signal(Signal::CONT);
             child.stop_timeout(signal, Duration::from_secs(30))?;
         }
         Ok(())
     }
-    fn supervised_fixture(&mut self, root: &Path) -> Result<()> {
+    pub(super) fn supervised_fixture(&mut self, root: &Path) -> Result<()> {
         let state_root = root.join("var-lib/scupper");
         let config_root = root.join("etc/scupper");
         let guard = WriterLock::acquire(root.join("run/scupper"))?;
         let store = VersionStore::open_with_mirror_root(&state_root, &config_root, Some(&guard))?;
         let head = store.head()?.ok_or("head missing")?;
-        let (text, _) = store.read(head)?;
+        let StateRead::Present(state) = StateFile::open(&state_root, None)?.read()? else {
+            return fail("missing applied safety state");
+        };
+        let (text, _) = store.read(state.applied_version.ok_or("missing applied version")?)?;
         let mut site = parse_site(&text)?;
         site.health.require_daemon = true;
         let text = toml::to_string(&site)?;
@@ -371,10 +558,7 @@ impl DaemonGuard<'_> {
         Ok(())
     }
     pub(super) fn reset_control_fixture(&mut self) -> Result<()> {
-        if !matches!(self.case.as_str(), "L10" | "L14" | "L43" | "L44" | "L50") {
-            return Ok(());
-        }
-        let root = self.lab.private.join("boot-root");
+        let root = self.lab.boot_root.clone();
         for marker in [
             "crash-after-selection",
             "pause-apply",
@@ -426,7 +610,7 @@ impl DaemonGuard<'_> {
             return fail(format!("L43 {phase}: latch missing"));
         }
         self.lab.daemon_route_healthy(Duration::from_secs(30))?;
-        self.expect_check(root, 4, phase)?;
+        self.expect_check(root, 4, Some(("FailClosed", "Quarantined")), phase)?;
         let report: serde_json::Value = serde_json::from_slice(&fs::read(
             self.lab
                 .artifacts
@@ -453,7 +637,7 @@ impl DaemonGuard<'_> {
         self.lab
             .daemon_ready_tick(self.notify.as_ref().ok_or("notify missing")?)?;
         self.lab.daemon_route_healthy(Duration::from_secs(30))?;
-        self.expect_check(&root, 0, "positive-control")?;
+        self.expect_check(&root, 0, None, "positive-control")?;
         let stem = format!("control-{case}");
         self.lab.capture("wan", A.gwhost.wan_if, &stem)?;
         let mut markers = Vec::new();
@@ -494,14 +678,14 @@ impl DaemonGuard<'_> {
                 }
                 fs::remove_file(root.join("run/scupper/incomplete-tick"))?;
                 self.lab.runner.dwell(Duration::from_secs(3))?;
-                self.expect_check(&root, 0, "fresh-again")?;
+                self.expect_check(&root, 0, None, "fresh-again")?;
                 self.child
                     .as_ref()
                     .ok_or("daemon missing")?
                     .signal(Signal::STOP);
                 let before = flow_counts(&path)?.1;
                 let at = Instant::now();
-                self.expect_check(&root, 5, "stopped")?;
+                self.expect_check(&root, 5, None, "stopped")?;
                 if at.elapsed() > Duration::from_secs(4) {
                     return fail(
                         "L10 stopped check exceeded Ping timeout plus local probe allowance",
@@ -516,10 +700,10 @@ impl DaemonGuard<'_> {
                     .as_ref()
                     .ok_or("daemon missing")?
                     .signal(Signal::CONT);
-                self.expect_check(&root, 0, "continued")?;
+                self.expect_check(&root, 0, None, "continued")?;
                 self.control_stop(Signal::KILL)?;
                 let before = flow_counts(&path)?.1;
-                self.expect_check(&root, 5, "killed")?;
+                self.expect_check(&root, 5, None, "killed")?;
                 self.lab.daemon_wait(
                     "L10 traffic after SIGKILL",
                     Duration::from_secs(3),
@@ -527,7 +711,7 @@ impl DaemonGuard<'_> {
                 )?;
                 flow.stop(Signal::TERM)?;
                 self.control_restart(&root, "after-kill")?;
-                self.expect_check(&root, 0, "restarted")?;
+                self.expect_check(&root, 0, None, "restarted")?;
             }
             "L14" => {
                 let (code, text) = self.control_command(&root, &["disconnect"], "disconnect")?;
@@ -538,23 +722,39 @@ impl DaemonGuard<'_> {
                     return fail(format!("L14 disconnect: {code}: {text}"));
                 }
                 self.assert_disconnect_snapshot("disconnect")?;
-                self.expect_check(&root, 4, "disconnected")?;
+                self.expect_check(
+                    &root,
+                    4,
+                    Some(("FailClosed", "AdminDisconnected")),
+                    "disconnected",
+                )?;
                 self.control_stop(Signal::TERM)?;
-                self.lab.boot_gateway(&[], "L14-reboot")?;
-                let boot: serde_json::Value =
-                    serde_json::from_slice(&fs::read(self.lab.artifacts.join("L14-reboot.json"))?)?;
+                self.lab.boot_gateway(&[], &format!("{case}-reboot"))?;
+                let boot: serde_json::Value = serde_json::from_slice(&fs::read(
+                    self.lab.artifacts.join(format!("{case}-reboot.json")),
+                )?)?;
                 if boot["adopted"] != true {
                     return fail("L14 disconnected reboot did not adopt");
                 }
-                self.expect_check(&root, 4, "reboot-closed")?;
+                self.expect_check(
+                    &root,
+                    4,
+                    Some(("FailClosed", "AdminDisconnected")),
+                    "reboot-closed",
+                )?;
                 self.control_restart(&root, "after-reboot")?;
-                self.expect_check(&root, 4, "restart-closed")?;
+                self.expect_check(
+                    &root,
+                    4,
+                    Some(("FailClosed", "AdminDisconnected")),
+                    "restart-closed",
+                )?;
                 let (code, text) = self.control_command(&root, &["connect"], "connect")?;
                 if code != 0 || !text.contains("transport: local socket") {
                     return fail(format!("L14 connect: {code}: {text}"));
                 }
                 self.recover_client(&mut markers)?;
-                self.expect_check(&root, 0, "connected")?;
+                self.expect_check(&root, 0, None, "connected")?;
                 self.lab.service_check(&mut markers)?;
                 let client_session = self.client_session()?;
                 self.stage_exit_change(&root)?;
@@ -577,8 +777,13 @@ impl DaemonGuard<'_> {
                     .cmd("scupper", "readlink", &["/proc/self/ns/net"])?;
                 self.lab.cmd("", "ip", &["netns", "delete", "scupper"])?;
                 self.assert_namespace_released(old_identity.trim())?;
-                self.lab.boot_gateway(&[], "L14-real-reboot")?;
-                self.expect_check(&root, 4, "real-reboot-closed")?;
+                self.lab.boot_gateway(&[], &format!("{case}-real-reboot"))?;
+                self.expect_check(
+                    &root,
+                    4,
+                    Some(("FailClosed", "AdminDisconnected")),
+                    "real-reboot-closed",
+                )?;
                 self.control_restart(&root, "real-reboot")?;
                 let (code, text) =
                     self.control_command(&root, &["connect"], "real-reboot-connect")?;
@@ -586,7 +791,7 @@ impl DaemonGuard<'_> {
                     return fail(text);
                 }
                 self.recover_client(&mut markers)?;
-                self.expect_check(&root, 0, "real-reboot-connected")?;
+                self.expect_check(&root, 0, None, "real-reboot-connected")?;
             }
             "L43" => {
                 for attempt in 0..5 {
@@ -658,7 +863,7 @@ impl DaemonGuard<'_> {
                 }
                 self.lab.daemon_route_healthy(Duration::from_secs(30))?;
                 self.assert_forwarding_open()?;
-                self.expect_check(&root, 0, "cleared")?;
+                self.expect_check(&root, 0, None, "cleared")?;
                 self.recover_client(&mut markers)?;
                 self.lab.service_check(&mut markers)?;
             }
@@ -749,11 +954,15 @@ impl DaemonGuard<'_> {
                         if code == 4
                             && (!self
                                 .lab
-                                .cmd("scupper", "ip", &["-4", "route", "show", "default"])?
+                                .cmd("scupper", "ip", &["-j", "-4", "route", "show", "default"])?
                                 .contains("unreachable")
                                 || !self
                                     .lab
-                                    .cmd("scupper", "ip", &["-6", "route", "show", "default"])?
+                                    .cmd(
+                                        "scupper",
+                                        "ip",
+                                        &["-j", "-6", "route", "show", "default"],
+                                    )?
                                     .contains("unreachable"))
                         {
                             return fail("L44 fail-closed report had reachable defaults");
@@ -791,7 +1000,7 @@ impl DaemonGuard<'_> {
                 }
                 self.lab.daemon_complete_tick(&root)?;
                 self.lab.daemon_route_healthy(Duration::from_secs(30))?;
-                self.expect_check(&root, 0, "one-writer-recovered")?;
+                self.expect_check(&root, 0, None, "one-writer-recovered")?;
                 self.assert_client_session(&client_session)?;
                 self.assert_client_traffic(&mut markers)?;
                 // Separately prove that a mutation queued during apply executes
@@ -834,8 +1043,8 @@ impl DaemonGuard<'_> {
                     return fail("L44 disconnect omitted effective-closure reply");
                 }
                 let snapshot = serde_json::json!({
-                    "v4":self.lab.cmd("scupper","ip",&["-4","route","show","default"])?,
-                    "v6":self.lab.cmd("scupper","ip",&["-6","route","show","default"])?,
+                    "v4":serde_json::from_str::<serde_json::Value>(&self.lab.cmd("scupper","ip",&["-j","-4","route","show","default"])?)?,
+                    "v6":serde_json::from_str::<serde_json::Value>(&self.lab.cmd("scupper","ip",&["-j","-6","route","show","default"])?)?,
                     "exit":self.lab.cmd("scupper","ip",&["-o","link","show","ex-ch1"])?,
                 });
                 fs::write(
@@ -845,7 +1054,12 @@ impl DaemonGuard<'_> {
                     serde_json::to_vec_pretty(&snapshot)?,
                 )?;
                 self.assert_disconnect_snapshot("queued-disconnect")?;
-                self.expect_check(&root, 4, "queued-disconnect-closed")?;
+                self.expect_check(
+                    &root,
+                    4,
+                    Some(("FailClosed", "AdminDisconnected")),
+                    "queued-disconnect-closed",
+                )?;
                 for family in ["-4", "-6"] {
                     if !self
                         .lab
@@ -885,7 +1099,12 @@ impl DaemonGuard<'_> {
                 if code != 0 || !text.contains("traffic is now blocked") {
                     return fail("L50 tightening did not verify closure");
                 }
-                self.expect_check(&root, 4, "tightened")?;
+                self.expect_check(
+                    &root,
+                    4,
+                    Some(("FailClosed", "AdminDisconnected")),
+                    "tightened",
+                )?;
                 self.control_restart(&root, "socket-closure")?;
                 let (code, text) = self.control_command(&root, &["connect"], "socket-connect")?;
                 if code != 0 {
@@ -925,7 +1144,12 @@ impl DaemonGuard<'_> {
                     return fail(format!("L50 socket closure: {code}: {text}"));
                 }
                 self.assert_disconnect_snapshot("socket-tighten")?;
-                self.expect_check(&root, 4, "socket-closed")?;
+                self.expect_check(
+                    &root,
+                    4,
+                    Some(("FailClosed", "AdminDisconnected")),
+                    "socket-closed",
+                )?;
             }
             _ => return fail("unknown control case"),
         }
@@ -949,7 +1173,7 @@ impl DaemonGuard<'_> {
             if code != 0 {
                 return fail(format!("L50 control recovery failed: {code}: {output}"));
             }
-            self.expect_check(&root, 0, "restored-control")?;
+            self.expect_check(&root, 0, None, "restored-control")?;
         }
         self.lab.daemon_capture_control(&stem)?;
         Ok("positive_check=0; control_fault_verified=true; uplink_violations=0; saved JSON, command output, notify, events and pcap".into())

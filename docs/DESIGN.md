@@ -2448,6 +2448,11 @@ several gateways (rejected in R1); `devices.*.gateways` is a list;
   check (a canary through the exit) before and after the fault. Every case
   has a hard timeout. Runs on
   GitHub-hosted Ubuntu runners and in a local VM via the same xtask.
+- **Lab port pinning (deviation from production):** the lab pins the exit WireGuard client to a
+  fixed listen port so the uplink allow-list can be an exact 4-tuple across daemon and boot
+  restarts. Production exits use ephemeral ports; after a crash, the provider may briefly send to a
+  stale port and the host answers ICMP port-unreachable quoting only WireGuard ciphertext. That is
+  not a leak (no client-derived plaintext), but the lab does not exercise it.
 - **Meta-tests:** mutation runs reintroduce each historical bug (source-based
   classification, non-directional ct accept, missing output containment,
   bound-probe-only check) and the suite must fail; a deliberately
@@ -2457,6 +2462,16 @@ several gateways (rejected in R1); `devices.*.gateways` is a list;
   both arches (arm64 unit tests under QEMU), reproducibility check (build
   twice, compare sha256), macOS job for `scupper-mac` and `pfctl -n`, secret
   and private-address scan of the repository.
+
+M2 lab deviations: L2/L11 permit client echo and deny gateway DNS/API
+requests because those listeners are deferred to M4 (§5.2). The isolated
+`gwhost` has no networkd instance, so L5 records that restart is inapplicable.
+L20's IPv6 subtrial widens the renderer's empty IPv6 sets and adds tunnel
+addresses while the real daemon is temporarily stopped, then restores the
+exact M2 rules and resumes it; M2 configuration still refuses IPv6. L9
+crash prefixes are independent simulated boots: their lab-private `/run`
+boot-attempt budgets are saved and reset between prefixes; production
+retry limits are unchanged.
 
 ### Leak-test list, staged
 
@@ -2478,7 +2493,7 @@ several gateways (rejected in R1); `devices.*.gateways` is a list;
 | L14 | admin disconnect, then reboot simulation | stays closed until connect | M2 |
 | L15 | exit-IP probe returns an uplink address (fake target) | check 2 | M2 |
 | L16 | exit down then back (single exit): leave FailClosed by itself (rp_filter, bound probes with `unreachable` default) | 4, then 0 | M2 |
-| L17 | `ip netns del scupper` while edge runs; namespace inode loss with no holder | first: re-mount, no second netns, traffic unchanged; second: clean rebuild | M2 |
+| L17 | `ip netns del scupper` while edge runs; namespace loss with no holder (daemon down: stop → delete → start) | first: re-mount, no second netns, traffic unchanged; second: clean rebuild with a fresh namespace-local marker | M2 |
 | L18 | sysctl inheritance: host `rp_filter=2`, `ip_forward=1`, `accept_ra=1` before boot | netns values as §5.4 after boot and after every forwarding toggle | M2 |
 | L19 | meta: mutation runs (bugs 1-4) and bridged topology | suite fails on each mutation; nft layer blocks in bridged topology | M2 |
 | L20 | MTU/PMTU: oversized packets client→exit and exit→client | ICMP frag-needed / packet-too-big reach the sender; no other ICMP paths | M2 |

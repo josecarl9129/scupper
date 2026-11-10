@@ -637,6 +637,10 @@ pub fn execute_file_command(
         .stdin(Stdio::from(file))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(feature = "testing")]
+    if let Some(ca) = std::env::var_os("SCUPPER_TEST_CA_DER") {
+        command.env("SCUPPER_TEST_CA_DER", ca);
+    }
     let started = Instant::now();
     let mut child = command
         .spawn()

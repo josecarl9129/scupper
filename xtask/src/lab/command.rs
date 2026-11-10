@@ -64,7 +64,12 @@ pub(super) struct Runner {
     pub whole: Instant,
     pub phase: Instant,
     pub cleanup: bool,
+    pub probe_ca: Option<String>,
+    pub boot_point: Option<String>,
+    pub boot_marker: Option<String>,
+    pub wg_fixture: Option<std::path::PathBuf>,
     trace: File,
+    last_stderr: String,
     background_groups: Vec<u32>,
 }
 impl Runner {
@@ -75,7 +80,12 @@ impl Runner {
             whole: now + Duration::from_secs(1600),
             phase: now + Duration::from_secs(180),
             cleanup: false,
+            probe_ca: None,
+            boot_point: None,
+            boot_marker: None,
+            wg_fixture: None,
             trace,
+            last_stderr: String::new(),
             background_groups: Vec::new(),
         }
     }
@@ -98,6 +108,27 @@ impl Runner {
     }
     fn command(&mut self, invocation: &Invocation, seconds: u64) -> Result<Command> {
         self.check()?;
+        let wrapped;
+        let invocation = if let Some(fixture) = &self.wg_fixture
+            && invocation.program == "nsenter"
+            && invocation
+                .args
+                .get(if invocation.args.get(2).is_some_and(|arg| arg == "env") {
+                    4
+                } else {
+                    2
+                })
+                .is_some_and(|arg| {
+                    matches!(
+                        Path::new(arg).file_name().and_then(|name| name.to_str()),
+                        Some("scupper" | "scupperd")
+                    )
+                }) {
+            wrapped = super::transport::overlay(invocation, fixture);
+            &wrapped
+        } else {
+            invocation
+        };
         writeln!(
             self.trace,
             "{}",
@@ -107,6 +138,18 @@ impl Runner {
         let mut cmd = Command::new("timeout");
         cmd.args(invocation.timed(seconds)).process_group(0);
         cmd.env("LC_ALL", "C");
+        cmd.env_remove("SCUPPER_TEST_BOOT_MARKER");
+        if let Some(marker) = &self.boot_marker {
+            cmd.env("SCUPPER_TEST_BOOT_MARKER", marker);
+        }
+        cmd.env_remove("SCUPPER_TEST_BOOT_POINT");
+        if let Some(point) = &self.boot_point {
+            cmd.env("SCUPPER_TEST_BOOT_POINT", point);
+        }
+        cmd.env_remove("SCUPPER_TEST_CA_DER");
+        if let Some(ca) = &self.probe_ca {
+            cmd.env("SCUPPER_TEST_CA_DER", ca);
+        }
         Ok(cmd)
     }
     pub fn output(
@@ -178,6 +221,7 @@ impl Runner {
         let stdout = stdout.ok_or("missing command stdout")?;
         let stderr = stderr.ok_or("missing command stderr")?;
         group.done = true;
+        self.last_stderr = String::from_utf8_lossy(&stderr).into_owned();
         if !status.success() {
             writeln!(
                 self.trace,
@@ -194,7 +238,8 @@ impl Runner {
         let (status, stdout) = self.output(invocation, input)?;
         if !status.success() {
             return fail(format!(
-                "command failed ({status}): {invocation:?}; see commands.jsonl"
+                "command failed ({status}): {invocation:?}; {}; see commands.jsonl",
+                self.last_stderr
             ));
         }
         Ok(stdout)

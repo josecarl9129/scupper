@@ -8,16 +8,118 @@ use super::{
     fail,
 };
 use scupper_core::{canon::canonicalize, render::desired_sysctls, rules::IfName};
-use scupper_sys::{
-    lock::WriterLock,
-    state::{Selection, StateFile},
-};
 use std::{
     fs,
     os::unix::process::ExitStatusExt,
     path::PathBuf,
     time::{Duration, Instant},
 };
+
+pub(super) fn client_handshake(text: &str, expected: &str) -> u64 {
+    text.lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            (fields.next()? == expected)
+                .then(|| fields.next()?.parse().ok())
+                .flatten()
+        })
+        .unwrap_or(0)
+}
+
+// ip_forward rewrites per-interface settings too: retain every IPv4 conf value,
+// then restore only changed files after restoring ip_forward itself.
+pub(super) struct InheritanceGuard {
+    saved: Vec<(PathBuf, String)>,
+    snapshot: Option<PathBuf>,
+}
+impl InheritanceGuard {
+    pub(super) fn save() -> Result<Self> {
+        let mut paths = vec![PathBuf::from("/proc/sys/net/ipv4/ip_forward")];
+        for interface in fs::read_dir("/proc/sys/net/ipv4/conf")? {
+            for key in fs::read_dir(interface?.path())? {
+                paths.push(key?.path());
+            }
+        }
+        for name in ["all", "default"] {
+            paths.push(PathBuf::from(format!(
+                "/proc/sys/net/ipv6/conf/{name}/accept_ra"
+            )));
+        }
+        let saved = paths
+            .into_iter()
+            .map(|p| {
+                let value = fs::read_to_string(&p)?;
+                Ok((p, value))
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self {
+            saved,
+            snapshot: None,
+        })
+    }
+    pub(super) fn persist(&mut self, path: PathBuf) -> Result<()> {
+        use std::io::Write as _;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        file.write_all(&serde_json::to_vec_pretty(&self.saved)?)?;
+        file.sync_all()?;
+        fs::File::open(path.parent().ok_or("snapshot parent")?)?.sync_all()?;
+        self.snapshot = Some(path);
+        Ok(())
+    }
+    pub(super) fn restore(&mut self) -> Result<()> {
+        let mut failures = Vec::new();
+        // ip_forward is first: writing it can rewrite the remaining values.
+        for (path, value) in &self.saved {
+            let restored = match fs::read_to_string(path) {
+                Ok(current) if current != *value => fs::write(path, value),
+                Ok(_) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = restored {
+                // A disappearing interface must not prevent restoring all/default.
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    failures.push(format!("{}: {error}", path.display()));
+                }
+            }
+        }
+        if !failures.is_empty() {
+            return fail(failures.join("; "));
+        }
+        if let Some(path) = &self.snapshot {
+            fs::remove_file(path)?;
+        }
+        self.snapshot = None;
+        self.saved.clear();
+        Ok(())
+    }
+}
+impl Drop for InheritanceGuard {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+pub(super) fn refuse_unrestored_sysctls(parent: &std::path::Path) -> Result<()> {
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("scupper-lab-")
+            && entry.path().join("host-sysctls.json").exists()
+        {
+            return fail(format!(
+                "unrestored host sysctls: {}; restore these originals before restarting the lab",
+                entry.path().join("host-sysctls.json").display()
+            ));
+        }
+    }
+    Ok(())
+}
 
 impl Lab {
     pub(super) fn boot_binary() -> Result<PathBuf> {
@@ -35,7 +137,7 @@ impl Lab {
         stem: &str,
     ) -> Result<(std::process::ExitStatus, serde_json::Value)> {
         let binary = Self::boot_binary()?;
-        let root = self.private.join("boot-root");
+        let root = self.boot_root.clone();
         let trace = self.artifacts.join(format!("{stem}.calls.json"));
         let mut args = vec![
             "--test-root",
@@ -66,6 +168,7 @@ impl Lab {
             .cmd("scupper", "wg", &["show", "ex-ch1", "listen-port"])?
             .trim()
             .parse()?;
+        self.assert_transport_ports()?;
         Ok(report)
     }
     pub(super) fn boot_adopt(&mut self) -> Result<()> {
@@ -97,6 +200,7 @@ impl Lab {
         self.rows.push(Row{name:"boot-adopt".into(),wanted:"verify only; two route replacements".into(),got:"adopted".into(),detail:"boot-adopt.calls.json records every public argv; no link, sysctl or live nft writes".into()});
         Ok(())
     }
+    #[allow(clippy::too_many_lines)] // Injection and its independent inherited-value control share a guard.
     pub(super) fn boot_inheritance(&mut self) -> Result<()> {
         if self
             .site
@@ -112,18 +216,56 @@ impl Lab {
         {
             return fail("lab gateway address differs from the address table");
         }
+        self.inheritance = Some(InheritanceGuard::save()?);
         self.cmd(
-            "gwhost",
+            "",
             "sysctl",
             &[
                 "-w",
+                "net.ipv4.ip_forward=1",
                 "net.ipv4.conf.all.rp_filter=2",
                 "net.ipv4.conf.default.rp_filter=2",
-                "net.ipv4.ip_forward=1",
                 "net.ipv6.conf.all.accept_ra=1",
                 "net.ipv6.conf.default.accept_ra=1",
             ],
         )?;
+        self.cmd("gwhost", "ip", &["netns", "add", "scupper-inherit"])?;
+        self.registry
+            .register(Resource::Namespace("scupper-inherit".into()));
+        let mut observed = serde_json::Map::new();
+        for (key, expected) in [
+            ("net.ipv4.ip_forward", "1"),
+            ("net.ipv4.conf.all.rp_filter", "2"),
+            ("net.ipv4.conf.default.rp_filter", "2"),
+            ("net.ipv6.conf.all.accept_ra", "1"),
+            ("net.ipv6.conf.default.accept_ra", "1"),
+        ] {
+            let value = self.cmd("scupper-inherit", "sysctl", &["-n", key])?;
+            observed.insert(key.into(), value.trim().into());
+            if value.trim() != expected {
+                return fail(format!(
+                    "L18 hostile inheritance positive control: {key}={value}, wanted {expected}"
+                ));
+            }
+        }
+        observed.insert(
+            "accept_ra_control".into(),
+            "compiled default, not inherited".into(),
+        );
+        fs::write(
+            self.artifacts.join("L18-pre-boot.json"),
+            serde_json::to_vec_pretty(&observed)?,
+        )?;
+        self.cmd("", "ip", &["netns", "delete", "scupper-inherit"])?;
+        self.registry
+            .unregister(&Resource::Namespace("scupper-inherit".into()));
+        Ok(())
+    }
+    pub(super) fn restore_inheritance(&mut self) -> Result<()> {
+        if let Some(guard) = &mut self.inheritance {
+            guard.restore()?;
+        }
+        self.inheritance = None;
         Ok(())
     }
     pub(super) fn boot_sysctls(&mut self) -> Result<()> {
@@ -141,68 +283,29 @@ impl Lab {
                 return fail(format!("L18 sysctl differs: {}", value.key));
             }
         }
-        self.rows.push(Row{name:"L18".into(),wanted:"explicit namespace hardening overrides inherited host values".into(),got:"verified".into(),detail:"gwhost rp_filter=2, forwarding=1, accept_ra=1 before real boot; all desired namespace sysctls read back".into()});
+        self.rows.push(Row{name:"L18".into(),wanted:"explicit namespace hardening overrides inherited host values".into(),got:"verified".into(),detail:"all desired namespace sysctls read back; L18-pre-boot.json records the inheritance trial separately".into()});
         Ok(())
     }
-    pub(super) fn boot_cases(&mut self) -> Result<()> {
-        self.runner.phase = Instant::now() + Duration::from_secs(450);
-        self.boot_disconnected()?;
-        for point in (0_u8..=7)
-            .map(|n| n.to_string())
-            .chain(["link-add-wg0".into(), "link-add-ex-ch1".into()])
-        {
-            self.boot_kill(&point, false)?;
-        }
-        for point in 1_u8..=6 {
-            self.boot_kill(&point.to_string(), true)?;
-        }
-        Ok(())
-    }
-    fn boot_disconnected(&mut self) -> Result<()> {
-        let root = self.private.join("boot-root");
-        let writer = WriterLock::acquire(root.join("run/scupper"))?;
-        let state = StateFile::open(root.join("var-lib/scupper"), Some(&writer))?;
-        state.update(&writer, |s| s.selection = Selection::Disconnected)?;
-        drop(writer);
-        self.boot_gateway(&[], "L14-boot")?;
-        for family in ["-4", "-6"] {
-            let routes: serde_json::Value = serde_json::from_str(&self.cmd(
-                "scupper",
-                "ip",
-                &["-j", family, "route", "show", "default"],
-            )?)?;
-            if !routes
-                .as_array()
-                .is_some_and(|r| r.len() == 1 && r[0]["type"] == "unreachable")
-            {
-                return fail(format!("L14 boot defaults: {routes}"));
+    pub(super) fn supervised_boot_cases(&mut self, case: &str) -> Result<()> {
+        let points: Vec<String> = match case {
+            "L9" => (0_u8..=7).map(|n| n.to_string()).collect(),
+            "L9b" => (1_u8..=6).map(|n| n.to_string()).collect(),
+            "L9-host-link" => vec!["link-add-wg0".into(), "link-add-ex-ch1".into()],
+            _ => return fail("unknown boot crash group"),
+        };
+        // The caller supplied one initial healthy recovery. Every prefix's
+        // after-recovery is the next prefix's before-control.
+        for cli in [true, false] {
+            for point in &points {
+                self.boot_kill(point, case == "L9b", cli)?;
             }
         }
-        let (code, report) = self.check_result(&Self::boot_binary()?, &root)?;
-        if code != 4 || report["verdict"]["FailClosed"] != "AdminDisconnected" {
-            return fail(format!("L14 check: {code}: {report}"));
-        }
-        let writer = WriterLock::acquire(root.join("run/scupper"))?;
-        state.update(&writer, |s| s.selection = Selection::Auto)?;
-        drop(writer);
-        self.boot_gateway(&[], "L14-restore")?;
-        self.wait_provider()?;
-        self.boot_fresh_client_handshake()?;
-        let (code, restored) = self.check_result(&Self::boot_binary()?, &root)?;
-        if code != 0 {
-            return fail(format!("L14 restore check: {code}: {restored}"));
-        }
-        self.rows.push(Row {
-            name: "L14-boot".into(),
-            wanted: "two unreachable defaults; check 4 Disconnected".into(),
-            got: "verified".into(),
-            detail: report.to_string(),
-        });
         Ok(())
     }
-    fn boot_client_rx(&mut self) -> Result<u64> {
+    pub(super) fn boot_client_rx(&mut self) -> Result<u64> {
         self.cmd("scupper", "wg", &["show", "wg0", "transfer"])?
             .lines()
+            .filter(|line| line.split_whitespace().next() == Some(self.public_keys[3].as_str()))
             .map(|line| {
                 line.split_whitespace()
                     .nth(1)
@@ -215,20 +318,19 @@ impl Lab {
             })
             .map_err(Into::into)
     }
-    fn boot_fresh_client_handshake(&mut self) -> Result<()> {
-        let latest = |text: &str| {
-            text.lines()
-                .filter_map(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
-                .max()
-                .unwrap_or(0)
-        };
-        let before = latest(&self.cmd("scupper", "wg", &["show", "wg0", "latest-handshakes"])?);
+    pub(super) fn boot_fresh_client_handshake(&mut self) -> Result<()> {
+        let expected = self.public_keys[3].clone();
+        let before = client_handshake(
+            &self.cmd("scupper", "wg", &["show", "wg0", "latest-handshakes"])?,
+            &expected,
+        );
         if before != 0 {
             self.runner.dwell(Duration::from_millis(1100))?;
         }
         // Down/up discards the old client session even if the gateway survived.
         self.cmd("client", "ip", &["link", "set", "wg0", "down"])?;
         self.cmd("client", "ip", &["link", "set", "wg0", "up"])?;
+        self.assert_transport_ports()?;
         for family in ["-4", "-6"] {
             self.cmd(
                 "client",
@@ -243,8 +345,10 @@ impl Lab {
                 &Invocation::new("client", "ping", &["-c", "1", "-W", "1", A.gateway_inner]),
                 None,
             )?;
-            let after =
-                latest(&self.cmd("scupper", "wg", &["show", "wg0", "latest-handshakes"])?);
+            let after = client_handshake(
+                &self.cmd("scupper", "wg", &["show", "wg0", "latest-handshakes"])?,
+                &expected,
+            );
             if after > before {
                 return Ok(());
             }
@@ -255,8 +359,12 @@ impl Lab {
         }
     }
     #[allow(clippy::too_many_lines)] // Each crash assertion stays next to the retry and capture it protects.
-    fn boot_kill(&mut self, point: &str, live: bool) -> Result<()> {
-        let stem = format!("{}-{point}", if live { "L9b" } else { "L9" });
+    fn boot_kill(&mut self, point: &str, live: bool, cli: bool) -> Result<()> {
+        let stem = format!(
+            "{}-{}-{point}",
+            if live { "L9b" } else { "L9" },
+            if cli { "cli" } else { "daemon" }
+        );
         // Lab reboot simulation: only the lab-owned gateway namespace is removed.
         // Boot itself never deletes an existing namespace, including during retry.
         if live {
@@ -274,16 +382,36 @@ impl Lab {
             fs::remove_file(record)?;
         }
         self.capture("wan", A.gwhost.wan_if, &stem)?;
-        let flags = if let Some(name) = point.strip_prefix("link-add-") {
-            vec!["--stop-after-link-add", name]
+        let marker = self.private.join("boot-root/run/scupper/boot-reached");
+        if marker.exists() {
+            fs::remove_file(&marker)?;
+        }
+        let status = if cli {
+            self.reset_boot_budget(&stem)?;
+            let args = if let Some(name) = point.strip_prefix("link-add-") {
+                vec!["--stop-after-link-add", name]
+            } else {
+                vec!["--stop-after", point]
+            };
+            self.boot_output(&args, &stem)?.0
         } else {
-            vec!["--stop-after", point]
+            self.daemon_boot_crash(&stem, point)?
         };
-        let (status, _) = self.boot_output(&flags, &stem)?;
+        let reached = fs::read_to_string(&marker)?;
+        fs::write(self.artifacts.join(format!("{stem}-reached.txt")), &reached)?;
+        if reached != format!("reached {point}\n") {
+            return fail("L9 crash checkpoint mismatch");
+        }
         if status.signal() != Some(9) && status.code() != Some(137) {
             return fail(format!("L9 did not kill boot at {point}: {status}"));
         }
         let exists = fs::symlink_metadata("/run/netns/scupper").is_ok();
+        let expected_exists = live || point != "0";
+        if exists != expected_exists {
+            return fail(format!(
+                "L9 {point}: namespace exists={exists}, expected={expected_exists}"
+            ));
+        }
         if exists {
             let links = scupper_core::parse::parse_ip_link(&self.cmd(
                 "scupper",
@@ -405,31 +533,18 @@ impl Lab {
             exit_port,
             matches!(point, "6" | "7"),
         )?;
-        self.boot_gateway(&[], &format!("{stem}-retry"))?;
         self.registry
             .register(Resource::Namespace("scupper".into()));
-        self.wait_provider()?;
-        self.boot_fresh_client_handshake()?;
-        let root = self.private.join("boot-root");
-        let (code, report) = self.check_result(&Self::boot_binary()?, &root)?;
-        let skip = (code == 3
-            && report["verdict"]["Degraded"]
-                .get("ExitProbeFailed")
-                .is_some())
-        .then(|| "runner internet unavailable after all local stages passed".to_owned());
-        if code != 0 && skip.is_none() {
-            return fail(format!("L9 retry check {point}: {code}: {report}"));
-        }
-        self.service_check(&mut Vec::new())?;
+        let after_stem = format!("{stem}-after");
+        self.capture("wan", A.gwhost.wan_if, &after_stem)?;
+        let report = self.daemon_boot_recover(&stem)?;
+        self.stop_captures()?;
+        self.daemon_oracle(&after_stem, &[], self.exit_port, self.exit_port)?;
         self.rows.push(Row {
             name: stem,
             wanted: "SIGKILL prefix closed; retry healthy".into(),
-            got: if skip.is_some() {
-                "local stages verified; external probe skipped".into()
-            } else {
-                "verified".into()
-            },
-            detail: skip.unwrap_or_else(|| report.to_string()),
+            got: "passed".into(),
+            detail: report,
         });
         evidence::save_results(&self.artifacts, &self.rows)?;
         Ok(())
@@ -459,4 +574,53 @@ pub(super) fn boot_canary_arrival(
         return fail("L9 UDP canary absent from gateway wg0 capture");
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod restore_tests {
+    use super::*;
+    #[test]
+    fn restore_continues_after_missing_interfaces_and_other_errors() {
+        let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("sysctl-restore-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let forward = root.join("ip_forward");
+        let bad = root.join("unreadable-value");
+        let rp_filter = root.join("rp_filter");
+        fs::write(&forward, "1").unwrap();
+        fs::write(&rp_filter, "2").unwrap();
+        fs::create_dir(&bad).unwrap();
+        let mut guard = InheritanceGuard {
+            saved: vec![
+                (forward.clone(), "0".into()),
+                (root.join("vanished-interface"), "0".into()),
+                (bad.clone(), "0".into()),
+                (rp_filter.clone(), "1".into()),
+            ],
+            snapshot: None,
+        };
+        let directory = root.join("scupper-lab-interrupted");
+        fs::create_dir(&directory).unwrap();
+        guard.persist(directory.join("host-sysctls.json")).unwrap();
+        assert!(refuse_unrestored_sysctls(&root).is_err());
+        assert!(
+            guard
+                .restore()
+                .unwrap_err()
+                .to_string()
+                .contains("unreadable-value")
+        );
+        assert_eq!(fs::read_to_string(&forward).unwrap(), "0");
+        assert_eq!(fs::read_to_string(&rp_filter).unwrap(), "1");
+        assert!(directory.join("host-sysctls.json").exists());
+        fs::remove_dir(&bad).unwrap();
+        fs::write(&bad, "2").unwrap();
+        guard.restore().unwrap();
+        assert_eq!(fs::read_to_string(bad).unwrap(), "0");
+        assert_eq!(guard.saved.len(), 0);
+        refuse_unrestored_sysctls(&root).unwrap();
+        guard.restore().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
 }

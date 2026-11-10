@@ -109,6 +109,18 @@ fn lab_site_validates_and_matches_all_tunnel_addresses() {
     );
 }
 #[test]
+fn second_client_runtime_configuration_preserves_the_single_peer_capture_template() {
+    let mut config = scupper_core::config::parse_site(SITE).unwrap();
+    assert_eq!(config.devices.len(), 1);
+    super::add_second_client(&mut config, "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=").unwrap();
+    let site = scupper_core::config::validate(config).unwrap();
+    assert_eq!(site.devices().len(), 2);
+    assert_eq!(
+        site.devices()["client2"].address4().addr().to_string(),
+        "10.99.0.3"
+    );
+}
+#[test]
 fn policy_for_every_case_has_exact_endpoints_and_positive_evidence() {
     let markers = vec!["scupper-canary-00112233445566778899aabbccddeeff".into()];
     let mut names = BTreeSet::new();
@@ -119,6 +131,15 @@ fn policy_for_every_case_has_exact_endpoints_and_positive_evidence() {
         let value: toml::Value = toml::from_str(&text).unwrap();
         assert_eq!(value["min_packets"].as_integer(), Some(4));
         assert_eq!(value["expect"].as_array().unwrap().len(), 2);
+        assert_eq!(value["wireguard"].as_array().unwrap().len(), 2);
+        let l11: toml::Value =
+            toml::from_str(&evidence::policy_for_case(&markers, false, 51821, true).unwrap())
+                .unwrap();
+        assert_eq!(l11["wireguard"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            l11["wireguard"][2]["peer"].as_str(),
+            Some("192.0.2.10:51820")
+        );
         assert_eq!(
             value["wireguard"][0]["gateway"].as_str(),
             Some("198.51.100.2:51820")
@@ -308,14 +329,28 @@ fn every_external_program_uses_argv_namespace_entry_and_a_timeout() {
     }
 }
 fn test_dir(name: &str) -> PathBuf {
-    let path = std::env::var_os("CARGO_TARGET_TMPDIR")
-        .map_or_else(
-            || PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../target/tmp")),
-            PathBuf::from,
-        )
+    let path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("lab-test-{name}-{}", std::process::id()));
     fs::create_dir_all(&path).unwrap();
     path
+}
+#[test]
+fn command_failure_preserves_stderr_in_case_error() {
+    let dir = test_dir("stderr");
+    let mut runner = Runner::new(
+        fs::File::create(dir.join("trace")).unwrap(),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let error = runner
+        .input(
+            &Invocation::new("", "sh", &["-c", "cat >&2; exit 1"]),
+            Some(b"nft: unsupported expression\n"),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("nft: unsupported expression"));
+    assert!(error.contains("exit status: 1"));
+    fs::remove_dir_all(dir).unwrap();
 }
 #[test]
 fn command_deadline_kills_and_reaps_without_root() {
@@ -342,7 +377,7 @@ fn results_round_trip_and_tsv_sanitizes_only_display_cells() {
     evidence::save_results(&dir, &rows).unwrap();
     assert_eq!(
         fs::read_to_string(dir.join("results.tsv")).unwrap(),
-        "name\twanted\tgot\tdetail\nbaseline\tclean\tfailed\tone two three \n"
+        "name\twanted\tgot\telapsed_ms\tdetail\nbaseline\tclean\tfailed\t0\tone two three \n"
     );
     assert_eq!(
         serde_json::from_str::<Vec<Row>>(&fs::read_to_string(dir.join("results.json")).unwrap())
@@ -351,6 +386,39 @@ fn results_round_trip_and_tsv_sanitizes_only_display_cells() {
     );
     fs::remove_dir_all(dir).unwrap();
 }
+#[test]
+fn setup_observations_do_not_masquerade_as_shard_cases_and_measurements_survive() {
+    let dir = test_dir("setup-results");
+    let row = |name: &str, got: &str, detail: &str| Row {
+        name: name.into(),
+        wanted: "evidence".into(),
+        got: got.into(),
+        detail: detail.into(),
+    };
+    let mut rows = vec![
+        row("L18", "verified", "hardening"),
+        row("boot-adopt", "adopted", "trace"),
+        row("L9-cli-0", "passed", "checkpoint"),
+        row(
+            "daemon-L7",
+            "passed",
+            "elapsed_ms=1234; forwarding_zero_ms=42",
+        ),
+        row("daemon-unknown", "passed", "not catalogued"),
+    ];
+    evidence::save_setup(&dir, &mut rows).unwrap();
+    evidence::save_setup(&dir, &mut rows).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].name, "daemon-L7");
+    evidence::save_results(&dir, &rows).unwrap();
+    let tsv = fs::read_to_string(dir.join("results.tsv")).unwrap();
+    assert!(tsv.contains("passed\t1234\telapsed_ms=1234; forwarding_zero_ms=42"));
+    let setup: Vec<Row> =
+        serde_json::from_slice(&fs::read(dir.join("setup-results.json")).unwrap()).unwrap();
+    assert_eq!(setup.len(), 4);
+    fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn public_key_fixture_redaction_preserves_structure() {
     let keys = vec![
@@ -422,6 +490,11 @@ fn capture_loss_or_missing_statistics_cannot_establish_silence() {
         .is_ok()
     );
     assert!(evidence::check_capture_stats("1 packets dropped by kernel\n").is_err());
+    let error = evidence::check_capture_stats(
+        "0 packets captured\n218 packets received by filter\n0 packets dropped by kernel\n",
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("capture harness error"));
     assert!(
         evidence::check_capture_stats(
             "0 packets dropped by kernel\n2 packets dropped by interface\n"
@@ -809,4 +882,32 @@ fn boot_canary_requires_received_bytes_and_the_actual_ingress_marker() {
     assert!(boot_canary_arrival(10, 10, &pcap, &markers).is_err());
     assert!(boot_canary_arrival(10, 11, &capture(&[]), &markers).is_err());
     assert!(boot_canary_arrival(10, 11, &pcap, &["different".into()]).is_err());
+}
+
+#[test]
+fn longest_daemon_case_has_a_short_control_socket_path() {
+    let longest = super::daemon::CASES
+        .iter()
+        .max_by_key(|case| case.len())
+        .unwrap();
+    let root = super::daemon::short_boot_root(longest).join("run/scupper");
+    assert!(root.join("control.sock").as_os_str().len() < 108);
+    scupper_sys::daemon::control::validate_socket_path(&root).unwrap();
+}
+
+#[test]
+fn fresh_handshake_only_uses_the_expected_client() {
+    use super::boot::client_handshake;
+    let before = client_handshake("client1 100\nclient2 200\n", "client1");
+    assert_eq!(before, 100);
+    assert_eq!(
+        client_handshake("client2 999\nclient1 100\n", "client1"),
+        before
+    );
+    assert_eq!(client_handshake("client2 999\n", "client1"), 0);
+    assert_eq!(
+        client_handshake("client1 101\nclient2 999\n", "client1"),
+        before + 1
+    );
+    assert_eq!(client_handshake("client1 0\nclient2 999\n", "client1"), 0);
 }

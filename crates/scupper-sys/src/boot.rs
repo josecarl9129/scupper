@@ -129,6 +129,22 @@ pub enum BootPoint {
     LinkAdded(IfName),
 }
 
+/// Persist positive checkpoint evidence before a test process kills itself.
+///
+/// # Errors
+/// Returns file creation, write or synchronization failures.
+#[cfg(feature = "testing")]
+pub fn testing_checkpoint(path: &Path, point: &BootPoint) -> Result<(), String> {
+    use std::io::Write as _;
+    let point = match point {
+        BootPoint::After(step) => (*step as u8).to_string(),
+        BootPoint::LinkAdded(name) => format!("link-add-{name}"),
+    };
+    let mut file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+    writeln!(file, "reached {point}").map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())
+}
+
 /// Boot's explicit I/O dependencies. Production roots are fixed by the CLI.
 #[derive(Clone, Copy)]
 pub struct BootDeps<'a> {

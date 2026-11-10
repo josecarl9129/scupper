@@ -2584,3 +2584,20 @@ fn corrupt_apply_target_preserves_attachment_and_error_kind() {
         assert!(retained);
     }
 }
+
+#[test]
+fn crash_checkpoints_persist_exact_numeric_and_host_link_evidence() {
+    let root = Root::new("ubuntu-24.04", &testing::handle().unwrap());
+    let path = root.path.join("boot-reached");
+    for (point, expected) in [
+        (BootPoint::After(BootStep::Lock), "reached 0\n"),
+        (BootPoint::After(BootStep::Record), "reached 7\n"),
+        (
+            BootPoint::LinkAdded(scupper_core::rules::IfName::new("wg0").unwrap()),
+            "reached link-add-wg0\n",
+        ),
+    ] {
+        scupper_sys::boot::testing_checkpoint(&path, &point).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+    }
+}

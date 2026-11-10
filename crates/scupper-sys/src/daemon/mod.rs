@@ -499,7 +499,7 @@ impl<'a> Runtime<'a> {
             config_root: &self.options.config_root,
             run_root: &self.options.run_root,
             #[cfg(feature = "testing")]
-            hook: None,
+            hook: Some(&testing_boot_hook),
             #[cfg(feature = "testing")]
             secret_owner: self.secret_owner,
         }
@@ -1098,6 +1098,25 @@ fn close_only(deps: &BootDeps<'_>, options: &Options) {
     let _ = crate::reconcile::forwarding_gates(deps, &held, false, None);
 }
 
+// Fault injection is confined to testing builds and still executes real boot.
+#[cfg(feature = "testing")]
+#[allow(clippy::needless_pass_by_value)] // Boot hook signature owns its checkpoint.
+fn testing_boot_hook(point: boot::BootPoint) -> Result<(), String> {
+    let label = match &point {
+        boot::BootPoint::After(step) => (*step as u8).to_string(),
+        boot::BootPoint::LinkAdded(name) => format!("link-add-{name}"),
+    };
+    if std::env::var("SCUPPER_TEST_BOOT_POINT").ok().as_deref() == Some(&label) {
+        let marker =
+            std::env::var_os("SCUPPER_TEST_BOOT_MARKER").ok_or("missing boot marker path")?;
+        boot::testing_checkpoint(Path::new(&marker), &point)?;
+        rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::KILL)
+            .map_err(|e| e.to_string())?;
+        return Err("injected daemon boot crash".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -1122,7 +1141,7 @@ mod tests {
             .unwrap();
         let lease = crate::lock::SupervisorLease::try_acquire(&root).unwrap();
         let options = Options {
-            run_root: root.clone(),
+            run_root: PathBuf::from(format!("/proc/self/fd/{}/.", dir.as_raw_fd())),
             config_root: root.join("missing"),
             state_root: root.join("state"),
             probe_binary: root.join("unused"),
@@ -1586,7 +1605,11 @@ pub mod testing {
             probe_binary: deps.run_root.join("unused-probe"),
         };
         let mut runtime = runtime(deps, &options)?;
-        let missing = deps.run_root.join("missing-notify.sock");
+        // Short and never created: the fixture root may exceed the 108-byte `sun_path` limit.
+        let missing = std::path::PathBuf::from(format!(
+            "/tmp/scupper-missing-notify-{}.sock",
+            std::process::id()
+        ));
         runtime.notify = notify::Notify::new(Some(missing.as_os_str()))?;
         runtime.started();
         runtime.started();

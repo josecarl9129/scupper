@@ -176,6 +176,24 @@ pub(crate) mod linux {
             .set_timeouts()
             .map_err(|error| io_failure(IoOperation::Path, &error))?;
         let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        #[cfg(feature = "testing")]
+        let roots = {
+            let mut roots = roots;
+            if let Ok(hex) = std::env::var("SCUPPER_TEST_CA_DER") {
+                if hex.len() > 16384 || !hex.len().is_multiple_of(2) || !hex.is_ascii() {
+                    return Err(ProbeError::setup("invalid test CA encoding"));
+                }
+                let der = (0..hex.len())
+                    .step_by(2)
+                    .map(|at| u8::from_str_radix(&hex[at..at + 2], 16))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| ProbeError::setup(&e.to_string()))?;
+                roots
+                    .add(rustls::pki_types::CertificateDer::from(der))
+                    .map_err(|e| ProbeError::setup(&e.to_string()))?;
+            }
+            roots
+        };
         let config =
             ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
                 .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])

@@ -116,6 +116,11 @@ impl Lab {
                 &["-q", "-w", "net.ipv6.conf.all.forwarding=1"],
             )?;
         }
+        self.internet_neighbors()?;
+        self.runner.input(&crate::lab::command::Invocation::new("provA", "nft", &["-f", "-"]), Some(b"table ip6 lab_nat6 { chain postrouting { type nat hook postrouting priority srcnat; oifname \"eth0\" masquerade;\n\t}\n}\n"))?;
+        Ok(())
+    }
+    pub(super) fn internet_neighbors(&mut self) -> Result<()> {
         // The lab links have no link-local addresses (addrgenmode none), so neighbour
         // discovery towards the IPv6 sink does not complete: use static entries, as the
         // bridge does.
@@ -149,7 +154,6 @@ impl Lab {
                 ],
             )?;
         }
-        self.runner.input(&crate::lab::command::Invocation::new("provA", "nft", &["-f", "-"]), Some(b"table ip6 lab_nat6 { chain postrouting { type nat hook postrouting priority srcnat; oifname \"eth0\" masquerade;\n\t}\n}\n"))?;
         Ok(())
     }
     fn v6_phase(&mut self, markers: &mut Vec<String>, phase: &str, permissive: bool) -> Result<()> {

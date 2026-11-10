@@ -3,7 +3,7 @@ use super::{
     Lab, Result,
     addresses::A,
     command::{Group, Invocation},
-    evidence::{self, Row},
+    evidence::{self},
     fail,
 };
 use rustix::process::Signal;
@@ -22,11 +22,66 @@ use std::{
 };
 
 mod control_cases;
+mod m2_cases;
 
-const CASES: [&str; 15] = [
-    "L6", "L7", "L13", "L16", "L17-V14", "L52", "L52b", "V03", "L3", "L4", "L10", "L14", "L43",
-    "L44", "L50",
+pub(super) fn short_boot_root(case: &str) -> std::path::PathBuf {
+    Path::new("/run/scupper-lab").join(format!("{}-{case}", std::process::id()))
+}
+
+pub(super) const CASES: [&str; 28] = [
+    "L1",
+    "L2",
+    "L5",
+    "L8",
+    "L9",
+    "L9b",
+    "L11",
+    "L12",
+    "L15",
+    "L18",
+    "L20",
+    "L17-rebuild",
+    "L6",
+    "L7",
+    "L13",
+    "L16",
+    "L17-V14",
+    "L52",
+    "L52b",
+    "V03",
+    "L3",
+    "L4",
+    "L10",
+    "L14",
+    "L43",
+    "L44",
+    "L50",
+    "L9-host-link",
 ];
+
+pub(super) fn host_rule_defaults(family: &str) -> &'static [(&'static str, &'static str)] {
+    if family == "-4" {
+        &[("0", "local"), ("32766", "main"), ("32767", "default")]
+    } else {
+        &[("0", "local"), ("32766", "main")]
+    }
+}
+
+// READY and startup WATCHDOG notifications precede the first reconciler tick.
+fn startup_complete(
+    ready: bool,
+    result: Option<&std::result::Result<scupper_proto::OpResult, scupper_proto::ApiError>>,
+) -> bool {
+    ready
+        && matches!(
+            result,
+            Some(Ok(scupper_proto::OpResult::Ping {
+                last_complete_iteration_age: Some(0..=4),
+                operation: None,
+                ..
+            }))
+        )
+}
 
 // Drain notifications continuously, including while fault commands or probes block.
 struct NotifyCapture {
@@ -118,6 +173,9 @@ struct DaemonGuard<'a> {
 impl DaemonGuard<'_> {
     #[allow(clippy::too_many_lines)] // Keep start/restart continuity and fault cleanup ordering together.
     fn run(&mut self, case: &str) -> Result<String> {
+        if m2_cases::is_m2(case) {
+            return self.run_m2(case);
+        }
         if matches!(case, "L10" | "L14" | "L43" | "L44" | "L50") {
             return self.run_control(case);
         }
@@ -361,9 +419,14 @@ impl DaemonGuard<'_> {
         }
         let restored = self
             .reset_control_fixture()
+            .and_then(|()| self.lab.restore_inheritance())
             .and_then(|()| self.lab.daemon_restore_host())
+            .and_then(|()| self.lab.restore_host_rules())
             .and_then(|()| self.lab.boot_gateway(&[], "daemon-restore"))
-            .and_then(|_| self.lab.daemon_clean_baseline())
+            .and_then(|_| self.reset_m2_network())
+            .and_then(|()| self.lab.wait_provider())
+            .and_then(|()| self.lab.boot_fresh_client_handshake())
+            .and_then(|()| self.lab.daemon_clean_baseline())
             .and_then(|()| super::mounts::verify_restored_peers(None))
             .and_then(|()| {
                 let run = self.lab.private.join("boot-root/run/scupper");
@@ -388,9 +451,18 @@ impl Drop for DaemonGuard<'_> {
 }
 
 impl Lab {
-    pub(super) fn daemon_case(&mut self) -> Result<String> {
+    pub(super) fn daemon_case(&mut self, selected: &str) -> Result<String> {
+        if !CASES.contains(&selected) {
+            return fail(format!("unknown daemon selection: {selected}"));
+        }
+        self.boot_root = short_boot_root(selected);
+        self.boot_root_ready = false;
+        self.prepare_check_v2()?;
+        let mut observation = String::new();
         let first_group = self.runner.background_checkpoint();
-        self.daemon_host_baseline = Some(self.daemon_host_sysctls()?);
+        if self.daemon_host_baseline.is_none() {
+            self.daemon_host_baseline = Some(self.daemon_host_sysctls()?);
+        }
         // Only this suite needs periodic client traffic during a real reboot.
         let key = self.cmd("client", "wg", &["show", "wg0", "peers"])?;
         let peer = key.trim();
@@ -401,13 +473,16 @@ impl Lab {
         )?;
         let mut failures = Vec::new();
         let mut blocked = None;
-        for case in CASES {
-            self.runner.phase = Instant::now()
-                + Duration::from_secs(if matches!(case, "L3" | "L50") {
-                    300
-                } else {
-                    180
-                });
+        for case in CASES.into_iter().filter(|case| *case == selected) {
+            self.runner.phase = self.runner.phase.max(
+                Instant::now()
+                    + Duration::from_secs(match case {
+                        "L9" => 1200,
+                        "L9b" => 900,
+                        "L3" | "L16" | "L50" | "L9-host-link" | "L11" => 300,
+                        _ => 180,
+                    }),
+            );
             let started = Instant::now();
             let observed = if let Some(cause) = &blocked {
                 fail(format!("skipped: baseline unavailable after {cause}"))
@@ -415,19 +490,16 @@ impl Lab {
                 self.daemon_clean_baseline()
                     .and_then(|()| self.daemon_trial(case))
             };
-            self.rows.push(Row {
-                name: format!("daemon-{case}"),
-                wanted: daemon_wanted(case).into(),
-                got: observed
+            eprintln!(
+                "daemon-{case}: elapsed_ms={}; {}",
+                started.elapsed().as_millis(),
+                observed
                     .as_ref()
-                    .cloned()
-                    .unwrap_or_else(|e| format!("failed: {e}")),
-                detail: format!(
-                    "elapsed_ms={}; isolated daemon; cleanup guard",
-                    started.elapsed().as_millis()
-                ),
-            });
-            evidence::save_results(&self.artifacts, &self.rows)?;
+                    .map_or_else(ToString::to_string, Clone::clone)
+            );
+            if let Ok(detail) = &observed {
+                observation.clone_from(detail);
+            }
             if let Err(error) = observed {
                 if blocked.is_none() && self.daemon_clean_baseline().is_err() {
                     blocked = Some(format!("{case}: {error}"));
@@ -450,7 +522,7 @@ impl Lab {
             })?;
             // Every daemon stream listener is allocated from this range.
             let sockets = self.cmd("internet", "ss", &["-H", "-lnt"])?;
-            for port in 8081..=8100 {
+            for port in 8081..=8120 {
                 if sockets
                     .split_whitespace()
                     .any(|word| word.ends_with(&format!(":{port}")))
@@ -469,9 +541,11 @@ impl Lab {
         if !failures.is_empty() {
             return fail(failures.join("; "));
         }
-        Ok("all daemon cases verified; guarded cleanup, notify evidence and clean shutdown".into())
+        Ok(observation)
     }
     fn daemon_trial(&mut self, case: &str) -> Result<String> {
+        self.fault_markers.clear();
+        self.reset_boot_budget(&format!("{case}-initial"))?;
         let events = self.private.join("boot-root/var-lib/scupper/events");
         if events.exists() {
             fs::remove_dir_all(events)?;
@@ -491,6 +565,67 @@ impl Lab {
             (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
             (Err(error), Err(cleanup)) => fail(format!("{error}; cleanup: {cleanup}")),
         }
+    }
+    pub(super) fn daemon_boot_crash(
+        &mut self,
+        stem: &str,
+        point: &str,
+    ) -> Result<std::process::ExitStatus> {
+        let root = self.boot_root.clone();
+        self.reset_boot_budget(stem)?;
+        self.runner.boot_point = Some(point.into());
+        self.runner.boot_marker = Some(
+            root.join("run/scupper/boot-reached")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let spawned = self.daemon_start(stem, &root);
+        self.runner.boot_point = None;
+        self.runner.boot_marker = None;
+        let (mut child, _notify) = spawned?;
+        child.wait_timeout(Duration::from_secs(30))
+    }
+    pub(super) fn daemon_boot_recover(&mut self, stem: &str) -> Result<String> {
+        let root = self.boot_root.clone();
+        self.reset_boot_budget(stem)?;
+        let (mut child, notify) = self.daemon_start(&format!("{stem}-retry"), &root)?;
+        self.daemon_ready_tick(&notify)?;
+        self.daemon_complete_tick(&root)?;
+        self.daemon_route_healthy(Duration::from_secs(30))?;
+        self.wait_provider()?;
+        self.boot_fresh_client_handshake()?;
+        self.exit_port = self
+            .cmd("scupper", "wg", &["show", "ex-ch1", "listen-port"])?
+            .trim()
+            .parse()?;
+        self.service_check(&mut Vec::new())?;
+        let (code, report) = self.check_result(&Self::boot_binary()?, &root)?;
+        fs::write(
+            self.artifacts.join(format!("{stem}-supervised-check.json")),
+            serde_json::to_vec_pretty(&report)?,
+        )?;
+        if code != 0 || report["verdict"].get("Protected").is_none() {
+            return fail(format!("{stem} supervised retry: {code}: {report}"));
+        }
+        child.stop_timeout(Signal::TERM, Duration::from_secs(30))?;
+        save_event_artifacts(
+            &root.join("var-lib/scupper/events"),
+            &self.artifacts.join(format!("{stem}-events")),
+        )?;
+        Ok(report.to_string())
+    }
+    // Each crash prefix represents a separate simulated boot, with its own /run
+    // retry budget. Preserve the preceding budget as evidence before resetting.
+    pub(super) fn reset_boot_budget(&self, stem: &str) -> Result<()> {
+        let path = self.private.join("boot-root/run/scupper/boot-attempts");
+        if path.exists() {
+            fs::copy(
+                &path,
+                self.artifacts.join(format!("{stem}-boot-attempts.json")),
+            )?;
+            fs::remove_file(path)?;
+        }
+        Ok(())
     }
     fn daemon_host_sysctls(&mut self) -> Result<Vec<(String, String)>> {
         let mut values = Vec::new();
@@ -525,7 +660,50 @@ impl Lab {
         self.cmd("gwhost", "conntrack", &["-F"])?;
         Ok(())
     }
+    pub(super) fn restore_host_rules(&mut self) -> Result<()> {
+        for family in ["-4", "-6"] {
+            for &(pref, table) in host_rule_defaults(family) {
+                let rules: serde_json::Value = serde_json::from_str(&self.cmd(
+                    "gwhost",
+                    "ip",
+                    &[family, "-j", "rule", "show"],
+                )?)?;
+                if !rules.as_array().ok_or("host rules")?.iter().any(|r| {
+                    r["priority"]
+                        .as_u64()
+                        .is_some_and(|p| p.to_string() == pref)
+                        && r["table"] == table
+                }) {
+                    self.cmd(
+                        "gwhost",
+                        "ip",
+                        &[family, "rule", "add", "pref", pref, "lookup", table],
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
     pub(super) fn daemon_clean_baseline(&mut self) -> Result<()> {
+        for family in ["-4", "-6"] {
+            let rules: serde_json::Value = serde_json::from_str(&self.cmd(
+                "gwhost",
+                "ip",
+                &[family, "-j", "rule", "show"],
+            )?)?;
+            for &(pref, table) in host_rule_defaults(family) {
+                if !rules.as_array().ok_or("host rules")?.iter().any(|r| {
+                    r["table"] == table
+                        && r["priority"]
+                            .as_u64()
+                            .is_some_and(|p| p.to_string() == pref)
+                }) {
+                    return fail(format!(
+                        "unclean baseline: missing host {family} pref {pref} {table} rule"
+                    ));
+                }
+            }
+        }
         if let Some(expected) = self.daemon_host_baseline.clone()
             && self.daemon_host_sysctls()? != expected
         {
@@ -583,7 +761,7 @@ impl Lab {
     fn daemon_start(&mut self, case: &str, root: &Path) -> Result<(Group, NotifyCapture)> {
         let artifacts = self.artifacts.join(format!("daemon-{case}"));
         fs::create_dir_all(&artifacts)?;
-        let notify_path = self.private.join(format!("notify-{case}.sock"));
+        let notify_path = self.daemon_notify_path(case)?;
         let notify = NotifyCapture::start(
             UnixDatagram::bind(&notify_path)?,
             &artifacts.join("notify.jsonl"),
@@ -591,12 +769,21 @@ impl Lab {
         let child = self.daemon_spawn(case, root, "start")?;
         Ok((child, notify))
     }
+    fn daemon_notify_path(&self, case: &str) -> Result<std::path::PathBuf> {
+        use std::os::fd::AsRawFd as _;
+        let directory = self
+            .private_dir
+            .as_ref()
+            .ok_or("private directory not open")?;
+        Ok(std::path::PathBuf::from(format!(
+            "/proc/{}/fd/{}/notify-{case}.sock",
+            std::process::id(),
+            directory.as_raw_fd()
+        )))
+    }
     fn daemon_spawn(&mut self, case: &str, root: &Path, stage: &str) -> Result<Group> {
         let daemon = Self::boot_binary()?.with_file_name("scupperd");
-        let env = format!(
-            "NOTIFY_SOCKET={}",
-            self.private.join(format!("notify-{case}.sock")).display()
-        );
+        let env = format!("NOTIFY_SOCKET={}", self.daemon_notify_path(case)?.display());
         self.runner.background(
             &Invocation::new(
                 "gwhost",
@@ -613,18 +800,31 @@ impl Lab {
     }
     fn daemon_ready_tick(&mut self, notify: &NotifyCapture) -> Result<()> {
         let mut ready = false;
-        let mut complete = false;
-        self.daemon_wait(
+        let root = self.boot_root.join("run/scupper");
+        let mut last_ping = String::new();
+        let waited = self.daemon_wait(
             "READY and first complete tick",
             Duration::from_secs(40),
             |_| {
                 for message in notify.drain()? {
                     ready |= message == "READY=1";
-                    complete |= message == "WATCHDOG=1";
                 }
-                Ok(ready && complete)
+                let response = scupper_sys::daemon::control::call(
+                    &root,
+                    &scupper_sys::daemon::control::request(scupper_proto::Op::Ping {}),
+                    Duration::from_millis(500),
+                );
+                last_ping = format!("{response:?}");
+                Ok(startup_complete(
+                    ready,
+                    response.as_ref().ok().map(|r| &r.result),
+                ))
             },
-        )?;
+        );
+        if let Err(error) = waited {
+            return fail(format!("{error}; ready={ready}; last ping={last_ping}"));
+        }
+        self.assert_transport_ports()?;
         Ok(())
     }
     fn daemon_complete_tick(&mut self, root: &Path) -> Result<()> {
@@ -891,13 +1091,13 @@ impl Lab {
                         .contains("unreachable"))
                 })?;
                 let (code, report) = self.check_result(&Self::boot_binary()?, root)?;
-                if code != 4 {
+                if code != 4 || report["verdict"]["FailClosed"] != "NoHealthyExit" {
                     return fail(format!("L16 expected 4: {code}: {report}"));
                 }
                 self.cmd("scupper", "ip", &["link", "set", "ex-ch1", "up"])?;
                 let up = self.daemon_route_healthy(Duration::from_secs(70))?;
                 let (code, report) = self.check_result(&Self::boot_binary()?, root)?;
-                if code != 0 {
+                if code != 0 || report["verdict"].get("Protected").is_none() {
                     return fail(format!("L16 expected recovered check 0: {code}: {report}"));
                 }
                 format!(
@@ -948,7 +1148,7 @@ impl Lab {
                     child.supervised_pid()?,
                 )?;
                 super::mounts::verify_restored_peers(child.supervised_pid()?)?;
-                if code != 0 {
+                if code != 0 || report["verdict"].get("Protected").is_none() {
                     return fail(format!("L17 fresh check expected 0: {code}: {report}"));
                 }
                 let after = NetnsHandle::open("/run/netns/scupper")?.identity();
@@ -1062,14 +1262,30 @@ impl Lab {
         self.daemon_capture_control(&stem)?;
         Ok(measurement)
     }
-    fn daemon_oracle(
+    pub(super) fn daemon_oracle(
         &self,
         stem: &str,
         markers: &[String],
         old_port: u16,
         new_port: u16,
     ) -> Result<()> {
-        let mut text = evidence::policy_with_exit_port(markers, false, old_port)?;
+        let mut text = evidence::policy_for_case(markers, false, old_port, stem == "daemon-L11")?;
+        let combined: Vec<_> = markers.iter().chain(&self.fault_markers).collect();
+        text = text
+            .lines()
+            .map(|line| {
+                if line.starts_with("canary_markers = ") {
+                    Ok(format!(
+                        "canary_markers = {}",
+                        serde_json::to_string(&combined)?
+                    ))
+                } else {
+                    Ok(line.to_owned())
+                }
+            })
+            .collect::<Result<Vec<_>>>()?
+            .join("\n");
+
         if old_port != new_port {
             write!(
                 text,
@@ -1170,7 +1386,9 @@ impl Lab {
             ],
         )?;
         let (code, report) = self.check_result(&Self::boot_binary()?, root)?;
-        if code != 2 {
+        if code != 2
+            || !control_cases::verdict_reason(&report["verdict"]["Unprotected"], "ForeignLink")
+        {
             return fail(format!("L13 expected check 2: {code}: {report}"));
         }
         let control_stem = format!("{stem}-foreign-control");
@@ -1450,7 +1668,7 @@ impl Lab {
                     && after[0]["ifindex"] != before[0]["ifindex"])
             })?;
             self.runner.dwell(Duration::from_secs(3))?;
-            let root = self.private.join("boot-root");
+            let root = self.boot_root.clone();
             let report: scupper_sys::boot::BootReport =
                 serde_json::from_slice(&fs::read(root.join("run/scupper/boot.json"))?)?;
             let after: serde_json::Value = serde_json::from_str(&self.cmd(
@@ -1509,9 +1727,9 @@ impl Lab {
                 Ok(flow_counts(udp_log)?.0 >= closed_count + 40)
             },
         )?;
-        let root = self.private.join("boot-root");
+        let root = self.boot_root.clone();
         let (code, report) = self.check_result(&Self::boot_binary()?, &root)?;
-        if code != 4 {
+        if code != 4 || report["verdict"]["FailClosed"] != "NoHealthyExit" {
             return fail(format!("L3 expected check 4: {code}: {report}"));
         }
         let checked_count = flow_counts(udp_log)?.0;
@@ -1612,8 +1830,23 @@ pub(super) fn foreign_control(bytes: &[u8], markers: &[String]) -> Result<usize>
     Ok(seen)
 }
 
-fn daemon_wanted(case: &str) -> &'static str {
+pub(super) fn daemon_wanted(case: &str) -> &'static str {
     match case {
+        "L1" => "baseline IPv4; WireGuard-only uplink and provider-NAT receipts",
+        "L2" => "gateway replies only over wg0; M2 DNS/API service requests dropped",
+        "L5" => "host RPDB/non-default route flush; check remains 0",
+        "L8" => "host nft flush/forwarding/dup cannot affect client path",
+        "L9" | "L9b" | "L9-host-link" => {
+            "daemon boot SIGKILL prefixes contained; supervised retry check 0"
+        }
+        "L11" => "second client isolation; gateway/provider scans denied; allowed client echo",
+        "L12" => "WireGuard source rejection; widened peer check 2; traced antispoof drop",
+        "L15" => "real fake HTTPS exit-IP target: 0, uplink address 2, restored 0",
+        "L18" => "host sysctl inheritance overridden; forwarding toggle reapplies hardening",
+        "L20" => "supervised IPv4 PMTU; IPv6 renderer chain property, unsupervised",
+        "L17-rebuild" => {
+            "no-holder loss = daemon down; restart rebuilds; fresh namespace marker; check 0"
+        }
         "L10" => "SIGKILL/SIGSTOP: check 5, traffic continues; SIGCONT: check 0",
         "L14" => "disconnect verifies closure; check 4 across reboot; connect restores 0",
         "L43" => {
@@ -1651,12 +1884,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn readiness_requires_ready_and_a_recent_completed_iteration() {
+        // Startup can send READY, STATUS=unconfirmed and WATCHDOG while Ping
+        // still has no completed iteration. Those notifications cannot pass.
+        let ping = |age| {
+            Ok(scupper_proto::OpResult::Ping {
+                last_complete_iteration_age: age,
+                current_iteration_age: None,
+                operation: None,
+                netns: scupper_core::verdict::v2::NetnsIdentity {
+                    device: 1,
+                    inode: 2,
+                },
+                version: 1,
+                quarantined: false,
+                selection: scupper_core::verdict::v2::Selection::Auto,
+            })
+        };
+        assert!(!startup_complete(false, Some(&ping(Some(0)))));
+        assert!(!startup_complete(true, None));
+        assert!(!startup_complete(true, Some(&ping(None))));
+        assert!(!startup_complete(true, Some(&ping(Some(5)))));
+        assert!(startup_complete(true, Some(&ping(Some(0)))));
+        assert!(startup_complete(true, Some(&ping(Some(4)))));
+        let mut applying = ping(Some(0));
+        if let Ok(scupper_proto::OpResult::Ping { operation, .. }) = &mut applying {
+            *operation = Some(scupper_proto::OperationProgress {
+                kind: scupper_proto::OperationKind::Rebuild,
+                from: 1,
+                to: 1,
+                age: 0,
+            });
+        }
+        assert!(!startup_complete(true, Some(&applying)));
+    }
+
+    #[test]
     fn copied_event_artifacts_are_readable_without_changing_sources() {
-        let root = std::env::var_os("CARGO_TARGET_TMPDIR")
-            .map_or_else(
-                || std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../target/tmp")),
-                std::path::PathBuf::from,
-            )
+        let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
             .join("daemon-event-artifacts")
             .join(std::process::id().to_string());
         let source = root.join("source");
@@ -1682,11 +1947,7 @@ mod tests {
     #[test]
     fn notify_capture_survives_idle_and_sender_restart() {
         use std::os::fd::AsRawFd;
-        let root = std::env::var_os("CARGO_TARGET_TMPDIR")
-            .map_or_else(
-                || std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../target/tmp")),
-                std::path::PathBuf::from,
-            )
+        let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
             .join(format!("notify-restart-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         let directory = fs::File::open(&root).unwrap();
@@ -1713,11 +1974,7 @@ mod tests {
 
     #[test]
     fn notify_artifact_keeps_every_message_even_when_consumers_drain() {
-        let root = std::env::var_os("CARGO_TARGET_TMPDIR")
-            .map_or_else(
-                || std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../target/tmp")),
-                std::path::PathBuf::from,
-            )
+        let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
             .join("daemon-notify-artifacts")
             .join(std::process::id().to_string());
         fs::create_dir_all(&root).unwrap();

@@ -11,14 +11,17 @@ mod flow;
 mod helpers;
 mod mounts;
 mod probe_child;
+mod shard;
+pub use shard::{Shard, list, list_with_durations};
 mod topology;
+mod transport;
 
 use addresses::A;
 use cleanup::{Registry, Resource};
 use command::{Group, Invocation, Runner};
-use evidence::{Case, Row};
+use evidence::Row;
 pub use flow::flow;
-pub use helpers::{inject, probe, sink};
+pub use helpers::{inject, probe, send_packet, sink};
 use rustix::process::Signal;
 use scupper_core::{
     config::{GatewayId, ValidatedSite},
@@ -41,17 +44,34 @@ fn fail<T>(message: impl Into<String>) -> Result<T> {
     Err(message.into().into())
 }
 
-const NAMESPACES: [&str; 8] = [
+const NAMESPACES: [&str; 10] = [
     "rulecap",
+    "scupper-inherit",
     "wan",
     "gwhost",
     "scupper",
     "client",
+    "client2",
     "provA",
     "internet",
     "scupper-verify",
 ];
 const SITE: &str = include_str!("../../lab/site-lab.toml");
+
+fn add_second_client(
+    config: &mut scupper_core::config::SiteConfig,
+    public_key: &str,
+) -> Result<()> {
+    let mut device = config
+        .devices
+        .get("client")
+        .ok_or("missing client template")?
+        .clone();
+    device.public_key.0 = public_key.into();
+    device.address4 = "10.99.0.3/32".into();
+    config.devices.insert("client2".into(), device);
+    Ok(())
+}
 
 struct Capture {
     process: Group,
@@ -59,12 +79,15 @@ struct Capture {
 }
 
 struct Lab {
+    boot_root: PathBuf,
+    boot_root_ready: bool,
     runner: Runner,
     registry: Registry,
     services: Vec<Group>,
     captures: Vec<Capture>,
     artifacts: PathBuf,
     private: PathBuf,
+    private_dir: Option<fs::File>,
     executable: String,
     public_keys: Vec<String>,
     site: ValidatedSite,
@@ -74,8 +97,12 @@ struct Lab {
     cleaned: bool,
     baseline_failure: Option<String>,
     daemon_host_baseline: Option<Vec<(String, String)>>,
+    inheritance: Option<boot::InheritanceGuard>,
+    host_sysctls: Option<boot::InheritanceGuard>,
+    fault_markers: Vec<String>,
     next_source_port: u16,
     exit_port: u16,
+    client_ports_ready: bool,
 }
 
 /// Runs the reference namespace lab, preserving captures, policies and reports.
@@ -83,7 +110,12 @@ struct Lab {
 /// # Errors
 /// Refuses non-Linux/non-root execution, occupied resource names, command failures,
 /// timeouts, failed service checks, leaks or blind positive controls.
-pub fn run(artifacts: &Path, capture_fixtures: Option<&Path>) -> Result<()> {
+pub fn run(
+    artifacts: &Path,
+    capture_fixtures: Option<&Path>,
+    shard: Shard,
+    durations: Option<&Path>,
+) -> Result<()> {
     if !rustix::process::geteuid().is_root() {
         return fail("leaktest requires root on a disposable Linux machine");
     }
@@ -96,7 +128,7 @@ pub fn run(artifacts: &Path, capture_fixtures: Option<&Path>) -> Result<()> {
     .into_iter()
     .map(|signal| signal_hook::flag::register(signal, Arc::clone(&cancel)))
     .collect::<std::io::Result<_>>()?;
-    let result = run_inner(artifacts, capture_fixtures, cancel);
+    let result = run_inner(artifacts, capture_fixtures, cancel, shard, durations);
     for signal in signals {
         signal_hook::low_level::unregister(signal);
     }
@@ -120,29 +152,42 @@ fn make_artifacts_readable(root: &Path) -> Result<()> {
     }
     Ok(())
 }
+#[allow(clippy::too_many_lines)] // Keep setup, per-case summaries and final cleanup together.
 fn run_inner(
     artifacts: &Path,
     capture_fixtures: Option<&Path>,
     cancel: Arc<AtomicBool>,
+    shard: Shard,
+    durations: Option<&Path>,
 ) -> Result<()> {
     fs::create_dir_all(artifacts)?;
     let artifacts = fs::canonicalize(artifacts)?;
-    let runner = Runner::new(fs::File::create(artifacts.join("commands.jsonl"))?, cancel);
+    let mut runner = Runner::new(fs::File::create(artifacts.join("commands.jsonl"))?, cancel);
+    let selected = shard::selected_recorded(shard, durations)?;
+    runner.whole = Instant::now()
+        + Duration::from_secs(selected.iter().map(|case| case.seconds).sum::<u64>() * 2 + 600);
     let config = scupper_core::config::parse_site(SITE)?;
     let site = scupper_core::config::validate(config)
         .map_err(|errors| format!("lab config: {errors:?}"))?;
-    let private = PathBuf::from("/run").join(format!("scupper-lab-{}", Lab::marker()?));
+    let temporary = PathBuf::from(
+        std::env::var_os("CARGO_TARGET_TMPDIR").ok_or("CARGO_TARGET_TMPDIR is required")?,
+    );
+    fs::create_dir_all(&temporary)?;
+    let private = fs::canonicalize(temporary)?.join(format!("scupper-lab-{}", Lab::marker()?));
     if private.starts_with(&artifacts) {
-        return fail("artifact directory must not contain the private /run directory");
+        return fail("artifact directory must not contain the private temporary directory");
     }
     let rules = private.join("netns.nft");
     let mut lab = Lab {
+        boot_root: daemon::short_boot_root("setup"),
+        boot_root_ready: false,
         runner,
         registry: Registry::default(),
         services: Vec::new(),
         captures: Vec::new(),
         artifacts,
         private,
+        private_dir: None,
         executable: std::env::current_exe()?.to_string_lossy().into_owned(),
         public_keys: Vec::new(),
         site,
@@ -152,8 +197,12 @@ fn run_inner(
         cleaned: false,
         baseline_failure: None,
         daemon_host_baseline: None,
+        inheritance: None,
+        host_sysctls: None,
+        fault_markers: Vec::new(),
         next_source_port: 20000,
         exit_port: 51821,
+        client_ports_ready: false,
     };
     let outcome: Result<()> = (|| {
         lab.preflight()?;
@@ -161,34 +210,52 @@ fn run_inner(
         lab.build()?;
         Lab::verify_handle_execution()?;
         lab.service_check(&mut Vec::new())?;
-        lab.boot_cases()?;
         if let Some(dir) = capture_fixtures {
             lab.fixtures(dir)?;
         }
+        evidence::save_setup(&lab.artifacts, &mut lab.rows)?;
         let mut failures = Vec::new();
-        for case in Case::ALL {
-            lab.runner.phase = Instant::now() + Duration::from_secs(140);
+        for spec in &selected {
+            lab.runner.phase = Instant::now() + Duration::from_secs(spec.seconds + 120);
+            let started = Instant::now();
+            let skipped = lab.baseline_failure.is_some();
             let result = if let Some(cause) = &lab.baseline_failure {
                 fail(format!("skipped: daemon baseline unavailable: {cause}"))
             } else {
-                lab.case(case)
+                match spec.kind {
+                    shard::Kind::Daemon => lab.daemon_case(spec.id.trim_start_matches("daemon-")),
+                    shard::Kind::Legacy(case) => lab.case(case),
+                }
             };
             let (got, detail) = match &result {
                 Ok(observed) => (
-                    observed.clone(),
-                    "before/after provider-NAT service checks and oracle assertions passed".into(),
+                    "passed".into(),
+                    format!("elapsed_ms={}; {observed}", started.elapsed().as_millis()),
                 ),
-                Err(error) => (format!("failed: {error}"), error.to_string()),
+                Err(error) => (
+                    if skipped { "skipped" } else { "failed" }.into(),
+                    format!("elapsed_ms={}; {error}", started.elapsed().as_millis()),
+                ),
             };
+            evidence::save_setup(&lab.artifacts, &mut lab.rows)?;
             lab.rows.push(Row {
-                name: case.name().into(),
-                wanted: case.wanted().into(),
+                name: spec.id.clone(),
+                wanted: match spec.kind {
+                    shard::Kind::Daemon => {
+                        daemon::daemon_wanted(spec.id.trim_start_matches("daemon-")).into()
+                    }
+                    shard::Kind::Legacy(case) => case.wanted().into(),
+                },
                 got,
                 detail,
             });
             evidence::save_results(&lab.artifacts, &lab.rows)?;
             if let Err(error) = result {
-                failures.push(format!("{}: {error}", case.name()));
+                failures.push(format!("{}: {error}", spec.id));
+                lab.runner.phase = Instant::now() + Duration::from_secs(90);
+                if let Err(cause) = lab.daemon_clean_baseline() {
+                    lab.baseline_failure = Some(cause.to_string());
+                }
             }
         }
         if failures.is_empty() {
@@ -208,6 +275,20 @@ fn run_inner(
             });
         }
     }
+    for spec in &selected {
+        if !lab.rows.iter().any(|row| row.name == spec.id) {
+            lab.rows.push(Row {
+                name: spec.id.clone(),
+                wanted: "complete trial".into(),
+                got: "skipped".into(),
+                detail: outcome.as_ref().err().map_or_else(
+                    || "trial was not executed".into(),
+                    |e| format!("setup/runner failure: {e}"),
+                ),
+            });
+        }
+    }
+    evidence::save_setup(&lab.artifacts, &mut lab.rows)?;
     evidence::save_results(&lab.artifacts, &lab.rows)?;
     let cleanup = lab.cleanup();
     match (outcome, cleanup) {
@@ -221,6 +302,10 @@ impl Lab {
         self.runner.run(&Invocation::new(ns, program, args))
     }
     fn preflight(&mut self) -> Result<()> {
+        if let Some(parent) = self.private.parent() {
+            boot::refuse_unrestored_sysctls(parent)?;
+        }
+
         for path in ["/etc/passwd", "/etc/group"] {
             if fs::read_to_string(path)?
                 .lines()
@@ -272,14 +357,19 @@ impl Lab {
         self.registry
             .register(Resource::User("scupper-probe".into()));
         fs::DirBuilder::new().mode(0o700).create(&self.private)?;
+        self.private_dir = Some(fs::File::open(&self.private)?);
         self.registry
             .register(Resource::Directory(self.private.clone()));
+        self.prepare_transport()?;
+        let mut host = boot::InheritanceGuard::save()?;
+        host.persist(self.private.join("host-sysctls.json"))?;
+        self.host_sysctls = Some(host);
         let resolver_dir = PathBuf::from("/etc/netns/scupper");
         fs::create_dir_all(&resolver_dir)?;
         self.registry
             .register(Resource::Directory(resolver_dir.clone()));
         fs::write(resolver_dir.join("resolv.conf"), "nameserver 127.0.0.53\n")?;
-        for key in ["gateway", "exit", "provider", "client"] {
+        for key in ["gateway", "exit", "provider", "client", "client2"] {
             let private = self.cmd("", "wg", &["genkey"])?;
             let path = self.private.join(format!("{key}.key"));
             let mut file = fs::OpenOptions::new()
@@ -319,6 +409,7 @@ impl Lab {
             .public_key
             .0
             .clone_from(&self.public_keys[3]);
+        add_second_client(&mut config, &self.public_keys[4])?;
         fs::write(
             self.private.join("runtime-site.toml"),
             toml::to_string(&config)?,
@@ -531,6 +622,7 @@ impl Lab {
             "-Z",
             "root",
             "-U",
+            "--immediate-mode",
             "-s",
             "0",
             "-i",
@@ -563,7 +655,11 @@ impl Lab {
     }
     fn stop_capture(&mut self) -> Result<()> {
         let mut capture = self.captures.pop().ok_or("missing capture process")?;
-        capture.process.stop(Signal::INT)?;
+        // Pop before checking deadlines so cancellation cannot strand the same
+        // capture in stop_captures' loop. Still request graceful shutdown.
+        let drained = self.runner.dwell(Duration::from_millis(1100));
+        let stopped = capture.process.stop(Signal::INT);
+        drained.and(stopped)?;
         evidence::check_capture_stats(&fs::read_to_string(capture.stderr)?)
     }
     fn stop_captures(&mut self) -> Result<()> {
@@ -590,6 +686,9 @@ impl Lab {
         let mut failures = Vec::new();
         let mut notes = Vec::new();
         if let Err(error) = mounts::save(&self.artifacts, "before-teardown", None) {
+            failures.push(error.to_string());
+        }
+        if let Err(error) = self.restore_inheritance() {
             failures.push(error.to_string());
         }
         if let Err(error) = self.stop_captures() {
@@ -626,9 +725,20 @@ impl Lab {
                 failures.push(error.to_string());
             }
         }
+        if let Some(host) = &mut self.host_sysctls
+            && let Err(error) = host.restore()
+        {
+            failures.push(format!("host sysctl restoration: {error}"));
+            // Keep the durable originals available to the next preflight.
+            self.registry
+                .unregister(&Resource::Directory(self.private.clone()));
+        }
         match self.registry.cleanup(&mut self.runner) {
             Ok(reports) => notes.extend(reports),
             Err(error) => failures.push(error.to_string()),
+        }
+        if let Err(error) = self.preflight() {
+            failures.push(format!("final host verification: {error}"));
         }
         let text = if failures.is_empty() {
             format!("ok\n{}", notes.join("\n"))

@@ -99,8 +99,16 @@ jobs:
         run: timeout 600 cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Unit tests without testing
         run: timeout 600 cargo test --workspace --lib --bins --locked
-      - name: Release daemon
-        run: timeout 600 cargo build -p scupperd --release --locked
+      - name: Release CLI and daemon
+        run: timeout 600 cargo build -p scupper -p scupperd --release --locked
+      - name: Verify testing hooks absent from release artifacts
+        run: |
+          for binary in scupper scupperd; do
+            if grep -aEq 'SCUPPER_TEST_BOOT_POINT|SCUPPER_TEST_CA_DER|injected boot stop' target/release/$binary; then
+              echo "testing hook found in release $binary"
+              exit 1
+            fi
+          done
 
   musl:
     if: ${{ !startsWith(github.ref, 'refs/heads/lab/') }}
@@ -130,7 +138,7 @@ jobs:
           rustup target add x86_64-unknown-linux-musl
 
       - name: Build musl release
-        run: cargo build -p scupper -p scupperd --bins --release --locked --target x86_64-unknown-linux-musl
+        run: timeout 600 cargo build -p scupper -p scupperd --bins --release --locked --target x86_64-unknown-linux-musl
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
 
@@ -141,6 +149,10 @@ jobs:
           printf '%s\n' "$description"
           [[ "$description" == *'ELF 64-bit LSB'* && "$description" == *'x86-64'* ]]
           [[ "$description" == *'statically linked'* || "$description" == *'static-pie linked'* ]]
+            if grep -aEq 'SCUPPER_TEST_BOOT_POINT|SCUPPER_TEST_CA_DER|injected boot stop' target/x86_64-unknown-linux-musl/release/$binary; then
+              echo "testing hook found in musl $binary"
+              exit 1
+            fi
           done
 
       - uses: actions/upload-artifact@v4
@@ -156,10 +168,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        shard: [1, 2, 3, 4]
         # Lab branches run one runner to save CI minutes; main runs both.
         runner: ${{ startsWith(github.ref, 'refs/heads/lab/') && fromJSON('["ubuntu-24.04"]') || fromJSON('["ubuntu-24.04", "ubuntu-22.04"]') }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 40
+    timeout-minutes: 100
     steps:
       - uses: actions/checkout@v4
         with:
@@ -172,7 +185,10 @@ jobs:
         run: |
           # conntrack is required by boot when rebuilding an existing namespace.
           sudo timeout 300 apt-get update
-          sudo timeout 300 apt-get install -y wireguard-tools nftables iproute2 tcpdump dnsmasq-base util-linux iputils-ping conntrack slirp4netns
+          sudo timeout 300 apt-get install -y wireguard-tools nftables iproute2 tcpdump dnsmasq-base util-linux iputils-ping conntrack slirp4netns openssl
+
+      - name: Check shard budget using built-in duration estimates
+        run: timeout 600 cargo test -p xtask --lib ci_shard_budget_uses_builtin_estimates_and_rejects_over_budget --locked
 
       - name: Build namespace lab
         run: timeout 600 cargo build -p xtask --release --locked
@@ -181,7 +197,7 @@ jobs:
         run: timeout 600 cargo build -p scupper -p scupperd --features testing --locked
 
       - name: Run boot-built namespace lab
-        run: sudo timeout 1800 target/release/xtask leaktest --artifacts lab-out --capture-fixtures lab-out/fixtures
+        run: sudo --preserve-env=CARGO_TARGET_TMPDIR timeout 3600 target/release/xtask leaktest --shard ${{ matrix.shard }}/4 --artifacts lab-out --capture-fixtures lab-out/fixtures
 
       - name: Make lab diagnostics readable
         if: always()
@@ -193,7 +209,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: leaktest-${{ matrix.runner }}
+          name: leaktest-${{ matrix.runner }}-shard-${{ matrix.shard }}
           path: lab-out
           retention-days: 14
           if-no-files-found: warn

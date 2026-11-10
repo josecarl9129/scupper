@@ -59,6 +59,14 @@ pub(super) fn policy_with_exit_port(
     auxiliary: bool,
     exit_port: u16,
 ) -> Result<String> {
+    policy_for_case(markers, auxiliary, exit_port, false)
+}
+pub(super) fn policy_for_case(
+    markers: &[String],
+    auxiliary: bool,
+    exit_port: u16,
+    client2: bool,
+) -> Result<String> {
     let mut text = format!(
         "uplink_addrs = {}\nforbidden_addrs = {}\ncanary_markers = {}\narp = true\nndp = true\nmin_packets = {}\nexpect = {}\n",
         serde_json::to_string(&if auxiliary {
@@ -97,10 +105,14 @@ pub(super) fn policy_with_exit_port(
             A.bridge_wan_v6
         )?;
     } else {
-        for (local_port, remote, remote_port) in [
+        let mut pairs = vec![
             (51820, A.client.peer, 51820),
             (exit_port, A.provider.peer, 51820),
-        ] {
+        ];
+        if client2 {
+            pairs.push((51820, A.client2.peer, 51820));
+        }
+        for (local_port, remote, remote_port) in pairs {
             write!(
                 text,
                 "\n[[wireguard]]\ngateway = \"{}:{local_port}\"\npeer = \"{remote}:{remote_port}\"\n",
@@ -118,7 +130,12 @@ pub(super) fn report(
     auxiliary: bool,
     port: u16,
 ) -> Result<Report> {
-    let text = policy_with_exit_port(markers, auxiliary, port)?;
+    let text = policy_for_case(
+        markers,
+        auxiliary,
+        port,
+        matches!(stem, "daemon-L11" | "daemon-L11-control"),
+    )?;
     fs::write(dir.join(format!("{stem}.policy.toml")), &text)?;
     let report = classify(
         &fs::read(dir.join(format!("{stem}.pcap")))?,
@@ -268,10 +285,21 @@ pub(super) struct Row {
     pub detail: String,
 }
 pub(super) fn save_results(dir: &Path, rows: &[Row]) -> Result<()> {
-    let mut tsv = "name\twanted\tgot\tdetail\n".to_owned();
+    let mut tsv = "name\twanted\tgot\telapsed_ms\tdetail\n".to_owned();
     for row in rows {
-        let cells = [&row.name, &row.wanted, &row.got, &row.detail]
-            .map(|s| s.replace(['\t', '\n', '\r'], " "));
+        let elapsed = row
+            .detail
+            .split(';')
+            .find_map(|v| v.trim().strip_prefix("elapsed_ms="))
+            .unwrap_or("0");
+        let cells = [
+            row.name.as_str(),
+            &row.wanted,
+            &row.got,
+            elapsed,
+            &row.detail,
+        ]
+        .map(|s| s.replace(['\t', '\n', '\r'], " "));
         tsv.push_str(&cells.join("\t"));
         tsv.push('\n');
     }
@@ -280,9 +308,46 @@ pub(super) fn save_results(dir: &Path, rows: &[Row]) -> Result<()> {
     Ok(())
 }
 
+// Setup and nested checkpoint observations are diagnostics, not shard cases.
+pub(super) fn save_setup(dir: &Path, rows: &mut Vec<Row>) -> Result<()> {
+    let mut saved: Vec<Row> = match fs::read(dir.join("setup-results.json")) {
+        Ok(bytes) => serde_json::from_slice(&bytes)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e.into()),
+    };
+    let mut cases = Vec::new();
+    for row in rows.drain(..) {
+        if matches!(row.got.as_str(), "passed" | "failed" | "skipped")
+            && super::shard::catalog().iter().any(|s| s.id == row.name)
+        {
+            cases.push(row);
+        } else {
+            saved.push(row);
+        }
+    }
+    *rows = cases;
+    fs::write(
+        dir.join("setup-results.json"),
+        serde_json::to_vec_pretty(&saved)?,
+    )?;
+    Ok(())
+}
+
 // A running tcpdump with a readable pcap is insufficient if its socket lost
 // packets. Require its normal shutdown statistics and zero reported loss.
 pub(super) fn check_capture_stats(stderr: &str) -> Result<()> {
+    let count = |suffix: &str| {
+        stderr
+            .lines()
+            .find_map(|line| line.strip_suffix(suffix)?.trim().parse::<u64>().ok())
+    };
+    if count("packets captured") == Some(0)
+        && count("packets received by filter").is_some_and(|n| n > 0)
+    {
+        return super::fail(
+            "capture harness error: tcpdump received packets but captured zero; capture was not drained",
+        );
+    }
     let mut kernel_stats = false;
     for line in stderr.lines() {
         if line.ends_with("packets dropped by kernel")

@@ -3,6 +3,7 @@
 mod control;
 mod decode;
 mod dns;
+pub(crate) mod path;
 mod policy;
 mod reader;
 
@@ -719,6 +720,7 @@ pub(crate) struct Observed {
 pub(crate) fn observe(bytes: &[u8]) -> Result<Vec<Observed>, Error> {
     let capture = reader::read(bytes)?;
     let mut observed = Vec::new();
+    let mut pending = BTreeMap::<Key, Assembly>::new();
     for (index, record) in capture.records.iter().enumerate() {
         if record.truncated {
             return Err(Error::Capture("truncated case evidence".into()));
@@ -732,8 +734,31 @@ pub(crate) fn observe(bytes: &[u8]) -> Result<Vec<Observed>, Error> {
         if let Link::Ip(data) = linked {
             let ip =
                 decode::ip(data, false).map_err(|e| Error::Capture(format!("case IP: {e:?}")))?;
-            if ip.truncated || ip.fragment.is_some() {
+            if ip.truncated {
                 return Err(Error::Capture("incomplete case datagram".into()));
+            }
+            if let Some(fragment) = &ip.fragment {
+                let assembly = pending.entry(fragment.key.clone()).or_default();
+                assembly.add(index, fragment, ip.payload, ip.hop_limit);
+                if let Some(reason) = &assembly.error {
+                    return Err(Error::Capture(format!("case fragments: {reason:?}")));
+                }
+                if assembly.complete() {
+                    let first = assembly.indices[0];
+                    let payload = assembly
+                        .reassemble()
+                        .map_err(|reason| Error::Capture(format!("case fragments: {reason:?}")))?;
+                    observed.push(Observed {
+                        timestamp: capture.records[first].timestamp.clone(),
+                        index: first + 1,
+                        source: ip.src,
+                        destination: ip.dst,
+                        protocol: ip.proto,
+                        payload,
+                    });
+                    pending.remove(&fragment.key);
+                }
+                continue;
             }
             observed.push(Observed {
                 timestamp: record.timestamp.clone(),
@@ -745,6 +770,10 @@ pub(crate) fn observe(bytes: &[u8]) -> Result<Vec<Observed>, Error> {
             });
         }
     }
+    if !pending.is_empty() {
+        return Err(Error::Capture("incomplete case datagram".into()));
+    }
+    observed.sort_by_key(|packet| packet.index);
     Ok(observed)
 }
 
@@ -752,6 +781,24 @@ pub(crate) fn observe(bytes: &[u8]) -> Result<Vec<Observed>, Error> {
 #[allow(clippy::unwrap_used)]
 mod observation_tests {
     use super::*;
+    #[test]
+    fn case_fragment_reassembly_requires_complete_nonoverlapping_records() {
+        let valid = include_bytes!("../../tests/fixtures/run5-l11-tls-fragments.pcap");
+        let packets = observe(valid).unwrap();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].payload.len(), 1460);
+        let first_length = u32::from_le_bytes(valid[32..36].try_into().unwrap()) as usize;
+        let end = 24 + 16 + first_length;
+        assert!(observe(&valid[..end]).is_err());
+        let mut duplicate = valid[..end].to_vec();
+        duplicate.extend_from_slice(&valid[24..end]);
+        duplicate.extend_from_slice(&valid[end..]);
+        assert!(observe(&duplicate).is_err());
+        let mut truncated = valid.to_vec();
+        // The first IP header now claims more bytes than the captured record.
+        truncated[42..44].copy_from_slice(&1500_u16.to_be_bytes());
+        assert!(observe(&truncated).is_err());
+    }
     fn capture(kind: u32, frame: &[u8]) -> Vec<u8> {
         let mut bytes = vec![0xd4, 0xc3, 0xb2, 0xa1, 2, 0, 4, 0];
         bytes.extend([0; 8]);
