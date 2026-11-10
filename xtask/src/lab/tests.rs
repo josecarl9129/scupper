@@ -641,22 +641,79 @@ fn bridge_policy_requires_arp_and_both_ping_exchanges() {
     }
 }
 
+fn bad_inline_nft_braces(source: &str) -> bool {
+    let adjacent = |text: &str| {
+        text.lines().any(|line| {
+            line.match_indices('}').any(|(at, _)| {
+                line[at + 1..]
+                    .trim_start_matches([' ', '\t', '\r'])
+                    .starts_with('}')
+            })
+        })
+    };
+    // Ordinary byte strings: preserve escaped quotes and decode line boundaries.
+    for start in source.match_indices("b\"").map(|(at, _)| at + 2) {
+        let mut literal = String::new();
+        let mut chars = source[start..].chars();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '"' => break,
+                '\\' => match chars.next() {
+                    Some('n') => literal.push('\n'),
+                    Some('t') => literal.push('\t'),
+                    Some('r') => literal.push('\r'),
+                    Some(ch) => literal.push(ch),
+                    None => break,
+                },
+                ch => literal.push(ch),
+            }
+        }
+        if adjacent(&literal) {
+            return true;
+        }
+    }
+    // Raw byte strings used by the topology fixtures.
+    source
+        .split("br#\"")
+        .skip(1)
+        .any(|tail| adjacent(tail.split("\"#").next().unwrap()))
+}
+
+#[test]
+fn inline_nft_guard_handles_spacing_and_escaped_quotes() {
+    for source in [
+        r#"Some(b"table { chain { } }")"#,
+        r#"Some(b"table { chain { }}")"#,
+        r#"Some(b"oifname \"eth0\"; }\t}")"#,
+    ] {
+        assert!(bad_inline_nft_braces(source), "{source}");
+    }
+    assert!(!bad_inline_nft_braces(r#"Some(b"table { chain { }\n}")"#));
+    assert!(!bad_inline_nft_braces("br#\"table { chain { }\n}\"#"));
+}
+
 /// nft rejects `...; } }` on one line (a closing brace after a chain needs a newline);
 /// every inline ruleset in the lab must be written with newlines.
 #[test]
 fn inline_nft_rulesets_have_no_single_line_closing_braces() {
-    // Scan every lab source, including newly added injection modules.
-    for entry in fs::read_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/lab")).unwrap() {
-        let path = entry.unwrap().path();
-        if path.extension().is_none_or(|ext| ext != "rs") || path.ends_with("tests.rs") {
-            continue;
+    let mut directories = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/lab")];
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                directories.push(path);
+                continue;
+            }
+            if path.extension().is_none_or(|ext| ext != "rs") || path.ends_with("tests.rs") {
+                continue;
+            }
+            let source = fs::read_to_string(&path).unwrap();
+            assert!(
+                !bad_inline_nft_braces(&source),
+                "{} contains a one-line nft ruleset",
+                path.display()
+            );
         }
-        let source = fs::read_to_string(&path).unwrap();
-        assert!(
-            !source.contains("; } }"),
-            "{} contains a one-line nft ruleset",
-            path.display()
-        );
     }
 }
 

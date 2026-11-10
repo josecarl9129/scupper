@@ -7,7 +7,7 @@ use super::{
     fail,
 };
 use scupper_core::{
-    config::{GatewayId, HealthSettings, parse_site, validate},
+    config::{DurationStr, GatewayId, HealthSettings, parse_site, validate},
     render::{VersionStamp, render_netns},
 };
 use scupper_sys::{
@@ -132,6 +132,10 @@ impl Lab {
         let text = fs::read_to_string(self.private.join("runtime-site.toml"))?;
         let mut config = parse_site(&text)?;
         config.health.probe_targets = HealthSettings::default().probe_targets;
+        // Minimum allowed WireGuard rekey interval + slack. L3 must observe
+        // staleness with a single exit, rather than relying on probe failures.
+        config.health.handshake_stale = DurationStr("150s".into());
+        config.health.failover_grace = DurationStr("30s".into());
         config.health.require_daemon = false; // scupperd is deliberately absent in this lab.
         let text = toml::to_string(&config)?;
         self.site = validate(config).map_err(|errors| format!("check lab config: {errors:?}"))?;

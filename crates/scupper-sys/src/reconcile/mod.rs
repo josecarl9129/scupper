@@ -824,6 +824,28 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 .steps
                 .retain(|step| step.failure() != StepFailure::Stop);
         }
+        // A contained failure can skip a switch's flush after its route
+        // writes succeeded. Repay that debt on the next complete observation,
+        // after route repairs and before forwarding is restored.
+        if report.complete
+            && observed.complete
+            && !planned.steps.contains(&Step::FlushConntrack)
+            && self
+                .config
+                .run_root
+                .join("route-switch")
+                .try_exists()
+                .unwrap_or(false)
+        {
+            let before_forwarding = planned
+                .steps
+                .iter()
+                .position(|step| matches!(step, Step::ForwardingOn { .. }))
+                .unwrap_or(planned.steps.len());
+            planned
+                .steps
+                .insert(before_forwarding, Step::FlushConntrack);
+        }
         self.run_plan(planned, &desired, guard, report, true);
     }
     fn report_verdict(&mut self, report: &mut TickReport) {

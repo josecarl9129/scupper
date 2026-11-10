@@ -260,7 +260,7 @@ fn decide(policy: &Policy, ip: &Ip<'_>) -> Result<String, Reason> {
         return Err(Reason::CanaryMarker);
     }
     if let Some(quotation) = t.quotation
-        && let Some(rule) = wireguard_error(policy, ip, quotation)?
+        && let Some(rule) = wireguard_error(policy, ip, proto, payload[0], quotation)?
     {
         return Ok(rule);
     }
@@ -315,18 +315,45 @@ fn decide(policy: &Policy, ip: &Ip<'_>) -> Result<String, Reason> {
 fn wireguard_error(
     policy: &Policy,
     outer: &Ip<'_>,
+    protocol: u8,
+    kind: u8,
     quotation: &[u8],
 ) -> Result<Option<String>, Reason> {
+    if !matches!((protocol, kind), (1, 3 | 11 | 12) | (58, 1..=4)) {
+        return Ok(None);
+    }
     let inner = decode::ip(quotation, true)?;
-    if inner.proto != 17 || inner.fragment.is_some() {
+    if inner.proto != 17 || inner.fragment.is_some() || !inner.trailer.is_empty() {
         return Ok(None);
     }
     let src = SocketAddr::new(inner.src, decode::word(inner.payload, 0)?);
     let dst = SocketAddr::new(inner.dst, decode::word(inner.payload, 2)?);
-    if decode::word(inner.payload, 4)? < 8 {
+    let udp_len = usize::from(decode::word(inner.payload, 4)?);
+    // The IP and UDP lengths must agree, even when ICMP quotes only a prefix.
+    let ip_len = if inner.src.is_ipv4() {
+        usize::from(decode::word(quotation, 2)?)
+    } else {
+        40 + usize::from(decode::word(quotation, 4)?)
+    };
+    let header_len = inner.raw.len() - inner.payload.len();
+    if udp_len < 8 || ip_len - header_len != udp_len {
         return Err(Reason::MalformedPacket);
     }
     decode::bytes(inner.payload, 0, 8)?;
+    let body = &inner.payload[8..];
+    if !body.is_empty() {
+        let full_len = udp_len - 8;
+        let valid_length = match body.first() {
+            Some(1) => full_len == 148,
+            Some(2) => full_len == 92,
+            Some(3) => full_len == 64,
+            Some(4) => full_len >= 32 && full_len.is_multiple_of(16),
+            _ => false,
+        };
+        if body.len() < 4 || body[1..4] != [0, 0, 0] || !valid_length {
+            return Err(Reason::MalformedWireGuard);
+        }
+    }
     Ok(policy.wireguard.iter().enumerate().find_map(|(i, rule)| {
         (outer.src == rule.gateway.ip()
             && outer.dst == rule.peer.ip()

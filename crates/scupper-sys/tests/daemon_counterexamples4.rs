@@ -524,3 +524,80 @@ fn l52b_prefix_through_unselected_unready_exit_closes_deletes_and_recovers() {
     assert_eq!(end.default_v4, baseline.default_v4);
     fs::remove_dir_all(root).unwrap();
 }
+
+/// A switch flush skipped after containment must not wait for a restart.
+#[test]
+fn f5_marker_debt_flushes_on_next_complete_tick_and_is_removed_once() {
+    let root = root("marker-debt");
+    let (kernel, config) = healthy(&root);
+    let mut machine = machine(&kernel, config);
+    kernel.clear_history();
+    fs::write(root.join("route-switch"), b"interrupted switch").unwrap();
+    kernel.observation_latency(Duration::ZERO, Duration::from_secs(21));
+    assert!(!machine.tick().complete);
+    assert!(root.join("route-switch").exists());
+    kernel.observation_latency(Duration::ZERO, Duration::ZERO);
+    kernel.inject(Fault {
+        step: StepKind::FlushConntrack,
+        remaining: Some(1),
+        partial: false,
+    });
+    let failed = machine.tick();
+    assert!(
+        failed
+            .failures
+            .iter()
+            .any(|(step, _)| *step == Step::FlushConntrack)
+    );
+    assert!(root.join("route-switch").exists());
+    assert!(machine.tick().complete);
+    assert!(!root.join("route-switch").exists());
+    // The failed flush also held back forwarding restoration. Let its
+    // independent recovery finish before checking the steady-state tick.
+    for _ in 0..4 {
+        assert!(machine.tick().complete);
+    }
+    kernel.clear_history();
+    assert!(machine.tick().complete);
+    assert!(
+        !kernel
+            .history()
+            .iter()
+            .any(|(step, _)| *step == Step::FlushConntrack)
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// L52b uses a configured UP exit whose family has no desired exit default.
+#[test]
+fn f5_l52b_ipv6_prefix_on_owned_up_exit_closes_and_recovers() {
+    let root = root("l52b-owned-v6");
+    let (kernel, config) = healthy(&root);
+    let mut machine = machine(&kernel, config);
+    let baseline = kernel.model();
+    let extra = RouteKey {
+        family: Family::V6,
+        entry: scupper_core::parse::parse_ip_route(
+            r#"[{"dst":"2001:db8:52::/64","dev":"ex-ch1","table":"main","scope":"link"}]"#,
+        )
+        .unwrap()
+        .remove(0),
+    };
+    assert_eq!(baseline.links["ex-ch1"].ours, Known::Value(true));
+    assert_eq!(baseline.links["ex-ch1"].up, Known::Value(true));
+    kernel.mutate(|model| model.extra_routes = Known::Value(vec![extra.clone()]));
+    kernel.clear_history();
+    for _ in 0..8 {
+        assert!(machine.tick().complete);
+    }
+    let steps: Vec<_> = kernel.history().into_iter().map(|(step, _)| step).collect();
+    assert!(steps.contains(&Step::ForwardingOff));
+    assert!(steps.contains(&Step::FlushConntrack));
+    assert!(steps.contains(&Step::RouteDelete { route: extra }));
+    let end = kernel.model();
+    assert_eq!(end.forwarding_v4, Known::Value(1));
+    assert_eq!(end.extra_routes, Known::Value(vec![]));
+    assert_eq!(end.default_v4, baseline.default_v4);
+    assert_eq!(end.default_v6, baseline.default_v6);
+    fs::remove_dir_all(root).unwrap();
+}

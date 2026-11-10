@@ -296,7 +296,11 @@ impl DaemonGuard<'_> {
                 vec!["qdisc", "del", "dev", "wg0", "clsact"],
             ),
             ("scupper", "ip", vec!["link", "del", "foreign0"]),
-            ("scupper", "ip", vec!["link", "del", "ex-unready"]),
+            (
+                "scupper",
+                "ip",
+                vec!["-6", "route", "del", "2001:db8:52::/64", "dev", "ex-ch1"],
+            ),
             ("gwhost", "ip", vec!["link", "del", "foreign-host"]),
             ("gwhost", "ip", vec!["link", "del", "foreign0"]),
             (
@@ -336,7 +340,8 @@ impl Lab {
     pub(super) fn daemon_case(&mut self) -> Result<String> {
         let mut failures = Vec::new();
         for case in CASES {
-            self.runner.phase = Instant::now() + Duration::from_secs(180);
+            self.runner.phase =
+                Instant::now() + Duration::from_secs(if case == "L3" { 300 } else { 180 });
             let started = Instant::now();
             let observed = self
                 .daemon_clean_baseline()
@@ -404,6 +409,12 @@ impl Lab {
             .contains("198.18.0.0/24")
         {
             return fail("unclean baseline: daemon extra route remains");
+        }
+        if self
+            .cmd("scupper", "ip", &["-6", "route", "show", "table", "main"])?
+            .contains("2001:db8:52::/64")
+        {
+            return fail("unclean baseline: daemon IPv6 extra route remains");
         }
         let tables = self.cmd("wan", "nft", &["list", "tables"])?;
         if tables.contains("lab_inject") || tables.contains("daemon_exit_down") {
@@ -742,38 +753,36 @@ impl Lab {
                     .map(|event| event.seq)
                     .max()
                     .unwrap_or(0);
-                // A separate, down WireGuard exit has no peers and is never
-                // selected. Keep the active exit healthy so its 30s provider
-                // recovery qualification does not obscure route-drift recovery.
-                let dev = if case == "L52b" {
-                    self.cmd(
-                        "scupper",
-                        "ip",
-                        &["link", "add", "ex-unready", "type", "wireguard"],
-                    )?;
-                    "ex-unready"
+                // M2 has one configured exit. IPv6 has no selected exit: its
+                // desired default is Unreachable even while ex-ch1 is owned,
+                // correctly configured and UP. This isolates the same-family
+                // desired-default restriction without a foreign/down link.
+                let (family, prefix) = if case == "L52b" {
+                    ("-6", "2001:db8:52::/64")
                 } else {
-                    "ex-ch1"
+                    ("-4", "198.18.0.0/24")
                 };
                 self.cmd(
                     "scupper",
                     "ip",
-                    &["route", "add", "198.18.0.0/24", "dev", dev],
+                    &[family, "route", "add", prefix, "dev", "ex-ch1"],
                 )?;
                 let (code, report) = self.check_result(&Self::boot_binary()?, root)?;
                 if (case == "L52"
                     && (code != 3 || report["verdict"]["Degraded"].get("RouteWrong").is_none()))
-                    || (case == "L52b" && code == 0)
+                    || (case == "L52b" && !matches!(code, 2 | 3))
                 {
-                    return fail(format!("L52 expected check 3 RouteWrong: {code}: {report}"));
+                    return fail(format!(
+                        "{case} unexpected route-drift check: {code}: {report}"
+                    ));
                 }
                 let recovery = Instant::now();
                 child.signal(Signal::CONT);
                 let elapsed =
                     self.daemon_wait("extra route removed", Duration::from_secs(8), |lab| {
                         Ok(!lab
-                            .cmd("scupper", "ip", &["route", "show", "table", "main"])?
-                            .contains("198.18.0.0/24"))
+                            .cmd("scupper", "ip", &[family, "route", "show", "table", "main"])?
+                            .contains(prefix))
                     })?;
                 if case == "L52b" {
                     self.daemon_wait(
@@ -809,7 +818,6 @@ impl Lab {
                         Ok(kinds.contains(&scupper_proto::StepKind::ForwardingOff)
                             && kinds.contains(&scupper_proto::StepKind::FlushConntrack))
                     })?;
-                    self.cmd("scupper", "ip", &["link", "del", "ex-unready"])?;
                 }
                 format!(
                     "check={code}; extra_route_removed_ms={elapsed}; closing_path={}",
@@ -1148,7 +1156,13 @@ impl Lab {
             self.runner.input(&Invocation::new("wan", "nft", &["-f", "-"]), Some(b"table inet daemon_exit_down {\n  chain forward {\n    type filter hook forward priority -100;\n    ip daddr 203.0.113.2 udp dport 51820 drop;\n  }\n}\n"))?;
             // L3 is the transport oracle: a stalled established stream cannot
             // emerge onto the physical uplink, even while the old session exists.
-            self.daemon_wait("L3 automatic fail-closed", Duration::from_secs(40), |lab| {
+            // With one exit, common-mode probe failures cannot mark it Down.
+            // Wait through handshake staleness, two 2s ticks and scheduling slack.
+            // The uplink capture stays active for this entire interval; the
+            // case oracle below requires zero violations, including client data.
+            let stale_bound =
+                self.site.health().handshake_stale() + Duration::from_secs(2 * 2 + 10);
+            self.daemon_wait("L3 automatic fail-closed", stale_bound, |lab| {
                 Ok(lab
                     .cmd("scupper", "ip", &["route", "show", "default"])?
                     .contains("unreachable"))
@@ -1289,7 +1303,7 @@ fn daemon_wanted(case: &str) -> &'static str {
         "L17-V14" => "name restored <=8000ms; identical inode; healthy traffic",
         "L52" => "check 3 RouteWrong; extra main route removed <=8000ms",
         "L52b" => {
-            "unready exit prefix closes forwarding; route deleted; service recovers <=20s; clean baseline"
+            "IPv6 prefix through owned UP exit with no selected IPv6 default closes forwarding; route deleted; service recovers <=20s; clean baseline"
         }
         "V03" => "ip_forward changes only forwarding/accept_redirects; full hardening reapplied",
         "L3" | "L4" => "persistent established flow and remote sender; zero uplink leaks",

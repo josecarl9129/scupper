@@ -266,6 +266,7 @@ pub struct Audit {
     gateway: GatewayId,
     retry_at: Instant,
     pending: Option<Receiver<Result<OpenedLog, crate::events::OpenError>>>,
+    pending_deadline: Option<Instant>,
 }
 impl Audit {
     /// Start in memory; the first disk open runs on the recovery worker.
@@ -284,6 +285,7 @@ impl Audit {
             gateway,
             retry_at: now,
             pending: None,
+            pending_deadline: None,
         })
     }
     /// Current nonblocking sender.
@@ -298,6 +300,7 @@ impl Audit {
             match pending.try_recv() {
                 Ok(Ok(opened)) => {
                     self.pending = None;
+                    self.pending_deadline = None;
                     if self.opened.handle.replay_into(&opened.handle).is_ok() {
                         self.opened = opened;
                         return true;
@@ -305,10 +308,22 @@ impl Audit {
                 }
                 Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {
                     self.pending = None;
+                    self.pending_deadline = None;
                     self.opened.handle.persistence_failed();
                     self.retry_at = now + Duration::from_secs(60);
                 }
-                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Empty) => {
+                    if self
+                        .pending_deadline
+                        .is_some_and(|deadline| now >= deadline)
+                    {
+                        // Keep the receiver: a slow open may still recover, and
+                        // abandoning it would spawn unbounded blocked workers.
+                        self.pending_deadline = None;
+                        eprintln!("scupperd: event log open exceeded 10 seconds");
+                        self.opened.handle.persistence_failed();
+                    }
+                }
             }
         }
         if !self.opened.handle.is_persistent() && self.pending.is_none() && now >= self.retry_at {
@@ -323,6 +338,7 @@ impl Audit {
                 .is_ok()
             {
                 self.pending = Some(receive);
+                self.pending_deadline = Some(now + Duration::from_secs(10));
             } else {
                 self.opened.handle.persistence_failed();
             }
@@ -716,6 +732,56 @@ fn close_only(deps: &BootDeps<'_>, options: &Options) {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hung_audit_open_reports_after_bound_and_can_still_recover() {
+        let now = Instant::now();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/audit-open-bound")
+            .join(std::process::id().to_string());
+        let _ = std::fs::remove_dir_all(&root);
+        let mut audit = Audit::open(&root, GatewayId("gw1".into()), now).unwrap();
+        let (send, receive) = mpsc::sync_channel(1);
+        audit.pending = Some(receive);
+        audit.pending_deadline = Some(now + Duration::from_secs(10));
+        assert!(!audit.poll(now + Duration::from_secs(9)));
+        assert_eq!(
+            audit
+                .handle()
+                .emit(EventKind::Flapping {}, Actor::Daemon, None)
+                .unwrap(),
+            1
+        );
+        assert!(!audit.poll(now + Duration::from_secs(10)));
+        assert!(!audit.poll(now + Duration::from_secs(120)));
+        assert!(audit.pending.is_some());
+        assert_eq!(
+            audit
+                .handle()
+                .emit(EventKind::Flapping {}, Actor::Daemon, None)
+                .unwrap(),
+            3
+        );
+        send.send(EventLog::open(&root, GatewayId("gw1".into()), || {
+            UnixSeconds(100)
+        }))
+        .unwrap();
+        assert!(audit.poll(now + Duration::from_secs(121)));
+        assert!(audit.handle().is_persistent());
+        audit.shutdown().unwrap();
+        drop(audit);
+        let events = crate::events::read_since(&root, 0, None)
+            .collect::<io::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e.kind, EventKind::PersistenceFailed { .. }))
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[cfg(feature = "testing")]
     #[test]
