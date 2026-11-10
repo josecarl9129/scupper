@@ -71,6 +71,22 @@ impl Lab {
             "sysctl",
             &["-q", "-w", "net.ipv6.conf.all.forwarding=1"],
         )?;
+        // Per-interface forwarding and explicit sink return routes make this
+        // positive control independent of earlier IPv6 fixture teardown.
+        for iface in ["all", "default", A.bridge.wan_if, A.internet.wan_if] {
+            self.cmd(
+                "wan",
+                "sysctl",
+                &["-q", "-w", &format!("net.ipv6.conf.{iface}.forwarding=1")],
+            )?;
+        }
+        for network in [A.client_v6_net, "2001:db8:5::/64"] {
+            self.cmd(
+                "internet",
+                "ip",
+                &["-6", "route", "replace", network, "via", A.wan_v6],
+            )?;
+        }
         self.bridge_routes(case)?;
         self.bridge_neighbors()?;
         self.capture("wan", A.bridge.wan_if, &format!("{}-bridge", case.name()))?;
@@ -291,6 +307,21 @@ impl Lab {
         Ok(())
     }
     pub(super) fn restore_bridge(&mut self) -> Result<()> {
+        for network in [A.client_v6_net, "2001:db8:5::/64"] {
+            let _ = self.runner.output(
+                &Invocation::new(
+                    "internet",
+                    "ip",
+                    &["-6", "route", "del", network, "via", A.wan_v6],
+                ),
+                None,
+            );
+        }
+        self.cmd(
+            "wan",
+            "sysctl",
+            &["-q", "-w", "net.ipv6.conf.default.forwarding=0"],
+        )?;
         self.cmd("scupper", "ip", &["-6", "route", "del", A.client_v6_net])?;
         self.cmd(
             "scupper",

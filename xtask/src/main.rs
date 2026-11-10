@@ -52,6 +52,9 @@ enum Command {
         shard: Option<String>,
         #[arg(long)]
         list: bool,
+        /// Shared previous results.tsv; use the same file for every shard.
+        #[arg(long)]
+        durations: Option<PathBuf>,
     },
     /// Namespace-local canary sink (used by leaktest).
     #[command(hide = true)]
@@ -122,11 +125,15 @@ fn run() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
             capture_fixtures,
             shard,
             list,
+            durations,
         } => {
             if list {
                 print!(
                     "{}",
-                    xtask::lab::list(shard.as_deref().map(str::parse).transpose()?)?
+                    xtask::lab::list_with_durations(
+                        shard.as_deref().map(str::parse).transpose()?,
+                        durations.as_deref()
+                    )?
                 );
                 return Ok(true);
             }
@@ -138,6 +145,7 @@ fn run() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
                     .map(str::parse)
                     .transpose()?
                     .unwrap_or_default(),
+                durations.as_deref(),
             )?;
             Ok(true)
         }

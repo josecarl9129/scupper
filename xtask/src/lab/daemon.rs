@@ -24,7 +24,7 @@ use std::{
 mod control_cases;
 mod m2_cases;
 
-pub(super) const CASES: [&str; 28] = [
+pub(super) const CASES: [&str; 29] = [
     "L1",
     "L2",
     "L5",
@@ -49,6 +49,7 @@ pub(super) const CASES: [&str; 28] = [
     "L4",
     "L10",
     "L14",
+    "L14-boot",
     "L43",
     "L44",
     "L50",
@@ -148,7 +149,7 @@ impl DaemonGuard<'_> {
         if m2_cases::is_m2(case) {
             return self.run_m2(case);
         }
-        if matches!(case, "L10" | "L14" | "L43" | "L44" | "L50") {
+        if matches!(case, "L10" | "L14" | "L14-boot" | "L43" | "L44" | "L50") {
             return self.run_control(case);
         }
         let root = self.lab.prepare_check_v2()?;
@@ -345,7 +346,9 @@ impl DaemonGuard<'_> {
                 .artifacts
                 .join(format!("daemon-{}/events", self.case)),
         );
-        let _ = fs::remove_file(self.lab.private.join("boot-root/run/scupper/stall-tick"));
+        for name in ["stall-tick", "release-namespace", "namespace-released"] {
+            let _ = fs::remove_file(self.lab.private.join("boot-root/run/scupper").join(name));
+        }
         let marker = if self
             .lab
             .private
@@ -391,10 +394,12 @@ impl DaemonGuard<'_> {
         }
         let restored = self
             .reset_control_fixture()
-            .and_then(|()| self.reset_m2_network())
+            .and_then(|()| self.lab.restore_inheritance())
             .and_then(|()| self.lab.daemon_restore_host())
+            .and_then(|()| self.lab.restore_host_rules())
             .and_then(|()| self.lab.boot_gateway(&[], "daemon-restore"))
-            .and_then(|_| self.lab.daemon_clean_baseline())
+            .and_then(|_| self.reset_m2_network())
+            .and_then(|()| self.lab.daemon_clean_baseline())
             .and_then(|()| super::mounts::verify_restored_peers(None))
             .and_then(|()| {
                 let run = self.lab.private.join("boot-root/run/scupper");
@@ -420,6 +425,10 @@ impl Drop for DaemonGuard<'_> {
 
 impl Lab {
     pub(super) fn daemon_case(&mut self, selected: &str) -> Result<String> {
+        if !CASES.contains(&selected) {
+            return fail(format!("unknown daemon selection: {selected}"));
+        }
+        let mut observation = String::new();
         let first_group = self.runner.background_checkpoint();
         if self.daemon_host_baseline.is_none() {
             self.daemon_host_baseline = Some(self.daemon_host_sysctls()?);
@@ -437,9 +446,9 @@ impl Lab {
         for case in CASES.into_iter().filter(|case| *case == selected) {
             self.runner.phase = Instant::now()
                 + Duration::from_secs(match case {
-                    "L9" => 600,
-                    "L9b" => 450,
-                    "L3" | "L16" | "L50" | "L9-host-link" => 300,
+                    "L9" => 1200,
+                    "L9b" => 900,
+                    "L3" | "L16" | "L50" | "L9-host-link" | "L11" => 300,
                     _ => 180,
                 });
             let started = Instant::now();
@@ -456,6 +465,9 @@ impl Lab {
                     .as_ref()
                     .map_or_else(ToString::to_string, Clone::clone)
             );
+            if let Ok(detail) = &observed {
+                observation.clone_from(detail);
+            }
             if let Err(error) = observed {
                 if blocked.is_none() && self.daemon_clean_baseline().is_err() {
                     blocked = Some(format!("{case}: {error}"));
@@ -497,9 +509,10 @@ impl Lab {
         if !failures.is_empty() {
             return fail(failures.join("; "));
         }
-        Ok("all daemon cases verified; guarded cleanup, notify evidence and clean shutdown".into())
+        Ok(observation)
     }
     fn daemon_trial(&mut self, case: &str) -> Result<String> {
+        self.fault_markers.clear();
         self.reset_boot_budget(&format!("{case}-initial"))?;
         let events = self.private.join("boot-root/var-lib/scupper/events");
         if events.exists() {
@@ -529,8 +542,14 @@ impl Lab {
         let root = self.private.join("boot-root");
         self.reset_boot_budget(stem)?;
         self.runner.boot_point = Some(point.into());
+        self.runner.boot_marker = Some(
+            root.join("run/scupper/boot-reached")
+                .to_string_lossy()
+                .into_owned(),
+        );
         let spawned = self.daemon_start(stem, &root);
         self.runner.boot_point = None;
+        self.runner.boot_marker = None;
         let (mut child, _notify) = spawned?;
         child.wait_timeout(Duration::from_secs(30))
     }
@@ -553,7 +572,7 @@ impl Lab {
             self.artifacts.join(format!("{stem}-supervised-check.json")),
             serde_json::to_vec_pretty(&report)?,
         )?;
-        if code != 0 {
+        if code != 0 || report["verdict"].get("Protected").is_none() {
             return fail(format!("{stem} supervised retry: {code}: {report}"));
         }
         child.stop_timeout(Signal::TERM, Duration::from_secs(30))?;
@@ -565,7 +584,7 @@ impl Lab {
     }
     // Each crash prefix represents a separate simulated boot, with its own /run
     // retry budget. Preserve the preceding budget as evidence before resetting.
-    fn reset_boot_budget(&self, stem: &str) -> Result<()> {
+    pub(super) fn reset_boot_budget(&self, stem: &str) -> Result<()> {
         let path = self.private.join("boot-root/run/scupper/boot-attempts");
         if path.exists() {
             fs::copy(
@@ -609,7 +628,50 @@ impl Lab {
         self.cmd("gwhost", "conntrack", &["-F"])?;
         Ok(())
     }
+    pub(super) fn restore_host_rules(&mut self) -> Result<()> {
+        for family in ["-4", "-6"] {
+            for (pref, table) in [("0", "local"), ("32766", "main"), ("32767", "default")] {
+                let rules: serde_json::Value = serde_json::from_str(&self.cmd(
+                    "gwhost",
+                    "ip",
+                    &[family, "-j", "rule", "show"],
+                )?)?;
+                if !rules.as_array().ok_or("host rules")?.iter().any(|r| {
+                    r["priority"]
+                        .as_u64()
+                        .is_some_and(|p| p.to_string() == pref)
+                        && r["table"] == table
+                }) {
+                    self.cmd(
+                        "gwhost",
+                        "ip",
+                        &[family, "rule", "add", "pref", pref, "lookup", table],
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
     pub(super) fn daemon_clean_baseline(&mut self) -> Result<()> {
+        for family in ["-4", "-6"] {
+            let rules: serde_json::Value = serde_json::from_str(&self.cmd(
+                "gwhost",
+                "ip",
+                &[family, "-j", "rule", "show"],
+            )?)?;
+            for table in ["local", "main", "default"] {
+                if !rules
+                    .as_array()
+                    .ok_or("host rules")?
+                    .iter()
+                    .any(|r| r["table"] == table)
+                {
+                    return fail(format!(
+                        "unclean baseline: missing host {family} {table} rule"
+                    ));
+                }
+            }
+        }
         if let Some(expected) = self.daemon_host_baseline.clone()
             && self.daemon_host_sysctls()? != expected
         {
@@ -667,7 +729,7 @@ impl Lab {
     fn daemon_start(&mut self, case: &str, root: &Path) -> Result<(Group, NotifyCapture)> {
         let artifacts = self.artifacts.join(format!("daemon-{case}"));
         fs::create_dir_all(&artifacts)?;
-        let notify_path = self.private.join(format!("notify-{case}.sock"));
+        let notify_path = self.daemon_notify_path(case)?;
         let notify = NotifyCapture::start(
             UnixDatagram::bind(&notify_path)?,
             &artifacts.join("notify.jsonl"),
@@ -675,12 +737,21 @@ impl Lab {
         let child = self.daemon_spawn(case, root, "start")?;
         Ok((child, notify))
     }
+    fn daemon_notify_path(&self, case: &str) -> Result<std::path::PathBuf> {
+        use std::os::fd::AsRawFd as _;
+        let directory = self
+            .private_dir
+            .as_ref()
+            .ok_or("private directory not open")?;
+        Ok(std::path::PathBuf::from(format!(
+            "/proc/{}/fd/{}/notify-{case}.sock",
+            std::process::id(),
+            directory.as_raw_fd()
+        )))
+    }
     fn daemon_spawn(&mut self, case: &str, root: &Path, stage: &str) -> Result<Group> {
         let daemon = Self::boot_binary()?.with_file_name("scupperd");
-        let env = format!(
-            "NOTIFY_SOCKET={}",
-            self.private.join(format!("notify-{case}.sock")).display()
-        );
+        let env = format!("NOTIFY_SOCKET={}", self.daemon_notify_path(case)?.display());
         self.runner.background(
             &Invocation::new(
                 "gwhost",
@@ -975,13 +1046,13 @@ impl Lab {
                         .contains("unreachable"))
                 })?;
                 let (code, report) = self.check_result(&Self::boot_binary()?, root)?;
-                if code != 4 {
+                if code != 4 || report["verdict"]["FailClosed"] != "NoHealthyExit" {
                     return fail(format!("L16 expected 4: {code}: {report}"));
                 }
                 self.cmd("scupper", "ip", &["link", "set", "ex-ch1", "up"])?;
                 let up = self.daemon_route_healthy(Duration::from_secs(70))?;
                 let (code, report) = self.check_result(&Self::boot_binary()?, root)?;
-                if code != 0 {
+                if code != 0 || report["verdict"].get("Protected").is_none() {
                     return fail(format!("L16 expected recovered check 0: {code}: {report}"));
                 }
                 format!(
@@ -1032,7 +1103,7 @@ impl Lab {
                     child.supervised_pid()?,
                 )?;
                 super::mounts::verify_restored_peers(child.supervised_pid()?)?;
-                if code != 0 {
+                if code != 0 || report["verdict"].get("Protected").is_none() {
                     return fail(format!("L17 fresh check expected 0: {code}: {report}"));
                 }
                 let after = NetnsHandle::open("/run/netns/scupper")?.identity();
@@ -1153,7 +1224,23 @@ impl Lab {
         old_port: u16,
         new_port: u16,
     ) -> Result<()> {
-        let mut text = evidence::policy_with_exit_port(markers, false, old_port)?;
+        let mut text = evidence::policy_for_case(markers, false, old_port, stem == "daemon-L11")?;
+        let combined: Vec<_> = markers.iter().chain(&self.fault_markers).collect();
+        text = text
+            .lines()
+            .map(|line| {
+                if line.starts_with("canary_markers = ") {
+                    Ok(format!(
+                        "canary_markers = {}",
+                        serde_json::to_string(&combined)?
+                    ))
+                } else {
+                    Ok(line.to_owned())
+                }
+            })
+            .collect::<Result<Vec<_>>>()?
+            .join("\n");
+
         if old_port != new_port {
             write!(
                 text,
@@ -1254,7 +1341,9 @@ impl Lab {
             ],
         )?;
         let (code, report) = self.check_result(&Self::boot_binary()?, root)?;
-        if code != 2 {
+        if code != 2
+            || !control_cases::verdict_reason(&report["verdict"]["Unprotected"], "ForeignLink")
+        {
             return fail(format!("L13 expected check 2: {code}: {report}"));
         }
         let control_stem = format!("{stem}-foreign-control");
@@ -1595,7 +1684,7 @@ impl Lab {
         )?;
         let root = self.private.join("boot-root");
         let (code, report) = self.check_result(&Self::boot_binary()?, &root)?;
-        if code != 4 {
+        if code != 4 || report["verdict"]["FailClosed"] != "NoHealthyExit" {
             return fail(format!("L3 expected check 4: {code}: {report}"));
         }
         let checked_count = flow_counts(udp_log)?.0;
@@ -1709,10 +1798,12 @@ pub(super) fn daemon_wanted(case: &str) -> &'static str {
         "L12" => "WireGuard source rejection; widened peer check 2; traced antispoof drop",
         "L15" => "real fake HTTPS exit-IP target: 0, uplink address 2, restored 0",
         "L18" => "host sysctl inheritance overridden; forwarding toggle reapplies hardening",
-        "L20" => "bidirectional IPv4/v6 PMTU errors only to exact flow sender",
-        "L17-rebuild" => "unheld namespace loss; daemon rebuild with new inode; check 0",
+        "L20" => "supervised IPv4 PMTU; IPv6 renderer chain property, unsupervised",
+        "L17-rebuild" => "unheld namespace loss while daemon runs; fresh namespace marker; check 0",
         "L10" => "SIGKILL/SIGSTOP: check 5, traffic continues; SIGCONT: check 0",
-        "L14" => "disconnect verifies closure; check 4 across reboot; connect restores 0",
+        "L14" | "L14-boot" => {
+            "disconnect verifies closure; check 4 across reboot; connect restores 0"
+        }
         "L43" => {
             "recurring foreign link latches; forwarding stays 0 across restart/reboot; repair clear restores 0"
         }

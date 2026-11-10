@@ -66,6 +66,7 @@ pub(super) struct Runner {
     pub cleanup: bool,
     pub probe_ca: Option<String>,
     pub boot_point: Option<String>,
+    pub boot_marker: Option<String>,
     trace: File,
     background_groups: Vec<u32>,
 }
@@ -79,6 +80,7 @@ impl Runner {
             cleanup: false,
             probe_ca: None,
             boot_point: None,
+            boot_marker: None,
             trace,
             background_groups: Vec::new(),
         }
@@ -111,6 +113,10 @@ impl Runner {
         let mut cmd = Command::new("timeout");
         cmd.args(invocation.timed(seconds)).process_group(0);
         cmd.env("LC_ALL", "C");
+        cmd.env_remove("SCUPPER_TEST_BOOT_MARKER");
+        if let Some(marker) = &self.boot_marker {
+            cmd.env("SCUPPER_TEST_BOOT_MARKER", marker);
+        }
         cmd.env_remove("SCUPPER_TEST_BOOT_POINT");
         if let Some(point) = &self.boot_point {
             cmd.env("SCUPPER_TEST_BOOT_POINT", point);

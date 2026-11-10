@@ -12,7 +12,7 @@ mod helpers;
 mod mounts;
 mod probe_child;
 mod shard;
-pub use shard::{Shard, list};
+pub use shard::{Shard, list, list_with_durations};
 mod topology;
 
 use addresses::A;
@@ -43,8 +43,9 @@ fn fail<T>(message: impl Into<String>) -> Result<T> {
     Err(message.into().into())
 }
 
-const NAMESPACES: [&str; 9] = [
+const NAMESPACES: [&str; 10] = [
     "rulecap",
+    "scupper-inherit",
     "wan",
     "gwhost",
     "scupper",
@@ -83,6 +84,7 @@ struct Lab {
     captures: Vec<Capture>,
     artifacts: PathBuf,
     private: PathBuf,
+    private_dir: Option<fs::File>,
     executable: String,
     public_keys: Vec<String>,
     site: ValidatedSite,
@@ -92,6 +94,8 @@ struct Lab {
     cleaned: bool,
     baseline_failure: Option<String>,
     daemon_host_baseline: Option<Vec<(String, String)>>,
+    inheritance: Option<boot::InheritanceGuard>,
+    fault_markers: Vec<String>,
     next_source_port: u16,
     exit_port: u16,
 }
@@ -101,7 +105,12 @@ struct Lab {
 /// # Errors
 /// Refuses non-Linux/non-root execution, occupied resource names, command failures,
 /// timeouts, failed service checks, leaks or blind positive controls.
-pub fn run(artifacts: &Path, capture_fixtures: Option<&Path>, shard: Shard) -> Result<()> {
+pub fn run(
+    artifacts: &Path,
+    capture_fixtures: Option<&Path>,
+    shard: Shard,
+    durations: Option<&Path>,
+) -> Result<()> {
     if !rustix::process::geteuid().is_root() {
         return fail("leaktest requires root on a disposable Linux machine");
     }
@@ -114,7 +123,7 @@ pub fn run(artifacts: &Path, capture_fixtures: Option<&Path>, shard: Shard) -> R
     .into_iter()
     .map(|signal| signal_hook::flag::register(signal, Arc::clone(&cancel)))
     .collect::<std::io::Result<_>>()?;
-    let result = run_inner(artifacts, capture_fixtures, cancel, shard);
+    let result = run_inner(artifacts, capture_fixtures, cancel, shard, durations);
     for signal in signals {
         signal_hook::low_level::unregister(signal);
     }
@@ -144,24 +153,24 @@ fn run_inner(
     capture_fixtures: Option<&Path>,
     cancel: Arc<AtomicBool>,
     shard: Shard,
+    durations: Option<&Path>,
 ) -> Result<()> {
     fs::create_dir_all(artifacts)?;
     let artifacts = fs::canonicalize(artifacts)?;
     let mut runner = Runner::new(fs::File::create(artifacts.join("commands.jsonl"))?, cancel);
+    let selected = shard::selected_recorded(shard, durations)?;
     runner.whole = Instant::now()
-        + Duration::from_secs(
-            shard::selected(shard)
-                .iter()
-                .map(|case| case.seconds)
-                .sum::<u64>()
-                + 300,
-        );
+        + Duration::from_secs(selected.iter().map(|case| case.seconds).sum::<u64>() * 2 + 600);
     let config = scupper_core::config::parse_site(SITE)?;
     let site = scupper_core::config::validate(config)
         .map_err(|errors| format!("lab config: {errors:?}"))?;
-    let private = PathBuf::from("/run").join(format!("scupper-lab-{}", Lab::marker()?));
+    let temporary = PathBuf::from(
+        std::env::var_os("CARGO_TARGET_TMPDIR").ok_or("CARGO_TARGET_TMPDIR is required")?,
+    );
+    fs::create_dir_all(&temporary)?;
+    let private = fs::canonicalize(temporary)?.join(format!("scupper-lab-{}", Lab::marker()?));
     if private.starts_with(&artifacts) {
-        return fail("artifact directory must not contain the private /run directory");
+        return fail("artifact directory must not contain the private temporary directory");
     }
     let rules = private.join("netns.nft");
     let mut lab = Lab {
@@ -171,6 +180,7 @@ fn run_inner(
         captures: Vec::new(),
         artifacts,
         private,
+        private_dir: None,
         executable: std::env::current_exe()?.to_string_lossy().into_owned(),
         public_keys: Vec::new(),
         site,
@@ -180,6 +190,8 @@ fn run_inner(
         cleaned: false,
         baseline_failure: None,
         daemon_host_baseline: None,
+        inheritance: None,
+        fault_markers: Vec::new(),
         next_source_port: 20000,
         exit_port: 51821,
     };
@@ -192,8 +204,9 @@ fn run_inner(
         if let Some(dir) = capture_fixtures {
             lab.fixtures(dir)?;
         }
+        evidence::save_setup(&lab.artifacts, &mut lab.rows)?;
         let mut failures = Vec::new();
-        for spec in shard::selected(shard) {
+        for spec in &selected {
             lab.runner.phase = Instant::now() + Duration::from_secs(spec.seconds + 120);
             let started = Instant::now();
             let skipped = lab.baseline_failure.is_some();
@@ -215,6 +228,7 @@ fn run_inner(
                     format!("elapsed_ms={}; {error}", started.elapsed().as_millis()),
                 ),
             };
+            evidence::save_setup(&lab.artifacts, &mut lab.rows)?;
             lab.rows.push(Row {
                 name: spec.id.clone(),
                 wanted: match spec.kind {
@@ -252,10 +266,10 @@ fn run_inner(
             });
         }
     }
-    for spec in shard::selected(shard) {
+    for spec in &selected {
         if !lab.rows.iter().any(|row| row.name == spec.id) {
             lab.rows.push(Row {
-                name: spec.id,
+                name: spec.id.clone(),
                 wanted: "complete trial".into(),
                 got: "skipped".into(),
                 detail: outcome.as_ref().err().map_or_else(
@@ -265,6 +279,7 @@ fn run_inner(
             });
         }
     }
+    evidence::save_setup(&lab.artifacts, &mut lab.rows)?;
     evidence::save_results(&lab.artifacts, &lab.rows)?;
     let cleanup = lab.cleanup();
     match (outcome, cleanup) {
@@ -329,6 +344,7 @@ impl Lab {
         self.registry
             .register(Resource::User("scupper-probe".into()));
         fs::DirBuilder::new().mode(0o700).create(&self.private)?;
+        self.private_dir = Some(fs::File::open(&self.private)?);
         self.registry
             .register(Resource::Directory(self.private.clone()));
         let resolver_dir = PathBuf::from("/etc/netns/scupper");
@@ -589,6 +605,7 @@ impl Lab {
             "-Z",
             "root",
             "-U",
+            "--immediate-mode",
             "-s",
             "0",
             "-i",
@@ -621,7 +638,11 @@ impl Lab {
     }
     fn stop_capture(&mut self) -> Result<()> {
         let mut capture = self.captures.pop().ok_or("missing capture process")?;
-        capture.process.stop(Signal::INT)?;
+        // Pop before checking deadlines so cancellation cannot strand the same
+        // capture in stop_captures' loop. Still request graceful shutdown.
+        let drained = self.runner.dwell(Duration::from_millis(1100));
+        let stopped = capture.process.stop(Signal::INT);
+        drained.and(stopped)?;
         evidence::check_capture_stats(&fs::read_to_string(capture.stderr)?)
     }
     fn stop_captures(&mut self) -> Result<()> {
@@ -648,6 +669,9 @@ impl Lab {
         let mut failures = Vec::new();
         let mut notes = Vec::new();
         if let Err(error) = mounts::save(&self.artifacts, "before-teardown", None) {
+            failures.push(error.to_string());
+        }
+        if let Err(error) = self.restore_inheritance() {
             failures.push(error.to_string());
         }
         if let Err(error) = self.stop_captures() {

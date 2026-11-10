@@ -43,12 +43,12 @@ pub(super) fn catalog() -> Vec<Spec> {
     let mut cases = Vec::new();
     for id in super::daemon::CASES {
         let seconds = match id {
-            "L3" | "L16" => 240,
-            "L9" => 360,
-            "L9b" => 270,
-            "L44" | "L50" => 180,
+            "L3" | "L16" | "L9-host-link" => 240,
+            "L9" => 900,
+            "L9b" => 720,
+            "L44" | "L50" | "L11" => 180,
             "L43" => 150,
-            "L20" | "L11" | "L9-host-link" => 120,
+            "L20" => 120,
             _ => 60,
         };
         cases.push(Spec {
@@ -85,8 +85,7 @@ fn assignments(cases: &[Spec], count: usize) -> Vec<usize> {
     }
     assigned
 }
-pub(super) fn selected(shard: Shard) -> Vec<Spec> {
-    let cases = catalog();
+fn select(shard: Shard, cases: Vec<Spec>) -> Vec<Spec> {
     let assigned = assignments(&cases, shard.count);
     cases
         .into_iter()
@@ -94,13 +93,78 @@ pub(super) fn selected(shard: Shard) -> Vec<Spec> {
         .filter_map(|(case, n)| (n == shard.index).then_some(case))
         .collect()
 }
+#[cfg(test)]
+fn selected(shard: Shard) -> Vec<Spec> {
+    select(shard, catalog())
+}
+pub(super) fn selected_recorded(shard: Shard, path: Option<&std::path::Path>) -> Result<Vec<Spec>> {
+    Ok(select(shard, recorded_catalog(path)?))
+}
+fn recorded_catalog(path: Option<&std::path::Path>) -> Result<Vec<Spec>> {
+    let mut cases = catalog();
+    let default = std::path::Path::new("xtask/lab/results.tsv");
+    if let Some(path) = path.or_else(|| default.exists().then_some(default)) {
+        apply_durations(&mut cases, &std::fs::read_to_string(path)?)?;
+    }
+    Ok(cases)
+}
+fn apply_durations(cases: &mut [Spec], text: &str) -> Result<()> {
+    let mut lines = text.lines();
+    let header: Vec<_> = lines
+        .next()
+        .ok_or("empty duration results")?
+        .split('\t')
+        .collect();
+    let column = |key| {
+        header
+            .iter()
+            .position(|v| *v == key)
+            .ok_or("duration results missing column")
+    };
+    let (name, got) = (column("name")?, column("got")?);
+    let elapsed = header.iter().position(|v| *v == "elapsed_ms");
+    let detail = column("detail")?;
+    for line in lines {
+        let cells: Vec<_> = line.split('\t').collect();
+        if cells.get(got) != Some(&"passed") {
+            continue;
+        }
+        let raw = elapsed.and_then(|i| cells.get(i).copied()).or_else(|| {
+            cells
+                .get(detail)?
+                .split(';')
+                .find_map(|v| v.trim().strip_prefix("elapsed_ms="))
+        });
+        let Some(ms) = raw.and_then(|v| v.parse::<u64>().ok()).filter(|v| *v > 0) else {
+            continue;
+        };
+        if let Some(case) = cases
+            .iter_mut()
+            .find(|c| cells.get(name) == Some(&c.id.as_str()))
+        {
+            // Retain a 25% allowance and five seconds of scheduling slack.
+            case.seconds = (ms.saturating_mul(5) / 4).div_ceil(1000).saturating_add(5);
+        }
+    }
+    Ok(())
+}
 /// Lists all cases with their deterministic shard and expected duration. `None`
 /// uses the four-shard CI layout; a selection prints just that shard.
 ///
 /// # Errors
 /// Returns an error if the catalog has duplicate identifiers.
 pub fn list(shard: Option<Shard>) -> Result<String> {
-    let cases = catalog();
+    list_with_durations(shard, None)
+}
+/// List using a shared previous results.tsv for duration balancing.
+///
+/// # Errors
+/// Returns an error for unreadable or malformed duration results.
+pub fn list_with_durations(
+    shard: Option<Shard>,
+    durations: Option<&std::path::Path>,
+) -> Result<String> {
+    let cases = recorded_catalog(durations)?;
     let count = shard.map_or(4, |s| s.count);
     let assigned = assignments(&cases, count);
     let mut seen = std::collections::BTreeSet::new();
@@ -138,21 +202,106 @@ mod tests {
                 }
             }
             assert_eq!(seen.len(), cases.len());
-            assert!(totals.iter().max().unwrap() - totals.iter().min().unwrap() <= 360);
+            assert!(totals.iter().max().unwrap() - totals.iter().min().unwrap() <= 900);
             if count == 4 {
                 assert!(totals.iter().all(|s| *s + 300 <= 25 * 60));
             }
         }
     }
     #[test]
+    fn design_m2_rows_and_explicit_extras_are_complete() {
+        let design = include_str!("../../../docs/DESIGN.md");
+        let mut expected = std::collections::BTreeSet::new();
+        let mut rows = std::collections::BTreeSet::new();
+        for line in design.lines().filter(|line| line.starts_with("| L")) {
+            let id = line.split('|').nth(1).unwrap().trim();
+            if let Some(n) = id.strip_prefix('L').and_then(|v| v.parse::<u8>().ok())
+                && (1..=20).contains(&n)
+                && n != 19
+            {
+                rows.insert(n);
+                expected.insert(format!("daemon-{}", if n == 17 { "L17-V14" } else { id }));
+            }
+        }
+        assert_eq!(rows, (1..=20).filter(|n| *n != 19).collect());
+        for extra in [
+            "daemon-L9b",
+            "daemon-L9-host-link",
+            "daemon-L14-boot",
+            "daemon-L17-rebuild",
+            "daemon-L43",
+            "daemon-L44",
+            "daemon-L50",
+            "daemon-L52",
+            "daemon-L52b",
+            "daemon-V03",
+            "baseline",
+            "probe-child",
+            "check-v2",
+            "client-v6-dropped",
+            "bridged-real-ruleset",
+            "positive-control-permissive",
+            "positive-control-uplink",
+        ] {
+            assert!(expected.insert(extra.into()));
+        }
+        assert_eq!(expected, catalog().into_iter().map(|c| c.id).collect());
+    }
+    #[test]
+    fn ci_matrix_covers_the_default_list_exactly() {
+        let ci = include_str!("../../../.github/workflows/ci.yml");
+        let matrix = ci
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("shard: ["))
+            .unwrap()
+            .trim_end_matches(']');
+        let shards: Vec<usize> = matrix
+            .split(',')
+            .map(|s| s.trim().parse().unwrap())
+            .collect();
+        let count = shards.len();
+        assert_eq!(shards, (1..=count).collect::<Vec<_>>());
+        let listed = list(None).unwrap();
+        assert!(listed.lines().skip(1).all(|line| {
+            line.split('\t')
+                .nth(1)
+                .unwrap()
+                .ends_with(&format!("/{count}"))
+        }));
+        assert!(ci.contains(&format!("--shard ${{{{ matrix.shard }}}}/{count}")));
+    }
+    #[test]
+    fn recorded_durations_ignore_failed_and_accept_old_and_new_results() {
+        let mut cases = catalog();
+        apply_durations(&mut cases, "name\twanted\tgot\tdetail\ndaemon-L9\ttrial\tpassed\telapsed_ms=800000; measured\ndaemon-L9b\ttrial\tfailed\telapsed_ms=1\n").unwrap();
+        assert_eq!(
+            cases.iter().find(|c| c.id == "daemon-L9").unwrap().seconds,
+            1005
+        );
+        assert_eq!(
+            cases.iter().find(|c| c.id == "daemon-L9b").unwrap().seconds,
+            720
+        );
+        apply_durations(
+            &mut cases,
+            "name\tgot\telapsed_ms\tdetail\ndaemon-L9\tpassed\t600000\twindow_ms=3\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cases.iter().find(|c| c.id == "daemon-L9").unwrap().seconds,
+            755
+        );
+    }
+    #[test]
     fn list_and_selection_agree_and_invalid_shards_fail() {
         let all = list(None).unwrap();
         assert_eq!(all.lines().count(), catalog().len() + 1);
+        let cases = recorded_catalog(None).unwrap();
         for index in 1..=4 {
             let shard = Shard { index, count: 4 };
             let text = list(Some(shard)).unwrap();
-            assert_eq!(text.lines().count(), selected(shard).len() + 1);
-            for case in selected(shard) {
+            assert_eq!(text.lines().count(), select(shard, cases.clone()).len() + 1);
+            for case in select(shard, cases.clone()) {
                 assert!(text.contains(&format!("{}\t{index}/4\t{}\n", case.id, case.seconds)));
             }
         }

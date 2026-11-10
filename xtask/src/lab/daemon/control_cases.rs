@@ -15,6 +15,39 @@ use scupper_sys::{
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 
+pub(super) fn verdict_reason(value: &serde_json::Value, reason: &str) -> bool {
+    match value {
+        serde_json::Value::String(s) => s == reason,
+        serde_json::Value::Object(map) => {
+            map.contains_key(reason) || map.values().any(|v| verdict_reason(v, reason))
+        }
+        serde_json::Value::Array(values) => values.iter().any(|v| verdict_reason(v, reason)),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod verdict_tests {
+    use super::verdict_reason;
+    #[test]
+    fn closed_for_the_wrong_reason_is_rejected() {
+        let stale = serde_json::json!({"FailClosed":"NoHealthyExit"});
+        assert!(!verdict_reason(&stale["FailClosed"], "AdminDisconnected"));
+        assert!(verdict_reason(
+            &serde_json::json!("AdminDisconnected"),
+            "AdminDisconnected"
+        ));
+        assert!(verdict_reason(
+            &serde_json::json!({"Quarantined":{"reason":"SafetyDrift"}}),
+            "Quarantined"
+        ));
+        assert!(!verdict_reason(
+            &serde_json::Value::Null,
+            "AdminDisconnected"
+        ));
+    }
+}
+
 fn session_continues(before: &str, after: &str) -> bool {
     compare_sessions(before, after, false)
 }
@@ -124,7 +157,13 @@ impl DaemonGuard<'_> {
         Ok(())
     }
 
-    pub(super) fn expect_check(&mut self, root: &Path, code: i32, stem: &str) -> Result<()> {
+    pub(super) fn expect_check(
+        &mut self,
+        root: &Path,
+        code: i32,
+        expected: Option<(&str, &str)>,
+        stem: &str,
+    ) -> Result<()> {
         let (got, report) = self.lab.check_result(&Lab::boot_binary()?, root)?;
         fs::write(
             self.lab
@@ -132,11 +171,33 @@ impl DaemonGuard<'_> {
                 .join(format!("{}-{stem}.json", self.case)),
             serde_json::to_vec_pretty(&report)?,
         )?;
-        if got != code {
+        let expected = expected.or(match code {
+            0 => Some(("Protected", "exit")),
+            5 => Some(("Unsupervised", "Dead")),
+            _ => None,
+        });
+        if got != code
+            || expected
+                .is_some_and(|(kind, reason)| !verdict_reason(&report["verdict"][kind], reason))
+        {
             return fail(format!(
                 "{} {stem}: expected {code}, got {got}: {report}",
                 self.case
             ));
+        }
+        if expected == Some(("FailClosed", "AdminDisconnected")) {
+            let snapshot = serde_json::json!({
+                "v4": self.lab.cmd("scupper", "ip", &["-4", "route", "show", "default"])?,
+                "v6": self.lab.cmd("scupper", "ip", &["-6", "route", "show", "default"])?,
+                "exit": self.lab.cmd("scupper", "ip", &["-o", "link", "show", "ex-ch1"])?,
+            });
+            fs::write(
+                self.lab
+                    .artifacts
+                    .join(format!("{}-{stem}-closure.json", self.case)),
+                serde_json::to_vec_pretty(&snapshot)?,
+            )?;
+            self.assert_disconnect_snapshot(stem)?;
         }
         Ok(())
     }
@@ -196,7 +257,7 @@ impl DaemonGuard<'_> {
         }
         Ok(sample)
     }
-    fn assert_namespace_released(&mut self, identity: &str) -> Result<()> {
+    pub(super) fn assert_namespace_released(&mut self, identity: &str) -> Result<()> {
         self.lab
             .daemon_wait("old namespace released", Duration::from_secs(5), |_| {
                 for process in fs::read_dir("/proc")? {
@@ -429,7 +490,7 @@ impl DaemonGuard<'_> {
             return fail(format!("L43 {phase}: latch missing"));
         }
         self.lab.daemon_route_healthy(Duration::from_secs(30))?;
-        self.expect_check(root, 4, phase)?;
+        self.expect_check(root, 4, Some(("FailClosed", "Quarantined")), phase)?;
         let report: serde_json::Value = serde_json::from_slice(&fs::read(
             self.lab
                 .artifacts
@@ -456,7 +517,7 @@ impl DaemonGuard<'_> {
         self.lab
             .daemon_ready_tick(self.notify.as_ref().ok_or("notify missing")?)?;
         self.lab.daemon_route_healthy(Duration::from_secs(30))?;
-        self.expect_check(&root, 0, "positive-control")?;
+        self.expect_check(&root, 0, None, "positive-control")?;
         let stem = format!("control-{case}");
         self.lab.capture("wan", A.gwhost.wan_if, &stem)?;
         let mut markers = Vec::new();
@@ -497,14 +558,14 @@ impl DaemonGuard<'_> {
                 }
                 fs::remove_file(root.join("run/scupper/incomplete-tick"))?;
                 self.lab.runner.dwell(Duration::from_secs(3))?;
-                self.expect_check(&root, 0, "fresh-again")?;
+                self.expect_check(&root, 0, None, "fresh-again")?;
                 self.child
                     .as_ref()
                     .ok_or("daemon missing")?
                     .signal(Signal::STOP);
                 let before = flow_counts(&path)?.1;
                 let at = Instant::now();
-                self.expect_check(&root, 5, "stopped")?;
+                self.expect_check(&root, 5, None, "stopped")?;
                 if at.elapsed() > Duration::from_secs(4) {
                     return fail(
                         "L10 stopped check exceeded Ping timeout plus local probe allowance",
@@ -519,10 +580,10 @@ impl DaemonGuard<'_> {
                     .as_ref()
                     .ok_or("daemon missing")?
                     .signal(Signal::CONT);
-                self.expect_check(&root, 0, "continued")?;
+                self.expect_check(&root, 0, None, "continued")?;
                 self.control_stop(Signal::KILL)?;
                 let before = flow_counts(&path)?.1;
-                self.expect_check(&root, 5, "killed")?;
+                self.expect_check(&root, 5, None, "killed")?;
                 self.lab.daemon_wait(
                     "L10 traffic after SIGKILL",
                     Duration::from_secs(3),
@@ -530,9 +591,9 @@ impl DaemonGuard<'_> {
                 )?;
                 flow.stop(Signal::TERM)?;
                 self.control_restart(&root, "after-kill")?;
-                self.expect_check(&root, 0, "restarted")?;
+                self.expect_check(&root, 0, None, "restarted")?;
             }
-            "L14" => {
+            "L14" | "L14-boot" => {
                 let (code, text) = self.control_command(&root, &["disconnect"], "disconnect")?;
                 if code != 0
                     || !text.contains("traffic is now blocked")
@@ -541,23 +602,39 @@ impl DaemonGuard<'_> {
                     return fail(format!("L14 disconnect: {code}: {text}"));
                 }
                 self.assert_disconnect_snapshot("disconnect")?;
-                self.expect_check(&root, 4, "disconnected")?;
+                self.expect_check(
+                    &root,
+                    4,
+                    Some(("FailClosed", "AdminDisconnected")),
+                    "disconnected",
+                )?;
                 self.control_stop(Signal::TERM)?;
-                self.lab.boot_gateway(&[], "L14-reboot")?;
-                let boot: serde_json::Value =
-                    serde_json::from_slice(&fs::read(self.lab.artifacts.join("L14-reboot.json"))?)?;
+                self.lab.boot_gateway(&[], &format!("{case}-reboot"))?;
+                let boot: serde_json::Value = serde_json::from_slice(&fs::read(
+                    self.lab.artifacts.join(format!("{case}-reboot.json")),
+                )?)?;
                 if boot["adopted"] != true {
                     return fail("L14 disconnected reboot did not adopt");
                 }
-                self.expect_check(&root, 4, "reboot-closed")?;
+                self.expect_check(
+                    &root,
+                    4,
+                    Some(("FailClosed", "AdminDisconnected")),
+                    "reboot-closed",
+                )?;
                 self.control_restart(&root, "after-reboot")?;
-                self.expect_check(&root, 4, "restart-closed")?;
+                self.expect_check(
+                    &root,
+                    4,
+                    Some(("FailClosed", "AdminDisconnected")),
+                    "restart-closed",
+                )?;
                 let (code, text) = self.control_command(&root, &["connect"], "connect")?;
                 if code != 0 || !text.contains("transport: local socket") {
                     return fail(format!("L14 connect: {code}: {text}"));
                 }
                 self.recover_client(&mut markers)?;
-                self.expect_check(&root, 0, "connected")?;
+                self.expect_check(&root, 0, None, "connected")?;
                 self.lab.service_check(&mut markers)?;
                 let client_session = self.client_session()?;
                 self.stage_exit_change(&root)?;
@@ -580,8 +657,13 @@ impl DaemonGuard<'_> {
                     .cmd("scupper", "readlink", &["/proc/self/ns/net"])?;
                 self.lab.cmd("", "ip", &["netns", "delete", "scupper"])?;
                 self.assert_namespace_released(old_identity.trim())?;
-                self.lab.boot_gateway(&[], "L14-real-reboot")?;
-                self.expect_check(&root, 4, "real-reboot-closed")?;
+                self.lab.boot_gateway(&[], &format!("{case}-real-reboot"))?;
+                self.expect_check(
+                    &root,
+                    4,
+                    Some(("FailClosed", "AdminDisconnected")),
+                    "real-reboot-closed",
+                )?;
                 self.control_restart(&root, "real-reboot")?;
                 let (code, text) =
                     self.control_command(&root, &["connect"], "real-reboot-connect")?;
@@ -589,7 +671,7 @@ impl DaemonGuard<'_> {
                     return fail(text);
                 }
                 self.recover_client(&mut markers)?;
-                self.expect_check(&root, 0, "real-reboot-connected")?;
+                self.expect_check(&root, 0, None, "real-reboot-connected")?;
             }
             "L43" => {
                 for attempt in 0..5 {
@@ -661,7 +743,7 @@ impl DaemonGuard<'_> {
                 }
                 self.lab.daemon_route_healthy(Duration::from_secs(30))?;
                 self.assert_forwarding_open()?;
-                self.expect_check(&root, 0, "cleared")?;
+                self.expect_check(&root, 0, None, "cleared")?;
                 self.recover_client(&mut markers)?;
                 self.lab.service_check(&mut markers)?;
             }
@@ -794,7 +876,7 @@ impl DaemonGuard<'_> {
                 }
                 self.lab.daemon_complete_tick(&root)?;
                 self.lab.daemon_route_healthy(Duration::from_secs(30))?;
-                self.expect_check(&root, 0, "one-writer-recovered")?;
+                self.expect_check(&root, 0, None, "one-writer-recovered")?;
                 self.assert_client_session(&client_session)?;
                 self.assert_client_traffic(&mut markers)?;
                 // Separately prove that a mutation queued during apply executes
@@ -848,7 +930,12 @@ impl DaemonGuard<'_> {
                     serde_json::to_vec_pretty(&snapshot)?,
                 )?;
                 self.assert_disconnect_snapshot("queued-disconnect")?;
-                self.expect_check(&root, 4, "queued-disconnect-closed")?;
+                self.expect_check(
+                    &root,
+                    4,
+                    Some(("FailClosed", "AdminDisconnected")),
+                    "queued-disconnect-closed",
+                )?;
                 for family in ["-4", "-6"] {
                     if !self
                         .lab
@@ -888,7 +975,12 @@ impl DaemonGuard<'_> {
                 if code != 0 || !text.contains("traffic is now blocked") {
                     return fail("L50 tightening did not verify closure");
                 }
-                self.expect_check(&root, 4, "tightened")?;
+                self.expect_check(
+                    &root,
+                    4,
+                    Some(("FailClosed", "AdminDisconnected")),
+                    "tightened",
+                )?;
                 self.control_restart(&root, "socket-closure")?;
                 let (code, text) = self.control_command(&root, &["connect"], "socket-connect")?;
                 if code != 0 {
@@ -928,7 +1020,12 @@ impl DaemonGuard<'_> {
                     return fail(format!("L50 socket closure: {code}: {text}"));
                 }
                 self.assert_disconnect_snapshot("socket-tighten")?;
-                self.expect_check(&root, 4, "socket-closed")?;
+                self.expect_check(
+                    &root,
+                    4,
+                    Some(("FailClosed", "AdminDisconnected")),
+                    "socket-closed",
+                )?;
             }
             _ => return fail("unknown control case"),
         }
@@ -952,7 +1049,7 @@ impl DaemonGuard<'_> {
             if code != 0 {
                 return fail(format!("L50 control recovery failed: {code}: {output}"));
             }
-            self.expect_check(&root, 0, "restored-control")?;
+            self.expect_check(&root, 0, None, "restored-control")?;
         }
         self.lab.daemon_capture_control(&stem)?;
         Ok("positive_check=0; control_fault_verified=true; uplink_violations=0; saved JSON, command output, notify, events and pcap".into())

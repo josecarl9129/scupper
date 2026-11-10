@@ -15,6 +15,49 @@ use std::{
     time::{Duration, Instant},
 };
 
+// ip_forward rewrites per-interface settings too: retain every IPv4 conf value,
+// then restore only changed files after restoring ip_forward itself.
+pub(super) struct InheritanceGuard {
+    saved: Vec<(PathBuf, String)>,
+}
+impl InheritanceGuard {
+    fn save() -> Result<Self> {
+        let mut paths = vec![PathBuf::from("/proc/sys/net/ipv4/ip_forward")];
+        for interface in fs::read_dir("/proc/sys/net/ipv4/conf")? {
+            for key in fs::read_dir(interface?.path())? {
+                paths.push(key?.path());
+            }
+        }
+        for name in ["all", "default"] {
+            paths.push(PathBuf::from(format!(
+                "/proc/sys/net/ipv6/conf/{name}/accept_ra"
+            )));
+        }
+        let saved = paths
+            .into_iter()
+            .map(|p| {
+                let value = fs::read_to_string(&p)?;
+                Ok((p, value))
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self { saved })
+    }
+    pub(super) fn restore(&mut self) -> Result<()> {
+        for (path, value) in &self.saved {
+            if fs::read_to_string(path)? != *value {
+                fs::write(path, value)?;
+            }
+        }
+        self.saved.clear();
+        Ok(())
+    }
+}
+impl Drop for InheritanceGuard {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
 impl Lab {
     pub(super) fn boot_binary() -> Result<PathBuf> {
         Ok(fs::canonicalize(
@@ -93,6 +136,7 @@ impl Lab {
         self.rows.push(Row{name:"boot-adopt".into(),wanted:"verify only; two route replacements".into(),got:"adopted".into(),detail:"boot-adopt.calls.json records every public argv; no link, sysctl or live nft writes".into()});
         Ok(())
     }
+    #[allow(clippy::too_many_lines)] // Injection and its independent inherited-value control share a guard.
     pub(super) fn boot_inheritance(&mut self) -> Result<()> {
         if self
             .site
@@ -108,18 +152,52 @@ impl Lab {
         {
             return fail("lab gateway address differs from the address table");
         }
+        self.inheritance = Some(InheritanceGuard::save()?);
         self.cmd(
-            "gwhost",
+            "",
             "sysctl",
             &[
                 "-w",
+                "net.ipv4.ip_forward=1",
                 "net.ipv4.conf.all.rp_filter=2",
                 "net.ipv4.conf.default.rp_filter=2",
-                "net.ipv4.ip_forward=1",
                 "net.ipv6.conf.all.accept_ra=1",
                 "net.ipv6.conf.default.accept_ra=1",
             ],
         )?;
+        self.cmd("gwhost", "ip", &["netns", "add", "scupper-inherit"])?;
+        self.registry
+            .register(Resource::Namespace("scupper-inherit".into()));
+        let mut observed = serde_json::Map::new();
+        for (key, expected) in [
+            ("net.ipv4.ip_forward", "1"),
+            ("net.ipv4.conf.all.rp_filter", "2"),
+            ("net.ipv4.conf.default.rp_filter", "2"),
+            ("net.ipv6.conf.all.accept_ra", "1"),
+            ("net.ipv6.conf.default.accept_ra", "1"),
+        ] {
+            let value = self.cmd("scupper-inherit", "sysctl", &["-n", key])?;
+            observed.insert(key.into(), value.trim().into());
+            if value.trim() != expected {
+                return fail(format!(
+                    "L18 hostile inheritance positive control: {key}={value}, wanted {expected}"
+                ));
+            }
+        }
+        fs::write(
+            self.artifacts.join("L18-pre-boot.json"),
+            serde_json::to_vec_pretty(&observed)?,
+        )?;
+        self.cmd("", "ip", &["netns", "delete", "scupper-inherit"])?;
+        self.registry
+            .unregister(&Resource::Namespace("scupper-inherit".into()));
+        Ok(())
+    }
+    pub(super) fn restore_inheritance(&mut self) -> Result<()> {
+        if let Some(guard) = &mut self.inheritance {
+            guard.restore()?;
+        }
+        self.inheritance = None;
         Ok(())
     }
     pub(super) fn boot_sysctls(&mut self) -> Result<()> {
@@ -137,7 +215,7 @@ impl Lab {
                 return fail(format!("L18 sysctl differs: {}", value.key));
             }
         }
-        self.rows.push(Row{name:"L18".into(),wanted:"explicit namespace hardening overrides inherited host values".into(),got:"verified".into(),detail:"gwhost rp_filter=2, forwarding=1, accept_ra=1 before real boot; all desired namespace sysctls read back".into()});
+        self.rows.push(Row{name:"L18".into(),wanted:"explicit namespace hardening overrides inherited host values".into(),got:"verified".into(),detail:"all desired namespace sysctls read back; L18-pre-boot.json records the inheritance trial separately".into()});
         Ok(())
     }
     pub(super) fn supervised_boot_cases(&mut self, case: &str) -> Result<()> {
@@ -147,14 +225,19 @@ impl Lab {
             "L9-host-link" => vec!["link-add-wg0".into(), "link-add-ex-ch1".into()],
             _ => return fail("unknown boot crash group"),
         };
-        for point in points {
-            self.boot_kill(&point, case == "L9b")?;
+        // The caller supplied one initial healthy recovery. Every prefix's
+        // after-recovery is the next prefix's before-control.
+        for cli in [true, false] {
+            for point in &points {
+                self.boot_kill(point, case == "L9b", cli)?;
+            }
         }
         Ok(())
     }
-    fn boot_client_rx(&mut self) -> Result<u64> {
+    pub(super) fn boot_client_rx(&mut self) -> Result<u64> {
         self.cmd("scupper", "wg", &["show", "wg0", "transfer"])?
             .lines()
+            .filter(|line| line.split_whitespace().next() == Some(self.public_keys[3].as_str()))
             .map(|line| {
                 line.split_whitespace()
                     .nth(1)
@@ -207,13 +290,12 @@ impl Lab {
         }
     }
     #[allow(clippy::too_many_lines)] // Each crash assertion stays next to the retry and capture it protects.
-    fn boot_kill(&mut self, point: &str, live: bool) -> Result<()> {
-        let stem = format!("{}-{point}", if live { "L9b" } else { "L9" });
-        let before_stem = format!("{stem}-before");
-        self.capture("wan", A.gwhost.wan_if, &before_stem)?;
-        self.daemon_boot_recover(&before_stem)?;
-        self.stop_captures()?;
-        self.daemon_oracle(&before_stem, &[], self.exit_port, self.exit_port)?;
+    fn boot_kill(&mut self, point: &str, live: bool, cli: bool) -> Result<()> {
+        let stem = format!(
+            "{}-{}-{point}",
+            if live { "L9b" } else { "L9" },
+            if cli { "cli" } else { "daemon" }
+        );
         // Lab reboot simulation: only the lab-owned gateway namespace is removed.
         // Boot itself never deletes an existing namespace, including during retry.
         if live {
@@ -231,11 +313,36 @@ impl Lab {
             fs::remove_file(record)?;
         }
         self.capture("wan", A.gwhost.wan_if, &stem)?;
-        let status = self.daemon_boot_crash(&stem, point)?;
+        let marker = self.private.join("boot-root/run/scupper/boot-reached");
+        if marker.exists() {
+            fs::remove_file(&marker)?;
+        }
+        let status = if cli {
+            self.reset_boot_budget(&stem)?;
+            let args = if let Some(name) = point.strip_prefix("link-add-") {
+                vec!["--stop-after-link-add", name]
+            } else {
+                vec!["--stop-after", point]
+            };
+            self.boot_output(&args, &stem)?.0
+        } else {
+            self.daemon_boot_crash(&stem, point)?
+        };
+        let reached = fs::read_to_string(&marker)?;
+        fs::write(self.artifacts.join(format!("{stem}-reached.txt")), &reached)?;
+        if reached != format!("reached {point}\n") {
+            return fail("L9 crash checkpoint mismatch");
+        }
         if status.signal() != Some(9) && status.code() != Some(137) {
             return fail(format!("L9 did not kill boot at {point}: {status}"));
         }
         let exists = fs::symlink_metadata("/run/netns/scupper").is_ok();
+        let expected_exists = live || point != "0";
+        if exists != expected_exists {
+            return fail(format!(
+                "L9 {point}: namespace exists={exists}, expected={expected_exists}"
+            ));
+        }
         if exists {
             let links = scupper_core::parse::parse_ip_link(&self.cmd(
                 "scupper",

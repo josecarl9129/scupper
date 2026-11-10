@@ -375,13 +375,17 @@ fn dispatch(
             #[cfg(feature = "testing")]
             let hook = |point: scupper_sys::boot::BootPoint| {
                 use scupper_sys::boot::BootPoint;
-                let stop = match point {
-                    BootPoint::After(step) => stop_after == Some(step as u8),
+                let stop = match &point {
+                    BootPoint::After(step) => stop_after == Some(*step as u8),
                     BootPoint::LinkAdded(name) => stop_after_link_add
                         .as_deref()
                         .is_some_and(|wanted| wanted == "any" || wanted == name.as_str()),
                 };
                 if stop {
+                    scupper_sys::boot::testing_checkpoint(
+                        &deps.writer_root.join("boot-reached"),
+                        &point,
+                    )?;
                     rustix::process::kill_process(
                         rustix::process::getpid(),
                         rustix::process::Signal::KILL,

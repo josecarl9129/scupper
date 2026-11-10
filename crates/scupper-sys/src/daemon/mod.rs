@@ -883,6 +883,14 @@ impl DaemonDeps for Runtime<'_> {
             Some(boot::boot(&deps))
         };
         if report.is_some_and(|report| report.succeeded()) {
+            let _ = self.audit.handle().emit(
+                EventKind::Boot {
+                    result: scupper_proto::Outcome::Recovered,
+                    step: scupper_proto::StepKind::EventLog,
+                },
+                Actor::Daemon,
+                None,
+            );
             self.initialize();
         }
         self.end_operation();
@@ -901,6 +909,24 @@ impl DaemonDeps for Runtime<'_> {
             .current_iteration = Some(now);
         #[cfg(feature = "testing")]
         if self.options.run_root.join("incomplete-tick").exists() {
+            return Some(crate::reconcile::TickReport::default());
+        }
+        #[cfg(feature = "testing")]
+        if self.options.run_root.join("release-namespace").exists() {
+            if self.running.is_some() {
+                self.close_only();
+                self.running = None;
+                self.startup_read = StartupRead::default();
+                self.abandon_probes();
+                self.pending_canon = false;
+                self.cached = None;
+                if let Err(error) = std::fs::write(
+                    self.options.run_root.join("namespace-released"),
+                    b"released\n",
+                ) {
+                    eprintln!("scupperd: release checkpoint: {error}");
+                }
+            }
             return Some(crate::reconcile::TickReport::default());
         }
         // A cold canonicalization timeout is Unknown, not an invalid boot
@@ -1100,12 +1126,16 @@ fn close_only(deps: &BootDeps<'_>, options: &Options) {
 
 // Fault injection is confined to testing builds and still executes real boot.
 #[cfg(feature = "testing")]
+#[allow(clippy::needless_pass_by_value)] // Boot hook signature owns its checkpoint.
 fn testing_boot_hook(point: boot::BootPoint) -> Result<(), String> {
-    let point = match point {
-        boot::BootPoint::After(step) => (step as u8).to_string(),
+    let label = match &point {
+        boot::BootPoint::After(step) => (*step as u8).to_string(),
         boot::BootPoint::LinkAdded(name) => format!("link-add-{name}"),
     };
-    if std::env::var("SCUPPER_TEST_BOOT_POINT").ok().as_deref() == Some(&point) {
+    if std::env::var("SCUPPER_TEST_BOOT_POINT").ok().as_deref() == Some(&label) {
+        let marker =
+            std::env::var_os("SCUPPER_TEST_BOOT_MARKER").ok_or("missing boot marker path")?;
+        boot::testing_checkpoint(Path::new(&marker), &point)?;
         rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::KILL)
             .map_err(|e| e.to_string())?;
         return Err("injected daemon boot crash".into());

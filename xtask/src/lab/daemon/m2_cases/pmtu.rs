@@ -1,6 +1,6 @@
 //! Exact DF/IPv6 datagrams exercise both sides of each tunnel's MTU boundary.
 use super::{A, DaemonGuard, Duration, Flow, Invocation, IpAddr, Path, Result, Signal, fail, fs};
-use crate::pcap::path::{Pmtu, pmtu_sender};
+use crate::pcap::path::{Pmtu, pmtu_receiver, pmtu_sender};
 
 impl DaemonGuard<'_> {
     pub(super) fn raw_udp(
@@ -10,11 +10,14 @@ impl DaemonGuard<'_> {
         endpoints: (IpAddr, IpAddr),
         ports: (u16, u16),
         size: usize,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let (source, destination) = endpoints;
         let (sport, dport) = ports;
-        let bytes = datagram(source, destination, sport, dport, size)?;
+        let marker = super::Lab::marker()?;
+        self.lab.fault_markers.push(marker.clone());
+        let bytes = datagram(source, destination, sport, dport, size, marker.as_bytes())?;
         let file = self.lab.private.join("m2-datagram.bin");
+        let length = bytes.len();
         fs::write(&file, bytes)?;
         let exe = self.lab.executable.clone();
         self.lab.cmd(
@@ -28,19 +31,47 @@ impl DaemonGuard<'_> {
                 file.to_str().ok_or("packet file")?,
             ],
         )?;
-        Ok(())
+        Ok(length)
     }
     pub(super) fn pmtu_trial(&mut self, root: &Path, stem: &str) -> Result<()> {
-        // M2's validator deliberately refuses IPv6. Keep the real daemon alive
-        // while freezing reconciliation for the explicitly widened v6 fixture,
-        // then restore the exact M2 configuration before resuming its ticks.
-        self.child.as_mut().ok_or("daemon")?.signal(Signal::STOP);
-        for v6 in [false, true] {
-            if v6 {
-                self.pmtu_v6_path()?;
+        // Supported IPv4 stays under active supervision. Require a completed
+        // tick while each MTU fault is present, then verify the service verdict.
+        for reverse in [false, true] {
+            self.pmtu_direction(stem, false, reverse)?;
+            self.lab.daemon_complete_tick(root)?;
+            let iface = if reverse { "wg0" } else { "ex-ch1" };
+            let links: serde_json::Value = serde_json::from_str(&self.lab.cmd(
+                "scupper",
+                "ip",
+                &["-j", "link", "show", iface],
+            )?)?;
+            fs::write(
+                self.lab
+                    .artifacts
+                    .join(format!("L20-v4-{iface}-after-tick.json")),
+                serde_json::to_vec_pretty(&links)?,
+            )?;
+            if links[0]["mtu"] != 1280 {
+                return fail("L20 IPv4 MTU fault did not survive the supervised tick");
             }
-            self.pmtu_direction(stem, v6, false)?;
-            self.pmtu_direction(stem, v6, true)?;
+            self.expect_check(
+                root,
+                0,
+                None,
+                if reverse {
+                    "v4-return-supervised"
+                } else {
+                    "v4-outbound-supervised"
+                },
+            )?;
+        }
+        self.reset_m2_network()?;
+        // M2 refuses IPv6 configuration. This separate fixture checks renderer
+        // chains only, with reconciliation suspended until exact restoration.
+        self.child.as_mut().ok_or("daemon")?.signal(Signal::STOP);
+        self.pmtu_v6_path()?;
+        for reverse in [false, true] {
+            self.pmtu_direction(stem, true, reverse)?;
         }
         self.reset_m2_network()?;
         self.child.as_mut().ok_or("daemon")?.signal(Signal::CONT);
@@ -215,7 +246,7 @@ impl DaemonGuard<'_> {
         fs::write(
             self.lab.artifacts.join(format!("{tag}.json")),
             serde_json::to_vec_pretty(
-                &serde_json::json!({"sender":source,"destination":destination,"router":router,"source_port":sport,"destination_port":dport,"mtu":1280,"packet_bytes":1400,"reverse":reverse,"ipv6":v6}),
+                &serde_json::json!({"sender":source,"destination":destination,"router":router,"source_port":sport,"destination_port":dport,"mtu":1280,"packet_bytes":1400,"reverse":reverse,"ipv6":v6,"supervision":if v6 {"renderer chain property, unsupervised"} else {"running"},"links":self.lab.cmd("scupper","ip",&["-j","link","show"])?}),
             )?,
         )?;
         self.raw_udp(ns, iface, (source, destination), (sport, dport), 1400)?;
@@ -235,12 +266,17 @@ impl DaemonGuard<'_> {
                 mtu: 1280,
             },
         )?;
-        let others = crate::pcap::observe(&fs::read(
-            self.lab.artifacts.join(format!("{tag}-other.pcap")),
-        )?)?;
-        if others.iter().any(|p| matches!(p.protocol, 1 | 58)) {
-            return fail("PMTU ICMP reached the receiver instead of the sender");
-        }
+        // At the receiver NAT changes outbound source / return destination.
+        let received_flow = Flow {
+            source: if reverse { source } else { exit },
+            destination: if reverse { client } else { destination },
+            protocol: 17,
+            ports: Some((sport, dport)),
+        };
+        pmtu_receiver(
+            &fs::read(self.lab.artifacts.join(format!("{tag}-other.pcap")))?,
+            &received_flow,
+        )?;
         server.alive()?;
         client_sink.alive()?;
         server.stop(Signal::TERM)?;
@@ -288,7 +324,13 @@ impl DaemonGuard<'_> {
                 ],
             )?;
         }
-        for (ns, family, table) in [("scupper", "inet", "m2_trace"), ("gwhost", "ip", "m2_host")] {
+        for (ns, family, table) in [
+            ("scupper", "inet", "m2_trace"),
+            ("gwhost", "ip", "m2_host"),
+            ("gwhost", "inet", "m2_host"),
+            ("gwhost", "ip", "m2_nat"),
+            ("gwhost", "ip", "m2_flush_control"),
+        ] {
             let _ = self.lab.runner.output(
                 &Invocation::new(ns, "nft", &["delete", "table", family, table]),
                 None,
@@ -302,6 +344,26 @@ impl DaemonGuard<'_> {
             &Invocation::new("gwhost", "ip", &["rule", "del", "pref", "100"]),
             None,
         );
+        let _ = self.lab.runner.output(
+            &Invocation::new("provA", "ip", &["route", "del", "10.99.0.0/24"]),
+            None,
+        );
+        if self.case == "L11" {
+            // Clear this trial's learned endpoint/session timers before later
+            // cases require zero ciphertext on the idle client's transport.
+            self.lab
+                .cmd("client2", "ip", &["link", "set", "wg0", "down"])?;
+            self.lab
+                .cmd("client2", "ip", &["link", "set", "wg0", "up"])?;
+            let peer = self.lab.public_keys[4].clone();
+            self.lab
+                .cmd("scupper", "wg", &["set", "wg0", "peer", &peer, "remove"])?;
+            self.lab.cmd(
+                "scupper",
+                "wg",
+                &["set", "wg0", "peer", &peer, "allowed-ips", "10.99.0.3/32"],
+            )?;
+        }
         self.lab.load_real_rules()?;
         Ok(())
     }
@@ -322,8 +384,10 @@ fn datagram(
     sport: u16,
     dport: u16,
     size: usize,
+    marker: &[u8],
 ) -> Result<Vec<u8>> {
     let header = if source.is_ipv4() { 20 } else { 40 };
+    let size = size.max(header + 8 + marker.len());
     if size < header + 8 || size > 65535 {
         return fail("invalid PMTU datagram size");
     }
@@ -333,6 +397,7 @@ fn datagram(
     let udp_len = u16::try_from(udp.len())?;
     udp[4..6].copy_from_slice(&udp_len.to_be_bytes());
     udp[6..8].fill(0);
+    udp[8..8 + marker.len()].copy_from_slice(marker);
     let mut packet = vec![0; header];
     match (source, destination) {
         (IpAddr::V4(a), IpAddr::V4(b)) => {
@@ -366,4 +431,28 @@ fn datagram(
     }
     packet.extend(udp);
     Ok(packet)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn small_raw_v4_v6_controls_keep_the_complete_canary_marker() {
+        let marker = b"scupper-canary-00112233445566778899aabbccddeeff";
+        for (source, destination) in [
+            ("198.18.12.2", "192.0.2.6"),
+            ("fd00:99::2", "2001:db8:2::1"),
+        ] {
+            let packet = super::datagram(
+                source.parse().unwrap(),
+                destination.parse().unwrap(),
+                40012,
+                8080,
+                64,
+                marker,
+            )
+            .unwrap();
+            assert!(packet.windows(marker.len()).any(|bytes| bytes == marker));
+            assert!(packet.len() < 1280);
+        }
+    }
 }

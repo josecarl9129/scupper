@@ -2,7 +2,7 @@
 use super::{A, DaemonGuard, Duration, Invocation, Lab, Path, Result, Signal, fail, fs};
 use crate::pcap::path::{self, Flow};
 use scupper_sys::state::{StateFile, StateRead};
-use std::net::IpAddr;
+use std::{fmt::Write as _, net::IpAddr};
 
 mod exit_ip;
 mod pmtu;
@@ -39,7 +39,7 @@ impl DaemonGuard<'_> {
         self.notify = Some(notify);
         self.lab
             .daemon_ready_tick(self.notify.as_ref().ok_or("missing notify")?)?;
-        self.expect_check(&root, 0, "before")?;
+        self.expect_check(&root, 0, None, "before")?;
         let stem = format!("daemon-{case}");
         let start_port = self.lab.exit_port;
         self.lab.capture("wan", A.gwhost.wan_if, &stem)?;
@@ -54,8 +54,8 @@ impl DaemonGuard<'_> {
             "L12" => self.spoof(&root, &stem)?,
             "L15" => self.exit_ip_target(&root)?,
             "L9" | "L9b" | "L9-host-link" => {
-                // The daemon executes boot itself. Its testing checkpoint kills
-                // the owning process, exactly as a crashed supervisor would.
+                // Both real CLI boot and daemon boot crash at each checkpoint;
+                // a fresh supervised retry must recover every closed prefix.
                 self.control_stop(Signal::TERM)?;
                 self.lab.stop_captures()?;
                 self.lab
@@ -73,7 +73,7 @@ impl DaemonGuard<'_> {
         }
         self.lab.daemon_route_healthy(Duration::from_secs(30))?;
         self.lab.service_check(&mut markers)?;
-        self.expect_check(&root, 0, "after")?;
+        self.expect_check(&root, 0, None, "after")?;
         self.lab.stop_captures()?;
         self.lab.exit_port = self
             .lab
@@ -92,7 +92,14 @@ impl DaemonGuard<'_> {
                 .daemon_oracle(&stem, &markers, start_port, self.lab.exit_port)?;
         }
         self.lab.daemon_capture_control(&stem)?;
-        Ok("supervised check=0 before/after; provider-NAT controls; strict uplink oracle; path captures and diagnostics saved".into())
+        Ok(format!(
+            "supervised check=0 before/after; provider-NAT controls; strict uplink oracle; {}",
+            if case == "L20" {
+                "IPv4 supervised; IPv6 renderer chain property, unsupervised"
+            } else {
+                "path captures and diagnostics saved"
+            }
+        ))
     }
     fn ping(&mut self, ns: &str, target: &str, delivered: bool) -> Result<()> {
         let (status, output) = self.lab.runner.output(
@@ -106,6 +113,7 @@ impl DaemonGuard<'_> {
     }
     fn query(&mut self, ns: &str, target: &str, port: u16, protocol: &str) -> Result<Flow> {
         let marker = Lab::marker()?;
+        self.lab.fault_markers.push(marker.clone());
         let source_port = self.lab.next_source_port;
         self.lab.next_source_port += 1;
         let exe = self.lab.executable.clone();
@@ -154,15 +162,19 @@ impl DaemonGuard<'_> {
         self.lab
             .capture("scupper", "ex-ch1", &format!("{stem}-exit"))?;
         self.ping("client", A.gateway_inner, true)?;
-        self.query("client", A.gateway_inner, 53, "dns")?;
+        let mut queries = vec![self.query("client", A.gateway_inner, 53, "dns")?];
         for port in [53, 7380] {
             for protocol in ["tcp", "udp"] {
-                self.query("client", A.gateway_inner, port, protocol)?;
+                queries.push(self.query("client", A.gateway_inner, port, protocol)?);
             }
         }
         self.lab.service_check(&mut Vec::new())?;
         self.lab.stop_capture()?;
         self.lab.stop_capture()?;
+        path::attempted(
+            &fs::read(self.lab.artifacts.join(format!("{stem}-wg0.pcap")))?,
+            &queries,
+        )?;
         path::gateway(
             &fs::read(self.lab.artifacts.join(format!("{stem}-wg0.pcap")))?,
             &fs::read(self.lab.artifacts.join(format!("{stem}-exit.pcap")))?,
@@ -245,32 +257,126 @@ impl DaemonGuard<'_> {
             self.lab.artifacts.join("L5-host-network.json"),
             serde_json::to_vec_pretty(&observed)?,
         )?;
-        self.expect_check(root, 0, "host-rules-flushed")
+        let rules: serde_json::Value =
+            serde_json::from_str(observed["rules4"].as_str().ok_or("L5 rule readback")?)?;
+        if rules
+            .as_array()
+            .is_none_or(|rules| rules.iter().any(|r| r["priority"] == 100))
+            || observed["routes4"]
+                .as_str()
+                .is_none_or(|v| v.contains("198.18.5.0/24"))
+        {
+            return fail("L5 flush left injected rule or route");
+        }
+        self.expect_check(root, 0, None, "host-rules-flushed")
     }
+    #[allow(clippy::too_many_lines)] // Host hooks, readback and positive counters describe one fault.
     fn host_nft(&mut self, root: &Path, markers: &mut Vec<String>) -> Result<()> {
+        // A sentinel proves that flush removed a real table.
+        self.lab
+            .cmd("gwhost", "nft", &["add", "table", "ip", "m2_flush_control"])?;
+        if !self
+            .lab
+            .cmd("gwhost", "nft", &["list", "tables"])?
+            .contains("m2_flush_control")
+        {
+            return fail("L8 sentinel missing before flush");
+        }
         self.lab.cmd("gwhost", "nft", &["flush", "ruleset"])?;
+        if self
+            .lab
+            .cmd("gwhost", "nft", &["list", "tables"])?
+            .contains("m2_flush_control")
+        {
+            return fail("L8 flush did not remove sentinel");
+        }
         self.lab
             .cmd("gwhost", "sysctl", &["-w", "net.ipv4.ip_forward=1"])?;
-        let rules = format!(
-            "table ip m2_host {{ chain forward {{ type filter hook forward priority filter; policy accept; dup to {} device eth0;\n\t}}\n}}\n",
-            A.gwhost.wan
-        );
+        let mut rules = String::new();
+        for family in ["ip", "inet"] {
+            writeln!(rules, "table {family} m2_host {{")?;
+            for hook in ["prerouting", "input", "forward", "output", "postrouting"] {
+                write!(
+                    rules,
+                    "chain {hook} {{ type filter hook {hook} priority filter; policy accept; udp sport {{ 51820, {} }} udp dport {{ 51820, {} }} counter; ip version 4 counter dup to {} device eth0;\n}}\n",
+                    self.lab.exit_port, self.lab.exit_port, A.gwhost.wan
+                )?;
+            }
+            rules.push_str("}\n");
+        }
+        rules.push_str("table ip m2_nat { chain post { type nat hook postrouting priority srcnat; ip saddr { 10.99.0.0/24, 10.2.0.0/24 } masquerade;\n}\n}\n");
         self.lab.runner.input(
             &Invocation::new("gwhost", "nft", &["-f", "-"]),
             Some(rules.as_bytes()),
         )?;
+        if self
+            .lab
+            .cmd("gwhost", "sysctl", &["-n", "net.ipv4.ip_forward"])?
+            .trim()
+            != "1"
+        {
+            return fail("L8 host forwarding fault absent");
+        }
+        self.lab.service_check(markers)?;
+        let observed: serde_json::Value =
+            serde_json::from_str(&self.lab.cmd("gwhost", "nft", &["-j", "list", "ruleset"])?)?;
         fs::write(
             self.lab.artifacts.join("L8-host-ruleset.json"),
-            self.lab.cmd("gwhost", "nft", &["-j", "list", "ruleset"])?,
+            serde_json::to_vec_pretty(&observed)?,
         )?;
-        self.lab.service_check(markers)?;
-        self.expect_check(root, 0, "host-dup-installed")?;
-        self.lab
-            .cmd("gwhost", "nft", &["delete", "table", "ip", "m2_host"])?;
+        for family in ["ip", "inet"] {
+            for hook in ["prerouting", "input", "output", "postrouting"] {
+                let live = observed["nftables"]
+                    .as_array()
+                    .ok_or("L8 rules")?
+                    .iter()
+                    .any(|entry| {
+                        let rule = &entry["rule"];
+                        rule["family"] == family
+                            && rule["table"] == "m2_host"
+                            && rule["chain"] == hook
+                            && rule["expr"].as_array().is_some_and(|expr| {
+                                expr.iter()
+                                    .any(|e| e["match"]["left"]["payload"]["protocol"] == "udp")
+                                    && expr.iter().any(|e| {
+                                        e["counter"]["packets"].as_u64().is_some_and(|n| n > 0)
+                                    })
+                            })
+                    });
+                if !live {
+                    return fail(format!("L8 hostile {family}/{hook} counter stayed zero"));
+                }
+            }
+        }
+        self.expect_check(root, 0, None, "host-dup-installed")?;
+        for (family, table) in [("ip", "m2_host"), ("inet", "m2_host"), ("ip", "m2_nat")] {
+            self.lab
+                .cmd("gwhost", "nft", &["delete", "table", family, table])?;
+        }
         Ok(())
     }
     #[allow(clippy::too_many_lines)] // Live controls and each protected path belong to the same measurement.
     fn isolation(&mut self, stem: &str) -> Result<()> {
+        let transfers_before = self
+            .lab
+            .cmd("scupper", "wg", &["show", "wg0", "transfer"])?;
+        self.lab.cmd(
+            "provA",
+            "wg",
+            &[
+                "set",
+                "wgp",
+                "peer",
+                &self.lab.public_keys[1].clone(),
+                "allowed-ips",
+                "10.2.0.2/32,10.99.0.0/24",
+            ],
+        )?;
+        self.lab.cmd(
+            "provA",
+            "ip",
+            &["route", "add", "10.99.0.0/24", "dev", "wgp"],
+        )?;
         // Live listeners behind the drop policy distinguish filtering from an
         // unbound port. Their process guards release them on every error path.
         let exe = self.lab.executable.clone();
@@ -350,10 +456,16 @@ impl DaemonGuard<'_> {
         self.ping("client2", A.client_inner, false)?;
         let mut client_queries = Vec::new();
         let mut provider_queries = Vec::new();
+        let mut to_client = Vec::new();
+        let mut to_client2 = Vec::new();
         for port in [22, 53, 7380, 8080] {
             for protocol in ["tcp", "udp"] {
                 client_queries.push(self.query("client2", A.gateway_inner, port, protocol)?);
-                provider_queries.push(self.query("provA", A.exit_inner, port, protocol)?);
+                for target in [A.exit_inner, A.gateway_inner, A.client_inner] {
+                    provider_queries.push(self.query("provA", target, port, protocol)?);
+                }
+                to_client.push(self.query("client2", A.client_inner, port, protocol)?);
+                to_client2.push(self.query("client", "10.99.0.3", port, protocol)?);
             }
         }
         // Provider echo is also new input and must be dropped.
@@ -388,6 +500,40 @@ impl DaemonGuard<'_> {
             &fs::read(self.lab.artifacts.join(format!("{stem}-exit.pcap")))?,
             &provider_queries,
         )?;
+        let wg_capture = fs::read(self.lab.artifacts.join(format!("{stem}-wg0.pcap")))?;
+        let destination = fs::read(self.lab.artifacts.join(format!("{stem}-destination.pcap")))?;
+        let client2_capture = fs::read(self.lab.artifacts.join(format!("{stem}-sender.pcap")))?;
+        path::dropped(&wg_capture, &destination, &to_client)?;
+        path::dropped(&wg_capture, &client2_capture, &to_client2)?;
+        let exit_capture = fs::read(self.lab.artifacts.join(format!("{stem}-exit.pcap")))?;
+        path::dropped(&exit_capture, &destination, &provider_queries)?;
+        let transfers_after = self
+            .lab
+            .cmd("scupper", "wg", &["show", "wg0", "transfer"])?;
+        for key in [&self.lab.public_keys[3], &self.lab.public_keys[4]] {
+            let counters = |text: &str| -> Result<(u64, u64)> {
+                let line = text
+                    .lines()
+                    .find(|l| l.split_whitespace().next() == Some(key.as_str()))
+                    .ok_or("L11 missing client transfer")?;
+                let mut fields = line.split_whitespace().skip(1);
+                Ok((
+                    fields.next().ok_or("rx")?.parse()?,
+                    fields.next().ok_or("tx")?.parse()?,
+                ))
+            };
+            let (rx, tx) = counters(&transfers_before)?;
+            let (after_rx, after_tx) = counters(&transfers_after)?;
+            if after_rx <= rx || after_tx <= tx {
+                return fail("L11 client transfer control did not grow in both directions");
+            }
+        }
+        fs::write(
+            self.lab.artifacts.join("L11-transfers.json"),
+            serde_json::to_vec_pretty(
+                &serde_json::json!({"before":transfers_before,"after":transfers_after}),
+            )?,
+        )?;
         // Only loopback controls may reach the actual listening sockets.
         let receipts = crate::lab::helpers::receipts(&fs::read_to_string(log)?)?;
         if receipts.iter().any(|r| !r.peer.ip().is_loopback()) {
@@ -408,17 +554,47 @@ impl DaemonGuard<'_> {
             .capture("scupper", "wg0", &format!("{stem}-wg-filter"))?;
         self.lab
             .capture("scupper", "ex-ch1", &format!("{stem}-wg-exit"))?;
-        self.raw_udp(
+        self.lab
+            .capture("gwhost", "eth0", &format!("{stem}-cipher-ingress"))?;
+        let rx_before = self.lab.boot_client_rx()?;
+        let forged_length = self.raw_udp(
             "client",
             "wg0",
             (forged, A.internet.peer.parse()?),
             (40012, 8080),
             64,
         )?;
-        self.lab.service_check(&mut Vec::new())?;
+        // Peer transfer accounting may exclude inner-source rejects. An
+        // authenticated echo control proves the live receive path as well.
+        self.ping("client", A.gateway_inner, true)?;
+        self.lab.runner.dwell(Duration::from_millis(300))?;
+        let rx_after = self.lab.boot_client_rx()?;
+        fs::write(
+            self.lab.artifacts.join("L12-wireguard-rx.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({"before":rx_before,"after":rx_after}))?,
+        )?;
+        if rx_after <= rx_before {
+            return fail("L12 gateway peer rx did not increase during forged-source trial");
+        }
         self.lab.stop_capture()?;
         self.lab.stop_capture()?;
         self.lab.stop_capture()?;
+        self.lab.stop_capture()?;
+        let ciphertext = crate::pcap::observe(&fs::read(
+            self.lab
+                .artifacts
+                .join(format!("{stem}-cipher-ingress.pcap")),
+        )?)?;
+        let encrypted_size = 8 + 16 + forged_length.div_ceil(16) * 16 + 16;
+        if !ciphertext.iter().any(|p| {
+            p.source.to_string() == A.client.peer
+                && p.destination.to_string() == A.gwhost.peer
+                && p.protocol == 17
+                && p.payload.len() == encrypted_size
+                && p.payload.get(8..12) == Some(&[4, 0, 0, 0])
+        }) {
+            return fail("L12 gateway did not capture the forged-size WireGuard data message");
+        }
         let flow = Flow {
             source: forged,
             destination: A.internet.peer.parse()?,
@@ -443,7 +619,12 @@ impl DaemonGuard<'_> {
                 &format!("{}/32,{forged}/32", A.client_inner),
             ],
         )?;
-        self.expect_check(root, 2, "widened-allowed-ips")?;
+        self.expect_check(
+            root,
+            2,
+            Some(("Unprotected", "PeerDiffers")),
+            "widened-allowed-ips",
+        )?;
         let report = fs::read_to_string(self.lab.artifacts.join("L12-widened-allowed-ips.json"))?;
         if !report.contains("PeerDiffers") {
             return fail("L12 check 2 did not identify peer drift");
@@ -516,17 +697,111 @@ impl DaemonGuard<'_> {
         self.child.as_mut().ok_or("daemon")?.signal(Signal::CONT);
         self.lab.daemon_complete_tick(root)
     }
+    #[allow(clippy::too_many_lines)] // Keep live-supervisor loss, gap evidence and recovery adjacent.
     fn rebuild(&mut self, root: &Path, case: &str) -> Result<()> {
+        let marker = Lab::marker()?;
+        self.lab.fault_markers.push(marker.clone());
+        let mut canary = self.lab.daemon_flow("udp", "client", &marker, case, 120)?;
+        let flow = self.lab.artifacts.join(format!("{case}-udp.jsonl"));
+        self.lab.daemon_wait(
+            "rebuild traffic live before loss",
+            Duration::from_secs(5),
+            |_| Ok(super::flow_counts(&flow)?.1 > 0),
+        )?;
         let before = self
             .lab
-            .cmd("", "stat", &["-Lc", "%i", "/run/netns/scupper"])?;
-        self.control_stop(Signal::TERM)?;
+            .cmd("scupper", "readlink", &["/proc/self/ns/net"])?;
+        let first_seq = super::read_since(&root.join("var-lib/scupper"), 0, None)
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.seq)
+            .max()
+            .unwrap_or(0);
+        if case == "L17-rebuild" {
+            fs::write(root.join("run/scupper/release-namespace"), b"release")?;
+            self.lab.daemon_wait(
+                "running daemon relinquished namespace",
+                Duration::from_secs(8),
+                |_| Ok(root.join("run/scupper/namespace-released").exists()),
+            )?;
+            self.child.as_mut().ok_or("daemon")?.alive()?;
+        } else {
+            self.control_stop(Signal::TERM)?;
+        }
+        self.lab.cmd(
+            "scupper",
+            "ip",
+            &["link", "set", "lo", "alias", "scupper-old-generation"],
+        )?;
         if case == "L18" {
             self.lab.boot_inheritance()?;
         }
         self.lab.cmd("", "ip", &["netns", "delete", "scupper"])?;
-        self.control_restart(root, "rebuild")?;
+        if std::path::Path::new("/run/netns/scupper").exists() {
+            return fail("namespace deletion fault did not take effect");
+        }
+        let sent = super::flow_counts(&flow)?.0;
+        self.lab.daemon_wait(
+            "canary sends during namespace gap",
+            Duration::from_secs(3),
+            |_| Ok(super::flow_counts(&flow)?.0 > sent),
+        )?;
+        fs::write(
+            self.lab.artifacts.join(format!("{case}-gap.json")),
+            serde_json::to_vec_pretty(
+                &serde_json::json!({"namespace_missing":true,"sent_before":sent,"sent_during_gap":super::flow_counts(&flow)?.0}),
+            )?,
+        )?;
+        if case == "L17-rebuild" {
+            self.assert_namespace_released(before.trim())?;
+            fs::remove_file(root.join("run/scupper/release-namespace"))?;
+            self.lab.daemon_wait(
+                "next-tick supervised namespace rebuild",
+                Duration::from_secs(12),
+                |_| Ok(std::path::Path::new("/run/netns/scupper").exists()),
+            )?;
+            self.child.as_mut().ok_or("daemon")?.alive()?;
+        } else {
+            self.control_restart(root, "rebuild")?;
+        }
         self.lab.daemon_complete_tick(root)?;
+        if case == "L17-rebuild" {
+            self.lab.daemon_wait(
+                "supervised loss recovered Boot event",
+                Duration::from_secs(5),
+                |_| {
+                    Ok(
+                        super::read_since(&root.join("var-lib/scupper"), first_seq, None)
+                            .filter_map(std::result::Result::ok)
+                            .any(|event| {
+                                matches!(
+                                    event.kind,
+                                    scupper_proto::EventKind::Boot {
+                                        result: scupper_proto::Outcome::Recovered,
+                                        ..
+                                    }
+                                )
+                            }),
+                    )
+                },
+            )?;
+            let events = super::read_since(&root.join("var-lib/scupper"), first_seq, None)
+                .collect::<std::io::Result<Vec<_>>>()?;
+            fs::write(
+                self.lab.artifacts.join("L17-rebuild-events.json"),
+                serde_json::to_vec_pretty(&events)?,
+            )?;
+            if !events.iter().any(|event| {
+                matches!(
+                    event.kind,
+                    scupper_proto::EventKind::Boot {
+                        result: scupper_proto::Outcome::Recovered,
+                        ..
+                    }
+                )
+            }) {
+                return fail("L17 supervised loss lacked recovered Boot event");
+            }
+        }
         let after = self
             .lab
             .cmd("", "stat", &["-Lc", "%i", "/run/netns/scupper"])?;
@@ -536,15 +811,24 @@ impl DaemonGuard<'_> {
                 &serde_json::json!({"before":before.trim(),"after":after.trim()}),
             )?,
         )?;
-        if before == after {
-            return fail("no-holder rebuild retained old namespace inode");
+        // Inodes may be reused after the last holder exits. The namespace-local
+        // marker is the identity control for a destroyed namespace.
+        if self
+            .lab
+            .cmd("scupper", "ip", &["-j", "link", "show", "lo"])?
+            .contains("scupper-old-generation")
+        {
+            return fail("rebuild retained old namespace marker");
         }
+        self.lab.restore_inheritance()?;
+        self.lab.boot_fresh_client_handshake()?;
         self.lab.wait_provider()?;
         self.lab.boot_sysctls()?;
         if case == "L18" {
             self.lab
                 .daemon_sysctl_fixture(self.child.as_mut().ok_or("daemon")?)?;
         }
+        canary.stop(Signal::TERM)?;
         Ok(())
     }
 }

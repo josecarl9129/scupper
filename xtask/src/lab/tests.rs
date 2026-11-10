@@ -131,9 +131,13 @@ fn policy_for_every_case_has_exact_endpoints_and_positive_evidence() {
         let value: toml::Value = toml::from_str(&text).unwrap();
         assert_eq!(value["min_packets"].as_integer(), Some(4));
         assert_eq!(value["expect"].as_array().unwrap().len(), 2);
-        assert_eq!(value["wireguard"].as_array().unwrap().len(), 3);
+        assert_eq!(value["wireguard"].as_array().unwrap().len(), 2);
+        let l11: toml::Value =
+            toml::from_str(&evidence::policy_for_case(&markers, false, 51821, true).unwrap())
+                .unwrap();
+        assert_eq!(l11["wireguard"].as_array().unwrap().len(), 3);
         assert_eq!(
-            value["wireguard"][2]["peer"].as_str(),
+            l11["wireguard"][2]["peer"].as_str(),
             Some("192.0.2.10:51820")
         );
         assert_eq!(
@@ -359,7 +363,7 @@ fn results_round_trip_and_tsv_sanitizes_only_display_cells() {
     evidence::save_results(&dir, &rows).unwrap();
     assert_eq!(
         fs::read_to_string(dir.join("results.tsv")).unwrap(),
-        "name\twanted\tgot\tdetail\nbaseline\tclean\tfailed\tone two three \n"
+        "name\twanted\tgot\telapsed_ms\tdetail\nbaseline\tclean\tfailed\t0\tone two three \n"
     );
     assert_eq!(
         serde_json::from_str::<Vec<Row>>(&fs::read_to_string(dir.join("results.json")).unwrap())
@@ -368,6 +372,39 @@ fn results_round_trip_and_tsv_sanitizes_only_display_cells() {
     );
     fs::remove_dir_all(dir).unwrap();
 }
+#[test]
+fn setup_observations_do_not_masquerade_as_shard_cases_and_measurements_survive() {
+    let dir = test_dir("setup-results");
+    let row = |name: &str, got: &str, detail: &str| Row {
+        name: name.into(),
+        wanted: "evidence".into(),
+        got: got.into(),
+        detail: detail.into(),
+    };
+    let mut rows = vec![
+        row("L18", "verified", "hardening"),
+        row("boot-adopt", "adopted", "trace"),
+        row("L9-cli-0", "passed", "checkpoint"),
+        row(
+            "daemon-L7",
+            "passed",
+            "elapsed_ms=1234; forwarding_zero_ms=42",
+        ),
+        row("daemon-unknown", "passed", "not catalogued"),
+    ];
+    evidence::save_setup(&dir, &mut rows).unwrap();
+    evidence::save_setup(&dir, &mut rows).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].name, "daemon-L7");
+    evidence::save_results(&dir, &rows).unwrap();
+    let tsv = fs::read_to_string(dir.join("results.tsv")).unwrap();
+    assert!(tsv.contains("passed\t1234\telapsed_ms=1234; forwarding_zero_ms=42"));
+    let setup: Vec<Row> =
+        serde_json::from_slice(&fs::read(dir.join("setup-results.json")).unwrap()).unwrap();
+    assert_eq!(setup.len(), 4);
+    fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn public_key_fixture_redaction_preserves_structure() {
     let keys = vec![
@@ -439,6 +476,11 @@ fn capture_loss_or_missing_statistics_cannot_establish_silence() {
         .is_ok()
     );
     assert!(evidence::check_capture_stats("1 packets dropped by kernel\n").is_err());
+    let error = evidence::check_capture_stats(
+        "0 packets captured\n218 packets received by filter\n0 packets dropped by kernel\n",
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("capture harness error"));
     assert!(
         evidence::check_capture_stats(
             "0 packets dropped by kernel\n2 packets dropped by interface\n"

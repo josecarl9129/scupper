@@ -32,6 +32,7 @@ table inet permissive {
 impl Lab {
     pub(super) fn build(&mut self) -> Result<()> {
         self.build_wan()?;
+        self.restore_host_rules()?;
         self.build_gateway()?;
         self.build_provider()?;
         self.build_client()?;
@@ -150,7 +151,6 @@ impl Lab {
     }
     fn build_gateway(&mut self) -> Result<()> {
         self.prepare_check_v2()?;
-        self.boot_inheritance()?;
         self.registry
             .register(Resource::Namespace("scupper".into()));
         self.boot_gateway(&[], "boot-fresh")?;

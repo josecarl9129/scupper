@@ -37,3 +37,31 @@ fn list_cli_matches_catalog_without_creating_artifacts() {
     assert!(!invalid.status.success());
     assert!(String::from_utf8_lossy(&invalid.stderr).contains("shard must be I/N"));
 }
+
+#[test]
+fn shared_duration_file_is_used_by_root_free_cli_listing() {
+    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    std::fs::create_dir_all(&root).unwrap();
+    let durations = root.join(format!("list-durations-{}.tsv", std::process::id()));
+    std::fs::write(
+        &durations,
+        "name\tgot\telapsed_ms\tdetail\ndaemon-L9\tpassed\t800000\tmeasured\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_xtask"))
+        .args(["leaktest", "--list", "--durations"])
+        .arg(&durations)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        text,
+        xtask::lab::list_with_durations(None, Some(&durations)).unwrap()
+    );
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("daemon-L9\t") && line.ends_with("\t1005"))
+    );
+    std::fs::remove_file(durations).unwrap();
+}

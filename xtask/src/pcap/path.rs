@@ -149,6 +149,21 @@ pub(crate) fn pmtu_sender(bytes: &[u8], expected: &Pmtu) -> Result<(), Error> {
     Ok(())
 }
 
+/// Reject PMTU ICMP and delivery of the oversized measured flow, after NAT.
+pub(crate) fn pmtu_receiver(bytes: &[u8], flow: &Flow) -> Result<(), Error> {
+    for packet in observe(bytes)? {
+        if matches!(packet.protocol, 1 | 58) {
+            return Err(error("PMTU ICMP reached receiver"));
+        }
+        // Capture begins after the small control has been received. Any packet
+        // on this tuple is measured-flow delivery, including its first fragment.
+        if flow.matches(&packet) {
+            return Err(error("oversized PMTU datagram reached receiver"));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::cast_possible_truncation)]
 mod tests {
@@ -286,6 +301,25 @@ mod tests {
             body.extend(&quote);
             let valid = ip(router, sender, proto, &body);
             assert!(pmtu_sender(&capture(&[original.clone(), valid.clone()]), &expected).is_ok());
+            // A correct sender error cannot excuse oversized delivery, including
+            // the NATed receiver tuple in either address family.
+            let received = Flow {
+                source: if proto == 1 {
+                    "10.2.0.2".parse().unwrap()
+                } else {
+                    "2001:db8:2::2".parse().unwrap()
+                },
+                ..expected.flow.clone()
+            };
+            let delivered = ip(&received.source.to_string(), destination, 17, &udp);
+            assert!(pmtu_receiver(&capture(&[]), &received).is_ok());
+            assert!(pmtu_receiver(&capture(&[delivered]), &received).is_err());
+            if proto == 1 {
+                let mut fragment = ip(&received.source.to_string(), destination, 17, &udp[..1024]);
+                fragment[6] = 0x20; // First IPv4 fragment, smaller than the path MTU.
+                assert!(pmtu_receiver(&capture(&[fragment]), &received).is_err());
+            }
+            assert!(pmtu_receiver(&capture(std::slice::from_ref(&valid)), &received).is_err());
             assert!(pmtu_sender(&capture(std::slice::from_ref(&valid)), &expected).is_err());
             let echo = ip(
                 router,

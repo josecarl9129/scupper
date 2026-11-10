@@ -118,15 +118,20 @@ impl DaemonGuard<'_> {
         self.lab.boot_gateway(&[], "L15-target-boot")?;
         self.control_restart(root, "fake-target")?;
         self.lab.daemon_complete_tick(root)?;
-        self.expect_check(root, 0, "fake-target-healthy")?;
+        self.expect_check(root, 0, None, "fake-target-healthy")?;
         fs::write(tls.join("ip.txt"), format!("{}\n", A.gwhost.peer))?;
-        self.expect_check(root, 2, "fake-target-uplink")?;
+        self.expect_check(
+            root,
+            2,
+            Some(("Unprotected", "ExitIpIsUplinkAddress")),
+            "fake-target-uplink",
+        )?;
         let report = fs::read_to_string(self.lab.artifacts.join("L15-fake-target-uplink.json"))?;
         if !report.contains("ExitIpIsUplinkAddress") || !report.contains(A.gwhost.peer) {
             return fail("L15 failed at a stage other than exit-IP uplink detection");
         }
         fs::write(tls.join("ip.txt"), format!("{}\n", A.provider.peer))?;
-        self.expect_check(root, 0, "fake-target-restored")?;
+        self.expect_check(root, 0, None, "fake-target-restored")?;
         self.control_stop(Signal::TERM)?;
         self.reset_control_fixture()?;
         self.supervised_fixture(root)?;
