@@ -182,6 +182,39 @@ pub fn list_with_durations(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // CI has no committed successful durations yet: always check the built-in
+    // estimates, with 300 seconds reserved for setup/cleanup in the 25-minute budget.
+    fn check_four_shard_budget(cases: &[Spec]) -> Result<()> {
+        if cases.is_empty() {
+            return fail("empty shard catalog");
+        }
+        for index in 1..=4 {
+            let seconds: u64 = select(Shard { index, count: 4 }, cases.to_vec())
+                .iter()
+                .map(|case| case.seconds)
+                .sum();
+            if seconds + 300 > 25 * 60 {
+                return fail(format!(
+                    "shard {index}: {seconds}s plus 300s exceeds 1500s budget"
+                ));
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    fn ci_shard_budget_uses_builtin_estimates_and_rejects_over_budget() {
+        check_four_shard_budget(&catalog()).unwrap();
+        let mut over_budget = catalog();
+        over_budget[0].seconds = 25 * 60;
+        assert!(
+            check_four_shard_budget(&over_budget)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds")
+        );
+        assert!(check_four_shard_budget(&[]).is_err());
+    }
+
     #[test]
     fn deterministic_complete_disjoint_balanced_and_order_independent() {
         let cases = catalog();

@@ -457,7 +457,7 @@ impl DaemonGuard<'_> {
         Ok(())
     }
     pub(super) fn reset_control_fixture(&mut self) -> Result<()> {
-        let root = self.lab.private.join("boot-root");
+        let root = self.lab.boot_root.clone();
         for marker in [
             "crash-after-selection",
             "pause-apply",

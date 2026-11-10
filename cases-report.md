@@ -237,3 +237,33 @@ Linux machine` (target/tmp/lab-round2.log). The process is uid 1000 with no
 effective capabilities; nft/tcpdump are absent. A green privileged lab rerun is
 still required for both CLI/daemon crash matrices, L8, L12, L17-rebuild, L18 and
 positive-control-permissive. No kernel pass is claimed.
+
+## Fix round 3
+
+| Item | Change | Verification |
+|---|---|---|
+| Lab control pathname | Each case uses a short `/run/scupper-lab/<pid>-<case>` root, created by the root-only lab with mode 0755 and registered for cleanup. Its etc, state and run links retain the existing private backing directories; saved artifacts stay in their original locations. Startup Ping, restart, crash recovery and CLI invocations use this short pathname. | Longest daemon case id produces a control socket pathname shorter than 108 bytes. |
+| Production pathname validation | Bind and connect share a byte-length check naming the socket pathname and the 108-byte limit. Daemon startup rejects invalid roots before acquiring its lease or entering the bind retry loop; CLI check/status/mutations report the same error before fallback. | Bind/connect boundary tests (107 accepted, 108 rejected), startup rejection and CLI regressions. |
+| N-A | Fresh-handshake observations select client 1's configured public key, both before and after resetting its session. | A newer client2 handshake, or client2 alone, cannot satisfy client1's wait. |
+| CI shard budget | CI explicitly runs a test using the built-in duration estimates, because no successful measured-duration file is committed. All four shards must fit 25 minutes including a 300-second setup/cleanup reserve. | Test checks the complete estimated catalog, rejects an empty catalog and rejects an injected over-budget case. |
+
+The new unit-test temporary paths use compile-time CARGO_TARGET_TMPDIR, with
+an OUT_DIR fallback supplied for scupper-sys library tests as for xtask.
+Existing socket fixtures use short descriptor paths while retaining their files
+under the test temporary directory.
+
+All five gates passed, each under `timeout 600`:
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets --all-features --locked --offline -- -D warnings`
+- `cargo test --workspace --all-features --locked --offline`
+- `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked --offline`
+- `cargo deny --locked check` (advisories, bans, licenses and sources OK)
+
+The targeted library suites passed (136 scupper-sys tests and 56 xtask tests),
+as did all nine final CLI tests and the exact default-feature CI shard-budget
+test (one test executed). Gate logs are in `target/tmp/*-round3.log`.
+`git diff --check` passed. `cargo fmt --all` is the final command.
+
+Privileged namespace trials cannot run here (uid 1000); no kernel/lab pass is
+claimed. No commit was created.

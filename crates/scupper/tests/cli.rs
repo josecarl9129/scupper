@@ -8,6 +8,7 @@ use std::{
     cell::RefCell,
     collections::VecDeque,
     io,
+    os::fd::AsRawFd,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -96,6 +97,8 @@ impl Harness {
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
         std::fs::create_dir_all(&root).unwrap();
+        let directory = std::fs::File::open(&root).unwrap();
+        let socket_root = PathBuf::from(format!("/proc/self/fd/{}/.", directory.as_raw_fd()));
         let mut out = Vec::new();
         let mut err = Vec::new();
         let code = cli::run_with(
@@ -103,7 +106,7 @@ impl Harness {
             &Dependencies {
                 state_root: &root.join("missing-store"),
                 config_root: &root.join("missing-config"),
-                writer_root: &root.join("unused-writer"),
+                writer_root: &socket_root.join("unused-writer"),
                 probe_exec: &scupper::system::RealSystem::default(),
                 system: self,
                 namespaces: self,

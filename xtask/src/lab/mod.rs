@@ -78,6 +78,8 @@ struct Capture {
 }
 
 struct Lab {
+    boot_root: PathBuf,
+    boot_root_ready: bool,
     runner: Runner,
     registry: Registry,
     services: Vec<Group>,
@@ -175,6 +177,8 @@ fn run_inner(
     }
     let rules = private.join("netns.nft");
     let mut lab = Lab {
+        boot_root: daemon::short_boot_root("setup"),
+        boot_root_ready: false,
         runner,
         registry: Registry::default(),
         services: Vec::new(),

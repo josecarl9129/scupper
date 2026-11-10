@@ -883,3 +883,31 @@ fn boot_canary_requires_received_bytes_and_the_actual_ingress_marker() {
     assert!(boot_canary_arrival(10, 11, &capture(&[]), &markers).is_err());
     assert!(boot_canary_arrival(10, 11, &pcap, &["different".into()]).is_err());
 }
+
+#[test]
+fn longest_daemon_case_has_a_short_control_socket_path() {
+    let longest = super::daemon::CASES
+        .iter()
+        .max_by_key(|case| case.len())
+        .unwrap();
+    let root = super::daemon::short_boot_root(longest).join("run/scupper");
+    assert!(root.join("control.sock").as_os_str().len() < 108);
+    scupper_sys::daemon::control::validate_socket_path(&root).unwrap();
+}
+
+#[test]
+fn fresh_handshake_only_uses_the_expected_client() {
+    use super::boot::client_handshake;
+    let before = client_handshake("client1 100\nclient2 200\n", "client1");
+    assert_eq!(before, 100);
+    assert_eq!(
+        client_handshake("client2 999\nclient1 100\n", "client1"),
+        before
+    );
+    assert_eq!(client_handshake("client2 999\n", "client1"), 0);
+    assert_eq!(
+        client_handshake("client1 101\nclient2 999\n", "client1"),
+        before + 1
+    );
+    assert_eq!(client_handshake("client1 0\nclient2 999\n", "client1"), 0);
+}

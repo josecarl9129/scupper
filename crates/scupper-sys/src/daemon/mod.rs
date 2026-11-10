@@ -1141,7 +1141,7 @@ mod tests {
             .unwrap();
         let lease = crate::lock::SupervisorLease::try_acquire(&root).unwrap();
         let options = Options {
-            run_root: root.clone(),
+            run_root: PathBuf::from(format!("/proc/self/fd/{}/.", dir.as_raw_fd())),
             config_root: root.join("missing"),
             state_root: root.join("state"),
             probe_binary: root.join("unused"),
@@ -1605,7 +1605,11 @@ pub mod testing {
             probe_binary: deps.run_root.join("unused-probe"),
         };
         let mut runtime = runtime(deps, &options)?;
-        let missing = deps.run_root.join("missing-notify.sock");
+        // Short and never created: the fixture root may exceed the 108-byte `sun_path` limit.
+        let missing = std::path::PathBuf::from(format!(
+            "/tmp/scupper-missing-notify-{}.sock",
+            std::process::id()
+        ));
         runtime.notify = notify::Notify::new(Some(missing.as_os_str()))?;
         runtime.started();
         runtime.started();

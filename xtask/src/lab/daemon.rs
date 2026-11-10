@@ -24,6 +24,10 @@ use std::{
 mod control_cases;
 mod m2_cases;
 
+pub(super) fn short_boot_root(case: &str) -> std::path::PathBuf {
+    Path::new("/run/scupper-lab").join(format!("{}-{case}", std::process::id()))
+}
+
 pub(super) const CASES: [&str; 28] = [
     "L1",
     "L2",
@@ -451,6 +455,9 @@ impl Lab {
         if !CASES.contains(&selected) {
             return fail(format!("unknown daemon selection: {selected}"));
         }
+        self.boot_root = short_boot_root(selected);
+        self.boot_root_ready = false;
+        self.prepare_check_v2()?;
         let mut observation = String::new();
         let first_group = self.runner.background_checkpoint();
         if self.daemon_host_baseline.is_none() {
@@ -564,7 +571,7 @@ impl Lab {
         stem: &str,
         point: &str,
     ) -> Result<std::process::ExitStatus> {
-        let root = self.private.join("boot-root");
+        let root = self.boot_root.clone();
         self.reset_boot_budget(stem)?;
         self.runner.boot_point = Some(point.into());
         self.runner.boot_marker = Some(
@@ -579,7 +586,7 @@ impl Lab {
         child.wait_timeout(Duration::from_secs(30))
     }
     pub(super) fn daemon_boot_recover(&mut self, stem: &str) -> Result<String> {
-        let root = self.private.join("boot-root");
+        let root = self.boot_root.clone();
         self.reset_boot_budget(stem)?;
         let (mut child, notify) = self.daemon_start(&format!("{stem}-retry"), &root)?;
         self.daemon_ready_tick(&notify)?;
@@ -793,7 +800,7 @@ impl Lab {
     }
     fn daemon_ready_tick(&mut self, notify: &NotifyCapture) -> Result<()> {
         let mut ready = false;
-        let root = self.private.join("boot-root/run/scupper");
+        let root = self.boot_root.join("run/scupper");
         let mut last_ping = String::new();
         let waited = self.daemon_wait(
             "READY and first complete tick",
@@ -1660,7 +1667,7 @@ impl Lab {
                     && after[0]["ifindex"] != before[0]["ifindex"])
             })?;
             self.runner.dwell(Duration::from_secs(3))?;
-            let root = self.private.join("boot-root");
+            let root = self.boot_root.clone();
             let report: scupper_sys::boot::BootReport =
                 serde_json::from_slice(&fs::read(root.join("run/scupper/boot.json"))?)?;
             let after: serde_json::Value = serde_json::from_str(&self.cmd(
@@ -1719,7 +1726,7 @@ impl Lab {
                 Ok(flow_counts(udp_log)?.0 >= closed_count + 40)
             },
         )?;
-        let root = self.private.join("boot-root");
+        let root = self.boot_root.clone();
         let (code, report) = self.check_result(&Self::boot_binary()?, &root)?;
         if code != 4 || report["verdict"]["FailClosed"] != "NoHealthyExit" {
             return fail(format!("L3 expected check 4: {code}: {report}"));

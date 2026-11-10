@@ -15,6 +15,17 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub(super) fn client_handshake(text: &str, expected: &str) -> u64 {
+    text.lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            (fields.next()? == expected)
+                .then(|| fields.next()?.parse().ok())
+                .flatten()
+        })
+        .unwrap_or(0)
+}
+
 // ip_forward rewrites per-interface settings too: retain every IPv4 conf value,
 // then restore only changed files after restoring ip_forward itself.
 pub(super) struct InheritanceGuard {
@@ -126,7 +137,7 @@ impl Lab {
         stem: &str,
     ) -> Result<(std::process::ExitStatus, serde_json::Value)> {
         let binary = Self::boot_binary()?;
-        let root = self.private.join("boot-root");
+        let root = self.boot_root.clone();
         let trace = self.artifacts.join(format!("{stem}.calls.json"));
         let mut args = vec![
             "--test-root",
@@ -307,13 +318,11 @@ impl Lab {
             .map_err(Into::into)
     }
     pub(super) fn boot_fresh_client_handshake(&mut self) -> Result<()> {
-        let latest = |text: &str| {
-            text.lines()
-                .filter_map(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
-                .max()
-                .unwrap_or(0)
-        };
-        let before = latest(&self.cmd("scupper", "wg", &["show", "wg0", "latest-handshakes"])?);
+        let expected = self.public_keys[3].clone();
+        let before = client_handshake(
+            &self.cmd("scupper", "wg", &["show", "wg0", "latest-handshakes"])?,
+            &expected,
+        );
         if before != 0 {
             self.runner.dwell(Duration::from_millis(1100))?;
         }
@@ -334,8 +343,10 @@ impl Lab {
                 &Invocation::new("client", "ping", &["-c", "1", "-W", "1", A.gateway_inner]),
                 None,
             )?;
-            let after =
-                latest(&self.cmd("scupper", "wg", &["show", "wg0", "latest-handshakes"])?);
+            let after = client_handshake(
+                &self.cmd("scupper", "wg", &["show", "wg0", "latest-handshakes"])?,
+                &expected,
+            );
             if after > before {
                 return Ok(());
             }

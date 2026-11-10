@@ -113,7 +113,7 @@ impl Lab {
     pub(super) fn prepare_check_v2(&mut self) -> Result<PathBuf> {
         let root = self.private.join("boot-root");
         if root.is_dir() {
-            return Ok(root);
+            return self.prepare_short_boot_root();
         }
         let etc = root.join("etc/scupper");
         let state = root.join("var-lib/scupper");
@@ -177,7 +177,38 @@ impl Lab {
         )?;
         store.write_rendered(&writer, version, &rules)?;
         fs::write(&self.rules, rules)?;
-        Ok(root)
+        self.prepare_short_boot_root()
+    }
+
+    // Keep private state in place; only the public runtime pathname needs shortening.
+    fn prepare_short_boot_root(&mut self) -> Result<PathBuf> {
+        use super::cleanup::Resource;
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, symlink};
+        if !self.boot_root_ready {
+            let parent = Path::new("/run/scupper-lab");
+            match fs::DirBuilder::new().mode(0o755).create(parent) {
+                Ok(()) => {
+                    self.registry.register(Resource::Directory(parent.into()));
+                    fs::set_permissions(parent, fs::Permissions::from_mode(0o755))?;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e.into()),
+            }
+            let meta = fs::symlink_metadata(parent)?;
+            if !meta.is_dir() || meta.uid() != 0 || meta.mode() & 0o777 != 0o755 {
+                return fail("/run/scupper-lab must be a root-owned 0755 directory");
+            }
+            fs::DirBuilder::new().mode(0o755).create(&self.boot_root)?;
+            self.registry
+                .register(Resource::Directory(self.boot_root.clone()));
+            fs::set_permissions(&self.boot_root, fs::Permissions::from_mode(0o755))?;
+            let storage = self.private.join("boot-root");
+            for name in ["etc", "var-lib", "run"] {
+                symlink(storage.join(name), self.boot_root.join(name))?;
+            }
+            self.boot_root_ready = true;
+        }
+        Ok(self.boot_root.clone())
     }
 
     pub(super) fn check_result(
