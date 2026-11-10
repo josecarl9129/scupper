@@ -8,10 +8,6 @@ use super::{
     fail,
 };
 use scupper_core::{canon::canonicalize, render::desired_sysctls, rules::IfName};
-use scupper_sys::{
-    lock::WriterLock,
-    state::{Selection, StateFile},
-};
 use std::{
     fs,
     os::unix::process::ExitStatusExt,
@@ -144,60 +140,16 @@ impl Lab {
         self.rows.push(Row{name:"L18".into(),wanted:"explicit namespace hardening overrides inherited host values".into(),got:"verified".into(),detail:"gwhost rp_filter=2, forwarding=1, accept_ra=1 before real boot; all desired namespace sysctls read back".into()});
         Ok(())
     }
-    pub(super) fn boot_cases(&mut self) -> Result<()> {
-        self.runner.phase = Instant::now() + Duration::from_secs(450);
-        self.boot_disconnected()?;
-        for point in (0_u8..=7)
-            .map(|n| n.to_string())
-            .chain(["link-add-wg0".into(), "link-add-ex-ch1".into()])
-        {
-            self.boot_kill(&point, false)?;
+    pub(super) fn supervised_boot_cases(&mut self, case: &str) -> Result<()> {
+        let points: Vec<String> = match case {
+            "L9" => (0_u8..=7).map(|n| n.to_string()).collect(),
+            "L9b" => (1_u8..=6).map(|n| n.to_string()).collect(),
+            "L9-host-link" => vec!["link-add-wg0".into(), "link-add-ex-ch1".into()],
+            _ => return fail("unknown boot crash group"),
+        };
+        for point in points {
+            self.boot_kill(&point, case == "L9b")?;
         }
-        for point in 1_u8..=6 {
-            self.boot_kill(&point.to_string(), true)?;
-        }
-        Ok(())
-    }
-    fn boot_disconnected(&mut self) -> Result<()> {
-        let root = self.private.join("boot-root");
-        let writer = WriterLock::acquire(root.join("run/scupper"))?;
-        let state = StateFile::open(root.join("var-lib/scupper"), Some(&writer))?;
-        state.update(&writer, |s| s.selection = Selection::Disconnected)?;
-        drop(writer);
-        self.boot_gateway(&[], "L14-boot")?;
-        for family in ["-4", "-6"] {
-            let routes: serde_json::Value = serde_json::from_str(&self.cmd(
-                "scupper",
-                "ip",
-                &["-j", family, "route", "show", "default"],
-            )?)?;
-            if !routes
-                .as_array()
-                .is_some_and(|r| r.len() == 1 && r[0]["type"] == "unreachable")
-            {
-                return fail(format!("L14 boot defaults: {routes}"));
-            }
-        }
-        let (code, report) = self.check_result(&Self::boot_binary()?, &root)?;
-        if code != 4 || report["verdict"]["FailClosed"] != "AdminDisconnected" {
-            return fail(format!("L14 check: {code}: {report}"));
-        }
-        let writer = WriterLock::acquire(root.join("run/scupper"))?;
-        state.update(&writer, |s| s.selection = Selection::Auto)?;
-        drop(writer);
-        self.boot_gateway(&[], "L14-restore")?;
-        self.wait_provider()?;
-        self.boot_fresh_client_handshake()?;
-        let (code, restored) = self.check_result(&Self::boot_binary()?, &root)?;
-        if code != 0 {
-            return fail(format!("L14 restore check: {code}: {restored}"));
-        }
-        self.rows.push(Row {
-            name: "L14-boot".into(),
-            wanted: "two unreachable defaults; check 4 Disconnected".into(),
-            got: "verified".into(),
-            detail: report.to_string(),
-        });
         Ok(())
     }
     fn boot_client_rx(&mut self) -> Result<u64> {
@@ -215,7 +167,7 @@ impl Lab {
             })
             .map_err(Into::into)
     }
-    fn boot_fresh_client_handshake(&mut self) -> Result<()> {
+    pub(super) fn boot_fresh_client_handshake(&mut self) -> Result<()> {
         let latest = |text: &str| {
             text.lines()
                 .filter_map(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
@@ -257,6 +209,11 @@ impl Lab {
     #[allow(clippy::too_many_lines)] // Each crash assertion stays next to the retry and capture it protects.
     fn boot_kill(&mut self, point: &str, live: bool) -> Result<()> {
         let stem = format!("{}-{point}", if live { "L9b" } else { "L9" });
+        let before_stem = format!("{stem}-before");
+        self.capture("wan", A.gwhost.wan_if, &before_stem)?;
+        self.daemon_boot_recover(&before_stem)?;
+        self.stop_captures()?;
+        self.daemon_oracle(&before_stem, &[], self.exit_port, self.exit_port)?;
         // Lab reboot simulation: only the lab-owned gateway namespace is removed.
         // Boot itself never deletes an existing namespace, including during retry.
         if live {
@@ -274,12 +231,7 @@ impl Lab {
             fs::remove_file(record)?;
         }
         self.capture("wan", A.gwhost.wan_if, &stem)?;
-        let flags = if let Some(name) = point.strip_prefix("link-add-") {
-            vec!["--stop-after-link-add", name]
-        } else {
-            vec!["--stop-after", point]
-        };
-        let (status, _) = self.boot_output(&flags, &stem)?;
+        let status = self.daemon_boot_crash(&stem, point)?;
         if status.signal() != Some(9) && status.code() != Some(137) {
             return fail(format!("L9 did not kill boot at {point}: {status}"));
         }
@@ -405,31 +357,18 @@ impl Lab {
             exit_port,
             matches!(point, "6" | "7"),
         )?;
-        self.boot_gateway(&[], &format!("{stem}-retry"))?;
         self.registry
             .register(Resource::Namespace("scupper".into()));
-        self.wait_provider()?;
-        self.boot_fresh_client_handshake()?;
-        let root = self.private.join("boot-root");
-        let (code, report) = self.check_result(&Self::boot_binary()?, &root)?;
-        let skip = (code == 3
-            && report["verdict"]["Degraded"]
-                .get("ExitProbeFailed")
-                .is_some())
-        .then(|| "runner internet unavailable after all local stages passed".to_owned());
-        if code != 0 && skip.is_none() {
-            return fail(format!("L9 retry check {point}: {code}: {report}"));
-        }
-        self.service_check(&mut Vec::new())?;
+        let after_stem = format!("{stem}-after");
+        self.capture("wan", A.gwhost.wan_if, &after_stem)?;
+        let report = self.daemon_boot_recover(&stem)?;
+        self.stop_captures()?;
+        self.daemon_oracle(&after_stem, &[], self.exit_port, self.exit_port)?;
         self.rows.push(Row {
             name: stem,
             wanted: "SIGKILL prefix closed; retry healthy".into(),
-            got: if skip.is_some() {
-                "local stages verified; external probe skipped".into()
-            } else {
-                "verified".into()
-            },
-            detail: skip.unwrap_or_else(|| report.to_string()),
+            got: "passed".into(),
+            detail: report,
         });
         evidence::save_results(&self.artifacts, &self.rows)?;
         Ok(())

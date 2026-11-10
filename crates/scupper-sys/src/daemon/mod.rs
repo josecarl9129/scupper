@@ -499,7 +499,7 @@ impl<'a> Runtime<'a> {
             config_root: &self.options.config_root,
             run_root: &self.options.run_root,
             #[cfg(feature = "testing")]
-            hook: None,
+            hook: Some(&testing_boot_hook),
             #[cfg(feature = "testing")]
             secret_owner: self.secret_owner,
         }
@@ -1096,6 +1096,21 @@ fn close_only(deps: &BootDeps<'_>, options: &Options) {
         return;
     };
     let _ = crate::reconcile::forwarding_gates(deps, &held, false, None);
+}
+
+// Fault injection is confined to testing builds and still executes real boot.
+#[cfg(feature = "testing")]
+fn testing_boot_hook(point: boot::BootPoint) -> Result<(), String> {
+    let point = match point {
+        boot::BootPoint::After(step) => (step as u8).to_string(),
+        boot::BootPoint::LinkAdded(name) => format!("link-add-{name}"),
+    };
+    if std::env::var("SCUPPER_TEST_BOOT_POINT").ok().as_deref() == Some(&point) {
+        rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::KILL)
+            .map_err(|e| e.to_string())?;
+        return Err("injected daemon boot crash".into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -64,6 +64,8 @@ pub(super) struct Runner {
     pub whole: Instant,
     pub phase: Instant,
     pub cleanup: bool,
+    pub probe_ca: Option<String>,
+    pub boot_point: Option<String>,
     trace: File,
     background_groups: Vec<u32>,
 }
@@ -75,6 +77,8 @@ impl Runner {
             whole: now + Duration::from_secs(1600),
             phase: now + Duration::from_secs(180),
             cleanup: false,
+            probe_ca: None,
+            boot_point: None,
             trace,
             background_groups: Vec::new(),
         }
@@ -107,6 +111,14 @@ impl Runner {
         let mut cmd = Command::new("timeout");
         cmd.args(invocation.timed(seconds)).process_group(0);
         cmd.env("LC_ALL", "C");
+        cmd.env_remove("SCUPPER_TEST_BOOT_POINT");
+        if let Some(point) = &self.boot_point {
+            cmd.env("SCUPPER_TEST_BOOT_POINT", point);
+        }
+        cmd.env_remove("SCUPPER_TEST_CA_DER");
+        if let Some(ca) = &self.probe_ca {
+            cmd.env("SCUPPER_TEST_CA_DER", ca);
+        }
         Ok(cmd)
     }
     pub fn output(

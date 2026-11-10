@@ -2458,6 +2458,16 @@ several gateways (rejected in R1); `devices.*.gateways` is a list;
   twice, compare sha256), macOS job for `scupper-mac` and `pfctl -n`, secret
   and private-address scan of the repository.
 
+M2 lab deviations: L2/L11 permit client echo and deny gateway DNS/API
+requests because those listeners are deferred to M4 (§5.2). The isolated
+`gwhost` has no networkd instance, so L5 records that restart is inapplicable.
+L20's IPv6 subtrial widens the renderer's empty IPv6 sets and adds tunnel
+addresses while the real daemon is temporarily stopped, then restores the
+exact M2 rules and resumes it; M2 configuration still refuses IPv6. L9
+crash prefixes are independent simulated boots: their lab-private `/run`
+boot-attempt budgets are saved and reset between prefixes; production
+retry limits are unchanged.
+
 ### Leak-test list, staged
 
 | # | Case | Expectation | Milestone |

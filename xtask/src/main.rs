@@ -11,6 +11,14 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Namespace-local raw datagram used by fault trials.
+    #[command(hide = true)]
+    SendPacket {
+        #[arg(long)]
+        interface: String,
+        #[arg(long)]
+        file: PathBuf,
+    },
     /// Continuous namespace-local fault canary.
     #[command(hide = true)]
     Flow {
@@ -40,6 +48,10 @@ enum Command {
         artifacts: PathBuf,
         #[arg(long)]
         capture_fixtures: Option<PathBuf>,
+        #[arg(long)]
+        shard: Option<String>,
+        #[arg(long)]
+        list: bool,
     },
     /// Namespace-local canary sink (used by leaktest).
     #[command(hide = true)]
@@ -79,6 +91,11 @@ enum Command {
 fn run() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     match Args::parse().command {
         #[cfg(target_os = "linux")]
+        Command::SendPacket { interface, file } => {
+            xtask::lab::send_packet(&interface, &file)?;
+            Ok(true)
+        }
+        #[cfg(target_os = "linux")]
         Command::Flow {
             mode,
             address,
@@ -103,8 +120,25 @@ fn run() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         Command::Leaktest {
             artifacts,
             capture_fixtures,
+            shard,
+            list,
         } => {
-            xtask::lab::run(&artifacts, capture_fixtures.as_deref())?;
+            if list {
+                print!(
+                    "{}",
+                    xtask::lab::list(shard.as_deref().map(str::parse).transpose()?)?
+                );
+                return Ok(true);
+            }
+            xtask::lab::run(
+                &artifacts,
+                capture_fixtures.as_deref(),
+                shard
+                    .as_deref()
+                    .map(str::parse)
+                    .transpose()?
+                    .unwrap_or_default(),
+            )?;
             Ok(true)
         }
         #[cfg(target_os = "linux")]

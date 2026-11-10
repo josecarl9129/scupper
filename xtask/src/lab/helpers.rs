@@ -175,6 +175,21 @@ fn valid_marker(text: &str) -> bool {
 /// # Errors
 /// Returns socket, log or malformed-marker errors.
 pub fn sink(protocol: &str, bind: SocketAddr, log: &Path) -> Result<()> {
+    if protocol == "udp-drain" {
+        let socket = UdpSocket::bind(bind)?;
+        let mut bytes = vec![0; 65535];
+        loop {
+            match socket.recv_from(&mut bytes) {
+                Ok((len, peer)) => record(log, protocol, &format!("datagram-{len}"), peer)?,
+                // A PMTU error belongs to the sender's evidence, and may also
+                // be delivered asynchronously to this bound UDP drain socket.
+                Err(error)
+                    if error.raw_os_error() == Some(90)
+                        || error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
     if protocol == "tcp" {
         let listener = TcpListener::bind(bind)?;
         listener.set_nonblocking(true)?;
@@ -225,7 +240,7 @@ pub fn sink(protocol: &str, bind: SocketAddr, log: &Path) -> Result<()> {
     fail("protocol must be tcp or udp")
 }
 
-/// Sends one marker, prints its structured outcome, and returns whether acknowledged.
+/// Sends a marker or DNS question and reports its structured delivery outcome.
 ///
 /// # Errors
 /// Returns resolution, connection, timeout or acknowledgment failures.
@@ -242,6 +257,11 @@ pub fn probe(
         return fail("invalid probe marker");
     }
     let address = SocketAddr::new(resolve(target, ipv6)?, port);
+    let payload = if protocol == "dns" {
+        dns_query(&format!("{marker}.lab.test"), ipv6)?
+    } else {
+        marker.as_bytes().to_vec()
+    };
     let mut attempted = false;
     let result: std::io::Result<()> = (|| {
         if protocol == "tcp" {
@@ -272,7 +292,7 @@ pub fn probe(
             if reply.trim_end() != marker {
                 return Err(std::io::Error::other("TCP acknowledgment mismatch"));
             }
-        } else if protocol == "udp" {
+        } else if matches!(protocol, "udp" | "dns") {
             let local = source.unwrap_or_else(|| {
                 if ipv6 {
                     std::net::Ipv6Addr::UNSPECIFIED.into()
@@ -292,14 +312,18 @@ pub fn probe(
             socket.set_read_timeout(Some(IO_TIMEOUT))?;
             socket.connect(&address.into())?;
             let socket: UdpSocket = socket.into();
-            socket.send(marker.as_bytes()).inspect_err(|error| {
+            socket.send(&payload).inspect_err(|error| {
                 // nft output drop is EPERM, distinct from local send failures.
                 attempted = error.raw_os_error() == Some(1);
             })?;
             attempted = true;
             let mut reply = [0; 1024];
             let len = socket.recv(&mut reply)?;
-            if &reply[..len] != marker.as_bytes() {
+            if protocol == "dns" {
+                if len < 12 || reply[..2] != payload[..2] || reply[2] & 0x80 == 0 {
+                    return Err(std::io::Error::other("DNS acknowledgment mismatch"));
+                }
+            } else if &reply[..len] != marker.as_bytes() {
                 return Err(std::io::Error::other("UDP acknowledgment mismatch"));
             }
         } else {
@@ -389,6 +413,40 @@ fn spoofed_packet(source: IpAddr, destination: IpAddr, marker: &[u8]) -> Result<
     // An IPv4 UDP checksum of zero means absent.
     packet[28..].copy_from_slice(marker);
     Ok(packet)
+}
+
+/// Sends a complete lab IP datagram through one explicitly bound tunnel.
+///
+/// # Errors
+/// Returns malformed input, privilege, binding or transmit errors.
+pub fn send_packet(interface: &str, file: &Path) -> Result<()> {
+    let bytes = std::fs::read(file)?;
+    let destination: IpAddr = match bytes.first().map(|b| b >> 4) {
+        Some(4) if bytes.len() >= 28 => {
+            std::net::Ipv4Addr::new(bytes[16], bytes[17], bytes[18], bytes[19]).into()
+        }
+        Some(6) if bytes.len() >= 48 => {
+            std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&bytes[24..40])?).into()
+        }
+        _ => return fail("invalid raw lab packet"),
+    };
+    let socket = Socket::new(
+        if destination.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        },
+        Type::RAW,
+        Some(Protocol::from(255)),
+    )?;
+    socket.bind_device(Some(interface.as_bytes()))?;
+    if destination.is_ipv4() {
+        socket.set_header_included_v4(true)?;
+    } else {
+        socket.set_header_included_v6(true)?;
+    }
+    socket.send_to(&bytes, &SocketAddr::new(destination, 0).into())?;
+    Ok(())
 }
 
 #[cfg(test)]

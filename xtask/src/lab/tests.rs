@@ -109,6 +109,18 @@ fn lab_site_validates_and_matches_all_tunnel_addresses() {
     );
 }
 #[test]
+fn second_client_runtime_configuration_preserves_the_single_peer_capture_template() {
+    let mut config = scupper_core::config::parse_site(SITE).unwrap();
+    assert_eq!(config.devices.len(), 1);
+    super::add_second_client(&mut config, "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=").unwrap();
+    let site = scupper_core::config::validate(config).unwrap();
+    assert_eq!(site.devices().len(), 2);
+    assert_eq!(
+        site.devices()["client2"].address4().addr().to_string(),
+        "10.99.0.3"
+    );
+}
+#[test]
 fn policy_for_every_case_has_exact_endpoints_and_positive_evidence() {
     let markers = vec!["scupper-canary-00112233445566778899aabbccddeeff".into()];
     let mut names = BTreeSet::new();
@@ -119,6 +131,11 @@ fn policy_for_every_case_has_exact_endpoints_and_positive_evidence() {
         let value: toml::Value = toml::from_str(&text).unwrap();
         assert_eq!(value["min_packets"].as_integer(), Some(4));
         assert_eq!(value["expect"].as_array().unwrap().len(), 2);
+        assert_eq!(value["wireguard"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            value["wireguard"][2]["peer"].as_str(),
+            Some("192.0.2.10:51820")
+        );
         assert_eq!(
             value["wireguard"][0]["gateway"].as_str(),
             Some("198.51.100.2:51820")

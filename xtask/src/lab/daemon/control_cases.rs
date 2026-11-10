@@ -124,7 +124,7 @@ impl DaemonGuard<'_> {
         Ok(())
     }
 
-    fn expect_check(&mut self, root: &Path, code: i32, stem: &str) -> Result<()> {
+    pub(super) fn expect_check(&mut self, root: &Path, code: i32, stem: &str) -> Result<()> {
         let (got, report) = self.lab.check_result(&Lab::boot_binary()?, root)?;
         fs::write(
             self.lab
@@ -184,7 +184,10 @@ impl DaemonGuard<'_> {
             .filter_map(|line| line.split_once(char::is_whitespace))
             .collect::<std::collections::BTreeMap<_, _>>();
         let mut sample = String::new();
-        for line in transfers.lines() {
+        for line in transfers
+            .lines()
+            .filter(|line| line.split_whitespace().next() == Some(self.lab.public_keys[3].as_str()))
+        {
             let (peer, counters) = line
                 .split_once(char::is_whitespace)
                 .ok_or("invalid peer counters")?;
@@ -312,7 +315,7 @@ impl DaemonGuard<'_> {
         }
         Ok(())
     }
-    fn control_restart(&mut self, root: &Path, stage: &str) -> Result<()> {
+    pub(super) fn control_restart(&mut self, root: &Path, stage: &str) -> Result<()> {
         if let Some(mut child) = self.child.take() {
             child.signal(Signal::CONT);
             child.stop_timeout(Signal::TERM, Duration::from_secs(30))?;
@@ -324,20 +327,23 @@ impl DaemonGuard<'_> {
         self.lab
             .daemon_ready_tick(self.notify.as_ref().ok_or("missing notify")?)
     }
-    fn control_stop(&mut self, signal: Signal) -> Result<()> {
+    pub(super) fn control_stop(&mut self, signal: Signal) -> Result<()> {
         if let Some(mut child) = self.child.take() {
             child.signal(Signal::CONT);
             child.stop_timeout(signal, Duration::from_secs(30))?;
         }
         Ok(())
     }
-    fn supervised_fixture(&mut self, root: &Path) -> Result<()> {
+    pub(super) fn supervised_fixture(&mut self, root: &Path) -> Result<()> {
         let state_root = root.join("var-lib/scupper");
         let config_root = root.join("etc/scupper");
         let guard = WriterLock::acquire(root.join("run/scupper"))?;
         let store = VersionStore::open_with_mirror_root(&state_root, &config_root, Some(&guard))?;
         let head = store.head()?.ok_or("head missing")?;
-        let (text, _) = store.read(head)?;
+        let StateRead::Present(state) = StateFile::open(&state_root, None)?.read()? else {
+            return fail("missing applied safety state");
+        };
+        let (text, _) = store.read(state.applied_version.ok_or("missing applied version")?)?;
         let mut site = parse_site(&text)?;
         site.health.require_daemon = true;
         let text = toml::to_string(&site)?;
@@ -371,9 +377,6 @@ impl DaemonGuard<'_> {
         Ok(())
     }
     pub(super) fn reset_control_fixture(&mut self) -> Result<()> {
-        if !matches!(self.case.as_str(), "L10" | "L14" | "L43" | "L44" | "L50") {
-            return Ok(());
-        }
         let root = self.lab.private.join("boot-root");
         for marker in [
             "crash-after-selection",

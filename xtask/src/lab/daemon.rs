@@ -3,7 +3,7 @@ use super::{
     Lab, Result,
     addresses::A,
     command::{Group, Invocation},
-    evidence::{self, Row},
+    evidence::{self},
     fail,
 };
 use rustix::process::Signal;
@@ -22,10 +22,37 @@ use std::{
 };
 
 mod control_cases;
+mod m2_cases;
 
-const CASES: [&str; 15] = [
-    "L6", "L7", "L13", "L16", "L17-V14", "L52", "L52b", "V03", "L3", "L4", "L10", "L14", "L43",
-    "L44", "L50",
+pub(super) const CASES: [&str; 28] = [
+    "L1",
+    "L2",
+    "L5",
+    "L8",
+    "L9",
+    "L9b",
+    "L11",
+    "L12",
+    "L15",
+    "L18",
+    "L20",
+    "L17-rebuild",
+    "L6",
+    "L7",
+    "L13",
+    "L16",
+    "L17-V14",
+    "L52",
+    "L52b",
+    "V03",
+    "L3",
+    "L4",
+    "L10",
+    "L14",
+    "L43",
+    "L44",
+    "L50",
+    "L9-host-link",
 ];
 
 // Drain notifications continuously, including while fault commands or probes block.
@@ -118,6 +145,9 @@ struct DaemonGuard<'a> {
 impl DaemonGuard<'_> {
     #[allow(clippy::too_many_lines)] // Keep start/restart continuity and fault cleanup ordering together.
     fn run(&mut self, case: &str) -> Result<String> {
+        if m2_cases::is_m2(case) {
+            return self.run_m2(case);
+        }
         if matches!(case, "L10" | "L14" | "L43" | "L44" | "L50") {
             return self.run_control(case);
         }
@@ -361,6 +391,7 @@ impl DaemonGuard<'_> {
         }
         let restored = self
             .reset_control_fixture()
+            .and_then(|()| self.reset_m2_network())
             .and_then(|()| self.lab.daemon_restore_host())
             .and_then(|()| self.lab.boot_gateway(&[], "daemon-restore"))
             .and_then(|_| self.lab.daemon_clean_baseline())
@@ -388,9 +419,11 @@ impl Drop for DaemonGuard<'_> {
 }
 
 impl Lab {
-    pub(super) fn daemon_case(&mut self) -> Result<String> {
+    pub(super) fn daemon_case(&mut self, selected: &str) -> Result<String> {
         let first_group = self.runner.background_checkpoint();
-        self.daemon_host_baseline = Some(self.daemon_host_sysctls()?);
+        if self.daemon_host_baseline.is_none() {
+            self.daemon_host_baseline = Some(self.daemon_host_sysctls()?);
+        }
         // Only this suite needs periodic client traffic during a real reboot.
         let key = self.cmd("client", "wg", &["show", "wg0", "peers"])?;
         let peer = key.trim();
@@ -401,12 +434,13 @@ impl Lab {
         )?;
         let mut failures = Vec::new();
         let mut blocked = None;
-        for case in CASES {
+        for case in CASES.into_iter().filter(|case| *case == selected) {
             self.runner.phase = Instant::now()
-                + Duration::from_secs(if matches!(case, "L3" | "L50") {
-                    300
-                } else {
-                    180
+                + Duration::from_secs(match case {
+                    "L9" => 600,
+                    "L9b" => 450,
+                    "L3" | "L16" | "L50" | "L9-host-link" => 300,
+                    _ => 180,
                 });
             let started = Instant::now();
             let observed = if let Some(cause) = &blocked {
@@ -415,19 +449,13 @@ impl Lab {
                 self.daemon_clean_baseline()
                     .and_then(|()| self.daemon_trial(case))
             };
-            self.rows.push(Row {
-                name: format!("daemon-{case}"),
-                wanted: daemon_wanted(case).into(),
-                got: observed
+            eprintln!(
+                "daemon-{case}: elapsed_ms={}; {}",
+                started.elapsed().as_millis(),
+                observed
                     .as_ref()
-                    .cloned()
-                    .unwrap_or_else(|e| format!("failed: {e}")),
-                detail: format!(
-                    "elapsed_ms={}; isolated daemon; cleanup guard",
-                    started.elapsed().as_millis()
-                ),
-            });
-            evidence::save_results(&self.artifacts, &self.rows)?;
+                    .map_or_else(ToString::to_string, Clone::clone)
+            );
             if let Err(error) = observed {
                 if blocked.is_none() && self.daemon_clean_baseline().is_err() {
                     blocked = Some(format!("{case}: {error}"));
@@ -450,7 +478,7 @@ impl Lab {
             })?;
             // Every daemon stream listener is allocated from this range.
             let sockets = self.cmd("internet", "ss", &["-H", "-lnt"])?;
-            for port in 8081..=8100 {
+            for port in 8081..=8120 {
                 if sockets
                     .split_whitespace()
                     .any(|word| word.ends_with(&format!(":{port}")))
@@ -472,6 +500,7 @@ impl Lab {
         Ok("all daemon cases verified; guarded cleanup, notify evidence and clean shutdown".into())
     }
     fn daemon_trial(&mut self, case: &str) -> Result<String> {
+        self.reset_boot_budget(&format!("{case}-initial"))?;
         let events = self.private.join("boot-root/var-lib/scupper/events");
         if events.exists() {
             fs::remove_dir_all(events)?;
@@ -491,6 +520,61 @@ impl Lab {
             (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
             (Err(error), Err(cleanup)) => fail(format!("{error}; cleanup: {cleanup}")),
         }
+    }
+    pub(super) fn daemon_boot_crash(
+        &mut self,
+        stem: &str,
+        point: &str,
+    ) -> Result<std::process::ExitStatus> {
+        let root = self.private.join("boot-root");
+        self.reset_boot_budget(stem)?;
+        self.runner.boot_point = Some(point.into());
+        let spawned = self.daemon_start(stem, &root);
+        self.runner.boot_point = None;
+        let (mut child, _notify) = spawned?;
+        child.wait_timeout(Duration::from_secs(30))
+    }
+    pub(super) fn daemon_boot_recover(&mut self, stem: &str) -> Result<String> {
+        let root = self.private.join("boot-root");
+        self.reset_boot_budget(stem)?;
+        let (mut child, notify) = self.daemon_start(&format!("{stem}-retry"), &root)?;
+        self.daemon_ready_tick(&notify)?;
+        self.daemon_complete_tick(&root)?;
+        self.daemon_route_healthy(Duration::from_secs(30))?;
+        self.wait_provider()?;
+        self.boot_fresh_client_handshake()?;
+        self.exit_port = self
+            .cmd("scupper", "wg", &["show", "ex-ch1", "listen-port"])?
+            .trim()
+            .parse()?;
+        self.service_check(&mut Vec::new())?;
+        let (code, report) = self.check_result(&Self::boot_binary()?, &root)?;
+        fs::write(
+            self.artifacts.join(format!("{stem}-supervised-check.json")),
+            serde_json::to_vec_pretty(&report)?,
+        )?;
+        if code != 0 {
+            return fail(format!("{stem} supervised retry: {code}: {report}"));
+        }
+        child.stop_timeout(Signal::TERM, Duration::from_secs(30))?;
+        save_event_artifacts(
+            &root.join("var-lib/scupper/events"),
+            &self.artifacts.join(format!("{stem}-events")),
+        )?;
+        Ok(report.to_string())
+    }
+    // Each crash prefix represents a separate simulated boot, with its own /run
+    // retry budget. Preserve the preceding budget as evidence before resetting.
+    fn reset_boot_budget(&self, stem: &str) -> Result<()> {
+        let path = self.private.join("boot-root/run/scupper/boot-attempts");
+        if path.exists() {
+            fs::copy(
+                &path,
+                self.artifacts.join(format!("{stem}-boot-attempts.json")),
+            )?;
+            fs::remove_file(path)?;
+        }
+        Ok(())
     }
     fn daemon_host_sysctls(&mut self) -> Result<Vec<(String, String)>> {
         let mut values = Vec::new();
@@ -1062,7 +1146,7 @@ impl Lab {
         self.daemon_capture_control(&stem)?;
         Ok(measurement)
     }
-    fn daemon_oracle(
+    pub(super) fn daemon_oracle(
         &self,
         stem: &str,
         markers: &[String],
@@ -1612,8 +1696,21 @@ pub(super) fn foreign_control(bytes: &[u8], markers: &[String]) -> Result<usize>
     Ok(seen)
 }
 
-fn daemon_wanted(case: &str) -> &'static str {
+pub(super) fn daemon_wanted(case: &str) -> &'static str {
     match case {
+        "L1" => "baseline IPv4; WireGuard-only uplink and provider-NAT receipts",
+        "L2" => "gateway replies only over wg0; M2 DNS/API service requests dropped",
+        "L5" => "host RPDB/non-default route flush; check remains 0",
+        "L8" => "host nft flush/forwarding/dup cannot affect client path",
+        "L9" | "L9b" | "L9-host-link" => {
+            "daemon boot SIGKILL prefixes contained; supervised retry check 0"
+        }
+        "L11" => "second client isolation; gateway/provider scans denied; allowed client echo",
+        "L12" => "WireGuard source rejection; widened peer check 2; traced antispoof drop",
+        "L15" => "real fake HTTPS exit-IP target: 0, uplink address 2, restored 0",
+        "L18" => "host sysctl inheritance overridden; forwarding toggle reapplies hardening",
+        "L20" => "bidirectional IPv4/v6 PMTU errors only to exact flow sender",
+        "L17-rebuild" => "unheld namespace loss; daemon rebuild with new inode; check 0",
         "L10" => "SIGKILL/SIGSTOP: check 5, traffic continues; SIGCONT: check 0",
         "L14" => "disconnect verifies closure; check 4 across reboot; connect restores 0",
         "L43" => {

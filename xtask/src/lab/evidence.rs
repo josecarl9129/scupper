@@ -100,6 +100,7 @@ pub(super) fn policy_with_exit_port(
         for (local_port, remote, remote_port) in [
             (51820, A.client.peer, 51820),
             (exit_port, A.provider.peer, 51820),
+            (51820, A.client2.peer, 51820),
         ] {
             write!(
                 text,

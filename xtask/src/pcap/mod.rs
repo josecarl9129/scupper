@@ -3,6 +3,7 @@
 mod control;
 mod decode;
 mod dns;
+pub(crate) mod path;
 mod policy;
 mod reader;
 

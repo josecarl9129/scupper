@@ -12,6 +12,7 @@ pub(super) struct Addresses {
     pub gwhost: Segment,
     pub client: Segment,
     pub provider: Segment,
+    pub client2: Segment,
     pub internet: Segment,
     pub bridge: Segment,
     pub client_net: &'static str,
@@ -46,6 +47,14 @@ pub(super) const A: Addresses = Addresses {
         network: "192.0.2.0/30",
         wan: "192.0.2.1",
         peer: "192.0.2.2",
+    },
+    client2: Segment {
+        ns: "client2",
+        wan_if: "to-client2",
+        staging: "scl-cl2",
+        network: "192.0.2.8/30",
+        wan: "192.0.2.9",
+        peer: "192.0.2.10",
     },
     provider: Segment {
         ns: "provA",
@@ -87,10 +96,11 @@ pub(super) const A: Addresses = Addresses {
     client_link_local_v6: "fe80::2",
 };
 impl Addresses {
-    pub fn segments(&self) -> [Segment; 5] {
+    pub fn segments(&self) -> [Segment; 6] {
         [
             self.gwhost,
             self.client,
+            self.client2,
             self.provider,
             self.internet,
             self.bridge,

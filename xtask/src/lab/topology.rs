@@ -35,18 +35,19 @@ impl Lab {
         self.build_gateway()?;
         self.build_provider()?;
         self.build_client()?;
+        self.build_second_client()?;
         self.start_sinks()?;
         self.wait_provider()?;
         Ok(())
     }
     fn build_wan(&mut self) -> Result<()> {
-        for ns in ["wan", "gwhost", "client", "provA", "internet"] {
+        for ns in ["wan", "gwhost", "client", "client2", "provA", "internet"] {
             self.new_namespace(ns, "")?;
         }
-        for segment in [A.gwhost, A.client, A.provider, A.internet] {
+        for segment in [A.gwhost, A.client, A.client2, A.provider, A.internet] {
             self.veth(segment, "eth0")?;
         }
-        for ns in ["wan", "gwhost", "client", "provA", "internet"] {
+        for ns in ["wan", "gwhost", "client", "client2", "provA", "internet"] {
             self.cmd(
                 ns,
                 "sysctl",
@@ -253,6 +254,45 @@ impl Lab {
             "ip",
             &["-6", "route", "add", "default", "dev", "wg0"],
         )?;
+        Ok(())
+    }
+    fn build_second_client(&mut self) -> Result<()> {
+        self.cmd(
+            "client2",
+            "ip",
+            &[
+                "route",
+                "add",
+                &format!("{}/32", A.gwhost.peer),
+                "via",
+                A.client2.wan,
+                "dev",
+                "eth0",
+            ],
+        )?;
+        self.cmd("client2", "ip", &["route", "del", "default"])?;
+        self.cmd(
+            "client2",
+            "ip",
+            &["link", "add", "wg0", "type", "wireguard"],
+        )?;
+        self.wg(
+            "client2",
+            "wg0",
+            "client2",
+            "51820",
+            0,
+            &[
+                "endpoint",
+                &format!("{}:51820", A.gwhost.peer),
+                "allowed-ips",
+                "0.0.0.0/0",
+                "persistent-keepalive",
+                "0",
+            ],
+        )?;
+        self.address_up("client2", "wg0", "10.99.0.3/32", 1420)?;
+        self.cmd("client2", "ip", &["route", "add", "default", "dev", "wg0"])?;
         Ok(())
     }
     fn start_sinks(&mut self) -> Result<()> {
@@ -496,7 +536,7 @@ impl Lab {
     pub(super) fn case(&mut self, case: Case) -> Result<String> {
         self.daemon_clean_baseline()?;
         if case == Case::Daemon {
-            return self.daemon_case();
+            return fail("daemon trials must be selected by case id");
         }
         if case == Case::CheckV2 {
             return self.check_v2_case();
@@ -507,7 +547,7 @@ impl Lab {
             self.capture("wan", A.gwhost.wan_if, stem)?;
             self.service_check(&mut markers)?;
             match case {
-                Case::Daemon => self.daemon_case().map(|_| ()),
+                Case::Daemon => fail("daemon trial requires case id"),
                 Case::Baseline => self.service_check(&mut markers),
                 Case::ProbeChild => self.probe_child_case(),
                 Case::CheckV2 => self.check_v2_case().map(|_| ()),
