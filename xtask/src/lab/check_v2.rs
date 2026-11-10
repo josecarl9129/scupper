@@ -134,7 +134,7 @@ impl Lab {
         config.health.probe_targets = HealthSettings::default().probe_targets;
         // Minimum allowed WireGuard rekey interval + slack. L3 must observe
         // staleness with a single exit, rather than relying on probe failures.
-        config.health.handshake_stale = DurationStr("150s".into());
+        config.health.handshake_stale = DurationStr("175s".into());
         config.health.failover_grace = DurationStr("30s".into());
         config.health.require_daemon = false; // scupperd is deliberately absent in this lab.
         let text = toml::to_string(&config)?;
