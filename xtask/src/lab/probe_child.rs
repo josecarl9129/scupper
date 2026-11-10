@@ -10,7 +10,7 @@ use scupper_sys::{
 };
 use std::{fs, io::Write, path::PathBuf, process::Command, time::Duration};
 
-struct Executable(PathBuf);
+pub(super) struct Executable(pub(super) PathBuf);
 impl ProbeExec for Executable {
     fn execute_probe(
         &self,

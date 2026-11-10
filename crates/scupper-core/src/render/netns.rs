@@ -21,6 +21,30 @@ pub fn render_netns(
     gateway: &GatewayId,
     stamp: &VersionStamp,
 ) -> Result<String, RenderError> {
+    let output = render_unmutated(site, gateway, stamp)?;
+    #[cfg(feature = "lab-mutation")]
+    let output = crate::lab_mutation::rules(output, crate::lab_mutation::active())
+        .map_err(RenderError::LabMutation)?;
+    Ok(output)
+}
+
+/// Render the control policy independently of the process mutation selector.
+/// # Errors
+/// Returns an error for an unknown gateway.
+#[cfg(feature = "lab-mutation")]
+pub fn render_netns_unmutated(
+    site: &ValidatedSite,
+    gateway: &GatewayId,
+    stamp: &VersionStamp,
+) -> Result<String, RenderError> {
+    render_unmutated(site, gateway, stamp)
+}
+
+fn render_unmutated(
+    site: &ValidatedSite,
+    gateway: &GatewayId,
+    stamp: &VersionStamp,
+) -> Result<String, RenderError> {
     const HEX: &[u8] = b"0123456789abcdef";
     let gw = site.gateway(gateway).ok_or(RenderError::UnknownGateway)?;
     let sha256: String = stamp

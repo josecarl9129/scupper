@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+lab-mutation = ["scupper-core/lab-mutation", "scupper-sys/lab-mutation"]
+
 [dependencies]
 clap.workspace = true
 serde.workspace = true

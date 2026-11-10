@@ -1,0 +1,2 @@
+-rule add pref 191 iif wg0 lookup 191
++rule add pref 191 from 10.99.0.0/24 lookup 191

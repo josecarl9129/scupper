@@ -1602,3 +1602,109 @@ fn clients_without_established_session_do_not_mask_later_stages() {
     obs.exit_probe = Some(Ok(UPLINK));
     assert_eq!(report(&obs).verdict.exit_code(), 2);
 }
+
+#[test]
+#[cfg(feature = "lab-mutation")]
+fn bound_probe_only_check_diff_is_golden() {
+    let cfg = config();
+    let mut obs = passing();
+    obs.defaults = None;
+    obs.routes = None;
+    obs.exit_probe = None;
+    let before = next(&obs, &cfg, NOW);
+    scupper_core::lab_mutation::trust_bound_probe(&mut obs, &cfg);
+    let after = next(&obs, &cfg, NOW);
+    let mut routes = passing();
+    routes.routes = None;
+    routes.exit_probe = None;
+    let route_before = next(&routes, &cfg, NOW);
+    scupper_core::lab_mutation::trust_bound_probe(&mut routes, &cfg);
+    let route_after = next(&routes, &cfg, NOW);
+    assert_eq!(
+        format!(
+            "-defaults={}; routes={}; bind=None\n+defaults={}; routes={}; bind={:?}\n",
+            matches!(before, Next::Defaults),
+            matches!(route_before, Next::Routes),
+            matches!(after, Next::Defaults),
+            matches!(route_after, Next::Routes),
+            scupper_core::lab_mutation::probe_binding(
+                Some(scupper_core::lab_mutation::Mutation::Probe),
+                cfg.exit_iface.ifname()
+            )
+            .map(|name| name.as_str().to_owned())
+        ),
+        include_str!("../../../tests/golden/M-probe.diff")
+    );
+    // Missing defaults still fail inventory, even under the narrowed mutation.
+    let mut missing = passing();
+    defaults(&mut missing).v4 = DefaultRouteObs::Missing;
+    scupper_core::lab_mutation::trust_bound_probe(&mut missing, &cfg);
+    assert!(matches!(
+        next(&missing, &cfg, NOW),
+        Next::Done(Ok(Report {
+            verdict: Verdict::Degraded(Degraded::DefaultRouteWrong { .. }),
+            ..
+        }))
+    ));
+    // A forwarded lookup failure with an intact default reaches the route stage.
+    let mut blocked = passing();
+    blocked.routes.as_mut().unwrap()[0].1.v4 = Ok(RouteAnswer::Unreachable);
+    assert!(matches!(
+        next(&blocked, &cfg, NOW),
+        Next::Done(Ok(Report {
+            verdict: Verdict::Degraded(Degraded::RouteWrong {
+                got: DefaultRouteObs::Unreachable,
+                ..
+            }),
+            ..
+        }))
+    ));
+    scupper_core::lab_mutation::trust_bound_probe(&mut blocked, &cfg);
+    assert!(matches!(
+        next(&blocked, &cfg, NOW),
+        Next::Done(Ok(Report {
+            verdict: Verdict::Protected { .. },
+            ..
+        }))
+    ));
+}
+
+#[test]
+#[cfg(not(feature = "lab-mutation"))]
+fn default_build_ignores_probe_mutation_in_the_real_engine() {
+    for mutation in ["M-ct", "M-probe"] {
+        let sentinel = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+            "default-route-child-{}-{mutation}.sentinel",
+            std::process::id()
+        ));
+        assert!(!sentinel.exists());
+        std::fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "default_build_route_child", "--nocapture"])
+            .env("SCUPPER_LAB_MUTATION", mutation)
+            .env("SCUPPER_DEFAULT_ROUTE_CHILD", &sentinel)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "completed");
+        std::fs::remove_file(sentinel).unwrap();
+    }
+}
+
+#[test]
+#[cfg(not(feature = "lab-mutation"))]
+fn default_build_route_child() {
+    let Some(sentinel) = std::env::var_os("SCUPPER_DEFAULT_ROUTE_CHILD") else {
+        return;
+    };
+    assert_eq!(scupper_core::lab_mutation::active(), None);
+    let mut obs = passing();
+    let client = obs.routes.as_ref().unwrap()[0].0;
+    obs.routes.as_mut().unwrap()[0].1.v4 = Ok(RouteAnswer::Unreachable);
+    let report = report(&obs);
+    assert_eq!(report.verdict.exit_code(), 3);
+    assert!(
+        matches!(report.verdict, Verdict::Degraded(Degraded::RouteWrong { client: got_client, got: DefaultRouteObs::Unreachable, .. }) if got_client == client)
+    );
+    std::fs::write(sentinel, "completed").unwrap();
+}

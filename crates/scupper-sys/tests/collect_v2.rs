@@ -871,3 +871,134 @@ fn forwarding_defaults_warn_only_when_inconsistent_with_global_gates() {
         }
     }
 }
+
+#[test]
+fn ingress_policy_fault_is_rejected_before_client_routes() {
+    use scupper_core::verdict::v2::{Verdict, Violation};
+    let runner = "ubuntu-24.04";
+    let handle = testing::handle().unwrap();
+    let root = Root::new(runner, &handle);
+    let site = site(runner);
+    let gateway = GatewayId("gw1".into());
+    let sys = Script::new(runner);
+    fresh(&sys);
+    let mut rules: serde_json::Value =
+        serde_json::from_str(&fixture(runner, "scupper--4-rule.json")).unwrap();
+    rules.as_array_mut().unwrap().insert(
+        1,
+        serde_json::json!({"priority":100,"src":"all","iif":"wg0","action":"unreachable"}),
+    );
+    sys.replace("scupper--4-rule.json", &rules.to_string());
+    *sys.route_failure.borrow_mut() =
+        Some((2, "RTNETLINK answers: Network is unreachable\n".into()));
+    let (report, obs) = check_v2::run_with_observations(
+        &Dependencies {
+            system: &sys,
+            probe_exec: &sys,
+            handle: Some(&handle),
+            run_root: &root.path,
+            state_root: &root.path,
+        },
+        &cfg(&site, &gateway, root.stamp),
+    );
+    assert!(
+        matches!(report.unwrap().verdict, Verdict::Unprotected(ref v) if v.as_slice().iter().any(|v| matches!(v, Violation::ExtraPolicyRule(_))))
+    );
+    assert!(obs.routes.is_none());
+}
+
+#[test]
+#[cfg(feature = "lab-mutation")]
+fn probe_runtime_hook_is_exercised_in_subprocesses() {
+    for mutant in [false, true] {
+        let sentinel = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+            "probe-child-{}-{mutant}.sentinel",
+            std::process::id()
+        ));
+        assert!(!sentinel.exists());
+        fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", "probe_runtime_child", "--nocapture"])
+            .env("SCUPPER_PROBE_TEST_CHILD", &sentinel)
+            .env_remove("SCUPPER_LAB_MUTATION");
+        if mutant {
+            command.env("SCUPPER_LAB_MUTATION", "M-probe");
+        }
+        assert!(command.status().unwrap().success());
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "completed");
+        fs::remove_file(sentinel).unwrap();
+    }
+}
+
+#[test]
+#[cfg(feature = "lab-mutation")]
+fn probe_runtime_child() {
+    use scupper_sys::{
+        probe_child::ProbeExec,
+        system::{ExecError, ExecOutput},
+    };
+    struct Probe<'a>(&'a Script, std::cell::RefCell<Option<serde_json::Value>>);
+    impl ProbeExec for Probe<'_> {
+        fn accepts_test_namespace(&self) -> bool {
+            true
+        }
+        fn execute_probe(
+            &self,
+            json: &str,
+            _: fs::File,
+            _: std::time::Duration,
+        ) -> Result<ExecOutput, ExecError> {
+            *self.1.borrow_mut() = Some(serde_json::from_str(json).unwrap());
+            Ok(ExecOutput {
+                status: Some(0),
+                stdout: self.0.probe.borrow().clone(),
+                stderr: String::new(),
+            })
+        }
+    }
+    let Some(sentinel) = std::env::var_os("SCUPPER_PROBE_TEST_CHILD") else {
+        return;
+    };
+    let runner = "ubuntu-24.04";
+    let handle = testing::handle().unwrap();
+    let root = Root::new(runner, &handle);
+    let site = site(runner);
+    let gateway = GatewayId("gw1".into());
+    let sys = Script::new(runner);
+    fresh(&sys);
+    *sys.route_failure.borrow_mut() =
+        Some((2, "RTNETLINK answers: Network is unreachable\n".into()));
+    let probe = Probe(&sys, std::cell::RefCell::new(None));
+    let (report, obs) = check_v2::run_with_observations(
+        &Dependencies {
+            system: &sys,
+            probe_exec: &probe,
+            handle: Some(&handle),
+            run_root: &root.path,
+            state_root: &root.path,
+        },
+        &cfg(&site, &gateway, root.stamp),
+    );
+    let report = report.unwrap();
+    assert!(obs.defaults.is_some(), "default inventory must still run");
+    if scupper_core::lab_mutation::active().is_some() {
+        assert_eq!(report.verdict.exit_code(), 0, "{report:?}");
+        assert!(obs.routes.is_none(), "client-route stage must be skipped");
+        assert_eq!(probe.1.borrow().as_ref().unwrap()["bind"], "ex-ch1");
+    } else {
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(report.verdict.exit_code(), 3);
+        assert_eq!(
+            json["verdict"]["Degraded"]["RouteWrong"]["client"],
+            "10.99.0.2"
+        );
+        assert_eq!(
+            json["verdict"]["Degraded"]["RouteWrong"]["got"],
+            "Unreachable"
+        );
+        assert!(obs.routes.is_some());
+        assert!(probe.1.borrow().is_none());
+    }
+    fs::write(sentinel, "completed").unwrap();
+}

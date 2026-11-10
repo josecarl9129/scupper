@@ -1,0 +1,6 @@
+-	chain output {
+-		type filter hook output priority filter; policy drop;
+-		oif "lo" accept
+-		oifname @client_ifaces accept
+-		oifname @exit_ifaces accept
+-	}

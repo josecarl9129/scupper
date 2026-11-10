@@ -8,6 +8,8 @@ mod routes;
 mod sysctls;
 
 pub use netns::render_netns;
+#[cfg(feature = "lab-mutation")]
+pub use netns::render_netns_unmutated;
 pub use routes::{Family, RouteTarget, desired_routes, route_argv};
 pub use sysctls::{Scope, Sysctl, SysctlFamily, SysctlKey, desired_sysctls};
 
@@ -26,6 +28,10 @@ pub enum RenderError {
     /// The requested gateway does not exist; no ruleset is produced.
     #[error("render: unknown gateway")]
     UnknownGateway,
+    /// A reviewed lab mutation no longer matches the renderer structure.
+    #[cfg(feature = "lab-mutation")]
+    #[error("lab mutation: {0}")]
+    LabMutation(&'static str),
 }
 
 pub mod units;

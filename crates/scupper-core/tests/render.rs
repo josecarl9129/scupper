@@ -203,7 +203,12 @@ fn route_arguments_match_design_table() {
             vec!["-6", "route", "replace", "unreachable", "default"],
         ),
     ] {
-        assert_eq!(route_argv(family, &target), expected);
+        let argv = route_argv(family, &target);
+        assert!(
+            !argv.iter().any(|s| s == "rule" || s == "from"),
+            "product route plan must use only the main table"
+        );
+        assert_eq!(argv, expected);
     }
 }
 

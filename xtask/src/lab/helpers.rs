@@ -51,7 +51,13 @@ impl Outcome {
         } else {
             Self::HarnessError {
                 errno: error.raw_os_error(),
-                message: error.to_string(),
+                message: if error.raw_os_error() == Some(126) {
+                    format!(
+                        "ENOKEY: WireGuard has no peer or endpoint for the probe destination; verify the intended route and socket device binding: {error}"
+                    )
+                } else {
+                    error.to_string()
+                },
             }
         }
     }
@@ -305,7 +311,11 @@ pub fn probe(
                 Type::DGRAM,
                 Some(Protocol::UDP),
             )?;
-            if source.is_some() {
+            // Only link-local IPv6 needs a scope device. Binding an exit's
+            // IPv4 source to wg0 overrides the preferred L19 bridge route.
+            if source
+                .is_some_and(|addr| matches!(addr, IpAddr::V6(v6) if v6.is_unicast_link_local()))
+            {
                 socket.bind_device(Some(b"wg0"))?;
             }
             socket.bind(&SocketAddr::new(local, source_port).into())?;
@@ -454,14 +464,42 @@ pub fn send_packet(interface: &str, file: &Path) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn source_bound_udp_uses_the_route_without_forcing_wg0() {
+        let echo = UdpSocket::bind("127.0.0.1:0").unwrap();
+        echo.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+        let port = echo.local_addr().unwrap().port();
+        let responder = thread::spawn(move || {
+            let mut bytes = [0; 1024];
+            let (len, peer) = echo.recv_from(&mut bytes).unwrap();
+            echo.send_to(&bytes[..len], peer).unwrap();
+        });
+        let result = probe(
+            "udp",
+            "127.0.0.1",
+            port,
+            "scupper-canary-source-route",
+            false,
+            0,
+            Some("127.0.0.1".parse().unwrap()),
+        );
+        responder.join().unwrap();
+        assert!(result.unwrap());
+    }
+    #[test]
     fn local_socket_errors_never_count_as_a_forward_drop() {
-        for errno in [101, 98, 99, 111, 113] {
+        for errno in [101, 98, 99, 111, 113, 126] {
             let error = std::io::Error::from_raw_os_error(errno);
             for attempted in [false, true] {
                 assert!(
                     matches!(Outcome::from_error(&error, attempted), Outcome::HarnessError { errno: Some(value), .. } if value == errno)
                 );
             }
+        }
+        for attempted in [false, true] {
+            let error = std::io::Error::from_raw_os_error(126);
+            assert!(
+                matches!(Outcome::from_error(&error, attempted), Outcome::HarnessError { errno: Some(126), message } if message.contains("ENOKEY") && message.contains("socket device binding"))
+            );
         }
         let again = std::io::Error::from_raw_os_error(11);
         assert_eq!(Outcome::from_error(&again, true), Outcome::TimedOut);

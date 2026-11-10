@@ -7,6 +7,7 @@ license.workspace = true
 publish.workspace = true
 
 [features]
+lab-mutation = ["scupper-sys/lab-mutation"]
 testing = ["scupper-sys/testing"]
 
 [dependencies]

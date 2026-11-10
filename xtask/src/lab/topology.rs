@@ -353,7 +353,7 @@ impl Lab {
         }
         Ok(())
     }
-    fn veth(&mut self, segment: Segment, peer_if: &str) -> Result<()> {
+    pub(super) fn veth(&mut self, segment: Segment, peer_if: &str) -> Result<()> {
         self.cmd(
             "",
             "ip",
@@ -459,7 +459,7 @@ impl Lab {
         self.cmd(ns, "wg", &args)?;
         Ok(())
     }
-    fn apply_sysctls(&mut self, forwarding: bool, bridge: bool) -> Result<()> {
+    pub(super) fn apply_sysctls(&mut self, forwarding: bool, bridge: bool) -> Result<()> {
         let mut links = vec![
             IfName::new("lo")?,
             IfName::new("wg0")?,
@@ -511,7 +511,7 @@ impl Lab {
             Case::Uplink => self
                 .cmd("wan", "nft", &["delete", "table", "inet", "lab_inject"])
                 .map(|_| ()),
-            Case::Baseline | Case::CheckV2 | Case::Daemon => Ok(()),
+            Case::Meta | Case::Baseline | Case::CheckV2 | Case::Daemon => Ok(()),
             Case::ProbeChild => self.restore_probe_child_routes(),
         };
         if let Err(error) = specific {
@@ -538,6 +538,13 @@ impl Lab {
     }
     pub(super) fn case(&mut self, case: Case) -> Result<String> {
         self.daemon_clean_baseline()?;
+        if case == Case::Meta {
+            let trial = self.meta_case();
+            // Meta has its own captures/oracles, but must still run the shared
+            // ruleset, conntrack and sysctl restoration on every exit path.
+            let restored = self.restore(case);
+            return super::mutation::finish(trial, restored);
+        }
         if case == Case::Daemon {
             return fail("daemon trials must be selected by case id");
         }
@@ -550,6 +557,7 @@ impl Lab {
             self.capture("wan", A.gwhost.wan_if, stem)?;
             self.service_check(&mut markers)?;
             match case {
+                Case::Meta => fail("meta trial requires direct selection"),
                 Case::Daemon => fail("daemon trial requires case id"),
                 Case::Baseline => self.service_check(&mut markers),
                 Case::ProbeChild => self.probe_child_case(),

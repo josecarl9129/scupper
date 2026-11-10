@@ -50,6 +50,7 @@ pub fn flow(mode: &str, address: SocketAddr, marker: &str, log: &Path, seconds: 
     if let Some(stream) = &tcp {
         stream.set_nonblocking(true)?;
     }
+    let local = udp.as_ref().map(UdpSocket::local_addr).transpose()?;
     let mut buffer = [0; 1024];
     while start.elapsed() < Duration::from_secs(seconds) {
         let (sent, received) = if let Some(stream) = &mut tcp {
@@ -68,7 +69,7 @@ pub fn flow(mode: &str, address: SocketAddr, marker: &str, log: &Path, seconds: 
         writeln!(
             log,
             "{}",
-            serde_json::json!({"elapsed_ms":start.elapsed().as_millis(),"sent":sent,"received":received})
+            serde_json::json!({"elapsed_ms":start.elapsed().as_millis(),"sent":sent,"received":received,"local":local})
         )?;
         log.flush()?;
         thread::sleep(Duration::from_millis(25));

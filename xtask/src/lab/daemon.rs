@@ -769,6 +769,69 @@ impl Lab {
         let child = self.daemon_spawn(case, root, "start")?;
         Ok((child, notify))
     }
+    // L19 needs a real reconciler for the freeze and recovery controls. Keep
+    // its lifetime around the entire trial, including restoration on failure.
+    pub(super) fn meta_supervised<T>(
+        &mut self,
+        trial: impl FnOnce(&mut Self, &Path) -> Result<T>,
+    ) -> Result<T> {
+        let root = self.prepare_check_v2()?;
+        let (mut child, notify) = self.daemon_start("L19-L3", &root)?;
+        let result = self
+            .daemon_ready_tick(&notify)
+            .and_then(|()| trial(self, &root))
+            .and_then(|value| {
+                let (code, report) = self.check_result(&Self::boot_binary()?, &root)?;
+                fs::write(
+                    self.artifacts.join("L19-L3-repaired-check.json"),
+                    serde_json::to_vec_pretty(&report)?,
+                )?;
+                if code != 0 || report["verdict"].get("Protected").is_none() {
+                    return fail(format!("L19 restored baseline failed: {code}: {report}"));
+                }
+                Ok(value)
+            });
+        let unfrozen = match fs::remove_file(root.join("run/scupper/incomplete-tick")) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        };
+        let stopped = child.stop_timeout(Signal::TERM, Duration::from_secs(30));
+        let saved = save_event_artifacts(
+            &root.join("var-lib/scupper/events"),
+            &self.artifacts.join("L19-L3-events"),
+        );
+        super::mutation::finish(result, unfrozen.and(stopped).and(saved))
+    }
+
+    pub(super) fn meta_resume(&mut self, root: &Path, prefix: &str) -> Result<()> {
+        fs::remove_file(root.join("run/scupper/incomplete-tick"))?;
+        self.daemon_wait(
+            "L19 bridge route and rules repaired",
+            Duration::from_secs(30),
+            |lab| {
+                let routes = lab.cmd("scupper", "ip", &["route", "show", "exact", prefix])?;
+                let rules = scupper_core::canon::canonicalize(&lab.cmd(
+                    "scupper",
+                    "nft",
+                    &["-j", "list", "ruleset"],
+                )?)?;
+                Ok(routes.trim().is_empty() && rules == lab.expected_rules)
+            },
+        )?;
+        self.daemon_complete_tick(root)?;
+        let snapshot = self.daemon_snapshot()?;
+        fs::write(
+            self.artifacts.join("L19-L3-repaired.json"),
+            serde_json::to_vec_pretty(&snapshot)?,
+        )?;
+        if snapshot["rules"] != self.expected_rules {
+            return fail("L19 daemon recovery did not restore the ruleset");
+        }
+        self.service_check(&mut Vec::new())?;
+        Ok(())
+    }
+
     fn daemon_notify_path(&self, case: &str) -> Result<std::path::PathBuf> {
         use std::os::fd::AsRawFd as _;
         let directory = self
@@ -860,7 +923,7 @@ impl Lab {
             "sysctls": self.daemon_sysctls()?,
         }))
     }
-    fn daemon_wait(
+    pub(super) fn daemon_wait(
         &mut self,
         label: &str,
         bound: Duration,
@@ -887,7 +950,7 @@ impl Lab {
                 .contains("dev ex-ch1"))
         })
     }
-    fn daemon_flow(
+    pub(super) fn daemon_flow(
         &mut self,
         mode: &str,
         ns: &str,
@@ -1788,7 +1851,7 @@ fn verify_continuity(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn flow_counts(path: &Path) -> Result<(u64, u64)> {
+pub(super) fn flow_counts(path: &Path) -> Result<(u64, u64)> {
     let mut sent = 0;
     let mut received = 0;
     let text = match fs::read_to_string(path) {
