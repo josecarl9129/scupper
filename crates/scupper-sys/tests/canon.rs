@@ -57,7 +57,7 @@ impl System for FakeSystem {
         self.run(p, args, timeout)
     }
     fn canon_run_root(&self) -> &Path {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
+        Path::new(env!("CARGO_TARGET_TMPDIR"))
     }
     fn run(&self, p: Program, a: &[String], t: Duration) -> Result<ExecOutput, ExecError> {
         self.calls.borrow_mut().push((p, a.into(), t));

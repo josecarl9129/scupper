@@ -26,7 +26,9 @@ use std::{
 // before binding: a recursive propagation change at / would include nsfs peers.
 const CHECK: &str = r#"
 set -eu
-for path in / /etc /var /var/lib; do
+# / is always a mount point; never let a missing or failing `mountpoint` skip it.
+mount --make-private /
+for path in /etc /var /var/lib; do
     if mountpoint -q "$path"; then
         mount --make-private "$path"
     fi
