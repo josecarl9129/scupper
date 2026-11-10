@@ -297,6 +297,31 @@ antispoof trace correlation, explicit DNS decoding and local probe errors
 (including an occupied UDP source port through the CLI). The actual namespace
 suite runs in CI on both Ubuntu 24.04 and 22.04; it is not part of `cargo test`.
 
+L17-V14 waits for the held namespace inode to reappear, then requires exactly
+one mount on `/run/netns/scupper`. Restore leaves a single mount of the held
+inode alone, detaches a hijacked mount with `MNT_DETACH` before binding, and
+creates the mount-point file only when missing. Unexpected mount counts or a
+wrong inode after binding report an escalation. With scupperd stopped, a single
+`ip netns delete scupper` must detach that mount and remove the name. With the
+daemon running, deletion is temporary: the next audit restores the held inode.
+
+The lab saves `/run/netns` mountinfo lines immediately after L17 restore, before
+each daemon case cleanup, and before final teardown (`*-host.mountinfo`,
+`*-daemon.mountinfo`, and `*-mounts.json`). Daemon snapshots read its procfs
+mountinfo directly and record whether its mount namespace differs from the
+host. Parent mount propagation fields and duplicate path entries are preserved.
+A stack fails the daemon case that left it. Final cleanup reports stacked names
+in `cleanup.txt`, lazily unmounts every layer with a bounded loop, then deletes
+the name; ordinary single mounts are deleted directly and checked absent.
+
+L13 starts the foreign-side control capture and waits for tcpdump's listening
+acknowledgement before sending three distinct UDP control markers on fresh
+tuples, spaced by probe completion and 250 ms. At least one exact UDP payload
+must appear. The measurement uses a separate continuous marker and still
+requires a pre-containment packet, redirect removal and link-down within eight
+seconds, and no matching packet later than containment plus 250 ms (or eight
+seconds from resume). Packet-loss checks and the uplink leak oracle still apply.
+
 Boot rebuilds first close forwarding, disable every foreign or wrong-kind link
 using its raw kernel name, and clear clsact/ingress and XDP on all namespace links.
 Foreign links remain down and boot fails for operator attention. Other RPDB or

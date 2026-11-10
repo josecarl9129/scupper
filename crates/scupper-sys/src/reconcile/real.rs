@@ -8,7 +8,7 @@ use crate::{
     },
     collect,
     lock::WriterGuard,
-    netns::{NetnsHandle, restore_mount},
+    netns::{NetnsError, NetnsHandle, restore_mount},
     system::EXEC_TIMEOUT,
 };
 use scupper_core::{
@@ -499,8 +499,14 @@ impl Kernel for RealKernel<'_> {
         self.memory_latch.set(latch.is_some());
     }
     fn restore_name(&self, held: &NetnsHandle, guard: &WriterGuard) -> Result<(), StepError> {
-        restore_mount(held, &self.namespace_path, guard)
-            .map_err(|_| StepError("namespace rebind failed"))
+        restore_mount(held, &self.namespace_path, guard).map_err(|error| {
+            if matches!(error, NetnsError::MountEscalation { .. }) {
+                eprintln!("scupperd: {error}");
+                StepError("namespace restore escalation")
+            } else {
+                StepError("namespace rebind failed")
+            }
+        })
     }
 }
 

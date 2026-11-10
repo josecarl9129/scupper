@@ -218,6 +218,20 @@ pub(super) struct Group {
     done: bool,
 }
 impl Group {
+    pub(super) fn supervised_pid(&self) -> Result<Option<u32>> {
+        if self.done {
+            return Ok(None);
+        }
+        let pid = self.child.id();
+        let children = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))?;
+        let mut children = children.split_whitespace();
+        let child = children.next().ok_or("supervisor has no child")?.parse()?;
+        if children.next().is_some() {
+            return fail("supervisor has multiple direct children");
+        }
+        Ok(Some(child))
+    }
+
     pub(super) fn signal(&self, signal: Signal) {
         if let Some(pid) = Pid::from_raw(self.child.id().cast_signed()) {
             let _ = kill_process_group(pid, signal);

@@ -209,6 +209,14 @@ impl DaemonGuard<'_> {
         }
         let child = self.child.as_mut().ok_or("missing daemon")?;
         let observed = self.lab.daemon_fault(case, child, notify, &root)?;
+        let mounts = super::mounts::save(
+            &self.lab.artifacts,
+            &format!("daemon-{case}-before-stop"),
+            child.supervised_pid()?,
+        )?;
+        if mounts > 1 {
+            return fail(format!("{case} left {mounts} stacked namespace mounts"));
+        }
         let before = self.lab.daemon_snapshot()?;
         child.stop_timeout(Signal::TERM, Duration::from_secs(30))?;
         if before != self.lab.daemon_snapshot()? {
@@ -261,6 +269,26 @@ impl DaemonGuard<'_> {
         self.lab.runner.cleanup = true;
         self.lab.runner.phase = Instant::now() + Duration::from_secs(90);
         self.lab.runner.whole = self.lab.runner.phase;
+        let mounts = (|| {
+            let pid = self
+                .child
+                .as_ref()
+                .map(Group::supervised_pid)
+                .transpose()?
+                .flatten();
+            let count = super::mounts::save(
+                &self.lab.artifacts,
+                &format!("daemon-{}-before-cleanup", self.case),
+                pid,
+            )?;
+            if count > 1 {
+                return fail(format!(
+                    "{} left {count} stacked namespace mounts",
+                    self.case
+                ));
+            }
+            Ok(())
+        })();
         if let Some(mut child) = self.child.take() {
             child.signal(Signal::CONT);
             let _ = child.stop_timeout(Signal::TERM, Duration::from_secs(5));
@@ -327,7 +355,7 @@ impl DaemonGuard<'_> {
         self.lab.runner.cleanup = cleanup;
         self.lab.runner.phase = phase;
         self.lab.runner.whole = whole;
-        saved.and(marker).and(captures).and(restored)
+        mounts.and(saved).and(marker).and(captures).and(restored)
     }
 }
 impl Drop for DaemonGuard<'_> {
@@ -737,13 +765,22 @@ impl Lab {
                 let start = Instant::now();
                 self.cmd("", "ip", &["netns", "del", "scupper"])?;
                 self.daemon_wait("held inode remount", Duration::from_secs(8), |_| {
-                    Ok(Path::new("/run/netns/scupper").exists())
+                    Ok(NetnsHandle::open("/run/netns/scupper")
+                        .is_ok_and(|held| held.identity() == before))
                 })?;
+                let remount = start.elapsed().as_millis();
+                let mounts = super::mounts::save(
+                    &self.artifacts,
+                    "daemon-L17-V14-after-restore",
+                    Some(child.supervised_pid()?.ok_or("missing live L17 daemon")?),
+                )?;
+                if mounts != 1 {
+                    return fail(format!("L17 restore left {mounts} namespace mounts"));
+                }
                 let after = NetnsHandle::open("/run/netns/scupper")?.identity();
                 if before != after {
                     return fail("L17 created a second namespace");
                 }
-                let remount = start.elapsed().as_millis();
                 self.daemon_wait(
                     "L17 canaries still acknowledged",
                     Duration::from_secs(3),
@@ -755,7 +792,7 @@ impl Lab {
                     return fail(format!("L17 canary loss: sent={sent}, replies={replies}"));
                 }
                 format!(
-                    "remount_ms={remount}; same_inode=true; second_namespace=false; stream_sent={sent}; stream_replies={replies}"
+                    "remount_ms={remount}; mounts={mounts}; same_inode=true; second_namespace=false; stream_sent={sent}; stream_replies={replies}"
                 )
             }
             "L52" | "L52b" => {
@@ -963,16 +1000,33 @@ impl Lab {
             return fail(format!("L13 expected check 2: {code}: {report}"));
         }
         let control_stem = format!("{stem}-foreign-control");
+        // capture() waits for tcpdump's listening acknowledgement before any
+        // injection. Distinct attempts also use fresh UDP tuples, avoiding a
+        // single lost startup packet or a stale conntrack mapping blinding it.
         self.capture("gwhost", "foreign-host", &control_stem)?;
+        let mut control_markers = Vec::new();
+        for _ in 0..3 {
+            let marker = Self::marker()?;
+            markers.push(marker.clone());
+            control_markers.push(marker.clone());
+            self.send("client", "udp", A.internet.peer, &marker, false)?;
+            self.runner.dwell(Duration::from_millis(250))?;
+        }
+        self.stop_capture()?;
+        let control = fs::read(self.artifacts.join(format!("{control_stem}.pcap")))?;
+        let control_seen = foreign_control(&control, &control_markers)?;
+        fs::write(
+            self.artifacts.join(format!("{control_stem}.json")),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "attempted": control_markers,
+                "observed": control_seen,
+            }))?,
+        )?;
+        // The continuous measurement keeps its own marker and all original
+        // pre-containment packet and last-packet deadline requirements.
         let marker = Self::marker()?;
         markers.push(marker.clone());
         let mut stream = self.daemon_flow("udp", "client", &marker, stem, 90)?;
-        self.runner.dwell(Duration::from_secs(1))?;
-        self.stop_capture()?;
-        let control = fs::read(self.artifacts.join(format!("{control_stem}.pcap")))?;
-        if !contains_marker(&control, &marker)? {
-            return fail("L13 foreign-side positive control was blind");
-        }
         self.capture("gwhost", "foreign-host", &format!("{stem}-foreign"))?;
         self.runner.dwell(Duration::from_millis(500))?;
         let start = Instant::now();
@@ -1038,7 +1092,7 @@ impl Lab {
                 == "1")
         })?;
         Ok(format!(
-            "check=2; detection_and_containment_ms={down}; observed_window_ms={window}; total_elapsed_ms={}; bound_ms=8000; foreign_capture_control=true; redirect_removed=true",
+            "check=2; detection_and_containment_ms={down}; observed_window_ms={window}; total_elapsed_ms={}; bound_ms=8000; foreign_capture_control=true; control_markers_seen={control_seen}/3; redirect_removed=true",
             start.elapsed().as_millis()
         ))
     }
@@ -1368,10 +1422,20 @@ fn flow_last_sent_ms(path: &Path) -> Result<Option<u64>> {
         .filter_map(|value| value["elapsed_ms"].as_u64())
         .next_back())
 }
-fn contains_marker(bytes: &[u8], marker: &str) -> Result<bool> {
-    Ok(crate::pcap::observe(bytes)?
+pub(super) fn foreign_control(bytes: &[u8], markers: &[String]) -> Result<usize> {
+    let packets = crate::pcap::observe(bytes)?;
+    let seen = markers
         .iter()
-        .any(|p| p.protocol == 17 && p.payload.get(8..) == Some(marker.as_bytes())))
+        .filter(|marker| {
+            packets
+                .iter()
+                .any(|p| p.protocol == 17 && p.payload.get(8..) == Some(marker.as_bytes()))
+        })
+        .count();
+    if seen == 0 {
+        return fail("L13 foreign-side positive control was blind");
+    }
+    Ok(seen)
 }
 
 fn daemon_wanted(case: &str) -> &'static str {

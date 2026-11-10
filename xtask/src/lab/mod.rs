@@ -9,6 +9,7 @@ mod evidence;
 mod fixtures;
 mod flow;
 mod helpers;
+mod mounts;
 mod probe_child;
 mod topology;
 
@@ -575,6 +576,10 @@ impl Lab {
         }
         self.cleaned = true;
         let mut failures = Vec::new();
+        let mut notes = Vec::new();
+        if let Err(error) = mounts::save(&self.artifacts, "before-teardown", None) {
+            failures.push(error.to_string());
+        }
         if let Err(error) = self.stop_captures() {
             failures.push(error.to_string());
         }
@@ -584,13 +589,14 @@ impl Lab {
             }
         }
         self.services.clear();
-        if let Err(error) = self.registry.cleanup(&mut self.runner) {
-            failures.push(error.to_string());
+        match self.registry.cleanup(&mut self.runner) {
+            Ok(reports) => notes.extend(reports),
+            Err(error) => failures.push(error.to_string()),
         }
         let text = if failures.is_empty() {
-            "ok\n".into()
+            format!("ok\n{}", notes.join("\n"))
         } else {
-            failures.join("\n")
+            [notes.join("\n"), failures.join("\n")].join("\n")
         };
         fs::write(self.artifacts.join("cleanup.txt"), &text)?;
         if failures.is_empty() {

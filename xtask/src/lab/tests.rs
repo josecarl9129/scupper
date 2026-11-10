@@ -173,6 +173,28 @@ fn udp(source: [u8; 4], destination: [u8; 4], sport: u16, dport: u16, payload: &
     bytes.extend(payload);
     bytes
 }
+
+#[test]
+fn foreign_control_accepts_any_exact_udp_marker_but_rejects_silence_and_substrings() {
+    let markers: Vec<String> = ["control-first", "control-second", "control-third"]
+        .map(String::from)
+        .to_vec();
+    let packet = |payload: &[u8]| udp([10, 0, 0, 1], [10, 0, 0, 2], 40000, 8080, payload);
+    let check = |packets: &[Vec<u8>]| super::daemon::foreign_control(&capture(packets), &markers);
+    assert!(check(&[]).is_err());
+    assert!(check(&[packet(b"other")]).is_err());
+    assert!(check(&[packet(b"prefix-control-second-suffix")]).is_err());
+    for marker in &markers {
+        assert_eq!(check(&[packet(marker.as_bytes())]).unwrap(), 1);
+    }
+    let packets: Vec<_> = markers.iter().map(|m| packet(m.as_bytes())).collect();
+    assert_eq!(check(&packets).unwrap(), 3);
+    // Repeated packets prove one marker, and TCP cannot satisfy the UDP control.
+    assert_eq!(check(&[packets[1].clone(), packets[1].clone()]).unwrap(), 1);
+    let mut tcp = packet(markers[1].as_bytes());
+    tcp[9] = 6;
+    assert!(check(&[tcp]).is_err());
+}
 #[test]
 fn positive_controls_require_packet_evidence_and_reject_silence() {
     let marker = "scupper-canary-00112233445566778899aabbccddeeff".to_owned();
