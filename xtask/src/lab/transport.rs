@@ -67,8 +67,17 @@ impl Lab {
     }
 
     pub(super) fn assert_transport_ports(&mut self) -> Result<()> {
-        // Initial gateway boot runs before the end clients are built.
-        let mut clients = vec![("scupper", "ex-ch1", EXIT_PORT)];
+        // Initial gateway boot runs before the end clients are built. A boot killed before the
+        // exit link was created has no exit port yet; the pin is checked once the link exists.
+        let links: serde_json::Value =
+            serde_json::from_str(&self.cmd("scupper", "ip", &["-j", "link", "show"])?)?;
+        let exit_exists = links
+            .as_array()
+            .is_some_and(|links| links.iter().any(|link| link["ifname"] == "ex-ch1"));
+        let mut clients = Vec::new();
+        if exit_exists {
+            clients.push(("scupper", "ex-ch1", EXIT_PORT));
+        }
         if self.client_ports_ready {
             for ns in ["client", "client2"] {
                 clients.push((ns, "wg0", 51820));
