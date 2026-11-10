@@ -15,10 +15,19 @@ use scupper_sys::{
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 
+/// Whether a verdict payload carries `reason`.
+///
+/// A reason is a unit variant (`"X"`) or a single-variant object (`{"X": ..}`). `Unprotected`
+/// carries a list of violations, which matches when any element carries the reason. The empty
+/// reason means "any payload": `Protected` is a struct (`{"exit", "exit_ip"}`), not a variant.
 pub(super) fn verdict_reason(value: &serde_json::Value, reason: &str) -> bool {
+    if reason.is_empty() {
+        return !value.is_null();
+    }
     match value {
         serde_json::Value::String(s) => s == reason,
         serde_json::Value::Object(map) => map.len() == 1 && map.contains_key(reason),
+        serde_json::Value::Array(items) => items.iter().any(|item| verdict_reason(item, reason)),
         _ => false,
     }
 }
@@ -62,6 +71,23 @@ mod verdict_tests {
             &serde_json::Value::Null,
             "AdminDisconnected"
         ));
+    }
+    #[test]
+    fn protected_and_violation_lists_match_real_reports() {
+        use serde_json::json;
+        let protected = json!({"Protected":{"exit":"ch1","exit_ip":"20.64.174.66"}});
+        assert!(verdict_reason(&protected["Protected"], ""));
+        assert!(!verdict_reason(&protected["Unprotected"], ""));
+        let violations = json!({"Unprotected":[
+            {"ForeignLink":"foreign0"},{"LinkKind":"foreign0"},{"TrafficControlHook":"wg0"}
+        ]});
+        assert!(verdict_reason(&violations["Unprotected"], "ForeignLink"));
+        assert!(verdict_reason(
+            &violations["Unprotected"],
+            "TrafficControlHook"
+        ));
+        assert!(!verdict_reason(&violations["Unprotected"], "PeerDiffers"));
+        assert!(!verdict_reason(&json!([]), "ForeignLink"));
     }
 }
 
@@ -191,7 +217,7 @@ impl DaemonGuard<'_> {
             serde_json::to_vec_pretty(&report)?,
         )?;
         let expected = expected.or(match code {
-            0 => Some(("Protected", "exit")),
+            0 => Some(("Protected", "")),
             5 => Some(("Unsupervised", "Dead")),
             _ => None,
         });
