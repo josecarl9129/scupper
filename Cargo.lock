@@ -411,6 +411,7 @@ dependencies = [
  "clap",
  "rustix",
  "scupper-core",
+ "scupper-proto",
  "scupper-sys",
  "serde_json",
 ]

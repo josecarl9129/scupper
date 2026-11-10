@@ -159,7 +159,7 @@ fn corrupt_m2_head_never_falls_back_to_m1() {
 }
 
 #[test]
-fn required_future_daemon_uses_code_five_only_after_data_path_passes() {
+fn required_daemon_fallback_verdict_table() {
     let sys = Script::new("ubuntu-24.04");
     fresh(&sys);
     let root = Root::new(&sys.runner, &testing::handle().unwrap());
@@ -184,6 +184,16 @@ fn required_future_daemon_uses_code_five_only_after_data_path_passes() {
     assert_eq!(report["config_version"], 2);
     assert_eq!(report["verdict"]["Unsupervised"]["why"], "Dead");
     assert_eq!(run(&sys, &root, &["status"]).0, 0);
+    for (filename, value, expected) in [
+        ("scupper-nft-ruleset.json", r#"{"nftables":[]}"#, 2),
+        ("scupper--4-route.json", "[]", 3),
+    ] {
+        sys.replace(filename, value);
+        assert_eq!(run(&sys, &root, &["check"]).0, expected);
+        sys.replacements.borrow_mut().remove(filename);
+    }
+    *sys.file_error.borrow_mut() = true;
+    assert_eq!(run(&sys, &root, &["check"]).0, 1);
 }
 
 #[test]
@@ -287,4 +297,80 @@ fn check_reports_the_applied_version_when_the_head_is_pending() {
     assert_eq!(code, 0, "{out} {err}");
     let report: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(report["config_version"], 1);
+}
+
+#[test]
+fn local_mutation_refuses_another_writer_before_loading_or_changing_intent() {
+    let sys = Script::new("ubuntu-24.04");
+    fresh(&sys);
+    let root = Root::new(&sys.runner, &testing::handle().unwrap());
+    let before = std::fs::read(root.path.join("state.json")).unwrap();
+    let guard = scupper_sys::lock::WriterLock::acquire(&root.path).unwrap();
+    let started = std::time::Instant::now();
+    let (code, out, err) = run(&sys, &root, &["disconnect"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("writer lock"), "{err}");
+    assert!(!out.contains("traffic is now blocked"));
+    assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    assert_eq!(before, std::fs::read(root.path.join("state.json")).unwrap());
+    drop(guard);
+}
+
+#[test]
+fn stage_eight_socket_age_table_uses_the_strict_thirty_second_boundary() {
+    use scupper_proto::{OpResult, Response, Schema};
+    use std::{io::Write, os::unix::net::UnixListener};
+    let sys = Script::new("ubuntu-24.04");
+    fresh(&sys);
+    let held = testing::handle().unwrap();
+    let root = Root::new(&sys.runner, &held);
+    let site = scupper_core::config::validate(
+        scupper_core::config::parse_site(
+            &support::site_text(&sys.runner)
+                .replace("require_daemon = false", "require_daemon = true"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    for (age, expected) in [(Some(29), 0), (Some(30), 5), (None, 5)] {
+        let path = root.path.join("control.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = scupper_sys::daemon::control::read_request(&stream).unwrap();
+            serde_json::to_writer(
+                &mut stream,
+                &Response {
+                    request_id: request.request_id,
+                    schema: Schema,
+                    result: Ok(OpResult::Ping {
+                        last_complete_iteration_age: age,
+                        version: 1,
+                        quarantined: false,
+                        selection: scupper_core::verdict::v2::Selection::Auto,
+                    }),
+                },
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+        });
+        let report = scupper_sys::check_v2::run_check_v2(
+            &scupper_sys::check_v2::Dependencies {
+                system: &sys,
+                probe_exec: &sys,
+                handle: Some(&held),
+                run_root: &root.path,
+                state_root: &root.path,
+            },
+            &scupper_sys::check_v2::Config {
+                site: &site,
+                gateway: &scupper_core::config::GatewayId("gw1".into()),
+                stamp: root.stamp,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.verdict.exit_code(), expected);
+        worker.join().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
 }

@@ -88,14 +88,19 @@ vocabulary!(
     SupervisorUnavailable,
     PersistenceUnavailable,
     Timeout,
-    Internal
+    Internal,
+    DisconnectNotEffective,
+    NotReady
 );
 /// Public error with a stable code and no reflected input or diagnostic string.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApiError {
     /// Stable caller-visible classification.
     pub code: ApiErrorCode,
+    /// Fresh staged report when a disconnect could not prove kernel closure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<serde_json::Value>,
 }
 impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -135,6 +140,51 @@ impl From<&crate::Report> for HealthSummary {
         }
     }
 }
+/// Cached public kernel facts; unknown values remain null.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KernelObservation {
+    /// Canonical match with the applied ruleset.
+    pub ruleset_exact: Option<bool>,
+    /// Observed global IPv4 forwarding gate.
+    pub forwarding_v4: Option<i64>,
+    /// Observed global IPv6 forwarding gate.
+    pub forwarding_v6: Option<i64>,
+    /// Observed IPv4 default, including missing and unreachable.
+    pub default_v4: Option<String>,
+    /// Observed IPv6 default, including missing and unreachable.
+    pub default_v6: Option<String>,
+    /// Observed link state without addresses, peer keys or endpoints.
+    pub links: Vec<LinkObservation>,
+}
+/// Cached operational state of one namespace link.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkObservation {
+    /// Kernel interface name, including foreign names.
+    pub name: String,
+    /// Whether the link was up.
+    pub up: Option<bool>,
+    /// Whether any peers were present.
+    pub peers_present: Option<bool>,
+}
+
+/// Last completed reconciler observation and attempted action categories.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TickObservation {
+    /// Whether all required tick observations completed.
+    pub complete: bool,
+    /// Safety observation time in milliseconds.
+    pub safety_ms: u64,
+    /// Attempted action categories, without addresses or command strings.
+    pub steps: Vec<crate::StepKind>,
+    /// Failed action categories.
+    pub failed_steps: Vec<crate::StepKind>,
+    /// Last kernel snapshot, independent of the actions attempted afterward.
+    pub kernel: Option<KernelObservation>,
+}
+
 sampled_enum! {
 /// Successful reply alphabet, with one result per operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,6 +194,12 @@ pub enum OpResult, result_samples {
     Ping {
         /// Monotonic age in whole seconds, supplied by the supervisor.
         last_complete_iteration_age: Option<u64> = Some(2),
+        /// Applied immutable version.
+        version: u64 = 1,
+        /// Persistent quarantine state.
+        quarantined: bool = false,
+        /// Durable administrative intent.
+        selection: scupper_core::verdict::v2::Selection = scupper_core::verdict::v2::Selection::Auto,
     },
     /// Cached health and its age.
     Status {
@@ -151,11 +207,15 @@ pub enum OpResult, result_samples {
         health: HealthSummary = sample_health(),
         /// Monotonic age in seconds.
         age: u64 = 3,
+        /// Cached reconcile observations; this is not a fresh full check.
+        observations: TickObservation = TickObservation { kernel: Some(KernelObservation { links: vec![LinkObservation { name: "ex-ch1".into(), up: Some(true), peers_present: Some(true) }], ..KernelObservation::default() }), ..TickObservation::default() },
     },
     /// Fresh health summary.
     Check {
         /// Fresh result.
         health: HealthSummary = sample_health(),
+        /// Complete schema-1 staged report, retaining violation details.
+        report: serde_json::Value = serde_json::Value::Null,
     },
     /// Selected exit after connection was verified.
     Connect {
@@ -170,6 +230,8 @@ pub enum OpResult, result_samples {
         version: u64 = 2,
         /// True when no mutation was executed.
         dry_run: bool = false,
+        /// Ordered operation categories, without kernel command text.
+        plan: Vec<crate::StepKind> = vec![crate::StepKind::VerifyRuleset],
     },
     /// Persistent quarantine summary.
     RepairStatus {
@@ -209,10 +271,12 @@ pub fn decode_request(line: &[u8]) -> Result<Request, ApiError> {
     if line.len() > MAX_REQUEST_SIZE {
         return Err(ApiError {
             code: ApiErrorCode::RequestTooLarge,
+            observation: None,
         });
     }
     let invalid = || ApiError {
         code: ApiErrorCode::InvalidRequest,
+        observation: None,
     };
     let body = line.strip_suffix(b"\n").unwrap_or(line);
     if body.contains(&b'\n') || body.contains(&b'\r') {

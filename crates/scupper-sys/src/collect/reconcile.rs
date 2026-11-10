@@ -29,10 +29,10 @@ use std::{
 };
 
 /// Applies a shared safety deadline in addition to the per-exec bound.
-struct SafetySystem<'a> {
-    system: &'a dyn System,
-    deadline: Instant,
-    failed: Cell<bool>,
+pub(crate) struct SafetySystem<'a> {
+    pub(crate) system: &'a dyn System,
+    pub(crate) deadline: Instant,
+    pub(crate) failed: Cell<bool>,
 }
 impl System for SafetySystem<'_> {
     fn canon_safety_deadline(&self) -> Option<Instant> {
@@ -80,6 +80,9 @@ impl System for SafetySystem<'_> {
     }
     fn wireguard_socket_dirs(&self) -> Vec<PathBuf> {
         self.system.wireguard_socket_dirs()
+    }
+    fn read_host_udp(&self, ipv6: bool) -> std::io::Result<String> {
+        self.system.read_host_udp(ipv6)
     }
 }
 fn read(sys: &dyn System, held: &NetnsHandle, cmd: &KernelCmd) -> Probe<String> {

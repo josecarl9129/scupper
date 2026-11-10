@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock, Weak,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -104,9 +104,6 @@ impl StateRead {
     }
 }
 
-// Every StateFile writer invalidates outstanding snapshots, including readers
-// owned by another adapter. The writer-lock boundary handles other processes.
-static READ_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileGeneration {
     device: u64,
@@ -135,6 +132,9 @@ type PendingJob<T> = (Option<u64>, std::sync::mpsc::Receiver<io::Result<T>>);
 #[derive(Debug, Default)]
 struct ReadCapacity {
     busy: AtomicBool,
+    // Writes invalidate other handles of this file, never unrelated state roots.
+    // The writer-lock boundary and metadata check handle other processes.
+    generation: AtomicU64,
 }
 #[derive(Debug)]
 struct ReadPermit(Arc<ReadCapacity>);
@@ -278,7 +278,7 @@ impl StateFile {
         let mut metadata = self.pending_metadata.borrow_mut();
         if let Some((started, receive)) = metadata.as_ref() {
             let started = *started;
-            let result = if started == Some(READ_GENERATION.load(Ordering::SeqCst)) {
+            let result = if started == Some(self.capacity.generation.load(Ordering::SeqCst)) {
                 receive.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
             } else {
                 receive.try_recv().map_err(|error| match error {
@@ -290,7 +290,7 @@ impl StateFile {
                 Err(RecvTimeoutError::Timeout) => return Err(timeout()),
                 Ok(result) => {
                     *metadata = None;
-                    if started == Some(READ_GENERATION.load(Ordering::SeqCst)) {
+                    if started == Some(self.capacity.generation.load(Ordering::SeqCst)) {
                         return result;
                     }
                 }
@@ -302,7 +302,10 @@ impl StateFile {
         }
         drop(metadata);
         let mut pending = self.pending_read.borrow_mut();
-        let generation = READ_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
+        let generation = self
+            .capacity
+            .generation
+            .load(std::sync::atomic::Ordering::SeqCst);
         let new_worker = pending.is_none();
         if new_worker {
             let permit = self.reserve_worker()?;
@@ -338,7 +341,13 @@ impl StateFile {
         match result {
             Ok(result) => {
                 *pending = None;
-                if started != Some(READ_GENERATION.load(std::sync::atomic::Ordering::SeqCst)) {
+                if started
+                    != Some(
+                        self.capacity
+                            .generation
+                            .load(std::sync::atomic::Ordering::SeqCst),
+                    )
+                {
                     return Ok(None);
                 }
                 drop(pending);
@@ -424,7 +433,9 @@ impl StateFile {
         hook: &dyn Fn(DurableStep) -> io::Result<()>,
     ) -> io::Result<()> {
         self.invalidate_reads();
-        READ_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.capacity
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         check_schema(state)?;
         let bytes = serde_json::to_vec(state).map_err(io::Error::other)?;
         let parent = self
@@ -526,7 +537,7 @@ mod tests {
         let reader = StateFile::open(&root, Some(&guard)).unwrap();
         reader.write(&guard, &State::default()).unwrap();
         let old_snapshot = reader.snapshot().unwrap();
-        let generation = READ_GENERATION.load(Ordering::SeqCst);
+        let generation = reader.capacity.generation.load(Ordering::SeqCst);
         let (send, receive) = std::sync::mpsc::sync_channel(1);
         *reader.pending_read.borrow_mut() = Some((Some(generation), receive));
         for _ in 0..32 {
@@ -599,7 +610,7 @@ mod tests {
         writer.write(&guard, &State::default()).unwrap();
         for mode in 0..3 {
             let old = reader.snapshot().unwrap();
-            let epoch = READ_GENERATION.load(Ordering::SeqCst);
+            let epoch = reader.capacity.generation.load(Ordering::SeqCst);
             let (send, receive) = std::sync::mpsc::sync_channel(1);
             *reader.pending_read.borrow_mut() = Some((Some(epoch), receive));
             // Deterministically hold a worker's captured old intent beyond its timeout.
@@ -632,6 +643,50 @@ mod tests {
             );
             writer.write(&guard, &State::default()).unwrap();
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn unrelated_state_writes_preserve_ready_snapshots_when_another_reader_is_busy() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/state-independent-roots")
+            .join(format!(
+                "{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+        let reader_guard = WriterLock::acquire(root.join("reader")).unwrap();
+        let other_guard = WriterLock::acquire(root.join("other")).unwrap();
+        let reader = StateFile::open(root.join("reader"), Some(&reader_guard)).unwrap();
+        let other = StateFile::open(root.join("other"), Some(&other_guard)).unwrap();
+        reader.write(&reader_guard, &State::default()).unwrap();
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        *reader.pending_metadata.borrow_mut() = Some((
+            Some(reader.capacity.generation.load(Ordering::SeqCst)),
+            receive,
+        ));
+        // A second handle may start another read after metadata verification
+        // releases its permit, before the first handle consumes its ready reply.
+        let busy = reader.reserve_worker().unwrap();
+        other
+            .write(
+                &other_guard,
+                &State {
+                    selection: Selection::Disconnected,
+                    ..State::default()
+                },
+            )
+            .unwrap();
+        send.send(Ok(Some(StateRead::Present(State::default()))))
+            .unwrap();
+        assert_eq!(
+            reader
+                .read_until(Instant::now() + Duration::from_secs(3))
+                .unwrap(),
+            StateRead::Present(State::default())
+        );
+        drop(busy);
+        drop(reader_guard);
+        drop(other_guard);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

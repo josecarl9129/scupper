@@ -260,6 +260,7 @@ pub struct Reconciler<K, S, C> {
     // Evidence only: no reservations or debounce are committed by emergency work.
     emergency_steps: Vec<Step>,
     startup: bool,
+    cached: Option<(Instant, KernelModel)>,
 }
 impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
     /// Resume from durable selection/quarantine, starting failover qualification afresh.
@@ -320,6 +321,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             deadline: None,
             emergency_steps: vec![],
             startup: true,
+            cached: None,
         })
     }
     /// Adapter access for lifecycle updates such as edge's new namespace path.
@@ -546,6 +548,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
     #[allow(clippy::single_match_else)] // Durable success and failure retain different latch views.
     fn observe(&mut self, report: &mut TickReport) -> Observation {
         let mut observation = self.kernel.observe(&self.held);
+        self.cached = Some((Instant::now(), observation.model.clone()));
         observation.model.latch = self.persisted.quarantine.as_ref().map(|q| Latch {
             reason: q.reason.clone(),
             object: q.object.clone(),
@@ -576,6 +579,13 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 });
                 self.kernel
                     .persisted_latch(observation.model.latch.as_ref());
+                if self.persisted.quarantine.is_some() && state.quarantine.is_none() {
+                    // Another authorized writer durably cleared the latch while
+                    // this process was unavailable. Memory-only latches still hold.
+                    self.latch = None;
+                    self.budgets = Budgets::default();
+                    self.kernel.hold_latch(None);
+                }
                 if self.latch.is_none() {
                     self.latch.clone_from(&observation.model.latch);
                 }
@@ -610,6 +620,11 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         }
         report.complete &= Instant::now() < deadline;
         observation.complete &= Instant::now() < deadline;
+        let at = self
+            .cached
+            .as_ref()
+            .map_or_else(Instant::now, |(at, _)| *at);
+        self.cached = Some((at, observation.model.clone()));
         observation
     }
     #[allow(clippy::too_many_lines)] // Preserve the observe/health/plan/execute ordering in one place.
@@ -643,7 +658,15 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 report.failures.push((Step::ForwardingOff, error));
                 return;
             }
-            // Never lose a memory-only quarantine while replacing the machine.
+            // A verified apply may have cleared durable quarantine while this
+            // process was unavailable. Preserve only a genuinely memory-only
+            // latch across that handoff, rather than undoing the operator clear.
+            if self.persisted.quarantine.is_some() && latest.quarantine.is_none() {
+                self.latch = None;
+                self.kernel.persisted_latch(None);
+                self.kernel.hold_latch(None);
+                self.budgets = Budgets::default();
+            }
             if let Some(latch) = &self.latch {
                 latest.quarantine = Some(Quarantine {
                     reason: latch.reason.clone(),
@@ -1367,6 +1390,38 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         }
         report.events.push(event);
     }
+    fn refresh_admin_state(&mut self) -> io::Result<State> {
+        self.store.begin_tick();
+        self.kernel.begin_tick();
+        let state = self
+            .store
+            .read_until(Instant::now() + Duration::from_secs(2))?;
+        if state.applied_version != self.persisted.applied_version {
+            return Err(io::Error::other(
+                "applied version changed; reconciler must reload",
+            ));
+        }
+        if self.persisted.quarantine.is_some() && state.quarantine.is_none() {
+            self.latch = None;
+            self.budgets = Budgets::default();
+        }
+        if self.latch.is_none() {
+            self.latch = state.quarantine.as_ref().map(|q| Latch {
+                reason: q.reason.clone(),
+                object: q.object.clone(),
+            });
+        }
+        self.kernel.persisted_latch(self.latch.as_ref());
+        self.kernel.hold_latch(self.latch.as_ref());
+        if state.selection != self.persisted.selection {
+            self.feed(
+                (self.clock)().0,
+                FailoverInput::SelectionChanged(state.selection.clone()),
+            );
+        }
+        self.persisted = state.clone();
+        Ok(state)
+    }
     /// Persist intent before executing a tick; Disconnected is acknowledged only
     /// after closing steps succeeded, with the same writer lock held throughout.
     ///
@@ -1384,11 +1439,27 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             return Err(io::Error::other("unconfigured exit"));
         }
         let guard = WriterLock::acquire_timeout(&self.config.run_root, self.config.lock_wait)?;
-        let mut state = self.persisted.clone();
+        let mut state = self.refresh_admin_state()?;
+        if state.quarantine.is_none()
+            && let Some(latch) = &self.latch
+        {
+            state.quarantine = Some(Quarantine {
+                reason: latch.reason.clone(),
+                object: latch.object.clone(),
+                since_unix: (self.clock)().1,
+            });
+        }
         state.selection = selection.clone();
         self.kernel.invalidate_state();
         self.store.write(&guard, &state)?;
         self.persisted = state;
+        #[cfg(feature = "testing")]
+        if self.config.run_root.join("crash-after-selection").exists() {
+            rustix::process::kill_process(
+                rustix::process::getpid(),
+                rustix::process::Signal::KILL,
+            )?;
+        }
         self.feed(
             (self.clock)().0,
             FailoverInput::SelectionChanged(selection.clone()),
@@ -1409,6 +1480,40 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             &mut report,
         );
         self.tick_locked(&guard, &mut report);
+        if selection != Selection::Disconnected && self.latch.is_none() && report.complete {
+            // An explicit connect can restore a verified fresh candidate before
+            // background probes confirm it. As on attachment, it remains
+            // Unconfirmed until real probe rounds arrive.
+            let safety = self.kernel.observe(&self.held);
+            let observed = self.kernel.observe_rest(
+                &self.held,
+                safety,
+                Instant::now() + Duration::from_secs(6),
+            );
+            for (exit, iface) in self.failover_config.exits.clone() {
+                let target = scupper_core::render::RouteTarget::Exit(iface);
+                let desired = self.config.desired(&selection, &target)?;
+                if observed.complete
+                    && observed.safety_complete
+                    && observed.model.namespace == planner::NamespaceState::Ready
+                    && !safety_drift(&observed.model, &desired, false)
+                    && observed.model.route_ready(&desired, &target)
+                    && observed.handshakes.get(&exit).is_some_and(|age| {
+                        age.is_some_and(|age| age <= self.failover_config.handshake_stale)
+                    })
+                    && self
+                        .failover
+                        .resume_verified((self.clock)().0, &exit, &self.failover_config)
+                {
+                    self.actions.extend([
+                        FailoverAction::SetRoute(target),
+                        FailoverAction::FlushConntrack,
+                    ]);
+                    self.tick_locked(&guard, &mut report);
+                    break;
+                }
+            }
+        }
         if selection == Selection::Disconnected
             && (!report.complete
                 || report
@@ -1459,17 +1564,145 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         }
         Ok(crate::boot::boot_with_guard(deps, &guard))
     }
+    /// Cached observed kernel facts and their earliest collection time.
+    #[must_use]
+    pub fn cached_observation(&self) -> Option<(Instant, scupper_proto::KernelObservation)> {
+        let (at, model) = self.cached.as_ref()?;
+        Some((
+            *at,
+            scupper_proto::KernelObservation {
+                ruleset_exact: model
+                    .ruleset
+                    .value()
+                    .map(|rules| *rules == planner::Ruleset::Verified(self.config.fingerprint)),
+                forwarding_v4: model.forwarding_v4.value().copied(),
+                forwarding_v6: model.forwarding_v6.value().copied(),
+                default_v4: model.default_v4.value().map(|route| format!("{route:?}")),
+                default_v6: model.default_v6.value().map(|route| format!("{route:?}")),
+                links: model
+                    .links
+                    .iter()
+                    .map(|(name, link)| scupper_proto::LinkObservation {
+                        name: name.clone(),
+                        up: link.up.value().copied(),
+                        peers_present: link.peers.value().map(|peers| !peers.is_empty()),
+                    })
+                    .collect(),
+            },
+        ))
+    }
+    /// Durable administrative intent, for control replies.
+    pub fn selection(&self) -> Selection {
+        self.persisted.selection.clone()
+    }
+    /// Immutable applied version.
+    pub fn version(&self) -> u64 {
+        self.config.stamp.version
+    }
+    /// Render the planner's next steps without mutating budgets or kernel state.
+    /// # Errors
+    /// Returns invalid desired state.
+    pub fn preview(&self) -> io::Result<Vec<StepKind>> {
+        let desired = self.desired()?;
+        let observed = self.kernel.observe(&self.held);
+        Ok(planner::plan(
+            &desired,
+            &observed.model,
+            &self.budgets,
+            self.latch.as_ref(),
+            &self.debounce,
+            (self.clock)().0,
+        )
+        .steps
+        .iter()
+        .map(StepKind::from)
+        .collect())
+    }
+    /// Plan an explicit same-version apply using fresh observations. Operator
+    /// apply bypasses automatic repair debounce and budgets; quarantine remains
+    /// held until the caller completes the final verified full boot.
+    /// # Errors
+    /// Returns lock, version, persistence or desired-state errors.
+    pub fn apply_plan(&mut self, dry_run: bool, actor: Actor) -> io::Result<Vec<StepKind>> {
+        self.deadline = Some(Instant::now() + Duration::from_secs(20));
+        let guard = WriterLock::acquire_timeout(&self.config.run_root, self.config.lock_wait)?;
+        let state = self.refresh_admin_state()?;
+        if state.selection != self.persisted.selection {
+            self.feed(
+                (self.clock)().0,
+                FailoverInput::SelectionChanged(state.selection.clone()),
+            );
+        }
+        self.persisted = state;
+        let desired = self.desired()?;
+        let safety = self.kernel.observe(&self.held);
+        let observed =
+            self.kernel
+                .observe_rest(&self.held, safety, Instant::now() + Duration::from_secs(6));
+        let budgets = Budgets::default();
+        let first = planner::plan(
+            &desired,
+            &observed.model,
+            &budgets,
+            self.latch.as_ref(),
+            &self.debounce,
+            (self.clock)().0,
+        );
+        let planned = planner::plan(
+            &desired,
+            &observed.model,
+            &budgets,
+            self.latch.as_ref(),
+            &first.debounce,
+            (self.clock)().0,
+        );
+        if dry_run {
+            return Ok(planned.steps.iter().map(StepKind::from).collect());
+        }
+        let mut report = TickReport {
+            complete: observed.complete && observed.safety_complete,
+            ..TickReport::default()
+        };
+        self.emit(
+            EventKind::AdminAction {
+                command: Command::Apply,
+            },
+            actor,
+            &mut report,
+        );
+        self.run_plan(planned, &desired, &guard, &mut report, true);
+        Ok(report.steps.iter().map(StepKind::from).collect())
+    }
     /// Explicit repair-clear transition. Memory quarantine remains if durability fails.
     ///
     /// # Errors
     /// Returns lock or state persistence failure.
     pub fn clear_latch(&mut self, actor: Actor) -> io::Result<()> {
+        self.clear_latch_for(actor, ClearLatch::RepairClear)
+    }
+    /// Clear a latch after an explicit repair or verified full apply.
+    /// # Errors
+    /// Returns lock or durability failure.
+    pub fn clear_latch_for(&mut self, actor: Actor, action: ClearLatch) -> io::Result<()> {
         let guard = WriterLock::acquire_timeout(&self.config.run_root, self.config.lock_wait)?;
+        let mut state = self.refresh_admin_state()?;
         let Some(latch) = &self.latch else {
+            self.store.write(&guard, &state)?;
+            self.budgets = Budgets::default();
+            let _ = self.log.emit(
+                EventKind::AdminAction {
+                    command: if action == ClearLatch::RepairClear {
+                        Command::RepairClear
+                    } else {
+                        Command::Apply
+                    },
+                },
+                actor,
+                self.persisted.applied_version,
+            );
             return Ok(());
         };
-        let transition = planner::clear_latch(latch, ClearLatch::RepairClear, &self.budgets);
-        let mut state = self.persisted.clone();
+        let transition = planner::clear_latch(latch, action, &self.budgets);
         state.quarantine = None;
         self.kernel.invalidate_state();
         self.store.write(&guard, &state)?;

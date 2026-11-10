@@ -1,6 +1,8 @@
 //! Synchronous daemon lifecycle. One thread owns the reconciler and all mutable
 //! scheduler state. Child-wait and audit-open workers return values over channels;
 //! neither can submit failover inputs or execute a kernel repair.
+pub mod admin;
+pub mod control;
 pub mod notify;
 pub mod probes;
 pub mod scheduler;
@@ -414,6 +416,10 @@ pub fn run(options: &Options, stop: &AtomicBool) -> io::Result<()> {
         setup_at: None,
         setup_rounds: 0,
         edge_logged: false,
+        control: control::Server::bind(&options.run_root)?,
+        dedupe: control::Dedupe::default(),
+        last_complete: None,
+        cached: None,
     };
     run_with(&mut runtime, stop);
     Ok(())
@@ -431,6 +437,14 @@ struct Runtime<'a> {
     startup_read: StartupRead,
     probes: probes::Probes,
     edge_logged: bool,
+    control: control::Server,
+    dedupe: control::Dedupe,
+    last_complete: Option<Instant>,
+    cached: Option<(
+        Instant,
+        scupper_proto::HealthSummary,
+        scupper_proto::TickObservation,
+    )>,
     setup_at: Option<Instant>,
     setup_rounds: u64,
 }
@@ -450,6 +464,97 @@ impl<'a> Runtime<'a> {
     }
 }
 impl Runtime<'_> {
+    fn control_requests(&mut self) {
+        // Bound request work between safety ticks. Dedupe is owned by this thread.
+        if let Ok(pending) = self.control.receive.try_recv() {
+            let mut dedupe = std::mem::take(&mut self.dedupe);
+            let response = dedupe.execute(pending.request, Instant::now(), |op| {
+                if Instant::now() > pending.until {
+                    return Err(control::api(scupper_proto::ApiErrorCode::Timeout));
+                }
+                self.operation(op, pending.uid)
+            });
+            self.dedupe = dedupe;
+            let _ = pending.reply.send(response);
+        }
+    }
+    fn operation(
+        &mut self,
+        op: scupper_proto::Op,
+        uid: u32,
+    ) -> Result<scupper_proto::OpResult, scupper_proto::ApiError> {
+        use scupper_proto::{ApiErrorCode, Op, OpResult};
+        if !control::authorized(uid) {
+            return Err(control::api(ApiErrorCode::Unauthorized));
+        }
+        let deps = self.deps();
+        if let Op::Commit {
+            parent,
+            toml,
+            reason,
+        } = op
+        {
+            return admin::commit(&deps, &self.audit.handle(), parent, &toml, reason, uid);
+        }
+        if let Op::Apply { version, dry_run } = op {
+            let target = version.or(VersionStore::read_only(deps.state_root, deps.config_root)
+                .head()
+                .map_err(|_| control::api(ApiErrorCode::Internal))?);
+            let prefix = if let Some((machine, _, _)) = &mut self.running
+                && Some(machine.version()) == target
+            {
+                machine
+                    .apply_plan(dry_run, Actor::Local { uid })
+                    .map_err(|_| control::api(ApiErrorCode::Internal))?
+            } else {
+                Vec::new()
+            };
+            let mut result = admin::apply(&deps, &self.audit.handle(), version, dry_run, uid);
+            if !dry_run {
+                self.initialize();
+                if result.is_ok() && self.running.is_none() {
+                    return Err(control::api(ApiErrorCode::Internal));
+                }
+                self.cached = None;
+            }
+            if let Ok(OpResult::Apply { plan, .. }) = &mut result {
+                plan.splice(0..0, prefix);
+            }
+            return result;
+        }
+        if matches!(op, Op::RepairStatus {}) && self.running.is_none() {
+            return admin::repair_status(deps.state_root);
+        }
+        if matches!(op, Op::Status {}) {
+            let (at, health, observations) = self
+                .cached
+                .as_ref()
+                .ok_or_else(|| control::api(ApiErrorCode::SupervisorUnavailable))?;
+            return Ok(OpResult::Status {
+                health: health.clone(),
+                age: at.elapsed().as_secs(),
+                observations: observations.clone(),
+            });
+        }
+        let Some((machine, held, config)) = &mut self.running else {
+            return Err(control::api(ApiErrorCode::SupervisorUnavailable));
+        };
+        admin::execute(
+            machine,
+            op,
+            uid,
+            self.last_complete.map(|at| at.elapsed().as_secs()),
+            |deadline| {
+                admin::check(
+                    &deps,
+                    &probes::ProbeCommand(self.options.probe_binary.clone()),
+                    held,
+                    config,
+                    deadline,
+                )
+            },
+        )
+    }
     fn initialize_until(&mut self, deadline: Instant) {
         self.running = match initialize(
             self.deps(),
@@ -485,6 +590,7 @@ impl DaemonDeps for Runtime<'_> {
     }
     fn sleep(&mut self, duration: Duration) {
         std::thread::sleep(duration);
+        self.control_requests();
     }
     fn started(&mut self) {
         if self.running.is_none() {
@@ -495,6 +601,9 @@ impl DaemonDeps for Runtime<'_> {
         }
     }
     fn notify(&mut self, iteration: &Iteration) {
+        if iteration.complete && self.running.is_some() {
+            self.last_complete = Some(Instant::now());
+        }
         let Some((machine, _, _)) = &self.running else {
             return;
         };
@@ -632,6 +741,36 @@ impl DaemonDeps for Runtime<'_> {
                 return Some(crate::reconcile::TickReport::default());
             }
             let report = machine.tick();
+            if let Some(verdict) = machine.verdict() {
+                let (at, kernel) = machine.cached_observation().map_or_else(
+                    || (Instant::now(), None),
+                    |(at, observation)| (at, Some(observation)),
+                );
+                self.cached = Some((
+                    at,
+                    scupper_proto::HealthSummary {
+                        verdict,
+                        at: UnixSeconds(unix()),
+                        config_version: config.stamp.version,
+                        warnings: 0,
+                    },
+                    scupper_proto::TickObservation {
+                        complete: report.complete,
+                        safety_ms: report.safety_ms,
+                        steps: report
+                            .steps
+                            .iter()
+                            .map(scupper_proto::StepKind::from)
+                            .collect(),
+                        kernel,
+                        failed_steps: report
+                            .failures
+                            .iter()
+                            .map(|(step, _)| scupper_proto::StepKind::from(step))
+                            .collect(),
+                    },
+                ));
+            }
             let rebuild = report.escalations.contains(&Escalation::RebuildRequired)
                 || report
                     .escalations

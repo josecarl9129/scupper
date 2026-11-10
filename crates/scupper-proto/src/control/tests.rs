@@ -167,6 +167,7 @@ fn every_variant_roundtrips_and_keys_are_private() {
     }
     for result in result_samples().into_iter().map(Ok).chain([Err(ApiError {
         code: ApiErrorCode::Timeout,
+        observation: None,
     })]) {
         let response = Response {
             request_id: id(),
@@ -230,11 +231,29 @@ fn every_variant_roundtrips_and_keys_are_private() {
         "Err",
         "code",
         "health",
+        "report",
         "verdict",
         "warnings",
         "age",
+        "observations",
+        "complete",
+        "safety_ms",
+        "steps",
+        "failed_steps",
+        "kernel",
+        "ruleset_exact",
+        "forwarding_v4",
+        "forwarding_v6",
+        "default_v4",
+        "default_v6",
+        "links",
+        "name",
+        "up",
+        "peers_present",
         "last_complete_iteration_age",
         "quarantined",
+        "selection",
+        "plan",
     ];
     let denied = [
         "dst",

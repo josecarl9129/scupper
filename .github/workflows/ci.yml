@@ -135,7 +135,7 @@ jobs:
       matrix:
         runner: [ubuntu-24.04, ubuntu-22.04]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 25
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with:
@@ -157,7 +157,7 @@ jobs:
         run: timeout 600 cargo build -p scupper -p scupperd --features testing --locked
 
       - name: Run boot-built namespace lab
-        run: sudo timeout 1200 target/release/xtask leaktest --artifacts lab-out --capture-fixtures lab-out/fixtures
+        run: sudo timeout 1800 target/release/xtask leaktest --artifacts lab-out --capture-fixtures lab-out/fixtures
 
       - name: Make lab diagnostics readable
         if: always()

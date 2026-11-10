@@ -71,7 +71,7 @@ impl Runner {
         let now = Instant::now();
         Self {
             cancel,
-            whole: now + Duration::from_secs(1000),
+            whole: now + Duration::from_secs(1600),
             phase: now + Duration::from_secs(180),
             cleanup: false,
             trace,
@@ -261,6 +261,20 @@ impl Group {
             return fail(format!("background process exited: {status}"));
         }
         Ok(())
+    }
+    /// Wait for completion without sending a signal; retain the cleanup guard.
+    pub(super) fn wait_timeout(&mut self, timeout: Duration) -> Result<std::process::ExitStatus> {
+        let until = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                self.done = true;
+                return Ok(status);
+            }
+            if Instant::now() >= until {
+                return fail("background completion deadline exceeded");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
     }
     pub fn stop(&mut self, signal: Signal) -> Result<()> {
         self.stop_timeout(signal, Duration::from_secs(3))

@@ -152,7 +152,36 @@ pub fn run_with_observations(
     deps: &Dependencies<'_>,
     cfg: &Config<'_>,
 ) -> (Result<Report, CheckError>, Observations) {
-    let mut obs = Observations::default();
+    run_driver(deps, cfg, false, None)
+}
+
+/// Fresh stages 1–7 on the supervisor tick owner; no recursive socket Ping.
+/// # Errors
+/// Returns required-observation failures from stages 1–7.
+pub fn run_supervised(deps: &Dependencies<'_>, cfg: &Config<'_>) -> Result<Report, CheckError> {
+    run_driver(deps, cfg, true, None).0
+}
+
+/// Local fallback after a bounded control request already failed. Reuse that
+/// supervision observation instead of waiting for a second two-second timeout.
+pub fn run_after_unavailable(
+    deps: &Dependencies<'_>,
+    cfg: &Config<'_>,
+) -> (Result<Report, CheckError>, Observations) {
+    run_driver(deps, cfg, false, Some(v2::Supervisor::Dead))
+}
+
+#[allow(clippy::too_many_lines)] // Keep the staged observation dispatch together.
+fn run_driver(
+    deps: &Dependencies<'_>,
+    cfg: &Config<'_>,
+    supervised: bool,
+    supervisor: Option<v2::Supervisor>,
+) -> (Result<Report, CheckError>, Observations) {
+    let mut obs = Observations {
+        supervisor,
+        ..Observations::default()
+    };
     let (health, state, pending) = match prepare(deps, cfg, &mut obs) {
         Ok(prepared) => prepared,
         Err(source) => return (Err(error(Stage::Topology, source)), obs),
@@ -175,7 +204,7 @@ pub fn run_with_observations(
         if let Next::Done(result) = request {
             return (result, obs);
         }
-        if seen.contains(&request) || seen.len() >= 7 {
+        if seen.contains(&request) || seen.len() >= 8 {
             return (
                 Err(error(
                     Stage::Topology,
@@ -232,7 +261,14 @@ pub fn run_with_observations(
                 ));
             }
             Next::Supervisor => {
-                obs.supervisor = Some(collect::supervisor(deps.system, handle, &health));
+                obs.supervisor = Some(if supervised {
+                    v2::Supervisor::Alive {
+                        iteration_age: std::time::Duration::ZERO,
+                        netns: health.expected_netns,
+                    }
+                } else {
+                    socket_supervisor(deps.run_root, health.expected_netns)
+                });
             }
             Next::StandbyProbe | Next::Dns | Next::Done(_) => {
                 return (
@@ -254,5 +290,30 @@ fn done(obs: &Observations, cfg: &HealthConfigV2, sys: &dyn System) -> Result<Re
             Stage::Topology,
             ProbeError::setup("internal missing namespace verdict"),
         )),
+    }
+}
+
+/// Stage 8: a failed or stale Ping is supervision loss, never an observation
+/// error that hides an earlier safety violation.
+#[must_use]
+pub fn socket_supervisor(root: &Path, netns: v2::NetnsIdentity) -> v2::Supervisor {
+    use crate::daemon::control::{call, request};
+    match call(
+        root,
+        &request(scupper_proto::Op::Ping {}),
+        std::time::Duration::from_secs(2),
+    ) {
+        Ok(scupper_proto::Response {
+            result:
+                Ok(scupper_proto::OpResult::Ping {
+                    last_complete_iteration_age: Some(age),
+                    ..
+                }),
+            ..
+        }) => v2::Supervisor::Alive {
+            iteration_age: std::time::Duration::from_secs(age),
+            netns,
+        },
+        _ => v2::Supervisor::Dead,
     }
 }

@@ -2338,3 +2338,183 @@ fn changed_applied_version_never_reloads_the_old_render() {
             .all(|(step, _)| matches!(step, Step::ForwardingOff))
     );
 }
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep the operation table and independent closure oracle together.
+fn control_ops_use_fake_kernel_and_verify_disconnect_independently() {
+    use scupper_core::verdict::v2::{Degraded, FailClosed, Report, Verdict};
+    use scupper_proto::{ApiErrorCode, Op, OpResult};
+    use scupper_sys::daemon::admin::execute;
+    let mut rig = Rig::new();
+    let healthy = |_| {
+        Ok(Report {
+            verdict: Verdict::Protected {
+                exit: scupper_core::config::ExitId("ch1".into()),
+                exit_ip: "192.0.2.1".parse().unwrap(),
+            },
+            warnings: vec![],
+            at: 1000,
+            config_version: 1,
+        })
+    };
+    assert!(matches!(
+        execute(rig.machine(), Op::Ping {}, 0, Some(2), healthy).unwrap(),
+        OpResult::Ping {
+            last_complete_iteration_age: Some(2),
+            version: 1,
+            ..
+        }
+    ));
+    assert!(matches!(
+        execute(rig.machine(), Op::Check {}, 0, None, healthy).unwrap(),
+        OpResult::Check { .. }
+    ));
+    assert!(matches!(
+        execute(rig.machine(), Op::Connect { exit: None }, 0, None, healthy).unwrap(),
+        OpResult::Connect { .. }
+    ));
+    assert!(matches!(
+        execute(rig.machine(), Op::RepairStatus {}, 0, None, healthy).unwrap(),
+        OpResult::RepairStatus {
+            quarantined: false,
+            ..
+        }
+    ));
+    assert!(execute(rig.machine(), Op::RepairClear {}, 0, None, healthy).is_ok());
+    assert_eq!(
+        execute(rig.machine(), Op::Disconnect {}, 1000, None, healthy)
+            .unwrap_err()
+            .code,
+        ApiErrorCode::Unauthorized
+    );
+    let kernel = rig.kernel.clone();
+    let closed = |_| {
+        let model = kernel.model();
+        let effective = model.default_v4 == Known::Value(DefaultRouteObs::Unreachable)
+            && model.default_v6 == Known::Value(DefaultRouteObs::Unreachable)
+            && model.links["ex-ch1"].up == Known::Value(false);
+        Ok(Report {
+            verdict: if effective {
+                Verdict::FailClosed(FailClosed::AdminDisconnected)
+            } else {
+                Verdict::Degraded(Degraded::DisconnectNotEffective)
+            },
+            warnings: vec![],
+            at: 1000,
+            config_version: 1,
+        })
+    };
+    rig.kernel.inject(Fault {
+        step: StepKind::RouteReplace,
+        remaining: None,
+        partial: false,
+    });
+    let error = execute(rig.machine(), Op::Disconnect {}, 0, None, closed).unwrap_err();
+    assert_eq!(error.code, ApiErrorCode::DisconnectNotEffective);
+    assert!(error.observation.is_some());
+    assert_eq!(rig.store.state().selection, Selection::Disconnected);
+    assert_ne!(
+        rig.kernel.model().default_v4,
+        Known::Value(DefaultRouteObs::Unreachable)
+    );
+    let mut rig = Rig::new();
+    assert!(
+        execute(rig.machine(), Op::Disconnect {}, 0, None, |_| Ok(Report {
+            verdict: Verdict::FailClosed(FailClosed::AdminDisconnected),
+            warnings: vec![],
+            at: 1000,
+            config_version: 1
+        }))
+        .is_ok()
+    );
+    assert_eq!(
+        rig.kernel.model().default_v4,
+        Known::Value(DefaultRouteObs::Unreachable)
+    );
+    rig.store.fail_writes(true);
+    assert!(execute(rig.machine(), Op::Connect { exit: None }, 0, None, healthy).is_err());
+    assert_eq!(rig.store.state().selection, Selection::Disconnected);
+    assert!(
+        execute(rig.machine(), Op::Check {}, 0, None, |_| Err(
+            scupper_proto::ApiError {
+                code: ApiErrorCode::Internal,
+                observation: None
+            }
+        ))
+        .is_err()
+    );
+}
+
+#[test]
+fn control_apply_planner_previews_without_writes_then_repairs_without_auto_debounce() {
+    let mut rig = Rig::new();
+    rig.kernel
+        .mutate(|model| *model.hardening.values_mut().next().unwrap() = Known::Value("-1".into()));
+    let before = rig.kernel.history().len();
+    let preview = rig
+        .machine()
+        .apply_plan(true, Actor::Local { uid: 0 })
+        .unwrap();
+    assert!(preview.contains(&StepKind::WriteSysctl));
+    assert_eq!(rig.kernel.history().len(), before);
+    let executed = rig
+        .machine()
+        .apply_plan(false, Actor::Local { uid: 0 })
+        .unwrap();
+    assert!(executed.contains(&StepKind::WriteSysctl));
+    assert!(rig.kernel.history().len() > before);
+}
+
+#[test]
+fn control_repair_clear_preserves_another_writers_selection() {
+    use scupper_sys::reconcile::StateStore;
+    let mut rig = Rig::new();
+    let mut state = rig.store.state();
+    state.selection = Selection::Disconnected;
+    state.quarantine = Some(scupper_sys::state::Quarantine {
+        reason: "repair-budget".into(),
+        object: "safety:ruleset".into(),
+        since_unix: 1000,
+    });
+    let guard = WriterLock::acquire(&rig.root).unwrap();
+    rig.store.write(&guard, &state).unwrap();
+    drop(guard);
+    rig.machine().clear_latch(Actor::Local { uid: 0 }).unwrap();
+    assert_eq!(rig.store.state().selection, Selection::Disconnected);
+    assert!(rig.store.state().quarantine.is_none());
+    rig.tick();
+    assert_eq!(
+        rig.kernel.model().default_v4,
+        Known::Value(DefaultRouteObs::Unreachable)
+    );
+}
+
+#[test]
+fn verified_apply_clear_is_not_undone_by_a_stale_daemon_version_handoff() {
+    use scupper_sys::reconcile::StateStore;
+    let mut rig = Rig::new();
+    let guard = WriterLock::acquire(&rig.root).unwrap();
+    let mut state = rig.store.state();
+    state.quarantine = Some(scupper_sys::state::Quarantine {
+        reason: "repair-budget".into(),
+        object: "safety:ruleset".into(),
+        since_unix: 1000,
+    });
+    rig.store.write(&guard, &state).unwrap();
+    drop(guard);
+    rig.restart();
+    assert!(rig.machine().latch().is_some());
+    let guard = WriterLock::acquire(&rig.root).unwrap();
+    state.applied_version = Some(2);
+    state.quarantine = None;
+    rig.store.write(&guard, &state).unwrap();
+    drop(guard);
+    assert!(
+        rig.tick()
+            .escalations
+            .contains(&Escalation::ReinitializeRequired)
+    );
+    assert!(rig.store.state().quarantine.is_none());
+    assert!(rig.machine().latch().is_none());
+    assert!(rig.kernel.model().forwarding_off());
+}

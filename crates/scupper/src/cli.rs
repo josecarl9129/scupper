@@ -13,6 +13,7 @@ use crate::{
 use clap::{Parser, Subcommand, error::ErrorKind};
 
 mod config;
+mod control;
 use config::ConfigCommand;
 
 #[derive(Parser)]
@@ -69,6 +70,20 @@ enum Command {
     Status,
     /// Check protection and return the verdict as an exit code.
     Check,
+    /// Clear disconnection and optionally prefer a configured exit.
+    Connect { exit: Option<String> },
+    /// Close the data path and independently verify kernel closure.
+    Disconnect,
+    /// Converge to the committed head configuration.
+    Apply {
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Inspect or explicitly clear persistent quarantine.
+    Repair {
+        #[command(subcommand)]
+        command: control::RepairCommand,
+    },
     /// Inspect and version the M2 site configuration.
     Config {
         #[command(subcommand)]
@@ -414,8 +429,28 @@ fn dispatch(
             stdout,
             stderr,
         )),
+        Command::Connect { exit } => {
+            control::mutation(deps, control::connect(deps, exit)?, json, stdout, stderr)
+        }
+        Command::Disconnect => {
+            control::mutation(deps, scupper_proto::Op::Disconnect {}, json, stdout, stderr)
+        }
+        Command::Apply { dry_run } => control::mutation(
+            deps,
+            scupper_proto::Op::Apply {
+                version: None,
+                dry_run,
+            },
+            json,
+            stdout,
+            stderr,
+        ),
+        Command::Repair { command } => control::repair(deps, command, json, stdout, stderr),
         Command::Status | Command::Check => {
             let status = matches!(command, Command::Status);
+            if let Some(code) = control::read(deps, status, json, stdout, stderr)? {
+                return Ok(code);
+            }
             let config = match m2_config(deps) {
                 Ok(Some(config)) => config,
                 Ok(None) => return Err("not an M2 gateway (no /var/lib/scupper store)".into()),
@@ -544,7 +579,7 @@ fn m2_check(
         }
         Err(error) => return Err(error),
     };
-    let (result, mut observations) = scupper_sys::check_v2::run_with_observations(
+    let (result, mut observations) = scupper_sys::check_v2::run_after_unavailable(
         &scupper_sys::check_v2::Dependencies {
             system: deps.system,
             probe_exec: deps.probe_exec,

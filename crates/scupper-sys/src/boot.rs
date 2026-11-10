@@ -126,6 +126,7 @@ pub enum BootPoint {
 }
 
 /// Boot's explicit I/O dependencies. Production roots are fixed by the CLI.
+#[derive(Clone, Copy)]
 pub struct BootDeps<'a> {
     /// Kernel executor and clock.
     pub system: &'a dyn System,

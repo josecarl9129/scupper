@@ -1565,3 +1565,125 @@ fn durable_boot_handoff_resumes_owned_links_and_guards_forwarding_intent() {
             .all(|s| !matches!(s, Step::ForwardingOn { .. }))
     );
 }
+
+#[test]
+fn control_commit_and_apply_use_one_writer_and_end_version_changes_in_full_boot() {
+    use scupper_proto::{ApiErrorCode, OpResult, Reason};
+    use scupper_sys::{daemon::admin, events::EventLog};
+    let fixture = Fixture::new();
+    assert!(fixture.run(None).succeeded());
+    let run_root = fixture.root.path.join("run");
+    let deps = BootDeps {
+        system: &fixture.kernel,
+        namespace: &fixture.kernel,
+        state_root: &fixture.root.path,
+        config_root: &fixture.root.path,
+        run_root: &run_root,
+        hook: None,
+        secret_owner: rustix::process::geteuid().as_raw(),
+    };
+    let log = EventLog::memory_only(scupper_core::config::GatewayId("gw1".into()), || {
+        scupper_proto::UnixSeconds(1000)
+    })
+    .unwrap();
+    let before = fs::read(fixture.root.path.join("state.json")).unwrap();
+    let calls = fixture.kernel.calls.borrow().len();
+    assert!(matches!(
+        admin::apply(&deps, &log.handle, None, true, 0).unwrap(),
+        OpResult::Apply {
+            dry_run: true,
+            version: 1,
+            ..
+        }
+    ));
+    assert_eq!(fixture.kernel.calls.borrow().len(), calls);
+    assert_eq!(
+        fs::read(fixture.root.path.join("state.json")).unwrap(),
+        before
+    );
+    assert_eq!(
+        admin::apply(&deps, &log.handle, Some(999), true, 0)
+            .unwrap_err()
+            .code,
+        ApiErrorCode::NotFound
+    );
+    assert_eq!(
+        admin::apply(&deps, &log.handle, None, false, 1000)
+            .unwrap_err()
+            .code,
+        ApiErrorCode::Unauthorized
+    );
+    let text = support::site_text("ubuntu-24.04");
+    assert_eq!(
+        admin::commit(&deps, &log.handle, Some(99), &text, Reason::Operator, 0)
+            .unwrap_err()
+            .code,
+        ApiErrorCode::Conflict
+    );
+    assert!(matches!(
+        admin::commit(&deps, &log.handle, Some(1), &text, Reason::Operator, 0).unwrap(),
+        OpResult::Commit { version: 2 }
+    ));
+    let guard = WriterLock::acquire(&run_root).unwrap();
+    assert!(admin::apply(&deps, &log.handle, None, false, 0).is_err());
+    drop(guard);
+    fixture.kernel.verified_this_run.set(false);
+    fixture.kernel.gates_closed.set(false);
+    fixture.kernel.began_live.set(true);
+    assert!(matches!(
+        admin::apply(&deps, &log.handle, None, false, 0).unwrap(),
+        OpResult::Apply {
+            version: 2,
+            dry_run: false,
+            ..
+        }
+    ));
+    let report: BootReport =
+        serde_json::from_slice(&fs::read(run_root.join("boot.json")).unwrap()).unwrap();
+    assert_eq!(report.applied_version, Some(2));
+    assert!(!report.adopted);
+    assert!(fixture.kernel.verified_this_run.get());
+}
+
+#[test]
+fn control_apply_keeps_quarantine_on_failure_and_clears_only_after_full_verification() {
+    use scupper_sys::{daemon::admin, events::EventLog};
+    let fixture = Fixture::new();
+    fixture.state(|s| {
+        s.quarantine = Some(Quarantine {
+            reason: "repair-budget".into(),
+            object: "safety:ruleset".into(),
+            since_unix: 1000,
+        });
+    });
+    assert!(fixture.run(None).succeeded());
+    let run_root = fixture.root.path.join("run");
+    let deps = BootDeps {
+        system: &fixture.kernel,
+        namespace: &fixture.kernel,
+        state_root: &fixture.root.path,
+        config_root: &fixture.root.path,
+        run_root: &run_root,
+        hook: None,
+        secret_owner: rustix::process::geteuid().as_raw(),
+    };
+    let log = EventLog::memory_only(scupper_core::config::GatewayId("gw1".into()), || {
+        scupper_proto::UnixSeconds(1000)
+    })
+    .unwrap();
+    *fixture.kernel.failure.borrow_mut() = Some((Program::Nft, "-f".into(), "injected".into()));
+    assert!(admin::apply(&deps, &log.handle, None, false, 0).is_err());
+    let file = StateFile::open(&fixture.root.path, None).unwrap();
+    let scupper_sys::state::StateRead::Present(state) = file.read().unwrap() else {
+        panic!("missing state");
+    };
+    assert!(state.quarantine.is_some());
+    assert_eq!(fixture.kernel.values.borrow()["net.ipv4.ip_forward"], "0");
+    *fixture.kernel.failure.borrow_mut() = None;
+    assert!(admin::apply(&deps, &log.handle, None, false, 0).is_ok());
+    let scupper_sys::state::StateRead::Present(state) = file.read().unwrap() else {
+        panic!("missing state");
+    };
+    assert!(state.quarantine.is_none());
+    assert_eq!(fixture.kernel.values.borrow()["net.ipv4.ip_forward"], "1");
+}

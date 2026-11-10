@@ -21,8 +21,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-const CASES: [&str; 10] = [
-    "L6", "L7", "L13", "L16", "L17-V14", "L52", "L52b", "V03", "L3", "L4",
+mod control_cases;
+
+const CASES: [&str; 15] = [
+    "L6", "L7", "L13", "L16", "L17-V14", "L52", "L52b", "V03", "L3", "L4", "L10", "L14", "L43",
+    "L44", "L50",
 ];
 
 // Drain notifications continuously, including while fault commands or probes block.
@@ -112,6 +115,9 @@ struct DaemonGuard<'a> {
 impl DaemonGuard<'_> {
     #[allow(clippy::too_many_lines)] // Keep start/restart continuity and fault cleanup ordering together.
     fn run(&mut self, case: &str) -> Result<String> {
+        if matches!(case, "L10" | "L14" | "L43" | "L44" | "L50") {
+            return self.run_control(case);
+        }
         let root = self.lab.prepare_check_v2()?;
         self.lab.boot_gateway(&[], "daemon-boot")?;
         self.lab.service_check(&mut Vec::new())?;
@@ -349,6 +355,7 @@ impl DaemonGuard<'_> {
                 .runner
                 .output(&Invocation::new(ns, program, &args), None);
         }
+        self.reset_control_fixture()?;
         let restored = self
             .lab
             .boot_gateway(&[], "daemon-restore")
@@ -1463,6 +1470,15 @@ pub(super) fn foreign_control(bytes: &[u8], markers: &[String]) -> Result<usize>
 
 fn daemon_wanted(case: &str) -> &'static str {
     match case {
+        "L10" => "SIGKILL/SIGSTOP: check 5, traffic continues; SIGCONT: check 0",
+        "L14" => "disconnect verifies closure; check 4 across reboot; connect restores 0",
+        "L43" => {
+            "recurring foreign link latches; forwarding stays 0 across restart/reboot; repair clear restores 0"
+        }
+        "L44" => "local apply races restart; writer contention bounded; samples closed or exact",
+        "L50" => {
+            "crash after durable Disconnected: check 3 while exit route exists; tightened closure gives 4"
+        }
         "L6" => {
             "check 3 and route event; tick-only stall stops watchdog while process lives; watchdog resumes; repair <=10s"
         }
