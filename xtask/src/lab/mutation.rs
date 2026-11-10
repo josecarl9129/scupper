@@ -179,8 +179,11 @@ pub fn run_mutation(artifacts: &Path, mutation: Mutation) -> Result<()> {
                 directory.display()
             ));
         }
-        let mut command = std::process::Command::new(std::env::current_exe()?);
+        // Give each stage its own full budget, including namespace cleanup.
+        let mut command = std::process::Command::new("timeout");
         command
+            .arg("600")
+            .arg(std::env::current_exe()?)
             .args(["leaktest", "--case", "L19", "--artifacts"])
             .arg(&directory);
         command.env_remove("SCUPPER_LAB_MUTATION");
@@ -493,6 +496,7 @@ impl Lab {
             if mutation == Mutation::Ct {
                 args.extend(["iif", "wg0"]);
             }
+            args.extend(["ipproto", "udp", "dport", "8080"]);
             let route = self.cmd("scupper", "ip", &args)?;
             fs::write(self.artifacts.join(format!("{stem}-route.txt")), &route)?;
             if !route
@@ -506,25 +510,23 @@ impl Lab {
             if mutation == Mutation::Ct {
                 self.capture("scupper", "wg0", &format!("{stem}-ingress"))?;
                 let log = self.artifacts.join(format!("{stem}-udp.jsonl"));
-                let sent = super::daemon::flow_counts(&log)?.0;
                 let before = self.meta_drop_counter()?;
+                let sent = super::daemon::flow_counts(&log)?.0;
                 self.daemon_wait(
                     "L19 established packets after route loss",
                     Duration::from_secs(3),
                     |_| Ok(super::daemon::flow_counts(&log)?.0 > sent + 40),
                 )?;
-                let after = self.meta_drop_counter()?;
                 let sent_after = super::daemon::flow_counts(&log)?.0;
+                let after = self.meta_drop_counter()?;
+                let (sends, drops, required) = drop_window(before, sent, sent_after, after);
                 fs::write(
                     self.artifacts.join("L19-L3-drops.json"),
                     serde_json::to_vec_pretty(
-                        &serde_json::json!({"before":before,"after":after,"sent":sent_after-sent}),
+                        &serde_json::json!({"before":before,"after":after,"sent":sends,"drops":drops,"required":required}),
                     )?,
                 )?;
-                if active() != Some(Mutation::Ct)
-                    && after.saturating_sub(before)
-                        < sent_after.saturating_sub(sent).saturating_sub(5).max(1)
-                {
+                if active() != Some(Mutation::Ct) && drops < required {
                     return fail("L19 established control lacks nft fwd_dropped evidence");
                 }
                 flow.as_mut().ok_or("missing established flow")?.alive()?;
@@ -866,10 +868,32 @@ pub(super) fn finish<T>(trial: Result<T>, cleanup: Result<()>) -> Result<T> {
     }
 }
 
+// The counter reads surround the send reads. Allow five in-flight packets,
+// but always require at least one observed nft drop in the control.
+fn drop_window(before: u64, sent: u64, sent_after: u64, after: u64) -> (u64, u64, u64) {
+    let sends = sent_after.saturating_sub(sent);
+    (
+        sends,
+        after.saturating_sub(before),
+        sends.saturating_sub(5).max(1),
+    )
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[test]
+    fn drop_window_counts_only_sends_inside_the_counter_window() {
+        // Sends during either slow counter read lie outside the inner send
+        // window; their drops can increase evidence but cannot raise the bar.
+        assert_eq!(drop_window(100, 120, 170, 180), (50, 80, 45));
+        assert_eq!(drop_window(100, 120, 170, 144), (50, 44, 45));
+        assert_eq!(drop_window(100, 120, 170, 145), (50, 45, 45));
+        assert_eq!(drop_window(100, 120, 124, 101), (4, 1, 1));
+        assert_eq!(drop_window(100, 120, 120, 100), (0, 0, 1));
+        assert_eq!(drop_window(100, 120, 119, 99), (0, 0, 1));
+    }
     #[test]
     fn inversion_requires_a_failed_case_with_the_exact_reason() {
         for mutation in Mutation::ALL {

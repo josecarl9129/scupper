@@ -2490,6 +2490,9 @@ without weakening policy-rule containment. The main default stays intact;
 the control requires IPv4 client `RouteWrong(Unreachable)` / exit 3 and the
 mutant requires Protected / exit 0. Live policy and independent forwarded
 lookups after check prove that the fault remains active in both runs.
+M-probe therefore proves that the route stage is the only detector of routing
+changes during a check. It does not prove the probe is needed in steady state:
+R1's policy-rule and route inventories catch steady-state drift first.
 
 ### Leak-test list, staged
 

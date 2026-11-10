@@ -911,15 +911,23 @@ fn ingress_policy_fault_is_rejected_before_client_routes() {
 #[cfg(feature = "lab-mutation")]
 fn probe_runtime_hook_is_exercised_in_subprocesses() {
     for mutant in [false, true] {
+        let sentinel = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+            "probe-child-{}-{mutant}.sentinel",
+            std::process::id()
+        ));
+        assert!(!sentinel.exists());
+        fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
         command
             .args(["--exact", "probe_runtime_child", "--nocapture"])
-            .env("SCUPPER_PROBE_TEST_CHILD", "1")
+            .env("SCUPPER_PROBE_TEST_CHILD", &sentinel)
             .env_remove("SCUPPER_LAB_MUTATION");
         if mutant {
             command.env("SCUPPER_LAB_MUTATION", "M-probe");
         }
         assert!(command.status().unwrap().success());
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "completed");
+        fs::remove_file(sentinel).unwrap();
     }
 }
 
@@ -949,9 +957,9 @@ fn probe_runtime_child() {
             })
         }
     }
-    if std::env::var_os("SCUPPER_PROBE_TEST_CHILD").is_none() {
+    let Some(sentinel) = std::env::var_os("SCUPPER_PROBE_TEST_CHILD") else {
         return;
-    }
+    };
     let runner = "ubuntu-24.04";
     let handle = testing::handle().unwrap();
     let root = Root::new(runner, &handle);
@@ -992,4 +1000,5 @@ fn probe_runtime_child() {
         assert!(obs.routes.is_some());
         assert!(probe.1.borrow().is_none());
     }
+    fs::write(sentinel, "completed").unwrap();
 }

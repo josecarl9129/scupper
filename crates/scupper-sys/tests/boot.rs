@@ -2610,15 +2610,17 @@ fn boot_never_adds_source_policy_rules_or_nonbaseline_rules() {
             f.state(|s| s.selection = Selection::Disconnected);
         }
         assert!(f.run(None).succeeded());
+        let mut families = [false; 2];
         for call in f.kernel.calls.borrow().iter() {
             let words: Vec<_> = call.split_whitespace().collect();
             if words.contains(&"Ip") && words.contains(&"rule") {
-                assert!(
-                    words.contains(&"show"),
-                    "boot must only observe baseline rules: {call}"
-                );
-                assert!(!words.contains(&"from"), "source policy rule: {call}");
+                match words.as_slice() {
+                    ["netns", "Ip", "-j", "-4", "rule", "show"] => families[0] = true,
+                    ["netns", "Ip", "-j", "-6", "rule", "show"] => families[1] = true,
+                    _ => panic!("boot must only observe baseline rules: {call}"),
+                }
             }
         }
+        assert_eq!(families, [true, true], "both rule inventories must run");
     }
 }

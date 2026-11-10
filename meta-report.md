@@ -73,3 +73,25 @@ Final verification for Fix round 1:
 - CI YAML parsing and `git diff --check` — passed.
 
 Final `cargo fmt --all` runs after these checks. No commit is created. Live namespace fault catches and nft counter/EPERM acceptances remain for privileged CI; local fake-system and subprocess results do not claim those live outcomes.
+
+## Fix round 2
+
+- Lab run 1: the saved L19-L4 lookup already selected `lab-bridge`, but the UDP sender forced every explicit source onto `wg0`. Device binding now applies only to scoped IPv6 link-local sources; the exit-sourced IPv4 canary follows the preferred bridge route. L3/L4 assert and save UDP route lookups before measurement. ENOKEY remains a harness error and now identifies the WireGuard route/device mismatch. Added a real source-bound UDP echo regression and ENOKEY classification checks.
+- L3: nft counter reads now surround both send-count reads. Window arithmetic has boundary, delayed-counter and saturation coverage; drop artifacts record sends, drops and the required count.
+- N1: both exit-status-only subprocess parents now require fresh completion sentinels written after the child assertions, under `env!("CARGO_TARGET_TMPDIR")`.
+- N6: control and mutant subprocesses each receive a separate 600-second timeout; the matrix shares one build-cache key. Release rejection requires exit 101 and the exact debug-only compile diagnostic.
+- DESIGN §17 states the during-check limit of M-probe: R1 inventories detect steady-state policy/route drift first.
+- N7/N8: the boot guard accepts only exact IPv4/IPv6 rule-inventory commands and requires both families. The L19 control and subprocess control already assert the client address and `got = Unreachable` exactly; those assertions are retained.
+
+Final verification for Fix round 2:
+
+- `timeout 600 cargo fmt --all -- --check` — passed.
+- `timeout 600 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` — passed.
+- `timeout 600 cargo test --workspace --all-features --locked` — passed, including the UDP source-binding regression, ENOKEY classification, window arithmetic, both rule inventories and feature subprocess sentinels.
+- `RUSTDOCFLAGS='-D warnings' timeout 600 cargo doc --workspace --no-deps --locked` — passed.
+- `timeout 600 cargo deny check` — passed.
+- Default-feature core `verdict_v2` / `default_build`, xtask mutation integration and scupper mutation integration tests — passed sequentially, each under `timeout 600`; the default-engine sentinels and exact RouteWrong assertions passed.
+- Release-feature rejection — passed under `timeout 600`, requiring exit 101 and `error: lab-mutation is restricted to debug lab builds`.
+- CI YAML, all workflow shell scripts, the matrix-independent cache key and `git diff --check` — passed.
+
+Final `timeout 600 cargo fmt --all` runs last. No commit is created. Privileged lab execution is unavailable locally (`ip`/`nft` absent); the supplied 24.04 failure artifacts were inspected, but no live containment or mutation catch is claimed.

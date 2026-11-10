@@ -1673,22 +1673,30 @@ fn bound_probe_only_check_diff_is_golden() {
 #[cfg(not(feature = "lab-mutation"))]
 fn default_build_ignores_probe_mutation_in_the_real_engine() {
     for mutation in ["M-ct", "M-probe"] {
+        let sentinel = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+            "default-route-child-{}-{mutation}.sentinel",
+            std::process::id()
+        ));
+        assert!(!sentinel.exists());
+        std::fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "default_build_route_child", "--nocapture"])
             .env("SCUPPER_LAB_MUTATION", mutation)
-            .env("SCUPPER_DEFAULT_ROUTE_CHILD", "1")
+            .env("SCUPPER_DEFAULT_ROUTE_CHILD", &sentinel)
             .status()
             .unwrap();
         assert!(status.success());
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "completed");
+        std::fs::remove_file(sentinel).unwrap();
     }
 }
 
 #[test]
 #[cfg(not(feature = "lab-mutation"))]
 fn default_build_route_child() {
-    if std::env::var_os("SCUPPER_DEFAULT_ROUTE_CHILD").is_none() {
+    let Some(sentinel) = std::env::var_os("SCUPPER_DEFAULT_ROUTE_CHILD") else {
         return;
-    }
+    };
     assert_eq!(scupper_core::lab_mutation::active(), None);
     let mut obs = passing();
     let client = obs.routes.as_ref().unwrap()[0].0;
@@ -1698,4 +1706,5 @@ fn default_build_route_child() {
     assert!(
         matches!(report.verdict, Verdict::Degraded(Degraded::RouteWrong { client: got_client, got: DefaultRouteObs::Unreachable, .. }) if got_client == client)
     );
+    std::fs::write(sentinel, "completed").unwrap();
 }

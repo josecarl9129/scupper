@@ -106,10 +106,14 @@ jobs:
           timeout 600 cargo test -p scupper-core --test verdict_v2 --locked default_build
       - name: Reject release mutation feature
         run: |
-          if timeout 600 cargo build --release -p scupper-core --features lab-mutation --locked; then
+          if timeout 600 cargo build --release -p scupper-core --features lab-mutation --locked > release-mutation.log 2>&1; then
+            cat release-mutation.log
             exit 1
           else
-            test "$?" -eq 101
+            release_status=$?
+            cat release-mutation.log
+            test "$release_status" -eq 101
+            grep -Fq 'error: lab-mutation is restricted to debug lab builds' release-mutation.log
           fi
       - name: Release CLI and daemon
         run: timeout 600 cargo build -p scupper -p scupperd --release --locked
@@ -247,7 +251,7 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             target
-          key: ${{ runner.os }}-${{ matrix.runner }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-mutations-${{ matrix.mutation }}
+          key: ${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-mutations
       - name: Install lab tools
         run: |
           sudo timeout 300 apt-get update
@@ -257,7 +261,8 @@ jobs:
           timeout 600 cargo build -p xtask --features lab-mutation --locked
           timeout 600 cargo build -p scupper -p scupperd --features testing,lab-mutation --locked
       - name: Require healthy control and expected mutant failure
-        run: sudo --preserve-env=CARGO_TARGET_TMPDIR timeout 600 target/debug/xtask leaktest --mutation ${{ matrix.mutation }} --artifacts mutation-out
+        # xtask gives the control and mutant separate timeout 600 budgets.
+        run: sudo --preserve-env=CARGO_TARGET_TMPDIR target/debug/xtask leaktest --mutation ${{ matrix.mutation }} --artifacts mutation-out
       - name: Make diagnostics readable
         if: always()
         run: |
