@@ -262,6 +262,11 @@ impl Group {
         }
         Ok(())
     }
+    pub(super) fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>> {
+        let status = self.child.try_wait()?;
+        self.done |= status.is_some();
+        Ok(status)
+    }
     /// Wait for completion without sending a signal; retain the cleanup guard.
     pub(super) fn wait_timeout(&mut self, timeout: Duration) -> Result<std::process::ExitStatus> {
         let until = Instant::now() + timeout;

@@ -735,8 +735,17 @@ mod tests {
     #[test]
     fn real_argv_stdin_wiring_and_process_group_timeout() -> Result<(), Box<dyn std::error::Error>>
     {
-        let dir =
-            std::env::current_dir()?.join(format!("target/probe-child-{}", std::process::id()));
+        let dir = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || {
+                    std::path::PathBuf::from(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../target/tmp"
+                    ))
+                },
+                std::path::PathBuf::from,
+            )
+            .join(format!("probe-child-{}", std::process::id()));
         std::fs::create_dir_all(&dir)?;
         let file_path = dir.join("namespace");
         std::fs::write(&file_path, b"namespace fd")?;

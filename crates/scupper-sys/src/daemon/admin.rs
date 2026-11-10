@@ -34,6 +34,27 @@ pub fn execute<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)>(
     age: Option<u64>,
     check: impl FnMut(Option<Instant>) -> Result<Report, ApiError>,
 ) -> Result<OpResult, ApiError> {
+    if !super::control::authorized(uid) {
+        return Err(api(ApiErrorCode::Unauthorized));
+    }
+    match op {
+        Op::Ping {} => {
+            return Ok(OpResult::Ping {
+                last_complete_iteration_age: age,
+                netns: machine.netns_identity(),
+                version: machine.version(),
+                quarantined: machine.latch().is_some(),
+                selection: machine.selection(),
+            });
+        }
+        Op::RepairStatus {} => {
+            return Ok(OpResult::RepairStatus {
+                quarantined: machine.latch().is_some(),
+                reason: machine.latch().map(|latch| latch.reason.clone()),
+            });
+        }
+        _ => {}
+    }
     let guard = machine.writer_guard().map_err(internal)?;
     execute_locked(machine, &guard, op, uid, age, check)
 }
@@ -175,6 +196,18 @@ pub fn check(
     deadline: Option<Instant>,
     age: Option<u64>,
 ) -> Result<Report, ApiError> {
+    let completed = age.and_then(|age| Instant::now().checked_sub(Duration::from_secs(age)));
+    check_live(deps, probe, held, config, deadline, &|| completed)
+}
+
+pub(super) fn check_live(
+    deps: &BootDeps<'_>,
+    probe: &dyn crate::probe_child::ProbeExec,
+    held: &crate::netns::NetnsHandle,
+    config: &Config,
+    deadline: Option<Instant>,
+    last_complete: &dyn Fn() -> Option<Instant>,
+) -> Result<Report, ApiError> {
     let bounded = crate::collect::reconcile::SafetySystem {
         system: deps.system,
         deadline: deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(45)),
@@ -184,7 +217,7 @@ pub fn check(
         inner: probe,
         until: bounded.deadline,
     };
-    crate::check_v2::run_supervised(
+    crate::check_v2::run_supervised_live(
         &crate::check_v2::Dependencies {
             system: &bounded,
             probe_exec: &probe,
@@ -197,7 +230,7 @@ pub fn check(
             gateway: &config.gateway,
             stamp: config.stamp,
         },
-        age,
+        last_complete,
     )
     .map_err(internal)
 }
@@ -251,6 +284,7 @@ pub fn commit_locked(
         })?;
     let _ = log.emit(
         EventKind::AdminAction {
+            reason: None,
             command: Command::Commit,
         },
         Actor::Local { uid },
@@ -289,9 +323,11 @@ pub fn apply_locked(
     uid: u32,
 ) -> Result<OpResult, ApiError> {
     let store = VersionStore::read_only(deps.state_root, deps.config_root);
-    let target = version
-        .or(store.head().map_err(internal)?)
-        .ok_or_else(|| api(ApiErrorCode::NotFound))?;
+    let target = match version {
+        Some(version) => Some(version),
+        None => store.head().map_err(internal)?,
+    }
+    .ok_or_else(|| api(ApiErrorCode::NotFound))?;
     store
         .read(target)
         .map_err(|_| api(ApiErrorCode::NotFound))?;
@@ -340,6 +376,7 @@ pub fn apply_locked(
         .map_err(|_| api(ApiErrorCode::PersistenceUnavailable))?;
     let _ = log.emit(
         EventKind::AdminAction {
+            reason: None,
             command: Command::Apply,
         },
         Actor::Local { uid },
@@ -536,7 +573,12 @@ pub fn durable_intent(deps: &BootDeps<'_>, op: &Op, uid: u32) -> Result<(), ApiE
         }
         Op::RepairClear { reason } => {
             state.quarantine = None;
-            state.last_repair_reason.clone_from(reason);
+            if reason
+                .as_ref()
+                .is_some_and(|text| text.len() > 1024 || text.contains(['\n', '\r']))
+            {
+                return Err(api(ApiErrorCode::InvalidRequest));
+            }
         }
         Op::Connect { exit } => {
             if state.quarantine.is_some() {
@@ -616,7 +658,7 @@ pub fn local(
         return repair_status(deps.state_root).map_err(LocalError::Api);
     }
     let _lease = SupervisorLease::try_acquire(deps.run_root)
-        .map_err(|e| format!("scupperd is alive but unresponsive: {e}"))?;
+        .map_err(|e| format!("scupperd control socket unavailable: {e}; stop scupperd with systemctl stop scupperd before using the local writer"))?;
     let guard = WriterLock::acquire_timeout(deps.run_root, Duration::from_secs(2))
         .map_err(|e| format!("another writer holds the writer lock: {e}"))?;
     let gateway = scupper_core::config::GatewayId(
@@ -639,9 +681,12 @@ pub fn local(
             .map_err(LocalError::Api);
     }
     if let Op::Apply { version, dry_run } = op {
-        let target = version.or(VersionStore::read_only(deps.state_root, deps.config_root)
-            .head()
-            .map_err(|e| e.to_string())?);
+        let target = match version {
+            Some(version) => Some(version),
+            None => VersionStore::read_only(deps.state_root, deps.config_root)
+                .head()
+                .map_err(|e| e.to_string())?,
+        };
         let prefix = if dry_run {
             preview_locked(&deps, &guard, target)?
         } else {

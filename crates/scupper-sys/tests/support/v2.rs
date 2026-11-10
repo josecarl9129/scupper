@@ -344,8 +344,21 @@ pub struct Root {
 }
 impl Root {
     pub fn new(runner: &str, handle: &NetnsHandle) -> Self {
+        Self::with_text(&site_text(runner), handle)
+    }
+    pub fn with_text(text: &str, handle: &NetnsHandle) -> Self {
         // Keep fixture sockets below sockaddr_un's path limit in deep worktrees.
-        let path = PathBuf::from("../../target").join(format!(
+        let temporary = Path::new(env!("CARGO_TARGET_TMPDIR"));
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let temporary = temporary.strip_prefix(workspace).map_or_else(
+            |_| temporary.to_path_buf(),
+            |path| Path::new("../..").join(path),
+        );
+        let path = temporary.join(format!(
             "scupper-v2-test-{}-{}",
             std::process::id(),
             unique()
@@ -353,12 +366,11 @@ impl Root {
         fs::create_dir_all(&path).unwrap();
         let writer = WriterLock::acquire(path.join("lock")).unwrap();
         let store = VersionStore::open(&path, Some(&writer)).unwrap();
-        let text = site_text(runner);
         let version = store
             .commit(
                 &writer,
                 None,
-                &text,
+                text,
                 MetaInput {
                     actor: "test".into(),
                     at: 1000,

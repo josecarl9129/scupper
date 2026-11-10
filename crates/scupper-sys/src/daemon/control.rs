@@ -15,12 +15,60 @@ use std::{
     },
     path::Path,
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver, SyncSender},
     },
     time::{Duration, Instant},
 };
+
+/// Maximum queue residence, including a bounded full apply and tick margin.
+pub const QUEUE_TIMEOUT: Duration = Duration::from_secs(180);
+/// Queue residence plus fresh verification and response margin.
+pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(240);
+
+#[derive(Default)]
+pub(crate) struct Snapshot {
+    pub ping: Option<OpResult>,
+    pub last_complete: Option<Instant>,
+}
+pub(crate) type SharedSnapshot = Arc<RwLock<Snapshot>>;
+
+impl Snapshot {
+    fn ping(&self) -> Result<OpResult, ApiError> {
+        let mut ping = self
+            .ping
+            .clone()
+            .ok_or_else(|| api(ApiErrorCode::SupervisorUnavailable))?;
+        if let OpResult::Ping {
+            last_complete_iteration_age,
+            ..
+        } = &mut ping
+        {
+            *last_complete_iteration_age = self.last_complete.map(|at| at.elapsed().as_secs());
+        }
+        Ok(ping)
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct FailureSummary {
+    last: Option<Instant>,
+    count: u64,
+}
+impl FailureSummary {
+    pub(crate) fn record(&mut self, now: Instant) -> Option<u64> {
+        self.count = self.count.saturating_add(1);
+        if self
+            .last
+            .is_some_and(|at| now.saturating_duration_since(at) < Duration::from_secs(60))
+        {
+            return None;
+        }
+        self.last = Some(now);
+        Some(std::mem::take(&mut self.count))
+    }
+}
 
 pub(crate) fn api(code: ApiErrorCode) -> ApiError {
     ApiError {
@@ -51,8 +99,8 @@ pub fn read_request(reader: impl Read) -> io::Result<Request> {
     scupper_proto::decode_request(&line).map_err(io::Error::other)
 }
 
-fn validate_directory(meta: &fs::Metadata) -> io::Result<()> {
-    if !meta.is_dir() || meta.uid() != 0 || meta.mode() & 0o022 != 0 {
+fn validate_directory(meta: &fs::Metadata, owner: u32) -> io::Result<()> {
+    if !meta.is_dir() || meta.uid() != owner || meta.mode() & 0o022 != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "control directory must be root-owned and not writable by group or others",
@@ -94,6 +142,18 @@ impl Server {
     /// Returns ownership, bind, permission or thread-start errors.
     #[allow(clippy::too_many_lines)] // Keep guarded publication and listener ownership together.
     pub fn bind(root: &Path) -> io::Result<Self> {
+        Self::bind_snapshot(root, SharedSnapshot::default())
+    }
+    pub(crate) fn bind_snapshot(root: &Path, snapshot: SharedSnapshot) -> io::Result<Self> {
+        Self::bind_owned(root, snapshot, 0, None)
+    }
+    #[allow(clippy::too_many_lines)] // Guarded publication retains one directory capability.
+    fn bind_owned(
+        root: &Path,
+        snapshot: SharedSnapshot,
+        owner: u32,
+        group: Option<u32>,
+    ) -> io::Result<Self> {
         fs::create_dir_all(root)?;
         let directory = fs::OpenOptions::new()
             .read(true)
@@ -103,12 +163,12 @@ impl Server {
                     .cast_signed(),
             )
             .open(root)?;
-        validate_directory(&directory.metadata()?)?;
+        validate_directory(&directory.metadata()?, owner)?;
         // Resolve through the held directory, so replacing a parent path cannot redirect writes.
         let root = std::path::PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
         let path = root.join("control.sock");
         match fs::symlink_metadata(&path) {
-            Ok(meta) if meta.file_type().is_socket() && meta.uid() == 0 => {
+            Ok(meta) if meta.file_type().is_socket() && meta.uid() == owner => {
                 match UnixStream::connect(&path) {
                     Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
                         fs::remove_file(&path)?;
@@ -141,16 +201,15 @@ impl Server {
         let staged = stage.0.join("control.sock");
         let listener = UnixListener::bind(&staged)?;
         let bound = fs::symlink_metadata(&staged)?;
-        let gid = fs::read_to_string("/etc/group")?
-            .lines()
-            .find_map(|line| {
+        let gid = group
+            .or(fs::read_to_string("/etc/group")?.lines().find_map(|line| {
                 let mut fields = line.split(':');
                 (fields.next()? == "scupper-admin")
                     .then(|| fields.nth(1)?.parse::<u32>().ok())
                     .flatten()
-            })
+            }))
             .unwrap_or(0);
-        std::os::unix::fs::chown(&staged, Some(0), Some(gid))?;
+        std::os::unix::fs::chown(&staged, Some(owner), Some(gid))?;
         fs::set_permissions(&staged, fs::Permissions::from_mode(0o660))?;
         fs::rename(&staged, &path)?;
         let identity = fs::symlink_metadata(&path)?;
@@ -182,10 +241,11 @@ impl Server {
                         }
                         let send = send.clone();
                         let count = active.clone();
+                        let snapshot = snapshot.clone();
                         if std::thread::Builder::new()
                             .name("scupper-control-peer".into())
                             .spawn(move || {
-                                let _ = serve(stream, &send);
+                                let _ = serve(stream, &send, &snapshot);
                                 count.fetch_sub(1, Ordering::Relaxed);
                             })
                             .is_err()
@@ -267,7 +327,11 @@ fn reserve_peer(stream: &UnixStream, active: &AtomicUsize) -> bool {
         .is_ok_and(|peer| reserve_authorized_peer(peer.uid.as_raw(), active))
 }
 
-fn serve(mut stream: UnixStream, send: &SyncSender<Pending>) -> io::Result<()> {
+fn serve(
+    mut stream: UnixStream,
+    send: &SyncSender<Pending>,
+    snapshot: &SharedSnapshot,
+) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let uid = rustix::net::sockopt::socket_peercred(&stream)?.uid.as_raw();
@@ -275,17 +339,34 @@ fn serve(mut stream: UnixStream, send: &SyncSender<Pending>) -> io::Result<()> {
         stream: &stream,
         until: Instant::now() + Duration::from_secs(5),
     })?;
-    let response = if authorized(uid) {
+    let response = answer(request, uid, send, snapshot)?;
+    serde_json::to_writer(&mut stream, &response)?;
+    stream.write_all(b"\n")
+}
+
+fn answer(
+    request: Request,
+    uid: u32,
+    send: &SyncSender<Pending>,
+    snapshot: &SharedSnapshot,
+) -> io::Result<Response> {
+    Ok(if authorized(uid) && matches!(request.op, Op::Ping {}) {
+        let result = snapshot
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ping();
+        response(request.request_id, result)
+    } else if authorized(uid) {
         let (reply, receive) = mpsc::sync_channel(1);
         send.try_send(Pending {
             request,
             uid,
-            until: Instant::now() + Duration::from_secs(2),
+            until: Instant::now() + QUEUE_TIMEOUT,
             reply,
         })
         .map_err(io::Error::other)?;
         receive
-            .recv_timeout(Duration::from_secs(50))
+            .recv_timeout(RESPONSE_TIMEOUT)
             .map_err(io::Error::other)?
     } else {
         Response {
@@ -295,9 +376,7 @@ fn serve(mut stream: UnixStream, send: &SyncSender<Pending>) -> io::Result<()> {
             observed_at: None,
             result: Err(api(ApiErrorCode::Unauthorized)),
         }
-    };
-    serde_json::to_writer(&mut stream, &response)?;
-    stream.write_all(b"\n")
+    })
 }
 
 pub(crate) fn response(request_id: Identifier, result: Result<OpResult, ApiError>) -> Response {
@@ -534,8 +613,17 @@ mod tests {
     }
     #[test]
     fn socket_client_timeout_is_bounded_and_marks_uncertain_delivery() {
-        let root =
-            std::path::PathBuf::from("../../target").join(format!("ct-{}", std::process::id()));
+        let root = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || {
+                    std::path::PathBuf::from(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../target/tmp"
+                    ))
+                },
+                std::path::PathBuf::from,
+            )
+            .join(format!("ct-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         let listener = UnixListener::bind(root.join("control.sock")).unwrap();
         let worker = std::thread::spawn(move || {
@@ -561,7 +649,8 @@ mod tests {
             .as_raw();
         assert_eq!(uid, rustix::process::geteuid().as_raw());
         let (send, receive) = mpsc::sync_channel(1);
-        let worker = std::thread::spawn(move || serve(server, &send).unwrap());
+        let worker =
+            std::thread::spawn(move || serve(server, &send, &SharedSnapshot::default()).unwrap());
         let original = request(Op::Disconnect {});
         serde_json::to_writer(&mut client, &original).unwrap();
         client.write_all(b"\n").unwrap();
@@ -694,12 +783,30 @@ mod tests {
     }
     #[test]
     fn unsafe_control_directory_is_refused() {
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target")
+        let root = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || {
+                    std::path::PathBuf::from(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../target/tmp"
+                    ))
+                },
+                std::path::PathBuf::from,
+            )
             .join(format!("unsafe-control-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o777)).unwrap();
-        assert!(Server::bind(&root).is_err());
+        let owner = rustix::process::geteuid().as_raw();
+        assert!(
+            Server::bind_owned(
+                &root,
+                SharedSnapshot::default(),
+                owner,
+                Some(rustix::process::getegid().as_raw())
+            )
+            .is_err()
+        );
+        assert_eq!(fs::metadata(&root).unwrap().uid(), owner);
         assert!(!root.join("control.sock").exists());
         fs::remove_dir(root).unwrap();
     }
@@ -710,5 +817,143 @@ mod tests {
             .collect();
         assert_eq!(ids.len(), 512);
         assert!(ids.iter().all(|id| id.len() == 32 && id != "invalid-id"));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod round_two_tests {
+    use super::*;
+    fn root(label: &str) -> std::path::PathBuf {
+        let root = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || {
+                    std::path::PathBuf::from(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../target/tmp"
+                    ))
+                },
+                std::path::PathBuf::from,
+            )
+            .join(format!("{label}-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+    #[test]
+    fn ping_snapshot_does_not_wait_for_dispatch() {
+        let root = root("ping");
+        let guard = crate::lock::WriterLock::acquire(&root).unwrap();
+        let snapshot = SharedSnapshot::default();
+        let ping = OpResult::Ping {
+            last_complete_iteration_age: None,
+            netns: scupper_core::verdict::v2::NetnsIdentity {
+                device: 5,
+                inode: 7,
+            },
+            version: 11,
+            quarantined: true,
+            selection: scupper_core::verdict::v2::Selection::Disconnected,
+        };
+        *snapshot.write().unwrap() = Snapshot {
+            ping: Some(ping),
+            last_complete: Instant::now().checked_sub(Duration::from_secs(3)),
+        };
+        let (send, receive) = mpsc::sync_channel(1);
+        // No tick owner drains this queue. Ping still answers under writer contention.
+        let start = Instant::now();
+        let response = answer(request(Op::Ping {}), 0, &send, &snapshot).unwrap();
+        assert!(start.elapsed() < Duration::from_millis(100));
+        assert!(matches!(
+            response.result,
+            Ok(OpResult::Ping {
+                version: 11,
+                quarantined: true,
+                last_complete_iteration_age: Some(3),
+                selection: scupper_core::verdict::v2::Selection::Disconnected,
+                ..
+            })
+        ));
+        assert!(receive.try_recv().is_err());
+        snapshot.write().unwrap().last_complete = None;
+        assert!(matches!(
+            answer(request(Op::Ping {}), 0, &send, &snapshot)
+                .unwrap()
+                .result,
+            Ok(OpResult::Ping {
+                last_complete_iteration_age: None,
+                ..
+            })
+        ));
+        drop(guard);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn bind_publication_stale_removal_replacement_and_rebind() {
+        let root = root("bind2");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let owner = rustix::process::geteuid().as_raw();
+        let group = Some(rustix::process::getegid().as_raw());
+        // Bind via a directory capability to keep sockaddr_un short in deep worktrees.
+        let dir = fs::File::open(&root).unwrap();
+        let path = std::path::PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()))
+            .join("control.sock");
+        drop(UnixListener::bind(&path).unwrap());
+        if let Err(error) = fs::set_permissions(&path, fs::Permissions::from_mode(0o660)) {
+            // Some shared worktree filesystems cannot chmod Unix sockets.
+            // Refusal is mandatory there; never turn this into a mode bypass.
+            assert!(
+                matches!(
+                    error.kind(),
+                    io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+                ),
+                "{error}"
+            );
+            assert!(Server::bind_owned(&root, SharedSnapshot::default(), owner, group).is_err());
+            eprintln!(
+                "socket chmod unsupported: verified fail-closed bind; publication checks require a supporting filesystem"
+            );
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        let first = Server::bind_owned(&root, SharedSnapshot::default(), owner, group).unwrap();
+        assert!(first.alive());
+        let metadata = fs::metadata(&path).unwrap();
+        assert_eq!(metadata.uid(), owner);
+        assert_eq!(metadata.mode() & 0o777, 0o660);
+        assert!(Server::bind_owned(&root, SharedSnapshot::default(), owner, group).is_err());
+        // A listener must not unlink a replacement when it dies.
+        fs::remove_file(&path).unwrap();
+        let replacement = UnixListener::bind(&path).unwrap();
+        let inode = fs::metadata(&path).unwrap().ino();
+        drop(first);
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        drop(replacement);
+        let second = Server::bind_owned(&root, SharedSnapshot::default(), owner, group).unwrap();
+        second.stop.store(true, Ordering::Relaxed);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while second.alive() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(second);
+        let third = Server::bind_owned(&root, SharedSnapshot::default(), owner, group).unwrap();
+        assert!(third.alive());
+        drop(third);
+        assert!(!path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn control_failures_are_counted_once_per_minute() {
+        let now = Instant::now();
+        let mut summary = FailureSummary::default();
+        assert_eq!(summary.record(now), Some(1));
+        for offset in 1..600 {
+            assert_eq!(
+                summary.record(now + Duration::from_millis(offset * 100)),
+                None
+            );
+        }
+        assert_eq!(summary.record(now + Duration::from_secs(60)), Some(600));
+        assert_eq!(summary.record(now + Duration::from_secs(120)), Some(1));
     }
 }

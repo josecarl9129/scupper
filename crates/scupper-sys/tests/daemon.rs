@@ -15,8 +15,12 @@ use std::{
 };
 fn root() -> PathBuf {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/daemon-tests")
+    let root = std::env::var_os("CARGO_TARGET_TMPDIR")
+        .map_or_else(
+            || std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/tmp")),
+            std::path::PathBuf::from,
+        )
+        .join("daemon-tests")
         .join(format!(
             "{}-{}",
             std::process::id(),
@@ -283,5 +287,35 @@ fn ordinary_audit_restart_waits_for_previous_writer_without_failure_event() {
             .iter()
             .any(|e| matches!(e.kind, EventKind::PersistenceFailed { .. }))
     );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn supervisor_lease_waits_for_release() {
+    use scupper_sys::lock::SupervisorLease;
+    let root = root();
+    let lease = SupervisorLease::try_acquire(&root).unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(3));
+        drop(lease);
+    });
+    let notices = AtomicUsize::new(0);
+    let start = Instant::now();
+    let acquired = SupervisorLease::acquire_timeout(&root, Duration::from_secs(5), || {
+        notices.fetch_add(1, Ordering::Relaxed);
+    })
+    .unwrap();
+    assert!(start.elapsed() >= Duration::from_secs(3));
+    assert!(start.elapsed() < Duration::from_secs(5));
+    assert!(notices.load(Ordering::Relaxed) > 0);
+    release.join().unwrap();
+    assert_eq!(
+        SupervisorLease::acquire_timeout(&root, Duration::from_millis(20), || {})
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::TimedOut
+    );
+    drop(acquired);
     fs::remove_dir_all(root).unwrap();
 }

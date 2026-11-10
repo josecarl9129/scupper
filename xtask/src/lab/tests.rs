@@ -308,8 +308,12 @@ fn every_external_program_uses_argv_namespace_entry_and_a_timeout() {
     }
 }
 fn test_dir(name: &str) -> PathBuf {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join(format!("../target/lab-test-{name}-{}", std::process::id()));
+    let path = std::env::var_os("CARGO_TARGET_TMPDIR")
+        .map_or_else(
+            || PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../target/tmp")),
+            PathBuf::from,
+        )
+        .join(format!("lab-test-{name}-{}", std::process::id()));
     fs::create_dir_all(&path).unwrap();
     path
 }

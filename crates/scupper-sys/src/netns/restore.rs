@@ -315,8 +315,17 @@ mod tests {
     #[test]
     fn directory_lock_contention_and_expired_deadline_are_bounded()
     -> Result<(), Box<dyn std::error::Error>> {
-        let dir =
-            std::env::current_dir()?.join(format!("target/restore-lock-{}", std::process::id()));
+        let dir = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || {
+                    std::path::PathBuf::from(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../target/tmp"
+                    ))
+                },
+                std::path::PathBuf::from,
+            )
+            .join(format!("restore-lock-{}", std::process::id()));
         fs::create_dir_all(&dir)?;
         let held = lock_parent(&dir, Instant::now() + Duration::from_secs(1))?;
         let started = Instant::now();
@@ -359,8 +368,17 @@ mod tests {
     #[test]
     fn target_descriptor_pins_the_file_and_rejects_replacement_symlinks()
     -> Result<(), Box<dyn std::error::Error>> {
-        let dir =
-            std::env::current_dir()?.join(format!("target/restore-target-{}", std::process::id()));
+        let dir = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || {
+                    std::path::PathBuf::from(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../target/tmp"
+                    ))
+                },
+                std::path::PathBuf::from,
+            )
+            .join(format!("restore-target-{}", std::process::id()));
         fs::create_dir_all(&dir)?;
         let path = dir.join("name");
         fs::write(&path, b"target")?;

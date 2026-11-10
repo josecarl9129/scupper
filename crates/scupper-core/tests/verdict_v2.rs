@@ -626,7 +626,7 @@ fn clock_skew_and_exact_freshness_boundaries() {
     }
 }
 #[test]
-fn client_handshakes_stale_is_warning_only() {
+fn established_client_handshakes_stale_is_warning_only() {
     for handshake in [
         Handshake::Never,
         Handshake::At {
@@ -639,7 +639,10 @@ fn client_handshakes_stale_is_warning_only() {
             .client_handshakes
             .insert([2; 32], handshake);
         let result = report(&obs);
-        assert_eq!(result.verdict.exit_code(), 0);
+        assert_eq!(
+            result.verdict.exit_code(),
+            if handshake == Handshake::Never { 3 } else { 0 }
+        );
         assert!(result.warnings.contains(&Warning::ClientHandshakesStale));
         assert_eq!(
             result.warnings.contains(&Warning::ClockSkew),
@@ -1585,4 +1588,17 @@ fn exit_down_does_not_hide_foreign_or_extra_routes() {
             want: RouteTarget::Exit(config().exit_iface),
         },
     );
+}
+
+#[test]
+fn clients_without_established_session_are_not_protected() {
+    let cfg = config();
+    let mut obs = passing_with(&cfg);
+    for handshake in forwarding(&mut obs).client_handshakes.values_mut() {
+        *handshake = Handshake::Never;
+    }
+    assert!(matches!(
+        report(&obs).verdict,
+        Verdict::Degraded(Degraded::ClientSideBroken(ClientFault::NoHandshake))
+    ));
 }

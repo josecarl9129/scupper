@@ -229,8 +229,17 @@ mod tests {
     }
     fn script(contents: &str) -> PathBuf {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/daemon-probe-workers")
+        let path = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || {
+                    std::path::PathBuf::from(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../target/tmp"
+                    ))
+                },
+                std::path::PathBuf::from,
+            )
+            .join("daemon-probe-workers")
             .join(format!(
                 "{}-{}",
                 std::process::id(),

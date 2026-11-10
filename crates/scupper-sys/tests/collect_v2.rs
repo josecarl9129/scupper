@@ -772,8 +772,69 @@ fn uninitialized_supervisor_persists_recovery_intent() {
     let StateRead::Present(state) = file.read().unwrap() else {
         unreachable!()
     };
-    assert_eq!(
-        state.last_repair_reason.as_deref(),
-        Some("recovered initialization")
+    assert!(
+        !serde_json::to_string(&state)
+            .unwrap()
+            .contains("last_repair_reason")
     );
+}
+
+#[test]
+fn supervised_check_reads_live_completion() {
+    use scupper_sys::probe_child::ProbeExec;
+    use std::{
+        cell::Cell,
+        time::{Duration, Instant},
+    };
+    struct CompletingProbe<'a> {
+        system: &'a Script,
+        completed: &'a Cell<Option<Instant>>,
+    }
+    impl ProbeExec for CompletingProbe<'_> {
+        fn accepts_test_namespace(&self) -> bool {
+            true
+        }
+        fn execute_probe(
+            &self,
+            json: &str,
+            namespace: fs::File,
+            timeout: Duration,
+        ) -> Result<scupper_sys::system::ExecOutput, scupper_sys::system::ExecError> {
+            let result = self.system.execute_probe(json, namespace, timeout);
+            self.completed.set(Some(Instant::now()));
+            result
+        }
+    }
+    let sys = Script::new("ubuntu-24.04");
+    fresh(&sys);
+    let held = testing::handle().unwrap();
+    let root = Root::new(&sys.runner, &held);
+    let site = scupper_core::config::validate(
+        scupper_core::config::parse_site(
+            &support::site_text(&sys.runner)
+                .replace("require_daemon = false", "require_daemon = true"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let gateway = GatewayId("gw1".into());
+    let config = cfg(&site, &gateway, root.stamp);
+    // This is the old timestamp at the end of a slow observation; stage 8 must
+    // instead see the iteration completed while the exit probe was running.
+    let old = Instant::now().checked_sub(Duration::from_secs(32)).unwrap();
+    let completed = Cell::new(Some(old));
+    let probe = CompletingProbe {
+        system: &sys,
+        completed: &completed,
+    };
+    let deps = Dependencies {
+        system: &sys,
+        probe_exec: &probe,
+        handle: Some(&held),
+        run_root: &root.path,
+        state_root: &root.path,
+    };
+    let report = check_v2::run_supervised_live(&deps, &config, &|| completed.get()).unwrap();
+    assert!(completed.get().unwrap() > old);
+    assert_eq!(report.verdict.exit_code(), 0, "{report:?}");
 }

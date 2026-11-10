@@ -455,7 +455,9 @@ pub(super) fn adoptable(deps: &BootDeps<'_>, handle: &NetnsHandle, cfg: &Inputs)
             l.ifname == name
                 && l.kind.as_deref() == Some("wireguard")
                 && l.mtu == mtu
-                && l.flags.iter().any(|f| f == "UP")
+                && (l.flags.iter().any(|f| f == "UP")
+                    || (cfg.state.selection == scupper_core::verdict::v2::Selection::Disconnected
+                        && name != gw.client_tunnel().ifname().as_str()))
         }) {
             return Err("configured link missing, down, wrong kind or MTU".into());
         }

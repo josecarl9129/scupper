@@ -642,7 +642,6 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                     self.persisted.selection = state.selection;
                 }
                 self.persisted.quarantine = state.quarantine;
-                self.persisted.last_repair_reason = state.last_repair_reason;
             }
             Err(_) => {
                 report.complete = false;
@@ -1497,6 +1496,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         };
         self.emit(
             EventKind::AdminAction {
+                reason: None,
                 command: if selection == Selection::Disconnected {
                     Command::Disconnect
                 } else {
@@ -1812,6 +1812,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         };
         self.emit(
             EventKind::AdminAction {
+                reason: None,
                 command: Command::Apply,
             },
             actor,
@@ -1845,7 +1846,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
     ) -> io::Result<()> {
         self.clear_latch_with_reason_locked(guard, actor, action, None)
     }
-    /// Clear quarantine while durably retaining bounded operator context.
+    /// Clear quarantine and record bounded operator context in the audit event.
     /// # Errors
     /// Returns validation or persistence failures.
     pub fn clear_latch_with_reason_locked(
@@ -1863,13 +1864,13 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         }
 
         let mut state = self.refresh_admin_state()?;
-        state.last_repair_reason = reason;
         let Some(latch) = &self.latch else {
             self.store.write(guard, &state)?;
             self.persisted = state;
             self.budgets = Budgets::default();
             let _ = self.log.emit(
                 EventKind::AdminAction {
+                    reason,
                     command: if action == ClearLatch::RepairClear {
                         Command::RepairClear
                     } else {
@@ -1890,11 +1891,14 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         self.kernel.persisted_latch(None);
         self.kernel.hold_latch(self.latch.as_ref());
         self.budgets = transition.budgets;
-        let _ = self.log.emit(
-            transition.event.into(),
-            actor,
-            self.persisted.applied_version,
-        );
+        let mut event: EventKind = transition.event.into();
+        if let EventKind::AdminAction {
+            reason: context, ..
+        } = &mut event
+        {
+            *context = reason;
+        }
+        let _ = self.log.emit(event, actor, self.persisted.applied_version);
         Ok(())
     }
 }

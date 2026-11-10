@@ -42,9 +42,6 @@ pub struct State {
     /// Persistent quarantine latch, cleared only by explicit administrative action.
     #[serde(deserialize_with = "required_option")]
     pub quarantine: Option<Quarantine>,
-    /// Bounded context from the last explicit repair clear.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_repair_reason: Option<String>,
 }
 fn required_option<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
     d: D,
@@ -58,7 +55,6 @@ impl Default for State {
             applied_version: None,
             selection: Selection::Auto,
             quarantine: None,
-            last_repair_reason: None,
         }
     }
 }
@@ -451,12 +447,7 @@ impl StateFile {
     }
 }
 fn check_schema(state: &State) -> io::Result<()> {
-    if state.schema == 1
-        && !state
-            .last_repair_reason
-            .as_ref()
-            .is_some_and(|text| text.len() > 1024 || text.contains(['\n', '\r']))
-    {
+    if state.schema == 1 {
         Ok(())
     } else {
         Err(io::Error::other("unsupported state.json schema"))
@@ -476,8 +467,17 @@ mod tests {
 
     #[test]
     fn worker_capacity_is_shared_across_handles_and_survives_handle_drop() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/state-worker-capacity")
+        let root = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || {
+                    std::path::PathBuf::from(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../target/tmp"
+                    ))
+                },
+                std::path::PathBuf::from,
+            )
+            .join("state-worker-capacity")
             .join(format!(
                 "{}-{}",
                 std::process::id(),
@@ -515,8 +515,17 @@ mod tests {
 
     #[test]
     fn worker_capacity_uses_canonical_roots() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/state-aliases")
+        let root = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || {
+                    std::path::PathBuf::from(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../target/tmp"
+                    ))
+                },
+                std::path::PathBuf::from,
+            )
+            .join("state-aliases")
             .join(format!(
                 "{}-{}",
                 std::process::id(),
@@ -535,8 +544,17 @@ mod tests {
 
     #[test]
     fn stalled_workers_survive_invalidation_without_spawning_replacements() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/state-workers")
+        let root = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || {
+                    std::path::PathBuf::from(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../target/tmp"
+                    ))
+                },
+                std::path::PathBuf::from,
+            )
+            .join("state-workers")
             .join(format!(
                 "{}-{}",
                 std::process::id(),
@@ -606,8 +624,17 @@ mod tests {
 
     #[test]
     fn delayed_snapshots_are_discarded_after_other_writers_and_lock_boundaries() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/state-generation")
+        let root = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || {
+                    std::path::PathBuf::from(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../target/tmp"
+                    ))
+                },
+                std::path::PathBuf::from,
+            )
+            .join("state-generation")
             .join(format!(
                 "{}-{}",
                 std::process::id(),
@@ -656,8 +683,17 @@ mod tests {
     }
     #[test]
     fn unrelated_state_writes_preserve_ready_snapshots_when_another_reader_is_busy() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/state-independent-roots")
+        let root = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || {
+                    std::path::PathBuf::from(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../target/tmp"
+                    ))
+                },
+                std::path::PathBuf::from,
+            )
+            .join("state-independent-roots")
             .join(format!(
                 "{}-{}",
                 std::process::id(),

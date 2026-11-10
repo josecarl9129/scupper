@@ -99,8 +99,8 @@ impl WriterLock {
             let mut holder = String::new();
             let _ = (&file).take(32).read_to_string(&mut holder);
             let message = holder.trim().parse::<u32>().map_or_else(
-                |_| "writer lock held by another writer".to_owned(),
-                |pid| format!("writer lock held by pid {pid}"),
+                |_| format!("{name} held by another writer"),
+                |pid| format!("{name} held by pid {pid}"),
             );
             return Err(io::Error::new(io::ErrorKind::WouldBlock, message));
         }
@@ -118,6 +118,35 @@ pub struct SupervisorLease {
     _guard: WriterGuard,
 }
 impl SupervisorLease {
+    /// Wait for a local writer with a bounded retry and status callback.
+    /// # Errors
+    /// Returns a timeout or filesystem error.
+    pub fn acquire_timeout(
+        root: &Path,
+        timeout: Duration,
+        mut waiting: impl FnMut(),
+    ) -> io::Result<Self> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match Self::try_acquire(root) {
+                Ok(lease) => return Ok(lease),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!("supervisor lease timeout: {error}"),
+                        ));
+                    }
+                    waiting();
+                    std::thread::sleep(
+                        Duration::from_millis(100)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
     /// Acquire without waiting; local mutations must refuse a live supervisor.
     /// # Errors
     /// Returns contention or filesystem errors.

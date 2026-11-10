@@ -1719,3 +1719,48 @@ fn control_apply_keeps_quarantine_on_failure_and_clears_only_after_full_verifica
     assert!(observed_open.get());
     assert_eq!(fixture.kernel.values.borrow()["net.ipv4.ip_forward"], "1");
 }
+
+#[test]
+fn disconnected_reboot_preserves_client_sessions() {
+    let f = Fixture::new();
+    assert!(f.run(None).succeeded());
+    f.state(|state| state.selection = Selection::Disconnected);
+    assert!(f.run(None).succeeded());
+    f.kernel.calls.borrow_mut().clear();
+    // A second boot sees exits already down, as after an effective disconnect.
+    let reboot = f.run(None);
+    assert!(reboot.succeeded() && reboot.adopted, "{reboot:?}");
+    let calls = f.kernel.calls.borrow();
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.starts_with("netns Wg set wg0"))
+    );
+    assert!(!calls.iter().any(|call| call.contains("wg0 down")));
+}
+
+#[test]
+fn explicit_apply_version_does_not_verify_unrelated_head() {
+    use scupper_sys::{daemon::admin, events::EventLog};
+    let f = Fixture::new();
+    assert!(f.run(None).succeeded());
+    // Head's committed version is now unavailable. The requested older version
+    // is still below that committed head and its own metadata verifies.
+    fs::write(f.root.path.join("config/head"), b"2\n").unwrap();
+    let run_root = f.root.path.join("run");
+    let deps = BootDeps {
+        system: &f.kernel,
+        namespace: &f.kernel,
+        state_root: &f.root.path,
+        config_root: &f.root.path,
+        run_root: &run_root,
+        hook: None,
+        secret_owner: rustix::process::geteuid().as_raw(),
+    };
+    let log = EventLog::memory_only(scupper_core::config::GatewayId("gw1".into()), || {
+        scupper_proto::UnixSeconds(1000)
+    })
+    .unwrap();
+    assert!(admin::apply(&deps, &log.handle, Some(1), true, 0).is_ok());
+    assert!(admin::apply(&deps, &log.handle, None, true, 0).is_err());
+}

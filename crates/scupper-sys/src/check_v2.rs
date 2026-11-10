@@ -152,7 +152,7 @@ pub fn run_with_observations(
     deps: &Dependencies<'_>,
     cfg: &Config<'_>,
 ) -> (Result<Report, CheckError>, Observations) {
-    run_driver(deps, cfg, None)
+    run_driver(deps, cfg, None, None)
 }
 
 /// Fresh stages 1–7 on the supervisor tick owner; no recursive socket Ping.
@@ -172,7 +172,18 @@ pub fn run_supervised(
                 netns: v2::NetnsIdentity { device, inode },
             }
         });
-    run_driver(deps, cfg, Some(supervisor)).0
+    run_driver(deps, cfg, Some(supervisor), None).0
+}
+
+/// Read the current completed iteration at evaluation time, including during observation.
+/// # Errors
+/// Returns required observation failures.
+pub fn run_supervised_live(
+    deps: &Dependencies<'_>,
+    cfg: &Config<'_>,
+    last_complete: &dyn Fn() -> Option<std::time::Instant>,
+) -> Result<Report, CheckError> {
+    run_driver(deps, cfg, Some(v2::Supervisor::Dead), Some(last_complete)).0
 }
 
 /// Local fallback after a bounded control request already failed. Reuse that
@@ -181,7 +192,7 @@ pub fn run_after_unavailable(
     deps: &Dependencies<'_>,
     cfg: &Config<'_>,
 ) -> (Result<Report, CheckError>, Observations) {
-    run_driver(deps, cfg, Some(v2::Supervisor::Dead))
+    run_driver(deps, cfg, Some(v2::Supervisor::Dead), None)
 }
 
 #[allow(clippy::too_many_lines)] // Keep the staged observation dispatch together.
@@ -189,6 +200,7 @@ fn run_driver(
     deps: &Dependencies<'_>,
     cfg: &Config<'_>,
     supervisor: Option<v2::Supervisor>,
+    last_complete: Option<&dyn Fn() -> Option<std::time::Instant>>,
 ) -> (Result<Report, CheckError>, Observations) {
     let started = std::time::Instant::now();
     let original_supervisor = supervisor;
@@ -224,6 +236,20 @@ fn run_driver(
                 iteration_age: iteration_age + started.elapsed(),
                 netns,
             });
+        }
+        if health.require_daemon
+            && let Some(completed) = last_complete
+        {
+            obs.supervisor = Some(completed().zip(deps.handle).map_or(
+                v2::Supervisor::Dead,
+                |(at, held)| {
+                    let (device, inode) = held.identity();
+                    v2::Supervisor::Alive {
+                        iteration_age: at.elapsed(),
+                        netns: v2::NetnsIdentity { device, inode },
+                    }
+                },
+            ));
         }
         let request = v2::next(&obs, &health, deps.system.now_unix_secs());
         if let Next::Done(result) = request {

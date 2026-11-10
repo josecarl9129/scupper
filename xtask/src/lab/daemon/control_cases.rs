@@ -27,7 +27,7 @@ impl DaemonGuard<'_> {
             &Invocation::new("gwhost", binary.to_str().ok_or("binary path")?, &command),
             &output_path,
         )?;
-        let status = child.wait_timeout(Duration::from_secs(55))?;
+        let status = child.wait_timeout(Duration::from_secs(245))?;
         let output = fs::read_to_string(&output_path)?;
         let diagnostic = fs::read_to_string(output_path.with_extension("stderr"))?;
         if args.contains(&"disconnect") {
@@ -297,10 +297,11 @@ impl DaemonGuard<'_> {
                 self.control_restart(&root, "after-reboot")?;
                 self.expect_check(&root, 4, "restart-closed")?;
                 let (code, text) = self.control_command(&root, &["connect"], "connect")?;
-                if code != 0 {
+                if code != 0 || !text.contains("transport: local socket") {
                     return fail(format!("L14 connect: {code}: {text}"));
                 }
                 self.expect_check(&root, 0, "connected")?;
+                self.lab.service_check(&mut markers)?;
             }
             "L43" => {
                 for attempt in 0..5 {
@@ -327,6 +328,20 @@ impl DaemonGuard<'_> {
                     {
                         break;
                     }
+                    // Each incident must finish reopening before the next one:
+                    // the class budget charges reopenings, not repeated sightings
+                    // during one continuously closed repair.
+                    self.lab.daemon_route_healthy(Duration::from_secs(30))?;
+                    self.lab.daemon_wait(
+                        "L43 repair reopened",
+                        Duration::from_secs(20),
+                        |lab| {
+                            Ok(lab
+                                .cmd("scupper", "sysctl", &["-n", "net.ipv4.ip_forward"])?
+                                .trim()
+                                == "1")
+                        },
+                    )?;
                     if attempt == 4 {
                         return fail("L43 recurring foreign links did not latch");
                     }
@@ -378,15 +393,22 @@ impl DaemonGuard<'_> {
                 if WriterLock::try_acquire(root.join("run/scupper")).is_ok() {
                     return fail("L44 socket apply did not hold the writer lock");
                 }
-                let (code, text) = self.control_command(&root, &["disconnect"], "busy-refusal")?;
+                let (code, text) = self.control_command(&root, &["boot"], "busy-refusal")?;
                 if code != 1
-                    || !text.contains("scupperd is alive but unresponsive")
+                    || !text.contains("supervisor lease unavailable")
                     || text.contains("traffic is now blocked")
                 {
                     return fail(format!("L44 busy daemon allowed fallback: {code}: {text}"));
                 }
                 let mut samples = Vec::new();
-                for sample in 0..16 {
+                let deadline = Instant::now() + Duration::from_secs(150);
+                let mut sample = 0;
+                let mut saw_open = false;
+                let mut finished = None;
+                let status = loop {
+                    if Instant::now() >= deadline {
+                        return fail("L44 apply sampling deadline");
+                    }
                     if sample == 4 {
                         fs::remove_file(root.join("run/scupper/pause-apply"))?;
                     }
@@ -403,11 +425,62 @@ impl DaemonGuard<'_> {
                     );
                     if forwarding.trim() != "0" || forwarding6.trim() != "0" {
                         let (code, report) = self.lab.check_result(&Lab::boot_binary()?, &root)?;
-                        if code != 0 {
+                        saw_open = true;
+                        if !matches!(code, 0 | 4 | 5) {
                             return fail(format!("L44 open unsafe sample {sample}: {report}"));
                         }
+                        if code == 5 {
+                            // A complete tick may land while check returns. A fresh
+                            // Ping on either side of that transition is acceptable.
+                            let ping = scupper_sys::daemon::control::call(
+                                &root.join("run/scupper"),
+                                &scupper_sys::daemon::control::request(scupper_proto::Op::Ping {}),
+                                Duration::from_secs(2),
+                            );
+                            if !matches!(
+                                ping,
+                                Ok(scupper_proto::Response {
+                                    result: Ok(scupper_proto::OpResult::Ping {
+                                        last_complete_iteration_age: None | Some(0..=2),
+                                        ..
+                                    }),
+                                    ..
+                                })
+                            ) {
+                                return fail(
+                                    "L44 supervision stale beyond the first post-apply tick",
+                                );
+                            }
+                        }
+                        if code == 4
+                            && (!self
+                                .lab
+                                .cmd("scupper", "ip", &["-4", "route", "show", "default"])?
+                                .contains("unreachable")
+                                || !self
+                                    .lab
+                                    .cmd("scupper", "ip", &["-6", "route", "show", "default"])?
+                                    .contains("unreachable"))
+                        {
+                            return fail("L44 fail-closed report had reachable defaults");
+                        }
                     }
+                    if let Some(status) = finished {
+                        break status;
+                    }
+                    if let Some(status) = apply.try_wait()? {
+                        finished = Some(status);
+                        if saw_open {
+                            break status;
+                        }
+                        // Sample once after exit too, closing the race between
+                        // the preceding sysctl read and the child's completion.
+                    }
+                    sample += 1;
                     self.lab.runner.dwell(Duration::from_millis(100))?;
+                };
+                if !saw_open {
+                    return fail("L44 apply completed without an open forwarding sample");
                 }
                 fs::write(
                     self.lab.artifacts.join("L44-intermediate-samples.json"),
@@ -415,7 +488,6 @@ impl DaemonGuard<'_> {
                 )?;
                 // A completed apply or a bounded writer refusal is acceptable;
                 // final convergence must be exact and connected.
-                let status = apply.wait_timeout(Duration::from_secs(30))?;
                 let output = fs::read_to_string(self.lab.artifacts.join("L44-apply.stdout"))?;
                 let diagnostic = fs::read_to_string(self.lab.artifacts.join("L44-apply.stderr"))?;
                 if !status.success() && !diagnostic.contains("writer lock") {
@@ -469,6 +541,13 @@ impl DaemonGuard<'_> {
                 {
                     return fail(format!("L50 socket ineffective disconnect: {code}: {text}"));
                 }
+                let (code, text) = self.control_command(&root, &["connect"], "socket-reconnect")?;
+                if code != 0 {
+                    return fail(format!(
+                        "L50 reconnect before ordering check: {code}: {text}"
+                    ));
+                }
+                self.lab.daemon_route_healthy(Duration::from_secs(30))?;
                 let (code, text) =
                     self.control_command(&root, &["disconnect"], "socket-tighten")?;
                 if code != 0 || !text.contains("transport: local socket") {

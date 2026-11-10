@@ -110,7 +110,7 @@ pub(super) fn mutation(
         Duration::from_secs(2),
     );
     let delivery = match ping {
-        Ok(_) => control::call(deps.writer_root, &request, Duration::from_secs(50)),
+        Ok(_) => control::call(deps.writer_root, &request, control::RESPONSE_TIMEOUT),
         Err(ClientError::Unavailable(error))
             if matches!(
                 error.kind(),
@@ -170,7 +170,7 @@ pub(super) fn mutation(
         }
         Err(ClientError::Unavailable(_) | ClientError::OutcomeUnknown(_)) => {
             return Err(format!(
-                "scupperd is alive but unresponsive; control outcome unknown for {}; retry with the same request id",
+                "scupperd is alive but unresponsive; control outcome unknown for {}; inspect scupper status before retrying",
                 String::from(request.request_id)
             ));
         }
@@ -209,11 +209,9 @@ pub(super) fn read(
         writeln!(err, "transport: local observations").map_err(output_error)?;
         return Ok(None);
     }
-    if let Ok(response) = control::call(
-        deps.writer_root,
-        &request,
-        Duration::from_secs(if status { 2 } else { 50 }),
-    ) {
+    if let Ok(response) = control::call(deps.writer_root, &request, control::RESPONSE_TIMEOUT)
+        && response.result.is_ok()
+    {
         writeln!(err, "transport: local socket").map_err(output_error)?;
         render(response, json, out).map(Some)
     } else {

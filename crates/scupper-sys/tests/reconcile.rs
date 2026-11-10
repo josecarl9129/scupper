@@ -61,8 +61,17 @@ impl Rig {
             &Selection::Auto,
         )
         .unwrap();
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/reconcile-fs")
+        let root = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || {
+                    std::path::PathBuf::from(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../target/tmp"
+                    ))
+                },
+                std::path::PathBuf::from,
+            )
+            .join("reconcile-fs")
             .join(format!(
                 "scupper-reconcile-{}-{}",
                 std::process::id(),
@@ -2709,10 +2718,16 @@ fn repair_clear_retains_operator_context_and_actual_latch_reason() {
         |_| unreachable!(),
     )
     .unwrap();
-    assert_eq!(
-        rig.store.state().last_repair_reason.as_deref(),
-        Some("operator inspected gateway")
+    assert!(
+        !serde_json::to_string(&rig.store.state())
+            .unwrap()
+            .contains("last_repair_reason")
     );
+    let disk = EventLog::open(&rig.root, GatewayId("gw1".into()), || UnixSeconds(1000)).unwrap();
+    rig.log.handle.replay_into(&disk.handle).unwrap();
+    disk.handle.flush_blocking(Duration::from_secs(2)).unwrap();
+    assert!(scupper_sys::events::read_since(&rig.root, 0, None).map(Result::unwrap).any(|event| matches!(&event.kind,
+        scupper_proto::EventKind::AdminAction { reason: Some(reason), .. } if reason == "operator inspected gateway")));
 }
 
 #[test]
@@ -2761,4 +2776,34 @@ fn bind_failure_does_not_prevent_scheduler_ticks() {
     assert_eq!(deps.iterations, 3);
     assert!(deps.control_calls >= 3);
     assert!(deps.complete_iterations > 0);
+}
+
+#[test]
+fn read_only_admin_ignores_writer_contention() {
+    use scupper_proto::{Op, OpResult};
+    let mut rig = Rig::new();
+    let guard = WriterLock::acquire(&rig.root).unwrap();
+    assert!(matches!(
+        scupper_sys::daemon::admin::execute(
+            rig.machine(),
+            Op::Ping {},
+            0,
+            Some(0),
+            |_| unreachable!()
+        )
+        .unwrap(),
+        OpResult::Ping { .. }
+    ));
+    assert!(matches!(
+        scupper_sys::daemon::admin::execute(
+            rig.machine(),
+            Op::RepairStatus {},
+            0,
+            None,
+            |_| unreachable!()
+        )
+        .unwrap(),
+        OpResult::RepairStatus { .. }
+    ));
+    drop(guard);
 }

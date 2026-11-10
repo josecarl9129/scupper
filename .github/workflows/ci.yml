@@ -16,6 +16,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: never
   CARGO_INCREMENTAL: "0"
+  CARGO_TARGET_TMPDIR: ${{ github.workspace }}/target/tmp
   CARGO_DENY_VERSION: "0.20.2"
 
 jobs:

@@ -42,3 +42,45 @@ All five gates passed, each invoked under `timeout 600`:
 The full test suite includes the delayed-handshake, stale socket check, lease refusal, operation-aware dedupe, unauthorized-peer slot flood, opening-boot failure, and durable repair-context regressions. Test temporary paths were kept inside the worktree for the final gates. `git diff --check` passed.
 
 Lab cases L10, L14, L43, L44 and L50 were updated and compiled, but not run locally. No third-party crates were added. No commit was created.
+
+## Fix round 2
+
+- Decisions / H3 / R2-1 / N3 → Ping is answered directly from a shared iteration snapshot without a writer capability; queue budget is 180 s, response budget 240 s, Ping remains 2 s. Socket Check errors fall back to local observations. Tests: `ping_snapshot_does_not_wait_for_dispatch`, `socket_check_error_uses_local_observations`.
+- Decision / R2-2 → supervised workers read the live last-complete instant at evaluation time. Test: `supervised_check_reads_live_completion`.
+- N1 → CLI boot retains the supervisor lease for its full lifetime and refuses contention before kernel calls. Test: `boot_refuses_live_supervisor_before_kernel_calls`.
+- N2 → startup retries lease contention for 60 s with STATUS notices; unit restarts every 2 s with no start-rate limit and a 90 s startup window. Test: `supervisor_lease_waits_for_release`.
+- N4 → apply watchdog feeding stops after a hard 120 s budget. Test: `apply_keepalive_stops_at_budget`.
+- N9 decision → schema 1 stays strict and unchanged: free-text repair context is written only to AdminAction audit events, never state.json. Old schema-1 readers can read all newly written safety state; a round-1 file containing the extra field is refused rather than silently discarding safety data. Test: `repair_clear_retains_operator_context_and_actual_latch_reason`, `uninitialized_supervisor_persists_recovery_intent`.
+- N5 → apply and reinitialization invalidate workers from the old namespace; pending Checks receive a retryable unavailable response, mutations spawn fresh verification. Test: `dispatcher_pending_across_apply`.
+- N6 → same-intent requests attach with independently correlated response ids; only different intent supersedes. Test: `dispatcher_same_intent_and_supersession`.
+- N7 → errors before intent persistence are not cached. Test: `dispatcher_expiry_and_unexecuted_retry`.
+- N8 → uncertain-delivery diagnostics now advise inspecting status before retrying; no unsupported request-id advice. Test: CLI diagnostics in full suite.
+- N10 → local refusal identifies the unavailable control socket and gives `systemctl stop scupperd` as the recovery path; lease contention names scupperd.lock. Test: lease refusal regressions.
+- N12 → Ping and RepairStatus avoid writer.lock; explicit versions resolve without reading head; failed applies retain the current attachment and last-complete timestamp. Tests: `read_only_admin_ignores_writer_contention`, `explicit_apply_version_does_not_verify_unrelated_head`.
+- Lab L14 → disconnected reboot previously rejected adoption solely because the exit was deliberately down, causing a full rebuild that reset client peers and sessions. Adoption now accepts down exits only for Disconnected intent after all public configuration checks. Stage 4 returns ClientSideBroken/NoHandshake when no client session has ever been established; L14 now runs real service canaries immediately after socket connect. Tests: `disconnected_reboot_preserves_client_sessions`, `clients_without_established_session_are_not_protected`. Saved run-2 evidence: L14-reboot had adopted=false and L14-connected was Protected with ClientHandshakesStale; privileged confirmation still required.
+- Lab L43 → each injected incident now waits for reopening, matching the per-class three-reopening/600 s budget. RouteDelete accepts a vanished route only after a successful full-family inventory proves the exact entry absent. Test: `route_delete_requires_observed_absence`; privileged L43 pending.
+- T-b / L50 → reconnect and prove healthy routes before the second disconnect, so the closure snapshot tests reply ordering. Lab case compiled; privileged execution pending.
+- N11 → persistent accept/bind failures produce at most one audit summary per minute, with accumulated error count. Test: `control_failures_are_counted_once_per_minute`.
+- T-a / L44 → sample until apply exits, require an open sample, reject check codes 1/2/3, and require unreachable defaults for code 4; competing boot refuses the retained lease while Ping remains responsive. Lab case compiled; privileged execution pending.
+- Lab L10 → notify capture also retries Interrupted reads and survives timeout/STOP/CONT/KILL gaps; test `notify_capture_survives_idle_and_sender_restart` covers idle gaps and replaced senders. Direct lab daemon execution does not exercise systemd watchdog kills; bounded feeder is verified independently.
+- Lab isolation → clear the prior event directory only after the preceding stopped daemon's evidence is saved; later cases are explicitly skipped if baseline restoration fails. Lab cases compiled; privileged execution pending.
+- T-c → production Runtime now drains through the factored Dispatcher, using an injected intent/worker backend and explicit monotonic time. Tests: `dispatcher_same_intent_and_supersession`, `dispatcher_same_intent_success_correlates_every_id`, `dispatcher_expiry_and_unexecuted_retry`, `dispatcher_pending_across_apply`.
+- T-d → bind ownership is injectable only through the private bind implementation. Mode rejection uses the actual test owner; publication, stale-socket removal, live-socket refusal, inode-preserving cleanup and rebind run without root on filesystems supporting socket chmod. This worktree filesystem returns EINVAL for socket chmod, so the local test explicitly proves fail-closed refusal and defers the complete publication branch to supporting CI filesystems. Tests: `unsafe_control_directory_is_refused`, `bind_publication_stale_removal_replacement_and_rebind`.
+- T-e → added `boot_refuses_live_supervisor_before_kernel_calls`, `supervisor_lease_waits_for_release` (real three-second contention and bounded timeout), and `apply_keepalive_stops_at_budget` (feeder exits while owner retains the guard).
+- Test scratch paths → legacy scratch directories now use CARGO_TARGET_TMPDIR (unit-test fallback target/tmp); CI exports it explicitly. Long socket paths use directory capabilities or a relative path within that root.
+
+### Round 2 verification
+
+All five gates passed, each under `timeout 600`:
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
+- `cargo test --workspace --all-features --locked --no-fail-fast`
+- `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked`
+- `cargo deny check`
+
+The full run passed 845 tests, with 8 existing subprocess fixtures ignored. Test scratch directories used CARGO_TARGET_TMPDIR under the worktree. `git diff --check` passed. No third-party crates or commits were added.
+
+Privileged lab cases and real-systemd watchdog fault runs were compiled but not executed locally. L14's session-reset diagnosis is supported by the saved boot trace and the new adoption/verdict regressions; actual canary recovery still needs the privileged lab. The bind test explicitly verifies fail-closed refusal on this filesystem's unsupported socket chmod (EINVAL); its full publication/rebind branch requires a supporting filesystem.
+
+Final scratch-path audit: the CLI harness, probe wiring, namespace restore, lab registry, oracle and lab test helper all use CARGO_TARGET_TMPDIR. The final xtask-only run passed 106 tests after its last scratch-path changes. No crate-local target directories were recreated; all changed files are within the authorized source/CI paths and this report.

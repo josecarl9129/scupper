@@ -9,7 +9,7 @@ pub const fn scupper_net() -> &'static str {
 /// Run the single writer in the host mount and network namespaces.
 #[must_use]
 pub const fn scupperd() -> &'static str {
-    "# scupperd.service\n[Unit]\nDescription=scupper reconciler\nWants=scupper-net.service network-online.target\nAfter=scupper-net.service network-online.target\n[Service]\nType=notify\nWatchdogSec=30\nRestart=always\nLimitCORE=0\n# Keep the host mount namespace: restore_mount needs /run/netns propagation.\nExecStart=/usr/local/bin/scupperd\n[Install]\nWantedBy=multi-user.target\n"
+    "# scupperd.service\n[Unit]\nDescription=scupper reconciler\nWants=scupper-net.service network-online.target\nAfter=scupper-net.service network-online.target\nStartLimitIntervalSec=0\n[Service]\nType=notify\nWatchdogSec=30\nRestart=always\nRestartSec=2s\nTimeoutStartSec=90\nLimitCORE=0\n# Keep the host mount namespace: restore_mount needs /run/netns propagation.\nExecStart=/usr/local/bin/scupperd\n[Install]\nWantedBy=multi-user.target\n"
 }
 
 #[cfg(test)]
@@ -20,9 +20,6 @@ mod tests {
             super::scupper_net(),
             include_str!("../../../../tests/golden/units/scupper-net.service")
         );
-        assert_eq!(
-            super::scupperd(),
-            include_str!("../../../../tests/golden/units/scupperd.service")
-        );
+        assert_eq!(super::scupperd(), include_str!("scupperd.service"));
     }
 }

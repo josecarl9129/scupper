@@ -350,6 +350,8 @@ fn dispatch(
             trace,
         } => {
             require_root(deps, "boot")?;
+            let _lease = scupper_sys::lock::SupervisorLease::try_acquire(deps.writer_root)
+                .map_err(|error| format!("boot refused: supervisor lease unavailable: {error}; use scupper apply through scupperd"))?;
             #[cfg(feature = "testing")]
             let hook = |point: scupper_sys::boot::BootPoint| {
                 use scupper_sys::boot::BootPoint;

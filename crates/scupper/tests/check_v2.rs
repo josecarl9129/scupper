@@ -396,7 +396,10 @@ fn live_supervisor_lease_refuses_fallback_without_changing_state() {
     let _lease = scupper_sys::lock::SupervisorLease::try_acquire(&root.path).unwrap();
     let (code, out, err) = run(&sys, &root, &["disconnect"]);
     assert_eq!(code, 1);
-    assert!(err.contains("scupperd is alive but unresponsive"), "{err}");
+    assert!(
+        err.contains("control socket unavailable") && err.contains("systemctl stop scupperd"),
+        "{err}"
+    );
     assert!(!out.contains("traffic is now blocked"));
     assert_eq!(before, std::fs::read(root.path.join("state.json")).unwrap());
 }
@@ -540,4 +543,58 @@ fn status_with_responsive_uninitialized_socket_keeps_local_schema() {
     let value: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert!(value.get("observations").is_some());
     assert!(value.get("request_id").is_none());
+}
+
+#[test]
+fn socket_check_error_uses_local_observations() {
+    use scupper_proto::{ApiError, ApiErrorCode, OpResult, Response, Schema};
+    use std::{io::Write, os::unix::net::UnixListener};
+    for error in [
+        ApiErrorCode::Timeout,
+        ApiErrorCode::SupervisorUnavailable,
+        ApiErrorCode::Internal,
+    ] {
+        let sys = Script::new("ubuntu-24.04");
+        fresh(&sys);
+        let held = testing::handle().unwrap();
+        let text = support::site_text(&sys.runner)
+            .replace("require_daemon = false", "require_daemon = true");
+        let root = Root::with_text(&text, &held);
+        let listener = UnixListener::bind(root.path.join("control.sock")).unwrap();
+        let (device, inode) = held.identity();
+        let worker = std::thread::spawn(move || {
+            for result in [
+                Ok(OpResult::Ping {
+                    last_complete_iteration_age: Some(0),
+                    netns: scupper_core::verdict::v2::NetnsIdentity { device, inode },
+                    version: 1,
+                    quarantined: false,
+                    selection: scupper_core::verdict::v2::Selection::Auto,
+                }),
+                Err(ApiError {
+                    code: error,
+                    observation: None,
+                }),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = scupper_sys::daemon::control::read_request(&stream).unwrap();
+                serde_json::to_writer(
+                    &mut stream,
+                    &Response {
+                        request_id: request.request_id,
+                        schema: Schema,
+                        replayed: false,
+                        observed_at: None,
+                        result,
+                    },
+                )
+                .unwrap();
+                stream.write_all(b"\n").unwrap();
+            }
+        });
+        let (code, out, err) = run(&sys, &root, &["check", "--json"]);
+        assert_eq!(code, 5, "{out}: {err}");
+        assert!(err.contains("transport: local observations"));
+        worker.join().unwrap();
+    }
 }

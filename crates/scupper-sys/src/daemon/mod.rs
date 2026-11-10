@@ -380,7 +380,15 @@ impl Drop for Audit {
 /// Returns invalid identity/configuration roots or notify socket setup errors.
 #[allow(clippy::too_many_lines)]
 pub fn run(options: &Options, stop: &AtomicBool) -> io::Result<()> {
-    let _lease = crate::lock::SupervisorLease::try_acquire(&options.run_root)?;
+    let lease_notify = notify::Notify::new(std::env::var_os("NOTIFY_SOCKET").as_deref())
+        .unwrap_or_else(|_| notify::Notify::disabled());
+    let _lease = crate::lock::SupervisorLease::acquire_timeout(
+        &options.run_root,
+        Duration::from_secs(60),
+        || {
+            let _ = lease_notify.status("waiting for supervisor lease; local writer active");
+        },
+    )?;
     let origin = Instant::now();
     let gateway = GatewayId(
         RealFs
@@ -429,10 +437,11 @@ pub fn run(options: &Options, stop: &AtomicBool) -> io::Result<()> {
         control: None,
         binding: None,
         bind_retry: Instant::now(),
-        dedupe: control::Dedupe::default(),
+        control_errors: control::FailureSummary::default(),
+        dispatcher: pending::Dispatcher::default(),
         last_complete: None,
+        snapshot: control::SharedSnapshot::default(),
         cached: None,
-        pending_admin: Vec::new(),
     };
     run_with(&mut runtime, stop);
     Ok(())
@@ -453,8 +462,10 @@ struct Runtime<'a> {
     control: Option<control::Server>,
     binding: Option<Receiver<io::Result<control::Server>>>,
     bind_retry: Instant,
-    dedupe: control::Dedupe,
+    control_errors: control::FailureSummary,
+    dispatcher: pending::Dispatcher,
     last_complete: Option<Instant>,
+    snapshot: control::SharedSnapshot,
     cached: Option<(
         Instant,
         scupper_proto::HealthSummary,
@@ -462,7 +473,6 @@ struct Runtime<'a> {
     )>,
     setup_at: Option<Instant>,
     setup_rounds: u64,
-    pending_admin: Vec<pending::Operation>,
 }
 impl<'a> Runtime<'a> {
     fn deps(&self) -> BootDeps<'a> {
@@ -480,23 +490,41 @@ impl<'a> Runtime<'a> {
     }
 }
 impl Runtime<'_> {
-    fn control_failure(&self, error: &str) {
-        eprintln!("scupperd: control listener: {error}");
-        let _ = self.audit.handle().emit(
-            EventKind::DriftDetected {
-                object: scupper_proto::ObjectKind::Unknown,
-                reason: scupper_proto::Reason::ObservationUnknown,
-            },
-            Actor::Daemon,
-            None,
-        );
+    fn publish_snapshot(&self) {
+        let mut snapshot = self
+            .snapshot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        snapshot.last_complete = self.last_complete;
+        snapshot.ping =
+            self.running
+                .as_ref()
+                .map(|(machine, _, _)| scupper_proto::OpResult::Ping {
+                    last_complete_iteration_age: None,
+                    netns: machine.netns_identity(),
+                    version: machine.version(),
+                    quarantined: machine.latch().is_some(),
+                    selection: machine.selection(),
+                });
+    }
+    fn control_failure(&mut self, error: &str) {
+        let Some(count) = self.control_errors.record(Instant::now()) else {
+            return;
+        };
+        eprintln!("scupperd: control listener: {count} errors since last notice: {error}");
+        let _ =
+            self.audit
+                .handle()
+                .emit(EventKind::ControlUnavailable { count }, Actor::Daemon, None);
     }
     fn maintain_control(&mut self) {
         if let Some(server) = &self.control {
-            while let Ok(error) = server.errors.try_recv() {
+            let errors: Vec<_> = server.errors.try_iter().collect();
+            let alive = server.alive();
+            for error in errors {
                 self.control_failure(&error);
             }
-            if !server.alive() {
+            if !alive {
                 self.control_failure("listener exited; rebinding");
                 self.control = None;
             }
@@ -521,66 +549,30 @@ impl Runtime<'_> {
         }
         if self.control.is_none() && self.binding.is_none() && Instant::now() >= self.bind_retry {
             let root = self.options.run_root.clone();
+            let snapshot = self.snapshot.clone();
             let (send, receive) = mpsc::sync_channel(1);
             self.binding = Some(receive);
             let _ = std::thread::Builder::new()
                 .name("scupper-control-bind".into())
                 .spawn(move || {
-                    let _ = send.send(control::Server::bind(&root));
+                    let _ = send.send(control::Server::bind_snapshot(&root, snapshot));
                 });
         }
     }
     fn control_requests(&mut self) {
         self.maintain_control();
-        self.poll_admin();
+        let mut dispatcher = std::mem::take(&mut self.dispatcher);
+        dispatcher.poll_admin(self, Instant::now());
         for _ in 0..4 {
             let Some(server) = &self.control else { break };
             let Ok(pending) = server.receive.try_recv() else {
                 break;
             };
-            if Instant::now() > pending.until {
-                let _ = pending.reply.send(control::response(
-                    pending.request.request_id,
-                    Err(control::api(scupper_proto::ApiErrorCode::Timeout)),
-                ));
-                continue;
-            }
-            if let Some(response) = self.dedupe.lookup(&pending.request, Instant::now()) {
-                let _ = pending.reply.send(response);
-                continue;
-            }
-            if let Some(inflight) = self
-                .pending_admin
-                .iter_mut()
-                .find(|op| op.request.request_id == pending.request.request_id)
-            {
-                if inflight.request.op == pending.request.op {
-                    inflight.replies.push(pending.reply);
-                } else {
-                    let _ = pending.reply.send(control::response(
-                        pending.request.request_id,
-                        Err(control::api(scupper_proto::ApiErrorCode::Conflict)),
-                    ));
-                }
-                continue;
-            }
-            if matches!(
-                pending.request.op,
-                scupper_proto::Op::Check {}
-                    | scupper_proto::Op::Connect { .. }
-                    | scupper_proto::Op::Disconnect {}
-            ) {
-                self.begin_admin(pending);
-                continue;
-            }
-            let mut dedupe = std::mem::take(&mut self.dedupe);
-            let response = dedupe.execute(pending.request, Instant::now(), |op| {
-                self.operation(op, pending.uid)
-            });
-            self.dedupe = dedupe;
-            let _ = pending.reply.send(response);
+            dispatcher.dispatch(pending, self, Instant::now());
         }
+        self.dispatcher = dispatcher;
     }
+    #[allow(clippy::too_many_lines)] // Keep the apply writer lifetime and reattachment boundary visible.
     fn operation(
         &mut self,
         op: scupper_proto::Op,
@@ -609,17 +601,23 @@ impl Runtime<'_> {
                     .preserve_latch_locked(&guard)
                     .map_err(|_| control::api(ApiErrorCode::PersistenceUnavailable))?;
             }
-            let target = version.or(VersionStore::read_only(deps.state_root, deps.config_root)
-                .head()
-                .map_err(|_| control::api(ApiErrorCode::Internal))?);
+            let target = match version {
+                Some(version) => Some(version),
+                None => VersionStore::read_only(deps.state_root, deps.config_root)
+                    .head()
+                    .map_err(|_| control::api(ApiErrorCode::Internal))?,
+            };
             let prefix = if dry_run {
                 admin::preview_locked(&deps, &guard, target)?
             } else {
                 Vec::new()
             };
+            if !dry_run {
+                self.dispatcher.invalidate_admin_workers(Instant::now());
+            }
             let mut result =
                 admin::apply_locked(&deps, &self.audit.handle(), &guard, version, dry_run, uid);
-            if !dry_run {
+            if !dry_run && result.is_ok() {
                 self.abandon_probes();
                 self.startup_read.ready = None;
                 self.running = initialize(
@@ -634,6 +632,7 @@ impl Runtime<'_> {
                 .ok();
                 self.cached = None;
                 self.last_complete = None;
+                self.publish_snapshot();
             }
             if let Ok(OpResult::Apply { repair_plan, .. }) = &mut result {
                 *repair_plan = prefix;
@@ -644,6 +643,11 @@ impl Runtime<'_> {
             admin::durable_intent(&deps, &op, uid)?;
             let _ = self.audit.handle().emit(
                 EventKind::AdminAction {
+                    reason: if let Op::RepairClear { reason } = &op {
+                        reason.clone()
+                    } else {
+                        None
+                    },
                     command: scupper_proto::Command::RepairClear,
                 },
                 Actor::Local { uid },
@@ -687,6 +691,9 @@ impl Runtime<'_> {
         )
     }
     fn initialize_until(&mut self, deadline: Instant) {
+        self.dispatcher.invalidate_admin_workers(Instant::now());
+        self.last_complete = None;
+        self.cached = None;
         self.running = match initialize(
             self.deps(),
             self.gateway.clone(),
@@ -738,6 +745,7 @@ impl DaemonDeps for Runtime<'_> {
         if iteration.complete && self.running.is_some() {
             self.last_complete = Some(Instant::now());
         }
+        self.publish_snapshot();
         let Some((machine, _, _)) = &self.running else {
             return;
         };
@@ -1013,8 +1021,17 @@ mod tests {
     #[test]
     fn hung_audit_open_reports_after_bound_and_can_still_recover() {
         let now = Instant::now();
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/audit-open-bound")
+        let root = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || {
+                    std::path::PathBuf::from(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../target/tmp"
+                    ))
+                },
+                std::path::PathBuf::from,
+            )
+            .join("audit-open-bound")
             .join(std::process::id().to_string());
         let _ = std::fs::remove_dir_all(&root);
         let mut audit = Audit::open(&root, GatewayId("gw1".into()), now).unwrap();
@@ -1135,8 +1152,17 @@ mod tests {
                 100
             }
         }
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/production-initialize")
+        let root = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || {
+                    std::path::PathBuf::from(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../target/tmp"
+                    ))
+                },
+                std::path::PathBuf::from,
+            )
+            .join("production-initialize")
             .join(std::process::id().to_string());
         std::fs::create_dir_all(&root).unwrap();
         let text = include_str!(concat!(
@@ -1230,8 +1256,17 @@ mod tests {
     #[test]
     fn startup_retry_waits_are_bounded_while_the_same_input_read_is_stalled() {
         use std::io::Write;
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/startup-read-bound")
+        let root = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || {
+                    std::path::PathBuf::from(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../target/tmp"
+                    ))
+                },
+                std::path::PathBuf::from,
+            )
+            .join("startup-read-bound")
             .join(std::process::id().to_string());
         std::fs::create_dir_all(&root).unwrap();
         let fifo = root.join("state.json");

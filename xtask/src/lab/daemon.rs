@@ -77,7 +77,9 @@ impl NotifyCapture {
                     Err(e)
                         if matches!(
                             e.kind(),
-                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                            io::ErrorKind::WouldBlock
+                                | io::ErrorKind::TimedOut
+                                | io::ErrorKind::Interrupted
                         ) =>
                     {
                         if stopping.load(Ordering::Relaxed) {
@@ -376,13 +378,17 @@ impl Drop for DaemonGuard<'_> {
 impl Lab {
     pub(super) fn daemon_case(&mut self) -> Result<String> {
         let mut failures = Vec::new();
+        let mut blocked = None;
         for case in CASES {
             self.runner.phase =
                 Instant::now() + Duration::from_secs(if case == "L3" { 300 } else { 180 });
             let started = Instant::now();
-            let observed = self
-                .daemon_clean_baseline()
-                .and_then(|()| self.daemon_trial(case));
+            let observed = if let Some(cause) = &blocked {
+                fail(format!("skipped: baseline unavailable after {cause}"))
+            } else {
+                self.daemon_clean_baseline()
+                    .and_then(|()| self.daemon_trial(case))
+            };
             self.rows.push(Row {
                 name: format!("daemon-{case}"),
                 wanted: daemon_wanted(case).into(),
@@ -397,6 +403,9 @@ impl Lab {
             });
             evidence::save_results(&self.artifacts, &self.rows)?;
             if let Err(error) = observed {
+                if blocked.is_none() && self.daemon_clean_baseline().is_err() {
+                    blocked = Some(format!("{case}: {error}"));
+                }
                 failures.push(format!("{case}: {error}"));
             }
         }
@@ -406,6 +415,10 @@ impl Lab {
         Ok("all daemon cases verified; guarded cleanup, notify evidence and clean shutdown".into())
     }
     fn daemon_trial(&mut self, case: &str) -> Result<String> {
+        let events = self.private.join("boot-root/var-lib/scupper/events");
+        if events.exists() {
+            fs::remove_dir_all(events)?;
+        }
         let mut guard = DaemonGuard {
             lab: self,
             child: None,
@@ -1508,8 +1521,12 @@ mod tests {
 
     #[test]
     fn copied_event_artifacts_are_readable_without_changing_sources() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../target/daemon-event-artifacts")
+        let root = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../target/tmp")),
+                std::path::PathBuf::from,
+            )
+            .join("daemon-event-artifacts")
             .join(std::process::id().to_string());
         let source = root.join("source");
         let target = root.join("saved");
@@ -1532,9 +1549,45 @@ mod tests {
     }
 
     #[test]
+    fn notify_capture_survives_idle_and_sender_restart() {
+        use std::os::fd::AsRawFd;
+        let root = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../target/tmp")),
+                std::path::PathBuf::from,
+            )
+            .join(format!("notify-restart-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let directory = fs::File::open(&root).unwrap();
+        let path = format!("/proc/self/fd/{}/notify.sock", directory.as_raw_fd());
+        let receive = UnixDatagram::bind(&path).unwrap();
+        let capture = NotifyCapture::start(receive, &root.join("notify.jsonl")).unwrap();
+        for message in ["READY=1", "WATCHDOG=1", "READY=1", "WATCHDOG=1"] {
+            let sender = UnixDatagram::unbound().unwrap();
+            sender.send_to(message.as_bytes(), &path).unwrap();
+            drop(sender);
+            std::thread::sleep(Duration::from_millis(100));
+            assert_eq!(capture.drain().unwrap(), vec![message.to_owned()]);
+        }
+        drop(capture);
+        assert_eq!(
+            fs::read_to_string(root.join("notify.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            4
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn notify_artifact_keeps_every_message_even_when_consumers_drain() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../target/daemon-notify-artifacts")
+        let root = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../target/tmp")),
+                std::path::PathBuf::from,
+            )
+            .join("daemon-notify-artifacts")
             .join(std::process::id().to_string());
         fs::create_dir_all(&root).unwrap();
         let path = root.join("notify.jsonl");
