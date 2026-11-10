@@ -93,6 +93,18 @@ pub trait Kernel {
     /// # Errors
     /// Returns a mount or identity error.
     fn restore_name(&self, held: &NetnsHandle, guard: &WriterGuard) -> Result<(), StepError>;
+    /// Restore with directory-lock contention bounded by the tick deadline.
+    ///
+    /// # Errors
+    /// Returns a mount, identity or directory-lock timeout error.
+    fn restore_name_until(
+        &self,
+        held: &NetnsHandle,
+        guard: &WriterGuard,
+        _deadline: Instant,
+    ) -> Result<(), StepError> {
+        self.restore_name(held, guard)
+    }
     /// Install the effective process latch before any planned action.
     fn hold_latch(&self, _latch: Option<&Latch>) {}
     /// Refresh the adapter's independent durable latch view after a state read/write.
@@ -1237,7 +1249,15 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         if !report.escalations.contains(&Escalation::RebindNamespace) {
             report.escalations.push(Escalation::RebindNamespace);
         }
-        if self.kernel.restore_name(&self.held, guard).is_err() {
+        if self
+            .kernel
+            .restore_name_until(
+                &self.held,
+                guard,
+                self.deadline.unwrap_or_else(Instant::now),
+            )
+            .is_err()
+        {
             report.complete = false;
             self.emit(
                 EventKind::DriftDetected {

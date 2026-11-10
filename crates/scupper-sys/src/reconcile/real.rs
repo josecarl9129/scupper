@@ -8,7 +8,7 @@ use crate::{
     },
     collect,
     lock::WriterGuard,
-    netns::{NetnsError, NetnsHandle, restore_mount},
+    netns::{NetnsError, NetnsHandle, restore_mount_until},
     system::EXEC_TIMEOUT,
 };
 use scupper_core::{
@@ -499,7 +499,19 @@ impl Kernel for RealKernel<'_> {
         self.memory_latch.set(latch.is_some());
     }
     fn restore_name(&self, held: &NetnsHandle, guard: &WriterGuard) -> Result<(), StepError> {
-        restore_mount(held, &self.namespace_path, guard).map_err(|error| {
+        self.restore_name_until(
+            held,
+            guard,
+            Instant::now() + std::time::Duration::from_millis(100),
+        )
+    }
+    fn restore_name_until(
+        &self,
+        held: &NetnsHandle,
+        guard: &WriterGuard,
+        deadline: Instant,
+    ) -> Result<(), StepError> {
+        restore_mount_until(held, &self.namespace_path, guard, deadline).map_err(|error| {
             if matches!(error, NetnsError::MountEscalation { .. }) {
                 eprintln!("scupperd: {error}");
                 StepError("namespace restore escalation")

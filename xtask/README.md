@@ -299,18 +299,33 @@ suite runs in CI on both Ubuntu 24.04 and 22.04; it is not part of `cargo test`.
 
 L17-V14 waits for the held namespace inode to reappear, then requires exactly
 one mount on `/run/netns/scupper`. Restore leaves a single mount of the held
-inode alone, detaches a hijacked mount with `MNT_DETACH` before binding, and
+inode alone, detaches a hijacked mount with `MNT_DETACH | UMOUNT_NOFOLLOW` before binding, and
 creates the mount-point file only when missing. Unexpected mount counts or a
 wrong inode after binding report an escalation. With scupperd stopped, a single
 `ip netns delete scupper` must detach that mount and remove the name. With the
 daemon running, deletion is temporary: the next audit restores the held inode.
+Restore requires an already shared parent mount and never rewrites propagation.
+Its directory flock uses non-blocking retries, capped at 100 ms and the tick
+deadline. A descriptor held through a deleted named mount is replaced as a bind
+source by a fresh `/proc/thread-self/ns/net` descriptor from a short-lived thread
+that enters the held network namespace. This avoids inheriting its old mount's `MNT_UMOUNT` flag
+on older kernels; the held namespace identity remains unchanged.
 
-The lab saves `/run/netns` mountinfo lines immediately after L17 restore, before
+The check wrapper uses `unshare --mount --propagation unchanged`. It makes only
+mounted overlay ancestors (`/`, `/etc`, `/var`, `/var/lib`) private, without
+recursion, before binding the lab's `/etc` and `/var/lib`. The two replacement
+mounts are also made private without recursion. It leaves all nsfs
+mounts and `/run/netns` propagation intact.
+
+The lab saves `/run/netns` mountinfo lines immediately after L17 restore,
+after its `ip netns exec` and fresh check, before
 each daemon case cleanup, and before final teardown (`*-host.mountinfo`,
 `*-daemon.mountinfo`, and `*-mounts.json`). Daemon snapshots read its procfs
 mountinfo directly and record whether its mount namespace differs from the
 host. Parent mount propagation fields and duplicate path entries are preserved.
-A stack fails the daemon case that left it. Final cleanup reports stacked names
+A stack or loss of shared nsfs peers fails the daemon case that left it. Shared
+peer shape is checked before stopping, before cleanup and after case cleanup,
+against the untouched `wan` namespace. Final cleanup reports stacked names
 in `cleanup.txt`, lazily unmounts every layer with a bounded loop, then deletes
 the name; ordinary single mounts are deleted directly and checked absent.
 

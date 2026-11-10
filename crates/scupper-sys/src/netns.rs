@@ -11,7 +11,7 @@ use thiserror::Error;
 
 pub mod mountinfo;
 mod restore;
-pub use restore::restore_mount;
+pub use restore::{restore_mount, restore_mount_until};
 
 /// Failure to open, identify or restore a namespace, without retaining its path.
 #[derive(Debug, Error)]

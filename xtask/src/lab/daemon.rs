@@ -217,6 +217,7 @@ impl DaemonGuard<'_> {
         if mounts > 1 {
             return fail(format!("{case} left {mounts} stacked namespace mounts"));
         }
+        super::mounts::verify_restored_peers(child.supervised_pid()?)?;
         let before = self.lab.daemon_snapshot()?;
         child.stop_timeout(Signal::TERM, Duration::from_secs(30))?;
         if before != self.lab.daemon_snapshot()? {
@@ -287,7 +288,7 @@ impl DaemonGuard<'_> {
                     self.case
                 ));
             }
-            Ok(())
+            super::mounts::verify_restored_peers(pid)
         })();
         if let Some(mut child) = self.child.take() {
             child.signal(Signal::CONT);
@@ -351,7 +352,8 @@ impl DaemonGuard<'_> {
         let restored = self
             .lab
             .boot_gateway(&[], "daemon-restore")
-            .and_then(|_| self.lab.daemon_clean_baseline());
+            .and_then(|_| self.lab.daemon_clean_baseline())
+            .and_then(|()| super::mounts::verify_restored_peers(None));
         self.lab.runner.cleanup = cleanup;
         self.lab.runner.phase = phase;
         self.lab.runner.whole = whole;
@@ -777,12 +779,24 @@ impl Lab {
                 if mounts != 1 {
                     return fail(format!("L17 restore left {mounts} namespace mounts"));
                 }
-                super::mounts::verify_restored_peers(
+                super::mounts::verify_restored_peers(Some(
                     child.supervised_pid()?.ok_or("missing live L17 daemon")?,
-                )?;
+                ))?;
                 self.cmd("", "ip", &["netns", "exec", "scupper", "true"])?;
+                super::mounts::save(
+                    &self.artifacts,
+                    "daemon-L17-V14-after-netns-exec",
+                    child.supervised_pid()?,
+                )?;
+                super::mounts::verify_restored_peers(child.supervised_pid()?)?;
                 // Reopen and audit the restored name without any intervening delete.
                 let (code, report) = self.check_result(&Self::boot_binary()?, root)?;
+                super::mounts::save(
+                    &self.artifacts,
+                    "daemon-L17-V14-after-check",
+                    child.supervised_pid()?,
+                )?;
+                super::mounts::verify_restored_peers(child.supervised_pid()?)?;
                 if code != 0 {
                     return fail(format!("L17 fresh check expected 0: {code}: {report}"));
                 }

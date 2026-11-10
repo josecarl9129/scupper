@@ -30,6 +30,7 @@ struct Entry<'a> {
     id: u64,
     parent: u64,
     point: &'a [u8],
+    shared: bool,
 }
 
 fn malformed() -> io::Error {
@@ -57,6 +58,19 @@ fn escaped(path: &Path) -> Vec<u8> {
 /// # Errors
 /// Rejects malformed records, duplicate IDs, cycles and a missing ancestor mount.
 pub fn count(info: &str, path: &Path) -> io::Result<usize> {
+    Ok(inspect(info, path)?.0)
+}
+
+/// Whether the visible mount containing `path` belongs to a shared peer group.
+/// This only reads propagation; it never prepares or changes a mount.
+///
+/// # Errors
+/// Rejects the same malformed mount trees as [`count`].
+pub fn is_shared(info: &str, path: &Path) -> io::Result<bool> {
+    Ok(inspect(info, path)?.1)
+}
+
+fn inspect(info: &str, path: &Path) -> io::Result<(usize, bool)> {
     if !path.is_absolute() {
         return Err(malformed());
     }
@@ -82,13 +96,24 @@ pub fn count(info: &str, path: &Path) -> io::Result<usize> {
         if fields.next().is_none() || !point.starts_with(b"/") || !ids.insert(id) {
             return Err(malformed());
         }
-        entries.push(Entry { id, parent, point });
+        let shared = fields.any(|field| {
+            field
+                .strip_prefix("shared:")
+                .is_some_and(|group| group.parse::<u64>().is_ok_and(|group| group > 0))
+        });
+        entries.push(Entry {
+            id,
+            parent,
+            point,
+            shared,
+        });
     }
     let mut current = None;
     let mut visited = BTreeSet::new();
     let mut ancestors: Vec<_> = path.ancestors().collect();
     ancestors.reverse();
     let mut count = 0;
+    let mut shared = false;
     for ancestor in ancestors {
         let point = escaped(ancestor);
         let mut depth = 0;
@@ -106,6 +131,7 @@ pub fn count(info: &str, path: &Path) -> io::Result<usize> {
                 return Err(malformed());
             }
             current = Some(next.id);
+            shared = next.shared;
             depth += 1;
         }
         if ancestor == path {
@@ -115,7 +141,7 @@ pub fn count(info: &str, path: &Path) -> io::Result<usize> {
     if current.is_none() {
         return Err(malformed());
     }
-    Ok(count)
+    Ok((count, shared))
 }
 
 #[cfg(test)]

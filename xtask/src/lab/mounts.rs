@@ -11,7 +11,7 @@ pub(super) fn count(info: &str, path: &str) -> std::io::Result<usize> {
 
 // Compare the propagated copies with an untouched iproute2 namespace. Shared
 // group numbers differ between names, but must agree among each name's copies.
-fn peer_shape(info: &str, path: &str) -> Result<Vec<u64>> {
+fn peer_shape(info: &str, path: &str) -> Result<(Vec<u64>, u64)> {
     let mut parents = Vec::new();
     let mut peer_group = None;
     let mut root = None;
@@ -47,19 +47,29 @@ fn peer_shape(info: &str, path: &str) -> Result<Vec<u64>> {
         return super::fail("namespace has no single visible shared mount");
     }
     parents.sort_unstable();
-    Ok(parents)
+    Ok((
+        parents,
+        peer_group.ok_or("missing namespace peer group")?.parse()?,
+    ))
 }
 
-fn verify_peer_shape(info: &str) -> Result<()> {
-    if peer_shape(info, SCUPPER)? != peer_shape(info, "/run/netns/wan")? {
+fn verify_peer_shape(info: &str) -> Result<u64> {
+    let (parents, group) = peer_shape(info, SCUPPER)?;
+    if parents != peer_shape(info, "/run/netns/wan")?.0 {
         return super::fail("restored namespace propagation differs from iproute2 namespace");
     }
-    Ok(())
+    Ok(group)
 }
 
-pub(super) fn verify_restored_peers(daemon_pid: u32) -> Result<()> {
-    verify_peer_shape(&mountinfo::read("/proc/self/mountinfo")?)?;
-    verify_peer_shape(&mountinfo::read(format!("/proc/{daemon_pid}/mountinfo"))?)
+pub(super) fn verify_restored_peers(daemon_pid: Option<u32>) -> Result<()> {
+    let host_group = verify_peer_shape(&mountinfo::read("/proc/self/mountinfo")?)?;
+    if let Some(pid) = daemon_pid {
+        let daemon_group = verify_peer_shape(&mountinfo::read(format!("/proc/{pid}/mountinfo"))?)?;
+        if daemon_group != host_group {
+            return super::fail("host and daemon namespace mounts are not shared peers");
+        }
+    }
+    Ok(())
 }
 
 fn netns_lines(info: &str) -> String {

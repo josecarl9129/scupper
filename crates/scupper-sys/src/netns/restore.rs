@@ -1,21 +1,64 @@
 //! Restore decisions use mountinfo as well as the visible namespace identity.
 use super::{NetnsError, NetnsHandle, NetnsId, mountinfo};
 use rustix::{
-    fs::{FileType, Mode, OFlags, fstat, open},
-    mount::{
-        MountPropagationFlags, UnmountFlags, mount_bind, mount_bind_recursive, mount_change,
-        unmount,
-    },
+    fs::{FileType, FlockOperation, Mode, OFlags, flock, fstat, open},
+    mount::{UnmountFlags, mount_bind, unmount},
 };
 use std::{
     fs::{self, OpenOptions},
     io,
     os::{
-        fd::{AsRawFd, OwnedFd},
+        fd::{AsFd, AsRawFd, OwnedFd},
         unix::{fs::MetadataExt, fs::OpenOptionsExt},
     },
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
+
+fn direct_source(link: &Path, held: NetnsId) -> bool {
+    link == Path::new(&format!("net:[{}]", held.1))
+}
+
+// A descriptor opened through a deleted bind mount retains that mount's
+// MNT_UMOUNT state. Older kernels copy it into a new bind and later strip its
+// shared peers during unmount. Obtain a source on the internal nsfs mount.
+fn bind_source(held: &NetnsHandle, deadline: Instant) -> Result<OwnedFd, NetnsError> {
+    if direct_source(&fs::read_link(held.fd_path())?, held.identity()) {
+        return Ok(held.try_clone_file()?.into());
+    }
+    let file = held.try_clone_file()?;
+    let identity = held.identity();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("netns-bind-source".into())
+        .spawn(move || {
+            let result = (|| -> Result<OwnedFd, NetnsError> {
+                // Network setns is per-thread. Never change the caller's network
+                // namespace, or enter/unshare a mount namespace here.
+                rustix::thread::move_into_link_name_space(
+                    file.as_fd(),
+                    Some(rustix::thread::LinkNameSpaceType::Network),
+                )?;
+                // /proc/self/ns/net would refer to the process leader instead.
+                let source = open(
+                    "/proc/thread-self/ns/net",
+                    OFlags::RDONLY | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )?;
+                let stat = fstat(&source)?;
+                if (stat.st_dev, stat.st_ino) != identity
+                    || !direct_source(&fs::read_link(fd_path(&source))?, identity)
+                {
+                    return Err(NetnsError::IdentityMismatch);
+                }
+                Ok(source)
+            })();
+            let _ = sender.send(result);
+        })?;
+    receiver
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .map_err(|error| io::Error::new(io::ErrorKind::TimedOut, error))?
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum Action {
@@ -31,6 +74,16 @@ fn decision(mounts: usize, identity: Option<NetnsId>, held: NetnsId) -> Result<A
         (1, false) => Ok(Action::DetachThenBind),
         (_, held_inode) => Err(NetnsError::MountEscalation { mounts, held_inode }),
     }
+}
+
+fn propagation_ready(info: &str, parent: &Path) -> Result<(), NetnsError> {
+    if !mountinfo::is_shared(info, parent)? {
+        return Err(io::Error::other(
+            "namespace parent mount is not shared; operator setup required",
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn state(path: &Path) -> Result<(usize, Option<NetnsId>), NetnsError> {
@@ -63,29 +116,32 @@ fn verify_restored(
     }
 }
 
-// Match iproute2's directory setup: make it recursively shared, with a
-// recursive self-bind on EINVAL only. Serialize setup against ip netns add.
-fn shared_parent(parent: &Path) -> Result<(), NetnsError> {
+// Serialize against ip netns add, without changing any mount's propagation.
+fn lock_parent(parent: &Path, deadline: Instant) -> Result<OwnedFd, NetnsError> {
     let directory = open(
         parent,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )?;
-    rustix::fs::flock(&directory, rustix::fs::FlockOperation::LockExclusive)?;
-    let flags = MountPropagationFlags::SHARED | MountPropagationFlags::REC;
-    match mount_change(parent, flags) {
-        Ok(()) => {}
-        Err(rustix::io::Errno::INVAL) => {
-            mount_bind_recursive(parent, parent)?;
-            mount_change(
-                parent,
-                MountPropagationFlags::PRIVATE | MountPropagationFlags::REC,
-            )?;
-            mount_change(parent, flags)?;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "namespace directory lock timeout",
+            )
+            .into());
         }
-        Err(error) => return Err(error.into()),
+        match flock(&directory, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => return Ok(directory),
+            Err(rustix::io::Errno::WOULDBLOCK | rustix::io::Errno::INTR) => {
+                std::thread::sleep(
+                    Duration::from_millis(5)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
-    Ok(())
 }
 
 fn target_fd(path: &Path) -> Result<OwnedFd, NetnsError> {
@@ -112,6 +168,7 @@ fn fd_path(fd: &OwnedFd) -> PathBuf {
 /// local readback cannot prove visibility in a private mount tree. After stopping
 /// scupperd, one `ip netns delete scupper` must detach the sole mount and unlink
 /// the name. While scupperd runs it restores that name on the next audit.
+/// Restore requires an already shared parent mount and never changes propagation.
 ///
 /// # Errors
 /// Returns identity, unsafe mount-point, mountinfo, detach or bind failures.
@@ -119,29 +176,51 @@ fn fd_path(fd: &OwnedFd) -> PathBuf {
 pub fn restore_mount(
     held: &NetnsHandle,
     path: &Path,
-    _writer: &crate::lock::WriterGuard,
+    writer: &crate::lock::WriterGuard,
 ) -> Result<(), NetnsError> {
+    restore_mount_until(
+        held,
+        path,
+        writer,
+        Instant::now() + Duration::from_millis(100),
+    )
+}
+
+/// Restore a namespace name with directory-lock retries bounded by `deadline`
+/// and a 100 ms maximum wait. Existing mount propagation is never changed.
+///
+/// # Errors
+/// Returns the same errors as [`restore_mount`], including lock timeout.
+pub fn restore_mount_until(
+    held: &NetnsHandle,
+    path: &Path,
+    _writer: &crate::lock::WriterGuard,
+    deadline: Instant,
+) -> Result<(), NetnsError> {
+    let lock_deadline = deadline.min(Instant::now() + Duration::from_millis(100));
     held.verify(held.identity())?;
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::other("namespace mount point has no parent"))?;
     fs::create_dir_all(parent)?;
     // mountinfo uses resolved paths, including when the caller uses /var/run.
-    let path = fs::canonicalize(parent)?.join(
+    let parent = fs::canonicalize(parent)?;
+    let path = parent.join(
         path.file_name()
             .ok_or_else(|| io::Error::other("namespace mount point has no name"))?,
     );
+    let _directory = lock_parent(&parent, lock_deadline)?;
     let (mounts, identity) = state(&path)?;
-    match decision(mounts, identity, held.identity())? {
-        Action::Keep => return Ok(()),
-        Action::DetachThenBind => unmount(&path, UnmountFlags::DETACH)?,
-        Action::Bind => {}
+    let action = decision(mounts, identity, held.identity())?;
+    if action == Action::Keep {
+        return Ok(());
+    }
+    propagation_ready(&mountinfo::read("/proc/self/mountinfo")?, &parent)?;
+    let source = bind_source(held, deadline)?;
+    if action == Action::DetachThenBind {
+        unmount(&path, UnmountFlags::DETACH | UnmountFlags::NOFOLLOW)?;
     }
     // Re-read after detach: never bind on a mount exposed underneath a hijack.
-    shared_parent(
-        path.parent()
-            .ok_or_else(|| io::Error::other("namespace mount point has no parent"))?,
-    )?;
     let (mounts, identity) = state(&path)?;
     if mounts != 0 || identity == Some(held.identity()) {
         return Err(NetnsError::MountEscalation {
@@ -171,7 +250,10 @@ pub fn restore_mount(
         });
     }
     let target_path = fd_path(&target);
-    mount_bind(held.child_fd_path().as_path(), &target_path)?;
+    if Instant::now() >= deadline {
+        return Err(io::Error::new(io::ErrorKind::TimedOut, "namespace restore timeout").into());
+    }
+    mount_bind(fd_path(&source), &target_path)?;
     // Inspect a fresh descriptor at the name: the original O_PATH descriptor
     // continues to refer to the underlying file after the bind.
     let restored = target_fd(&path)?;
@@ -185,6 +267,70 @@ mod tests {
     use super::*;
 
     const HELD: NetnsId = (4, 42);
+
+    #[test]
+    fn bind_source_decision_rejects_named_and_lazily_detached_mounts() {
+        assert!(direct_source(Path::new("net:[42]"), HELD));
+        for path in [
+            "/run/netns/scupper",
+            "/run/netns/scupper (deleted)",
+            "/proc/123/fd/4",
+            "net:[43]",
+            "mnt:[42]",
+        ] {
+            assert!(!direct_source(Path::new(path), HELD), "{path}");
+        }
+    }
+
+    #[test]
+    fn direct_bind_source_keeps_identity_and_cloexec() -> Result<(), NetnsError> {
+        let held = NetnsHandle::open_network("/proc/self/ns/net")?;
+        let identity = held.identity();
+        let source = bind_source(&held, Instant::now() + Duration::from_secs(1))?;
+        drop(held);
+        let stat = fstat(&source)?;
+        assert_eq!((stat.st_dev, stat.st_ino), identity);
+        assert!(direct_source(&fs::read_link(fd_path(&source))?, identity));
+        assert!(rustix::io::fcntl_getfd(&source)?.contains(rustix::io::FdFlags::CLOEXEC));
+        Ok(())
+    }
+
+    #[test]
+    fn propagation_decision_requires_existing_shared_parent() -> Result<(), NetnsError> {
+        let shared = "1 0 0:1 / / rw - tmpfs tmpfs rw\n\
+            2 1 0:1 /netns /run/netns rw shared:12 - tmpfs tmpfs rw\n\
+            3 2 0:5 net:[42] /run/netns/scupper rw shared:418 - nsfs nsfs rw\n";
+        let parent = Path::new("/run/netns");
+        propagation_ready(shared, parent)?;
+        // A shared child cannot make its private parent suitable for restore.
+        assert!(propagation_ready(&shared.replace("shared:12", ""), parent).is_err());
+        // A private child must not cause restore to rewrite propagation.
+        propagation_ready(&shared.replace("shared:418", ""), parent)?;
+        let hidden = format!("{shared}4 2 0:1 / /run/netns rw - tmpfs tmpfs rw\n");
+        assert!(propagation_ready(&hidden, parent).is_err());
+        assert!(propagation_ready("invalid", parent).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn directory_lock_contention_and_expired_deadline_are_bounded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir =
+            std::env::current_dir()?.join(format!("target/restore-lock-{}", std::process::id()));
+        fs::create_dir_all(&dir)?;
+        let held = lock_parent(&dir, Instant::now() + Duration::from_secs(1))?;
+        let started = Instant::now();
+        let error = lock_parent(&dir, started + Duration::from_millis(20)).unwrap_err();
+        assert!(
+            matches!(error, NetnsError::Proc(error) if error.kind() == io::ErrorKind::TimedOut)
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(held);
+        assert!(lock_parent(&dir, Instant::now()).is_err());
+        drop(lock_parent(&dir, Instant::now() + Duration::from_secs(1))?);
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
 
     #[test]
     fn restore_decisions_distinguish_mounts_from_visible_inodes() -> Result<(), NetnsError> {
