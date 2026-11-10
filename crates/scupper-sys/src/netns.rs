@@ -9,6 +9,7 @@ use std::{
 };
 use thiserror::Error;
 
+pub mod mountinfo;
 mod restore;
 pub use restore::restore_mount;
 

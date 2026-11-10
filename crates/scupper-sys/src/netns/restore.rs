@@ -1,14 +1,20 @@
 //! Restore decisions use mountinfo as well as the visible namespace identity.
-use super::{NetnsError, NetnsHandle, NetnsId};
+use super::{NetnsError, NetnsHandle, NetnsId, mountinfo};
 use rustix::{
-    fs::OFlags,
-    mount::{MountFlags, UnmountFlags, mount, unmount},
+    fs::{FileType, Mode, OFlags, fstat, open},
+    mount::{
+        MountPropagationFlags, UnmountFlags, mount_bind, mount_bind_recursive, mount_change,
+        unmount,
+    },
 };
 use std::{
     fs::{self, OpenOptions},
     io,
-    os::unix::{ffi::OsStrExt, fs::MetadataExt, fs::OpenOptionsExt},
-    path::Path,
+    os::{
+        fd::{AsRawFd, OwnedFd},
+        unix::{fs::MetadataExt, fs::OpenOptionsExt},
+    },
+    path::{Path, PathBuf},
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -20,32 +26,11 @@ enum Action {
 
 fn decision(mounts: usize, identity: Option<NetnsId>, held: NetnsId) -> Result<Action, NetnsError> {
     match (mounts, identity == Some(held)) {
-        (0, _) => Ok(Action::Bind),
+        (0, false) => Ok(Action::Bind),
         (1, true) => Ok(Action::Keep),
         (1, false) => Ok(Action::DetachThenBind),
         (_, held_inode) => Err(NetnsError::MountEscalation { mounts, held_inode }),
     }
-}
-
-// Compare the escaped mountinfo field byte-for-byte.
-fn mount_count(mountinfo: &str, path: &Path) -> io::Result<usize> {
-    let mut escaped = Vec::new();
-    for byte in path.as_os_str().as_bytes() {
-        match byte {
-            b' ' => escaped.extend_from_slice(b"\\040"),
-            b'\t' => escaped.extend_from_slice(b"\\011"),
-            b'\n' => escaped.extend_from_slice(b"\\012"),
-            b'\\' => escaped.extend_from_slice(b"\\134"),
-            byte => escaped.push(*byte),
-        }
-    }
-    mountinfo.lines().try_fold(0, |count, line| {
-        let point = line
-            .split_whitespace()
-            .nth(4)
-            .ok_or_else(|| io::Error::other("malformed namespace mountinfo"))?;
-        Ok(count + usize::from(point.as_bytes() == escaped))
-    })
 }
 
 fn state(path: &Path) -> Result<(usize, Option<NetnsId>), NetnsError> {
@@ -58,7 +43,7 @@ fn state(path: &Path) -> Result<(usize, Option<NetnsId>), NetnsError> {
         Err(error) => return Err(error.into()),
     };
     Ok((
-        mount_count(&fs::read_to_string("/proc/self/mountinfo")?, path)?,
+        mountinfo::count(&mountinfo::read("/proc/self/mountinfo")?, path)?,
         identity,
     ))
 }
@@ -76,6 +61,47 @@ fn verify_restored(
             held_inode: identity == Some(held),
         })
     }
+}
+
+// Match iproute2's directory setup: make it recursively shared, with a
+// recursive self-bind on EINVAL only. Serialize setup against ip netns add.
+fn shared_parent(parent: &Path) -> Result<(), NetnsError> {
+    let directory = open(
+        parent,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    rustix::fs::flock(&directory, rustix::fs::FlockOperation::LockExclusive)?;
+    let flags = MountPropagationFlags::SHARED | MountPropagationFlags::REC;
+    match mount_change(parent, flags) {
+        Ok(()) => {}
+        Err(rustix::io::Errno::INVAL) => {
+            mount_bind_recursive(parent, parent)?;
+            mount_change(
+                parent,
+                MountPropagationFlags::PRIVATE | MountPropagationFlags::REC,
+            )?;
+            mount_change(parent, flags)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn target_fd(path: &Path) -> Result<OwnedFd, NetnsError> {
+    let fd = open(
+        path,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    if FileType::from_raw_mode(fstat(&fd)?.st_mode) != FileType::RegularFile {
+        return Err(io::Error::other("unsafe namespace mount point").into());
+    }
+    Ok(fd)
+}
+
+fn fd_path(fd: &OwnedFd) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()))
 }
 
 /// Rebind a missing or hijacked name to the original held namespace descriptor.
@@ -112,8 +138,12 @@ pub fn restore_mount(
         Action::Bind => {}
     }
     // Re-read after detach: never bind on a mount exposed underneath a hijack.
+    shared_parent(
+        path.parent()
+            .ok_or_else(|| io::Error::other("namespace mount point has no parent"))?,
+    )?;
     let (mounts, identity) = state(&path)?;
-    if mounts != 0 {
+    if mounts != 0 || identity == Some(held.identity()) {
         return Err(NetnsError::MountEscalation {
             mounts,
             held_inode: identity == Some(held.identity()),
@@ -127,15 +157,27 @@ pub fn restore_mount(
             .mode(0o600)
             .open(&path)?;
     }
-    mount(
-        held.child_fd_path().as_path(),
-        &path,
-        "",
-        MountFlags::BIND,
-        None::<&std::ffi::CStr>,
-    )?;
+    // Pin the final component. A replacement symlink cannot redirect mount(2).
+    let target = target_fd(&path)?;
+    let stat = fstat(&target)?;
     let (mounts, identity) = state(&path)?;
-    verify_restored(mounts, identity, held.identity())
+    if mounts != 0
+        || identity == Some(held.identity())
+        || identity != Some((stat.st_dev, stat.st_ino))
+    {
+        return Err(NetnsError::MountEscalation {
+            mounts,
+            held_inode: identity == Some(held.identity()),
+        });
+    }
+    let target_path = fd_path(&target);
+    mount_bind(held.child_fd_path().as_path(), &target_path)?;
+    // Inspect a fresh descriptor at the name: the original O_PATH descriptor
+    // continues to refer to the underlying file after the bind.
+    let restored = target_fd(&path)?;
+    let stat = fstat(&restored)?;
+    let mounts = mountinfo::count(&mountinfo::read("/proc/self/mountinfo")?, &path)?;
+    verify_restored(mounts, Some((stat.st_dev, stat.st_ino)), held.identity())
 }
 
 #[cfg(test)]
@@ -148,7 +190,13 @@ mod tests {
     fn restore_decisions_distinguish_mounts_from_visible_inodes() -> Result<(), NetnsError> {
         assert_eq!(decision(0, None, HELD)?, Action::Bind);
         assert_eq!(decision(0, Some((1, 2)), HELD)?, Action::Bind);
-        assert_eq!(decision(0, Some(HELD), HELD)?, Action::Bind);
+        assert!(matches!(
+            decision(0, Some(HELD), HELD),
+            Err(NetnsError::MountEscalation {
+                mounts: 0,
+                held_inode: true
+            })
+        ));
         assert_eq!(decision(1, Some(HELD), HELD)?, Action::Keep);
         assert_eq!(decision(1, Some((4, 43)), HELD)?, Action::DetachThenBind);
         // Even a mount of another filesystem must be detached before binding.
@@ -163,6 +211,30 @@ mod tests {
     }
 
     #[test]
+    fn target_descriptor_pins_the_file_and_rejects_replacement_symlinks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir =
+            std::env::current_dir()?.join(format!("target/restore-target-{}", std::process::id()));
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("name");
+        fs::write(&path, b"target")?;
+        let target = target_fd(&path)?;
+        let before = fstat(&target)?;
+        fs::rename(&path, dir.join("pinned"))?;
+        fs::write(dir.join("other"), b"other")?;
+        std::os::unix::fs::symlink(dir.join("other"), &path)?;
+        assert!(target_fd(&path).is_err());
+        let pinned = fs::metadata(fd_path(&target))?;
+        assert_eq!((pinned.dev(), pinned.ino()), (before.st_dev, before.st_ino));
+        assert_ne!(fs::metadata(&path)?.ino(), before.st_ino);
+        fs::remove_file(&path)?;
+        fs::create_dir(&path)?;
+        assert!(target_fd(&path).is_err());
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn readback_requires_exactly_one_mount_and_the_held_inode() {
         assert!(verify_restored(1, Some(HELD), HELD).is_ok());
         for mounts in [0, 1, 2, 3] {
@@ -173,20 +245,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn mountinfo_counts_exact_paths_and_hidden_stacked_mounts() -> io::Result<()> {
-        let info = "11 1 0:1 / /run/netns rw shared:1 - tmpfs tmpfs rw\n\
-                    12 11 0:4 net:[42] /run/netns/scupper rw - nsfs nsfs rw\n\
-                    13 11 0:4 net:[43] /run/netns/scupper rw - nsfs nsfs rw\n\
-                    14 11 0:4 net:[44] /run/netns/scupper-other rw - nsfs nsfs rw\n\
-                    15 11 0:4 net:[45] /run/netns/a\\040b\\134c rw - nsfs nsfs rw\n";
-        assert_eq!(mount_count(info, Path::new("/run/netns/scupper"))?, 2);
-        assert_eq!(mount_count(info, Path::new("/run/netns/scupper-other"))?, 1);
-        assert_eq!(mount_count(info, Path::new("/run/netns/missing"))?, 0);
-        assert_eq!(mount_count(info, Path::new("/run/netns/a b\\c"))?, 1);
-        assert!(mount_count("invalid", Path::new("/run/netns/scupper")).is_err());
-        Ok(())
     }
 }

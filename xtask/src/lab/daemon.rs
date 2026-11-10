@@ -777,6 +777,15 @@ impl Lab {
                 if mounts != 1 {
                     return fail(format!("L17 restore left {mounts} namespace mounts"));
                 }
+                super::mounts::verify_restored_peers(
+                    child.supervised_pid()?.ok_or("missing live L17 daemon")?,
+                )?;
+                self.cmd("", "ip", &["netns", "exec", "scupper", "true"])?;
+                // Reopen and audit the restored name without any intervening delete.
+                let (code, report) = self.check_result(&Self::boot_binary()?, root)?;
+                if code != 0 {
+                    return fail(format!("L17 fresh check expected 0: {code}: {report}"));
+                }
                 let after = NetnsHandle::open("/run/netns/scupper")?.identity();
                 if before != after {
                     return fail("L17 created a second namespace");
@@ -792,7 +801,7 @@ impl Lab {
                     return fail(format!("L17 canary loss: sent={sent}, replies={replies}"));
                 }
                 format!(
-                    "remount_ms={remount}; mounts={mounts}; same_inode=true; second_namespace=false; stream_sent={sent}; stream_replies={replies}"
+                    "remount_ms={remount}; mounts={mounts}; same_inode=true; shared_peers=true; netns_exec=true; fresh_check=0; second_namespace=false; stream_sent={sent}; stream_replies={replies}"
                 )
             }
             "L52" | "L52b" => {

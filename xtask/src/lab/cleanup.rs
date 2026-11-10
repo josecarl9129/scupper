@@ -52,9 +52,9 @@ impl Registry {
                         let path = format!("/run/netns/{ns}");
                         let mounts = || -> Result<usize> {
                             Ok(super::mounts::count(
-                                &fs::read_to_string("/proc/self/mountinfo")?,
+                                &scupper_sys::netns::mountinfo::read("/proc/self/mountinfo")?,
                                 &path,
-                            ))
+                            )?)
                         };
                         let count = mounts()?;
                         if count > 1 {
