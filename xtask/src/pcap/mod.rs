@@ -259,6 +259,11 @@ fn decide(policy: &Policy, ip: &Ip<'_>) -> Result<String, Reason> {
     if policy.marker(ip.raw) {
         return Err(Reason::CanaryMarker);
     }
+    if let Some(quotation) = t.quotation
+        && let Some(rule) = wireguard_error(policy, ip, quotation)?
+    {
+        return Ok(rule);
+    }
     if proto == 58 && matches!(payload.first(), Some(131..=137 | 143)) {
         return if control::ndp(policy, ip, payload)? {
             Ok("ndp".into())
@@ -301,6 +306,35 @@ fn decide(policy: &Policy, ip: &Ip<'_>) -> Result<String, Reason> {
         return Err(Reason::CanaryMarker);
     }
     host_allowed(policy, ip, proto, payload, t.ports).ok_or(Reason::NotAllowListed)
+}
+
+// The quotation may contain just IP + UDP headers. Its tuple must be the
+// incoming direction of an explicitly listed WireGuard pair, including the
+// gateway's old listen port after recreation. All quotation safety checks run
+// before this exception, and errors never count as positive WireGuard traffic.
+fn wireguard_error(
+    policy: &Policy,
+    outer: &Ip<'_>,
+    quotation: &[u8],
+) -> Result<Option<String>, Reason> {
+    let inner = decode::ip(quotation, true)?;
+    if inner.proto != 17 || inner.fragment.is_some() {
+        return Ok(None);
+    }
+    let src = SocketAddr::new(inner.src, decode::word(inner.payload, 0)?);
+    let dst = SocketAddr::new(inner.dst, decode::word(inner.payload, 2)?);
+    if decode::word(inner.payload, 4)? < 8 {
+        return Err(Reason::MalformedPacket);
+    }
+    decode::bytes(inner.payload, 0, 8)?;
+    Ok(policy.wireguard.iter().enumerate().find_map(|(i, rule)| {
+        (outer.src == rule.gateway.ip()
+            && outer.dst == rule.peer.ip()
+            && policy.uplink_addrs.contains(&outer.src)
+            && src == rule.peer
+            && dst == rule.gateway)
+            .then(|| format!("wireguard_error[{i}]"))
+    }))
 }
 
 fn host_allowed(

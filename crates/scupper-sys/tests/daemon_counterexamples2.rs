@@ -205,24 +205,50 @@ impl Kernel for CacheKernel<'_> {
 fn now() -> (MonoTime, u64) {
     (MonoTime(Duration::from_secs(100)), 100)
 }
-type StartupMachine<'a> = Reconciler<CacheKernel<'a>, StateFile, fn() -> (MonoTime, u64)>;
+// Advance scheduler time at the state boundary instead of racing wall-clock
+// sleeps and filesystem workers. The real blocked StateFile path is covered by fx1.
+struct StartupStore {
+    inner: scupper_sys::reconcile::fake::MemoryStore,
+    slow: bool,
+    time: std::rc::Rc<std::cell::Cell<Instant>>,
+    reads: std::rc::Rc<std::cell::Cell<usize>>,
+}
+impl StateStore for StartupStore {
+    fn read(&self) -> std::io::Result<State> {
+        self.inner.read()
+    }
+    fn read_until(&self, _: Instant) -> std::io::Result<State> {
+        self.reads.set(self.reads.get() + 1);
+        if self.slow {
+            self.time.set(self.time.get() + Duration::from_millis(200));
+        }
+        self.inner.read()
+    }
+    fn applied_snapshot_until(&self, _: Instant) -> Option<State> {
+        if self.slow {
+            None
+        } else {
+            self.inner.read().ok()
+        }
+    }
+    fn write(&self, guard: &WriterGuard, state: &State) -> std::io::Result<()> {
+        self.inner.write(guard, state)
+    }
+}
+type StartupMachine<'a> = Reconciler<CacheKernel<'a>, StartupStore, fn() -> (MonoTime, u64)>;
 struct StartupDaemon<'a> {
     machine: StartupMachine<'a>,
     system: &'a CacheSystem,
     held: Arc<NetnsHandle>,
-    root: &'a Path,
     stop: &'a AtomicBool,
     ticks: usize,
-    slow: bool,
-    writer: Option<std::thread::JoinHandle<()>>,
-    time: Instant,
+    time: std::rc::Rc<std::cell::Cell<Instant>>,
     ready: bool,
 }
 impl DaemonDeps for StartupDaemon<'_> {
     fn initialize(&mut self) {
         // Same ordering as production: bounded cold canonicalization, handoff, READY.
         assert_eq!(self.system.calls.load(Ordering::Relaxed), 0);
-        let started = Instant::now();
         canon::prepare_netns_ruleset(
             self.system,
             &self.held,
@@ -230,37 +256,13 @@ impl DaemonDeps for StartupDaemon<'_> {
             Instant::now() + Duration::from_secs(3),
         )
         .unwrap();
-        assert!(started.elapsed() >= Duration::from_millis(150));
         self.machine.resume_existing();
-        if self.slow {
-            let fifo = self.root.join("state.json");
-            fs::remove_file(&fifo).unwrap();
-            assert!(
-                std::process::Command::new("mkfifo")
-                    .arg(&fifo)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-            self.writer = Some(std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(200));
-                let mut file = fs::OpenOptions::new().write(true).open(fifo).unwrap();
-                file.write_all(
-                    &serde_json::to_vec(&State {
-                        applied_version: Some(1),
-                        ..State::default()
-                    })
-                    .unwrap(),
-                )
-                .unwrap();
-            }));
-        }
     }
     fn now(&self) -> Instant {
-        self.time
+        self.time.get()
     }
     fn sleep(&mut self, duration: Duration) {
-        self.time += duration;
+        self.time.set(self.time.get() + duration);
     }
     fn started(&mut self) {
         self.ready = true;
@@ -268,22 +270,7 @@ impl DaemonDeps for StartupDaemon<'_> {
     fn tick(&mut self, _: &AtomicBool) -> Option<TickReport> {
         assert!(self.ready);
         self.ticks += 1;
-        let started = Instant::now();
         let report = self.machine.tick();
-        if let Some(writer) = self.writer.take() {
-            writer.join().unwrap();
-            assert!(started.elapsed() >= Duration::from_millis(150));
-            fs::remove_file(self.root.join("state.json")).unwrap();
-            fs::write(
-                self.root.join("state.json"),
-                serde_json::to_vec(&State {
-                    applied_version: Some(1),
-                    ..State::default()
-                })
-                .unwrap(),
-            )
-            .unwrap();
-        }
         assert!(report.complete, "{report:?}");
         if self.ticks == 8 {
             self.stop.store(true, Ordering::Relaxed);
@@ -298,7 +285,7 @@ impl DaemonDeps for StartupDaemon<'_> {
         assert!(self.ticks == usize::MAX, "unexpected rebuild");
     }
     fn run_root(&self) -> &Path {
-        self.root
+        &self.system.root
     }
     fn boot_time(&self) -> Duration {
         Duration::from_secs(100)
@@ -334,15 +321,6 @@ fn healthy_daemon_start_and_restart_never_close_with_cold_cache_and_slow_state()
         .unwrap();
         let kernel = FakeKernel::new(desired);
         let log = EventLog::memory_only(gateway.clone(), || UnixSeconds(100)).unwrap();
-        fs::write(
-            root.join("state.json"),
-            serde_json::to_vec(&State {
-                applied_version: Some(1),
-                ..State::default()
-            })
-            .unwrap(),
-        )
-        .unwrap();
         for _ in 0..2 {
             let system = CacheSystem {
                 cache: RefCell::default(),
@@ -352,12 +330,22 @@ fn healthy_daemon_start_and_restart_never_close_with_cold_cache_and_slow_state()
                 live: RULES.into(),
             };
             let held = Arc::new(scupper_sys::netns::testing::handle().unwrap());
+            let time = std::rc::Rc::new(std::cell::Cell::new(Instant::now()));
+            let reads = std::rc::Rc::new(std::cell::Cell::new(0));
             let machine = Reconciler::new(
                 CacheKernel {
                     fake: kernel.clone(),
                     system: &system,
                 },
-                StateFile::open(&root, None).unwrap(),
+                StartupStore {
+                    inner: scupper_sys::reconcile::fake::MemoryStore::new(State {
+                        applied_version: Some(1),
+                        ..State::default()
+                    }),
+                    slow,
+                    time: time.clone(),
+                    reads: reads.clone(),
+                },
                 log.handle.clone(),
                 Config {
                     site: site.clone(),
@@ -376,16 +364,14 @@ fn healthy_daemon_start_and_restart_never_close_with_cold_cache_and_slow_state()
                 machine,
                 system: &system,
                 held,
-                root: &root,
                 stop: &stop,
                 ticks: 0,
-                slow,
-                writer: None,
-                time: Instant::now(),
+                time,
                 ready: false,
             };
             run_with(&mut daemon, &stop);
             assert_eq!(daemon.ticks, 8);
+            assert!(reads.get() >= daemon.ticks);
             assert!(
                 !kernel.history().iter().any(|(step, _)| matches!(
                     step,

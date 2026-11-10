@@ -494,7 +494,13 @@ fn worker_want(
             Ok(result) => {
                 let requested = (pending.rendered, pending.live);
                 cache.pending = None;
-                let (key, value) = result?;
+                let (key, value) = result.inspect_err(|_| {
+                    // A failed fresh canonicalization revokes the keep rule until
+                    // a new worker succeeds; retrying must remain Unknown.
+                    cache.verified = None;
+                    cache.cached = None;
+                    cache.confirmed = None;
+                })?;
                 let now = Instant::now();
                 cache.facts = Some((now, key.clone()));
                 cache.checked_at = Some(now);
@@ -528,6 +534,9 @@ fn worker_want(
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 cache.pending = None;
+                cache.verified = None;
+                cache.cached = None;
+                cache.confirmed = None;
                 return Err(ProbeError::io("canonical worker stopped"));
             }
         }

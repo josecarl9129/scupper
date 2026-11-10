@@ -227,3 +227,61 @@ fn a_cached_difference_must_survive_a_fresh_kernel_canonicalization() {
     assert!(scupper_sys::canon::netns_rulesets(&sys, &held, "rendered").is_err());
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn ordinary_audit_restart_waits_for_previous_writer_without_failure_event() {
+    use scupper_proto::UnixSeconds;
+    use scupper_sys::events::EventLog;
+    let root = root();
+    let previous = EventLog::open(&root, GatewayId("gw1".into()), || UnixSeconds(100)).unwrap();
+    previous
+        .handle
+        .emit(EventKind::Flapping {}, Actor::Daemon, None)
+        .unwrap();
+    let (send, receive) = std::sync::mpsc::sync_channel(1);
+    let open_root = root.clone();
+    let opening = std::thread::spawn(move || {
+        send.send(EventLog::open(&open_root, GatewayId("gw1".into()), || {
+            UnixSeconds(101)
+        }))
+        .unwrap();
+    });
+    assert!(matches!(
+        receive.recv_timeout(Duration::from_millis(100)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    previous
+        .handle
+        .flush_blocking(Duration::from_secs(5))
+        .unwrap();
+    drop(previous);
+    let successor = receive
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    opening.join().unwrap();
+    successor
+        .handle
+        .flush_blocking(Duration::from_secs(5))
+        .unwrap();
+    drop(successor);
+
+    let now = Instant::now();
+    let mut audit = Audit::open(&root, GatewayId("gw1".into()), now).unwrap();
+    let until = Instant::now() + Duration::from_secs(5);
+    while !audit.poll(now) {
+        assert!(Instant::now() < until);
+        std::thread::yield_now();
+    }
+    audit.shutdown().unwrap();
+    drop(audit);
+    let events = read_since(&root, 0, None)
+        .collect::<io::Result<Vec<_>>>()
+        .unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::PersistenceFailed { .. }))
+    );
+    fs::remove_dir_all(root).unwrap();
+}

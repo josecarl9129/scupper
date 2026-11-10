@@ -273,6 +273,7 @@ pub struct LogHandle {
 impl EventLog {
     /// Recovers sequence state, truncates torn tails, and starts the writer.
     /// The supplied root is normally `/var/lib/scupper`.
+    /// Waits up to five seconds for the previous instance's writer lock.
     ///
     /// # Errors
     /// Returns lock, recovery or thread-start errors. An unreadable audit history
@@ -309,6 +310,16 @@ impl EventLog {
         gateway: GatewayId,
         clock: impl Fn() -> UnixSeconds + Send + Sync + 'static,
     ) -> Result<OpenedLog, OpenError> {
+        let opened = Self::memory_buffer(gateway, clock)?;
+        opened.handle.shared.failed();
+        Ok(opened)
+    }
+
+    /// Planned memory-first startup: no persistence failure has occurred yet.
+    pub(crate) fn memory_buffer(
+        gateway: GatewayId,
+        clock: impl Fn() -> UnixSeconds + Send + Sync + 'static,
+    ) -> Result<OpenedLog, OpenError> {
         let gateway = Identifier::try_from(gateway.0).map_err(|_| OpenError::InvalidGateway)?;
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue {
@@ -323,7 +334,6 @@ impl EventLog {
             capacity: CAPACITY,
             persistent: false,
         });
-        shared.failed();
         Ok(OpenedLog {
             log: Self {
                 shared: shared.clone(),
@@ -366,7 +376,7 @@ impl EventLog {
         let directory = root.join("events");
         durable_directory(&directory)?;
         // Separate from the safety writer lock: audit I/O cannot hold that lock.
-        let guard = WriterLock::try_acquire(&directory)?;
+        let guard = WriterLock::acquire_timeout(&directory, Duration::from_secs(5))?;
         RealFs.cleanup_stale(&directory)?;
         let recovery = recover(&directory, &gateway)?;
         let clean = directory.join("clean");
@@ -494,6 +504,10 @@ impl Drop for EventLog {
 }
 
 impl LogHandle {
+    pub(crate) fn persistence_failed(&self) {
+        self.shared.failed();
+    }
+
     /// Assigns a unique sequence and enqueues without disk I/O or a capacity wait.
     /// Overflow discards the oldest buffered event and records a bounded gap note.
     ///

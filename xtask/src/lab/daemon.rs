@@ -21,8 +21,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-const CASES: [&str; 9] = [
-    "L6", "L7", "L13", "L16", "L17-V14", "L52", "V03", "L3", "L4",
+const CASES: [&str; 10] = [
+    "L6", "L7", "L13", "L16", "L17-V14", "L52", "L52b", "V03", "L3", "L4",
 ];
 
 // Drain notifications continuously, including while fault commands or probes block.
@@ -165,6 +165,16 @@ impl DaemonGuard<'_> {
         }
         notify.drain()?;
         drop(self.child.take());
+        // The supervisor can exit before the old audit worker releases its
+        // lock. Fence that handoff before launching the restart measurement.
+        let previous_writer = scupper_sys::lock::WriterLock::acquire_timeout(
+            root.join("var-lib/scupper/events"),
+            Duration::from_secs(5),
+        )?;
+        if !root.join("var-lib/scupper/events/clean").exists() {
+            return fail("initial daemon stop did not finish its event log");
+        }
+        drop(previous_writer);
         self.child = Some(self.lab.daemon_spawn(case, &root, "restart")?);
         self.lab.daemon_ready_tick(notify)?;
         let replies_at_restart = flow_counts(&flow)?.1;
@@ -207,6 +217,28 @@ impl DaemonGuard<'_> {
         if !root.join("var-lib/scupper/events/clean").exists() {
             return fail("SIGTERM did not write clean event marker");
         }
+        // This trial intentionally runs one initial process and one restart.
+        // Check each process emitted exactly one start, with no false audit alarm.
+        let events = read_since(&root.join("var-lib/scupper"), first_seq, None)
+            .collect::<io::Result<Vec<_>>>()?;
+        if events
+            .iter()
+            .filter(|event| matches!(event.kind, scupper_proto::EventKind::DaemonStarted { .. }))
+            .count()
+            != 2
+        {
+            return fail("expected exactly one DaemonStarted per initial/restarted process");
+        }
+        if events.iter().any(|event| {
+            matches!(
+                event.kind,
+                scupper_proto::EventKind::PersistenceFailed {
+                    reason: scupper_proto::Reason::EventWrite
+                }
+            )
+        }) {
+            return fail("ordinary daemon start/restart reported an event persistence failure");
+        }
         // L4 must also survive reopening the durable owned-link handoff.
         if case == "L4" {
             drop(self.child.take());
@@ -245,6 +277,16 @@ impl DaemonGuard<'_> {
                 .join(format!("daemon-{}/events", self.case)),
         );
         let _ = fs::remove_file(self.lab.private.join("boot-root/run/scupper/stall-tick"));
+        let marker = if self
+            .lab
+            .private
+            .join("boot-root/run/scupper/route-switch")
+            .exists()
+        {
+            fail("clean daemon stop left route-switch marker")
+        } else {
+            Ok(())
+        };
         let captures = self.lab.stop_captures();
         // Absent resources are fine. Verify the baseline after ordered boot.
         for (ns, program, args) in [
@@ -254,6 +296,7 @@ impl DaemonGuard<'_> {
                 vec!["qdisc", "del", "dev", "wg0", "clsact"],
             ),
             ("scupper", "ip", vec!["link", "del", "foreign0"]),
+            ("scupper", "ip", vec!["link", "del", "ex-unready"]),
             ("gwhost", "ip", vec!["link", "del", "foreign-host"]),
             ("gwhost", "ip", vec!["link", "del", "foreign0"]),
             (
@@ -280,7 +323,7 @@ impl DaemonGuard<'_> {
         self.lab.runner.cleanup = cleanup;
         self.lab.runner.phase = phase;
         self.lab.runner.whole = whole;
-        saved.and(captures).and(restored)
+        saved.and(marker).and(captures).and(restored)
     }
 }
 impl Drop for DaemonGuard<'_> {
@@ -692,17 +735,39 @@ impl Lab {
                     "remount_ms={remount}; same_inode=true; second_namespace=false; stream_sent={sent}; stream_replies={replies}"
                 )
             }
-            "L52" => {
+            "L52" | "L52b" => {
                 child.signal(Signal::STOP);
+                let first_seq = read_since(&root.join("var-lib/scupper"), 0, None)
+                    .filter_map(std::result::Result::ok)
+                    .map(|event| event.seq)
+                    .max()
+                    .unwrap_or(0);
+                // A separate, down WireGuard exit has no peers and is never
+                // selected. Keep the active exit healthy so its 30s provider
+                // recovery qualification does not obscure route-drift recovery.
+                let dev = if case == "L52b" {
+                    self.cmd(
+                        "scupper",
+                        "ip",
+                        &["link", "add", "ex-unready", "type", "wireguard"],
+                    )?;
+                    "ex-unready"
+                } else {
+                    "ex-ch1"
+                };
                 self.cmd(
                     "scupper",
                     "ip",
-                    &["route", "add", "198.18.0.0/24", "dev", "ex-ch1"],
+                    &["route", "add", "198.18.0.0/24", "dev", dev],
                 )?;
                 let (code, report) = self.check_result(&Self::boot_binary()?, root)?;
-                if code != 3 || report["verdict"]["Degraded"].get("RouteWrong").is_none() {
+                if (case == "L52"
+                    && (code != 3 || report["verdict"]["Degraded"].get("RouteWrong").is_none()))
+                    || (case == "L52b" && code == 0)
+                {
                     return fail(format!("L52 expected check 3 RouteWrong: {code}: {report}"));
                 }
+                let recovery = Instant::now();
                 child.signal(Signal::CONT);
                 let elapsed =
                     self.daemon_wait("extra route removed", Duration::from_secs(8), |lab| {
@@ -710,7 +775,46 @@ impl Lab {
                             .cmd("scupper", "ip", &["route", "show", "table", "main"])?
                             .contains("198.18.0.0/24"))
                     })?;
-                format!("check=3 RouteWrong; extra_route_removed_ms={elapsed}")
+                if case == "L52b" {
+                    self.daemon_wait(
+                        "L52b forwarding recovered",
+                        Duration::from_secs(20).saturating_sub(recovery.elapsed()),
+                        |lab| {
+                            Ok(lab
+                                .cmd("scupper", "sysctl", &["-n", "net.ipv4.ip_forward"])?
+                                .trim()
+                                == "1"
+                                && lab
+                                    .cmd("scupper", "ip", &["route", "show", "default"])?
+                                    .contains("dev ex-ch1"))
+                        },
+                    )?;
+                    self.service_check(&mut markers)?;
+                    if recovery.elapsed() > Duration::from_secs(20) {
+                        return fail("L52b service did not recover within 20s");
+                    }
+                    self.daemon_wait("L52b closing repair events", Duration::from_secs(5), |_| {
+                        let kinds: Vec<_> =
+                            read_since(&root.join("var-lib/scupper"), first_seq, None)
+                                .filter_map(std::result::Result::ok)
+                                .filter_map(|event| match event.kind {
+                                    scupper_proto::EventKind::Repair {
+                                        kind,
+                                        result: scupper_proto::Outcome::Succeeded,
+                                        ..
+                                    } => Some(kind),
+                                    _ => None,
+                                })
+                                .collect();
+                        Ok(kinds.contains(&scupper_proto::StepKind::ForwardingOff)
+                            && kinds.contains(&scupper_proto::StepKind::FlushConntrack))
+                    })?;
+                    self.cmd("scupper", "ip", &["link", "del", "ex-unready"])?;
+                }
+                format!(
+                    "check={code}; extra_route_removed_ms={elapsed}; closing_path={}",
+                    case == "L52b"
+                )
             }
             "V03" => self.daemon_sysctl_fixture(child)?,
             "L3" | "L4" => self.daemon_dead_flow(case, &mut markers, &stem)?,
@@ -1041,7 +1145,7 @@ impl Lab {
         let sent_before = flow_counts(&server_log)?.0;
         let started = Instant::now();
         if case == "L3" {
-            self.runner.input(&Invocation::new("wan", "nft", &["-f", "-"]), Some(b"table inet daemon_exit_down { chain forward { type filter hook forward priority -100; ip daddr 203.0.113.2 udp dport 51820 drop; } }\n"))?;
+            self.runner.input(&Invocation::new("wan", "nft", &["-f", "-"]), Some(b"table inet daemon_exit_down {\n  chain forward {\n    type filter hook forward priority -100;\n    ip daddr 203.0.113.2 udp dport 51820 drop;\n  }\n}\n"))?;
             // L3 is the transport oracle: a stalled established stream cannot
             // emerge onto the physical uplink, even while the old session exists.
             self.daemon_wait("L3 automatic fail-closed", Duration::from_secs(40), |lab| {
@@ -1184,6 +1288,9 @@ fn daemon_wanted(case: &str) -> &'static str {
         "L16" => "single exit down 4 then active route/healthy service by itself",
         "L17-V14" => "name restored <=8000ms; identical inode; healthy traffic",
         "L52" => "check 3 RouteWrong; extra main route removed <=8000ms",
+        "L52b" => {
+            "unready exit prefix closes forwarding; route deleted; service recovers <=20s; clean baseline"
+        }
         "V03" => "ip_forward changes only forwarding/accept_redirects; full hardening reapplied",
         "L3" | "L4" => "persistent established flow and remote sender; zero uplink leaks",
         _ => "unknown",

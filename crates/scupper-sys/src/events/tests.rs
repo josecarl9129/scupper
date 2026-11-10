@@ -338,7 +338,7 @@ fn exclusive_writer_corruption_and_foreign_gateway_refused() {
     let (log, handle) = open(&dir, 0);
     assert!(
         matches!(EventLog::open(&dir.0, gateway(), || UnixSeconds(0)),
-        Err(OpenError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock)
+        Err(OpenError::Io(error)) if error.kind() == io::ErrorKind::TimedOut)
     );
     emit(&handle);
     flush(&handle);
@@ -907,7 +907,7 @@ fn timed_out_drop_cleans_a_late_marker_before_releasing_writer_lock() {
     });
     wait_for(|| entered.load(Ordering::SeqCst));
     let bounded = result.recv_timeout(Duration::from_secs(2)).is_ok();
-    let locked = matches!(EventLog::open(&dir.0, gateway(), || UnixSeconds(0)), Err(OpenError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock);
+    let locked = matches!(WriterLock::try_acquire(dir.0.join("events")), Err(error) if error.kind() == io::ErrorKind::WouldBlock);
     let highwater = fs::read_to_string(dir.0.join("events/seq")).unwrap();
     release.store(true, Ordering::SeqCst);
     shutdown.join().unwrap();

@@ -431,9 +431,21 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         let _guard = WriterLock::acquire_timeout(&self.config.run_root, self.config.lock_wait)?;
         match std::fs::symlink_metadata(self.config.run_root.join("route-switch")) {
             Ok(_) => {
-                self.kernel
-                    .execute(&Step::FlushConntrack)
-                    .map_err(|e| io::Error::other(e.0))?;
+                let result = self.kernel.execute(&Step::FlushConntrack);
+                let _ = self.log.emit(
+                    EventKind::Repair {
+                        kind: StepKind::FlushConntrack,
+                        class: repair_class(&Step::FlushConntrack),
+                        result: if result.is_ok() {
+                            Outcome::Succeeded
+                        } else {
+                            Outcome::Failed
+                        },
+                    },
+                    Actor::Daemon,
+                    self.persisted.applied_version,
+                );
+                result.map_err(|e| io::Error::other(e.0))?;
                 self.clear_route_switch()
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -600,7 +612,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             && latest.applied_version != self.persisted.applied_version
         {
             report.steps.push(Step::ForwardingOff);
-            let closed = self.execute_step(&Step::ForwardingOff, guard, report);
+            let closed = self.execute_step(&Step::ForwardingOff, false, guard, report);
             self.emit(
                 EventKind::Repair {
                     kind: StepKind::ForwardingOff,
@@ -860,7 +872,8 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 self.emergency_steps.push(step.clone());
             }
             report.steps.push(step.clone());
-            let result = self.execute_step(&step, guard, report);
+            let result =
+                self.execute_step(&step, steps.contains(&Step::FlushConntrack), guard, report);
             self.kernel.step_boundary(&step);
             if result.is_ok() && !matches!(step, Step::Emit(_)) {
                 *model = model.apply(&step);
@@ -1030,7 +1043,11 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         let mut contained = false;
         let mut may_recover = recover;
         let mut refresh_before_restore = false;
-        for step in plan.steps {
+        let last_flush = plan
+            .steps
+            .iter()
+            .rposition(|step| *step == Step::FlushConntrack);
+        for (index, step) in plan.steps.into_iter().enumerate() {
             // Namespace loss prevents kernel execution, but never drops a
             // planned audit or durable quarantine operation.
             if inode_gone && !matches!(step, Step::Emit(_) | Step::PersistLatch { .. }) {
@@ -1068,7 +1085,12 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                     .push((self.clock)().0);
             }
             report.steps.push(step.clone());
-            let result = self.execute_step(&step, guard, report);
+            let result = self.execute_step(
+                &step,
+                last_flush.is_some_and(|flush| index < flush),
+                guard,
+                report,
+            );
             self.kernel.step_boundary(&step);
             if let Err(error) = result {
                 if step.failure() == StepFailure::NonFatal {
@@ -1208,6 +1230,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
     fn execute_step(
         &mut self,
         step: &Step,
+        flush_follows: bool,
         guard: &WriterGuard,
         report: &mut TickReport,
     ) -> Result<(), StepError> {
@@ -1245,7 +1268,9 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             Step::ForwardingOn { .. } if self.latch.is_some() => {
                 Err(StepError("quarantine blocks forwarding"))
             }
-            Step::RouteReplace { target, .. } => {
+            // A route restore from fail-closed intentionally preserves conntrack.
+            // Only an interrupted switch with a planned flush needs recovery.
+            Step::RouteReplace { target, .. } if flush_follows => {
                 let bytes = format!("target={target:?}\ntime={}\n", (self.clock)().1);
                 crate::fs::durable_replace(
                     &crate::fs::RealFs,

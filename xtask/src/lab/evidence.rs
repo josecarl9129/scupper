@@ -41,7 +41,7 @@ impl Case {
     pub fn wanted(self) -> &'static str {
         match self {
             Self::Baseline => "clean",
-            Self::Daemon => "measured L3/L4/L6/L7/L13/L16/L17/L52/V-03/V-14",
+            Self::Daemon => "measured L3/L4/L6/L7/L13/L16/L17/L52/L52b/V-03/V-14",
             Self::ProbeChild => "unprivileged-exit-dns",
             Self::CheckV2 => "0,3,0,2,0,4,0",
             Self::V6 => "v6-dropped",

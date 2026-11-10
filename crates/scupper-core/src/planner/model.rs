@@ -686,10 +686,12 @@ fn exit_prefix_routes_safe(model: &KernelModel, desired: &Desired) -> bool {
                 && route.entry.table == RoutingTable::Main
                 && matches!(route.entry.dst, RouteDestination::Prefix(_))
                 && route.entry.dev.as_ref().is_some_and(|name| {
-                    desired.exits.values().any(|exit| exit == name)
-                        && model.links.get(name).is_some_and(|link| {
-                            desired.links.get(name).is_some_and(|want| link.ready(want))
-                        })
+                    desired.routes.iter().any(|(family, target)| {
+                        *family == route.family
+                            && matches!(target, RouteTarget::Exit(exit) if exit.as_str() == name)
+                    }) && model.links.get(name).is_some_and(|link| {
+                        desired.links.get(name).is_some_and(|want| link.ready(want))
+                    })
                 })
         })
     })

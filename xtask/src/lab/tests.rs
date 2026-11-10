@@ -645,14 +645,17 @@ fn bridge_policy_requires_arp_and_both_ping_exchanges() {
 /// every inline ruleset in the lab must be written with newlines.
 #[test]
 fn inline_nft_rulesets_have_no_single_line_closing_braces() {
-    for (name, source) in [
-        ("topology.rs", include_str!("topology.rs")),
-        ("probe_child.rs", include_str!("probe_child.rs")),
-        ("check_v2.rs", include_str!("check_v2.rs")),
-    ] {
+    // Scan every lab source, including newly added injection modules.
+    for entry in fs::read_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/lab")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|ext| ext != "rs") || path.ends_with("tests.rs") {
+            continue;
+        }
+        let source = fs::read_to_string(&path).unwrap();
         assert!(
             !source.contains("; } }"),
-            "{name} contains a one-line nft ruleset"
+            "{} contains a one-line nft ruleset",
+            path.display()
         );
     }
 }

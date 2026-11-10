@@ -277,7 +277,7 @@ impl Audit {
         gateway: GatewayId,
         now: Instant,
     ) -> Result<Self, crate::events::OpenError> {
-        let opened = EventLog::memory_only(gateway.clone(), || UnixSeconds(unix()))?;
+        let opened = EventLog::memory_buffer(gateway.clone(), || UnixSeconds(unix()))?;
         Ok(Self {
             opened,
             root: root.into(),
@@ -305,6 +305,7 @@ impl Audit {
                 }
                 Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {
                     self.pending = None;
+                    self.opened.handle.persistence_failed();
                     self.retry_at = now + Duration::from_secs(60);
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -322,6 +323,8 @@ impl Audit {
                 .is_ok()
             {
                 self.pending = Some(receive);
+            } else {
+                self.opened.handle.persistence_failed();
             }
             self.retry_at = now + Duration::from_secs(60);
         }
