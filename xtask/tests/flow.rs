@@ -5,10 +5,8 @@
 #[test]
 fn flow_seconds_bounds_a_live_sender() {
     let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    let log = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
-        "../target/flow-duration-{}.jsonl",
-        std::process::id()
-    ));
+    let log = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("flow-duration-{}.jsonl", std::process::id()));
     let output = std::process::Command::new("timeout")
         .args([
             "10",

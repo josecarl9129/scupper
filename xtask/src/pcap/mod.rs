@@ -326,6 +326,10 @@ fn wireguard_error(
     if inner.proto != 17 || inner.fragment.is_some() || !inner.trailer.is_empty() {
         return Ok(None);
     }
+    // Without both ports no WireGuard tuple can match; host_allow still applies.
+    if inner.payload.len() < 4 {
+        return Ok(None);
+    }
     let src = SocketAddr::new(inner.src, decode::word(inner.payload, 0)?);
     let dst = SocketAddr::new(inner.dst, decode::word(inner.payload, 2)?);
     let Some((i, _)) = policy.wireguard.iter().enumerate().find(|(_, rule)| {
@@ -368,8 +372,7 @@ fn wireguard_error(
         Some(2) => full_len == 92,
         Some(3) => full_len == 64,
         Some(4) => full_len >= 32,
-        // Without a type field, any possible WireGuard message needs 32 bytes.
-        None => full_len == 0 || full_len >= 32,
+        None => full_len == 0,
         _ => false,
     };
     if !valid_length || (!body.is_empty() && (body.len() < 4 || body[1..4] != [0, 0, 0])) {

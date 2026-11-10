@@ -1132,6 +1132,7 @@ impl Lab {
         );
         Ok(values)
     }
+    #[allow(clippy::too_many_lines)] // Keep each fault and its live-flow evidence together.
     fn daemon_dead_flow(
         &mut self,
         case: &str,
@@ -1170,11 +1171,19 @@ impl Lab {
         let server_log = artifact_root.join(format!("{stem}-server.jsonl"));
         let sent_before = flow_counts(&server_log)?.0;
         let started = Instant::now();
-        let mut sent_at_closed = None;
+        let mut udp_counts = None;
         if case == "L3" {
+            let udp_marker = Self::marker()?;
+            markers.push(udp_marker.clone());
+            let mut udp = self.daemon_flow("udp", "client", &udp_marker, stem, seconds)?;
+            let udp_log = artifact_root.join(format!("{stem}-udp.jsonl"));
+            self.daemon_wait("L3 established UDP canary", Duration::from_secs(5), |_| {
+                udp.alive()?;
+                Ok(flow_counts(&udp_log)?.1 > 0)
+            })?;
             self.runner.input(&Invocation::new("wan", "nft", &["-f", "-"]), Some(b"table inet daemon_exit_down {\n  chain forward {\n    type filter hook forward priority -100;\n    ip daddr 203.0.113.2 udp dport 51820 drop;\n  }\n}\n"))?;
-            // L3 is the transport oracle: a stalled established stream cannot
-            // emerge onto the physical uplink, even while the old session exists.
+            // The UDP canary keeps client traffic entering the gateway while TCP
+            // stalls. Neither flow may emerge onto the physical uplink.
             // With one exit, common-mode probe failures cannot mark it Down.
             // Wait through handshake staleness, two 2s ticks and scheduling slack.
             // The uplink capture stays active for this entire interval; the
@@ -1184,13 +1193,18 @@ impl Lab {
                     .cmd("scupper", "ip", &["route", "show", "default"])?
                     .contains("unreachable"))
             })?;
-            sent_at_closed =
-                Some(self.daemon_verify_closed_flow(&mut client, &mut server, &server_log)?);
+            udp_counts = Some(self.daemon_verify_closed_flow(
+                &mut client,
+                &mut server,
+                &mut udp,
+                &udp_log,
+            )?);
             self.cmd(
                 "wan",
                 "nft",
                 &["delete", "table", "inet", "daemon_exit_down"],
             )?;
+            udp.stop(Signal::TERM)?;
         } else {
             let before: serde_json::Value = serde_json::from_str(&self.cmd(
                 "scupper",
@@ -1225,17 +1239,24 @@ impl Lab {
                 .cmd("scupper", "wg", &["show", "ex-ch1", "listen-port"])?
                 .trim()
                 .parse()?;
+            self.daemon_wait(
+                "remote sender continued after fault",
+                Duration::from_secs(3),
+                |_| Ok(flow_counts(&server_log)?.0 > sent_before),
+            )?;
         }
-        self.daemon_wait(
-            "remote sender continued after fault",
-            Duration::from_secs(3),
-            |_| Ok(flow_counts(&server_log)?.0 > sent_before),
-        )?;
         client.stop(Signal::TERM)?;
         server.stop(Signal::TERM)?;
         let sent_after = flow_counts(&server_log)?.0;
+        let continuity = udp_counts.map_or_else(
+            || "remote_sender_continued=true".to_owned(),
+            |(closed, after)| format!("udp_sent_at_closed={closed}; udp_sent_after={after}"),
+        );
+        let client_last_sent_ms =
+            flow_last_sent_ms(&artifact_root.join(format!("{stem}-client.jsonl")))?;
+        let server_last_sent_ms = flow_last_sent_ms(&server_log)?;
         Ok(format!(
-            "fault_ms={}; persistent_bidirectional_control=true; remote_sender_continued=true; remote_sent_before={sent_before}; remote_sent_at_closed={sent_at_closed:?}; remote_sent_after={sent_after}; flow_seconds={seconds}",
+            "fault_ms={}; persistent_bidirectional_control=true; {continuity}; remote_sent_before={sent_before}; remote_sent_after={sent_after}; client_last_sent_ms={client_last_sent_ms:?}; server_last_sent_ms={server_last_sent_ms:?}; flow_seconds={seconds}",
             started.elapsed().as_millis()
         ))
     }
@@ -1243,18 +1264,21 @@ impl Lab {
         &mut self,
         client: &mut Group,
         server: &mut Group,
-        server_log: &Path,
-    ) -> Result<u64> {
+        udp: &mut Group,
+        udp_log: &Path,
+    ) -> Result<(u64, u64)> {
         client.alive()?;
         server.alive()?;
-        let closed_count = flow_counts(server_log)?.0;
+        udp.alive()?;
+        let closed_count = flow_counts(udp_log)?.0;
         self.daemon_wait(
-            "remote sender continued after fail-closed",
+            "client UDP continued after fail-closed",
             Duration::from_secs(3),
             |_| {
                 client.alive()?;
                 server.alive()?;
-                Ok(flow_counts(server_log)?.0 > closed_count)
+                udp.alive()?;
+                Ok(flow_counts(udp_log)?.0 >= closed_count + 40)
             },
         )?;
         let root = self.private.join("boot-root");
@@ -1262,7 +1286,20 @@ impl Lab {
         if code != 4 {
             return fail(format!("L3 expected check 4: {code}: {report}"));
         }
-        Ok(closed_count)
+        let checked_count = flow_counts(udp_log)?.0;
+        // Keep the drop and uplink capture in place through the post-closure
+        // probe, and require fresh sends immediately before removing the drop.
+        self.daemon_wait(
+            "client UDP continued through closed-state checks",
+            Duration::from_secs(3),
+            |_| {
+                client.alive()?;
+                server.alive()?;
+                udp.alive()?;
+                Ok(flow_counts(udp_log)?.0 > checked_count)
+            },
+        )?;
+        Ok((closed_count, flow_counts(udp_log)?.0))
     }
 }
 fn save_event_artifacts(source: &Path, target: &Path) -> Result<()> {
@@ -1323,6 +1360,14 @@ fn flow_counts(path: &Path) -> Result<(u64, u64)> {
     }
     Ok((sent, received))
 }
+fn flow_last_sent_ms(path: &Path) -> Result<Option<u64>> {
+    Ok(fs::read_to_string(path)?
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|value| value["sent"].as_u64().is_some_and(|n| n > 0))
+        .filter_map(|value| value["elapsed_ms"].as_u64())
+        .next_back())
+}
 fn contains_marker(bytes: &[u8], marker: &str) -> Result<bool> {
     Ok(crate::pcap::observe(bytes)?
         .iter()
@@ -1345,7 +1390,10 @@ fn daemon_wanted(case: &str) -> &'static str {
             "IPv6 prefix through owned UP exit with no selected IPv6 default closes forwarding; route deleted; service recovers <=20s; clean baseline"
         }
         "V03" => "ip_forward changes only forwarding/accept_redirects; full hardening reapplied",
-        "L3" | "L4" => "persistent established flow and remote sender; zero uplink leaks",
+        "L3" => {
+            "persistent TCP control; client UDP grows through fail-closed/check 4; zero uplink leaks"
+        }
+        "L4" => "persistent established flow and remote sender; zero uplink leaks",
         _ => "unknown",
     }
 }
