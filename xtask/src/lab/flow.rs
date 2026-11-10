@@ -9,12 +9,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Run a lab stream for at most ninety seconds; log actual transmitted/received
+/// Run a lab stream for the requested seconds; log actual transmitted/received
 /// bytes so each fault case can prove that its established-flow control worked.
 ///
 /// # Errors
 /// Returns invalid mode, setup, or evidence-write errors.
-pub fn flow(mode: &str, address: SocketAddr, marker: &str, log: &Path) -> Result<()> {
+pub fn flow(mode: &str, address: SocketAddr, marker: &str, log: &Path, seconds: u64) -> Result<()> {
     let mut log = OpenOptions::new().create(true).append(true).open(log)?;
     let start = Instant::now();
     let payload = format!("{marker}\n");
@@ -51,7 +51,7 @@ pub fn flow(mode: &str, address: SocketAddr, marker: &str, log: &Path) -> Result
         stream.set_nonblocking(true)?;
     }
     let mut buffer = [0; 1024];
-    while start.elapsed() < Duration::from_secs(90) {
+    while start.elapsed() < Duration::from_secs(seconds) {
         let (sent, received) = if let Some(stream) = &mut tcp {
             (
                 stream.write(payload.as_bytes()).unwrap_or(0),

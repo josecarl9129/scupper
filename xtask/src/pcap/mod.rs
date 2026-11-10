@@ -308,7 +308,7 @@ fn decide(policy: &Policy, ip: &Ip<'_>) -> Result<String, Reason> {
     host_allowed(policy, ip, proto, payload, t.ports).ok_or(Reason::NotAllowListed)
 }
 
-// The quotation may contain just IP + UDP headers. Its tuple must be the
+// A complete quotation may contain just IP + UDP headers. Its tuple must be the
 // incoming direction of an explicitly listed WireGuard pair, including the
 // gateway's old listen port after recreation. All quotation safety checks run
 // before this exception, and errors never count as positive WireGuard traffic.
@@ -328,6 +328,25 @@ fn wireguard_error(
     }
     let src = SocketAddr::new(inner.src, decode::word(inner.payload, 0)?);
     let dst = SocketAddr::new(inner.dst, decode::word(inner.payload, 2)?);
+    let Some((i, _)) = policy.wireguard.iter().enumerate().find(|(_, rule)| {
+        outer.src == rule.gateway.ip()
+            && outer.dst == rule.peer.ip()
+            && policy.uplink_addrs.contains(&outer.src)
+            && src == rule.peer
+            && dst == rule.gateway
+    }) else {
+        return Ok(None);
+    };
+    let header_len = inner.raw.len() - inner.payload.len();
+    let (base_header_len, quotation_limit) = if inner.src.is_ipv4() {
+        (20, 548)
+    } else {
+        (40, 1232)
+    };
+    // Peer WireGuard datagrams have no IP options or extension headers.
+    if header_len != base_header_len {
+        return Err(Reason::MalformedPacket);
+    }
     let udp_len = usize::from(decode::word(inner.payload, 4)?);
     // The IP and UDP lengths must agree, even when ICMP quotes only a prefix.
     let ip_len = if inner.src.is_ipv4() {
@@ -335,33 +354,28 @@ fn wireguard_error(
     } else {
         40 + usize::from(decode::word(quotation, 4)?)
     };
-    let header_len = inner.raw.len() - inner.payload.len();
     if udp_len < 8 || ip_len - header_len != udp_len {
         return Err(Reason::MalformedPacket);
     }
+    if inner.raw.len() != ip_len && quotation.len() != quotation_limit {
+        return Err(Reason::Truncated);
+    }
     decode::bytes(inner.payload, 0, 8)?;
     let body = &inner.payload[8..];
-    if !body.is_empty() {
-        let full_len = udp_len - 8;
-        let valid_length = match body.first() {
-            Some(1) => full_len == 148,
-            Some(2) => full_len == 92,
-            Some(3) => full_len == 64,
-            Some(4) => full_len >= 32 && full_len.is_multiple_of(16),
-            _ => false,
-        };
-        if body.len() < 4 || body[1..4] != [0, 0, 0] || !valid_length {
-            return Err(Reason::MalformedWireGuard);
-        }
+    let full_len = udp_len - 8;
+    let valid_length = match body.first() {
+        Some(1) => full_len == 148,
+        Some(2) => full_len == 92,
+        Some(3) => full_len == 64,
+        Some(4) => full_len >= 32,
+        // Without a type field, any possible WireGuard message needs 32 bytes.
+        None => full_len == 0 || full_len >= 32,
+        _ => false,
+    };
+    if !valid_length || (!body.is_empty() && (body.len() < 4 || body[1..4] != [0, 0, 0])) {
+        return Err(Reason::MalformedWireGuard);
     }
-    Ok(policy.wireguard.iter().enumerate().find_map(|(i, rule)| {
-        (outer.src == rule.gateway.ip()
-            && outer.dst == rule.peer.ip()
-            && policy.uplink_addrs.contains(&outer.src)
-            && src == rule.peer
-            && dst == rule.gateway)
-            .then(|| format!("wireguard_error[{i}]"))
-    }))
+    Ok(Some(format!("wireguard_error[{i}]")))
 }
 
 fn host_allowed(

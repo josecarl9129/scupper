@@ -1512,7 +1512,7 @@ fn wireguard_only_policy() -> Policy {
 fn wireguard_icmp_errors_require_the_exact_reverse_listed_tuple() {
     let policy = wireguard_only_policy();
     let quote = ip4(PEER, LOCAL, 17, &udp(51820, 51820, &wg(4, 32)));
-    let mut error = icmp(3, &quote[..28]); // Legal minimal IP + UDP quotation.
+    let mut error = icmp(3, &quote); // Complete quotation.
     error[1] = 3;
     let allowed_error = ip4(LOCAL, PEER, 1, &error);
     let report = classify(&capture(101, &[allowed_error]), &policy, 10).unwrap();
@@ -1592,7 +1592,7 @@ fn wireguard_icmpv6_errors_require_the_exact_reverse_listed_tuple() {
     let local = "2001:db8::1";
     let peer = "2001:db8:1::2";
     let quote = ip6(peer, local, 17, &udp(51820, 51820, &wg(4, 32)));
-    let allowed_error = ip6(local, peer, 58, &icmp(1, &quote[..48]));
+    let allowed_error = ip6(local, peer, 58, &icmp(1, &quote));
     let forbidden = ip6(
         local,
         peer,

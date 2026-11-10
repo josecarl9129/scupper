@@ -78,9 +78,21 @@ runs before the WireGuard decision; decoding failures are non-fatal for a packet
 that otherwise matches WireGuard. Data packets have no 16-byte length alignment
 requirement because Linux may cap padding at the MTU.
 
+The `wireguard_error[i]` exception admits ICMPv4 errors 3/11/12 and ICMPv6
+errors 1–4 only for an exact incoming WireGuard tuple quoted by its uplink
+gateway to the listed peer. Quoted IP and UDP lengths must agree; IPv4 options,
+IPv6 extension headers, fragments and trailers are excluded. A quotation must
+be complete or end exactly at 548 bytes (IPv4) or 1232 bytes (IPv6). Available
+message bytes must satisfy the same type, reserved-byte and length rules as
+positive WireGuard traffic. A complete empty UDP datagram is also permitted;
+a header-only prefix of a longer datagram is rejected. These framing checks
+apply after matching the tuple; other ICMP errors retain their host rules.
+
 Content inside allowed WireGuard/TLS flows is opaque: it is judged only by
 endpoints and shape, with plaintext canary detection as an additional check.
-The oracle cannot determine what encrypted content carries. Keep host rules
+A type-4 frame can carry arbitrary bytes after its framing, including plaintext
+or an embedded client header. L3/L4 therefore establish framing and address
+containment with opaque payloads, not payload confidentiality. Keep host rules
 narrow; an allowed SSH/TLS or UDP flow can carry tunneled traffic that endpoint
 and shape checks cannot distinguish.
 

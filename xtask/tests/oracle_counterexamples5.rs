@@ -87,13 +87,10 @@ fn class(packet: Vec<u8>) -> Class {
         .clone()
 }
 fn quote() -> Vec<u8> {
-    // Quote four bytes of a valid 32-byte data message, at the quotation limit.
-    // A complete four-byte type-4 datagram is invalid under the framing rule.
+    // Quote a complete valid 32-byte data message.
     let mut body = vec![0; 32];
     body[0] = 4;
-    let mut packet = ip4(PEER, LOCAL, 17, &udp(51820, 51820, &body));
-    packet.truncate(32);
-    packet
+    ip4(PEER, LOCAL, 17, &udp(51820, 51820, &body))
 }
 #[test]
 fn control_port_unreachable_is_admitted() {
@@ -179,14 +176,28 @@ fn wrapped(v6: bool, kind: u8, body: &[u8], cut: Option<usize>) -> Vec<u8> {
 fn ipv4_and_ipv6_quoted_framing_and_truncation_limits() {
     for v6 in [false, true] {
         let kind = if v6 { 1 } else { 3 };
-        for (message, len) in [(1, 148), (2, 92), (3, 64), (4, 32), (4, 48)] {
+        for (message, len) in [
+            (1, 148),
+            (2, 92),
+            (3, 64),
+            (4, 32),
+            (4, 33),
+            (4, 47),
+            (4, 48),
+            (4, 49),
+            (4, 1452),
+        ] {
             let mut body = vec![0; len];
             body[0] = message;
-            for cut in [None, Some(0), Some(4), Some(len - 1)] {
-                assert!(
-                    matches!(class(wrapped(v6, kind, &body, cut)), Class::Allowed(_)),
-                    "v6={v6} message={message} len={len} cut={cut:?}"
-                );
+            assert!(
+                matches!(class(wrapped(v6, kind, &body, None)), Class::Allowed(_)),
+                "v6={v6} message={message} len={len}"
+            );
+            for cut in [Some(0), Some(4), Some(len - 1)] {
+                assert!(matches!(
+                    class(wrapped(v6, kind, &body, cut)),
+                    Class::Violation(_)
+                ));
             }
             for cut in [Some(1), Some(2), Some(3)] {
                 assert!(matches!(
@@ -194,7 +205,12 @@ fn ipv4_and_ipv6_quoted_framing_and_truncation_limits() {
                     Class::Violation(_)
                 ));
             }
-            for bad_len in [len - 1, len + 1] {
+            let bad_lengths = if message == 4 {
+                vec![31]
+            } else {
+                vec![len - 1, len + 1]
+            };
+            for bad_len in bad_lengths {
                 let mut bad = vec![0; bad_len];
                 bad[0] = message;
                 for cut in [None, Some(4)] {
@@ -205,10 +221,12 @@ fn ipv4_and_ipv6_quoted_framing_and_truncation_limits() {
                 }
             }
             body[1] = 1;
-            assert!(matches!(
-                class(wrapped(v6, kind, &body, Some(4))),
-                Class::Violation(_)
-            ));
+            for cut in [None, Some(4)] {
+                assert!(matches!(
+                    class(wrapped(v6, kind, &body, cut)),
+                    Class::Violation(_)
+                ));
+            }
         }
         for body in [
             b"GET / HTTP/1.1\r\nHost: x\r\n".as_slice(),

@@ -126,7 +126,7 @@ impl DaemonGuard<'_> {
             )?;
         let mut server = self
             .lab
-            .daemon_flow_port("server", "internet", &marker, &stem, port)?;
+            .daemon_flow_port("server", "internet", &marker, &stem, port, 90)?;
         self.lab
             .daemon_wait("startup TCP listener", Duration::from_secs(5), |lab| {
                 Ok(lab
@@ -135,7 +135,7 @@ impl DaemonGuard<'_> {
             })?;
         let mut client = self
             .lab
-            .daemon_flow_port("client", "client", &marker, &stem, port)?;
+            .daemon_flow_port("client", "client", &marker, &stem, port, 90)?;
         let flow = self.lab.artifacts.join(format!("{stem}-client.jsonl"));
         self.lab
             .daemon_wait("pre-start established flow", Duration::from_secs(5), |_| {
@@ -506,15 +506,24 @@ impl Lab {
                 .contains("dev ex-ch1"))
         })
     }
-    fn daemon_flow(&mut self, mode: &str, ns: &str, marker: &str, stem: &str) -> Result<Group> {
+    fn daemon_flow(
+        &mut self,
+        mode: &str,
+        ns: &str,
+        marker: &str,
+        stem: &str,
+        seconds: u64,
+    ) -> Result<Group> {
         self.daemon_flow_port(
             mode,
             ns,
             marker,
             stem,
             if mode == "udp" { 8080 } else { 8081 },
+            seconds,
         )
     }
+    #[allow(clippy::too_many_arguments)] // Keep the flow endpoint and lifetime explicit.
     fn daemon_flow_port(
         &mut self,
         mode: &str,
@@ -522,6 +531,7 @@ impl Lab {
         marker: &str,
         stem: &str,
         port: u16,
+        seconds: u64,
     ) -> Result<Group> {
         let address = format!("{}:{port}", A.internet.peer);
         self.runner.background(
@@ -532,6 +542,8 @@ impl Lab {
                     "flow",
                     "--mode",
                     mode,
+                    "--seconds",
+                    &seconds.to_string(),
                     "--address",
                     &address,
                     "--marker",
@@ -624,7 +636,7 @@ impl Lab {
             "L7" => {
                 let marker = Self::marker()?;
                 markers.push(marker.clone());
-                let mut stream = self.daemon_flow("udp", "client", &marker, &stem)?;
+                let mut stream = self.daemon_flow("udp", "client", &marker, &stem, 90)?;
                 self.runner.dwell(Duration::from_millis(300))?;
                 // Inject after a completed iteration and measure the actual closure.
                 notify.drain()?;
@@ -714,7 +726,7 @@ impl Lab {
             "L17-V14" => {
                 let marker = Self::marker()?;
                 markers.push(marker.clone());
-                let mut stream = self.daemon_flow("udp", "client", &marker, &stem)?;
+                let mut stream = self.daemon_flow("udp", "client", &marker, &stem, 90)?;
                 let stream_log = self.artifacts.join(format!("{stem}-udp.jsonl"));
                 self.daemon_wait("L17 live canary control", Duration::from_secs(3), |_| {
                     Ok(flow_counts(&stream_log)?.1 > 0)
@@ -954,7 +966,7 @@ impl Lab {
         self.capture("gwhost", "foreign-host", &control_stem)?;
         let marker = Self::marker()?;
         markers.push(marker.clone());
-        let mut stream = self.daemon_flow("udp", "client", &marker, stem)?;
+        let mut stream = self.daemon_flow("udp", "client", &marker, stem, 90)?;
         self.runner.dwell(Duration::from_secs(1))?;
         self.stop_capture()?;
         let control = fs::read(self.artifacts.join(format!("{control_stem}.pcap")))?;
@@ -1128,8 +1140,14 @@ impl Lab {
     ) -> Result<String> {
         let marker = Self::marker()?;
         markers.push(marker.clone());
-        let mut server = self.daemon_flow("server", "internet", &marker, stem)?;
-        let mut client = self.daemon_flow("client", "client", &marker, stem)?;
+        let stale_bound = self.site.health().handshake_stale() + Duration::from_secs(2 * 2 + 10);
+        let seconds = if case == "L3" {
+            stale_bound.as_secs() + 60
+        } else {
+            90
+        };
+        let mut server = self.daemon_flow("server", "internet", &marker, stem, seconds)?;
+        let mut client = self.daemon_flow("client", "client", &marker, stem, seconds)?;
         let artifact_root = self.artifacts.clone();
         self.daemon_wait(
             "established bidirectional flow",
@@ -1152,6 +1170,7 @@ impl Lab {
         let server_log = artifact_root.join(format!("{stem}-server.jsonl"));
         let sent_before = flow_counts(&server_log)?.0;
         let started = Instant::now();
+        let mut sent_at_closed = None;
         if case == "L3" {
             self.runner.input(&Invocation::new("wan", "nft", &["-f", "-"]), Some(b"table inet daemon_exit_down {\n  chain forward {\n    type filter hook forward priority -100;\n    ip daddr 203.0.113.2 udp dport 51820 drop;\n  }\n}\n"))?;
             // L3 is the transport oracle: a stalled established stream cannot
@@ -1160,18 +1179,13 @@ impl Lab {
             // Wait through handshake staleness, two 2s ticks and scheduling slack.
             // The uplink capture stays active for this entire interval; the
             // case oracle below requires zero violations, including client data.
-            let stale_bound =
-                self.site.health().handshake_stale() + Duration::from_secs(2 * 2 + 10);
             self.daemon_wait("L3 automatic fail-closed", stale_bound, |lab| {
                 Ok(lab
                     .cmd("scupper", "ip", &["route", "show", "default"])?
                     .contains("unreachable"))
             })?;
-            let root = self.private.join("boot-root");
-            let (code, report) = self.check_result(&Self::boot_binary()?, &root)?;
-            if code != 4 {
-                return fail(format!("L3 expected check 4: {code}: {report}"));
-            }
+            sent_at_closed =
+                Some(self.daemon_verify_closed_flow(&mut client, &mut server, &server_log)?);
             self.cmd(
                 "wan",
                 "nft",
@@ -1221,9 +1235,34 @@ impl Lab {
         server.stop(Signal::TERM)?;
         let sent_after = flow_counts(&server_log)?.0;
         Ok(format!(
-            "fault_ms={}; persistent_bidirectional_control=true; remote_sender_continued=true; remote_sent_before={sent_before}; remote_sent_after={sent_after}",
+            "fault_ms={}; persistent_bidirectional_control=true; remote_sender_continued=true; remote_sent_before={sent_before}; remote_sent_at_closed={sent_at_closed:?}; remote_sent_after={sent_after}; flow_seconds={seconds}",
             started.elapsed().as_millis()
         ))
+    }
+    fn daemon_verify_closed_flow(
+        &mut self,
+        client: &mut Group,
+        server: &mut Group,
+        server_log: &Path,
+    ) -> Result<u64> {
+        client.alive()?;
+        server.alive()?;
+        let closed_count = flow_counts(server_log)?.0;
+        self.daemon_wait(
+            "remote sender continued after fail-closed",
+            Duration::from_secs(3),
+            |_| {
+                client.alive()?;
+                server.alive()?;
+                Ok(flow_counts(server_log)?.0 > closed_count)
+            },
+        )?;
+        let root = self.private.join("boot-root");
+        let (code, report) = self.check_result(&Self::boot_binary()?, &root)?;
+        if code != 4 {
+            return fail(format!("L3 expected check 4: {code}: {report}"));
+        }
+        Ok(closed_count)
     }
 }
 fn save_event_artifacts(source: &Path, target: &Path) -> Result<()> {

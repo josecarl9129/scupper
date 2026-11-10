@@ -22,6 +22,8 @@ enum Command {
         marker: String,
         #[arg(long)]
         log: PathBuf,
+        #[arg(long, default_value_t = 90)]
+        seconds: u64,
     },
     /// Check every uplink packet against an explicit allow-list.
     Classify {
@@ -82,8 +84,9 @@ fn run() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
             address,
             marker,
             log,
+            seconds,
         } => {
-            xtask::lab::flow(&mode, address, &marker, &log)?;
+            xtask::lab::flow(&mode, address, &marker, &log, seconds)?;
             Ok(true)
         }
         Command::Classify {
