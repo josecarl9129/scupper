@@ -28,10 +28,12 @@ impl MonoTime {
 pub enum ExitHealth {
     /// Startup qualification is incomplete.
     Unknown,
-    /// Fresh handshake and qualified path.
+    /// Fresh handshake; a resumed path awaits its first successful probe.
     Healthy {
         /// Start of uninterrupted healthy time.
         since: MonoTime,
+        /// A successful path probe has confirmed this process's handoff.
+        confirmed: bool,
     },
     /// One or two consecutive counted path failures.
     Suspect {

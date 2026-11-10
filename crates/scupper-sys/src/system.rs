@@ -238,6 +238,10 @@ pub enum ExecTarget<'a> {
 /// }
 /// ```
 pub trait System {
+    /// Remaining safety-group deadline, when called by the safety collector.
+    fn canon_safety_deadline(&self) -> Option<std::time::Instant> {
+        None
+    }
     /// Optional process-local canonical cache and the exact nft executable path.
     fn canon_cache(&self) -> Option<(&std::cell::RefCell<crate::canon::CanonCache>, &Path)> {
         None

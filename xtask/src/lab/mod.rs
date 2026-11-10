@@ -97,7 +97,25 @@ pub fn run(artifacts: &Path, capture_fixtures: Option<&Path>) -> Result<()> {
     for signal in signals {
         signal_hook::low_level::unregister(signal);
     }
-    result
+    let readable = make_artifacts_readable(artifacts);
+    result.and(readable)
+}
+fn make_artifacts_readable(root: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if !root.exists() {
+        return Ok(());
+    }
+    fs::set_permissions(root, fs::Permissions::from_mode(0o755))?;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            make_artifacts_readable(&entry.path())?;
+        } else if kind.is_file() {
+            fs::set_permissions(entry.path(), fs::Permissions::from_mode(0o644))?;
+        }
+    }
+    Ok(())
 }
 fn run_inner(
     artifacts: &Path,

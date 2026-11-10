@@ -35,6 +35,9 @@ struct SafetySystem<'a> {
     failed: Cell<bool>,
 }
 impl System for SafetySystem<'_> {
+    fn canon_safety_deadline(&self) -> Option<Instant> {
+        Some(self.deadline)
+    }
     fn canon_worker(&self) -> Option<Box<dyn System + Send>> {
         self.system.canon_worker()
     }

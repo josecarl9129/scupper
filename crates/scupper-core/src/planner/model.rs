@@ -676,6 +676,24 @@ pub(super) fn route_obs(target: &RouteTarget) -> DefaultRouteObs {
         RouteTarget::Unreachable => DefaultRouteObs::Unreachable,
     }
 }
+// An extra prefix through a configured, ready exit cannot bypass the kill switch.
+// It remains routing drift to delete, without closing or flushing established flows.
+fn exit_prefix_routes_safe(model: &KernelModel, desired: &Desired) -> bool {
+    use crate::parse::{RouteDestination, RouteKind, RoutingTable};
+    model.extra_routes.value().is_some_and(|routes| {
+        routes.iter().all(|route| {
+            route.entry.kind == RouteKind::Unicast
+                && route.entry.table == RoutingTable::Main
+                && matches!(route.entry.dst, RouteDestination::Prefix(_))
+                && route.entry.dev.as_ref().is_some_and(|name| {
+                    desired.exits.values().any(|exit| exit == name)
+                        && model.links.get(name).is_some_and(|link| {
+                            desired.links.get(name).is_some_and(|want| link.ready(want))
+                        })
+                })
+        })
+    })
+}
 /// Containment, independent of availability. Unknown safety items are unsafe,
 /// including while forwarding is closed (tc can bypass the forwarding gate).
 #[must_use]
@@ -730,7 +748,7 @@ pub fn safe(m: &KernelModel, desired: &Desired) -> bool {
             NamespaceState::InodeGone | NamespaceState::Unknown
         )
         && m.links_complete
-        && m.extra_routes == Known::Value(vec![])
+        && exit_prefix_routes_safe(m, desired)
         && m.extra_rules == Known::Value(vec![])
         && m.links.iter().all(|(name, link)| {
             let loopback = link.kind == Known::Value("loopback".into());

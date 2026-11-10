@@ -87,6 +87,7 @@ vocabulary!(
     "Bounded exit health.",
     Unknown,
     Healthy,
+    Unconfirmed,
     Suspect,
     Down,
     Recovering

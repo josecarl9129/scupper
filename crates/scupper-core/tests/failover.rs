@@ -92,7 +92,10 @@ fn qualified(cfg: &FailoverConfig) -> Failover {
 fn healthy_since(machine: &Failover, index: usize, seconds: u64) {
     assert_eq!(
         machine.health()[&id(index)],
-        ExitHealth::Healthy { since: at(seconds) }
+        ExitHealth::Healthy {
+            since: at(seconds),
+            confirmed: true
+        }
     );
 }
 fn switch_event(from: usize, to: usize, failback: bool) -> FailoverAction {

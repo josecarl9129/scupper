@@ -49,6 +49,7 @@ pub struct CanonCache {
 struct PendingCanon {
     rendered: [u8; 32],
     live: [u8; 32],
+    started: Instant,
     receive: std::sync::mpsc::Receiver<Probe<(CacheKey, Value)>>,
 }
 impl CanonCache {
@@ -442,7 +443,7 @@ fn cache_matches(cache: &CanonCache, key: &CacheKey, rendered: [u8; 32]) -> bool
 }
 
 // One outstanding worker per cache, including a worker stuck in filesystem I/O.
-// The safety caller only hashes, polls and clones owned in-memory inputs.
+// Safety waits only on the channel, for at most one second in its group budget.
 fn worker_want(
     sys: &dyn System,
     inode: u64,
@@ -456,75 +457,79 @@ fn worker_want(
     let (cell, _) = sys
         .canon_cache()
         .ok_or_else(|| ProbeError::setup("no canonical cache"))?;
+    let deadline = deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(1));
     let mut cache = cell.borrow_mut();
-    // A normal hit must not perform any filesystem or tool work.
-    if !fresh
-        && let Some((key, value)) = &cache.cached
-        && cache_matches(&cache, key, hash)
-    {
-        return Ok(value.clone());
-    }
-    if cache.pending.is_none() {
-        let worker = sys
-            .canon_worker()
-            .ok_or_else(|| ProbeError::setup("no canonical worker"))?;
-        let text = rendered.to_owned();
-        let (send, receive) = std::sync::mpsc::sync_channel(1);
-        std::thread::Builder::new()
-            .name("scupper-canon".into())
-            .spawn(move || {
-                let _ = send.send(load_want(worker.as_ref(), inode, &text));
-            })
-            .map_err(|e| file_error(&e))?;
-        cache.pending = Some(PendingCanon {
-            rendered: hash,
-            live,
-            receive,
-        });
-    }
-    let pending = cache.pending.as_ref().ok_or(ProbeError::Timeout)?;
-    let result = if let Some(deadline) = deadline {
-        pending
+    loop {
+        // A normal hit must not perform any filesystem or tool work.
+        if !fresh
+            && let Some((key, value)) = &cache.cached
+            && cache_matches(&cache, key, hash)
+        {
+            return Ok(value.clone());
+        }
+        if cache.pending.is_none() {
+            let worker = sys
+                .canon_worker()
+                .ok_or_else(|| ProbeError::setup("no canonical worker"))?;
+            let text = rendered.to_owned();
+            let (send, receive) = std::sync::mpsc::sync_channel(1);
+            std::thread::Builder::new()
+                .name("scupper-canon".into())
+                .spawn(move || {
+                    let _ = send.send(load_want(worker.as_ref(), inode, &text));
+                })
+                .map_err(|e| file_error(&e))?;
+            cache.pending = Some(PendingCanon {
+                rendered: hash,
+                live,
+                started: Instant::now(),
+                receive,
+            });
+        }
+        let pending = cache.pending.as_ref().ok_or(ProbeError::Timeout)?;
+        let result = pending
             .receive
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-    } else {
-        pending.receive.try_recv().map_err(|e| match e {
-            std::sync::mpsc::TryRecvError::Empty => std::sync::mpsc::RecvTimeoutError::Timeout,
-            std::sync::mpsc::TryRecvError::Disconnected => {
-                std::sync::mpsc::RecvTimeoutError::Disconnected
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        match result {
+            Ok(result) => {
+                let requested = (pending.rendered, pending.live);
+                cache.pending = None;
+                let (key, value) = result?;
+                let now = Instant::now();
+                cache.facts = Some((now, key.clone()));
+                cache.checked_at = Some(now);
+                cache.confirmed = Some((key.clone(), requested.1));
+                cache.cached = Some((key, value.clone()));
+                if requested.0 == hash {
+                    return Ok(value);
+                }
+                if Instant::now() >= deadline {
+                    return Err(ProbeError::Timeout);
+                }
             }
-        })
-    };
-    match result {
-        Ok(result) => {
-            let requested = (pending.rendered, pending.live);
-            cache.pending = None;
-            let (key, value) = result?;
-            let now = Instant::now();
-            cache.facts = Some((now, key.clone()));
-            cache.checked_at = Some(now);
-            cache.confirmed = Some((key.clone(), requested.1));
-            cache.cached = Some((key, value.clone()));
-            if requested.0 == hash {
-                Ok(value)
-            } else {
-                Err(ProbeError::Timeout)
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if let Some((key, verified_live)) = &cache.verified
+                    && *verified_live == live
+                    && key.rendered == hash
+                    && cache
+                        .facts
+                        .as_ref()
+                        .is_some_and(|(_, facts)| key.kernel_release == facts.kernel_release)
+                    && cache
+                        .pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.started.elapsed() <= CANON_TIMEOUT)
+                    && let Some((old_key, value)) = &cache.cached
+                    && key == old_key
+                {
+                    return Ok(value.clone());
+                }
+                return Err(ProbeError::Timeout);
             }
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            if let Some((key, verified_live)) = &cache.verified
-                && *verified_live == live
-                && cache_matches(&cache, key, hash)
-                && let Some((old_key, value)) = &cache.cached
-                && key == old_key
-            {
-                return Ok(value.clone());
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                cache.pending = None;
+                return Err(ProbeError::io("canonical worker stopped"));
             }
-            Err(ProbeError::Timeout)
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            cache.pending = None;
-            Err(ProbeError::io("canonical worker stopped"))
         }
     }
 }
@@ -569,7 +574,18 @@ pub fn netns_rulesets_safety(
     ))?;
     let hash = Sha256::digest(text.as_bytes()).into();
     let live = canonicalize(&text)?;
-    let mut want = worker_want(sys, handle.identity().1, rendered, hash, false, None)?;
+    let deadline = sys.canon_safety_deadline().map_or_else(
+        || Instant::now() + Duration::from_secs(1),
+        |group| group.min(Instant::now() + Duration::from_secs(1)),
+    );
+    let mut want = worker_want(
+        sys,
+        handle.identity().1,
+        rendered,
+        hash,
+        false,
+        Some(deadline),
+    )?;
     let (cache, _) = sys
         .canon_cache()
         .ok_or_else(|| ProbeError::setup("no canonical cache"))?;
@@ -582,7 +598,14 @@ pub fn netns_rulesets_safety(
                 .is_some_and(|(key, _)| cache.confirmed.as_ref() == Some(&(key.clone(), hash)))
         };
         if !confirmed {
-            want = worker_want(sys, handle.identity().1, rendered, hash, true, None)?;
+            want = worker_want(
+                sys,
+                handle.identity().1,
+                rendered,
+                hash,
+                true,
+                Some(deadline),
+            )?;
         }
     }
     if want == live {

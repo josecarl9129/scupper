@@ -94,8 +94,16 @@ impl Failover {
         };
         self.active = RouteTarget::Exit(iface.clone());
         self.active_exit = Some(exit.clone());
-        self.health
-            .insert(exit.clone(), ExitHealth::Healthy { since: now });
+        self.health.insert(
+            exit.clone(),
+            ExitHealth::Healthy {
+                since: now,
+                confirmed: false,
+            },
+        );
+        if let Some(signals) = self.signals.get_mut(exit) {
+            signals.unconfirmed = true;
+        }
         self.fail_closed_since = None;
         self.closed_reason = None;
         self.last_activation = Some(now);
@@ -118,6 +126,14 @@ impl Failover {
     #[must_use]
     pub fn active(&self) -> &RouteTarget {
         &self.active
+    }
+    /// The active handoff has not yet had a successful path probe.
+    #[must_use]
+    pub fn unconfirmed(&self) -> bool {
+        self.active_exit
+            .as_ref()
+            .and_then(|id| self.signals.get(id))
+            .is_some_and(|signals| signals.unconfirmed)
     }
     /// Per-exit health, in stable exit-ID order.
     #[must_use]
@@ -302,6 +318,7 @@ impl Failover {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // Keep common-mode, selection and failback ordering together.
     fn decide(
         &mut self,
         now: MonoTime,
@@ -348,7 +365,14 @@ impl Failover {
             return;
         }
         let first_healthy = candidates.iter().copied().find(|id| {
-            !common_mode && matches!(self.health.get(*id), Some(ExitHealth::Healthy { .. }))
+            !common_mode
+                && matches!(
+                    self.health.get(*id),
+                    Some(ExitHealth::Healthy {
+                        confirmed: true,
+                        ..
+                    })
+                )
         });
         let must_choose = admin
             || current.is_none()
@@ -405,7 +429,7 @@ impl Failover {
                 .signals
                 .get(candidate)
                 .is_some_and(|signals| signals.comparison_success(now))
-                && matches!(self.health.get(candidate), Some(ExitHealth::Healthy { since }) if now.elapsed_since(*since) >= cfg.failback_hold)
+                && matches!(self.health.get(candidate), Some(ExitHealth::Healthy { since, confirmed: true }) if now.elapsed_since(*since) >= cfg.failback_hold)
             {
                 self.activate(now, current, candidate, true, cfg, actions);
                 break;

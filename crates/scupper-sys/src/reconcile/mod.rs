@@ -263,6 +263,17 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         clock: C,
     ) -> io::Result<Self> {
         let persisted = store.read()?;
+        Self::with_state(kernel, store, log, config, held, clock, persisted)
+    }
+    pub(crate) fn with_state(
+        kernel: K,
+        store: S,
+        log: LogHandle,
+        config: Config,
+        held: Arc<NetnsHandle>,
+        clock: C,
+        persisted: State,
+    ) -> io::Result<Self> {
         if persisted.applied_version != Some(config.stamp.version) {
             return Err(io::Error::other("applied version mismatch"));
         }
@@ -311,6 +322,14 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
     pub fn health(&self) -> &BTreeMap<ExitId, scupper_core::failover::ExitHealth> {
         self.failover.health()
     }
+    /// The retained active route still awaits path confirmation.
+    pub fn unconfirmed(&self) -> bool {
+        self.failover.unconfirmed()
+    }
+    /// Verdict from the most recent tick, including unconfirmed handoffs.
+    pub fn verdict(&self) -> Option<VerdictCode> {
+        self.verdict
+    }
     /// Active exit to probe, or the selected recovery candidate while closed.
     /// Deliberate disconnection does not schedule network work.
     pub fn probe_exit(&self) -> Option<ExitId> {
@@ -353,6 +372,11 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         {
             return;
         }
+        let Ok(_guard) = WriterLock::acquire_timeout(&self.config.run_root, self.config.lock_wait)
+        else {
+            return;
+        };
+        self.kernel.begin_tick();
         let safety = self.kernel.observe(&self.held);
         let observed =
             self.kernel
@@ -385,8 +409,42 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                     .resume_verified((self.clock)().0, exit, &self.failover_config)
             {
                 self.actions.clear();
+                let _ = self.log.emit(
+                    EventKind::ExitHealthChanged {
+                        exit: scupper_proto::Identifier::from(exit),
+                        from: scupper_proto::Health::Unknown,
+                        to: scupper_proto::Health::Unconfirmed,
+                    },
+                    Actor::Daemon,
+                    self.persisted.applied_version,
+                );
                 break;
             }
+        }
+    }
+    /// Complete an interrupted route transition before daemon readiness.
+    /// A normal start with no marker performs no conntrack operation.
+    ///
+    /// # Errors
+    /// Returns lock, marker inspection, flush or durable removal failures.
+    pub fn recover_route_switch(&self) -> io::Result<()> {
+        let _guard = WriterLock::acquire_timeout(&self.config.run_root, self.config.lock_wait)?;
+        match std::fs::symlink_metadata(self.config.run_root.join("route-switch")) {
+            Ok(_) => {
+                self.kernel
+                    .execute(&Step::FlushConntrack)
+                    .map_err(|e| io::Error::other(e.0))?;
+                self.clear_route_switch()
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+    fn clear_route_switch(&self) -> io::Result<()> {
+        match std::fs::remove_file(self.config.run_root.join("route-switch")) {
+            Ok(()) => crate::fs::Fs::sync_dir(&crate::fs::RealFs, &self.config.run_root),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
         }
     }
     /// Current memory quarantine, including a latch whose durable write failed.
@@ -403,6 +461,25 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
     }
     fn feed(&mut self, now: MonoTime, input: FailoverInput) {
         let (next, actions) = self.failover.step(now, input, &self.failover_config);
+        for (exit, health) in next.health() {
+            let to = public_health(health);
+            let from = self
+                .failover
+                .health()
+                .get(exit)
+                .map_or(scupper_proto::Health::Unknown, public_health);
+            if from != to {
+                let _ = self.log.emit(
+                    EventKind::ExitHealthChanged {
+                        exit: scupper_proto::Identifier::from(exit),
+                        from,
+                        to,
+                    },
+                    Actor::Daemon,
+                    self.persisted.applied_version,
+                );
+            }
+        }
         self.failover = next;
         self.actions.extend(actions);
     }
@@ -746,6 +823,8 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             || *self.failover.desired_route() == scupper_core::render::RouteTarget::Unreachable
         {
             VerdictCode::FailClosed
+        } else if self.unconfirmed() {
+            VerdictCode::Degraded
         } else {
             VerdictCode::Protected
         };
@@ -1166,6 +1245,23 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             Step::ForwardingOn { .. } if self.latch.is_some() => {
                 Err(StepError("quarantine blocks forwarding"))
             }
+            Step::RouteReplace { target, .. } => {
+                let bytes = format!("target={target:?}\ntime={}\n", (self.clock)().1);
+                crate::fs::durable_replace(
+                    &crate::fs::RealFs,
+                    &self.config.run_root.join("route-switch"),
+                    bytes.as_bytes(),
+                    0o600,
+                    &|_| Ok(()),
+                    &|_| Ok(()),
+                )
+                .map_err(|_| StepError("route switch marker write failed"))
+                .and_then(|()| self.kernel.execute(step))
+            }
+            Step::FlushConntrack => self.kernel.execute(step).and_then(|()| {
+                self.clear_route_switch()
+                    .map_err(|_| StepError("route switch marker removal failed"))
+            }),
             _ => self.kernel.execute(step),
         };
         if result.is_ok()
@@ -1474,4 +1570,20 @@ fn phase_a_unknown(model: &KernelModel) -> bool {
                 || link.ours == Known::Unknown
                 || link.up == Known::Unknown
         })
+}
+
+fn public_health(health: &scupper_core::failover::ExitHealth) -> scupper_proto::Health {
+    use scupper_core::failover::ExitHealth;
+    match health {
+        ExitHealth::Unknown => scupper_proto::Health::Unknown,
+        ExitHealth::Healthy {
+            confirmed: false, ..
+        } => scupper_proto::Health::Unconfirmed,
+        ExitHealth::Healthy {
+            confirmed: true, ..
+        } => scupper_proto::Health::Healthy,
+        ExitHealth::Suspect { .. } => scupper_proto::Health::Suspect,
+        ExitHealth::Down { .. } => scupper_proto::Health::Down,
+        ExitHealth::Recovering { .. } => scupper_proto::Health::Recovering,
+    }
 }

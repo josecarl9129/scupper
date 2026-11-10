@@ -121,6 +121,7 @@ struct CacheSystem {
     root: PathBuf,
     calls: Arc<AtomicUsize>,
     live: String,
+    delay: Duration,
 }
 const RULES: &str = r#"{"nftables":[{"table":{"family":"inet","name":"scupper"}}]}"#;
 impl System for CacheSystem {
@@ -136,12 +137,13 @@ impl System for CacheSystem {
             root: self.root.clone(),
             calls: self.calls.clone(),
             live: self.live.clone(),
+            delay: self.delay,
         }))
     }
     fn run(&self, program: Program, _: &[String], _: Duration) -> Result<ExecOutput, ExecError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         if program == Program::Unshare {
-            std::thread::sleep(Duration::from_millis(200));
+            std::thread::sleep(self.delay);
         }
         Ok(ExecOutput {
             status: Some(0),
@@ -346,6 +348,7 @@ fn healthy_daemon_start_and_restart_never_close_with_cold_cache_and_slow_state()
                 cache: RefCell::default(),
                 root: root.clone(),
                 calls: Arc::default(),
+                delay: Duration::from_millis(200),
                 live: RULES.into(),
             };
             let held = Arc::new(scupper_sys::netns::testing::handle().unwrap());
@@ -403,6 +406,7 @@ fn safety_cache_misses_and_confirmations_never_wait_on_worker_io() {
         cache: RefCell::default(),
         root: root.clone(),
         calls: Arc::default(),
+        delay: Duration::from_millis(1500),
         live: RULES.into(),
     };
     let held = scupper_sys::netns::testing::handle().unwrap();
@@ -417,20 +421,20 @@ fn safety_cache_misses_and_confirmations_never_wait_on_worker_io() {
         Err(scupper_sys::verdict::ProbeError::Timeout)
     ));
     assert!(canon::netns_rulesets_safety(&system, &held, "rendered").is_err());
-    assert!(started.elapsed() < Duration::from_millis(100));
-    std::thread::sleep(Duration::from_millis(250));
+    assert!(started.elapsed() < Duration::from_millis(1200));
+    std::thread::sleep(Duration::from_millis(600));
     assert!(canon::netns_rulesets_safety(&system, &held, "rendered").is_ok());
     // A changed live JSON cannot inherit a previously verified observation.
     system.live = r#"{"nftables":[]}"#.into();
     let started = Instant::now();
     assert!(canon::netns_rulesets_safety(&system, &held, "rendered").is_err());
-    assert!(started.elapsed() < Duration::from_millis(100));
-    // Returning to the verified live JSON keeps traffic while confirmation is pending.
+    assert!(started.elapsed() < Duration::from_millis(1200));
+    // Returning to the verified live JSON is a memory cache hit while confirmation is pending.
     system.live = RULES.into();
     assert!(canon::netns_rulesets_safety(&system, &held, "rendered").is_ok());
     // Different render inputs cannot use that verified result while pending.
     assert!(canon::netns_rulesets_safety(&system, &held, "other render").is_err());
-    std::thread::sleep(Duration::from_millis(250));
+    std::thread::sleep(Duration::from_millis(600));
     fs::remove_dir_all(root).unwrap();
 }
 

@@ -12,7 +12,7 @@ use std::{
     fmt::Write as _,
     fs,
     io::{self, Write},
-    os::unix::net::UnixDatagram,
+    os::unix::{fs::PermissionsExt, net::UnixDatagram},
     path::Path,
     sync::{
         Arc, Mutex,
@@ -110,6 +110,7 @@ struct DaemonGuard<'a> {
     notify: Option<NotifyCapture>,
 }
 impl DaemonGuard<'_> {
+    #[allow(clippy::too_many_lines)] // Keep start/restart continuity and fault cleanup ordering together.
     fn run(&mut self, case: &str) -> Result<String> {
         let root = self.lab.prepare_check_v2()?;
         self.lab.boot_gateway(&[], "daemon-boot")?;
@@ -166,6 +167,12 @@ impl DaemonGuard<'_> {
         drop(self.child.take());
         self.child = Some(self.lab.daemon_spawn(case, &root, "restart")?);
         self.lab.daemon_ready_tick(notify)?;
+        let replies_at_restart = flow_counts(&flow)?.1;
+        self.lab.daemon_wait(
+            "continuity reply after restart READY",
+            Duration::from_secs(2),
+            |_| Ok(flow_counts(&flow)?.1 > replies_at_restart),
+        )?;
         self.lab.service_check(&mut Vec::new())?;
         if before != self.lab.daemon_snapshot()? {
             return fail("daemon restart changed healthy kernel state");
@@ -1109,7 +1116,9 @@ fn save_event_artifacts(source: &Path, target: &Path) -> Result<()> {
     for entry in fs::read_dir(source)? {
         let entry = entry?;
         if entry.file_type()?.is_file() {
-            fs::copy(entry.path(), target.join(entry.file_name()))?;
+            let copy = target.join(entry.file_name());
+            fs::copy(entry.path(), &copy)?;
+            fs::set_permissions(copy, fs::Permissions::from_mode(0o644))?;
         }
     }
     Ok(())
@@ -1185,6 +1194,31 @@ fn daemon_wanted(case: &str) -> &'static str {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copied_event_artifacts_are_readable_without_changing_sources() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/daemon-event-artifacts")
+            .join(std::process::id().to_string());
+        let source = root.join("source");
+        let target = root.join("saved");
+        fs::create_dir_all(&source).unwrap();
+        let event = source.join("2026-11.jsonl");
+        fs::write(&event, b"event\n").unwrap();
+        fs::set_permissions(&event, fs::Permissions::from_mode(0o640)).unwrap();
+        save_event_artifacts(&source, &target).unwrap();
+        assert_eq!(
+            fs::metadata(&event).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        let saved = target.join("2026-11.jsonl");
+        assert_eq!(
+            fs::metadata(&saved).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(fs::read(saved).unwrap(), b"event\n");
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn notify_artifact_keeps_every_message_even_when_consumers_drain() {

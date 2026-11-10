@@ -89,37 +89,115 @@ fn unix() -> u64 {
 }
 type Machine<'a> = Reconciler<RealKernel<'a>, StateFile, Box<dyn Fn() -> (MonoTime, u64)>>;
 
-fn initialize(
-    deps: BootDeps<'_>,
+// One owned read job survives startup timeouts. Retained inputs make canon retries
+// channel-only; no configuration, state, boot report or namespace is reopened.
+struct StartupInputs {
+    state: StateFile,
+    kernel_state: StateFile,
+    saved: crate::state::State,
+    text: String,
+    report: BootReport,
+    held: Arc<NetnsHandle>,
+}
+#[derive(Default)]
+struct StartupRead {
+    pending: Option<Receiver<io::Result<StartupInputs>>>,
+    ready: Option<StartupInputs>,
+}
+impl StartupRead {
+    fn load(&mut self, deps: &BootDeps<'_>, deadline: Instant) -> io::Result<&StartupInputs> {
+        if self.ready.is_none() {
+            if self.pending.is_none() {
+                let state_root = deps.state_root.to_path_buf();
+                let config_root = deps.config_root.to_path_buf();
+                let run_root = deps.run_root.to_path_buf();
+                let (send, receive) = mpsc::sync_channel(1);
+                std::thread::Builder::new()
+                    .name("scupper-startup-read".into())
+                    .spawn(move || {
+                        let result = (|| {
+                            let state = StateFile::open(&state_root, None)?;
+                            let StateRead::Present(saved) = state.read()? else {
+                                return Err(io::Error::other("missing safety state"));
+                            };
+                            let version = saved
+                                .applied_version
+                                .ok_or_else(|| io::Error::other("no applied version"))?;
+                            let (text, _) = VersionStore::read_only(&state_root, &config_root)
+                                .read(version)
+                                .map_err(io::Error::other)?;
+                            let report: BootReport =
+                                serde_json::from_str(&RealFs.read(&run_root.join("boot.json"))?)
+                                    .map_err(io::Error::other)?;
+                            let expected = report.netns.ok_or_else(|| {
+                                io::Error::other("missing boot namespace identity")
+                            })?;
+                            let held = Arc::new(
+                                NetnsHandle::open_expected(
+                                    "/run/netns/scupper",
+                                    Some((expected.dev, expected.ino)),
+                                )
+                                .map_err(io::Error::other)?,
+                            );
+                            let kernel_state = StateFile::open(&state_root, None)?;
+                            Ok(StartupInputs {
+                                state,
+                                kernel_state,
+                                saved,
+                                text,
+                                report,
+                                held,
+                            })
+                        })();
+                        let _ = send.send(result);
+                    })?;
+                self.pending = Some(receive);
+            }
+            let result = self
+                .pending
+                .as_ref()
+                .ok_or_else(|| io::Error::other("missing startup worker"))?
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .map_err(|e| match e {
+                    mpsc::RecvTimeoutError::Timeout => {
+                        io::Error::new(io::ErrorKind::TimedOut, "startup reads pending")
+                    }
+                    mpsc::RecvTimeoutError::Disconnected => {
+                        io::Error::other("startup read worker stopped")
+                    }
+                })?;
+            self.pending = None;
+            self.ready = Some(result?);
+        }
+        self.ready
+            .as_ref()
+            .ok_or_else(|| io::Error::other("missing startup inputs"))
+    }
+}
+fn initialize<'a>(
+    deps: BootDeps<'a>,
     gateway: GatewayId,
     log: crate::events::LogHandle,
     origin: Instant,
     canon_deadline: Instant,
-) -> io::Result<(Machine<'_>, Arc<NetnsHandle>, Config)> {
-    let state = StateFile::open(deps.state_root, None)?;
-    let StateRead::Present(saved) = state.read()? else {
-        return Err(io::Error::other("missing safety state"));
-    };
-    let version = saved
+    inputs: &mut StartupRead,
+) -> io::Result<(Machine<'a>, Arc<NetnsHandle>, Config)> {
+    let loaded = inputs.load(&deps, canon_deadline)?;
+    let site = validate(parse_site(&loaded.text).map_err(io::Error::other)?)
+        .map_err(|_| io::Error::other("invalid applied configuration"))?;
+    let version = loaded
+        .saved
         .applied_version
         .ok_or_else(|| io::Error::other("no applied version"))?;
-    let store = VersionStore::read_only(deps.state_root, deps.config_root);
-    let (text, _) = store.read(version).map_err(io::Error::other)?;
-    let site = validate(parse_site(&text).map_err(io::Error::other)?)
-        .map_err(|_| io::Error::other("invalid applied configuration"))?;
     let stamp = VersionStamp {
         version,
-        sha256: Sha256::digest(text.as_bytes()).into(),
+        sha256: Sha256::digest(loaded.text.as_bytes()).into(),
     };
-    let report: BootReport = serde_json::from_str(&RealFs.read(&deps.run_root.join("boot.json"))?)
-        .map_err(io::Error::other)?;
-    let expected = report
+    let held = loaded.held.clone();
+    let expected = loaded
+        .report
         .netns
         .ok_or_else(|| io::Error::other("missing boot namespace identity"))?;
-    let held = Arc::new(
-        NetnsHandle::open_expected("/run/netns/scupper", Some((expected.dev, expected.ino)))
-            .map_err(io::Error::other)?,
-    );
     let rendered = render_netns(&site, &gateway, &stamp).map_err(io::Error::other)?;
     let want = canon::prepare_netns_ruleset(deps.system, &held, &rendered, canon_deadline)
         .map_err(|error| match error {
@@ -146,13 +224,17 @@ fn initialize(
         version,
     )
     .map_err(io::Error::other)?;
-    let kernel = RealKernel::from_boot_file(
+    let loaded = inputs
+        .ready
+        .take()
+        .ok_or_else(|| io::Error::other("missing startup inputs"))?;
+    let kernel = RealKernel::from_boot_report(
         deps,
         held.clone(),
         &config,
         health,
-        "/run/netns/scupper".into(),
-        None,
+        loaded.report,
+        loaded.kernel_state,
     )?;
     let machine_config = Config {
         site: config.site.clone(),
@@ -162,14 +244,16 @@ fn initialize(
         run_root: config.run_root.clone(),
         lock_wait: config.lock_wait,
     };
-    let mut machine = Reconciler::new(
+    let mut machine = Reconciler::with_state(
         kernel,
-        state,
+        loaded.state,
         log,
         machine_config,
         held.clone(),
         Box::new(move || (MonoTime(origin.elapsed()), unix())) as Box<dyn Fn() -> (MonoTime, u64)>,
+        loaded.saved,
     )?;
+    machine.recover_route_switch()?;
     machine.resume_existing();
     Ok((machine, held, config))
 }
@@ -305,6 +389,7 @@ pub fn run(options: &Options, stop: &AtomicBool) -> io::Result<()> {
         notify,
         running: None,
         pending_canon: false,
+        startup_read: StartupRead::default(),
         probes: probes::Probes::new(options.probe_binary.clone(), origin)
             .with_uplink(uplink_addresses(&system).unwrap_or_default()),
         setup_at: None,
@@ -324,6 +409,7 @@ struct Runtime<'a> {
     notify: notify::Notify,
     running: Option<(Machine<'a>, Arc<NetnsHandle>, Config)>,
     pending_canon: bool,
+    startup_read: StartupRead,
     probes: probes::Probes,
     edge_logged: bool,
     setup_at: Option<Instant>,
@@ -352,6 +438,7 @@ impl Runtime<'_> {
             self.audit.handle(),
             self.origin,
             deadline,
+            &mut self.startup_read,
         ) {
             Ok(machine) => {
                 self.pending_canon = false;
@@ -381,12 +468,23 @@ impl DaemonDeps for Runtime<'_> {
         std::thread::sleep(duration);
     }
     fn started(&mut self) {
+        if self.running.is_none() {
+            return;
+        }
         if let Err(error) = self.notify.started() {
             eprintln!("scupperd: notify: {error}");
         }
     }
     fn notify(&mut self, iteration: &Iteration) {
-        if let Err(error) = self.notify.iteration(iteration.complete, iteration.status) {
+        let Some((machine, _, _)) = &self.running else {
+            return;
+        };
+        let status = if machine.unconfirmed() {
+            "unconfirmed; reconciling"
+        } else {
+            iteration.status
+        };
+        if let Err(error) = self.notify.iteration(iteration.complete, status) {
             eprintln!("scupperd: notify: {error}");
         }
     }
@@ -397,6 +495,7 @@ impl DaemonDeps for Runtime<'_> {
         }
     }
     fn initialize(&mut self) {
+        self.startup_read.ready = None;
         self.initialize_until(Instant::now() + canon::CANON_TIMEOUT + crate::system::EXEC_TIMEOUT);
     }
     fn run_root(&self) -> &Path {
@@ -448,9 +547,9 @@ impl DaemonDeps for Runtime<'_> {
         // A cold canonicalization timeout is Unknown, not an invalid boot
         // handoff. Poll its existing worker and contain without consuming a boot.
         if self.pending_canon && !stop.load(Ordering::Relaxed) {
-            self.initialize_until(now);
+            close_only(&self.deps(), self.options);
+            self.initialize_until(now + Duration::from_millis(100));
             if self.pending_canon {
-                close_only(&self.deps(), self.options);
                 return Some(crate::reconcile::TickReport::default());
             }
         }
@@ -608,4 +707,229 @@ fn close_only(deps: &BootDeps<'_>, options: &Options) {
         return;
     };
     let _ = crate::reconcile::forwarding_gates(deps, &held, false, None);
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "testing")]
+    #[test]
+    #[allow(clippy::too_many_lines)] // Exercise production timeout, retry and handoff ordering together.
+    fn production_initialize_retries_only_canon_then_recovers_before_handoff() {
+        use crate::{
+            canon::CanonCache,
+            system::{ExecError, ExecOutput, ExecTarget, Program, System},
+        };
+        use std::{cell::RefCell, sync::atomic::AtomicUsize};
+        const RULES: &str = r#"{"nftables":[]}"#;
+        struct StartupSystem {
+            cache: RefCell<CanonCache>,
+            root: PathBuf,
+            reads: Arc<AtomicUsize>,
+            flushes: Arc<AtomicUsize>,
+        }
+        impl System for StartupSystem {
+            fn canon_cache(&self) -> Option<(&RefCell<CanonCache>, &Path)> {
+                Some((&self.cache, &self.root))
+            }
+            fn canon_run_root(&self) -> &Path {
+                &self.root
+            }
+            fn canon_worker(&self) -> Option<Box<dyn System + Send>> {
+                Some(Box::new(Self {
+                    cache: RefCell::default(),
+                    root: self.root.clone(),
+                    reads: self.reads.clone(),
+                    flushes: self.flushes.clone(),
+                }))
+            }
+            fn run(&self, p: Program, _: &[String], _: Duration) -> Result<ExecOutput, ExecError> {
+                if p == Program::Unshare {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                Ok(ExecOutput {
+                    status: Some(0),
+                    stdout: if p == Program::Unshare {
+                        RULES.into()
+                    } else {
+                        "nft v1".into()
+                    },
+                    stderr: String::new(),
+                })
+            }
+            fn run_in(
+                &self,
+                _: ExecTarget<'_>,
+                p: Program,
+                args: &[String],
+                _: Duration,
+            ) -> Result<ExecOutput, ExecError> {
+                if p == Program::Conntrack {
+                    self.flushes.fetch_add(1, Ordering::Relaxed);
+                }
+                if p == Program::Nft {
+                    self.reads.fetch_add(1, Ordering::Relaxed);
+                }
+                let stdout = if p == Program::Nft {
+                    RULES.into()
+                } else if p == Program::Ip && args.iter().any(|arg| arg == "addr") {
+                    r#"[{"ifindex":1,"ifname":"eth0","addr_info":[{"family":"inet","local":"203.0.113.1","prefixlen":24,"scope":"global"}]}]"#.into()
+                } else {
+                    "[]".into()
+                };
+                Ok(ExecOutput {
+                    status: Some(0),
+                    stdout,
+                    stderr: String::new(),
+                })
+            }
+            fn now_unix_secs(&self) -> u64 {
+                100
+            }
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/production-initialize")
+            .join(std::process::id().to_string());
+        std::fs::create_dir_all(&root).unwrap();
+        let text = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../scupper-core/tests/fixtures/site-m2.toml"
+        ))
+        .to_owned();
+        let held = Arc::new(crate::netns::testing::handle().unwrap());
+        let (dev, ino) = held.identity();
+        let report = BootReport {
+            steps: vec![
+                boot::StepResult {
+                    step: boot::BootStep::Lock,
+                    error: None,
+                    adopted: true
+                };
+                8
+            ],
+            applied_version: Some(1),
+            netns: Some(boot::NamespaceIdentity { dev, ino }),
+            owned_links: std::collections::BTreeMap::from([
+                ("wg0".into(), 1),
+                ("ex-ch1".into(), 2),
+            ]),
+            ..BootReport::default()
+        };
+        let mut inputs = StartupRead {
+            pending: None,
+            ready: Some(StartupInputs {
+                state: StateFile::open(&root, None).unwrap(),
+                kernel_state: StateFile::open(&root, None).unwrap(),
+                saved: crate::state::State {
+                    applied_version: Some(1),
+                    ..crate::state::State::default()
+                },
+                text,
+                report,
+                held,
+            }),
+        };
+        let system = StartupSystem {
+            cache: RefCell::default(),
+            root: root.clone(),
+            reads: Arc::default(),
+            flushes: Arc::default(),
+        };
+        let deps = || BootDeps {
+            system: &system,
+            namespace: &GatewayNamespace,
+            state_root: &root,
+            config_root: &root,
+            run_root: &root,
+            hook: None,
+            secret_owner: 0,
+        };
+        let log = EventLog::memory_only(GatewayId("gw1".into()), || UnixSeconds(100)).unwrap();
+        let attempt = |inputs: &mut StartupRead, wait| {
+            initialize(
+                deps(),
+                GatewayId("gw1".into()),
+                log.handle.clone(),
+                Instant::now(),
+                Instant::now() + wait,
+                inputs,
+            )
+        };
+        let error = attempt(&mut inputs, Duration::from_millis(5))
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(inputs.ready.is_some());
+        assert_eq!(
+            system.reads.load(Ordering::Relaxed),
+            0,
+            "handoff observed before canon completed"
+        );
+        // No state/version/boot files exist: retry must use the retained inputs.
+        std::fs::write(root.join("route-switch"), b"target=exit\ntime=100\n").unwrap();
+        let (_machine, _, _) = attempt(&mut inputs, Duration::from_secs(3)).unwrap();
+        assert!(inputs.ready.is_none());
+        assert_eq!(system.flushes.load(Ordering::Relaxed), 1);
+        assert!(!root.join("route-switch").exists());
+        assert!(
+            system.reads.load(Ordering::Relaxed) > 0,
+            "production initialization skipped handoff observation"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_retry_waits_are_bounded_while_the_same_input_read_is_stalled() {
+        use std::io::Write;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/startup-read-bound")
+            .join(std::process::id().to_string());
+        std::fs::create_dir_all(&root).unwrap();
+        let fifo = root.join("state.json");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let system = RealSystem::new(crate::system::Programs::default());
+        let deps = BootDeps {
+            system: &system,
+            namespace: &GatewayNamespace,
+            state_root: &root,
+            config_root: &root,
+            run_root: &root,
+            #[cfg(feature = "testing")]
+            hook: None,
+            #[cfg(feature = "testing")]
+            secret_owner: 0,
+        };
+        let mut reader = StartupRead::default();
+        for _ in 0..3 {
+            let started = Instant::now();
+            let error = reader
+                .load(&deps, started + Duration::from_millis(25))
+                .err()
+                .unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert!(started.elapsed() < Duration::from_millis(250));
+            assert!(reader.pending.is_some());
+        }
+        let writer = std::thread::spawn(move || {
+            let mut file = std::fs::OpenOptions::new().write(true).open(fifo).unwrap();
+            file.write_all(&serde_json::to_vec(&crate::state::State::default()).unwrap())
+                .unwrap();
+        });
+        let error = reader
+            .load(&deps, Instant::now() + Duration::from_secs(2))
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), "no applied version");
+        writer.join().unwrap();
+        assert!(reader.pending.is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

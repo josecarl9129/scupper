@@ -64,6 +64,18 @@ impl<'a> RealKernel<'a> {
         namespace_path: PathBuf,
         edge_path: Option<PathBuf>,
     ) -> std::io::Result<Self> {
+        let state = crate::state::StateFile::open(deps.state_root, None)?;
+        Self::with_state(deps, held, config, health, namespace_path, edge_path, state)
+    }
+    fn with_state(
+        deps: BootDeps<'a>,
+        held: Arc<NetnsHandle>,
+        config: &Config,
+        health: HealthConfigV2,
+        namespace_path: PathBuf,
+        edge_path: Option<PathBuf>,
+        state: crate::state::StateFile,
+    ) -> std::io::Result<Self> {
         let desired = config.desired(
             &scupper_core::verdict::v2::Selection::Auto,
             &scupper_core::render::RouteTarget::Unreachable,
@@ -77,7 +89,6 @@ impl<'a> RealKernel<'a> {
             .iter()
             .map(|e| (e.id().clone(), e.private_key_ref().clone()))
             .collect();
-        let state = crate::state::StateFile::open(deps.state_root, None)?;
         Ok(Self {
             deps,
             held,
@@ -110,13 +121,35 @@ impl<'a> RealKernel<'a> {
         let report: BootReport =
             serde_json::from_slice(&std::fs::read(deps.run_root.join("boot.json"))?)
                 .map_err(std::io::Error::other)?;
+        let state = crate::state::StateFile::open(deps.state_root, None)?;
+        let mut kernel = Self::from_boot_report(deps, held, config, health, report, state)?;
+        kernel.namespace_path = namespace_path;
+        kernel.edge_path = RefCell::new(edge_path);
+        Ok(kernel)
+    }
+    pub(crate) fn from_boot_report(
+        deps: BootDeps<'a>,
+        held: Arc<NetnsHandle>,
+        config: &Config,
+        health: HealthConfigV2,
+        report: BootReport,
+        state: crate::state::StateFile,
+    ) -> std::io::Result<Self> {
         if !report.succeeded()
             || report.applied_version != Some(config.stamp.version)
             || report.netns.map(|n| (n.dev, n.ino)) != Some(held.identity())
         {
             return Err(std::io::Error::other("invalid boot handoff"));
         }
-        let kernel = Self::new(deps, held, config, health, namespace_path, edge_path)?;
+        let kernel = Self::with_state(
+            deps,
+            held,
+            config,
+            health,
+            "/run/netns/scupper".into(),
+            None,
+            state,
+        )?;
         if kernel
             .desired
             .links()
