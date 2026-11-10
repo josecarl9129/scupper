@@ -860,3 +860,109 @@ fn ping_followed_by_connection_refused_is_unsupervised() {
     assert_eq!(code, 5, "{out}: {err}");
     worker.join().unwrap();
 }
+
+#[test]
+fn hung_check_keeps_real_ruleset_violations_and_retries_rebuilt_namespaces() {
+    use scupper_core::verdict::v2::{NetnsIdentity, Selection};
+    use scupper_proto::{Op, OpResult, OperationKind, OperationProgress, Response, Schema};
+    use std::{io::Write, os::unix::net::UnixListener};
+
+    // Stable snapshots must preserve a real alarm. An operation may explain a
+    // transitional ruleset; a completed rebuild instead requires fresh checks.
+    for (device_changed, inode_changed, violation, operation, expected) in [
+        (false, false, true, false, 2),
+        (false, false, true, true, 3),
+        (false, true, false, false, 0),
+        (true, false, false, false, 0),
+        (false, true, true, false, 2),
+    ] {
+        let sys = Script::new("ubuntu-24.04");
+        fresh(&sys);
+        let held = testing::handle().unwrap();
+        let text = support::site_text(&sys.runner)
+            .replace("require_daemon = false", "require_daemon = true");
+        let root = Root::with_text(&text, &held);
+        // Make state and both Pings explicitly agree on the applied version.
+        let state_path = root.path.join("state.json");
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        state["applied_version"] = 1.into();
+        std::fs::write(state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+        if violation {
+            sys.replace("scupper-nft-ruleset.json", r#"{"nftables":[]}"#);
+        }
+        let (device, inode) = held.identity();
+        let listener = UnixListener::bind(root.path.join("control.sock")).unwrap();
+        let worker = std::thread::spawn(move || {
+            let ping = |netns, operation| OpResult::Ping {
+                last_complete_iteration_age: Some(0),
+                current_iteration_age: None,
+                operation,
+                netns,
+                version: 1,
+                quarantined: false,
+                selection: Selection::Auto,
+            };
+            let respond = |stream: &mut std::os::unix::net::UnixStream, result| {
+                let request = scupper_sys::daemon::control::read_request(&*stream).unwrap();
+                assert_eq!(request.op, Op::Ping {});
+                serde_json::to_writer(
+                    &mut *stream,
+                    &Response {
+                        request_id: request.request_id,
+                        schema: Schema,
+                        replayed: false,
+                        observed_at: None,
+                        result: Ok(result),
+                    },
+                )
+                .unwrap();
+                stream.write_all(b"\n").unwrap();
+            };
+            let (mut initial, _) = listener.accept().unwrap();
+            respond(
+                &mut initial,
+                ping(
+                    NetnsIdentity {
+                        device: device + u64::from(device_changed),
+                        inode: inode + u64::from(inode_changed),
+                    },
+                    None,
+                ),
+            );
+            let (hung, _) = listener.accept().unwrap();
+            let request = scupper_sys::daemon::control::read_request(&hung).unwrap();
+            assert_eq!(request.op, Op::Check {});
+            // Keep Check open while serving the final Ping independently.
+            let final_operation = operation.then_some(OperationProgress {
+                kind: OperationKind::Rebuild,
+                from: 1,
+                to: 1,
+                age: 1,
+            });
+            let (mut final_ping, _) = listener.accept().unwrap();
+            respond(
+                &mut final_ping,
+                ping(NetnsIdentity { device, inode }, final_operation),
+            );
+            if (device_changed || inode_changed) && violation {
+                let (mut repeated, _) = listener.accept().unwrap();
+                respond(&mut repeated, ping(NetnsIdentity { device, inode }, None));
+            }
+            drop(hung);
+        });
+        let (code, out, err) = run(&sys, &root, &["check", "--json"]);
+        assert_eq!(code, expected, "{out}: {err}");
+        let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(report["config_version"], 1);
+        if expected == 2 {
+            assert!(out.contains("Ruleset"), "{out}");
+        }
+        if expected == 3 {
+            assert!(out.contains("OperationInProgress"), "{out}");
+        }
+        // A retry writes only its final report.
+        assert_eq!(out.lines().count(), 1);
+        worker.join().unwrap();
+    }
+}

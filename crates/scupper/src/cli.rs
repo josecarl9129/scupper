@@ -597,6 +597,7 @@ fn status_json(
     writeln!(stdout).map_err(output_error)
 }
 
+#[allow(clippy::too_many_lines)] // Keep the single bounded retry beside the final verdict.
 fn m2_check(
     deps: &Dependencies<'_>,
     config: &AppliedConfig,
@@ -606,88 +607,109 @@ fn m2_check(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<u8, String> {
-    let handle = match deps.namespaces.open_gateway() {
-        Ok(handle) => handle,
-        Err(error) if status => {
-            return status_error(stdout, json, &error);
-        }
-        Err(error) => return Err(error),
-    };
-    let check_deps = scupper_sys::check_v2::Dependencies {
-        system: deps.system,
-        probe_exec: deps.probe_exec,
-        handle: handle.as_ref(),
-        state_root: deps.state_root,
-        run_root: deps.writer_root,
-    };
-    let check_config = scupper_sys::check_v2::Config {
-        site: &config.site,
-        gateway: &config.gateway,
-        stamp: config.stamp,
-    };
-    let (result, mut observations) = if status {
-        scupper_sys::check_v2::run_with_observations(&check_deps, &check_config)
-    } else {
-        scupper_sys::check_v2::run_with_supervisor(&check_deps, &check_config, supervisor)
-    };
-    if status {
-        redact_endpoints(&mut observations);
-        if json {
-            status_json(stdout, &result, &observations)?;
+    let mut refreshed_config = None;
+    let mut supervisor = supervisor;
+    loop {
+        let config = refreshed_config.as_ref().unwrap_or(config);
+        let handle = match deps.namespaces.open_gateway() {
+            Ok(handle) => handle,
+            Err(error) if status => {
+                return status_error(stdout, json, &error);
+            }
+            Err(error) => return Err(error),
+        };
+        let check_deps = scupper_sys::check_v2::Dependencies {
+            system: deps.system,
+            probe_exec: deps.probe_exec,
+            handle: handle.as_ref(),
+            state_root: deps.state_root,
+            run_root: deps.writer_root,
+        };
+        let check_config = scupper_sys::check_v2::Config {
+            site: &config.site,
+            gateway: &config.gateway,
+            stamp: config.stamp,
+        };
+        let (result, mut observations) = if status {
+            scupper_sys::check_v2::run_with_observations(&check_deps, &check_config)
+        } else {
+            scupper_sys::check_v2::run_with_supervisor(&check_deps, &check_config, supervisor)
+        };
+        if status {
+            redact_endpoints(&mut observations);
+            if json {
+                status_json(stdout, &result, &observations)?;
+                return Ok(0);
+            }
+            writeln!(
+                stdout,
+                "M2 observations (None = not requested):\n{observations:#?}"
+            )
+            .map_err(output_error)?;
+            match result {
+                Ok(report) => writeln!(stdout, "{}", report.verdict).map_err(output_error)?,
+                Err(error) => writeln!(stdout, "{error}").map_err(output_error)?,
+            }
             return Ok(0);
         }
-        writeln!(
-            stdout,
-            "M2 observations (None = not requested):\n{observations:#?}"
-        )
-        .map_err(output_error)?;
-        match result {
-            Ok(report) => writeln!(stdout, "{}", report.verdict).map_err(output_error)?,
-            Err(error) => writeln!(stdout, "{error}").map_err(output_error)?,
-        }
-        return Ok(0);
-    }
-    match result {
-        Ok(report) => {
-            if report.verdict.exit_code() == 2
-                && matches!(
-                    supervisor,
-                    scupper_core::verdict::v2::Supervisor::Alive { .. }
-                )
-                && let Some(code) = control::transition_after_observation(
-                    deps,
-                    config.stamp.version,
-                    json,
-                    stdout,
-                    stderr,
-                )?
-            {
-                return Ok(code);
-            }
-            if json {
-                serde_json::to_writer(&mut *stdout, &report).map_err(|error| error.to_string())?;
-                writeln!(stdout).map_err(output_error)?;
-            } else {
-                writeln!(stdout, "{}", report.verdict).map_err(output_error)?;
-                for warning in &report.warnings {
-                    writeln!(stderr, "warning: {warning:?}").map_err(output_error)?;
+        return match result {
+            Ok(report) => {
+                if report.verdict.exit_code() == 2
+                    && matches!(
+                        supervisor,
+                        scupper_core::verdict::v2::Supervisor::Alive { .. }
+                    )
+                    && let Some(outcome) = control::transition_after_observation(
+                        deps,
+                        config.stamp.version,
+                        supervisor,
+                        json,
+                        stdout,
+                        stderr,
+                    )?
+                {
+                    match outcome {
+                        control::ReadOutcome::Rendered(code) => return Ok(code),
+                        control::ReadOutcome::Local {
+                            supervisor: fresh,
+                            version,
+                        } if refreshed_config.is_none() => {
+                            refreshed_config = Some(
+                                m2_config_at(deps, version)?
+                                    .ok_or("not an M2 gateway (no /var/lib/scupper store)")?,
+                            );
+                            supervisor = fresh;
+                            continue;
+                        }
+                        control::ReadOutcome::Local { .. } => {}
+                    }
                 }
+                if json {
+                    serde_json::to_writer(&mut *stdout, &report)
+                        .map_err(|error| error.to_string())?;
+                    writeln!(stdout).map_err(output_error)?;
+                } else {
+                    writeln!(stdout, "{}", report.verdict).map_err(output_error)?;
+                    for warning in &report.warnings {
+                        writeln!(stderr, "warning: {warning:?}").map_err(output_error)?;
+                    }
+                }
+                Ok(report.verdict.exit_code())
             }
-            Ok(report.verdict.exit_code())
-        }
-        Err(error) => {
-            if json {
-                serde_json::to_writer(
+            Err(error) => {
+                if json {
+                    serde_json::to_writer(
                     &mut *stdout,
                     &serde_json::json!({"schema": 1, "error": json_error(Some(error.stage), &error.source.to_string())}),
                 )
                 .map_err(|error| error.to_string())?;
-                writeln!(stdout).map_err(output_error)?;
-                Ok(1)
-            } else {
-                Err(error.to_string())
+                    writeln!(stdout).map_err(output_error)?;
+                    Ok(1)
+                } else {
+                    Err(error.to_string())
+                }
             }
-        }
+        };
     }
 }
 

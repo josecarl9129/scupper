@@ -245,10 +245,7 @@ impl Dispatcher {
                 self.finish_admin(operation, result, now);
                 continue;
             }
-            if operation.receive.is_none()
-                && now >= operation.retry_at
-                && operation.deadline.saturating_duration_since(now) >= control::CHECK_TIMEOUT
-            {
+            if operation.receive.is_none() && now >= operation.retry_at {
                 operation.receive = backend.check(operation.deadline);
                 if operation.receive.is_none() && matches!(operation.request.op, Op::Check {}) {
                     self.finish_admin(
@@ -370,6 +367,14 @@ impl Runtime<'_> {
                     #[cfg(feature = "testing")]
                     secret_owner: 0,
                 };
+                #[cfg(feature = "testing")]
+                let trace = verification_trace::Trace::start(
+                    &system,
+                    &held,
+                    &config,
+                    deadline,
+                    &run_root.join("connect-verification.jsonl"),
+                );
                 let result = super::admin::check_live(
                     &deps,
                     &probes::ProbeCommand(binary),
@@ -383,6 +388,10 @@ impl Runtime<'_> {
                             .last_complete
                     },
                 );
+                #[cfg(feature = "testing")]
+                if let Some(trace) = trace {
+                    trace.finish(&result);
+                }
                 let _ = send.send(result);
             });
         receive
@@ -509,3 +518,7 @@ mod deadline_tests {
         }
     }
 }
+
+#[cfg(feature = "testing")]
+#[path = "verification_trace.rs"]
+mod verification_trace;

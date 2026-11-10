@@ -391,3 +391,41 @@ fn dispatcher_disconnect_survives_peer_hangup() {
     dispatcher.poll_admin(&mut rig, now);
     assert_eq!(receive.recv().unwrap().result, Ok(OpResult::Disconnect {}));
 }
+
+#[test]
+fn dispatcher_connect_observes_readiness_at_seven_seconds() {
+    let start = Instant::now();
+    let mut dispatcher = Dispatcher::default();
+    let mut rig = Rig::default();
+    let op = Op::Connect { exit: None };
+    let reply = enqueue(
+        &mut dispatcher,
+        &mut rig,
+        control::request(op.clone()),
+        start,
+        start + control::QUEUE_TIMEOUT,
+    );
+    // Every attempt before seven seconds sees an unqualified exit. Advance
+    // the dispatcher's monotonic clock without sleeping through the window.
+    for millis in (0..=7000).step_by(100) {
+        let now = start + Duration::from_millis(millis);
+        dispatcher.poll_admin(&mut rig, now);
+        let workers = std::mem::take(&mut *rig.workers.borrow_mut());
+        for worker in workers {
+            let mut observation = report(&op);
+            if millis < 7000 {
+                observation.verdict = Verdict::FailClosed(FailClosed::NoHealthyExit);
+            }
+            worker.send(Ok(observation)).unwrap();
+        }
+        dispatcher.poll_admin(&mut rig, now);
+        if millis < 7000 {
+            assert!(reply.try_recv().is_err());
+        }
+    }
+    assert!(matches!(
+        reply.try_recv().unwrap().result,
+        Ok(OpResult::Connect { .. })
+    ));
+    assert!(dispatcher.pending_admin.is_empty());
+}

@@ -334,23 +334,30 @@ pub(super) fn read(
 pub(super) fn transition_after_observation(
     deps: &Dependencies<'_>,
     version: u64,
+    supervisor: scupper_core::verdict::v2::Supervisor,
     json: bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
-) -> Result<Option<u8>, String> {
+) -> Result<Option<ReadOutcome>, String> {
     let ping = ping_supervisor(deps);
     let state_version = applied_version(deps);
-    let target = ping
-        .as_ref()
-        .map(|ping| ping.version)
-        .filter(|target| *target != version)
-        .or(state_version.filter(|target| *target != version));
-    let operation = ping
-        .and_then(|ping| ping.operation)
-        .or_else(|| version_transition(version, target));
-    if let Some(operation) = operation {
-        operation_report(&operation, json, out, err)?;
-        return Ok(Some(3));
+    if let Some(ping) = ping.as_ref() {
+        if let Some(operation) = &ping.operation {
+            return operation_report(operation, json, out, err).map(Some);
+        }
+        let identity = |supervisor| match supervisor {
+            scupper_core::verdict::v2::Supervisor::Alive { netns, .. } => Some(netns),
+            _ => None,
+        };
+        if ping.version != version || identity(ping.supervisor) != identity(supervisor) {
+            return Ok(Some(ReadOutcome::Local {
+                supervisor: ping.supervisor,
+                version: Some(ping.version),
+            }));
+        }
+    }
+    if let Some(operation) = version_transition(version, state_version) {
+        return operation_report(&operation, json, out, err).map(Some);
     }
     Ok(None)
 }

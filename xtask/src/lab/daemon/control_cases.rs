@@ -16,6 +16,14 @@ use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 
 fn session_continues(before: &str, after: &str) -> bool {
+    compare_sessions(before, after, false)
+}
+
+fn session_has_traffic(before: &str, after: &str) -> bool {
+    compare_sessions(before, after, true)
+}
+
+fn compare_sessions(before: &str, after: &str, traffic: bool) -> bool {
     let sessions = |text: &str| {
         text.lines()
             .filter_map(|line| {
@@ -37,7 +45,11 @@ fn session_continues(before: &str, after: &str) -> bool {
         && before.keys().eq(after.keys())
         && before.iter().all(|(key, (time, rx, tx))| {
             let (next_time, next_rx, next_tx) = after[key];
-            *time > 0 && next_time >= *time && next_rx > *rx && next_tx > *tx
+            *time > 0
+                && next_time >= *time
+                && next_rx >= *rx
+                && next_tx >= *tx
+                && (!traffic || (next_rx > *rx && next_tx > *tx))
         })
 }
 
@@ -50,11 +62,24 @@ impl DaemonGuard<'_> {
             .lab
             .artifacts
             .join(format!("{}-{stem}.stdout", self.case));
+        let trace_path = root.join("run/scupper/connect-verification.jsonl");
+        if args.contains(&"connect") {
+            fs::write(&trace_path, b"")?;
+        }
         let mut child = self.lab.runner.background(
             &Invocation::new("gwhost", binary.to_str().ok_or("binary path")?, &command),
             &output_path,
         )?;
         let status = child.wait_timeout(Duration::from_secs(245))?;
+        if args.contains(&"connect") {
+            fs::copy(
+                &trace_path,
+                self.lab
+                    .artifacts
+                    .join(format!("{}-{stem}-verification.jsonl", self.case)),
+            )?;
+            fs::remove_file(&trace_path)?;
+        }
         let output = fs::read_to_string(&output_path)?;
         let diagnostic = fs::read_to_string(output_path.with_extension("stderr"))?;
         if args.contains(&"disconnect") {
@@ -265,6 +290,17 @@ impl DaemonGuard<'_> {
         )?;
         store.write_rendered(&guard, version, &rules)?;
         fs::write(&self.lab.rules, rules)?;
+        Ok(())
+    }
+    fn assert_client_traffic(&mut self, markers: &mut Vec<String>) -> Result<()> {
+        let before = self.client_session()?;
+        self.lab.service_check(markers)?;
+        let after = self.client_session()?;
+        if !session_has_traffic(&before, &after) {
+            return fail(format!(
+                "canaries did not advance client counters: {before:?} -> {after:?}"
+            ));
+        }
         Ok(())
     }
     fn assert_client_session(&mut self, before: &str) -> Result<()> {
@@ -527,7 +563,7 @@ impl DaemonGuard<'_> {
                     return fail(format!("L14 apply: {code}: {text}"));
                 }
                 self.assert_client_session(&client_session)?;
-                self.lab.service_check(&mut markers)?;
+                self.assert_client_traffic(&mut markers)?;
                 // A real reboot necessarily loses the server session. Do not
                 // reset the client: its ordinary WireGuard rekey must recover.
                 let (code, text) =
@@ -757,7 +793,7 @@ impl DaemonGuard<'_> {
                 self.lab.daemon_route_healthy(Duration::from_secs(30))?;
                 self.expect_check(&root, 0, "one-writer-recovered")?;
                 self.assert_client_session(&client_session)?;
-                self.lab.service_check(&mut markers)?;
+                self.assert_client_traffic(&mut markers)?;
                 // Separately prove that a mutation queued during apply executes
                 // afterwards and that its reply follows effective closure.
                 fs::remove_file(root.join("run/scupper/apply-paused"))?;
@@ -876,19 +912,11 @@ impl DaemonGuard<'_> {
                 {
                     return fail(format!("L50 socket ineffective disconnect: {code}: {text}"));
                 }
-                let deadline = Instant::now() + Duration::from_secs(60);
-                loop {
-                    let (code, text) =
-                        self.control_command(&root, &["connect"], "socket-reconnect")?;
-                    if code == 0 {
-                        break;
-                    }
-                    if code != 3 || !text.contains("NotReady") || Instant::now() >= deadline {
-                        return fail(format!(
-                            "L50 reconnect before ordering check: {code}: {text}"
-                        ));
-                    }
-                    self.lab.runner.dwell(Duration::from_millis(200))?;
+                let (code, text) = self.control_command(&root, &["connect"], "socket-reconnect")?;
+                if code != 0 {
+                    return fail(format!(
+                        "L50 reconnect before ordering check: {code}: {text}"
+                    ));
                 }
                 self.lab.daemon_route_healthy(Duration::from_secs(5))?;
                 let (code, text) =
@@ -958,14 +986,20 @@ mod tests {
 
 #[cfg(test)]
 mod session_tests {
-    use super::session_continues;
+    use super::{session_continues, session_has_traffic};
     #[test]
-    fn counters_allow_rekeys_and_reject_session_resets_or_idle_traffic() {
+    fn counters_allow_idle_sessions_and_rekeys_but_reject_resets() {
         let before = "peer 100 1000 2000\n";
         assert!(session_continues(before, "peer 220 1100 2100"));
+        assert!(session_continues(before, before));
+        assert!(session_continues(before, "peer 100 1100 2000"));
+        assert!(session_has_traffic(before, "peer 220 1100 2100"));
+        assert!(!session_has_traffic(before, before));
+        assert!(!session_has_traffic(before, "peer 100 1100 2000"));
+        assert!(!session_has_traffic(before, "peer 100 1000 2100"));
         for after in [
             "peer 220 1 2100",
-            "peer 100 1100 2000",
+            "peer 220 1100 1",
             "other 100 1100 2100",
             "peer 99 1100 2100",
         ] {

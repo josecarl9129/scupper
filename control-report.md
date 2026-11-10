@@ -197,3 +197,26 @@ The final workspace run passed 869 tests, with 8 existing ignored fixtures and n
 `git diff --check` and the edit-scope audit passed. Gate logs and temporary files are under CARGO_TARGET_TMPDIR in this worktree. Final `cargo fmt --all` runs after the gates. No new crates or commits.
 
 Privileged L14/L44/L50 and suite-isolation runs remain unverified locally. The saved L44 events support a harness READY-wait error rather than stalled reconciliation; the port-allocation and sink-lifetime fixes still need a green privileged lab. Real-droplet queue/probe timing (L-4) also remains pending.
+
+## Fix round 6
+
+- N-1 → removed the five-second retry cut-off: Connect continues fresh verification until its full ten-second deadline. Test: `dispatcher_connect_observes_readiness_at_seven_seconds` advances the production dispatcher through NotReady observations until readiness at seven seconds. Removed L50's outer Connect retry loop. Lab Connect commands save per-worker handshake timestamps/ages, IPv4/IPv6 defaults and outcomes in command-specific verification JSONL artifacts; tracing is opt-in and testing-feature-only, with reads bounded by the original deadline.
+- N-2 → L14/L44 require non-decreasing per-peer rx/tx and handshake timestamps across apply, then strictly increasing rx/tx during a separate post-apply service-canary window. Test: `counters_allow_idle_sessions_and_rekeys_but_reject_resets` accepts idle intact sessions/rekeys and rejects resets; the canary comparison rejects idle or one-way counter growth.
+- T-1 / namespace identity race → after local observations would return 2, compare the final Ping's namespace device/inode and version with the initial snapshot. A completed change retries local collection once with refreshed configuration, namespace handle and supervision; a live operation still returns 3. Stable snapshots preserve real ruleset alarms, including after the one allowed retry. Test: `hung_check_keeps_real_ruleset_violations_and_retries_rebuilt_namespaces` exercises a hung Check with matching Ping/state versions, real ruleset replacement (2), a final operation (3), and rebuilds changing either identity component (0).
+- Lab suite isolation → removed the sinks' independent 1800-second expiry. The suite owns their process groups and explicitly stops them during teardown, retaining the suite deadline as an outer bound. Final teardown waits for all tracked background groups to disappear and checks both TCP/UDP marker ports before namespace removal; daemon-suite process/listener assertions remain in place.
+
+### Round 6 verification
+
+All five gates passed, each invoked under `timeout 600`:
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets --all-features --locked --offline -- -D warnings`
+- `cargo test --workspace --all-features --locked --offline --no-fail-fast`
+- `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked --offline`
+- `cargo deny check`
+
+The full workspace run passed 871 tests, with 8 existing ignored subprocess fixtures and no failing targets. It includes the seven-second readiness, hung-Check masking/namespace race, idle-session/rekey/reset and canary-growth regressions, plus the existing background-process shutdown/release test. A final dispatcher regression run also passed after trace finalization. Verification traces record attempt starts before checks, so a worker still completing at the operation deadline retains its diagnostic snapshot.
+
+`git diff --check` and the edit-scope audit passed. Gate logs, dependency-cache copies and temporary paths are under CARGO_TARGET_TMPDIR in this worktree. Final `cargo fmt --all` runs after the gates. No new crates or commits.
+
+Privileged L14/L44/L50 and suite-isolation runs were compiled but not executed locally; their final green lab result remains unverified.
