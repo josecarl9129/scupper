@@ -185,7 +185,7 @@ impl Lab {
         binary: &Path,
         root: &Path,
     ) -> Result<(i32, serde_json::Value)> {
-        let (status, stdout) = self.runner.output(
+        let (status, stdout) = self.runner.output_timeout(
             &Invocation::new(
                 "",
                 "unshare",
@@ -203,6 +203,7 @@ impl Lab {
                 ],
             ),
             None,
+            90,
         )?;
         let report = serde_json::from_str(&stdout)
             .map_err(|error| format!("check-v2 JSON: {error}; output: {stdout}"))?;

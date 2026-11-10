@@ -26,6 +26,8 @@ use std::{
 pub const QUEUE_TIMEOUT: Duration = Duration::from_secs(180);
 /// Queue residence plus fresh verification and response margin.
 pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(240);
+/// One maximum tick plus fresh check budget and delivery margin.
+pub const CHECK_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Default)]
 pub(crate) struct Snapshot {
@@ -77,6 +79,19 @@ pub(crate) fn api(code: ApiErrorCode) -> ApiError {
     }
 }
 
+pub(crate) fn peer_connected(peer: &UnixStream) -> bool {
+    let mut byte = [0];
+    match rustix::net::recv(
+        peer,
+        &mut byte,
+        rustix::net::RecvFlags::PEEK | rustix::net::RecvFlags::DONTWAIT,
+    ) {
+        Ok((0, _)) => false,
+        Ok(_) | Err(rustix::io::Errno::WOULDBLOCK) => true,
+        Err(_) => false,
+    }
+}
+
 /// All M2 operations, including reads, require a root peer.
 #[must_use]
 pub fn authorized(uid: u32) -> bool {
@@ -121,6 +136,7 @@ pub(crate) struct Pending {
     pub uid: u32,
     pub until: Instant,
     pub reply: SyncSender<Response>,
+    pub peer: Option<UnixStream>,
 }
 
 /// Listener lifetime. Shutdown never unlinks a replacement socket.
@@ -201,14 +217,18 @@ impl Server {
         let staged = stage.0.join("control.sock");
         let listener = UnixListener::bind(&staged)?;
         let bound = fs::symlink_metadata(&staged)?;
-        let gid = group
-            .or(fs::read_to_string("/etc/group")?.lines().find_map(|line| {
-                let mut fields = line.split(':');
-                (fields.next()? == "scupper-admin")
-                    .then(|| fields.nth(1)?.parse::<u32>().ok())
-                    .flatten()
-            }))
-            .unwrap_or(0);
+        let gid = match group {
+            Some(group) => group,
+            None => fs::read_to_string("/etc/group")?
+                .lines()
+                .find_map(|line| {
+                    let mut fields = line.split(':');
+                    (fields.next()? == "scupper-admin")
+                        .then(|| fields.nth(1)?.parse::<u32>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0),
+        };
         std::os::unix::fs::chown(&staged, Some(owner), Some(gid))?;
         fs::set_permissions(&staged, fs::Permissions::from_mode(0o660))?;
         fs::rename(&staged, &path)?;
@@ -339,7 +359,7 @@ fn serve(
         stream: &stream,
         until: Instant::now() + Duration::from_secs(5),
     })?;
-    let response = answer(request, uid, send, snapshot)?;
+    let response = answer(request, uid, send, snapshot, Some(&stream))?;
     serde_json::to_writer(&mut stream, &response)?;
     stream.write_all(b"\n")
 }
@@ -349,6 +369,7 @@ fn answer(
     uid: u32,
     send: &SyncSender<Pending>,
     snapshot: &SharedSnapshot,
+    peer: Option<&UnixStream>,
 ) -> io::Result<Response> {
     Ok(if authorized(uid) && matches!(request.op, Op::Ping {}) {
         let result = snapshot
@@ -363,11 +384,18 @@ fn answer(
             uid,
             until: Instant::now() + QUEUE_TIMEOUT,
             reply,
+            peer: peer.map(UnixStream::try_clone).transpose()?,
         })
         .map_err(io::Error::other)?;
-        receive
-            .recv_timeout(RESPONSE_TIMEOUT)
-            .map_err(io::Error::other)?
+        let deadline = Instant::now() + RESPONSE_TIMEOUT;
+        loop {
+            match receive.recv_timeout(Duration::from_millis(100)) {
+                Ok(response) => break response,
+                Err(mpsc::RecvTimeoutError::Timeout)
+                    if Instant::now() < deadline && peer.is_none_or(peer_connected) => {}
+                Err(error) => return Err(io::Error::other(error)),
+            }
+        }
     } else {
         Response {
             request_id: request.request_id,
@@ -861,7 +889,7 @@ mod round_two_tests {
         let (send, receive) = mpsc::sync_channel(1);
         // No tick owner drains this queue. Ping still answers under writer contention.
         let start = Instant::now();
-        let response = answer(request(Op::Ping {}), 0, &send, &snapshot).unwrap();
+        let response = answer(request(Op::Ping {}), 0, &send, &snapshot, None).unwrap();
         assert!(start.elapsed() < Duration::from_millis(100));
         assert!(matches!(
             response.result,
@@ -876,7 +904,7 @@ mod round_two_tests {
         assert!(receive.try_recv().is_err());
         snapshot.write().unwrap().last_complete = None;
         assert!(matches!(
-            answer(request(Op::Ping {}), 0, &send, &snapshot)
+            answer(request(Op::Ping {}), 0, &send, &snapshot, None)
                 .unwrap()
                 .result,
             Ok(OpResult::Ping {
@@ -908,7 +936,27 @@ mod round_two_tests {
                 ),
                 "{error}"
             );
-            assert!(Server::bind_owned(&root, SharedSnapshot::default(), owner, group).is_err());
+            let error = Server::bind_owned(&root, SharedSnapshot::default(), owner, group)
+                .err()
+                .unwrap();
+            assert!(
+                matches!(
+                    error.kind(),
+                    io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+                ),
+                "{error}"
+            );
+            assert!(!fs::read_dir(&root).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".control-")
+            }));
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "CI must exercise socket publication: {error}"
+            );
             eprintln!(
                 "socket chmod unsupported: verified fail-closed bind; publication checks require a supporting filesystem"
             );

@@ -20,6 +20,6 @@ mod tests {
             super::scupper_net(),
             include_str!("../../../../tests/golden/units/scupper-net.service")
         );
-        assert_eq!(super::scupperd(), include_str!("scupperd.service"));
+        assert_eq!(super::scupperd(), include_str!("../../../../tests/golden/units/scupperd.service"));
     }
 }

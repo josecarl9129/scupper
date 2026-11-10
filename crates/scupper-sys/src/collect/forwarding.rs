@@ -76,7 +76,9 @@ pub fn forwarding(
             handle,
             KernelCmd::Sysctl(SysctlCmd::Read(setting.key.clone())),
         )?)?;
-        if values.len() >= 2 && value.to_string() != setting.value {
+        if !matches!(setting.key.name, "forwarding" | "ip_forward")
+            && value.to_string() != setting.value
+        {
             hardening.push(setting.key.to_string());
         }
         values.push(value);

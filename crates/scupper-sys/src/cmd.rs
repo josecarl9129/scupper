@@ -648,7 +648,16 @@ pub fn delete_observed_route(
         ))?;
         if scupper_core::parse::parse_ip_route(&text)?
             .iter()
-            .any(|entry| entry == &route.entry)
+            .any(|entry| {
+                let old = &route.entry;
+                entry.table == old.table
+                    && entry.dst == old.dst
+                    && entry.kind == old.kind
+                    && entry.from == old.from
+                    && entry.dev == old.dev
+                    && entry.gateway == old.gateway
+                    && entry.metric == old.metric
+            })
         {
             return Err(error);
         }

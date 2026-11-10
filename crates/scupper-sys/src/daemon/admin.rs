@@ -314,6 +314,7 @@ pub fn apply(
 /// Full apply with a caller-owned writer capability.
 /// # Errors
 /// Returns version, verification or persistence errors.
+#[allow(clippy::too_many_lines)] // Keep the version publication, rollback and latch boundary together.
 pub fn apply_locked(
     deps: &BootDeps<'_>,
     log: &LogHandle,
@@ -371,6 +372,7 @@ pub fn apply_locked(
     let StateRead::Present(mut state) = file.read().map_err(internal)? else {
         return Err(api(ApiErrorCode::PersistenceUnavailable));
     };
+    let previous = state.applied_version;
     state.applied_version = Some(target);
     file.write(guard, &state)
         .map_err(|_| api(ApiErrorCode::PersistenceUnavailable))?;
@@ -382,9 +384,34 @@ pub fn apply_locked(
         Actor::Local { uid },
         Some(target),
     );
-    if !crate::boot::boot_apply_with_guard(deps, guard, true).succeeded() {
+    let report = crate::boot::boot_apply_with_guard(deps, guard, true);
+    if !report.succeeded() {
         if let Ok(Some(held)) = deps.namespace.open() {
             let _ = crate::reconcile::forwarding_gates(deps, &held, false, None);
+        }
+        state.applied_version = previous;
+        let restored = file.write(guard, &state);
+        let step = match report.steps.last().map(|step| step.step) {
+            Some(crate::boot::BootStep::Ruleset) => scupper_proto::StepKind::LoadRuleset,
+            Some(crate::boot::BootStep::Links) => scupper_proto::StepKind::LinkReconfigure,
+            Some(crate::boot::BootStep::Routes) => scupper_proto::StepKind::RouteReplace,
+            Some(crate::boot::BootStep::Forwarding) => scupper_proto::StepKind::ForwardingOn,
+            _ => scupper_proto::StepKind::VerifyRuleset,
+        };
+        let _ = log.emit(
+            EventKind::ApplyFailed {
+                version: Some(target),
+                step,
+                reason: scupper_proto::Reason::ExecutionFailed,
+            },
+            Actor::Local { uid },
+            previous,
+        );
+        restored.map_err(|_| api(ApiErrorCode::PersistenceUnavailable))?;
+        // Reconverge known apply leftovers before attaching the old machine.
+        // This is operator recovery, outside drift detection and repair budgets.
+        if previous.is_some() {
+            let _ = crate::boot::boot_with_guard(deps, guard);
         }
         return Err(api(ApiErrorCode::Internal));
     }

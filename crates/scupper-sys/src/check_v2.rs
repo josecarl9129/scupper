@@ -195,6 +195,15 @@ pub fn run_after_unavailable(
     run_driver(deps, cfg, Some(v2::Supervisor::Dead), None)
 }
 
+/// Local observations using the supervisor identity and age already read by the CLI.
+pub fn run_with_supervisor(
+    deps: &Dependencies<'_>,
+    cfg: &Config<'_>,
+    supervisor: v2::Supervisor,
+) -> (Result<Report, CheckError>, Observations) {
+    run_driver(deps, cfg, Some(supervisor), None)
+}
+
 #[allow(clippy::too_many_lines)] // Keep the staged observation dispatch together.
 fn run_driver(
     deps: &Dependencies<'_>,

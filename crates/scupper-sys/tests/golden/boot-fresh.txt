@@ -112,7 +112,7 @@ host Ip link set wg0 netns <netns-fd>
 netns Wg set wg0 private-key /dev/stdin stdin=45
 netns Wg show wg0 peers
 netns Wg set wg0 listen-port 51820
-netns Wg set wg0 peer AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM= allowed-ips 10.99.0.2/32
+netns Wg set wg0 peer AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM= allowed-ips 10.99.0.2/32 persistent-keepalive 0
 netns Ip addr flush dev wg0
 netns Ip addr add 10.99.0.1/24 dev wg0
 netns Ip -d -j link show

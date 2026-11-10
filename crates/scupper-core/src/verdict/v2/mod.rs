@@ -570,7 +570,6 @@ pub fn next(obs: &Observations, cfg: &HealthConfigV2, now: u64) -> Next {
     }
     if let Some(peers) = cfg.peers.get(&cfg.client_iface) {
         let mut stale = false;
-        let mut established = peers.is_empty();
         for peer in peers {
             let Some(handshake) = forwarding.client_handshakes.get(&peer.public_key) else {
                 return error(
@@ -578,19 +577,10 @@ pub fn next(obs: &Observations, cfg: &HealthConfigV2, now: u64) -> Next {
                     &ProbeError::io("client handshake observation missing"),
                 );
             };
-            established |= !matches!(handshake, crate::parse::Handshake::Never);
             stale |= !fresh(*handshake, cfg, now, &mut warnings);
         }
         if stale {
             warnings.push(Warning::ClientHandshakesStale);
-        }
-        if !established {
-            return report(
-                Verdict::Degraded(Degraded::ClientSideBroken(ClientFault::NoHandshake)),
-                warnings,
-                cfg,
-                now,
-            );
         }
     }
     let Some(routes) = &obs.routes else {

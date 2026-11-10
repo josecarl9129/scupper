@@ -2807,3 +2807,51 @@ fn read_only_admin_ignores_writer_contention() {
     ));
     drop(guard);
 }
+
+#[test]
+fn repair_clear_reopens_forwarding_after_quarantined_restart() {
+    let mut rig = Rig::new();
+    let mut state = rig.store.state();
+    state.quarantine = Some(scupper_sys::state::Quarantine {
+        reason: "repair budget".into(),
+        object: "safety:ruleset".into(),
+        since_unix: 1000,
+    });
+    let guard = WriterLock::acquire(&rig.root).unwrap();
+    scupper_sys::reconcile::StateStore::write(&rig.store, &guard, &state).unwrap();
+    drop(guard);
+    rig.kernel.mutate(|model| {
+        model.forwarding_v4 = Known::Value(0);
+        model.forwarding_v6 = Known::Value(0);
+        model.default_forwarding_v4 = Known::Value(0);
+        model.default_forwarding_v6 = Known::Value(0);
+        model.client_forwarding_v4 = Known::Value(0);
+        for link in model.links.values_mut() {
+            link.forwarding_v4 = Known::Value(0);
+            link.forwarding_v6 = Known::Value(0);
+        }
+    });
+    rig.restart();
+    for _ in 0..4 {
+        rig.round(true);
+        rig.tick();
+    }
+    assert!(rig.kernel.model().forwarding_off());
+    rig.machine().clear_latch(Actor::Local { uid: 0 }).unwrap();
+    for _ in 0..4 {
+        rig.round(true);
+        rig.tick();
+    }
+    let model = rig.kernel.model();
+    for gate in [
+        &model.forwarding_v4,
+        &model.forwarding_v6,
+        &model.default_forwarding_v4,
+        &model.default_forwarding_v6,
+        &model.client_forwarding_v4,
+    ] {
+        assert_eq!(*gate, Known::Value(1));
+    }
+    assert!(rig.store.state().quarantine.is_none());
+    assert!(rig.machine().latch().is_none());
+}

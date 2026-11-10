@@ -442,73 +442,35 @@ fn local_dry_run_includes_hardening_repair_preview() {
     assert_eq!(before, std::fs::read(root.path.join("state.json")).unwrap());
 }
 #[test]
-fn socket_check_with_stale_age_returns_five() {
-    use scupper_proto::{OpResult, Response, Schema};
-    use std::{io::Write, os::unix::net::UnixListener};
-    let sys = Script::new("ubuntu-24.04");
-    fresh(&sys);
-    let held = testing::handle().unwrap();
-    let root = Root::new(&sys.runner, &held);
-    let site = scupper_core::config::validate(
-        scupper_core::config::parse_site(
-            &support::site_text(&sys.runner)
-                .replace("require_daemon = false", "require_daemon = true"),
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    let report = scupper_sys::check_v2::run_supervised(
-        &scupper_sys::check_v2::Dependencies {
-            system: &sys,
-            probe_exec: &sys,
-            handle: Some(&held),
-            run_root: &root.path,
-            state_root: &root.path,
-        },
-        &scupper_sys::check_v2::Config {
-            site: &site,
-            gateway: &scupper_core::config::GatewayId("gw1".into()),
-            stamp: root.stamp,
-        },
-        Some(30),
-    )
-    .unwrap();
-    let listener = UnixListener::bind(root.path.join("control.sock")).unwrap();
-    let (device, inode) = held.identity();
-    let worker = std::thread::spawn(move || {
-        for result in [
-            OpResult::Ping {
-                last_complete_iteration_age: Some(30),
+fn stale_ping_skips_socket_check_and_preserves_stale_supervision() {
+    use scupper_proto::OpResult;
+    use std::os::unix::net::UnixListener;
+    for age in [None, Some(30), Some(100)] {
+        let sys = Script::new("ubuntu-24.04");
+        fresh(&sys);
+        let held = testing::handle().unwrap();
+        let text = support::site_text(&sys.runner)
+            .replace("require_daemon = false", "require_daemon = true");
+        let root = Root::with_text(&text, &held);
+        let listener = UnixListener::bind(root.path.join("control.sock")).unwrap();
+        let (device, inode) = held.identity();
+        let worker = serve_sequence(
+            listener,
+            vec![Ok(OpResult::Ping {
+                last_complete_iteration_age: age,
                 netns: scupper_core::verdict::v2::NetnsIdentity { device, inode },
                 version: 1,
                 quarantined: false,
                 selection: scupper_core::verdict::v2::Selection::Auto,
-            },
-            OpResult::Check {
-                health: (&report).into(),
-                report: serde_json::to_value(report).unwrap(),
-            },
-        ] {
-            let (mut stream, _) = listener.accept().unwrap();
-            let request = scupper_sys::daemon::control::read_request(&stream).unwrap();
-            serde_json::to_writer(
-                &mut stream,
-                &Response {
-                    request_id: request.request_id,
-                    schema: Schema,
-                    replayed: false,
-                    observed_at: None,
-                    result: Ok(result),
-                },
-            )
-            .unwrap();
-            stream.write_all(b"\n").unwrap();
-        }
-    });
-    let (code, out, err) = run(&sys, &root, &["check", "--json"]);
-    assert_eq!(code, 5, "{out}: {err}");
-    assert!(err.contains("transport: local socket"));
-    worker.join().unwrap();
+            })],
+        );
+        let (code, out, err) = run(&sys, &root, &["check", "--json"]);
+        assert_eq!(code, 5, "{out}: {err}");
+        assert!(err.contains("transport: local observations"));
+        let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(report["verdict"]["Unsupervised"]["why"], "Stale");
+        worker.join().unwrap();
+    }
 }
 #[test]
 fn timed_out_ping_with_live_lease_never_runs_local_mutation() {
@@ -597,4 +559,94 @@ fn socket_check_error_uses_local_observations() {
         assert!(err.contains("transport: local observations"));
         worker.join().unwrap();
     }
+}
+
+fn serve_sequence(
+    listener: std::os::unix::net::UnixListener,
+    results: Vec<Result<scupper_proto::OpResult, scupper_proto::ApiError>>,
+) -> std::thread::JoinHandle<()> {
+    use std::io::Write;
+    std::thread::spawn(move || {
+        for result in results {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = scupper_sys::daemon::control::read_request(&stream).unwrap();
+            serde_json::to_writer(
+                &mut stream,
+                &scupper_proto::Response {
+                    request_id: request.request_id,
+                    schema: scupper_proto::Schema,
+                    replayed: false,
+                    observed_at: None,
+                    result,
+                },
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+        }
+    })
+}
+
+#[test]
+fn check_retries_once_after_apply_invalidates_worker() {
+    use scupper_proto::{ApiError, ApiErrorCode, OpResult};
+    use std::os::unix::net::UnixListener;
+    let sys = Script::new("ubuntu-24.04");
+    fresh(&sys);
+    let held = testing::handle().unwrap();
+    let text =
+        support::site_text(&sys.runner).replace("require_daemon = false", "require_daemon = true");
+    let root = Root::with_text(&text, &held);
+    let site =
+        scupper_core::config::validate(scupper_core::config::parse_site(&text).unwrap()).unwrap();
+    let report = scupper_sys::check_v2::run_supervised(
+        &scupper_sys::check_v2::Dependencies {
+            system: &sys,
+            probe_exec: &sys,
+            handle: Some(&held),
+            run_root: &root.path,
+            state_root: &root.path,
+        },
+        &scupper_sys::check_v2::Config {
+            site: &site,
+            gateway: &scupper_core::config::GatewayId("gw1".into()),
+            stamp: root.stamp,
+        },
+        Some(0),
+    )
+    .unwrap();
+    let (device, inode) = held.identity();
+    let ping = || {
+        Ok(OpResult::Ping {
+            last_complete_iteration_age: Some(0),
+            netns: scupper_core::verdict::v2::NetnsIdentity { device, inode },
+            version: 1,
+            quarantined: false,
+            selection: scupper_core::verdict::v2::Selection::Auto,
+        })
+    };
+    let listener = UnixListener::bind(root.path.join("control.sock")).unwrap();
+    let worker = serve_sequence(
+        listener,
+        vec![
+            ping(),
+            Err(ApiError {
+                code: ApiErrorCode::SupervisorUnavailable,
+                observation: None,
+            }),
+            ping(),
+            Ok(OpResult::Check {
+                health: (&report).into(),
+                report: serde_json::to_value(report).unwrap(),
+            }),
+        ],
+    );
+    let (code, out, err) = run(&sys, &root, &["check", "--json"]);
+    assert_eq!(code, 0, "{out}: {err}");
+    assert!(err.contains("transport: local socket"));
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&out).unwrap()["verdict"]
+            .get("Protected")
+            .is_some()
+    );
+    worker.join().unwrap();
 }

@@ -6,7 +6,10 @@ use scupper_sys::daemon::{
     admin,
     control::{self, ClientError},
 };
-use std::{io::Write, time::Duration};
+use std::{
+    io::Write,
+    time::{Duration, Instant},
+};
 
 #[derive(Clone, Subcommand)]
 pub(super) enum RepairCommand {
@@ -178,46 +181,84 @@ pub(super) fn mutation(
     render(response, json, out)
 }
 
+pub(super) enum ReadOutcome {
+    Rendered(u8),
+    Local(scupper_core::verdict::v2::Supervisor),
+}
+
+fn ping_supervisor(deps: &Dependencies<'_>) -> Option<scupper_core::verdict::v2::Supervisor> {
+    use scupper_core::verdict::v2::Supervisor;
+    let response = control::call(
+        deps.writer_root,
+        &control::request(Op::Ping {}),
+        Duration::from_secs(2),
+    )
+    .ok()?;
+    let Ok(OpResult::Ping {
+        last_complete_iteration_age,
+        netns,
+        ..
+    }) = response.result
+    else {
+        return None;
+    };
+    Some(Supervisor::Alive {
+        netns,
+        iteration_age: Duration::from_secs(last_complete_iteration_age.unwrap_or(30)),
+    })
+}
+
 pub(super) fn read(
     deps: &Dependencies<'_>,
     status: bool,
     json: bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
-) -> Result<Option<u8>, String> {
+) -> Result<ReadOutcome, String> {
+    use scupper_core::verdict::v2::Supervisor;
+    let local = |err: &mut dyn Write, supervisor| {
+        writeln!(err, "transport: local observations").map_err(output_error)?;
+        Ok(ReadOutcome::Local(supervisor))
+    };
     if status {
-        writeln!(err, "transport: local observations").map_err(output_error)?;
-        return Ok(None);
+        return local(err, Supervisor::Dead);
     }
-    let request = control::request(Op::Check {});
-    let ping = control::call(
-        deps.writer_root,
-        &control::request(Op::Ping {}),
-        Duration::from_secs(2),
-    );
-    if matches!(
-        ping,
-        Err(_)
-            | Ok(Response {
-                result: Err(scupper_proto::ApiError {
-                    code: scupper_proto::ApiErrorCode::SupervisorUnavailable,
-                    ..
-                }),
-                ..
-            })
-    ) {
-        writeln!(err, "transport: local observations").map_err(output_error)?;
-        return Ok(None);
-    }
-    if let Ok(response) = control::call(deps.writer_root, &request, control::RESPONSE_TIMEOUT)
-        && response.result.is_ok()
+    let Some(supervisor) = ping_supervisor(deps) else {
+        return local(err, Supervisor::Dead);
+    };
+    if matches!(supervisor, Supervisor::Alive {iteration_age, ..} if iteration_age >= Duration::from_secs(30))
     {
-        writeln!(err, "transport: local socket").map_err(output_error)?;
-        render(response, json, out).map(Some)
-    } else {
-        writeln!(err, "transport: local observations").map_err(output_error)?;
-        Ok(None)
+        return local(err, supervisor);
     }
+    let deadline = Instant::now() + control::CHECK_TIMEOUT;
+    for attempt in 0..2 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let response = control::call(deps.writer_root, &control::request(Op::Check {}), remaining);
+        match response {
+            Ok(response) if response.result.is_ok() => {
+                writeln!(err, "transport: local socket").map_err(output_error)?;
+                return render(response, json, out).map(ReadOutcome::Rendered);
+            }
+            Ok(Response {
+                result:
+                    Err(scupper_proto::ApiError {
+                        code: scupper_proto::ApiErrorCode::SupervisorUnavailable,
+                        ..
+                    }),
+                ..
+            }) if attempt == 0 => {
+                if !matches!(ping_supervisor(deps), Some(Supervisor::Alive {iteration_age, ..}) if iteration_age < Duration::from_secs(30))
+                {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    local(err, Supervisor::Dead)
 }
 
 fn render(response: Response, json: bool, out: &mut dyn Write) -> Result<u8, String> {

@@ -580,7 +580,8 @@ fn route_delete_requires_observed_absence() -> Result<(), Box<dyn Error>> {
         )
         .is_err()
     );
-    for (inventory, fail_inventory) in [("bad json", false), ("[]", true)] {
+    let changed_flags = r#"[{"dst":"198.18.0.0/24","dev":"foreign0","protocol":"boot","scope":"global","prefsrc":"198.18.0.2","flags":["linkdown"]}]"#;
+    for (inventory, fail_inventory) in [("bad json", false), ("[]", true), (changed_flags, false)] {
         assert!(
             delete_observed_route(
                 &Routes {

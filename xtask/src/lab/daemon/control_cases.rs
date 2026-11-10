@@ -88,6 +88,101 @@ impl DaemonGuard<'_> {
         }
         Ok(())
     }
+    fn wait_client_handshake(&mut self) -> Result<()> {
+        self.lab
+            .daemon_wait(
+                "client handshake after reboot",
+                Duration::from_secs(20),
+                |lab| {
+                    Ok(lab
+                        .cmd("scupper", "wg", &["show", "wg0", "latest-handshakes"])?
+                        .lines()
+                        .any(|line| {
+                            line.split_whitespace()
+                                .nth(1)
+                                .and_then(|age| age.parse::<u64>().ok())
+                                .is_some_and(|age| age > 0)
+                        }))
+                },
+            )
+            .map(|_| ())
+    }
+    fn assert_forwarding_open(&mut self) -> Result<()> {
+        self.lab
+            .daemon_wait(
+                "forwarding reopened after clear",
+                Duration::from_secs(20),
+                |lab| {
+                    for key in [
+                        "net.ipv4.ip_forward",
+                        "net.ipv6.conf.all.forwarding",
+                        "net.ipv4.conf.default.forwarding",
+                        "net.ipv6.conf.default.forwarding",
+                        "net.ipv4.conf.wg0.forwarding",
+                    ] {
+                        if lab.cmd("scupper", "sysctl", &["-n", key])?.trim() != "1" {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                },
+            )
+            .map(|_| ())
+    }
+    fn stage_exit_change(&mut self, root: &Path) -> Result<()> {
+        let state_root = root.join("var-lib/scupper");
+        let config_root = root.join("etc/scupper");
+        let guard = WriterLock::acquire(root.join("run/scupper"))?;
+        let store = VersionStore::open_with_mirror_root(&state_root, &config_root, Some(&guard))?;
+        let head = store.head()?.ok_or("missing head")?;
+        let (old, _) = store.read(head)?;
+        let text = if old.contains("keepalive = \"25s\"") {
+            old.replace("keepalive = \"25s\"", "keepalive = \"26s\"")
+        } else {
+            old.replace("keepalive = \"26s\"", "keepalive = \"25s\"")
+        };
+        if text == old {
+            return fail("exit-only change did not change keepalive");
+        }
+        let version = store.commit(
+            &guard,
+            Some(head),
+            &text,
+            MetaInput {
+                actor: "lab".into(),
+                at: 3,
+                reason: "exit-only apply preserves clients".into(),
+            },
+        )?;
+        self.lab.site = validate(parse_site(&text)?).map_err(|e| format!("exit change: {e:?}"))?;
+        let rules = render_netns(
+            &self.lab.site,
+            &GatewayId("gw1".into()),
+            &VersionStamp {
+                version,
+                sha256: Sha256::digest(text.as_bytes()).into(),
+            },
+        )?;
+        store.write_rendered(&guard, version, &rules)?;
+        fs::write(&self.lab.rules, rules)?;
+        Ok(())
+    }
+    fn assert_client_session(&mut self) -> Result<()> {
+        if !self
+            .lab
+            .cmd("scupper", "wg", &["show", "wg0", "latest-handshakes"])?
+            .lines()
+            .any(|line| {
+                line.split_whitespace()
+                    .nth(1)
+                    .and_then(|age| age.parse::<u64>().ok())
+                    .is_some_and(|age| age > 0)
+            })
+        {
+            return fail("apply reset the established client session");
+        }
+        Ok(())
+    }
     fn control_restart(&mut self, root: &Path, stage: &str) -> Result<()> {
         if let Some(mut child) = self.child.take() {
             child.signal(Signal::CONT);
@@ -241,7 +336,7 @@ impl DaemonGuard<'_> {
                 self.lab.runner.dwell(Duration::from_secs(32))?;
                 let (code, text) =
                     self.control_command(&root, &["check", "--json"], "responsive-stale")?;
-                if code != 5 || !text.contains("transport: local socket") {
+                if code != 5 || !text.contains("transport: local observations") {
                     return fail(format!("L10 responsive stale supervisor: {code}: {text}"));
                 }
                 fs::remove_file(root.join("run/scupper/incomplete-tick"))?;
@@ -293,6 +388,11 @@ impl DaemonGuard<'_> {
                 self.expect_check(&root, 4, "disconnected")?;
                 self.control_stop(Signal::TERM)?;
                 self.lab.boot_gateway(&[], "L14-reboot")?;
+                let boot: serde_json::Value =
+                    serde_json::from_slice(&fs::read(self.lab.artifacts.join("L14-reboot.json"))?)?;
+                if boot["adopted"] != true {
+                    return fail("L14 disconnected reboot did not adopt");
+                }
                 self.expect_check(&root, 4, "reboot-closed")?;
                 self.control_restart(&root, "after-reboot")?;
                 self.expect_check(&root, 4, "restart-closed")?;
@@ -300,8 +400,40 @@ impl DaemonGuard<'_> {
                 if code != 0 || !text.contains("transport: local socket") {
                     return fail(format!("L14 connect: {code}: {text}"));
                 }
+                self.wait_client_handshake()?;
                 self.expect_check(&root, 0, "connected")?;
                 self.lab.service_check(&mut markers)?;
+                self.stage_exit_change(&root)?;
+                let (code, text) = self.control_command(&root, &["apply"], "exit-only-apply")?;
+                if code != 0 {
+                    return fail(format!("L14 apply: {code}: {text}"));
+                }
+                self.assert_client_session()?;
+                self.lab.service_check(&mut markers)?;
+                // A real reboot necessarily loses the server session. Do not
+                // reset the client: its ordinary WireGuard rekey must recover.
+                let (code, text) =
+                    self.control_command(&root, &["disconnect"], "real-reboot-disconnect")?;
+                if code != 0 {
+                    return fail(text);
+                }
+                self.control_stop(Signal::TERM)?;
+                self.lab.cmd("", "ip", &["netns", "delete", "scupper"])?;
+                self.lab.boot_gateway(&[], "L14-real-reboot")?;
+                self.expect_check(&root, 4, "real-reboot-closed")?;
+                self.control_restart(&root, "real-reboot")?;
+                let (code, text) =
+                    self.control_command(&root, &["connect"], "real-reboot-connect")?;
+                if code != 0 {
+                    return fail(text);
+                }
+                let recovered = Instant::now();
+                self.wait_client_handshake()?;
+                self.lab.service_check(&mut markers)?;
+                if recovered.elapsed() > Duration::from_secs(20) {
+                    return fail("L14 real reboot exceeded client rekey bound");
+                }
+                self.expect_check(&root, 0, "real-reboot-connected")?;
             }
             "L43" => {
                 for attempt in 0..5 {
@@ -372,9 +504,13 @@ impl DaemonGuard<'_> {
                     return fail(format!("L43 clear: {code}: {text}"));
                 }
                 self.lab.daemon_route_healthy(Duration::from_secs(30))?;
+                self.assert_forwarding_open()?;
                 self.expect_check(&root, 0, "cleared")?;
+                self.wait_client_handshake()?;
+                self.lab.service_check(&mut markers)?;
             }
             "L44" => {
+                self.stage_exit_change(&root)?;
                 fs::write(root.join("run/scupper/pause-apply"), b"pause")?;
                 let binary = Lab::boot_binary()?;
                 let mut apply = self.lab.runner.background(
@@ -394,8 +530,8 @@ impl DaemonGuard<'_> {
                     return fail("L44 socket apply did not hold the writer lock");
                 }
                 let (code, text) = self.control_command(&root, &["boot"], "busy-refusal")?;
-                if code != 1
-                    || !text.contains("supervisor lease unavailable")
+                if code != 0
+                    || !text.contains("scupperd owns the namespace")
                     || text.contains("traffic is now blocked")
                 {
                     return fail(format!("L44 busy daemon allowed fallback: {code}: {text}"));
@@ -499,6 +635,75 @@ impl DaemonGuard<'_> {
                     .daemon_ready_tick(self.notify.as_ref().ok_or("notify missing")?)?;
                 self.lab.daemon_route_healthy(Duration::from_secs(30))?;
                 self.expect_check(&root, 0, "one-writer-recovered")?;
+                self.assert_client_session()?;
+                self.lab.service_check(&mut markers)?;
+                // Separately prove that a mutation queued during apply executes
+                // afterwards and that its reply follows effective closure.
+                fs::remove_file(root.join("run/scupper/apply-paused"))?;
+                fs::write(root.join("run/scupper/pause-apply"), b"pause")?;
+                let mut second = self.lab.runner.background(
+                    &Invocation::new(
+                        "gwhost",
+                        binary.to_str().ok_or("binary")?,
+                        &["--test-root", root.to_str().ok_or("root")?, "apply"],
+                    ),
+                    &self.lab.artifacts.join("L44-ordered-apply.stdout"),
+                )?;
+                self.lab
+                    .daemon_wait("L44 second apply paused", Duration::from_secs(5), |_| {
+                        Ok(root.join("run/scupper/apply-paused").exists())
+                    })?;
+                let mut disconnect = self.lab.runner.background(
+                    &Invocation::new(
+                        "gwhost",
+                        binary.to_str().ok_or("binary")?,
+                        &["--test-root", root.to_str().ok_or("root")?, "disconnect"],
+                    ),
+                    &self.lab.artifacts.join("L44-queued-disconnect.stdout"),
+                )?;
+                self.lab.runner.dwell(Duration::from_millis(250))?;
+                if disconnect.try_wait()?.is_some() {
+                    return fail("L44 disconnect replied before paused apply completed");
+                }
+                fs::remove_file(root.join("run/scupper/pause-apply"))?;
+                if !second.wait_timeout(Duration::from_secs(150))?.success()
+                    || !disconnect.wait_timeout(Duration::from_secs(60))?.success()
+                {
+                    return fail("L44 ordered mutation failed");
+                }
+                let output =
+                    fs::read_to_string(self.lab.artifacts.join("L44-queued-disconnect.stdout"))?;
+                if !output.contains("traffic is now blocked") {
+                    return fail("L44 disconnect omitted effective-closure reply");
+                }
+                let snapshot = serde_json::json!({
+                    "v4":self.lab.cmd("scupper","ip",&["-4","route","show","default"])?,
+                    "v6":self.lab.cmd("scupper","ip",&["-6","route","show","default"])?,
+                    "exit":self.lab.cmd("scupper","ip",&["-o","link","show","ex-ch1"])?,
+                });
+                fs::write(
+                    self.lab
+                        .artifacts
+                        .join("L44-queued-disconnect-closure.json"),
+                    serde_json::to_vec_pretty(&snapshot)?,
+                )?;
+                self.assert_disconnect_snapshot("queued-disconnect")?;
+                self.expect_check(&root, 4, "queued-disconnect-closed")?;
+                for family in ["-4", "-6"] {
+                    if !self
+                        .lab
+                        .cmd("scupper", "ip", &[family, "route", "show", "default"])?
+                        .contains("unreachable")
+                    {
+                        return fail("L44 queued disconnect left reachable defaults");
+                    }
+                }
+                let (code, text) =
+                    self.control_command(&root, &["connect"], "ordered-reconnect")?;
+                if code != 0 {
+                    return fail(text);
+                }
+                self.lab.service_check(&mut markers)?;
             }
             "L50" => {
                 self.control_stop(Signal::TERM)?;

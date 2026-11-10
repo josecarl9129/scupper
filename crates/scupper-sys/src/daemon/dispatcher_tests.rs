@@ -51,6 +51,7 @@ fn enqueue(
     let (reply, receive) = mpsc::sync_channel(1);
     dispatcher.dispatch(
         control::Pending {
+            peer: None,
             request,
             uid: 0,
             until,
@@ -336,4 +337,27 @@ fn dispatcher_three_second_tick_does_not_expire_requests() {
         .unwrap();
     dispatcher.poll_admin(&mut rig, now + Duration::from_secs(3));
     assert!(response.recv().unwrap().result.is_ok());
+}
+
+#[test]
+fn dispatcher_drops_mutation_after_peer_hangup() {
+    let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+    drop(client);
+    let mut dispatcher = Dispatcher::default();
+    let mut rig = Rig::default();
+    let (reply, receive) = mpsc::sync_channel(1);
+    let now = Instant::now();
+    dispatcher.dispatch(
+        control::Pending {
+            peer: Some(server),
+            request: control::request(Op::Disconnect {}),
+            uid: 0,
+            until: now + Duration::from_secs(30),
+            reply,
+        },
+        &mut rig,
+        now,
+    );
+    assert_eq!(rig.intents, [] as [Op; 0]);
+    assert!(receive.recv().is_err());
 }

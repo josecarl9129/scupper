@@ -498,7 +498,9 @@ fn boot_locked(deps: &BootDeps<'_>, mut report: BootReport, open_quarantined: bo
             && !cfg.missing_state_alert
             && links::adoptable(deps, &handle, &cfg).is_ok()
             && containment(deps, &handle, &cfg, &mut owned_links).is_ok()
-            && sysctls(deps, &handle, &names, true, false).is_ok();
+            && (sysctls(deps, &handle, &names, true, false).is_ok()
+                || (cfg.state.selection == Selection::Disconnected
+                    && sysctls(deps, &handle, &names, false, false).is_ok()));
         let closed = if adopted {
             Ok(())
         } else {

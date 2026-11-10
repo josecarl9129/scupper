@@ -382,6 +382,14 @@ impl Drop for Audit {
 pub fn run(options: &Options, stop: &AtomicBool) -> io::Result<()> {
     let lease_notify = notify::Notify::new(std::env::var_os("NOTIFY_SOCKET").as_deref())
         .unwrap_or_else(|_| notify::Notify::disabled());
+    run_notified(options, stop, lease_notify)
+}
+
+fn run_notified(
+    options: &Options,
+    stop: &AtomicBool,
+    lease_notify: notify::Notify,
+) -> io::Result<()> {
     let _lease = crate::lock::SupervisorLease::acquire_timeout(
         &options.run_root,
         Duration::from_secs(60),
@@ -402,22 +410,6 @@ pub fn run(options: &Options, stop: &AtomicBool) -> io::Result<()> {
     let mut audit =
         Audit::open(&options.state_root, gateway.clone(), origin).map_err(io::Error::other)?;
     audit.poll(origin);
-    let _ = audit.handle().emit(
-        EventKind::DaemonStarted {
-            version: Release {
-                major: env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap_or(0),
-                minor: env!("CARGO_PKG_VERSION_MINOR").parse().unwrap_or(0),
-                patch: env!("CARGO_PKG_VERSION_PATCH").parse().unwrap_or(0),
-            },
-        },
-        Actor::Daemon,
-        None,
-    );
-    let notify =
-        notify::Notify::new(std::env::var_os("NOTIFY_SOCKET").as_deref()).unwrap_or_else(|error| {
-            eprintln!("scupperd: notify setup: {error}");
-            notify::Notify::disabled()
-        });
     let mut runtime = Runtime {
         options,
         system: &system,
@@ -425,7 +417,8 @@ pub fn run(options: &Options, stop: &AtomicBool) -> io::Result<()> {
         gateway,
         origin,
         audit,
-        notify,
+        notify: lease_notify,
+        started_event: false,
         running: None,
         pending_canon: false,
         startup_read: StartupRead::default(),
@@ -454,6 +447,7 @@ struct Runtime<'a> {
     origin: Instant,
     audit: Audit,
     notify: notify::Notify,
+    started_event: bool,
     running: Option<(Machine<'a>, Arc<NetnsHandle>, Config)>,
     pending_canon: bool,
     startup_read: StartupRead,
@@ -612,24 +606,28 @@ impl Runtime<'_> {
             } else {
                 Vec::new()
             };
-            if !dry_run {
-                self.dispatcher.invalidate_admin_workers(Instant::now());
-            }
             let mut result =
                 admin::apply_locked(&deps, &self.audit.handle(), &guard, version, dry_run, uid);
-            if !dry_run && result.is_ok() {
+            if !dry_run {
                 self.abandon_probes();
-                self.startup_read.ready = None;
-                self.running = initialize(
-                    deps,
-                    self.gateway.clone(),
-                    self.audit.handle(),
-                    self.origin,
-                    Instant::now() + canon::CANON_TIMEOUT + crate::system::EXEC_TIMEOUT,
-                    &mut self.startup_read,
-                    Some((&guard, true)),
-                )
-                .ok();
+                self.startup_read = StartupRead::default();
+                self.running = if result
+                    .as_ref()
+                    .is_err_and(|error| error.code == ApiErrorCode::PersistenceUnavailable)
+                {
+                    None
+                } else {
+                    initialize(
+                        deps,
+                        self.gateway.clone(),
+                        self.audit.handle(),
+                        self.origin,
+                        Instant::now() + canon::CANON_TIMEOUT + crate::system::EXEC_TIMEOUT,
+                        &mut self.startup_read,
+                        Some((&guard, true)),
+                    )
+                    .ok()
+                };
                 self.cached = None;
                 self.last_complete = None;
                 self.publish_snapshot();
@@ -721,6 +719,7 @@ impl Runtime<'_> {
                 None
             }
         };
+        self.publish_snapshot();
     }
 }
 impl DaemonDeps for Runtime<'_> {
@@ -739,6 +738,21 @@ impl DaemonDeps for Runtime<'_> {
         }
         if let Err(error) = self.notify.started() {
             eprintln!("scupperd: notify: {error}");
+            return;
+        }
+        if !self.started_event {
+            self.started_event = true;
+            let _ = self.audit.handle().emit(
+                EventKind::DaemonStarted {
+                    version: Release {
+                        major: env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap_or(0),
+                        minor: env!("CARGO_PKG_VERSION_MINOR").parse().unwrap_or(0),
+                        patch: env!("CARGO_PKG_VERSION_PATCH").parse().unwrap_or(0),
+                    },
+                },
+                Actor::Daemon,
+                None,
+            );
         }
     }
     fn notify(&mut self, iteration: &Iteration) {
@@ -1017,6 +1031,68 @@ fn close_only(deps: &BootDeps<'_>, options: &Options) {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_run_waits_for_lease_and_sends_status_before_reading_config() {
+        use std::os::{fd::AsRawFd, unix::net::UnixDatagram};
+        let root = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map_or_else(
+                || PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/tmp")),
+                PathBuf::from,
+            )
+            .join(format!("run-lease-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        // Directory fd keeps sockaddr_un within its platform limit.
+        let dir = std::fs::File::open(&root).unwrap();
+        let path = PathBuf::from(format!("/proc/self/fd/{}/notify", dir.as_raw_fd()));
+        let socket = UnixDatagram::bind(&path).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let lease = crate::lock::SupervisorLease::try_acquire(&root).unwrap();
+        let options = Options {
+            run_root: root.clone(),
+            config_root: root.join("missing"),
+            state_root: root.join("state"),
+            probe_binary: root.join("unused"),
+        };
+        let notify = notify::Notify::new(Some(path.as_os_str())).unwrap();
+        let (send, receive) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let _ = send.send(run_notified(&options, &AtomicBool::new(false), notify));
+        });
+        let mut buf = [0; 256];
+        let count = socket.recv(&mut buf).unwrap();
+        assert!(
+            std::str::from_utf8(&buf[..count])
+                .unwrap()
+                .starts_with("STATUS=waiting for supervisor lease")
+        );
+        assert!(
+            receive.try_recv().is_err(),
+            "run exited while its lease was held"
+        );
+        socket
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        assert!(
+            socket.recv(&mut buf).is_err(),
+            "lease notices flooded the socket"
+        );
+        drop(lease);
+        // The first post-lease operation now reaches the deliberately missing config.
+        assert_eq!(
+            receive
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        worker.join().unwrap();
+        assert!(!root.join("state").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn hung_audit_open_reports_after_bound_and_can_still_recover() {

@@ -111,7 +111,9 @@ pub(super) fn configure(deps: &BootDeps<'_>, handle: &NetnsHandle, cfg: &Inputs)
             if link.kind.as_deref() != Some("wireguard") {
                 return Err("configured namespace link has foreign kind".into());
             }
-            set_up(deps, handle, name, false)?;
+            if name != gw.client_tunnel().ifname().as_str() {
+                set_up(deps, handle, name, false)?;
+            }
         } else {
             cleanup_host(deps, name)?;
             add_host(deps, name)?;
@@ -135,13 +137,20 @@ pub(crate) fn configure_one(
         if link.kind.as_deref() != Some("wireguard") {
             return Err("configured namespace link has foreign kind".into());
         }
-        execute(
-            deps,
-            ExecTarget::Netns(handle),
-            Program::Ip,
-            &strings(&["link", "set", "dev", name, "down"]),
-            None,
-        )?;
+        let client = cfg
+            .site
+            .gateway(&cfg.gateway)
+            .ok_or("unknown gateway")?
+            .client_tunnel();
+        if name != client.ifname().as_str() {
+            execute(
+                deps,
+                ExecTarget::Netns(handle),
+                Program::Ip,
+                &strings(&["link", "set", "dev", name, "down"]),
+                None,
+            )?;
+        }
     } else {
         return Err("link missing before configuration".into());
     }
@@ -178,7 +187,8 @@ fn configure_body(
         },
         Some(key.expose()),
     )?;
-    // Recover interrupted configuration without retaining any stale peer.
+    // Preserve configured client sessions and roamed endpoints. Exit sessions
+    // may be recreated; unknown client peers must still be removed.
     let peers = execute(
         deps,
         target,
@@ -187,6 +197,14 @@ fn configure_body(
         None,
     )?;
     for peer in peers.split_whitespace() {
+        if name == client.ifname().as_str()
+            && cfg.site.devices().values().any(|device| {
+                device.gateways().contains(&cfg.gateway)
+                    && device.public_key_text().as_str() == peer
+            })
+        {
+            continue;
+        }
         wg(
             deps,
             handle,
@@ -280,7 +298,7 @@ pub(crate) fn configure_peers(
                         .map_err(|e| e.to_string())?,
                     allowed_ips: vec![device.address4().into()],
                     endpoint: None,
-                    keepalive: None,
+                    keepalive: Some(0),
                 },
                 None,
             )?;

@@ -350,8 +350,14 @@ fn dispatch(
             trace,
         } => {
             require_root(deps, "boot")?;
-            let _lease = scupper_sys::lock::SupervisorLease::try_acquire(deps.writer_root)
-                .map_err(|error| format!("boot refused: supervisor lease unavailable: {error}; use scupper apply through scupperd"))?;
+            let _lease = match scupper_sys::lock::SupervisorLease::try_acquire(deps.writer_root) {
+                Ok(lease) => lease,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    writeln!(stderr, "scupperd owns the namespace; boot skipped successfully; use scupper apply for a verified update").map_err(output_error)?;
+                    return Ok(0);
+                }
+                Err(error) => return Err(format!("supervisor lease unavailable: {error}")),
+            };
             #[cfg(feature = "testing")]
             let hook = |point: scupper_sys::boot::BootPoint| {
                 use scupper_sys::boot::BootPoint;
@@ -450,16 +456,17 @@ fn dispatch(
         Command::Repair { command } => control::repair(deps, command, json, stdout, stderr),
         Command::Status | Command::Check => {
             let status = matches!(command, Command::Status);
-            if let Some(code) = control::read(deps, status, json, stdout, stderr)? {
-                return Ok(code);
-            }
+            let supervisor = match control::read(deps, status, json, stdout, stderr)? {
+                control::ReadOutcome::Rendered(code) => return Ok(code),
+                control::ReadOutcome::Local(supervisor) => supervisor,
+            };
             let config = match m2_config(deps) {
                 Ok(Some(config)) => config,
                 Ok(None) => return Err("not an M2 gateway (no /var/lib/scupper store)".into()),
                 Err(error) if status => return status_error(stdout, json, &error),
                 Err(error) => return Err(error),
             };
-            m2_check(deps, &config, status, json, stdout, stderr)
+            m2_check(deps, &config, status, json, supervisor, stdout, stderr)
         }
         Command::Config { command } => config::run(command, deps, stdout),
         Command::Rules { diff } => config::rules(deps, diff, stdout),
@@ -571,6 +578,7 @@ fn m2_check(
     config: &AppliedConfig,
     status: bool,
     json: bool,
+    supervisor: scupper_core::verdict::v2::Supervisor,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<u8, String> {
@@ -581,25 +589,23 @@ fn m2_check(
         }
         Err(error) => return Err(error),
     };
-    let driver = if status {
-        scupper_sys::check_v2::run_with_observations
-    } else {
-        scupper_sys::check_v2::run_after_unavailable
+    let check_deps = scupper_sys::check_v2::Dependencies {
+        system: deps.system,
+        probe_exec: deps.probe_exec,
+        handle: handle.as_ref(),
+        state_root: deps.state_root,
+        run_root: deps.writer_root,
     };
-    let (result, mut observations) = driver(
-        &scupper_sys::check_v2::Dependencies {
-            system: deps.system,
-            probe_exec: deps.probe_exec,
-            handle: handle.as_ref(),
-            state_root: deps.state_root,
-            run_root: deps.writer_root,
-        },
-        &scupper_sys::check_v2::Config {
-            site: &config.site,
-            gateway: &config.gateway,
-            stamp: config.stamp,
-        },
-    );
+    let check_config = scupper_sys::check_v2::Config {
+        site: &config.site,
+        gateway: &config.gateway,
+        stamp: config.stamp,
+    };
+    let (result, mut observations) = if status {
+        scupper_sys::check_v2::run_with_observations(&check_deps, &check_config)
+    } else {
+        scupper_sys::check_v2::run_with_supervisor(&check_deps, &check_config, supervisor)
+    };
     if status {
         redact_endpoints(&mut observations);
         if json {

@@ -127,6 +127,7 @@ impl SupervisorLease {
         mut waiting: impl FnMut(),
     ) -> io::Result<Self> {
         let deadline = Instant::now() + timeout;
+        let mut next_notice = Instant::now();
         loop {
             match Self::try_acquire(root) {
                 Ok(lease) => return Ok(lease),
@@ -137,7 +138,10 @@ impl SupervisorLease {
                             format!("supervisor lease timeout: {error}"),
                         ));
                     }
-                    waiting();
+                    if Instant::now() >= next_notice {
+                        waiting();
+                        next_notice = Instant::now() + Duration::from_secs(5);
+                    }
                     std::thread::sleep(
                         Duration::from_millis(100)
                             .min(deadline.saturating_duration_since(Instant::now())),

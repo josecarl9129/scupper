@@ -120,6 +120,13 @@ impl Dispatcher {
         backend: &mut impl Backend,
         now: Instant,
     ) {
+        if pending
+            .peer
+            .as_ref()
+            .is_some_and(|peer| !control::peer_connected(peer))
+        {
+            return;
+        }
         if !control::authorized(pending.uid) {
             let _ = pending.reply.send(control::response(
                 pending.request.request_id,

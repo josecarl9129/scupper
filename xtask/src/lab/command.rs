@@ -112,7 +112,15 @@ impl Runner {
         invocation: &Invocation,
         input: Option<&[u8]>,
     ) -> Result<(ExitStatus, String)> {
-        let mut cmd = self.command(invocation, 15)?;
+        self.output_timeout(invocation, input, 15)
+    }
+    pub fn output_timeout(
+        &mut self,
+        invocation: &Invocation,
+        input: Option<&[u8]>,
+        seconds: u64,
+    ) -> Result<(ExitStatus, String)> {
+        let mut cmd = self.command(invocation, seconds)?;
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         cmd.stdin(if input.is_some() {
             Stdio::piped()
@@ -144,7 +152,7 @@ impl Runner {
         }
         // A descendant may retain a pipe after the leader exits. Keep the
         // process-group guard armed and bound pipe draining as well as wait.
-        let deadline = Instant::now() + Duration::from_secs(17);
+        let deadline = Instant::now() + Duration::from_secs(seconds + 2);
         let mut status = None;
         let mut stdout = None;
         let mut stderr = None;

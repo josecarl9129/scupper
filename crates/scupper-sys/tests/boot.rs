@@ -195,7 +195,14 @@ impl Kernel {
                 stdout = Self::json_links(&map.borrow());
             }
             Program::Ip if args == ["-j", "addr", "show"] => {
-                stdout = Self::json_addresses(&map.borrow());
+                let mut addresses: Vec<serde_json::Value> =
+                    serde_json::from_str(&Self::json_addresses(&map.borrow())).unwrap();
+                if !ns {
+                    let uplinks: Vec<serde_json::Value> =
+                        serde_json::from_str(&self.script.text("gwhost--4-addr.json")).unwrap();
+                    addresses.extend(uplinks.into_iter().filter(|link| link["ifname"] == "eth0"));
+                }
+                stdout = serde_json::to_string(&addresses).unwrap();
             }
             Program::Ip if a(0) == "link" && a(1) == "add" => {
                 assert!(!ns);
@@ -236,6 +243,31 @@ impl Kernel {
                 } else {
                     links.get_mut(a(4)).unwrap().addresses.push(a(2).into());
                 }
+            }
+            Program::Ip if a(0) == "-j" && a(2) == "route" && a(3) == "show" => {
+                let all = a(5) == "all" || a(5) == "local";
+                let filename = format!(
+                    "scupper-{}-{}.json",
+                    a(1),
+                    if all { "routes-all" } else { "route" }
+                );
+                let mut routes: Vec<serde_json::Value> =
+                    serde_json::from_str(&self.script.text(&filename)).unwrap();
+                if let Some(route) = self.defaults.borrow().get(&(a(1) == "-6")) {
+                    routes.retain(|r| r["dst"] != "default");
+                    routes.push(if route.contains("unreachable") {
+                        serde_json::json!({"dst":"default", "type":"unreachable"})
+                    } else {
+                        serde_json::json!({"dst":"default", "dev":"ex-ch1"})
+                    });
+                }
+                if a(4) == "default" {
+                    routes.retain(|r| r["dst"] == "default");
+                }
+                if a(5) == "local" {
+                    routes.retain(|r| r["table"] == "local");
+                }
+                stdout = serde_json::to_string(&routes).unwrap();
             }
             Program::Ip if args.iter().any(|a| a == "replace") => {
                 assert!(ns);
@@ -308,16 +340,20 @@ impl Kernel {
                     }
                     "peer" => {
                         let allowed = args.iter().position(|a| a == "allowed-ips").unwrap();
-                        let endpoint = args
-                            .iter()
-                            .position(|a| a == "endpoint")
-                            .map_or("(none)", |i| a(i + 1));
+                        let endpoint = args.iter().position(|a| a == "endpoint").map_or_else(
+                            || {
+                                link.peers
+                                    .get(a(3))
+                                    .map_or_else(|| "(none)".into(), |peer| peer.1.clone())
+                            },
+                            |i| a(i + 1).to_owned(),
+                        );
                         link.keepalive = args
                             .iter()
                             .position(|a| a == "persistent-keepalive")
                             .map_or(0, |i| a(i + 1).parse().unwrap());
                         link.peers
-                            .insert(a(3).into(), (a(allowed + 1).into(), endpoint.into()));
+                            .insert(a(3).into(), (a(allowed + 1).into(), endpoint));
                     }
                     _ => panic!("unexpected wg writer"),
                 }
@@ -469,6 +505,25 @@ impl Fixture {
             hook,
             secret_owner: rustix::process::geteuid().as_raw(),
         })
+    }
+    fn check(&self) -> scupper_core::verdict::v2::Report {
+        let held = testing::handle().unwrap();
+        let site = support::site("ubuntu-24.04");
+        scupper_sys::check_v2::run_check_v2(
+            &scupper_sys::check_v2::Dependencies {
+                system: &self.kernel,
+                probe_exec: &self.kernel.script,
+                handle: Some(&held),
+                state_root: &self.root.path,
+                run_root: &self.root.path.join("run"),
+            },
+            &scupper_sys::check_v2::Config {
+                site: &site,
+                gateway: &scupper_core::config::GatewayId("gw1".into()),
+                stamp: self.root.stamp,
+            },
+        )
+        .unwrap()
     }
     fn state(&self, change: impl FnOnce(&mut scupper_sys::state::State)) {
         let guard = WriterLock::acquire(self.root.path.join("lock")).unwrap();
@@ -1711,12 +1766,22 @@ fn control_apply_keeps_quarantine_on_failure_and_clears_only_after_full_verifica
     assert!(state.quarantine.is_some());
     assert_eq!(fixture.kernel.values.borrow()["net.ipv4.ip_forward"], "0");
     *fixture.kernel.failure.borrow_mut() = None;
+    fixture.kernel.calls.borrow_mut().clear();
     assert!(admin::apply(&deps, &log.handle, None, false, 0).is_ok());
     let scupper_sys::state::StateRead::Present(state) = file.read().unwrap() else {
         panic!("missing state");
     };
     assert!(state.quarantine.is_none());
     assert!(observed_open.get());
+    assert!(
+        !fixture
+            .kernel
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call.contains("wg0 down")
+                || (call.starts_with("netns Wg set wg0 peer") && call.ends_with("remove")))
+    );
     assert_eq!(fixture.kernel.values.borrow()["net.ipv4.ip_forward"], "1");
 }
 
@@ -1726,10 +1791,39 @@ fn disconnected_reboot_preserves_client_sessions() {
     assert!(f.run(None).succeeded());
     f.state(|state| state.selection = Selection::Disconnected);
     assert!(f.run(None).succeeded());
+    // Effective daemon disconnect closes the gates as well as exit links.
+    for key in [
+        "net.ipv4.ip_forward",
+        "net.ipv6.conf.all.forwarding",
+        "net.ipv4.conf.default.forwarding",
+        "net.ipv6.conf.default.forwarding",
+    ] {
+        f.kernel.values.borrow_mut().insert(key.into(), "0".into());
+    }
     f.kernel.calls.borrow_mut().clear();
     // A second boot sees exits already down, as after an effective disconnect.
     let reboot = f.run(None);
     assert!(reboot.succeeded() && reboot.adopted, "{reboot:?}");
+    assert!(
+        f.kernel
+            .defaults
+            .borrow()
+            .values()
+            .all(|route| route.contains("unreachable"))
+    );
+    assert_eq!(f.kernel.defaults.borrow().len(), 2);
+    assert!(!f.kernel.ns.borrow()["ex-ch1"].up);
+    assert_eq!(f.kernel.values.borrow()["net.ipv4.ip_forward"], "0");
+    assert_eq!(
+        f.kernel.values.borrow()["net.ipv6.conf.all.forwarding"],
+        "0"
+    );
+    assert_eq!(
+        f.check().verdict,
+        scupper_core::verdict::v2::Verdict::FailClosed(
+            scupper_core::verdict::v2::FailClosed::AdminDisconnected
+        )
+    );
     let calls = f.kernel.calls.borrow();
     assert!(
         !calls
@@ -1763,4 +1857,275 @@ fn explicit_apply_version_does_not_verify_unrelated_head() {
     .unwrap();
     assert!(admin::apply(&deps, &log.handle, Some(1), true, 0).is_ok());
     assert!(admin::apply(&deps, &log.handle, None, true, 0).is_err());
+}
+
+#[test]
+fn full_boot_updates_client_peers_without_resetting_sessions() {
+    let f = Fixture::new();
+    assert!(f.run(None).succeeded());
+    for peer in f
+        .kernel
+        .ns
+        .borrow_mut()
+        .get_mut("wg0")
+        .unwrap()
+        .peers
+        .values_mut()
+    {
+        peer.1 = "198.51.100.44:65000".into();
+    }
+    let peers = f.kernel.ns.borrow()["wg0"].peers.clone();
+    f.kernel
+        .ns
+        .borrow_mut()
+        .get_mut("wg0")
+        .unwrap()
+        .peers
+        .insert(
+            "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk=".into(),
+            ("10.99.0.99/32".into(), "(none)".into()),
+        );
+    // A changed MTU forces a full boot over the existing link.
+    f.kernel.ns.borrow_mut().get_mut("wg0").unwrap().mtu = 1300;
+    f.kernel.calls.borrow_mut().clear();
+    let report = f.run(None);
+    assert!(report.succeeded() && !report.adopted, "{report:?}");
+    assert_eq!(f.kernel.ns.borrow()["wg0"].peers, peers);
+    let calls = f.kernel.calls.borrow();
+    assert!(!calls.iter().any(|call| {
+        peers
+            .keys()
+            .any(|key| call == &format!("netns Wg set wg0 peer {key} remove"))
+    }));
+    assert!(!calls.iter().any(|call| call.contains("wg0 down")));
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.starts_with("netns Wg set wg0 peer")
+                && call.contains("allowed-ips")
+                && call.contains("persistent-keepalive 0"))
+    );
+}
+
+#[test]
+fn disconnected_boot_closes_an_up_exit_and_foreign_default() {
+    let f = Fixture::new();
+    assert!(f.run(None).succeeded());
+    f.state(|state| state.selection = Selection::Disconnected);
+    f.kernel
+        .defaults
+        .borrow_mut()
+        .insert(false, "default dev foreign0".into());
+    let report = f.run(None);
+    assert!(report.succeeded(), "{report:?}");
+    assert!(!f.kernel.ns.borrow()["ex-ch1"].up);
+    assert!(
+        f.kernel
+            .defaults
+            .borrow()
+            .values()
+            .all(|route| route.contains("unreachable"))
+    );
+    assert_eq!(f.check().verdict.exit_code(), 4);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn failed_apply_restores_version_without_drift_budget_or_latch_and_restart_boots_previous() {
+    use scupper_proto::{EventKind, Op, OpResult};
+    use scupper_sys::{
+        daemon::admin,
+        events::EventLog,
+        store::{MetaInput, VersionStore},
+    };
+    let f = Fixture::new();
+    assert!(f.run(None).succeeded());
+    let run_root = f.root.path.join("run");
+    let guard = WriterLock::acquire(&run_root).unwrap();
+    VersionStore::open(&f.root.path, Some(&guard))
+        .unwrap()
+        .commit(
+            &guard,
+            Some(1),
+            &support::site_text("ubuntu-24.04").replace("mtu = 1420", "mtu = 1400"),
+            MetaInput {
+                actor: "test".into(),
+                at: 1000,
+                reason: "exit change".into(),
+            },
+        )
+        .unwrap();
+    drop(guard);
+    let fail_target = |point| {
+        let scupper_sys::state::StateRead::Present(state) =
+            StateFile::open(&f.root.path, None).unwrap().read().unwrap()
+        else {
+            unreachable!()
+        };
+        if point == BootPoint::After(BootStep::Ruleset) && state.applied_version == Some(2) {
+            assert!(f.kernel.verified_this_run.get());
+            return Err("target failed after loading ruleset".into());
+        }
+        Ok(())
+    };
+    let deps = || BootDeps {
+        system: &f.kernel,
+        namespace: &f.kernel,
+        state_root: &f.root.path,
+        config_root: &f.root.path,
+        run_root: &run_root,
+        hook: Some(&fail_target),
+        secret_owner: rustix::process::geteuid().as_raw(),
+    };
+    let log = EventLog::memory_only(scupper_core::config::GatewayId("gw1".into()), || {
+        scupper_proto::UnixSeconds(1000)
+    })
+    .unwrap();
+    for _ in 0..4 {
+        assert!(admin::apply(&deps(), &log.handle, Some(2), false, 0).is_err());
+        let scupper_sys::state::StateRead::Present(state) =
+            StateFile::open(&f.root.path, None).unwrap().read().unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(state.applied_version, Some(1));
+        assert!(state.quarantine.is_none());
+        let report: BootReport =
+            serde_json::from_slice(&fs::read(run_root.join("boot.json")).unwrap()).unwrap();
+        assert!(report.succeeded());
+        assert_eq!(report.applied_version, Some(1));
+        let site = support::site("ubuntu-24.04");
+        let stamp = f.root.stamp;
+        let held = std::sync::Arc::new(testing::handle().unwrap());
+        let (device, inode) = held.identity();
+        let health = scupper_core::verdict::v2::HealthConfigV2::new(
+            &site,
+            &scupper_core::config::GatewayId("gw1".into()),
+            scupper_core::verdict::v2::NetnsIdentity { device, inode },
+            vec!["203.0.113.1".parse().unwrap()],
+            1,
+        )
+        .unwrap();
+        let fingerprint = scupper_sys::canon::fingerprint(
+            &scupper_sys::canon::canonicalize(&f.kernel.script.text("want.json")).unwrap(),
+        )
+        .unwrap();
+        let config = scupper_sys::reconcile::Config {
+            site,
+            gateway: scupper_core::config::GatewayId("gw1".into()),
+            stamp,
+            fingerprint,
+            run_root: run_root.clone(),
+            lock_wait: Duration::from_millis(100),
+        };
+        let kernel = scupper_sys::reconcile::RealKernel::from_boot_file(
+            deps(),
+            held.clone(),
+            &config,
+            health,
+            "/proc/self/ns/net".into(),
+            None,
+        )
+        .unwrap();
+        let mut machine = scupper_sys::reconcile::Reconciler::new(
+            kernel,
+            StateFile::open(&f.root.path, None).unwrap(),
+            log.handle.clone(),
+            config,
+            held,
+            || (scupper_core::failover::MonoTime(Duration::ZERO), 1000),
+        )
+        .unwrap();
+        machine.resume_existing();
+        assert!(matches!(
+            admin::execute(&mut machine, Op::Ping {}, 0, Some(0), |_| unreachable!()).unwrap(),
+            OpResult::Ping {
+                version: 1,
+                quarantined: false,
+                ..
+            }
+        ));
+        let tick = machine.tick();
+        assert!(
+            !tick
+                .events
+                .iter()
+                .any(|event| matches!(event, EventKind::DriftDetected { .. }))
+        );
+        assert!(machine.latch().is_none());
+        drop(machine);
+        let restart = f.run(None);
+        assert!(restart.succeeded());
+        assert_eq!(restart.applied_version, Some(1));
+    }
+    assert!(!run_root.join("boot-attempts").exists());
+    let disk = EventLog::open(
+        &f.root.path,
+        scupper_core::config::GatewayId("gw1".into()),
+        || scupper_proto::UnixSeconds(1000),
+    )
+    .unwrap();
+    log.handle.replay_into(&disk.handle).unwrap();
+    disk.handle.flush_blocking(Duration::from_secs(2)).unwrap();
+    let events: Vec<_> = scupper_sys::events::read_since(&f.root.path, 0, None)
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::ApplyFailed { .. }))
+            .count(),
+        4
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::DriftDetected { .. }))
+    );
+}
+
+#[test]
+fn failed_apply_with_undurable_rollback_keeps_forwarding_closed() {
+    use scupper_sys::{daemon::admin, events::EventLog};
+    let f = Fixture::new();
+    assert!(f.run(None).succeeded());
+    let break_rollback = |point| {
+        if point == BootPoint::After(BootStep::Ruleset) {
+            fs::rename(
+                f.root.path.join("state.json"),
+                f.root.path.join("saved-state.json"),
+            )
+            .unwrap();
+            fs::create_dir(f.root.path.join("state.json")).unwrap();
+            return Err("boot failed and rollback publication unavailable".into());
+        }
+        Ok(())
+    };
+    let run_root = f.root.path.join("run");
+    let deps = BootDeps {
+        system: &f.kernel,
+        namespace: &f.kernel,
+        state_root: &f.root.path,
+        config_root: &f.root.path,
+        run_root: &run_root,
+        hook: Some(&break_rollback),
+        secret_owner: rustix::process::geteuid().as_raw(),
+    };
+    let log = EventLog::memory_only(scupper_core::config::GatewayId("gw1".into()), || {
+        scupper_proto::UnixSeconds(1000)
+    })
+    .unwrap();
+    let error = admin::apply(&deps, &log.handle, Some(1), false, 0).unwrap_err();
+    assert_eq!(
+        error.code,
+        scupper_proto::ApiErrorCode::PersistenceUnavailable
+    );
+    assert_eq!(f.kernel.values.borrow()["net.ipv4.ip_forward"], "0");
+    assert_eq!(
+        f.kernel.values.borrow()["net.ipv6.conf.all.forwarding"],
+        "0"
+    );
+    let report: BootReport =
+        serde_json::from_slice(&fs::read(run_root.join("boot.json")).unwrap()).unwrap();
+    assert!(!report.succeeded());
 }

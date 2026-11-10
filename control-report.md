@@ -84,3 +84,44 @@ The full run passed 845 tests, with 8 existing subprocess fixtures ignored. Test
 Privileged lab cases and real-systemd watchdog fault runs were compiled but not executed locally. L14's session-reset diagnosis is supported by the saved boot trace and the new adoption/verdict regressions; actual canary recovery still needs the privileged lab. The bind test explicitly verifies fail-closed refusal on this filesystem's unsupported socket chmod (EINVAL); its full publication/rebind branch requires a supporting filesystem.
 
 Final scratch-path audit: the CLI harness, probe wiring, namespace restore, lab registry, oracle and lab test helper all use CARGO_TARGET_TMPDIR. The final xtask-only run passed 106 tests after its last scratch-path changes. No crate-local target directories were recreated; all changed files are within the authorized source/CI paths and this report.
+
+## Fix round 3
+
+- F1 decision → stale and Never client handshakes warn only; stages 5–8 still run. Tests: `client_handshakes_stale_is_warning_only`, `clients_without_established_session_do_not_mask_later_stages`.
+- F2 decision → full boot preserves configured client peers in place and keeps wg0 up, while removing unknown peers and updating AllowedIPs/keepalive. Test: `full_boot_updates_client_peers_without_resetting_sessions`; lab canary assertions tracked below.
+- F3 decision / N12 / T-5 → failed target boot durably restores the previous applied version, emits ApplyFailed, and boots the previous configuration under the same writer guard before reattachment. Failed rollback persistence drops the running attachment and keeps gates closed. Test: `failed_apply_restores_version_without_drift_budget_or_latch_and_restart_boots_previous` (added below).
+- F10 / F12 → removed invalidation of the taken dispatcher; publish namespace snapshots immediately after initialization and rebuild. Tests: dispatcher apply regressions and initialization tests.
+- T-2 → disconnected adoption now asserts both unreachable defaults, down exits, unchanged forwarding and check=4; an up-exit/foreign-default boot must close routes. Tests: `disconnected_reboot_preserves_client_sessions`, `disconnected_boot_closes_an_up_exit_and_foreign_default`.
+- F5 decision → RouteDelete absence compares table/family/destination/type/source/device/gateway/metric identity; flags, preferred source, protocol and scope cannot disguise a surviving route. Test: `route_delete_requires_observed_absence` (includes changed linkdown).
+- F6 decision → a boot under a live supervisor lease exits 0 with an explicit namespace-ownership notice, so manual scupper-net restarts succeed without resetting sessions. Filesystem/lease errors still fail. Test: `boot_defers_to_live_supervisor_before_kernel_calls`.
+- F10 → explicit bind group avoids reading /etc/group. Test: `bind_publication_stale_removal_replacement_and_rebind`.
+- T-1 → unsupported chmod must yield InvalidInput/Unsupported, leave no staging directories, and fails the test if CI is set. Test: `bind_publication_stale_removal_replacement_and_rebind`.
+- F11 → lease wait notices fire immediately then at most every five seconds. Tests: `supervisor_lease_waits_for_release`, production startup regression tracked below.
+- F9 decision → retain the Ubuntu 22.04-compatible fixed RestartSec=2s backoff; emit DaemonStarted once only after READY so deterministic startup failures do not flood audit history. Tests: daemon scheduler/startup tests and unit golden.
+- F4 / F7 / lab L6 → stale or missing Ping completion age skips queued Check and retains Alive/stale for local observations; socket Check has a 60 s deadline and retries SupervisorUnavailable once after fresh Ping. Queued requests from disconnected peers are discarded, and peer slots release promptly on hangup. L6 artifacts show a 15 s external timeout killing the queued check before output; lab Check now allows its 60 s deadline plus local observation margin (90 s). Tests: stale-Ping, retry and abandoned-peer regressions added below; existing JSON/fallback tests.
+- F2 / lab L14 / L44 → require adopted=true for the disconnected simulated reboot, observe a client handshake before canaries, apply an exit-only keepalive version, assert the existing client session remains established and immediately deliver service canaries. Privileged execution pending.
+- Lab L43 → after clear wait for all forwarding gates (including both defaults and wg0) to read 1 before check=0, then require client delivery; healthy routes alone were already present and did not prove reopening. Forwarding defaults are now classified as gates rather than hardening warnings. Tests: clear/reopen regression and collector tests; privileged lab pending.
+- T-4 → L44 additionally queues disconnect during a second paused apply, proves no early reply, releases apply, requires both commands to succeed, then asserts unreachable defaults and check=4 before reconnecting. Privileged execution pending.
+- T-6 → L14 now deletes the namespace with the daemon stopped, boots disconnected/check=4, reconnects, and requires an ordinary client handshake and service delivery within 20 s, retaining the uplink capture oracle. Privileged execution pending.
+- T-3 / T-5 partial coverage → production run delegates to the same injectable notification entry after parsing its socket address. Test `daemon_run_waits_for_lease_and_sends_status_before_reading_config` holds the real lease, receives STATUS, proves run stays pending without notification flooding, releases it and proves config reading resumes. The supplied 24.04 artifacts skipped L44 and contain no 22.04 READY-timeout evidence, so that historical timeout remains unassigned.
+- F4 abandoned calls → `dispatcher_drops_mutation_after_peer_hangup` proves a disconnected queued mutation cannot persist intent.
+- F4 / F7 regression tests → `stale_ping_skips_socket_check_and_preserves_stale_supervision` covers None/30/100 s ages with typed JSON/stale verdict; `check_retries_once_after_apply_invalidates_worker` covers Ping → unavailable Check → fresh Ping → successful Check.
+- Lab L14 / T-2 evidence → L14-reboot.calls.json completes topology/adoption checks, then reads ip_forward and immediately starts Close. The daemon's effective disconnect had already closed global gates, but adoption demanded forwarding=1. Disconnected adoption now accepts a fully verified closed sysctl set as well as the verified open set, preserving the gate state and client sessions. Test: `disconnected_reboot_preserves_client_sessions` now models the daemon's closed gates.
+- F3 rollback failure → `failed_apply_with_undurable_rollback_keeps_forwarding_closed` prevents state publication after the target ruleset step and requires PersistenceUnavailable, both global gates closed and a failed boot handoff.
+- L43 recovery verification → `repair_clear_reopens_forwarding_after_quarantined_restart` passes with both global gates, both default gates and wg0 forwarding restored after normal debounce/ticks.
+- F4 deadline → the optional Check retry shares the original 60 s deadline rather than extending it.
+- F8 scope exception pending → the stated edit scope excludes `docs/DESIGN.md` and `tests/golden/units/scupperd.service`. Those files remain unchanged pending the requested exception. The replacement unit golden and DESIGN changes (unit settings and daemon-owned manual boot behavior) are prepared under `CARGO_TARGET_TMPDIR/round3`; switching the unit test back and deleting the adjacent copy will accompany that exception. Current test: `render::units::tests::m2_goldens` still uses the adjacent copy, so F8 remains open.
+
+### Round 3 verification
+
+All five gates passed, each invoked under `timeout 600`:
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
+- `cargo test --workspace --all-features --locked --no-fail-fast`
+- `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked`
+- `cargo deny check`
+
+The final full workspace run passed with no failing targets. The prior broad run exposed a fixture error: its unknown peer reused the configured client's key and overwrote the test's roamed endpoint; the fixture now uses a distinct key. The final run includes the disconnected closed-gate adoption, configured-peer/session retention, rollback/restart, rollback-persistence refusal, stale-Ping/retry, abandoned-client, startup STATUS and quarantine-clear reopening regressions. `git diff --check` and the edit-scope audit passed.
+
+Privileged L10/L14/L43/L44/L50 and real-systemd watchdog runs were compiled but not executed. The supplied read-only artifacts cover 24.04; the historical 22.04 READY timeout cannot be assigned a cause from them. All scratch files are under CARGO_TARGET_TMPDIR in this worktree. No new crates or commits.
