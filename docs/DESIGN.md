@@ -2480,7 +2480,22 @@ retry limits are unchanged.
 L19 replays source policy routing in a lab-only table (R1 production has no
 client policy rule), and extends L2/L3/L4/L6 with focused provenance, established-flow,
 local-output and route-stage subtrials. L3/L4 deliberately add a preferred veth
-route so topology isolation cannot mask an nft mutation. The bound-probe-only
+route so topology isolation cannot mask an nft mutation. L19-L3 establishes a
+bidirectional UDP canary through the exit, saves provider-NAT receipts and the
+exact ASSURED conntrack tuple (UDP's bidirectional ESTABLISHED state), then pauses
+the sender and freezes the real daemon with its testing-only `incomplete-tick`
+hook in both control and mutant. It diverts the established replies after reverse
+NAT toward the bridge; the original direction still uses the exit. Diverting the
+original direction can invalidate the MASQUERADE mapping on an output-interface
+change, independently masking the historical nft bug. Immediately before sending,
+L19 requires the same established tuple; missing or changed state is a harness
+error. The control requires `fwd_dropped` increases and no forbidden bridge
+packets; M-ct requires the exact established reply tuple and marker on the bridge
+classified as ForbiddenAddress. Conntrack is checked again after measurement.
+After unfreezing, the daemon must remove the injected route and restore rules and
+service before a catch can be published. In the product, a conntrack flush on
+route repair is an additional layer that also masks bug 2; L19 freezes
+reconciliation to isolate the nft layer. The bound-probe-only
 mutation forges only forwarded route observations; default inventory and the
 real bound exit probe remain required. A preinstalled policy rule would fail
 baseline-rule inventory first (checked with the fake system), so an xtask-only

@@ -95,3 +95,20 @@ Final verification for Fix round 2:
 - CI YAML, all workflow shell scripts, the matrix-independent cache key and `git diff --check` — passed.
 
 Final `timeout 600 cargo fmt --all` runs last. No commit is created. Privileged lab execution is unavailable locally (`ip`/`nft` absent); the supplied 24.04 failure artifacts were inspected, but no live containment or mutation catch is claimed.
+
+
+## Fix round 3
+
+- Run 2 evidence: mutant `L19-L3-drops.json` records 43 drops for 41 sends despite the live non-directional ct accept; the saved route selects `lab-bridge`. Its UDP log records replies through 6071 ms, and matching sink receipts use provider NAT. `commands.jsonl` has no daemon launch and no conntrack flush until restoration: daemon repair cannot explain this run. Original-direction MASQUERADE interface invalidation is the remaining likely cause; the old trial did not save conntrack state, so that mechanism cannot be confirmed from these artifacts alone.
+- L19-L3 now diverts the established reply direction after reverse NAT, keeping the original exit/NAT path intact. No product rules change. A real daemon runs in both controls and mutants; after provider-NAT receipts and an exact ASSURED UDP conntrack entry are saved, the sender pauses and `incomplete-tick` freezes reconciliation before bridge setup. The identical tuple must still be established immediately before sending and after measurement, otherwise the trial fails as a harness error.
+- Control requires the exact reply tuple/marker arriving on the exit, nft drops and no forbidden bridge packets. M-ct requires the Internet-to-client established UDP reply, exact ports and marker, classified as ForbiddenAddress on the bridge. Recovery unfreezes the daemon and requires route removal, rules verification and restored service before accepting a catch. DESIGN §17 records both NAT-path isolation and the product's additional conntrack-flush layer on route repair.
+Verification for Fix round 3 (each gate uses `timeout 600`):
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` — passed on the final source.
+- `cargo test --workspace --all-features --locked` — passed on the final source, including the exit-ingress and recovery refinements.
+- `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked` — passed on the final source.
+- `cargo deny check` — passed.
+- Focused mutation regressions — 7 passed, including missing/unreplied/changed conntrack tuples and rejection of catches without establishment/freeze evidence.
+
+Final `timeout 600 cargo fmt --all` runs last. Product code and dependencies are unchanged. Privileged live execution is unavailable locally (`ip`, `nft` and `conntrack` absent; non-root), so no live M-ct catch is claimed. No commit is created.

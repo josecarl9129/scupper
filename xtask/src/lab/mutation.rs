@@ -97,7 +97,21 @@ fn evidence_matches(mutation: Mutation, e: &Evidence) -> bool {
             !e.live["actual"].is_null()
                 && e.live["actual"] == e.live["expected"]
                 && e.live["actual"] != e.live["control"]
-                && o["destination"] == A.internet.peer
+                && if mutation == Mutation::Ct {
+                    o["destination"] == A.client_inner
+                        && o["source"] == A.internet.peer
+                        && o["established"]["reconciliation_frozen"] == true
+                        && o["established"]["provider_nat"] == true
+                        && o["established"]["source_port"]
+                            .as_u64()
+                            .and_then(|p| u16::try_from(p).ok())
+                            .filter(|p| *p > 0)
+                            .is_some_and(|port| {
+                                o["established"]["tuple"] == serde_json::json!(udp_nat_tuple(port))
+                            })
+                } else {
+                    o["destination"] == A.internet.peer
+                }
                 && o["packet_index"].as_u64().is_some_and(|n| n > 0)
                 && o["marker"].as_str().is_some_and(|m| !m.is_empty())
                 && o["report"]["packets"].as_array().is_some_and(|a| {
@@ -405,8 +419,20 @@ impl Lab {
         finish(trial, cleanup)
     }
 
-    #[allow(clippy::too_many_lines)] // Keep path setup, live controls, fault evidence and restoration together.
     fn meta_bridge(&mut self, mutation: Mutation) -> Result<Option<serde_json::Value>> {
+        if mutation == Mutation::Ct {
+            self.meta_supervised(|lab, root| lab.meta_bridge_trial(mutation, Some(root)))
+        } else {
+            self.meta_bridge_trial(mutation, None)
+        }
+    }
+
+    #[allow(clippy::too_many_lines)] // Keep path setup, live controls, fault evidence and restoration together.
+    fn meta_bridge_trial(
+        &mut self,
+        mutation: Mutation,
+        root: Option<&Path>,
+    ) -> Result<Option<serde_json::Value>> {
         let stem = if mutation == Mutation::Ct {
             "L19-L3"
         } else {
@@ -414,15 +440,71 @@ impl Lab {
         };
         let marker = Lab::marker()?;
         let mut flow = None;
+        let mut established = None;
+        let destination = if mutation == Mutation::Ct {
+            A.client_inner
+        } else {
+            A.internet.peer
+        };
+        let prefix = format!("{destination}/32");
         let trial = (|| {
             if mutation == Mutation::Ct {
-                flow = Some(self.daemon_flow("udp", "client", &marker, stem, 45)?);
+                flow = Some(self.daemon_flow("udp", "client", &marker, stem, 120)?);
                 let log = self.artifacts.join(format!("{stem}-udp.jsonl"));
                 self.daemon_wait(
                     "L19 established UDP replies",
                     Duration::from_secs(5),
                     |_| Ok(super::daemon::flow_counts(&log)?.1 > 4),
                 )?;
+                let first: serde_json::Value = serde_json::from_str(
+                    fs::read_to_string(&log)?
+                        .lines()
+                        .next()
+                        .ok_or("missing flow metadata")?,
+                )?;
+                let local: std::net::SocketAddr = first["local"]
+                    .as_str()
+                    .ok_or("missing UDP local tuple")?
+                    .parse()?;
+                let receipts: Vec<_> = super::helpers::receipts(&fs::read_to_string(
+                    self.artifacts.join("sink.jsonl"),
+                )?)?
+                .into_iter()
+                .filter(|r| r.marker == marker && r.protocol == "udp")
+                .collect();
+                fs::write(
+                    self.artifacts.join("L19-L3-provider-receipts.json"),
+                    serde_json::to_vec_pretty(&receipts)?,
+                )?;
+                if receipts.len() < 5
+                    || receipts
+                        .iter()
+                        .any(|r| r.peer.ip().to_string() != A.provider.peer)
+                {
+                    return fail("L19 harness: established flow lacks provider-NAT receipts");
+                }
+                // Linux marks a UDP flow ASSURED only after traffic continues past
+                // its ~2 s threshold: poll (sender still running) instead of
+                // checking right after the first replies.
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                let before = loop {
+                    match self.meta_conntrack(local.port(), "before") {
+                        Ok(entries) => break entries,
+                        Err(e) if std::time::Instant::now() >= deadline => {
+                            return fail(format!("L19 harness: flow not ASSURED within 10 s: {e}"));
+                        }
+                        Err(_) => self.runner.dwell(Duration::from_millis(250))?,
+                    }
+                };
+                // Stop the sender while changing the path; drain in-flight
+                // replies before measuring so none can cross before readback.
+                flow.as_ref()
+                    .ok_or("missing flow")?
+                    .signal(rustix::process::Signal::STOP);
+                let root = root.ok_or("missing L19 daemon root")?;
+                fs::write(root.join("run/scupper/incomplete-tick"), b"hold")?;
+                self.runner.dwell(Duration::from_millis(2200))?;
+                established = Some((local.port(), before));
             }
             self.veth(A.bridge, "lab-bridge")?;
             // Match the existing bridge fixture: incidental IPv6 MLD must not
@@ -436,11 +518,17 @@ impl Lab {
                 "ip",
                 &["route", "add", A.exit_net, "via", A.bridge.peer],
             )?;
-            self.cmd(
-                "wan",
-                "ip",
-                &["route", "add", A.client_net, "via", A.bridge.peer],
-            )?;
+            if mutation == Mutation::Ct {
+                // Capture the forbidden reply once, without routing it back
+                // into scupper and creating an established-packet loop.
+                self.cmd("wan", "ip", &["route", "add", "blackhole", A.client_net])?;
+            } else {
+                self.cmd(
+                    "wan",
+                    "ip",
+                    &["route", "add", A.client_net, "via", A.bridge.peer],
+                )?;
+            }
             // Narrow output liveness exception, separate from client and exit sources.
             if active() != Some(Mutation::Out) {
                 self.cmd(
@@ -480,23 +568,33 @@ impl Lab {
                 &[
                     "route",
                     "add",
-                    &format!("{}/32", A.internet.peer),
+                    &prefix,
                     "via",
                     A.bridge.wan,
                     "dev",
                     "lab-bridge",
                 ],
             )?;
+            // Divert replies after reverse NAT, preserving the original
+            // exit path. Moving a MASQUERADE flow's original output interface
+            // can invalidate its conntrack mapping before it reaches the wire.
             let source = if mutation == Mutation::Ct {
-                A.client_inner
+                A.internet.peer
             } else {
                 A.exit_inner
             };
-            let mut args = vec!["route", "get", A.internet.peer, "from", source];
+            let mut args = vec!["route", "get", destination, "from", source];
             if mutation == Mutation::Ct {
-                args.extend(["iif", "wg0"]);
+                args.extend(["iif", "ex-ch1"]);
             }
-            args.extend(["ipproto", "udp", "dport", "8080"]);
+            args.extend(["ipproto", "udp"]);
+            let reply_port = established.as_ref().map(|(port, _)| port.to_string());
+            if let Some(port) = &reply_port {
+                // Route lookup sees the tuple after reverse NAT in prerouting.
+                args.extend(["sport", "8080", "dport", port]);
+            } else {
+                args.extend(["dport", "8080"]);
+            }
             let route = self.cmd("scupper", "ip", &args)?;
             fs::write(self.artifacts.join(format!("{stem}-route.txt")), &route)?;
             if !route
@@ -508,10 +606,18 @@ impl Lab {
                 return fail("L19 foreign path not preferred");
             }
             if mutation == Mutation::Ct {
-                self.capture("scupper", "wg0", &format!("{stem}-ingress"))?;
+                self.capture("scupper", "ex-ch1", &format!("{stem}-ingress"))?;
                 let log = self.artifacts.join(format!("{stem}-udp.jsonl"));
                 let before = self.meta_drop_counter()?;
                 let sent = super::daemon::flow_counts(&log)?.0;
+                let (port, initial) = established.as_ref().ok_or("missing conntrack baseline")?;
+                let current = self.meta_conntrack(*port, "pre-send")?;
+                if initial != &current {
+                    return fail("L19 harness: established conntrack tuple changed before send");
+                }
+                flow.as_ref()
+                    .ok_or("missing flow")?
+                    .signal(rustix::process::Signal::CONT);
                 self.daemon_wait(
                     "L19 established packets after route loss",
                     Duration::from_secs(3),
@@ -519,6 +625,9 @@ impl Lab {
                 )?;
                 let sent_after = super::daemon::flow_counts(&log)?.0;
                 let after = self.meta_drop_counter()?;
+                if self.meta_conntrack(*port, "post-send")? != *initial {
+                    return fail("L19 harness: conntrack changed during the frozen measurement");
+                }
                 let (sends, drops, required) = drop_window(before, sent, sent_after, after);
                 fs::write(
                     self.artifacts.join("L19-L3-drops.json"),
@@ -558,12 +667,19 @@ impl Lab {
                     self.artifacts.join(format!("{stem}-ingress.pcap")),
                 )?)?;
                 if !packets.iter().any(|p| {
-                    p.source.to_string() == A.client_inner
+                    p.source.to_string() == A.internet.peer
+                        && p.destination.to_string() == A.exit_inner
+                        && p.protocol == 17
+                        && established.as_ref().is_some_and(|(port, _)| {
+                            let [a, b] = 8080_u16.to_be_bytes();
+                            let [c, d] = port.to_be_bytes();
+                            p.payload.get(..4) == Some(&[a, b, c, d])
+                        })
                         && p.payload
                             .windows(marker.len())
                             .any(|w| w == marker.as_bytes())
                 }) {
-                    return fail("L19 established ingress marker missing");
+                    return fail("L19 established exit reply tuple/marker missing");
                 }
             }
             let policy = format!(
@@ -598,9 +714,14 @@ impl Lab {
             let packet = packets
                 .iter()
                 .find(|p| {
-                    p.destination.to_string() == A.internet.peer
-                        && [A.client_inner, A.exit_inner].contains(&p.source.to_string().as_str())
+                    p.destination.to_string() == destination
+                        && p.source.to_string() == source
                         && p.protocol == 17
+                        && established.as_ref().is_none_or(|(port, _)| {
+                            let [a, b] = 8080_u16.to_be_bytes();
+                            let [c, d] = port.to_be_bytes();
+                            p.payload.get(..4) == Some(&[a, b, c, d])
+                        })
                         && p.payload
                             .windows(marker.len())
                             .any(|w| w == marker.as_bytes())
@@ -617,21 +738,32 @@ impl Lab {
                 )?;
             Ok(Some(
                 serde_json::json!({"capture": format!("{stem}.pcap"), "report": report,
-                "marker": marker, "destination": packet.destination, "source":packet.source, "packet_index":packet.index,"protocol":packet.protocol}),
+                "marker": marker, "destination": packet.destination, "source":packet.source, "packet_index":packet.index,"protocol":packet.protocol,
+                "established": established.as_ref().map(|(port, tuple)| serde_json::json!({"source_port":port,"tuple":tuple,"reconciliation_frozen":true,"provider_nat":true}))}),
             ))
         })();
+        if let Some(flow) = &flow {
+            flow.signal(rustix::process::Signal::CONT);
+        }
         let stopped = flow
             .as_mut()
             .map_or(Ok(()), |flow| flow.stop(rustix::process::Signal::TERM));
+        let resumed = if let Some(root) = root {
+            self.meta_resume(root, &prefix)
+        } else {
+            Ok(())
+        };
+        let route_cleanup = if root.is_none() {
+            self.cmd("scupper", "ip", &["route", "del", &prefix])
+                .map(|_| ())
+        } else {
+            Ok(())
+        };
         let cleanup = cleanup_results([
             stopped,
             self.stop_captures(),
-            self.cmd(
-                "scupper",
-                "ip",
-                &["route", "del", &format!("{}/32", A.internet.peer)],
-            )
-            .map(|_| ()),
+            resumed,
+            route_cleanup,
             self.cmd("wan", "ip", &["route", "del", A.exit_net])
                 .map(|_| ()),
             self.cmd("wan", "ip", &["route", "del", A.client_net])
@@ -644,6 +776,31 @@ impl Lab {
             self.service_check(&mut Vec::new()),
         ]);
         finish(trial, cleanup)
+    }
+
+    fn meta_conntrack(&mut self, port: u16, stage: &str) -> Result<Vec<String>> {
+        let entries = self.cmd(
+            "scupper",
+            "conntrack",
+            &[
+                "-L",
+                "-p",
+                "udp",
+                "--orig-src",
+                A.client_inner,
+                "--orig-dst",
+                A.internet.peer,
+                "--sport",
+                &port.to_string(),
+                "--dport",
+                "8080",
+            ],
+        )?;
+        fs::write(
+            self.artifacts.join(format!("L19-L3-conntrack-{stage}.txt")),
+            &entries,
+        )?;
+        established_udp_tuple(&entries, port)
     }
 
     #[allow(clippy::too_many_lines)] // Keep timed policy drift, stage evidence and restoration together.
@@ -868,6 +1025,53 @@ pub(super) fn finish<T>(trial: Result<T>, cleanup: Result<()>) -> Result<T> {
     }
 }
 
+// UDP has no printed TCP-style ESTABLISHED label. ASSURED proves the
+// bidirectional exchange (ct state established); reject UNREPLIED or a
+// different original/reply tuple instead of treating absent state as protection.
+fn established_udp_tuple(entries: &str, port: u16) -> Result<Vec<String>> {
+    let lines: Vec<_> = entries
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    if lines.len() != 1 {
+        return fail("L19 harness: expected exactly one ESTABLISHED UDP conntrack entry");
+    }
+    let words: Vec<_> = lines[0].split_whitespace().collect();
+    let tuple: Vec<_> = words
+        .iter()
+        .filter(|w| {
+            ["src=", "dst=", "sport=", "dport="]
+                .iter()
+                .any(|prefix| w.starts_with(prefix))
+        })
+        .map(ToString::to_string)
+        .collect();
+    let expected = udp_nat_tuple(port);
+    if words.first() != Some(&"udp")
+        || !words.contains(&"[ASSURED]")
+        || words.contains(&"[UNREPLIED]")
+        || tuple != expected
+    {
+        return fail(
+            "L19 harness: canary conntrack entry is not ESTABLISHED with the expected NAT tuple",
+        );
+    }
+    Ok(tuple)
+}
+
+fn udp_nat_tuple(port: u16) -> Vec<String> {
+    vec![
+        format!("src={}", A.client_inner),
+        format!("dst={}", A.internet.peer),
+        format!("sport={port}"),
+        "dport=8080".into(),
+        format!("src={}", A.internet.peer),
+        format!("dst={}", A.exit_inner),
+        "sport=8080".into(),
+        format!("dport={port}"),
+    ]
+}
+
 // The counter reads surround the send reads. Allow five in-flight packets,
 // but always require at least one observed nft drop in the control.
 fn drop_window(before: u64, sent: u64, sent_after: u64, after: u64) -> (u64, u64, u64) {
@@ -883,6 +1087,28 @@ fn drop_window(before: u64, sent: u64, sent_after: u64, after: u64) -> (u64, u64
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[test]
+    fn conntrack_requires_the_exact_assured_bidirectional_udp_tuple() {
+        let entry = "udp 17 179 src=10.99.0.2 dst=192.0.2.6 sport=42000 dport=8080 src=192.0.2.6 dst=10.2.0.2 sport=8080 dport=42000 [ASSURED] mark=0 use=1\n";
+        let tuple = established_udp_tuple(entry, 42000).unwrap();
+        assert_eq!(
+            tuple,
+            established_udp_tuple(&entry.replace("179", "130"), 42000).unwrap()
+        );
+        for invalid in [
+            String::new(),
+            entry.repeat(2),
+            entry.replace("[ASSURED]", "[UNREPLIED]"),
+            entry.replace("[ASSURED]", ""),
+            entry.replace("src=10.99.0.2", "src=10.99.0.3"),
+            entry.replace("dst=10.2.0.2", "dst=198.51.100.6"),
+            entry.replace("dport=42000", "dport=42001"),
+        ] {
+            assert!(established_udp_tuple(&invalid, 42000).is_err(), "{invalid}");
+        }
+        assert!(established_udp_tuple(entry, 42001).is_err());
+    }
+
     #[test]
     fn drop_window_counts_only_sends_inside_the_counter_window() {
         // Sends during either slow counter read lie outside the inner send
@@ -904,7 +1130,9 @@ mod tests {
                 live: serde_json::json!({"actual":["mutant"],"expected":["mutant"],"control":["control"]}),
                 observation: match mutation {
                     Mutation::Ct | Mutation::Out => {
-                        serde_json::json!({"capture":if mutation == Mutation::Ct { "L19-L3.pcap" } else { "L19-L4.pcap" },"packet_index":1,"destination":A.internet.peer,"marker":"canary","report":{"packets":[{"index":1,"class":{"Violation":{"ForbiddenAddress":{"addr":A.internet.peer}}}}]}})
+                        serde_json::json!({"capture":if mutation == Mutation::Ct { "L19-L3.pcap" } else { "L19-L4.pcap" },"packet_index":1,"destination":if mutation == Mutation::Ct { A.client_inner } else { A.internet.peer },"source":if mutation == Mutation::Ct { A.internet.peer } else { A.exit_inner },"marker":"canary",
+                        "established":{"source_port":42000,"tuple":["src=10.99.0.2","dst=192.0.2.6","sport=42000","dport=8080","src=192.0.2.6","dst=10.2.0.2","sport=8080","dport=42000"],"reconciliation_frozen":true,"provider_nat":true},
+                        "report":{"packets":[{"index":1,"class":{"Violation":{"ForbiddenAddress":{"addr":A.internet.peer}}}}]}})
                     }
                     Mutation::Src => {
                         serde_json::json!({"packet_index":1,"source":A.gateway_inner,"destination":A.client_inner,"source_selector":A.client_net,"live_rule":{"src":"10.99.0.0","srclen":24}})
@@ -928,6 +1156,19 @@ mod tests {
             assert_eq!(observed.reason, caught.reason);
             assert!(invert(mutation, true, Some(&observed)).is_ok());
             assert!(invert(mutation, true, Some(&caught)).is_ok());
+            if mutation == Mutation::Ct {
+                for field in [
+                    "reconciliation_frozen",
+                    "provider_nat",
+                    "tuple",
+                    "source_port",
+                ] {
+                    let mut missing = caught.clone();
+                    missing.evidence.as_mut().unwrap().observation["established"][field] =
+                        serde_json::Value::Null;
+                    assert!(invert(mutation, true, Some(&missing)).is_err());
+                }
+            }
             assert!(invert(mutation, false, None).is_err());
             assert!(invert(mutation, true, None).is_err()); // harness error/timeout
             assert!(invert(mutation, false, Some(&caught)).is_err());
