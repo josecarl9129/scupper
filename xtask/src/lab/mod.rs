@@ -99,6 +99,32 @@ struct Capture {
     interface: String,
 }
 
+fn capture_invocation(ns: &str, iface: &str, pcap: &Path) -> Result<Invocation> {
+    // The oracle classifies both directions, including replies and link control.
+    // Keep every frame: neither a direction selector nor a BPF filter is safe.
+    // Retain main's immediate delivery for low-rate controls as well as -U's
+    // packet-buffered file writes; only enlarge the socket buffer.
+    Ok(Invocation::new(
+        ns,
+        "tcpdump",
+        &[
+            "-n",
+            "-Z",
+            "root",
+            "-B",
+            "16384",
+            "-U",
+            "--immediate-mode",
+            "-s",
+            "0",
+            "-i",
+            iface,
+            "-w",
+            pcap.to_str().ok_or("non-UTF8 artifact path")?,
+        ],
+    ))
+}
+
 struct Lab {
     boot_root: PathBuf,
     boot_root_ready: bool,
@@ -666,20 +692,6 @@ impl Lab {
         Ok(())
     }
     fn capture(&mut self, ns: &str, iface: &str, stem: &str) -> Result<()> {
-        self.capture_direction(ns, iface, stem, false)
-    }
-    // Full-service uplink trials prove both tunnel classes in this direction.
-    // Startup and heartbeat fixtures also need packets arriving at gwhost.
-    fn capture_uplink(&mut self, stem: &str) -> Result<()> {
-        self.capture_direction("wan", A.gwhost.wan_if, stem, true)
-    }
-    fn capture_direction(
-        &mut self,
-        ns: &str,
-        iface: &str,
-        stem: &str,
-        ingress: bool,
-    ) -> Result<()> {
         if self
             .captures
             .iter()
@@ -691,31 +703,9 @@ impl Lab {
         }
         let pcap = self.artifacts.join(format!("{stem}.pcap"));
         let log = self.artifacts.join(format!("{stem}.tcpdump.stdout"));
-        let mut args = vec![
-            "-n",
-            "-Z",
-            "root",
-            "-B",
-            "16384",
-            "-U",
-            "-s",
-            "0",
-            "-i",
-            iface,
-            "-w",
-            pcap.to_str().ok_or("non-UTF8 artifact path")?,
-        ];
-        // At the WAN end of this veth, ingress is everything emitted by gwhost.
-        // Filter only direction, never address, EtherType, protocol or port:
-        // plaintext, quoted addresses, markers, fragments, malformed WireGuard,
-        // truncated/unknown frames and ARP/ND must all reach the oracle. Other
-        // path captures need both directions (including bridge echo controls).
-        if ingress {
-            args.extend(["-Q", "in", "inbound"]);
-        }
         let group = self
             .runner
-            .background(&Invocation::new(ns, "tcpdump", &args), &log)?;
+            .background(&capture_invocation(ns, iface, &pcap)?, &log)?;
         self.captures.push(Capture {
             process: group,
             stderr: log.with_extension("stderr"),
@@ -737,6 +727,9 @@ impl Lab {
         }
         self.runner.dwell(Duration::from_secs(1))?;
         Ok(())
+    }
+    fn capture_uplink(&mut self, stem: &str) -> Result<()> {
+        self.capture("wan", A.gwhost.wan_if, stem)
     }
     fn stop_capture(&mut self) -> Result<()> {
         let mut capture = self.captures.pop().ok_or("missing capture process")?;

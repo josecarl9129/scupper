@@ -277,6 +277,102 @@ fn positive_controls_require_packet_evidence_and_reject_silence() {
     assert!(!evidence::leak_seen(&malformed));
 }
 #[test]
+fn capture_command_keeps_both_directions_and_all_frames() {
+    let path = std::path::Path::new("/pcap path/case.pcap");
+    for (ns, iface) in [
+        ("wan", A.gwhost.wan_if),
+        ("gwhost", "foreign-host"),
+        ("scupper", "wg0"),
+    ] {
+        assert_eq!(
+            super::capture_invocation(ns, iface, path).unwrap(),
+            Invocation::new(
+                ns,
+                "tcpdump",
+                &[
+                    "-n",
+                    "-Z",
+                    "root",
+                    "-B",
+                    "16384",
+                    "-U",
+                    "--immediate-mode",
+                    "-s",
+                    "0",
+                    "-i",
+                    iface,
+                    "-w",
+                    "/pcap path/case.pcap",
+                ]
+            )
+        );
+    }
+}
+
+#[test]
+fn saved_buffered_capture_preserves_old_oracle_classification() {
+    use crate::pcap::{Class, Reason};
+
+    let old = include_bytes!("../../tests/fixtures/capture-round3-old.pcap");
+    let new = include_bytes!("../../tests/fixtures/capture-round3-new.pcap");
+    let marker = "scupper-canary-00112233445566778899aabbccddeeff".to_owned();
+    let baseline_policy =
+        Policy::from_toml(&evidence::policy(&vec![marker.clone(); 12], false).unwrap()).unwrap();
+    let control_policy =
+        Policy::from_toml(&evidence::policy(&vec![marker.clone(); 5], false).unwrap()).unwrap();
+    // The saved stream starts with 48 fixed-size Ethernet/IPv4/UDP/WG records.
+    let baseline_end = 24 + 48 * (16 + 14 + 20 + 8 + 32);
+    let mut reports = Vec::new();
+    for bytes in [old.as_slice(), new.as_slice()] {
+        let baseline = classify(&bytes[..baseline_end], &baseline_policy, 30).unwrap();
+        assert!(evidence::contained(&baseline));
+        assert_eq!(baseline.packet_count, 48);
+        for rule in ["wireguard[0]", "wireguard[1]"] {
+            assert_eq!(baseline.counts[&format!("Allowed({rule})")], 24);
+        }
+        assert_saved_tunnel_directions(&bytes[..baseline_end]);
+        let control = classify(bytes, &control_policy, 30).unwrap();
+        assert_eq!(control.packet_count, 51);
+        assert_eq!(control.violation_count, 3);
+        assert_eq!(control.capture_failures, []);
+        assert_eq!(control.counts["Violation(CanaryMarker)"], 2);
+        assert!(matches!(
+            control.packets[48].class,
+            Class::Violation(Reason::ForbiddenAddress { .. })
+        ));
+        evidence::injected_only(&control, bytes, &marker).unwrap();
+        reports.push(serde_json::to_value((&baseline, &control)).unwrap());
+    }
+    assert_eq!(reports[0], reports[1]);
+}
+
+fn assert_saved_tunnel_directions(bytes: &[u8]) {
+    let observed = crate::pcap::observe(bytes).unwrap();
+    for (peer, local_port) in [(A.client.peer, 51820_u16), (A.provider.peer, 51821_u16)] {
+        for outgoing in [true, false] {
+            let (source, destination, sport, dport) = if outgoing {
+                (A.gwhost.peer, peer, local_port, 51820)
+            } else {
+                (peer, A.gwhost.peer, 51820, local_port)
+            };
+            assert_eq!(
+                observed
+                    .iter()
+                    .filter(|packet| {
+                        packet.source.to_string() == source
+                            && packet.destination.to_string() == destination
+                            && packet.protocol == 17
+                            && packet.payload.get(..2) == Some(sport.to_be_bytes().as_slice())
+                            && packet.payload.get(2..4) == Some(dport.to_be_bytes().as_slice())
+                    })
+                    .count(),
+                12
+            );
+        }
+    }
+}
+
+#[test]
 fn every_external_program_uses_argv_namespace_entry_and_a_timeout() {
     let commands: &[(&str, &[&str])] = &[
         ("ip", &["-j", "route", "show", "table", "all"]),
@@ -529,6 +625,19 @@ fn capture_loss_or_missing_statistics_cannot_establish_silence() {
         .is_ok()
     );
     assert!(evidence::check_capture_stats("1 packets dropped by kernel\n").is_err());
+    assert!(
+        evidence::check_capture_stats(
+            "51 packets captured\n96 packets received by filter\n1 packets dropped by kernel\n"
+        )
+        .is_err()
+    );
+    // Received-by-filter and captured counts have platform-specific semantics.
+    assert!(
+        evidence::check_capture_stats(
+            "51 packets captured\n96 packets received by filter\n0 packets dropped by kernel\n"
+        )
+        .is_ok()
+    );
     let error = evidence::check_capture_stats(
         "0 packets captured\n218 packets received by filter\n0 packets dropped by kernel\n",
     )
