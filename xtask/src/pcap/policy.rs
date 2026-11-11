@@ -8,6 +8,7 @@ use serde::Deserialize;
 pub struct Policy {
     pub(super) uplink_addrs: Vec<IpAddr>,
     pub(super) heartbeat: Option<SocketAddr>,
+    pub(super) heartbeat_dscp: Option<u8>,
     pub(super) wireguard: Vec<WireGuard>,
     pub(super) host_allow: Vec<HostRule>,
     pub(super) arp: bool,
@@ -69,6 +70,8 @@ struct RawPolicy {
     wireguard: Vec<WireGuard>,
     #[serde(default)]
     heartbeat: Option<SocketAddr>,
+    #[serde(default)]
+    heartbeat_dscp: Option<u8>,
     #[serde(default)]
     host_allow: Vec<RawHost>,
     #[serde(default)]
@@ -155,6 +158,7 @@ impl Policy {
             uplink_addrs: raw.uplink_addrs,
             wireguard: raw.wireguard,
             heartbeat: raw.heartbeat,
+            heartbeat_dscp: raw.heartbeat_dscp,
             host_allow: Vec::new(),
             arp: raw.arp,
             ndp: raw.ndp,
@@ -173,6 +177,9 @@ impl Policy {
             return Err(invalid(
                 "heartbeat requires one non-forbidden HTTPS endpoint on port 443",
             ));
+        }
+        if policy.heartbeat_dscp.is_some_and(|mark| mark > 63) {
+            return Err(invalid("heartbeat_dscp must fit six bits"));
         }
         for pair in &policy.wireguard {
             if !policy.uplink_addrs.contains(&pair.gateway.ip())

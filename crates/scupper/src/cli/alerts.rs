@@ -93,6 +93,8 @@ pub(super) fn run(
                     break outcome;
                 }
                 if std::time::Instant::now() >= deadline {
+                    scupper_sys::alerts::cancel_test(deps.state_root, &name, &id)
+                        .map_err(|_| "could not cancel timed-out alert test")?;
                     break "timeout".into();
                 }
                 std::thread::sleep(Duration::from_millis(100));

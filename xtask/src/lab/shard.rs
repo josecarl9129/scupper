@@ -185,9 +185,9 @@ pub fn list_with_durations(
 mod tests {
     use super::*;
     // CI has no committed successful durations yet: always check the built-in
-    // estimates. The live alert hold adds 120 seconds to the catalog; round
-    // the per-shard budget up one minute and retain all 300 seconds for setup/cleanup.
-    const CI_SHARD_SECONDS: u64 = 31 * 60;
+    // estimates against the workflow's explicit leaktest command timeout,
+    // retaining 300 seconds for setup/cleanup inside that command budget.
+    const CI_SHARD_SECONDS: u64 = 60 * 60;
     fn check_four_shard_budget(cases: &[Spec]) -> Result<()> {
         if cases.is_empty() {
             return fail("empty shard catalog");
@@ -207,6 +207,11 @@ mod tests {
     }
     #[test]
     fn ci_shard_budget_uses_builtin_estimates_and_rejects_over_budget() {
+        assert!(
+            include_str!("../../../.github/workflows/ci.yml").contains(&format!(
+                "timeout {CI_SHARD_SECONDS} target/release/xtask leaktest --shard"
+            ))
+        );
         check_four_shard_budget(&catalog()).unwrap();
         let mut over_budget = catalog();
         over_budget[0].seconds = CI_SHARD_SECONDS;

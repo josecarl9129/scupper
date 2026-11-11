@@ -9,12 +9,13 @@ use crate::{
     fs::{DurableStep, Fs, RealFs, durable_directory, durable_replace},
     lock::{WriterGuard, WriterLock},
 };
+use scupper_core::alerts::{Alert, AlertKey, Severity};
 use scupper_proto::{
     Actor, Event, EventKind, GatewayId, Identifier, Outcome, Reason, StepKind, UnixSeconds,
 };
 use serde::Deserialize;
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{self, File, OpenOptions},
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
@@ -134,6 +135,7 @@ enum WriterState {
 struct Queue {
     seq: u64,
     events: VecDeque<Event>,
+    current_critical: BTreeMap<AlertKey, Alert>,
     gap: Gap,
     dropped: u64,
     failure: bool,
@@ -206,12 +208,18 @@ impl Shared {
     }
     fn enqueue(&self, queue: &mut Queue, event: Event) {
         self.reserve(queue);
+        if let Some(alert) = event.alert().filter(|a| a.severity == Severity::Critical) {
+            queue.current_critical.insert(alert.key, alert);
+        }
         queue.events.push_back(event);
         let _ = self.wake.try_send(());
     }
     fn failed(&self) {
         let mut queue = self.lock();
         if !queue.failure {
+            eprintln!(
+                "scupperd: warning: event persistence failed; alert delivery stopped; external heartbeat is the backstop"
+            );
             queue.failure = true;
             let event = self.event(
                 &mut queue,
@@ -504,6 +512,17 @@ impl Drop for EventLog {
 }
 
 impl LogHandle {
+    // Only this process's observations, never reconstructed historical state.
+    // A key is usable once the sink has scanned its newest durable observation.
+    pub(crate) fn current_critical_keys(&self, through: u64) -> BTreeSet<AlertKey> {
+        self.shared
+            .lock()
+            .current_critical
+            .iter()
+            .filter(|(_, alert)| alert.seq <= through)
+            .map(|(key, _)| *key)
+            .collect()
+    }
     pub(crate) fn persistence_failed(&self) {
         self.shared.failed();
     }

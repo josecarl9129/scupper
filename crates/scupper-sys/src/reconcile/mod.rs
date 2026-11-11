@@ -256,7 +256,8 @@ pub struct Reconciler<K, S, C> {
     probe_rounds: Vec<BTreeMap<ExitId, scupper_core::failover::ProbeOutcome>>,
     actions: Vec<FailoverAction>,
     verdict: Option<VerdictCode>,
-    reported_quarantine: bool,
+    reported_quarantine: Option<bool>,
+    reported_fail_closed: Option<bool>,
     forwarding: bool,
     deadline: Option<Instant>,
     // Evidence only: no reservations or debounce are committed by emergency work.
@@ -320,7 +321,8 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             probe_rounds: vec![],
             actions,
             verdict: None,
-            reported_quarantine: false,
+            reported_quarantine: None,
+            reported_fail_closed: None,
             forwarding: false,
             deadline: None,
             emergency_steps: vec![],
@@ -874,9 +876,6 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                     );
                 }
                 FailoverAction::FlushConntrack => transition.push(Step::FlushConntrack),
-                FailoverAction::Emit(scupper_core::failover::FailoverEvent::FailClosedEnded {
-                    ..
-                }) if self.latch.is_some() => {}
                 FailoverAction::Emit(event) => self.emit(event.into(), Actor::Daemon, report),
                 FailoverAction::SetExitsDown => transition.extend(
                     desired
@@ -934,15 +933,57 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         }
         self.run_plan(planned, &desired, guard, report, true);
     }
+    #[allow(clippy::too_many_lines)] // Publish independent incident state alongside the tick verdict.
     fn report_verdict(&mut self, report: &mut TickReport) {
         let active = self.latch.is_some();
-        if active != self.reported_quarantine {
+        if Some(active) != self.reported_quarantine {
             self.emit(
                 EventKind::QuarantineChanged { active },
                 Actor::Daemon,
                 report,
             );
-            self.reported_quarantine = active;
+            self.reported_quarantine = Some(active);
+        }
+        if report.complete {
+            use scupper_core::failover::FailClosedReason;
+            let closed = matches!(
+                self.failover.fail_closed_reason(),
+                Some(FailClosedReason::NoHealthyExit | FailClosedReason::PinnedExitDown(_))
+            );
+            if self.reported_fail_closed != Some(closed) {
+                let kind = if closed {
+                    EventKind::FailClosedStarted {
+                        reason: if matches!(
+                            self.failover.fail_closed_reason(),
+                            Some(FailClosedReason::PinnedExitDown(_))
+                        ) {
+                            Reason::PinnedExitDown
+                        } else {
+                            Reason::NoHealthyExit
+                        },
+                        exit: None,
+                    }
+                } else {
+                    EventKind::FailClosedEnded {
+                        duration: Duration::ZERO,
+                    }
+                };
+                if !report.events.iter().any(|e| {
+                    matches!(
+                        (e, &kind),
+                        (
+                            EventKind::FailClosedStarted { .. },
+                            EventKind::FailClosedStarted { .. }
+                        ) | (
+                            EventKind::FailClosedEnded { .. },
+                            EventKind::FailClosedEnded { .. }
+                        )
+                    )
+                }) {
+                    self.emit(kind, Actor::Daemon, report);
+                }
+                self.reported_fail_closed = Some(closed);
+            }
         }
         let verdict = if !report.complete {
             VerdictCode::ObservationError
@@ -1915,7 +1956,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             actor.clone(),
             self.persisted.applied_version,
         );
-        self.reported_quarantine = false;
+        self.reported_quarantine = Some(false);
         self.kernel.persisted_latch(None);
         self.kernel.hold_latch(self.latch.as_ref());
         self.budgets = transition.budgets;

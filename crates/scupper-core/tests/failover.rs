@@ -588,7 +588,12 @@ fn admin_candidates_disconnect_pin_and_immediate_re_evaluation() {
         &cfg,
     );
     assert_eq!(machine.active(), &RouteTarget::Unreachable);
-    assert_eq!(actions, []);
+    assert_eq!(
+        actions,
+        vec![FailoverAction::Emit(FailoverEvent::FailClosedStarted(
+            FailClosedReason::NoHealthyExit
+        ))]
+    );
     fresh(&mut machine, 11, &cfg);
     for now in [11, 11] {
         advance(&mut machine, now, all_probes(&cfg, true), &cfg);
@@ -1258,7 +1263,15 @@ fn startup_restart_and_tick_reconciliation_always_assert_the_desired_route() {
             selection == Selection::Disconnected
         );
         for now in 1..50 {
-            assert_eq!(advance(&mut machine, now, FailoverInput::Tick, &cfg), []);
+            let actions = advance(&mut machine, now, FailoverInput::Tick, &cfg);
+            let expected = if now == 1 && selection != Selection::Disconnected {
+                vec![FailoverAction::Emit(FailoverEvent::FailClosedStarted(
+                    machine.fail_closed_reason().unwrap().clone(),
+                ))]
+            } else {
+                vec![]
+            };
+            assert_eq!(actions, expected);
             // Reconciler contract: overwrite any drift on every tick, without
             // waiting for a transition action from the machine.
             let observed_route = previous_route.clone();
@@ -1428,4 +1441,50 @@ fn inconclusive_probe_neither_counts_as_failure_nor_witnesses_another_failure() 
     );
     assert_eq!(actions, []);
     healthy_since(&machine, 0, 4);
+}
+
+#[test]
+fn startup_and_reconnect_into_outage_emit_started_once() {
+    let cfg = config(1);
+    let mut machine = Failover::new(at(0), Selection::Auto, &cfg).0;
+    let started = |actions: Vec<FailoverAction>| {
+        actions
+            .into_iter()
+            .filter(|a| {
+                matches!(
+                    a,
+                    FailoverAction::Emit(FailoverEvent::FailClosedStarted(
+                        FailClosedReason::NoHealthyExit
+                    ))
+                )
+            })
+            .count()
+    };
+    assert_eq!(
+        started(advance(&mut machine, 30, FailoverInput::Tick, &cfg)),
+        1
+    );
+    assert_eq!(
+        started(advance(&mut machine, 31, FailoverInput::Tick, &cfg)),
+        0
+    );
+    advance(
+        &mut machine,
+        32,
+        FailoverInput::SelectionChanged(Selection::Disconnected),
+        &cfg,
+    );
+    assert_eq!(
+        started(advance(
+            &mut machine,
+            33,
+            FailoverInput::SelectionChanged(Selection::Auto),
+            &cfg
+        )),
+        1
+    );
+    assert_eq!(
+        started(advance(&mut machine, 34, FailoverInput::Tick, &cfg)),
+        0
+    );
 }

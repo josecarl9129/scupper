@@ -1828,7 +1828,8 @@ bound probe succeeded) stays a named test.
   `ApplyFailed`, `Failover{from,to,cause}`, `Failback`,
   `FailClosedStarted{reason}`, `FailClosedEnded{duration}`,
   `ExitHealthChanged`, `DriftDetected`, `Repair{kind,class,result}`,
-  `RepairSuppressed`, `VerdictChanged{from,to}`, `AdminAction{command}`,
+  `RepairSuppressed`, `VerdictChanged{from,to}`,
+  `CheckVerdictChanged{from,to,reason}`, `AdminAction{command}`,
   `DaemonStarted{version}`, `Boot{result,step}`, `SinkFailed`,
   `HeartbeatFailed`, `PersistenceFailed`.
 - `actor`: `Daemon | Local{uid} | Device{id,user} | Boot`.
@@ -1887,8 +1888,8 @@ its matching key. An intervening ObservationError neither fires nor resolves it.
 |---|---|---|---|
 | `FailClosedStarted(NoHealthyExit or PinnedExitDown)` | `fail_closed` | Critical | Firing; `FailClosedEnded` resolves |
 | `FailClosedEnded` | `fail_closed` | Critical | Resolved, only for an active incident |
-| verdict changes to Unprotected (ruleset differs, foreign link/tc hook, peer differs, exit IP equals uplink address) | `unprotected` | Critical | Firing; next Protected verdict resolves |
-| verdict changes to Protected, including after ObservationError | `unprotected` | Critical | Resolved, only for an active incident |
+| fresh full-check `CheckVerdictChanged` to Unprotected (ruleset differs, foreign link/tc hook, peer differs, exit IP equals uplink address) | `unprotected` | Critical | Firing; next Protected verdict resolves |
+| fresh full-check verdict changes to Protected, including after ObservationError | `unprotected` | Critical | Resolved, only for an active incident |
 | quarantine latch set (`QuarantineChanged(true)`; legacy `FailClosedStarted(Quarantined)`) | `quarantine` | Critical | Firing; latch clearing resolves |
 | `QuarantineChanged(false)` after durable clear / verified apply | `quarantine` | Critical | Resolved, only for an active incident |
 | `Failover` | `failover` | Warning | Firing |
@@ -1904,14 +1905,17 @@ its matching key. An intervening ObservationError neither fires nor resolves it.
 
 Payload keys, states and severities use explicit `snake_case` serialization.
 Resolved duration uses the monotonic incident age (or the known FailClosed
-duration if larger). Critical recoveries use ntfy priority 4 / Pushover priority 0;
+duration or audit timestamp difference if larger). Critical recoveries use ntfy priority 4 / Pushover priority 0;
 Critical Firing uses priority 5 / 1 respectively.
 
 **Delivery** (ADR 0018): workers start with the daemon and synchronize on every
 iteration, including incomplete iterations. They consume only the event log's
 fsync watermark, keeping per-month byte offsets and doing no reads when that
 watermark has not advanced. Undecodable committed records produce `EventSkipped`
-and advance the scan, without terminating the worker.
+and advance the scan, without terminating the worker. If persistence fails (for
+example, disk full), alert delivery stops with it, including Persistence warnings.
+The warning is also emitted to stderr/journal. The external heartbeat is the
+required backstop for this log-first failure mode.
 
 Each sink has a versioned durable journal at
 `/var/lib/scupper/sinks/<name>.cursor`, containing scan position, at most 64
@@ -1925,9 +1929,18 @@ listing marks an unavailable row without failing other rows. Workers supervise
 local I/O failures with exponential backoff, recording `SinkFailed` with
 `AlertPersistence` when possible; the tick thread performs no delivery I/O.
 
+Every Critical Firing has a Resolved on every recovery path, including recovery
+while the quarantine latch is set. On worker startup, current Critical state is
+rebuilt from the durable state transitions rather than inherited from stale local
+incident state. Each key waits for a fresh process-local observation, scanned
+through its committed sequence, before delivery; old open incidents cannot fire
+at startup before the current state is known. Boot and reconnect into a non-administrative outage emit
+`FailClosedStarted` after the first complete failover evaluation.
+
 **Ordering and suppression:** delivery is at least once for admitted alerts;
-a crash between delivery and acknowledgement may duplicate one. Order is
-preserved within each key. Among ready keys, Critical precedes non-Critical;
+a crash between delivery and acknowledgement may duplicate one. Retained
+notifications preserve order within each key; deferred Critical transitions
+collapse to current state as described below. Among ready keys, Critical precedes non-Critical;
 held non-Critical resolutions never block other keys. Thus Failover → Failback
 (held) → all exits down delivers the Critical before the held Failback. Non-Critical
 incidents coalesce for ten minutes (one immediate Firing, counted Resolved after
@@ -1935,36 +1948,46 @@ the window; active incidents may repeat once per window). Critical transitions
 bypass that hold, while still deduplicating active incidents.
 
 The per-sink token bucket has burst 5 and refills one token per 300 seconds.
-A refused notification is dropped and counted as suppressed, never delayed for
-a refill. Suppression is summarized by the next admitted notification. Retries
-of an admitted notification consume no further tokens. On queue overflow,
-Critical can displace a non-Critical notification, otherwise the new notification
-is suppressed; the oldest admitted item for each key is retained. The queue and
-journal remain bounded under a storm.
+Critical bypasses coalescing but not the bucket: a refusal defers its latest
+state, never discards it. Each Critical key retains the latest Firing/Resolved
+state, timestamp, duration and count, plus its last delivered state. Pending
+transitions for a key collapse to that latest state; when it already equals the
+last delivered state no delivery is owed. As tokens become available, owed
+Critical state precedes all non-Critical notifications. Non-Critical refusals are
+dropped and counted. Suppression is summarized by the next admitted notification.
+Retries consume no further tokens. Queue overflow evicts the oldest non-Critical
+item first. At most one pending state per Critical key keeps the queue and
+journal bounded under a storm, including sink outages and permanent failures.
 
 All bucket, coalescing, retry and give-up clocks are monotonic; wall time is for
 display only. Persisted monotonic ages are rebased conservatively if a new clock
 origin precedes the stored origin. Retry backoff is 5 seconds through 15 minutes,
 measured from the failure's completion. Failure lifetime is per sink: after
-24 hours of transient failures, one `SinkFailed(AlertGiveUp)` settles the backlog
+24 hours of continuous real-alert failures, one `SinkFailed(AlertGiveUp)` settles the non-Critical backlog
 and the sink enters a 15-minute retry cadence until success. Local secret,
 account, exec and protocol failures emit an immediate, specific `SinkFailed`;
 permanent HTTP rejection has its own reason. These also enter the slow cadence,
 without one failure event per queued alert.
 
 Explicit Info tests use unique durable requests and individual receipts, sharing
-the real worker and bucket. The CLI waits up to 60 seconds and returns zero only
+the real worker with a separate allowance, never the alert bucket. A test failure
+never starts or advances the real-alert give-up clock. Each test performs a real
+attempt even during slow retry; success clears failure state and releases queued
+Criticals. The CLI waits up to 60 seconds and returns zero only
 for delivery; permanent/transient/configuration failure, suppression and timeout
 return nonzero with a value-free reason. Concurrent requests cannot overwrite or
 acknowledge each other. Pending requests and retained receipts are capped at 64
-per sink; consumed receipts are removed by the CLI.
+per sink; consumed receipts are removed by the CLI. Timeout writes a cancellation
+marker, removes the request/receipt, and prevents late acknowledgement. Workers
+honour cancellation and garbage-collect receipts after ten minutes.
 
 The namespace lab checks exact ordered deliveries per sink (allowing only
 adjacent retransmissions of the same sequence), runs client canaries including
 the alert endpoint during all-exits-down, and validates generic, ntfy and
 Telegram wire payloads. Testing builds alone may shorten the coalescing hold;
-the lab uses 120 seconds (a 300-second case estimate and 31-minute shard budget,
-including the unchanged five-minute setup/cleanup allowance) and verifies that the resolution stays held and
+the lab uses 120 seconds (a 300-second case estimate, with the shard self-check
+bound to CI's 60-minute leaktest command timeout and a five-minute setup/cleanup
+allowance) and verifies that the resolution stays held and
 that the Critical arrives during the hold. Production always uses ten minutes.
 
 ### External heartbeat (dead-man switch), M2

@@ -23,11 +23,11 @@ impl Event {
                 result: Outcome::Succeeded,
                 ..
             } => E::RepairRestored,
-            EventKind::VerdictChanged {
+            EventKind::CheckVerdictChanged {
                 to: VerdictCode::Unprotected,
                 ..
             } => E::Unprotected,
-            EventKind::VerdictChanged {
+            EventKind::CheckVerdictChanged {
                 to: VerdictCode::Protected,
                 ..
             } => E::ProtectionRestored,
@@ -40,7 +40,24 @@ impl Event {
             } => E::PersistenceRecovered,
             _ => return None,
         };
-        Some(alerts::map(projection, self.seq, self.at.0))
+        let mut alert = alerts::map(projection, self.seq, self.at.0);
+        if let EventKind::CheckVerdictChanged {
+            to: VerdictCode::Unprotected,
+            reason,
+            ..
+        } = self.kind
+        {
+            use alerts::ProtectionReason as R;
+            alert.reason = Some(match reason {
+                crate::ObjectKind::Ruleset => R::Ruleset,
+                crate::ObjectKind::ForeignLink => R::ForeignLink,
+                crate::ObjectKind::TcHook => R::TcHook,
+                crate::ObjectKind::Peer => R::Peer,
+                crate::ObjectKind::ExitIp => R::ExitIp,
+                _ => R::Other,
+            });
+        }
+        Some(alert)
     }
 }
 
@@ -70,7 +87,8 @@ mod tests {
         let alert = event.alert().unwrap();
         assert!(!alert.body().contains("secret"));
         assert_eq!(alert.severity, scupper_core::config::Severity::Critical);
-        event.kind = EventKind::VerdictChanged {
+        event.kind = EventKind::CheckVerdictChanged {
+            reason: crate::ObjectKind::Unknown,
             from: VerdictCode::Unprotected,
             to: VerdictCode::ObservationError,
         };
@@ -139,7 +157,8 @@ mod tests {
                 S::Resolved,
             ),
             (
-                EventKind::VerdictChanged {
+                EventKind::CheckVerdictChanged {
+                    reason: crate::ObjectKind::Unknown,
                     from: VerdictCode::Protected,
                     to: VerdictCode::Unprotected,
                 },
@@ -148,7 +167,8 @@ mod tests {
                 S::Firing,
             ),
             (
-                EventKind::VerdictChanged {
+                EventKind::CheckVerdictChanged {
+                    reason: crate::ObjectKind::Unknown,
                     from: VerdictCode::ObservationError,
                     to: VerdictCode::Protected,
                 },
@@ -237,7 +257,8 @@ mod tests {
             VerdictCode::Unsupervised,
         ] {
             assert!(
-                event(EventKind::VerdictChanged {
+                event(EventKind::CheckVerdictChanged {
+                    reason: crate::ObjectKind::Unknown,
                     from: VerdictCode::Unprotected,
                     to: verdict
                 })

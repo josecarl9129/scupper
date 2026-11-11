@@ -44,6 +44,7 @@ pub struct Failover {
     failback_suppressed_until: Option<MonoTime>,
     fail_closed_since: Option<MonoTime>,
     closed_reason: Option<FailClosedReason>,
+    closure_reported: bool,
     signals: BTreeMap<ExitId, health::Signals>,
     last_activation: Option<MonoTime>,
 }
@@ -67,6 +68,7 @@ impl Failover {
             failback_suppressed_until: None,
             fail_closed_since: Some(now),
             closed_reason: None,
+            closure_reported: false,
             signals: BTreeMap::new(),
             last_activation: None,
         };
@@ -106,6 +108,7 @@ impl Failover {
         }
         self.fail_closed_since = None;
         self.closed_reason = None;
+        self.closure_reported = false;
         self.last_activation = Some(now);
         true
     }
@@ -344,6 +347,7 @@ impl Failover {
             self.active_exit = None;
             self.fail_closed_since.get_or_insert(now);
             self.closed_reason = Some(FailClosedReason::AdminDisconnected);
+            self.closure_reported = false;
             return;
         }
         let previous = self.active_exit.clone();
@@ -401,6 +405,12 @@ impl Failover {
                         FailoverAction::Emit(FailoverEvent::FailClosedStarted(reason.clone())),
                     ]);
                 }
+                if !self.closure_reported && self.active == RouteTarget::Unreachable {
+                    actions.push(FailoverAction::Emit(FailoverEvent::FailClosedStarted(
+                        reason.clone(),
+                    )));
+                }
+                self.closure_reported = true;
                 self.active = RouteTarget::Unreachable;
                 self.active_exit = None;
                 self.fail_closed_since.get_or_insert(now);
@@ -467,6 +477,7 @@ impl Failover {
         self.active_exit = Some(to.clone());
         self.last_activation = Some(now);
         self.closed_reason = None;
+        self.closure_reported = false;
         actions.push(FailoverAction::SetRoute(self.active.clone()));
         if let Some(from) = from {
             actions.push(FailoverAction::FlushConntrack);

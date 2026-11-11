@@ -191,6 +191,22 @@ impl DaemonGuard<'_> {
             .daemon_wait("alert HTTPS listener", Duration::from_secs(5), |lab| {
                 Ok(lab.cmd("internet", "ss", &["-ltnH"])?.contains(":443"))
             })?;
+        // Mark only locally generated delivery-identity traffic. Forwarded client
+        // SYNs cannot receive this mark, even after source translation.
+        let identity = scupper_sys::heartbeat::account(
+            &fs::read_to_string(root.join("etc/passwd"))?,
+            &fs::read_to_string(root.join("etc/group"))?,
+        )
+        .map_err(|_| "alert identity missing")?;
+        let mark = format!(
+            "table inet alert_identity {{\n  chain output {{\n    type filter hook output priority -150;\n    ip daddr {endpoint} tcp dport 443 ip dscp set cs0;\n    meta skuid {} ip daddr {endpoint} tcp dport 443 ip dscp set cs7;\n  }}\n  chain forward {{\n    type filter hook forward priority -150;\n    ip daddr {endpoint} tcp dport 443 ip dscp set cs0;\n  }}\n}}\n",
+            identity.uid,
+            endpoint = super::heartbeat::ENDPOINT
+        );
+        self.lab.runner.input(
+            &Invocation::new("gwhost", "nft", &["-f", "-"]),
+            Some(mark.as_bytes()),
+        )?;
         self.lab.capture("wan", A.gwhost.wan_if, "alerts")?;
         let (child, notify) = self.lab.daemon_start("alerts", &root)?;
         self.child = Some(child);
@@ -272,12 +288,12 @@ impl DaemonGuard<'_> {
             .daemon_flow("udp", "client", &marker, "alerts-canary", 180)?;
         let endpoint_marker = super::Lab::marker()?;
         self.lab.fault_markers.push(endpoint_marker.clone());
-        let mut endpoint_canary = self.lab.daemon_flow_port(
+        let mut endpoint_canary = self.lab.daemon_flow_to(
             "connect",
             "client",
             &endpoint_marker,
             "alerts-endpoint",
-            443,
+            &format!("{}:443", super::heartbeat::ENDPOINT),
             180,
         )?;
         self.lab.daemon_wait(
@@ -330,7 +346,6 @@ impl DaemonGuard<'_> {
             return fail("unavailable sink accepted an alert");
         }
         fs::remove_file(outage)?;
-        self.wait_alert("/backlog", "fail_closed", "firing")?;
         self.wait_alert("/backlog", "fail_closed", "resolved")?;
         let (code, text) = self.control_command(&root, &["alerts", "test", "primary"], "test")?;
         if code != 0 {
@@ -361,10 +376,7 @@ impl DaemonGuard<'_> {
                     ("test", "firing"),
                 ],
             ),
-            (
-                "/backlog",
-                vec![("fail_closed", "firing"), ("fail_closed", "resolved")],
-            ),
+            ("/backlog", vec![("fail_closed", "resolved")]),
             (
                 "/coalesce",
                 vec![

@@ -16,9 +16,8 @@ use std::{
     io,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, SyncSender},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -130,10 +129,23 @@ struct Journal {
     retry: u64,
     status: Status,
     scanned: u64,
+    #[serde(default)]
+    critical_scanned: u64,
+    #[serde(skip)]
+    live_keys: Option<std::collections::BTreeSet<alerts::AlertKey>>,
     coalescer: Coalescer,
     bucket: TokenBucket,
     suppressed: u64,
+    #[serde(default)]
+    delivered: BTreeMap<alerts::AlertKey, alerts::AlertState>,
+    #[serde(default)]
+    latest: BTreeMap<alerts::AlertKey, Alert>,
+    #[serde(default = "new_test_bucket")]
+    test_bucket: TokenBucket,
     queue: Vec<Pending>,
+}
+fn new_test_bucket() -> TokenBucket {
+    TokenBucket::new(monotonic())
 }
 impl Journal {
     fn new(at: u64) -> Self {
@@ -145,28 +157,57 @@ impl Journal {
             retry: 0,
             status: Status::default(),
             scanned: 0,
+            critical_scanned: 0,
+            live_keys: None,
             coalescer: Coalescer::default(),
             bucket: TokenBucket::new(at),
             suppressed: 0,
+            delivered: BTreeMap::new(),
+            latest: BTreeMap::new(),
+            test_bucket: TokenBucket::new(at),
             queue: Vec::new(),
         }
     }
     fn enqueue(&mut self, alerts: Vec<Alert>) {
-        for alert in alerts {
-            if self.queue.len() == 64 {
-                // Prefer Critical across keys, preserving the oldest item within a key.
-                if alert.severity == alerts::Severity::Critical {
-                    if let Some(index) = self.queue.iter().rposition(|p| {
-                        p.test.is_none() && p.alert.severity != alerts::Severity::Critical
-                    }) {
-                        self.queue.remove(index);
-                    } else {
+        for mut alert in alerts {
+            if alert.severity == alerts::Severity::Critical {
+                self.latest.insert(alert.key, alert.clone());
+                if let Some(index) = self.queue.iter().position(|p| p.alert.key == alert.key) {
+                    let pending = self.queue.remove(index);
+                    if pending.alert.seq != alert.seq || pending.alert.state != alert.state {
                         self.suppressed = self.suppressed.saturating_add(1);
-                        continue;
+                    } else {
+                        alert.count = alert.count.max(pending.alert.count);
+                        alert.duration = alert.duration.max(pending.alert.duration);
                     }
-                } else {
+                    if self.delivered.get(&alert.key) != Some(&alert.state) {
+                        // Collapsing changes state, not the sink's retry schedule
+                        // or the admission already paid for this owed key.
+                        let mut replacement = pending;
+                        replacement.alert = alert;
+                        self.queue.push(replacement);
+                    }
+                    continue;
+                }
+                if self.delivered.get(&alert.key) == Some(&alert.state) {
+                    continue;
+                }
+            }
+            if self.queue.len() == 64 {
+                if let Some(index) = self
+                    .queue
+                    .iter()
+                    .position(|p| p.alert.severity != alerts::Severity::Critical)
+                {
+                    self.queue.remove(index);
+                } else if alert.severity != alerts::Severity::Critical {
                     self.suppressed = self.suppressed.saturating_add(1);
                     continue;
+                } else {
+                    // Three Critical keys always fit; explicit tests are expendable.
+                    if let Some(index) = self.queue.iter().position(|p| p.test.is_some()) {
+                        self.queue.remove(index);
+                    }
                 }
                 self.suppressed = self.suppressed.saturating_add(1);
             }
@@ -176,6 +217,7 @@ impl Journal {
     fn advance_clock(&mut self, at: u64) {
         if at < self.clock {
             self.bucket.rebase(self.clock, at);
+            self.test_bucket.rebase(self.clock, at);
             self.coalescer.rebase(self.clock, at);
             self.failing_since = self
                 .failing_since
@@ -250,6 +292,17 @@ impl Journal {
                         "unsupported alert journal",
                     ));
                 }
+                // Upgrade old FIFO journals to one latest slot per Critical key.
+                let mut keys = std::collections::BTreeSet::new();
+                journal.queue.reverse();
+                journal.queue.retain(|pending| {
+                    pending.alert.severity != alerts::Severity::Critical
+                        || keys.insert(pending.alert.key)
+                });
+                journal.queue.reverse();
+                if !journal.queue.iter().any(|p| p.test.is_none()) {
+                    journal.failing_since = None;
+                }
                 journal.advance_clock(at);
                 Ok(journal)
             }
@@ -313,8 +366,12 @@ fn step_with_ack(
         journal.enqueue(ready);
         journal.save(path)?;
     }
+    if !journal.queue.iter().any(|p| p.test.is_none()) {
+        journal.failing_since = None;
+    }
     // A retained resolution is local to its key. Skip delayed retries, and
     // prioritize Critical among the first outstanding notification of each key.
+    let alert_token_available = journal.bucket.clone().take(at);
     let index = journal
         .queue
         .iter()
@@ -324,9 +381,20 @@ fn step_with_ack(
                 .iter()
                 .any(|earlier| earlier.alert.key == p.alert.key)
         })
-        .filter(|(_, p)| at >= p.retry)
+        .filter(|(_, p)| at >= p.retry && (p.test.is_some() || at >= journal.retry))
+        .filter(|(_, p)| {
+            p.alert.severity != alerts::Severity::Critical || p.admitted || alert_token_available
+        })
+        .filter(|(_, p)| {
+            p.alert.severity != alerts::Severity::Critical
+                || journal
+                    .live_keys
+                    .as_ref()
+                    .is_none_or(|keys| keys.contains(&p.alert.key))
+        })
         .max_by_key(|(i, p)| {
             (
+                p.test.is_some() && (journal.failed || at < journal.retry),
                 p.alert.severity == alerts::Severity::Critical,
                 std::cmp::Reverse(*i),
             )
@@ -335,27 +403,36 @@ fn step_with_ack(
     let expired = journal
         .failing_since
         .is_some_and(|first| alerts::exhausted(first, at));
-    if expired && !journal.failed {
+    if expired && !journal.failed && index.is_none_or(|i| journal.queue[i].test.is_none()) {
         failure(log, sink.name(), Reason::AlertGiveUp)?;
         journal.failed = true;
         journal.retry = at.saturating_add(900);
         for pending in &journal.queue {
-            acknowledge(path, pending, "give_up")?;
+            if pending.test.is_none() {
+                acknowledge(path, pending, "give_up")?;
+            }
         }
         journal.suppressed = journal
             .suppressed
             .saturating_add(journal.queue.len() as u64);
-        journal.queue.clear();
+        journal
+            .queue
+            .retain(|p| p.test.is_some() || p.alert.severity == alerts::Severity::Critical);
         return journal.save(path);
-    }
-    if at < journal.retry {
-        return Ok(());
     }
     let Some(index) = index else {
         return Ok(());
     };
     if !journal.queue[index].admitted {
-        if !journal.bucket.take(at) {
+        let allowed = if journal.queue[index].test.is_some() {
+            journal.test_bucket.take(at)
+        } else {
+            journal.bucket.take(at)
+        };
+        if !allowed {
+            if journal.queue[index].alert.severity == alerts::Severity::Critical {
+                return journal.save(path);
+            }
             let pending = journal.queue.remove(index);
             acknowledge(path, &pending, "rate_limited")?;
             journal.suppressed = journal.suppressed.saturating_add(1);
@@ -379,8 +456,18 @@ fn step_with_ack(
             journal.failing_since = None;
             journal.failed = false;
             journal.retry = 0;
+            if journal.queue[index].test.is_some() {
+                for pending in &mut journal.queue {
+                    pending.retry = 0;
+                }
+            }
             acknowledge(path, &journal.queue[index], "delivered")?;
-            journal.queue.remove(index);
+            let pending = journal.queue.remove(index);
+            if pending.alert.severity == alerts::Severity::Critical {
+                journal
+                    .delivered
+                    .insert(pending.alert.key, pending.alert.state);
+            }
         }
         Err(error) => {
             let class = match error {
@@ -392,7 +479,9 @@ fn step_with_ack(
                 SinkError::Internal => "internal",
             };
             journal.status.last_failure = Some((now(), class.into()));
-            journal.failing_since.get_or_insert(completed);
+            if journal.queue[index].test.is_none() {
+                journal.failing_since.get_or_insert(completed);
+            }
             acknowledge(path, &journal.queue[index], class)?;
             // A test is settled by its first real outcome, individually.
             if error != SinkError::Transient {
@@ -408,13 +497,9 @@ fn step_with_ack(
                 }
                 journal.failed = true;
                 journal.retry = completed.saturating_add(900);
-                journal.queue.remove(index);
-                for pending in &journal.queue {
-                    if pending.test.is_some() {
-                        acknowledge(path, pending, class)?;
-                    }
+                if journal.queue[index].alert.severity != alerts::Severity::Critical {
+                    journal.queue.remove(index);
                 }
-                journal.queue.retain(|pending| pending.test.is_none());
             } else if journal.queue[index].test.is_some() {
                 journal.queue.remove(index);
             } else {
@@ -427,6 +512,9 @@ fn step_with_ack(
             }
         }
     }
+    if !journal.queue.iter().any(|p| p.test.is_none()) {
+        journal.failing_since = None;
+    }
     journal.clock = completed;
     journal.save(path)
 }
@@ -436,6 +524,9 @@ fn test_directory(path: &Path) -> PathBuf {
 }
 fn acknowledge(path: &Path, pending: &Pending, outcome: &str) -> io::Result<()> {
     if let Some(id) = &pending.test {
+        if test_directory(path).join(format!("{id}.cancel")).exists() {
+            return Ok(());
+        }
         durable_replace(
             &RealFs,
             &test_directory(path).join(format!("{id}.outcome")),
@@ -447,9 +538,52 @@ fn acknowledge(path: &Path, pending: &Pending, outcome: &str) -> io::Result<()> 
     }
     Ok(())
 }
+fn remove_if_present(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+fn clean_tests(journal: &mut Journal, path: &Path) -> io::Result<()> {
+    let directory = test_directory(path);
+    let before = journal.queue.len();
+    journal
+        .queue
+        .retain(|p| p.test.is_none() || now().saturating_sub(p.alert.at) < 600);
+    if before != journal.queue.len() {
+        journal.save(path)?;
+    }
+    for entry in std::fs::read_dir(&directory)? {
+        let entry = entry?;
+        let file = entry.path();
+        let Some(id) = file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .filter(|s| valid_request_id(s))
+        else {
+            continue;
+        };
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        let expired =
+            metadata.modified()?.elapsed().unwrap_or_default() >= Duration::from_secs(600);
+        if file.extension().is_some_and(|s| s == "cancel") || expired {
+            journal.queue.retain(|p| p.test.as_deref() != Some(id));
+            journal.save(path)?;
+            for extension in ["request", "outcome", "cancel"] {
+                remove_if_present(&directory.join(format!("{id}.{extension}")))?;
+            }
+        }
+    }
+    Ok(())
+}
 fn ingest_tests(journal: &mut Journal, path: &Path) -> io::Result<()> {
     let directory = test_directory(path);
     durable_directory(&directory)?;
+    clean_tests(journal, path)?;
     let mut entries = std::fs::read_dir(&directory)?.collect::<io::Result<Vec<_>>>()?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
     for entry in entries {
@@ -472,17 +606,7 @@ fn ingest_tests(journal: &mut Journal, path: &Path) -> io::Result<()> {
         {
             let mut pending = Pending::new(Alert::test(now()));
             pending.test = Some(id);
-            if journal.failed && monotonic() < journal.retry {
-                acknowledge(
-                    path,
-                    &pending,
-                    journal
-                        .status
-                        .last_failure
-                        .as_ref()
-                        .map_or("unavailable", |(_, class)| class.as_str()),
-                )?;
-            } else if journal.queue.len() == 64 {
+            if journal.queue.len() == 64 {
                 acknowledge(path, &pending, "queue_full")?;
             } else {
                 journal.queue.push(pending);
@@ -513,6 +637,10 @@ fn scan_events(
                 if let Some(alert) = event
                     .alert()
                     .filter(|a| alerts::eligible(a, settings.min_severity()))
+                    .filter(|a| {
+                        a.severity != alerts::Severity::Critical
+                            || event.seq > journal.critical_scanned
+                    })
                 {
                     let ready = journal.coalescer.push_at(alert, monotonic());
                     journal.enqueue(ready);
@@ -525,6 +653,7 @@ fn scan_events(
         }
     }
     journal.scanned = upper;
+    journal.critical_scanned = upper;
     journal.save(path)
 }
 
@@ -532,12 +661,26 @@ fn run_worker(
     root: &Path,
     sink: &Sink,
     log: &mut LogHandle,
-    receive: &mpsc::Receiver<LogHandle>,
+    receive: &Mutex<Option<LogHandle>>,
     stopping: &AtomicBool,
+    healthy: &mut bool,
 ) -> io::Result<()> {
     // Recovery may replace a memory-only log while the worker is backing off.
-    while let Ok(updated) = receive.try_recv() {
-        *log = updated;
+    loop {
+        if let Some(updated) = receive
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            *log = updated;
+        }
+        if log.is_persistent() {
+            break;
+        }
+        if stopping.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(200));
     }
     durable_directory(&root.join("sinks"))?;
     let path = cursor_path(root, &sink.name)?;
@@ -554,11 +697,20 @@ fn run_worker(
     }
     let mut tail = events::Tail::default();
     while !stopping.load(Ordering::Acquire) {
-        while let Ok(updated) = receive.try_recv() {
+        if let Some(updated) = receive
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
             *log = updated;
+        }
+        if !log.is_persistent() {
+            std::thread::sleep(Duration::from_millis(200));
+            continue;
         }
         scan_events(&mut journal, &mut tail, root, &path, log, &sink.settings)?;
         ingest_tests(&mut journal, &path)?;
+        journal.live_keys = Some(log.current_critical_keys(journal.scanned));
         step_with_ack(
             &mut journal,
             &path,
@@ -568,6 +720,7 @@ fn run_worker(
             &monotonic,
             &|| Ok(()),
         )?;
+        *healthy = true;
         std::thread::sleep(Duration::from_millis(200));
     }
     Ok(())
@@ -588,7 +741,7 @@ fn report_spawn_failure(log: &LogHandle, name: &str) {
 
 struct Worker {
     settings: Settings,
-    log: SyncSender<LogHandle>,
+    log: Arc<Mutex<Option<LogHandle>>>,
     stop: Arc<AtomicBool>,
     thread: std::thread::JoinHandle<()>,
 }
@@ -630,7 +783,10 @@ impl Workers {
         });
         for (name, settings) in settings {
             if let Some(worker) = self.workers.get(name) {
-                let _ = worker.log.try_send(log.clone());
+                *worker
+                    .log
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(log.clone());
                 continue;
             }
             if self
@@ -654,7 +810,8 @@ impl Workers {
             let root = state_root.to_path_buf();
             let stop = Arc::new(AtomicBool::new(false));
             let stopping = stop.clone();
-            let (send, receive) = mpsc::sync_channel(1);
+            let send = Arc::new(Mutex::new(None));
+            let receive = send.clone();
             let failure_log = log.clone();
             let mut log = log.clone();
             let result = std::thread::Builder::new()
@@ -663,14 +820,20 @@ impl Workers {
                     let mut delay = 5;
                     let mut reported = false;
                     while !stopping.load(Ordering::Acquire) {
+                        let mut healthy = false;
                         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            run_worker(&root, &sink, &mut log, &receive, &stopping)
+                            run_worker(&root, &sink, &mut log, &receive, &stopping, &mut healthy)
                         }))
                         .is_ok_and(|r| r.is_ok())
                         {
                             break;
                         }
+                        if healthy {
+                            delay = 5;
+                            reported = false;
+                        }
                         if !reported {
+                            eprintln!("scupperd: alert persistence unavailable");
                             reported = failure(&log, &sink.name, Reason::AlertPersistence).is_ok();
                         }
                         // Keep ownership while backing off; ticks cannot respawn a failed worker.
@@ -725,6 +888,15 @@ pub fn request_test(root: &Path, name: &str) -> io::Result<String> {
     let directory = test_directory(&path);
     durable_directory(&directory)?;
     let _guard = WriterLock::acquire_timeout(directory.join("writer"), Duration::from_secs(2))?;
+    for entry in std::fs::read_dir(&directory)? {
+        let entry = entry?;
+        if entry.path().extension().is_some_and(|s| s == "outcome")
+            && entry.metadata()?.modified()?.elapsed().unwrap_or_default()
+                >= Duration::from_secs(600)
+        {
+            remove_if_present(&entry.path())?;
+        }
+    }
     if std::fs::read_dir(&directory)?
         .filter_map(Result::ok)
         .filter(|e| {
@@ -791,6 +963,25 @@ pub fn test_outcome(root: &Path, name: &str, id: &str) -> io::Result<Option<Stri
         Err(e) => Err(e),
     }
 }
+/// Cancel a timed-out request and remove its receipt, including late acknowledgements.
+/// # Errors
+/// Invalid identities or local filesystem failure.
+pub fn cancel_test(root: &Path, name: &str, id: &str) -> io::Result<()> {
+    if !valid_request_id(id) {
+        return Err(io::Error::other("invalid test identity"));
+    }
+    let directory = test_directory(&cursor_path(root, name)?);
+    durable_replace(
+        &RealFs,
+        &directory.join(format!("{id}.cancel")),
+        b"cancel",
+        0o600,
+        &|_| Ok(()),
+        &|_| Ok(()),
+    )?;
+    remove_if_present(&directory.join(format!("{id}.request")))?;
+    remove_if_present(&directory.join(format!("{id}.outcome")))
+}
 /// Remove a consumed test receipt.
 /// # Errors
 /// Invalid identities or filesystem failure.
@@ -806,39 +997,58 @@ fn open_journal(root: &Path, path: &Path, log: &LogHandle) -> io::Result<Journal
     if !log.is_persistent() {
         return Err(io::Error::other("event log not persistent"));
     }
-    if path.exists() {
+    let mut existing = false;
+    let mut journal = if path.exists() {
         match Journal::load(path, monotonic()) {
-            Ok(journal) => return Ok(journal),
-            Err(e) if e.kind() == io::ErrorKind::InvalidData => {}
+            Ok(journal) => {
+                existing = true;
+                journal
+            }
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                std::fs::rename(path, path.with_extension("corrupt"))?;
+                RealFs.sync_dir(&root.join("sinks"))?;
+                Journal::new(monotonic())
+            }
             Err(e) => return Err(e),
         }
-        // Keep corrupt bytes for local inspection, bounded to one quarantined file.
-        std::fs::rename(path, path.with_extension("corrupt"))?;
-        RealFs.sync_dir(&root.join("sinks"))?;
-    }
-    let mut journal = Journal::new(monotonic());
-    journal.scanned = log.committed_seq();
-    // No historical deliveries. Reconstruct only currently active Critical state.
-    let mut active = BTreeMap::new();
+    } else {
+        Journal::new(monotonic())
+    };
+    // Recompute incident truth independently of stale worker-local dedup state.
+    // Preserve queued non-Critical work; new sinks never replay old transitions.
+    let upper = log.committed_seq();
+    let mut latest = BTreeMap::new();
+    let mut current = Coalescer::default();
     let mut tail = events::Tail::default();
-    for record in tail.read(root, 0, journal.scanned)? {
+    for record in tail.read(root, 0, upper)? {
         if let events::TailRecord::Event(event) = record
             && let Some(alert) = event
                 .alert()
                 .filter(|a| a.severity == alerts::Severity::Critical)
         {
-            if alert.state == alerts::AlertState::Firing {
-                active.insert(alert.key, alert);
-            } else {
-                active.remove(&alert.key);
+            latest.insert(alert.key, alert.clone());
+            for ready in current.push_at(alert, monotonic()) {
+                latest.insert(ready.key, ready);
             }
         }
     }
-    for mut alert in active.into_values() {
-        alert.seq = journal.scanned;
-        alert.at = now();
-        let ready = journal.coalescer.push_at(alert, monotonic());
-        journal.enqueue(ready);
+    for alert in latest.values_mut() {
+        if alert.state == alerts::AlertState::Firing
+            && let Some((since, count)) = current.incident_stats(alert.key)
+        {
+            alert.at = since;
+            alert.count = count;
+        }
+    }
+    journal.coalescer.restore_critical(&current);
+    journal.critical_scanned = upper;
+    if !existing {
+        journal.scanned = upper;
+    }
+    for alert in latest.into_values() {
+        if existing || alert.state == alerts::AlertState::Firing {
+            journal.enqueue(vec![alert]);
+        }
     }
     journal.save(path)?;
     Ok(journal)
@@ -904,8 +1114,8 @@ mod tests {
         let mut j = Journal::new(100);
         j.scanned = 2;
         j.enqueue(vec![
-            map(OperationalEvent::FailClosedStarted, 1, 100),
-            map(OperationalEvent::FailClosedEnded(3), 2, 103),
+            map(OperationalEvent::Failover, 1, 100),
+            map(OperationalEvent::Failback, 2, 103),
         ]);
         j
     }
@@ -997,33 +1207,71 @@ mod tests {
         }
     }
     #[test]
-    fn rate_limited_critical_is_suppressed_and_next_delivery_summarizes() {
+    fn critical_flaps_converge_through_scan_and_survive_restart() {
         let t = Temp::new();
         let log = t.log();
         let sink = Fake::new(Ok(()));
-        let mut j = Journal::new(100);
-        j.scanned = 6;
-        j.enqueue(
-            (1..=6)
-                .map(|seq| map(OperationalEvent::FailClosedStarted, seq, 100))
-                .collect(),
-        );
-        for _ in 0..6 {
-            step(&mut j, &t.path(), &sink, &log.handle, 100).unwrap();
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "kind":"ntfy", "url_ref":"fixture", "min_severity":"critical"
+        }))
+        .unwrap();
+        let mut j = Journal::new(0);
+        let mut tail = events::Tail::default();
+        for seq in 1..=7 {
+            log.handle
+                .emit(
+                    if seq % 2 == 1 {
+                        EventKind::FailClosedStarted {
+                            reason: Reason::NoHealthyExit,
+                            exit: None,
+                        }
+                    } else {
+                        EventKind::FailClosedEnded {
+                            duration: Duration::from_secs(1),
+                        }
+                    },
+                    Actor::Daemon,
+                    None,
+                )
+                .unwrap();
+            log.handle.flush_blocking(Duration::from_secs(5)).unwrap();
+            scan_events(&mut j, &mut tail, &t.0, &t.path(), &log.handle, &settings).unwrap();
+            step(
+                &mut j,
+                &t.path(),
+                &sink,
+                &log.handle,
+                ((seq - 1) * 60).min(301),
+            )
+            .unwrap();
         }
-        assert_eq!(sink.sent.lock().unwrap().len(), 5);
-        assert_eq!(j.status.cursor, 6);
-        let mut j = Journal::load(&t.path(), 399).unwrap();
-        step(&mut j, &t.path(), &sink, &log.handle, 399).unwrap();
-        assert_eq!(j.status.cursor, 6);
-        step(&mut j, &t.path(), &sink, &log.handle, 400).unwrap();
-        assert_eq!(j.status.cursor, 6);
-        assert_eq!(sink.sent.lock().unwrap().len(), 5);
-        j.enqueue(vec![map(OperationalEvent::FailClosedEnded(300), 7, 400)]);
-        step(&mut j, &t.path(), &sink, &log.handle, 400).unwrap();
-        assert_eq!(*sink.sent.lock().unwrap(), vec![1, 2, 3, 4, 5, 7]);
-        assert_eq!(sink.suppressed.load(Ordering::Acquire), 1);
-        log.handle.flush_blocking(Duration::from_secs(5)).unwrap();
+        j.save(&t.path()).unwrap();
+        let mut j = Journal::load(&t.path(), 600).unwrap();
+        step(&mut j, &t.path(), &sink, &log.handle, 600).unwrap();
+        assert_eq!(sink.sent.lock().unwrap().last(), Some(&7));
+        assert_eq!(
+            j.delivered.get(&alerts::AlertKey::FailClosed),
+            Some(&alerts::AlertState::Firing)
+        );
+    }
+    #[test]
+    fn tests_have_their_own_allowance_before_outage() {
+        let t = Temp::new();
+        let log = t.log();
+        let sink = Fake::new(Ok(()));
+        let mut j = Journal::new(0);
+        for _ in 0..5 {
+            let id = request_test(&t.0, "fixture").unwrap();
+            ingest_tests(&mut j, &t.path()).unwrap();
+            step(&mut j, &t.path(), &sink, &log.handle, 0).unwrap();
+            assert_eq!(
+                test_outcome(&t.0, "fixture", &id).unwrap().as_deref(),
+                Some("delivered")
+            );
+        }
+        j.enqueue(vec![map(OperationalEvent::FailClosedStarted, 1, 0)]);
+        step(&mut j, &t.path(), &sink, &log.handle, 0).unwrap();
+        assert_eq!(sink.sent.lock().unwrap().last(), Some(&1));
     }
     #[test]
     fn complete_but_unfsynced_record_is_never_read_for_alerts() {
@@ -1116,38 +1364,41 @@ mod tests {
             step(&mut j, &t.path(), &sink, &log.handle, at).unwrap();
         }
         assert!(j.queue.is_empty());
-        assert_eq!(*sink.sent.lock().unwrap(), vec![1, 1, 1, 1, 1, 1, 2, 4, 3]);
+        assert_eq!(*sink.sent.lock().unwrap(), vec![1, 1, 1, 1, 1, 1, 4, 2, 3]);
     }
     #[test]
-    fn two_hour_storm_is_bounded_and_suppression_is_never_delayed() {
+    fn outage_storm_collapses_to_latest_critical_with_bounded_queue() {
         let t = Temp::new();
         let log = t.log();
-        let sink = Fake::new(Ok(()));
+        let sink = Fake::new(Err(SinkError::Transient));
         let mut j = Journal::new(0);
-        for seq in 1..=240 {
-            let at = (seq - 1) * 30;
-            j.scanned = seq;
-            j.enqueue(vec![map(
-                if seq % 2 == 1 {
-                    OperationalEvent::FailClosedStarted
-                } else {
-                    OperationalEvent::FailClosedEnded(30)
-                },
-                seq,
-                at,
-            )]);
-            step(&mut j, &t.path(), &sink, &log.handle, at).unwrap();
-            assert!(j.queue.is_empty());
-            assert_eq!(j.status.cursor, seq);
+        for seq in 1..=71 {
+            let ready = j.coalescer.push_at(
+                map(
+                    if seq % 2 == 1 {
+                        OperationalEvent::FailClosedStarted
+                    } else {
+                        OperationalEvent::FailClosedEnded(1)
+                    },
+                    seq,
+                    seq,
+                ),
+                0,
+            );
+            j.enqueue(ready);
+            step(&mut j, &t.path(), &sink, &log.handle, 0).unwrap();
+            assert!(j.queue.len() <= 1);
         }
-        assert_eq!(sink.sent.lock().unwrap().len(), 28);
-        assert!(std::fs::metadata(t.path()).unwrap().len() < 4096);
-        j.enqueue(
-            (241..500)
-                .map(|seq| map(OperationalEvent::FailClosedStarted, seq, 7200))
-                .collect(),
+        assert_eq!(
+            sink.sent.lock().unwrap().len(),
+            1,
+            "flaps must not reset retry backoff"
         );
-        assert_eq!(j.queue.len(), 64);
+        *sink.result.lock().unwrap() = Ok(());
+        step(&mut j, &t.path(), &sink, &log.handle, 300).unwrap();
+        assert_eq!(sink.sent.lock().unwrap().last(), Some(&71));
+        assert!(j.queue.is_empty());
+        assert!(std::fs::metadata(t.path()).unwrap().len() < 4096);
     }
     #[test]
     fn new_renamed_and_corrupt_journals_start_at_watermark_with_active_state_only() {
@@ -1301,7 +1552,7 @@ mod tests {
             let mut j = Journal::new(100);
             if expected == "rate_limited" {
                 for _ in 0..5 {
-                    assert!(j.bucket.take(100));
+                    assert!(j.test_bucket.take(100));
                 }
             }
             let id = request_test(&t.0, "fixture").unwrap();
@@ -1313,6 +1564,329 @@ mod tests {
             );
             assert!(j.queue.is_empty());
         }
+    }
+
+    #[test]
+    fn deferred_critical_does_not_block_independent_test_allowance() {
+        let t = Temp::new();
+        let log = t.log();
+        let sink = Fake::new(Ok(()));
+        let mut j = Journal::new(0);
+        for _ in 0..5 {
+            assert!(j.bucket.take(0));
+        }
+        j.enqueue(vec![map(OperationalEvent::FailClosedStarted, 1, 0)]);
+        let id = request_test(&t.0, "fixture").unwrap();
+        ingest_tests(&mut j, &t.path()).unwrap();
+        step(&mut j, &t.path(), &sink, &log.handle, 0).unwrap();
+        assert_eq!(
+            test_outcome(&t.0, "fixture", &id).unwrap().as_deref(),
+            Some("delivered")
+        );
+        assert_eq!(*sink.sent.lock().unwrap(), vec![0]);
+        step(&mut j, &t.path(), &sink, &log.handle, 300).unwrap();
+        assert_eq!(*sink.sent.lock().unwrap(), vec![0, 1]);
+    }
+    #[test]
+    fn overflow_evicts_oldest_noncritical_and_keeps_latest_critical() {
+        let mut j = Journal::new(0);
+        j.enqueue(
+            (1..=65)
+                .map(|seq| map(OperationalEvent::Failover, seq, 0))
+                .collect(),
+        );
+        assert_eq!(j.queue.len(), 64);
+        assert_eq!(j.queue[0].alert.seq, 2);
+        j.enqueue(vec![map(OperationalEvent::FailClosedStarted, 66, 0)]);
+        assert_eq!(j.queue[0].alert.seq, 3);
+        for seq in 67..=136 {
+            j.enqueue(vec![map(
+                if seq % 2 == 1 {
+                    OperationalEvent::FailClosedEnded(1)
+                } else {
+                    OperationalEvent::FailClosedStarted
+                },
+                seq,
+                0,
+            )]);
+            assert_eq!(j.queue.len(), 64);
+        }
+        assert_eq!(j.queue.last().unwrap().alert.seq, 136);
+        assert_eq!(
+            j.queue.last().unwrap().alert.state,
+            alerts::AlertState::Firing
+        );
+    }
+
+    #[test]
+    fn failed_test_does_not_age_a_later_real_alert() {
+        let t = Temp::new();
+        let log = t.log();
+        let sink = Fake::new(Err(SinkError::Transient));
+        let mut j = Journal::new(0);
+        let id = request_test(&t.0, "fixture").unwrap();
+        ingest_tests(&mut j, &t.path()).unwrap();
+        step(&mut j, &t.path(), &sink, &log.handle, 0).unwrap();
+        assert_eq!(
+            test_outcome(&t.0, "fixture", &id).unwrap().as_deref(),
+            Some("transient")
+        );
+        assert_eq!(j.failing_since, None);
+        j.enqueue(vec![map(OperationalEvent::FailClosedStarted, 1, 172_800)]);
+        step(&mut j, &t.path(), &sink, &log.handle, 172_800).unwrap();
+        assert_eq!(*sink.sent.lock().unwrap(), vec![0, 1]);
+        assert!(!j.failed);
+    }
+    #[test]
+    fn successful_test_bypasses_slow_retry_and_releases_critical() {
+        let t = Temp::new();
+        let log = t.log();
+        let sink = Fake::new(Err(SinkError::Permanent));
+        let mut j = Journal::new(0);
+        j.enqueue(vec![map(OperationalEvent::FailClosedStarted, 1, 0)]);
+        step(&mut j, &t.path(), &sink, &log.handle, 0).unwrap();
+        assert!(j.failed);
+        let id = request_test(&t.0, "fixture").unwrap();
+        ingest_tests(&mut j, &t.path()).unwrap();
+        *sink.result.lock().unwrap() = Ok(());
+        step(&mut j, &t.path(), &sink, &log.handle, 1).unwrap();
+        assert_eq!(
+            test_outcome(&t.0, "fixture", &id).unwrap().as_deref(),
+            Some("delivered")
+        );
+        assert!(!j.failed);
+        assert_eq!(j.failing_since, None);
+        step(&mut j, &t.path(), &sink, &log.handle, 1).unwrap();
+        assert_eq!(*sink.sent.lock().unwrap(), vec![1, 0, 1]);
+        assert!(j.queue.is_empty());
+    }
+    #[test]
+    fn timeouts_and_expired_receipts_never_lock_out_tests_or_deliver_late() {
+        let t = Temp::new();
+        let log = t.log();
+        let sink = Fake::new(Ok(()));
+        let mut j = Journal::new(0);
+        for _ in 0..70 {
+            let id = request_test(&t.0, "fixture").unwrap();
+            ingest_tests(&mut j, &t.path()).unwrap();
+            let pending = j.queue[0].clone();
+            cancel_test(&t.0, "fixture", &id).unwrap();
+            acknowledge(&t.path(), &pending, "delivered").unwrap();
+            assert_eq!(test_outcome(&t.0, "fixture", &id).unwrap(), None);
+            ingest_tests(&mut j, &t.path()).unwrap();
+            step(&mut j, &t.path(), &sink, &log.handle, 0).unwrap();
+        }
+        assert!(sink.sent.lock().unwrap().is_empty());
+        let id = request_test(&t.0, "fixture").unwrap();
+        ingest_tests(&mut j, &t.path()).unwrap();
+        step(&mut j, &t.path(), &sink, &log.handle, 0).unwrap();
+        let outcome = test_directory(&t.path()).join(format!("{id}.outcome"));
+        std::fs::File::open(outcome)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(UNIX_EPOCH))
+            .unwrap();
+        ingest_tests(&mut j, &t.path()).unwrap();
+        assert_eq!(test_outcome(&t.0, "fixture", &id).unwrap(), None);
+    }
+    #[test]
+    fn new_sink_and_restarted_worker_wait_for_current_process_state() {
+        let t = Temp::new();
+        let old = t.log();
+        old.handle
+            .emit(
+                EventKind::FailClosedStarted {
+                    reason: Reason::NoHealthyExit,
+                    exit: None,
+                },
+                Actor::Daemon,
+                None,
+            )
+            .unwrap();
+        old.handle.flush_blocking(Duration::from_secs(5)).unwrap();
+        drop(old);
+        let log = t.log();
+        let sink = Fake::new(Ok(()));
+        let settings: Settings = serde_json::from_value(
+            serde_json::json!({"kind":"ntfy", "url_ref":"fixture", "min_severity":"critical"}),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let mut j = open_journal(&t.0, &t.path(), &log.handle).unwrap();
+            j.live_keys = Some(log.handle.current_critical_keys(j.scanned));
+            step(&mut j, &t.path(), &sink, &log.handle, monotonic()).unwrap();
+            assert!(sink.sent.lock().unwrap().is_empty());
+        }
+        let ended = log
+            .handle
+            .emit(
+                EventKind::FailClosedEnded {
+                    duration: Duration::from_secs(90),
+                },
+                Actor::Daemon,
+                None,
+            )
+            .unwrap();
+        log.handle.flush_blocking(Duration::from_secs(5)).unwrap();
+        let mut j = open_journal(&t.0, &t.path(), &log.handle).unwrap();
+        let mut tail = events::Tail::default();
+        scan_events(&mut j, &mut tail, &t.0, &t.path(), &log.handle, &settings).unwrap();
+        j.live_keys = Some(log.handle.current_critical_keys(j.scanned));
+        step(&mut j, &t.path(), &sink, &log.handle, monotonic()).unwrap();
+        let started = log
+            .handle
+            .emit(
+                EventKind::FailClosedStarted {
+                    reason: Reason::NoHealthyExit,
+                    exit: None,
+                },
+                Actor::Daemon,
+                None,
+            )
+            .unwrap();
+        log.handle.flush_blocking(Duration::from_secs(5)).unwrap();
+        scan_events(&mut j, &mut tail, &t.0, &t.path(), &log.handle, &settings).unwrap();
+        j.live_keys = Some(log.handle.current_critical_keys(j.scanned));
+        step(&mut j, &t.path(), &sink, &log.handle, monotonic()).unwrap();
+        assert_eq!(*sink.sent.lock().unwrap(), vec![ended, started]);
+    }
+    #[test]
+    fn critical_retry_and_incident_stats_survive_worker_reconstruction() {
+        let t = Temp::new();
+        let log = t.log();
+        for _ in 0..2 {
+            log.handle
+                .emit(
+                    EventKind::FailClosedStarted {
+                        reason: Reason::NoHealthyExit,
+                        exit: None,
+                    },
+                    Actor::Daemon,
+                    None,
+                )
+                .unwrap();
+        }
+        log.handle.flush_blocking(Duration::from_secs(5)).unwrap();
+        let mut j = open_journal(&t.0, &t.path(), &log.handle).unwrap();
+        assert_eq!(j.queue[0].alert.count, 2);
+        let at = monotonic();
+        let sink = Fake::new(Err(SinkError::Transient));
+        step(&mut j, &t.path(), &sink, &log.handle, at).unwrap();
+        let retry = j.queue[0].retry;
+        let first = j.queue[0].first;
+        let mut j = open_journal(&t.0, &t.path(), &log.handle).unwrap();
+        assert_eq!(j.queue[0].retry, retry);
+        assert_eq!(j.queue[0].first, first);
+        assert_eq!(j.queue[0].alert.count, 2);
+        step(&mut j, &t.path(), &sink, &log.handle, at + 1).unwrap();
+        assert_eq!(sink.sent.lock().unwrap().len(), 1);
+    }
+    #[test]
+    fn empty_old_journal_cannot_carry_a_test_failure_clock_into_real_alerts() {
+        let t = Temp::new();
+        let log = t.log();
+        let mut j = Journal::new(0);
+        j.failing_since = Some(0);
+        j.save(&t.path()).unwrap();
+        let mut j = Journal::load(&t.path(), 172_800).unwrap();
+        j.enqueue(vec![map(OperationalEvent::FailClosedStarted, 1, 172_800)]);
+        let sink = Fake::new(Ok(()));
+        step(&mut j, &t.path(), &sink, &log.handle, 172_800).unwrap();
+        assert_eq!(*sink.sent.lock().unwrap(), vec![1]);
+        assert!(!j.failed);
+    }
+    #[test]
+    fn exhausted_bucket_rebases_and_refills_after_three_hundred_seconds() {
+        let t = Temp::new();
+        let log = t.log();
+        let mut j = Journal::new(86400);
+        for _ in 0..5 {
+            assert!(j.bucket.take(86400));
+        }
+        j.enqueue(vec![map(OperationalEvent::FailClosedStarted, 1, 100)]);
+        j.save(&t.path()).unwrap();
+        let mut j = Journal::load(&t.path(), 1).unwrap();
+        let sink = Fake::new(Ok(()));
+        step(&mut j, &t.path(), &sink, &log.handle, 300).unwrap();
+        assert!(sink.sent.lock().unwrap().is_empty());
+        step(&mut j, &t.path(), &sink, &log.handle, 301).unwrap();
+        assert_eq!(*sink.sent.lock().unwrap(), vec![1]);
+    }
+    #[test]
+    fn restart_recomputes_stale_open_incident_from_current_durable_state() {
+        let t = Temp::new();
+        let log = t.log();
+        log.handle
+            .emit(
+                EventKind::FailClosedEnded {
+                    duration: Duration::from_secs(90),
+                },
+                Actor::Daemon,
+                None,
+            )
+            .unwrap();
+        log.handle.flush_blocking(Duration::from_secs(5)).unwrap();
+        let mut j = Journal::new(monotonic());
+        j.scanned = log.handle.committed_seq();
+        j.coalescer
+            .push_at(map(OperationalEvent::FailClosedStarted, 0, 0), monotonic());
+        j.delivered
+            .insert(alerts::AlertKey::FailClosed, alerts::AlertState::Firing);
+        j.save(&t.path()).unwrap();
+        let mut j = open_journal(&t.0, &t.path(), &log.handle).unwrap();
+        let sink = Fake::new(Ok(()));
+        step(&mut j, &t.path(), &sink, &log.handle, monotonic()).unwrap();
+        let ready = j.coalescer.push_at(
+            map(OperationalEvent::FailClosedStarted, 2, 100),
+            monotonic(),
+        );
+        j.enqueue(ready);
+        step(&mut j, &t.path(), &sink, &log.handle, monotonic()).unwrap();
+        assert_eq!(*sink.sent.lock().unwrap(), vec![1, 2]);
+    }
+    #[test]
+    fn memory_log_at_start_waits_without_false_sink_failure() {
+        let t = Temp::new();
+        let memory = EventLog::memory_only(GatewayId("gw1".into()), || UnixSeconds(100)).unwrap();
+        let settings: Settings = serde_json::from_value(
+            serde_json::json!({"kind":"ntfy", "url_ref":"fixture", "min_severity":"critical"}),
+        )
+        .unwrap();
+        let mut workers = Workers::default();
+        let settings = BTreeMap::from([("fixture".into(), settings)]);
+        workers.sync(
+            &settings,
+            &t.0,
+            &t.0,
+            &t.0.join("unused"),
+            &memory.handle,
+            0,
+        );
+        std::thread::sleep(Duration::from_millis(250));
+        let persistent = t.log();
+        workers.sync(
+            &settings,
+            &t.0,
+            &t.0,
+            &t.0.join("unused"),
+            &persistent.handle,
+            0,
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !t.path().exists() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        memory.handle.replay_into(&persistent.handle).unwrap();
+        persistent
+            .handle
+            .flush_blocking(Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            !events::read_since(&t.0, 0, None)
+                .map(Result::unwrap)
+                .any(|e| matches!(e.kind, EventKind::SinkFailed { .. }))
+        );
+        workers.stop();
     }
 
     #[test]
@@ -1476,6 +2050,36 @@ mod tests {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(10));
         }
+        // A second independent local failure reports again and restarts at five
+        // seconds after the intervening healthy step, rather than doubling forever.
+        std::thread::sleep(Duration::from_millis(250));
+        let previous = log.handle.committed_seq();
+        std::fs::remove_dir_all(t.0.join("sinks")).unwrap();
+        std::fs::write(t.0.join("sinks"), b"blocked again").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while log.handle.committed_seq() == previous {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::fs::remove_file(t.0.join("sinks")).unwrap();
+        std::fs::create_dir(t.0.join("sinks")).unwrap();
+        while !t.path().exists() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let failures = events::read_since(&t.0, 0, None)
+            .map(Result::unwrap)
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    EventKind::SinkFailed {
+                        reason: Reason::AlertPersistence,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(failures, 2);
         workers.stop();
     }
 }

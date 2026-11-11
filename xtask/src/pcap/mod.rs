@@ -402,7 +402,11 @@ fn host_allowed(
                 SocketAddr::new(ip.src, source),
             ),
         ] {
-            if policy.uplink_addrs.contains(&local.ip()) && remote == endpoint {
+            if policy.uplink_addrs.contains(&local.ip())
+                && remote == endpoint
+                && (ip.src != local.ip()
+                    || policy.heartbeat_dscp.is_none_or(|mark| ip.dscp == mark))
+            {
                 return Some("heartbeat".into());
             }
         }
@@ -541,6 +545,7 @@ fn finish(policy: &Policy, key: &Key, assembly: &Assembly, packets: &mut [Packet
                 fragment: None,
                 truncated: false,
                 hop_limit: assembly.hop_limit,
+                dscp: 0, // Identity exceptions never authorize fragmented delivery traffic.
             },
         ),
         Err(reason) => Class::Violation(reason),

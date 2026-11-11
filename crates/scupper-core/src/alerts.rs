@@ -112,6 +112,35 @@ pub fn map(event: OperationalEvent, seq: u64, at: u64) -> Alert {
     }
     .into()
 }
+/// Value-free reason for a failed protection check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProtectionReason {
+    /// Required ruleset is absent or differs.
+    Ruleset,
+    /// Unexpected link or link kind.
+    ForeignLink,
+    /// Unexpected traffic-control hook.
+    TcHook,
+    /// Public peer configuration differs.
+    Peer,
+    /// Exit address equals a host uplink address.
+    ExitIp,
+    /// Another containment violation.
+    Other,
+}
+impl ProtectionReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ruleset => "ruleset_differs",
+            Self::ForeignLink => "foreign_link",
+            Self::TcHook => "foreign_tc_hook",
+            Self::Peer => "peer_differs",
+            Self::ExitIp => "exit_ip_is_uplink_address",
+            Self::Other => "containment_violation",
+        }
+    }
+}
 /// An alert contains only bounded vocabulary and numeric operational fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Alert {
@@ -129,6 +158,9 @@ pub struct Alert {
     pub duration: u64,
     /// Coalesced occurrences.
     pub count: u64,
+    /// Closed protection-check reason, when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<ProtectionReason>,
     /// Suppressed notifications since the previous delivery.
     pub suppressed: u64,
 }
@@ -143,6 +175,7 @@ impl From<AlertEvent> for Alert {
             duration: e.duration,
             count: 1,
             suppressed: 0,
+            reason: None,
         }
     }
 }
@@ -164,7 +197,7 @@ impl Alert {
     /// Bounded body, with no caller-supplied strings.
     #[must_use]
     pub fn body(&self) -> String {
-        format!(
+        let mut body = format!(
             "{}: {}; severity={}; seq={}; duration={}s; count={}; suppressed={}",
             self.title(),
             self.state,
@@ -173,7 +206,12 @@ impl Alert {
             self.duration,
             self.count,
             self.suppressed
-        )
+        );
+        if let Some(reason) = self.reason {
+            body.push_str("; reason=");
+            body.push_str(reason.as_str());
+        }
+        body
     }
     /// Explicit Info test; bypasses configured minimum severity.
     #[must_use]
@@ -253,11 +291,13 @@ pub fn render(settings: &Settings, alert: &Alert) -> Payload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Incident {
     first: u64,
+    #[serde(default)]
+    event_at: Option<u64>,
     window: u64,
     count: u64,
     resolved: Option<Alert>,
 }
-/// Same-key ten-minute incident window, driven by audit time.
+/// Same-key ten-minute incident window, driven by the caller's monotonic clock.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Coalescer {
     #[serde(skip, default = "default_hold")]
@@ -276,6 +316,34 @@ impl Default for Coalescer {
     }
 }
 impl Coalescer {
+    /// Replace Critical incident truth from an independent durable reconstruction.
+    pub fn restore_critical(&mut self, current: &Self) {
+        self.incidents.retain(|key, _| {
+            !matches!(
+                key,
+                AlertKey::FailClosed | AlertKey::Quarantine | AlertKey::Unprotected
+            )
+        });
+        self.incidents.extend(
+            current
+                .incidents
+                .iter()
+                .filter(|(key, _)| {
+                    matches!(
+                        key,
+                        AlertKey::FailClosed | AlertKey::Quarantine | AlertKey::Unprotected
+                    )
+                })
+                .map(|(key, value)| (*key, value.clone())),
+        );
+    }
+    /// Original audit timestamp and count for a currently open incident.
+    #[must_use]
+    pub fn incident_stats(&self, key: AlertKey) -> Option<(u64, u64)> {
+        let incident = self.incidents.get(&key)?;
+        Some((incident.event_at?, incident.count))
+    }
+
     /// Shorten the hold only in testing builds for the real-worker lab.
     #[cfg(feature = "testing")]
     pub fn set_test_hold(&mut self, seconds: u64) {
@@ -293,13 +361,21 @@ impl Coalescer {
                 if !critical && now.saturating_sub(incident.window) >= self.hold {
                     incident.window = now;
                     alert.count = incident.count;
-                    alert.duration = alert.duration.max(now.saturating_sub(incident.first));
+                    alert.duration = alert.duration.max(now.saturating_sub(incident.first)).max(
+                        incident
+                            .event_at
+                            .map_or(0, |at| alert.at.saturating_sub(at)),
+                    );
                     ready.push(alert);
                 }
             }
             Some(incident) => {
                 alert.count = incident.count;
-                alert.duration = alert.duration.max(now.saturating_sub(incident.first));
+                alert.duration = alert.duration.max(now.saturating_sub(incident.first)).max(
+                    incident
+                        .event_at
+                        .map_or(0, |at| alert.at.saturating_sub(at)),
+                );
                 if critical {
                     self.incidents.remove(&alert.key);
                     ready.push(alert);
@@ -312,6 +388,7 @@ impl Coalescer {
                     alert.key,
                     Incident {
                         first: now,
+                        event_at: Some(alert.at),
                         window: now,
                         count: 1,
                         resolved: None,
@@ -384,7 +461,7 @@ impl TokenBucket {
     pub fn rebase(&mut self, from: u64, to: u64) {
         self.refilled = to.saturating_sub(from.saturating_sub(self.refilled));
     }
-    /// Charge one admitted notification. Refusals must be suppressed.
+    /// Charge one admitted notification; callers defer Critical state on refusal.
     pub fn take(&mut self, now: u64) -> bool {
         self.refilled = self.refilled.min(now);
         let refill = now.saturating_sub(self.refilled) / 300;

@@ -1037,9 +1037,16 @@ impl Lab {
             ],
         );
         if case == "alerts" {
+            // `Invocation::new` with a namespace prepends nsenter options, so insert the
+            // assignment right after NOTIFY_SOCKET (an `env` argument), never at a fixed index.
+            let at = invocation
+                .args
+                .iter()
+                .position(|arg| *arg == env)
+                .ok_or("NOTIFY_SOCKET argument missing")?;
             invocation
                 .args
-                .insert(1, "SCUPPER_TEST_ALERT_WINDOW_SECONDS=120".into());
+                .insert(at + 1, "SCUPPER_TEST_ALERT_WINDOW_SECONDS=120".into());
         }
         if matches!(case, "L10" | "L53" | "L53b" | "heartbeat" | "alerts") {
             // Apply the existing executable overlay first, then carry the
@@ -1170,7 +1177,25 @@ impl Lab {
         port: u16,
         seconds: u64,
     ) -> Result<Group> {
-        let address = format!("{}:{port}", A.internet.peer);
+        self.daemon_flow_to(
+            mode,
+            ns,
+            marker,
+            stem,
+            &format!("{}:{port}", A.internet.peer),
+            seconds,
+        )
+    }
+    #[allow(clippy::too_many_arguments)] // Explicit endpoint keeps canary destinations reviewable.
+    fn daemon_flow_to(
+        &mut self,
+        mode: &str,
+        ns: &str,
+        marker: &str,
+        stem: &str,
+        address: &str,
+        seconds: u64,
+    ) -> Result<Group> {
         self.runner.background(
             &Invocation::new(
                 ns,
@@ -1182,7 +1207,7 @@ impl Lab {
                     "--seconds",
                     &seconds.to_string(),
                     "--address",
-                    &address,
+                    address,
                     "--marker",
                     marker,
                     "--log",
@@ -1528,6 +1553,9 @@ impl Lab {
         let mut text = evidence::policy_for_case(markers, false, old_port, stem == "daemon-L11")?;
         if stem.contains("heartbeat") || stem == "control-L10" || stem == "alerts" {
             text = format!("heartbeat = \"{}:443\"\n{text}", heartbeat::ENDPOINT);
+        }
+        if stem == "alerts" {
+            text = format!("heartbeat_dscp = 56\n{text}");
         }
         let combined: Vec<_> = markers.iter().chain(&self.fault_markers).collect();
         text = text

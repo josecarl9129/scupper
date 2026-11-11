@@ -22,6 +22,7 @@ struct Checked {
     at: Instant,
     version: u64,
     code: u8,
+    reason: scupper_proto::ObjectKind,
     full_fresh_check: bool,
     namespace: (u64, u64),
 }
@@ -29,6 +30,8 @@ struct Checked {
 #[derive(Default)]
 pub(super) struct Heartbeat {
     check_at: Option<Instant>,
+    verdict: Option<scupper_proto::VerdictCode>,
+    pub(super) verdict_events: Vec<EventKind>,
     check: Option<Receiver<Checked>>,
     sending: Option<Receiver<Result<Instant, Failure>>>,
     sending_deadline: Option<Instant>,
@@ -40,12 +43,27 @@ pub(super) struct Heartbeat {
     pub(super) last_success: Option<Instant>,
 }
 impl Heartbeat {
+    pub(super) fn record_verdict(&mut self, code: u8, reason: scupper_proto::ObjectKind) {
+        use scupper_proto::VerdictCode as V;
+        let to = match code {
+            0 => V::Protected,
+            2 => V::Unprotected,
+            _ => return,
+        };
+        let from = self.verdict.unwrap_or(V::ObservationError);
+        if from != to {
+            self.verdict_events
+                .push(EventKind::CheckVerdictChanged { from, to, reason });
+        }
+        self.verdict = Some(to);
+    }
     pub(super) fn abandon_check(&mut self) {
         self.check = None;
         self.check_at = None;
     }
     // Shared by the real runtime and fake-clock tests. All eligibility and
     // cadence decisions live here; only starting work is delegated to Runtime.
+    #[allow(clippy::too_many_lines)] // Coordinate fresh protection checks and the independent delivery cadence.
     fn iteration(
         &mut self,
         now: Instant,
@@ -71,17 +89,27 @@ impl Heartbeat {
                 && checked.namespace == context.namespace
                 && self.sending.is_none()
             {
+                if checked.full_fresh_check
+                    && now.saturating_duration_since(checked.at) < Duration::from_secs(30)
+                {
+                    self.record_verdict(checked.code, checked.reason);
+                }
                 let mono = |at: Instant| MonoTime(at.saturating_duration_since(origin));
-                let decision = decide(
-                    context.settings,
-                    mono(now),
-                    Some(CompleteIteration {
-                        at: mono(checked.at),
-                        full_fresh_check: checked.full_fresh_check,
-                        code: checked.code,
-                    }),
-                    self.last_send.map(mono),
-                );
+                let decision =
+                    context
+                        .settings
+                        .map_or(Decision::Skip(SkipReason::NotHealthy), |settings| {
+                            decide(
+                                settings,
+                                mono(now),
+                                Some(CompleteIteration {
+                                    at: mono(checked.at),
+                                    full_fresh_check: checked.full_fresh_check,
+                                    code: checked.code,
+                                }),
+                                self.last_send.map(mono),
+                            )
+                        });
                 if checked.code == 0
                     && matches!(decision, Decision::Skip(SkipReason::Stale))
                     && self.last_stale.is_none_or(|at| {
@@ -107,9 +135,14 @@ impl Heartbeat {
         }
         let interval = context
             .settings
-            .interval
-            .duration()
-            .unwrap_or(Duration::MAX);
+            .map_or(Duration::from_secs(60), |settings| {
+                settings.interval.duration().unwrap_or(Duration::MAX)
+            })
+            .min(if context.alerts {
+                Duration::from_secs(60)
+            } else {
+                Duration::MAX
+            });
         // One cadence source: checks become due from the last attempt. check_at
         // only throttles suppressed/failed checks, never an eligible next beat.
         let due = self.last_send.map_or_else(
@@ -175,6 +208,9 @@ impl Heartbeat {
         self.detached.append(&mut self.workers);
     }
     pub(super) fn report_events(&mut self, log: &crate::events::LogHandle, version: Option<u64>) {
+        for event in self.verdict_events.drain(..) {
+            let _ = log.emit(event, Actor::Daemon, version);
+        }
         for _ in 0..std::mem::take(&mut self.pending_detached) {
             let _ = log.emit(EventKind::HeartbeatCheckDetached {}, Actor::Daemon, version);
         }
@@ -215,7 +251,8 @@ impl Heartbeat {
     }
 }
 struct Context<'a> {
-    settings: &'a scupper_core::config::HeartbeatSettings,
+    settings: Option<&'a scupper_core::config::HeartbeatSettings>,
+    alerts: bool,
     version: u64,
     namespace: (u64, u64),
 }
@@ -224,6 +261,23 @@ enum Work {
     WorkerLimit,
     Stale,
     Send { suffix: String, deadline: Instant },
+}
+pub(super) fn protection_reason(
+    verdict: &scupper_core::verdict::v2::Verdict,
+) -> scupper_proto::ObjectKind {
+    use scupper_core::verdict::v2::{Verdict, Violation};
+    use scupper_proto::ObjectKind as O;
+    let Verdict::Unprotected(violations) = verdict else {
+        return O::Unknown;
+    };
+    match &violations.as_slice()[0] {
+        Violation::RulesetMissing | Violation::RulesetDiffers { .. } => O::Ruleset,
+        Violation::ForeignLink(_) | Violation::LinkKind(_) => O::ForeignLink,
+        Violation::TrafficControlHook(_) => O::TcHook,
+        Violation::PeerDiffers { .. } => O::Peer,
+        Violation::ExitIpIsUplinkAddress(_) => O::ExitIp,
+        _ => O::Unknown,
+    }
 }
 fn failure_event(failure: Failure) -> EventKind {
     let reason = match failure {
@@ -259,9 +313,13 @@ impl Runtime<'_> {
         if let Some(failure) = self.heartbeat.expire(now) {
             self.heartbeat_failed(failure);
         }
+        // Alert protection checks run even without an external heartbeat.
         let context = self.running.as_ref().and_then(|(_, held, config)| {
-            config.site.heartbeat().map(|settings| Context {
+            let settings = config.site.heartbeat();
+            let alerts = !config.site.sinks().is_empty();
+            (settings.is_some() || alerts).then_some(Context {
                 settings,
+                alerts,
                 version: config.stamp.version,
                 namespace: held.identity(),
             })
@@ -352,6 +410,11 @@ impl Runtime<'_> {
                             .last_complete
                     },
                 );
+                let reason = result
+                    .as_ref()
+                    .map_or(scupper_proto::ObjectKind::Unknown, |report| {
+                        protection_reason(&report.verdict)
+                    });
                 let code = result.map_or(1, |report| report.verdict.exit_code());
                 #[cfg(feature = "testing")]
                 let code = std::fs::read_to_string(run_root.join("heartbeat-test-code"))
@@ -362,6 +425,7 @@ impl Runtime<'_> {
                     at: now,
                     version: config.stamp.version,
                     code,
+                    reason,
                     full_fresh_check: Instant::now() < deadline,
                     namespace: held.identity(),
                 });
@@ -466,7 +530,8 @@ mod tests {
     }
     fn context(settings: &scupper_core::config::HeartbeatSettings) -> Context<'_> {
         Context {
-            settings,
+            settings: Some(settings),
+            alerts: false,
             version: 1,
             namespace: (2, 3),
         }
@@ -478,11 +543,41 @@ mod tests {
         send.send(Checked {
             at,
             code,
+            reason: scupper_proto::ObjectKind::Unknown,
             full_fresh_check: fresh,
             version: 1,
             namespace: (2, 3),
         })
         .unwrap();
+    }
+    #[test]
+    fn alert_only_configuration_runs_fresh_checks_and_reports_protection() {
+        let now = Instant::now();
+        let mut state = Heartbeat::default();
+        let context = || Context {
+            settings: None,
+            alerts: true,
+            version: 1,
+            namespace: (2, 3),
+        };
+        assert!(matches!(
+            state.iteration(now, now, true, Some(context())),
+            Some(Work::Check)
+        ));
+        queue(&mut state, now, 2, true);
+        state.iteration(now, now, true, Some(context()));
+        assert!(matches!(
+            state.verdict_events.as_slice(),
+            [EventKind::CheckVerdictChanged {
+                to: scupper_proto::VerdictCode::Unprotected,
+                ..
+            }]
+        ));
+        assert_eq!(state.last_send, None);
+        assert!(matches!(
+            state.iteration(now + Duration::from_secs(60), now, true, Some(context())),
+            Some(Work::Check)
+        ));
     }
     #[test]
     fn stuck_read_only_worker_does_not_veto_or_delay_repair() {
@@ -751,6 +846,7 @@ mod tests {
                     send.send(Checked {
                         at,
                         version: 1,
+                        reason: scupper_proto::ObjectKind::Unknown,
                         code: 0,
                         full_fresh_check: true,
                         namespace: (2, 3),
@@ -831,7 +927,8 @@ mod tests {
                 origin,
                 true,
                 Some(Context {
-                    settings: &cfg,
+                    settings: Some(&cfg),
+                    alerts: false,
                     version,
                     namespace,
                 }),

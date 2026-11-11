@@ -456,11 +456,19 @@ fn run_notified(
         last_complete: None,
         heartbeat: crate::daemon::heartbeat::Heartbeat::default(),
         alerts: crate::alerts::Workers::default(),
+        alert_startup: AlertStartup::default(),
         snapshot: control::SharedSnapshot::default(),
         cached: None,
     };
     run_with(&mut runtime, stop);
     Ok(())
+}
+type AlertSettings = std::collections::BTreeMap<String, scupper_core::config::AlertSink>;
+#[derive(Default)]
+struct AlertStartup {
+    settings: Option<AlertSettings>,
+    loading: Option<Receiver<Option<AlertSettings>>>,
+    failed: bool,
 }
 struct Runtime<'a> {
     options: &'a Options,
@@ -486,6 +494,7 @@ struct Runtime<'a> {
     last_complete: Option<Instant>,
     heartbeat: heartbeat::Heartbeat,
     alerts: crate::alerts::Workers,
+    alert_startup: AlertStartup,
     snapshot: control::SharedSnapshot,
     cached: Option<(
         Instant,
@@ -511,14 +520,70 @@ impl<'a> Runtime<'a> {
     }
 }
 impl Runtime<'_> {
+    #[allow(clippy::too_many_lines)] // Keep applied settings and failed-boot fallback synchronization together.
     fn sync_alerts(&mut self) {
         if let Some((_, _, config)) = &self.running {
+            self.alert_startup.settings = Some(config.site.sinks().clone());
+            if std::mem::take(&mut self.alert_startup.failed) {
+                let _ = self.audit.handle().emit(
+                    EventKind::FailClosedEnded {
+                        duration: Duration::ZERO,
+                    },
+                    Actor::Daemon,
+                    None,
+                );
+            }
+        } else if self.alert_startup.settings.is_none() && self.alert_startup.loading.is_none() {
+            let state_root = self.options.state_root.clone();
+            let config_root = self.options.config_root.clone();
+            let (send, receive) = mpsc::sync_channel(1);
+            self.alert_startup.loading = Some(receive);
+            let _ = std::thread::Builder::new()
+                .name("scupper-alert-config".into())
+                .spawn(move || {
+                    let settings = (|| {
+                        let StateRead::Present(state) =
+                            StateFile::open(&state_root, None).ok()?.read().ok()?
+                        else {
+                            return None;
+                        };
+                        let (text, _) = VersionStore::read_only(&state_root, &config_root)
+                            .read(state.applied_version?)
+                            .ok()?;
+                        Some(validate(parse_site(&text).ok()?).ok()?.sinks().clone())
+                    })();
+                    let _ = send.send(settings);
+                });
+        }
+        if self.running.is_none() {
+            if let Some(receive) = &self.alert_startup.loading
+                && let Ok(settings) = receive.try_recv()
+            {
+                self.alert_startup.settings = settings;
+                self.alert_startup.loading = None;
+            }
+            if self.alert_startup.settings.is_some()
+                && !self.alert_startup.failed
+                && !self.pending_canon
+            {
+                self.alert_startup.failed = true;
+                let _ = self.audit.handle().emit(
+                    EventKind::FailClosedStarted {
+                        reason: scupper_proto::Reason::NoHealthyExit,
+                        exit: None,
+                    },
+                    Actor::Daemon,
+                    None,
+                );
+            }
+        }
+        if let Some(settings) = &self.alert_startup.settings {
             #[cfg(feature = "testing")]
             let owner = self.secret_owner;
             #[cfg(not(feature = "testing"))]
             let owner = 0;
             self.alerts.sync(
-                config.site.sinks(),
+                settings,
                 &self.options.state_root,
                 &self.options.config_root,
                 &self.options.probe_binary,
@@ -1007,7 +1072,9 @@ impl DaemonDeps for Runtime<'_> {
                 if !round.paths.is_empty() {
                     machine.submit_probe_outcomes(round.paths);
                 }
-                if round.exit_ok == Some(false) && round.setup_failures == 0 {
+                if round.exit_ok == Some(probes::ExitIpOutcome::ProbeFailed)
+                    && round.setup_failures == 0
+                {
                     let _ = audit.handle().emit(
                         EventKind::DriftDetected {
                             object: scupper_proto::ObjectKind::Unknown,
@@ -1536,9 +1603,35 @@ mod tests {
 #[cfg(feature = "testing")]
 pub mod testing {
     use super::{
-        Audit, BootDeps, DaemonDeps, Duration, EventKind, EventLog, GatewayId, Instant, Options,
-        Runtime, StartupRead, UnixSeconds, control, io, mpsc, notify, pending, probes, unix,
+        AlertStartup, Audit, BootDeps, DaemonDeps, Duration, EventKind, EventLog, GatewayId,
+        Instant, Options, Runtime, StartupRead, UnixSeconds, control, io, mpsc, notify, pending,
+        probes, unix,
     };
+    /// Run the daemon's fresh full check and its production alert projection.
+    /// # Errors
+    /// Returns fixture or observation failures.
+    pub fn protection_alerts(
+        deps: &BootDeps<'_>,
+        probe: &dyn crate::probe_child::ProbeExec,
+        held: &crate::netns::NetnsHandle,
+        config: &crate::reconcile::Config,
+    ) -> io::Result<(scupper_core::verdict::v2::Report, Vec<EventKind>)> {
+        let report = super::admin::check_live(
+            deps,
+            probe,
+            held,
+            config,
+            Some(Instant::now() + Duration::from_secs(20)),
+            &|| Some(Instant::now()),
+        )
+        .map_err(|_| io::Error::other("full check failed"))?;
+        let mut heartbeat = super::heartbeat::Heartbeat::default();
+        heartbeat.record_verdict(
+            report.verdict.exit_code(),
+            super::heartbeat::protection_reason(&report.verdict),
+        );
+        Ok((report, heartbeat.verdict_events))
+    }
     /// Drives one apply through the real runtime using injected kernel I/O.
     /// Returns the response, Ping before/after, retained completion age, and next tick.
     /// # Errors
@@ -1636,6 +1729,7 @@ pub mod testing {
             last_complete: None,
             heartbeat: crate::daemon::heartbeat::Heartbeat::default(),
             alerts: crate::alerts::Workers::default(),
+            alert_startup: AlertStartup::default(),
             snapshot: control::SharedSnapshot::default(),
             cached: None,
         };
