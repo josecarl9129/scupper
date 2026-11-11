@@ -255,6 +255,7 @@ fn every_variant_roundtrips_and_keys_are_private() {
         "up",
         "peers_present",
         "last_complete_iteration_age",
+        "heartbeat_last_success_age",
         "current_iteration_age",
         "operation",
         "quarantined",

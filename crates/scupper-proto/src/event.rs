@@ -52,7 +52,20 @@ vocabulary!(
     Recovery,
     UncleanStop,
     QueueOverflow,
-    UnknownObject
+    UnknownObject,
+    HeartbeatSecret,
+    HeartbeatAccount,
+    HeartbeatHttp,
+    HeartbeatDeadline,
+    HeartbeatExec,
+    HeartbeatTls,
+    HeartbeatTransport,
+    HeartbeatRtoRead,
+    HeartbeatWriteRefused,
+    HeartbeatReset,
+    HeartbeatCertificate,
+    HeartbeatWorkerLimit,
+    Stale
 );
 vocabulary!(
     ObjectKind,
@@ -187,6 +200,8 @@ event_kinds! {
     Boot { result: Outcome = Outcome::Recovered, step: StepKind = StepKind::EventLog },
     SinkFailed { sink: Identifier = Identifier("primary".into()), reason: Reason = Reason::ExecutionFailed },
     HeartbeatFailed { reason: Reason = Reason::EdgeDead },
+    HeartbeatSkipped { reason: Reason = Reason::Stale },
+    HeartbeatCheckDetached {},
     PersistenceFailed { reason: Reason = Reason::EventWrite },
     Flapping {},
     MemoryReplay { dropped: u64 = 0, local_first: u64 = 1, local_last: u64 = 3, replayed: u64 = 3 },

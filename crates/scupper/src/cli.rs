@@ -54,6 +54,12 @@ enum Command {
         /// One JSON `ProbeRequest` (stdin is not a byte stream).
         request: String,
     },
+    /// Internal unprivileged delivery using a secret stdin protocol.
+    #[command(hide = true)]
+    Deliver {
+        #[command(subcommand)]
+        command: DeliverCommand,
+    },
     /// Canonicalize a ruleset only inside an isolated network namespace.
     #[command(hide = true)]
     Canon {
@@ -95,6 +101,11 @@ enum Command {
         #[arg(long)]
         diff: bool,
     },
+}
+
+#[derive(Clone, Subcommand)]
+enum DeliverCommand {
+    Heartbeat,
 }
 
 /// Namespace identity reader used before any canon command execution.
@@ -424,6 +435,10 @@ fn dispatch(
             writeln!(stdout).map_err(output_error)?;
             Ok(u8::from(!report.succeeded()))
         }
+        Command::Deliver {
+            command: DeliverCommand::Heartbeat,
+        } => Ok(scupper_sys::heartbeat::child(std::io::stdin().lock())
+            .map_or_else(scupper_sys::heartbeat::Failure::exit_code, |()| 0)),
         Command::Probe { request } => {
             let outcome = scupper_sys::probe_child::child_main(&request)?;
             serde_json::to_writer(&mut *stdout, &outcome).map_err(|error| error.to_string())?;

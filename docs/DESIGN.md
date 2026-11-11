@@ -141,7 +141,8 @@ Phases: **S** steady state, **F** failover, **A** apply, **B** boot,
   provider dropping un-NATed packets (unverified, V-08).
 - B: no namespace exists before `scupper boot`. Boot order: netns →
   forwarding 0 → hardening sysctls → ruleset → verify → links → routes →
-  forwarding 1. A crash leaves a prefix; every prefix is closed.
+  forwarding 1 unless latched or Disconnected. A crash leaves a prefix;
+  every prefix is closed.
 - D: the data path is kernel objects only. With scupperd dead, failover stops;
   if the active exit dies, packets wait inside its WireGuard interface (no
   handshake, nothing sent). With edge dead, DNS fails (closed).
@@ -325,7 +326,7 @@ with the namespace layout, which does not depend on `nftables.service`.
 | Process | Where | Privilege | Role | In data path |
 |---|---|---|---|---|
 | `scupper-net.service` (oneshot, `scupper boot`) | host → builds netns | root | namespace, sysctls, ruleset, links, routes at boot | no (exits) |
-| `scupperd` | host netns | root, no network listener | synchronous reconcile loop, health, failover, repairs, event log, alerts and heartbeat via eth0, control socket | no |
+| `scupperd` | host netns | root, no network listener | synchronous reconcile loop, health, failover, repairs, event log, alerts and heartbeat via eth0, control socket; heartbeat fresh checks use a concurrent read-only worker (§13, ADR 0004 exception) | no |
 | `scupper probe …` children | started by scupperd, enter the netns | root until sockets exist, then `scupper-probe` | path, exit-IP and DNS probes | no |
 | `scupper deliver …` children | started by scupperd in host netns | `scupper-alert` from exec (`Command::uid`) | one alert/heartbeat HTTPS request | no |
 | `scupper-edge` | **whole process in the netns** (`NetworkNamespacePath=`) | user `scupper-edge`, `CAP_NET_BIND_SERVICE` only | DNS forwarder, tunnel API, `/metrics` | DNS only |
@@ -894,10 +895,12 @@ upstream generation with scupperd's.
 
 ### Repairs
 
+Disconnected keeps all forwarding gates at 0.
+
 | Drift | Detected by | Repair (in order) | Class |
 |---|---|---|---|
-| Ruleset missing or differs | fingerprint | forwarding 0 (both families, **immediately**, no debounce) → `nft -f` rendered file → verify → `conntrack -F` (drops flows created during the gap) → forwarding 1 → re-apply hardening → read back | Tighten, then Restore |
-| Forwarding 0 with verified ruleset, no quarantine latch | sysctl | forwarding 1 (only with an exact match on the same tick and no latch set), re-apply hardening | Restore |
+| Ruleset missing or differs | fingerprint | forwarding 0 (both families, **immediately**, no debounce) → `nft -f` rendered file → verify → `conntrack -F` (drops flows created during the gap) → forwarding 1 unless latched or Disconnected → re-apply hardening → read back | Tighten, then Restore |
+| Forwarding 0 with verified ruleset, no quarantine latch, not Disconnected | sysctl | forwarding 1 (only with an exact match on the same tick, unless latched or Disconnected), re-apply hardening | Restore |
 | Hardening sysctl differs | sysctl | write, read back | Restore |
 | Route missing or wrong | route table | `route replace` with the failover machine's current target | Restore |
 | Extra route in the netns main table | route table | delete | Tighten |
@@ -1895,7 +1898,7 @@ bucket; suppressed alerts are summarized in the next delivered one.
 
 Covers "the gateway (or scupperd) is dead", which no on-host alert can.
 
-- Every `heartbeat.interval` (60 s), after a complete iteration that ran a
+- Every `heartbeat.interval` (default 60 s; validated range 10 s to 1 h), after a complete iteration that ran a
   full check (all stages, fresh), scupperd starts a `scupper deliver
   heartbeat` child that requests the configured URL via the uplink.
 - Only healthchecks-compatible services are supported (`kind =
@@ -1909,13 +1912,80 @@ Covers "the gateway (or scupperd) is dead", which no on-host alert can.
 - Truthful (I3): the ping is derived from a verdict at most one interval old;
   a dead or hung scupperd sends nothing because the watchdog-gated
   iteration never completes. Each delivery child gets a deadline (verdict
-  time + 30 s, monotonic) and exits without sending once it has passed, so
-  a child started before scupperd died cannot report later. Code 5 is never
+  start + min(30 s, interval), monotonic) and exits without sending once it
+  has passed. Sockets use SO_LINGER(0) and TCP_USER_TIMEOUT equal to the
+  remaining deadline, refreshed before each socket operation. TCP_USER_TIMEOUT
+  does not shorten the first retransmission or tail-loss probe. Before every
+  socket write the child reads the current TCP_INFO.tcpi_rto (via the safe
+  SOCK_DIAG interface) and requires more than RTO + 1 s remaining, and at least
+  2 s. Closing or killing the child discards unacknowledged bytes. The child
+  arms its own SIGKILL timer independently of the parent's process-group kill;
+  while SIGSTOPped, the socket's kernel timeout still runs. Code 5 is never
   sent (scupperd is the sender). Coverage is the gateway-side verdict
   (§12).
 - The URL is a secret ref (it identifies the check). Failures are retried
   once, then `HeartbeatFailed` (warning); the external service's own alert
   is the safety net.
+
+M2 implementation deviations: a separate fresh check thread runs concurrently
+with the reconciler (an exception to ADR 0004's single synchronous reconciler;
+the thread observes only and never persists intent). Verdict time is the check's
+start, the oldest observation it can use; checks taking 20 s or longer are
+ineligible, including after SIGSTOP/resume. The next check is scheduled from the
+last send attempt, so attempts, including failures, are throttled by the interval;
+a check rejected for health is also throttled. Retries retain the original
+deadline. Stuck checks after 40 s and deliveries 10 s past their deadline emit
+`HeartbeatFailed` and release their receiver, permitting another cycle. Before
+rebuild or apply, check workers get at most 50 ms to finish. A stuck read-only
+worker is detached and its receiver closed; its late verdict cannot authorize a
+send or veto repair. Each detachment emits `HeartbeatCheckDetached`. Completion
+handles remain tracked until exit; at most four detached checks may remain live.
+While that cap is occupied, no new heartbeat check starts, and each due attempt
+emits `HeartbeatSkipped` with reason `HeartbeatWorkerLimit` (at most once per
+configured interval). The drain runs before the scheduler charges the boot attempt.
+Healthy verdicts rejected as stale emit the informational `HeartbeatSkipped`
+event with reason `Stale`, at most once per minute.
+
+Delivery uses HTTPS GET rather than HEAD. Child exit codes are 20 (HTTP
+non-2xx or malformed response), 21 (deadline/timeout), 22 (internal/protocol),
+23 (identity), 24 (other TLS protocol failure), 25 (network transport), 26 (exec),
+27 (secret), 28 (TCP_INFO/RTO read failure), 29 (write refused by deadline/RTO
+rule), 30 (connection reset) and 31 (certificate/verification failure); 0 is
+success. Events and daemon stderr preserve these value-free failure categories.
+Status includes `heartbeat_last_success_age`. URL secret files accept exactly
+one trailing newline, with no other whitespace trimming. Before reading any
+secret stdin bytes, the child disables core dumps, sets NoNewPrivs and becomes
+NotDumpable. After parsing the request and rejecting expired jobs, it checks all
+real/effective/saved/filesystem IDs through Linux procfs (the safe getresuid/getresgid equivalent available here),
+empty supplementary groups, empty inheritable/permitted/effective/ambient
+capability sets and NoNewPrivs. Its inherited capability bounding mask can remain
+nonzero; NoNewPrivs and the empty live sets prevent regaining those capabilities.
+
+Explicit M2 non-goal: scupper does not restrict the host network namespace.
+`scupper-alert` can reach the uplink, loopback and host services like any host
+process. Endpoint confinement is a property of the child implementation, not a
+host firewall sandbox. The child receives only a root-owned URL and sends no
+client data. The lab's dedicated endpoint tuple is not targeted by client flows;
+its tuple-only oracle allowance is cross-checked with an established socket
+owned by the locally allocated `scupper-alert` uid in L53/L53b.
+
+The absolute CLOCK_MONOTONIC deadline assumes parent and child share a time
+namespace. It does not advance during system suspend; wall-clock freshness over
+suspend remains a documented M2 limitation. Linux kernel transmission deadlines
+bound locally queued work; they cannot recall packets already in the network.
+
+Lab deviations: L53 completes a TLS handshake before dropping the encrypted GET,
+then kills the parent and proves the child is alive near its deadline and exits
+by deadline +1 s. L53b stops that child near its deadline, proves it remains alive
+past it, removes the drop, and checks all outbound TCP payload timestamps for
+late retransmissions while the child is still stopped. Quiet windows cover at
+least three minimum intervals and check both ClientHello counts and parent
+launch traces, with healthy cadence controls. The testing build injects code 3
+and code 5 to exercise positive status suffix and suppression controls; parent
+traces describe launch decisions, while the resolve unit test covers the actual
+GET path suffix. Only testing builds accept the disposable local TLS CA and
+handshake pause fixture. Whole-run lab deadline is 1900 s (formerly 1600 s), and
+the four CI shards allow 30 min (formerly 25 min) including setup slack.
 
 ---
 
@@ -2151,7 +2221,7 @@ WantedBy=multi-user.target
    per-link sysctls, `ip link set <if> up`.
 5. Routes for the persisted selection: first candidate exit (packets wait
    inside WireGuard until the first handshake) or `unreachable`.
-6. Forwarding 1 unless the quarantine latch is set; re-apply hardening; read back.
+6. Forwarding 1 unless latched or Disconnected; re-apply hardening; read back.
 7. Write `/run/scupper/boot.json` (step results); scupperd logs `Boot`.
 
 Requirement "ruleset before forwarding" is met inside the namespace by
@@ -2218,7 +2288,7 @@ that later releases may not change incompatibly.
    `DeployRollback`), as `config rollback` does.
 4. Start `scupperd`; it converges with the ordered planner (every prefix
    safe); a ruleset change goes through forwarding 0 → load → verify →
-   forwarding 1, so a failed load stays closed.
+   forwarding 1 unless latched or Disconnected, so a failed load stays closed.
 5. Start edge; emit `DeployRolledBack{id, reason}`; alert.
 A failure at any step leaves the gateway closed and alerting; the heartbeat
 reflects the verdict. A first deploy to a fresh host (nothing to roll back
@@ -2565,7 +2635,8 @@ R1's policy-rule and route inventories catch steady-state drift first.
 | L50 | crash after `Disconnected` is persisted and before the routes change | check 3 `DisconnectNotEffective`, never 4 while a route via an exit exists; then tightened | M2 |
 | L51 | deploy edge cases: two deploys at once; confirmation racing the rollback; a device revoked during the window; a deploy that changes a unit file; a build whose own check falsely reports 0 | second deploy refused; exactly one of confirm/rollback; revocation survives rollback; units restored; Mac-side checks refuse to confirm the false-0 build | M6 |
 | L52 | an extra main-table route via an exit in the netns | check 3 `RouteWrong`; removed | M2 |
-| L53 | heartbeat child started just before scupperd is SIGKILLed and the uplink is delayed | no ping after the child's deadline | M2 |
+| L53 | heartbeat TLS handshake completes, GET is dropped, parent is killed | child alive near deadline, gone by deadline +1 s; no late TCP payload | M2 |
+| L53b | GET queued behind a drop, parent killed and child stopped; separate held GET released with <2 s remaining | no TCP payload after either original deadline; unconditional group kill/reap on every exit path | M2 |
 | L54 | client queries `use-application-dns.net` (A, AAAA, HTTPS) | NXDOMAIN from the gateway; no upstream query for it on any exit | M4 |
 | L55 | gateway-generated ICMP errors about NATed client flows (undeliverable reply, frag-needed) | nothing with the exit address or client addresses on the uplink, checked after NAT | M1 (lab), M2 |
 
@@ -2594,7 +2665,7 @@ still execute after a client hangs up because they only tighten policy.
 | All exits dead | fail closed | as above | route unreachable; alert via uplink; recover after qualification |
 | Probe targets down | none on the data path | common-mode rule | 3, alert, no switch |
 | Provider DNS down | client DNS fails | path probes, DNS self-test | 3; common mode if on all exits |
-| Netns ruleset flushed or changed | NAT, isolation, DNS forcing lost; no uplink leak | fingerprint ≤ 2 s | forwarding 0, reload, verify, conntrack flush, forwarding 1 |
+| Netns ruleset flushed or changed | NAT, isolation, DNS forcing lost; no uplink leak | fingerprint ≤ 2 s | forwarding 0, reload, verify, conntrack flush, forwarding 1 unless latched or Disconnected |
 | Netns route changed or deleted | clients cut or on another exit | route compare | restore |
 | Foreign link or tc in netns | possible path among tunnels | link/tc scan | down / delete; check 2; alert |
 | Netns name deleted (`ip netns del`) while edge runs | namespace, links and routes survive and keep forwarding via exits | stat vs held inode | re-mount from held fd; no rebuild |

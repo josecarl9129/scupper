@@ -274,7 +274,8 @@ fn build_plan(
     };
     builder.result.latch.clone_from(&new_latch);
     builder.model.latch = effective_latch.cloned().or(new_latch.clone());
-    let closed = new_latch.is_some()
+    let closed = desired.disconnected
+        || new_latch.is_some()
         || effective_latch.is_some()
         || !safe(observed, desired)
         || observed.ruleset != Known::Value(Ruleset::Verified(desired.fingerprint));
@@ -773,7 +774,8 @@ impl Builder<'_> {
         closed.forwarding_v4 = Known::Value(0);
         closed.forwarding_v6 = Known::Value(0);
         closed.client_forwarding_v4 = Known::Value(0);
-        self.model.latch.is_none()
+        !self.desired.disconnected
+            && self.model.latch.is_none()
             && self.model.ruleset == Known::Value(Ruleset::Verified(self.desired.fingerprint))
             && safe(&closed, self.desired)
     }

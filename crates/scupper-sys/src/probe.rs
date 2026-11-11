@@ -122,13 +122,31 @@ pub fn is_setup_error(operation: IoOperation, kind: io::ErrorKind, raw: Option<i
     }
 }
 
-/// Maps local socket failures to Setup, timeouts to Timeout, and other failures
-/// to Io with their diagnostic. Resolving always uses the path classification.
+/// Preserves local setup, deadline-write, reset and timeout classifications;
+/// other failures retain a bounded I/O diagnostic.
 #[cfg(target_os = "linux")]
 pub(crate) fn io_failure(operation: IoOperation, error: &io::Error) -> ProbeError {
     if is_setup_error(operation, error.kind(), error.raw_os_error()) {
-        ProbeError::setup(&error.to_string())
-    } else if matches!(
+        return ProbeError::setup(&error.to_string());
+    }
+    if let Some(issue) = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<WriteIssue>())
+    {
+        return match issue {
+            WriteIssue::RtoRead => ProbeError::RtoRead,
+            WriteIssue::Refused => ProbeError::WriteRefused,
+        };
+    }
+    if matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+    ) {
+        return ProbeError::ConnectionReset;
+    }
+    if matches!(
         error.kind(),
         io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
     ) {
@@ -137,6 +155,18 @@ pub(crate) fn io_failure(operation: IoOperation, error: &io::Error) -> ProbeErro
         ProbeError::io(&error.to_string())
     }
 }
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Error)]
+enum WriteIssue {
+    #[error("TCP_INFO/RTO read failed")]
+    RtoRead,
+    #[error("write refused by deadline/RTO rule")]
+    Refused,
+}
+
+#[cfg(target_os = "linux")]
+mod tcp_info;
 
 #[cfg(target_os = "linux")]
 pub(crate) mod linux {
@@ -162,6 +192,29 @@ pub(crate) mod linux {
         address: Ipv4Addr,
         deadline: Instant,
     ) -> Probe<Vec<u8>> {
+        exchange(socket, target, address, deadline, false, &|| Ok(()))
+    }
+
+    // Heartbeats need only the status line/headers, not an IP response body.
+    pub(crate) fn exchange_status_socket(
+        socket: Socket,
+        target: &Target,
+        address: Ipv4Addr,
+        deadline: Instant,
+        before_request: &dyn Fn() -> Probe<()>,
+    ) -> Probe<Vec<u8>> {
+        exchange(socket, target, address, deadline, true, before_request)
+    }
+
+    fn exchange(
+        socket: Socket,
+        target: &Target,
+        address: Ipv4Addr,
+        deadline: Instant,
+        status_only: bool,
+        before_request: &dyn Fn() -> Probe<()>,
+    ) -> Probe<Vec<u8>> {
+        remaining(deadline)?;
         socket
             .connect_timeout(
                 &SocketAddr::from((address, 443)).into(),
@@ -171,6 +224,7 @@ pub(crate) mod linux {
         let stream = DeadlineStream {
             stream: socket.into(),
             deadline,
+            abort_at_deadline: status_only,
         };
         stream
             .set_timeouts()
@@ -205,9 +259,16 @@ pub(crate) mod linux {
         let connection = ClientConnection::new(Arc::new(config), name)
             .map_err(|error| ProbeError::io(&error.to_string()))?;
         let mut tls = StreamOwned::new(connection, stream);
-        tls.write_all(&target.request_bytes())
-            .and_then(|()| tls.flush())
-            .map_err(|error| io_failure(IoOperation::Path, &error))?;
+        // Finish the handshake before accepting application bytes. In particular,
+        // a handshake delayed beyond the verdict deadline must never queue a GET.
+        while tls.conn.is_handshaking() {
+            remaining(deadline)?;
+            tls.conn
+                .complete_io(&mut tls.sock)
+                .map_err(|error| tls_failure(&error))?;
+        }
+        before_request()?;
+        write_request(&mut tls, target, deadline)?;
         let mut bytes = Vec::new();
         let mut buffer = [0; 2048];
         loop {
@@ -220,16 +281,40 @@ pub(crate) mod linux {
             }
             let count = tls
                 .read(&mut buffer[..available])
-                .map_err(|error| io_failure(IoOperation::Path, &error))?;
+                .map_err(|error| tls_failure(&error))?;
             if count == 0 {
                 return Ok(bytes);
             }
             bytes.extend_from_slice(&buffer[..count]);
             // Framed responses need not wait for the peer to close TLS.
-            if parse_complete(&bytes) {
+            if (status_only && bytes.windows(4).any(|w| w == b"\r\n\r\n")) || parse_complete(&bytes)
+            {
                 return Ok(bytes);
             }
         }
+    }
+
+    fn tls_failure(error: &io::Error) -> ProbeError {
+        if let Some(tls) = error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+        {
+            return match tls {
+                rustls::Error::InvalidCertificate(_) | rustls::Error::NoCertificatesPresented => {
+                    ProbeError::Certificate
+                }
+                _ => ProbeError::Tls,
+            };
+        }
+        io_failure(IoOperation::Path, error)
+    }
+
+    fn write_request(writer: &mut impl Write, target: &Target, deadline: Instant) -> Probe<()> {
+        remaining(deadline)?;
+        writer
+            .write_all(&target.request_bytes())
+            .and_then(|()| writer.flush())
+            .map_err(|error| tls_failure(&error))
     }
 
     fn parse_complete(bytes: &[u8]) -> bool {
@@ -241,12 +326,23 @@ pub(crate) mod linux {
     struct DeadlineStream {
         stream: TcpStream,
         deadline: Instant,
+        abort_at_deadline: bool,
     }
 
     impl DeadlineStream {
         fn set_timeouts(&self) -> io::Result<()> {
             let timeout =
                 remaining(self.deadline).map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?;
+            if self.abort_at_deadline {
+                // Refresh before every syscall, including each TLS flight: the
+                // kernel timeout must shrink with the verdict's remaining life.
+                let millis = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+                if millis == 0 {
+                    return Err(io::Error::from(io::ErrorKind::TimedOut));
+                }
+                socket2::SockRef::from(&self.stream)
+                    .set_tcp_user_timeout(Some(std::time::Duration::from_millis(millis)))?;
+            }
             self.stream.set_read_timeout(Some(timeout))?;
             self.stream.set_write_timeout(Some(timeout))
         }
@@ -259,8 +355,25 @@ pub(crate) mod linux {
         }
     }
 
+    // TCP_USER_TIMEOUT cannot advance the first retransmission or tail-loss
+    // probe. Leave room for the current RTO plus scheduling/measurement margin.
+    fn write_allowed(left: std::time::Duration, rto: std::time::Duration) -> bool {
+        left >= std::time::Duration::from_secs(2)
+            && left > rto.saturating_add(std::time::Duration::from_secs(1))
+    }
     impl Write for DeadlineStream {
         fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if self.abort_at_deadline {
+                let rto = super::tcp_info::rto(&self.stream)
+                    .map_err(|_| io::Error::other(super::WriteIssue::RtoRead))?;
+                let left = self.deadline.saturating_duration_since(Instant::now());
+                if !write_allowed(left, rto) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        super::WriteIssue::Refused,
+                    ));
+                }
+            }
             self.set_timeouts()?;
             self.stream.write(buffer)
         }
@@ -268,6 +381,155 @@ pub(crate) mod linux {
         fn flush(&mut self) -> io::Result<()> {
             self.set_timeouts()?;
             self.stream.flush()
+        }
+    }
+    #[cfg(test)]
+    mod deadline_tests {
+        use super::*;
+        use socket2::{Domain, Protocol, Type};
+        use std::time::Duration;
+        #[test]
+        fn tls_handshake_errors_preserve_transport_and_verification_causes() {
+            for (error, expected) in [
+                (
+                    io::Error::from(io::ErrorKind::UnexpectedEof),
+                    ProbeError::io("unexpected end of file"),
+                ),
+                (
+                    io::Error::from(io::ErrorKind::ConnectionReset),
+                    ProbeError::ConnectionReset,
+                ),
+                (
+                    io::Error::from(io::ErrorKind::BrokenPipe),
+                    ProbeError::ConnectionReset,
+                ),
+                (
+                    io::Error::from(io::ErrorKind::TimedOut),
+                    ProbeError::Timeout,
+                ),
+                (
+                    io::Error::from(io::ErrorKind::WouldBlock),
+                    ProbeError::Timeout,
+                ),
+                (
+                    io::Error::other(super::super::WriteIssue::RtoRead),
+                    ProbeError::RtoRead,
+                ),
+                (
+                    io::Error::new(io::ErrorKind::TimedOut, super::super::WriteIssue::Refused),
+                    ProbeError::WriteRefused,
+                ),
+                (
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer),
+                    ),
+                    ProbeError::Certificate,
+                ),
+                (
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        rustls::Error::NoCertificatesPresented,
+                    ),
+                    ProbeError::Certificate,
+                ),
+                (
+                    io::Error::new(io::ErrorKind::InvalidData, rustls::Error::DecryptError),
+                    ProbeError::Tls,
+                ),
+            ] {
+                assert_eq!(tls_failure(&error), expected);
+                assert!(!tls_failure(&error).to_string().contains("private"));
+            }
+        }
+        #[test]
+        fn reset_classification_preserves_local_socket_setup_priority() {
+            let error = io::Error::from(io::ErrorKind::ConnectionReset);
+            assert!(matches!(
+                io_failure(IoOperation::Socket, &error),
+                ProbeError::Setup(_)
+            ));
+            assert_eq!(
+                io_failure(IoOperation::Path, &error),
+                ProbeError::ConnectionReset
+            );
+        }
+        #[test]
+        fn refuses_writes_without_rto_margin_or_two_seconds() {
+            for (left, rto, allowed) in [
+                (1999, 100, false),
+                (2000, 100, true),
+                (2000, 1000, false),
+                (6000, 5000, false),
+                (6001, 5000, true),
+                (0, 0, false),
+            ] {
+                assert_eq!(
+                    write_allowed(Duration::from_millis(left), Duration::from_millis(rto)),
+                    allowed
+                );
+            }
+        }
+        #[test]
+        fn refused_write_never_reaches_peer() {
+            let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (mut peer, _) = listener.accept().unwrap();
+            let mut stream = DeadlineStream {
+                stream,
+                deadline: Instant::now() + Duration::from_millis(1999),
+                abort_at_deadline: true,
+            };
+            let error = stream.write(b"GET /private HTTP/1.1\r\n").unwrap_err();
+            assert_eq!(tls_failure(&error), ProbeError::WriteRefused);
+            peer.set_nonblocking(true).unwrap();
+            assert_eq!(
+                peer.read(&mut [0; 64]).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
+        #[test]
+        fn healthy_deadline_write_reads_rto_and_reaches_peer() {
+            let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (mut peer, _) = listener.accept().unwrap();
+            let mut stream = DeadlineStream {
+                stream,
+                deadline: Instant::now() + Duration::from_secs(10),
+                abort_at_deadline: true,
+            };
+            stream.write_all(b"test flight").unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            let mut bytes = [0; 11];
+            peer.read_exact(&mut bytes).unwrap();
+            assert_eq!(&bytes, b"test flight");
+        }
+        #[test]
+        fn expired_before_connect_never_uses_socket() {
+            let target = Target::new("heartbeat.invalid", "/secret-path").unwrap();
+            let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+            let result = exchange_status_socket(
+                socket,
+                &target,
+                Ipv4Addr::LOCALHOST,
+                Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+                &|| Ok(()),
+            );
+            assert!(matches!(result, Err(ProbeError::Timeout)));
+        }
+        #[test]
+        fn handshake_finishing_after_deadline_never_writes_request() {
+            let target = Target::new("heartbeat.invalid", "/secret-path").unwrap();
+            let mut bytes = Vec::new();
+            let deadline = Instant::now();
+            std::thread::sleep(Duration::from_millis(2));
+            assert!(matches!(
+                write_request(&mut bytes, &target, deadline),
+                Err(ProbeError::Timeout)
+            ));
+            assert_eq!(bytes, [] as [u8; 0]);
+            write_request(&mut bytes, &target, Instant::now() + Duration::from_secs(1)).unwrap();
+            assert!(bytes.starts_with(b"GET /secret-path HTTP/1.1\r\n"));
         }
     }
 }

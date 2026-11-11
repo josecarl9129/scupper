@@ -87,7 +87,7 @@ impl Url {
         url.target()?;
         Ok(url)
     }
-    fn target(&self) -> Probe<Target> {
+    pub(crate) fn target(&self) -> Probe<Target> {
         let rest = self
             .0
             .strip_prefix("https://")
@@ -175,10 +175,13 @@ impl ProbeIdentity {
     /// # Errors
     /// Rejects missing, duplicate, malformed, root or mismatched account entries.
     pub fn parse(passwd: &str, group: &str) -> Probe<Self> {
-        fn entry(text: &str) -> Probe<Vec<&str>> {
+        Self::parse_named(passwd, group, "scupper-probe")
+    }
+    pub(crate) fn parse_named(passwd: &str, group: &str, account: &str) -> Probe<Self> {
+        fn entry<'a>(text: &'a str, account: &str) -> Probe<Vec<&'a str>> {
             let mut entries = text
                 .lines()
-                .filter(|line| line.split(':').next() == Some("scupper-probe"));
+                .filter(|line| line.split(':').next() == Some(account));
             let fields: Vec<_> = entries
                 .next()
                 .ok_or_else(|| ProbeError::setup("scupper-probe account missing"))?
@@ -189,8 +192,8 @@ impl ProbeIdentity {
             }
             Ok(fields)
         }
-        let user = entry(passwd)?;
-        let probe_group = entry(group)?;
+        let user = entry(passwd, account)?;
+        let probe_group = entry(group, account)?;
         let number = |field: Option<&&str>| {
             field
                 .and_then(|s| s.parse::<u32>().ok())
@@ -207,18 +210,18 @@ impl ProbeIdentity {
         }
         let shared_user = passwd.lines().any(|line| {
             let fields: Vec<_> = line.split(':').collect();
-            fields.first() != Some(&"scupper-probe")
+            fields.first() != Some(&account)
                 && (fields.get(2).and_then(|id| id.parse::<u32>().ok()) == Some(identity.uid)
                     || fields.get(3).and_then(|id| id.parse::<u32>().ok()) == Some(identity.gid))
         });
         let shared_group = group.lines().any(|line| {
             let fields: Vec<_> = line.split(':').collect();
             fields.get(2).and_then(|id| id.parse::<u32>().ok()) == Some(identity.gid)
-                && (fields.first() != Some(&"scupper-probe")
+                && (fields.first() != Some(&account)
                     || fields.get(3).is_some_and(|members| {
                         members
                             .split(',')
-                            .any(|member| !member.is_empty() && member != "scupper-probe")
+                            .any(|member| !member.is_empty() && member != account)
                     }))
         });
         if shared_user || shared_group {

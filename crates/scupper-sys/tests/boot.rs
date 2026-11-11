@@ -837,6 +837,54 @@ fn disconnected_routes_are_both_unreachable() {
             .values()
             .all(|v| v.contains("unreachable"))
     );
+    for sysctl in desired_sysctls(
+        &[
+            scupper_core::rules::IfName::new("wg0").unwrap(),
+            scupper_core::rules::IfName::new("ex-ch1").unwrap(),
+            scupper_core::rules::IfName::new("lo").unwrap(),
+        ],
+        false,
+    )
+    .into_iter()
+    .filter(|s| {
+        s.key.to_string().ends_with("forwarding") || s.key.to_string() == "net.ipv4.ip_forward"
+    }) {
+        assert_eq!(f.kernel.values.borrow()[&sysctl.key.to_string()], "0");
+    }
+    assert!(
+        !f.kernel
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call.ends_with("forwarding=1") || call.ends_with("ip_forward=1"))
+    );
+}
+
+#[test]
+fn disconnected_adoption_rejects_open_forwarding_gates() {
+    let f = Fixture::new();
+    f.state(|s| s.selection = Selection::Disconnected);
+    assert!(f.run(None).succeeded());
+    for value in f
+        .kernel
+        .values
+        .borrow_mut()
+        .iter_mut()
+        .filter(|(key, _)| key.ends_with("forwarding") || key.as_str() == "net.ipv4.ip_forward")
+    {
+        *value.1 = "1".into();
+    }
+    f.kernel.calls.borrow_mut().clear();
+    let report = f.run(None);
+    assert!(report.succeeded() && !report.adopted, "{report:?}");
+    assert_eq!(f.kernel.values.borrow()["net.ipv4.ip_forward"], "0");
+    assert!(
+        !f.kernel
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call.ends_with("forwarding=1") || call.ends_with("ip_forward=1"))
+    );
 }
 
 #[test]
@@ -1367,6 +1415,13 @@ fn adopting_a_disconnect_closes_routes_before_exits_and_reconnect_opens_exits_be
     let f = Fixture::new();
     assert!(f.run(None).succeeded());
     f.state(|s| s.selection = Selection::Disconnected);
+    // Disconnected adoption requires closed gates; step 5 still reasserts
+    // route closure before lowering exits, preserving the client session.
+    for (key, value) in f.kernel.values.borrow_mut().iter_mut() {
+        if key.ends_with("forwarding") || key == "net.ipv4.ip_forward" {
+            *value = "0".into();
+        }
+    }
     f.kernel.calls.borrow_mut().clear();
     let report = f.run(None);
     assert!(report.succeeded() && report.adopted, "{report:?}");
@@ -1383,7 +1438,8 @@ fn adopting_a_disconnect_closes_routes_before_exits_and_reconnect_opens_exits_be
     drop(calls);
     f.state(|s| s.selection = Selection::Auto);
     f.kernel.calls.borrow_mut().clear();
-    assert!(f.run(None).succeeded());
+    let reconnect = f.run(None);
+    assert!(reconnect.succeeded() && !reconnect.adopted, "{reconnect:?}");
     let calls = f.kernel.calls.borrow();
     let up = calls
         .iter()

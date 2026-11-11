@@ -220,10 +220,16 @@ impl KernelModel {
     /// A complete reference model of applied intent, useful to collectors/tests.
     #[must_use]
     pub fn desired(desired: &Desired) -> Self {
+        let forwarding = i64::from(!desired.disconnected);
         let mut links = desired
             .links
             .iter()
-            .map(|(name, link)| (name.clone(), KernelLink::configured(link)))
+            .map(|(name, link)| {
+                let mut configured = KernelLink::configured(link);
+                configured.forwarding_v4 = Known::Value(forwarding);
+                configured.forwarding_v6 = Known::Value(forwarding);
+                (name.clone(), configured)
+            })
             .collect::<BTreeMap<_, _>>();
         links.insert(
             "lo".into(),
@@ -235,17 +241,17 @@ impl KernelModel {
                 peers: Known::Value(vec![]),
                 settings: Known::Unknown,
                 tc_hooks: Known::Value(vec![]),
-                forwarding_v4: Known::Value(1),
-                forwarding_v6: Known::Value(1),
+                forwarding_v4: Known::Value(forwarding),
+                forwarding_v6: Known::Value(forwarding),
             },
         );
         Self {
             client_link: desired.link_order[0].clone(),
-            forwarding_v4: Known::Value(1),
-            forwarding_v6: Known::Value(1),
-            client_forwarding_v4: Known::Value(1),
-            default_forwarding_v4: Known::Value(1),
-            default_forwarding_v6: Known::Value(1),
+            forwarding_v4: Known::Value(forwarding),
+            forwarding_v6: Known::Value(forwarding),
+            client_forwarding_v4: Known::Value(forwarding),
+            default_forwarding_v4: Known::Value(forwarding),
+            default_forwarding_v6: Known::Value(forwarding),
             ruleset: Known::Value(Ruleset::Verified(desired.fingerprint)),
             hardening: desired
                 .hardening
@@ -741,7 +747,8 @@ pub fn safe(m: &KernelModel, desired: &Desired) -> bool {
             }
             Known::Unknown | Known::Value(DefaultRouteObs::Other(_)) => false,
         });
-    forwarding_ok
+    (!desired.disconnected || m.forwarding_off())
+        && forwarding_ok
         && m.ruleset != Known::Unknown
         && link_gates_ok
         && routes_ok

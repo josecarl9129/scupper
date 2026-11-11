@@ -56,6 +56,9 @@ impl SecretFile {
         if bytes.len() > 4096 {
             return Err(failure("reference exceeds 4 KiB"));
         }
+        if name.kind() == SecretKind::Url && bytes.last() == Some(&b'\n') {
+            bytes.pop();
+        }
         let text = std::str::from_utf8(&bytes).map_err(|_| failure("content must be UTF-8"))?;
         let valid = match name.kind() {
             SecretKind::Wg => valid_wg_secret(text.strip_suffix('\n').unwrap_or(text)),

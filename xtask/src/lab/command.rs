@@ -77,7 +77,7 @@ impl Runner {
         let now = Instant::now();
         Self {
             cancel,
-            whole: now + Duration::from_secs(1600),
+            whole: now + Duration::from_secs(1900),
             phase: now + Duration::from_secs(180),
             cleanup: false,
             probe_ca: None,

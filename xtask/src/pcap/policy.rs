@@ -7,6 +7,7 @@ use serde::Deserialize;
 #[derive(Debug)]
 pub struct Policy {
     pub(super) uplink_addrs: Vec<IpAddr>,
+    pub(super) heartbeat: Option<SocketAddr>,
     pub(super) wireguard: Vec<WireGuard>,
     pub(super) host_allow: Vec<HostRule>,
     pub(super) arp: bool,
@@ -66,6 +67,8 @@ struct RawPolicy {
     uplink_addrs: Vec<IpAddr>,
     #[serde(default)]
     wireguard: Vec<WireGuard>,
+    #[serde(default)]
+    heartbeat: Option<SocketAddr>,
     #[serde(default)]
     host_allow: Vec<RawHost>,
     #[serde(default)]
@@ -151,6 +154,7 @@ impl Policy {
         let mut policy = Self {
             uplink_addrs: raw.uplink_addrs,
             wireguard: raw.wireguard,
+            heartbeat: raw.heartbeat,
             host_allow: Vec::new(),
             arp: raw.arp,
             ndp: raw.ndp,
@@ -161,6 +165,14 @@ impl Policy {
         };
         if policy.uplink_addrs.iter().any(|&a| policy.forbidden(a)) {
             return Err(invalid("uplink_addrs overlaps forbidden_addrs"));
+        }
+        if policy
+            .heartbeat
+            .is_some_and(|endpoint| endpoint.port() != 443 || policy.forbidden(endpoint.ip()))
+        {
+            return Err(invalid(
+                "heartbeat requires one non-forbidden HTTPS endpoint on port 443",
+            ));
         }
         for pair in &policy.wireguard {
             if !policy.uplink_addrs.contains(&pair.gateway.ip())
@@ -209,7 +221,7 @@ impl Policy {
         for expected in &policy.expect {
             let valid = matches!(
                 expected.as_str(),
-                "wireguard" | "host_allow" | "arp" | "ndp"
+                "wireguard" | "host_allow" | "heartbeat" | "arp" | "ndp"
             ) || (0..policy.wireguard.len())
                 .any(|i| *expected == format!("wireguard[{i}]"))
                 || (0..policy.host_allow.len()).any(|i| *expected == format!("host_allow[{i}]"));

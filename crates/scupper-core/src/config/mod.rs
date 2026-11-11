@@ -70,6 +70,7 @@ rules! {
     UnknownUser => "A device must reference an existing user.",
     InvalidEndpoint => "Endpoints must contain a literal IP and port 1–65535.",
     InvalidDnsServer => "DNS servers must be literal IP addresses.",
+    InvalidHeartbeatInterval => "Heartbeat interval must be between 10 seconds and 1 hour inclusive.",
     InvalidDuration => "Durations must be positive integer seconds, minutes or hours without overflow.",
     FailoverGraceNotLessThanHandshakeStale => "Failover grace must be less than the stale handshake threshold.",
     LooksLikeKeyMaterial => "A non-public-key string contains 32-byte base64 key material.",

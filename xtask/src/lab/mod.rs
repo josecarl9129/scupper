@@ -49,6 +49,20 @@ fn fail<T>(message: impl Into<String>) -> Result<T> {
     Err(message.into().into())
 }
 
+const LAB_ACCOUNTS: [&str; 2] = ["scupper-probe", "scupper-alert"];
+
+fn refuse_lab_accounts(passwd: &str, group: &str) -> Result<()> {
+    for account in LAB_ACCOUNTS {
+        if [passwd, group].iter().any(|text| {
+            text.lines()
+                .any(|line| line.split(':').next() == Some(account))
+        }) {
+            return fail(format!("refusing occupied {account} lab account/group"));
+        }
+    }
+    Ok(())
+}
+
 const NAMESPACES: [&str; 10] = [
     "rulecap",
     "scupper-inherit",
@@ -338,14 +352,10 @@ impl Lab {
             boot::refuse_unrestored_sysctls(parent)?;
         }
 
-        for path in ["/etc/passwd", "/etc/group"] {
-            if fs::read_to_string(path)?
-                .lines()
-                .any(|line| line.split(':').next() == Some("scupper-probe"))
-            {
-                return fail("refusing occupied scupper-probe lab account/group");
-            }
-        }
+        refuse_lab_accounts(
+            &fs::read_to_string("/etc/passwd")?,
+            &fs::read_to_string("/etc/group")?,
+        )?;
         for ns in NAMESPACES {
             for path in [format!("/run/netns/{ns}"), format!("/etc/netns/{ns}")] {
                 if fs::symlink_metadata(&path).is_ok() {
@@ -374,20 +384,27 @@ impl Lab {
         Ok(())
     }
     fn prepare(&mut self) -> Result<()> {
-        self.cmd(
-            "",
-            "useradd",
-            &[
-                "--system",
-                "--user-group",
-                "--no-create-home",
-                "--shell",
-                "/usr/sbin/nologin",
-                "scupper-probe",
-            ],
-        )?;
-        self.registry
-            .register(Resource::User("scupper-probe".into()));
+        for account in LAB_ACCOUNTS {
+            self.cmd(
+                "",
+                "useradd",
+                &[
+                    "--system",
+                    "--user-group",
+                    "--no-create-home",
+                    "--shell",
+                    "/usr/sbin/nologin",
+                    account,
+                ],
+            )?;
+            self.registry.register(Resource::User(account.into()));
+            self.rows.push(Row {
+                name: format!("setup-account-{account}"),
+                wanted: "dedicated system account; no login shell or home creation".into(),
+                got: "passed".into(),
+                detail: "created by lab; registered for teardown".into(),
+            });
+        }
         fs::DirBuilder::new().mode(0o700).create(&self.private)?;
         self.private_dir = Some(fs::File::open(&self.private)?);
         self.registry

@@ -190,6 +190,14 @@ pub fn validate(cfg: SiteConfig) -> Result<ValidatedSite, Vec<ValidationError>> 
     if let Some(heartbeat) = &cfg.heartbeat {
         errors.secret(&heartbeat.url_ref, "heartbeat.url_ref", SecretKind::Url);
         errors.duration(&heartbeat.interval, "heartbeat.interval");
+        if let Ok(interval) = heartbeat.interval.duration() {
+            errors.check(
+                (std::time::Duration::from_secs(10)..=std::time::Duration::from_secs(3600))
+                    .contains(&interval),
+                "heartbeat.interval",
+                Rule::InvalidHeartbeatInterval,
+            );
+        }
     }
     if !errors.0.is_empty() {
         return Err(errors.0);

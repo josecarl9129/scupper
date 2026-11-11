@@ -615,6 +615,44 @@ impl RealSystem {
     }
 }
 
+/// Executes a trusted child with secret input on a bounded nonblocking pipe.
+/// Uses the same process-group kill, reap and capture limits as probe children.
+/// The caller selects uid/gid before exec; no namespace transition is performed.
+///
+/// # Errors
+/// Returns spawn, capture or timeout errors. Callers must discard child diagnostics.
+pub fn execute_input_command(
+    mut command: Command,
+    input: &[u8],
+    timeout: Duration,
+) -> Result<ExecOutput, ExecError> {
+    command
+        .env_clear()
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .env("LC_ALL", "C")
+        .current_dir("/")
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(feature = "testing")]
+    if let Some(ca) = std::env::var_os("SCUPPER_TEST_CA_DER") {
+        command.env("SCUPPER_TEST_CA_DER", ca);
+    }
+    let started = Instant::now();
+    let mut child = command
+        .spawn()
+        .map_err(|_| ExecError::spawn("delivery spawn failed"))?;
+    let deadline = started + timeout + Duration::from_millis(900);
+    let mut readers = Vec::with_capacity(2);
+    let result = collect(&mut child, started, timeout, &mut readers, Some(input));
+    if result.is_err() {
+        terminate(child, deadline);
+    }
+    join_readers(readers, deadline);
+    result
+}
+
 // The probe has its own single-threaded namespace entry; its stdin is a file,
 // never a request pipe. Reuse the same capture/deadline/group-kill machinery.
 /// Runs an explicitly selected executable with an inherited file on stdin.

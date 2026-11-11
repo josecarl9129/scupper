@@ -9,6 +9,7 @@ pub mod canon;
 pub mod config;
 pub mod dns;
 pub mod failover;
+pub mod heartbeat;
 pub mod lab_mutation;
 pub mod parse;
 pub mod planner;

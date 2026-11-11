@@ -714,7 +714,7 @@ fn secret_content_validation_is_strict_and_value_free() {
         (
             SecretKind::Url,
             "url",
-            format!("https://example.net/{MARKER}\n"),
+            format!("https://example.net/{MARKER}\n\n"),
         ),
         (
             SecretKind::Url,

@@ -44,11 +44,13 @@ pub(super) fn catalog() -> Vec<Spec> {
     for id in super::daemon::CASES {
         let seconds = match id {
             "L3" | "L16" | "L9-host-link" => 240,
+            "L10" => 420,
             "L9" => 900,
             "L9b" => 720,
-            "L44" | "L50" | "L11" => 180,
+            "L44" | "L50" | "L11" | "L53" | "L53b" => 180,
             "L43" => 150,
             "L20" => 120,
+            "heartbeat" => 300,
             _ => 60,
         };
         cases.push(Spec {
@@ -183,7 +185,7 @@ pub fn list_with_durations(
 mod tests {
     use super::*;
     // CI has no committed successful durations yet: always check the built-in
-    // estimates, with 300 seconds reserved for setup/cleanup in the 25-minute budget.
+    // estimates, with 300 seconds reserved for setup/cleanup in the 30-minute budget.
     fn check_four_shard_budget(cases: &[Spec]) -> Result<()> {
         if cases.is_empty() {
             return fail("empty shard catalog");
@@ -193,9 +195,9 @@ mod tests {
                 .iter()
                 .map(|case| case.seconds)
                 .sum();
-            if seconds + 300 > 25 * 60 {
+            if seconds + 300 > 30 * 60 {
                 return fail(format!(
-                    "shard {index}: {seconds}s plus 300s exceeds 1500s budget"
+                    "shard {index}: {seconds}s plus 300s exceeds 1800s budget"
                 ));
             }
         }
@@ -205,7 +207,7 @@ mod tests {
     fn ci_shard_budget_uses_builtin_estimates_and_rejects_over_budget() {
         check_four_shard_budget(&catalog()).unwrap();
         let mut over_budget = catalog();
-        over_budget[0].seconds = 25 * 60;
+        over_budget[0].seconds = 30 * 60;
         assert!(
             check_four_shard_budget(&over_budget)
                 .unwrap_err()
@@ -237,7 +239,7 @@ mod tests {
             assert_eq!(seen.len(), cases.len());
             assert!(totals.iter().max().unwrap() - totals.iter().min().unwrap() <= 900);
             if count == 4 {
-                assert!(totals.iter().all(|s| *s + 300 <= 25 * 60));
+                assert!(totals.iter().all(|s| *s + 300 <= 30 * 60));
             }
         }
     }
@@ -269,6 +271,9 @@ mod tests {
             "daemon-L50",
             "daemon-L52",
             "daemon-L52b",
+            "daemon-L53",
+            "daemon-L53b",
+            "daemon-heartbeat",
             "daemon-V03",
             "baseline",
             "probe-child",
@@ -346,7 +351,7 @@ mod tests {
                 .map(|case| case.seconds)
                 .sum();
             assert!(
-                seconds + 300 <= 25 * 60,
+                seconds + 300 <= 30 * 60,
                 "recorded shard {index}: {seconds}s"
             );
         }

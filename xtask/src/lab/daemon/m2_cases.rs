@@ -668,7 +668,10 @@ impl DaemonGuard<'_> {
             std::slice::from_ref(&flow),
             &[capture_control(A.client_inner, A.gateway_inner, 1)?],
         )?;
-        self.child.as_mut().ok_or("daemon")?.signal(Signal::STOP);
+        self.notify
+            .as_ref()
+            .ok_or("notify")?
+            .freeze_process(self.child.as_ref().ok_or("daemon")?, true)?;
         self.lab.cmd(
             "scupper",
             "wg",
@@ -757,7 +760,10 @@ impl DaemonGuard<'_> {
                 &format!("{}/32", A.client_inner),
             ],
         )?;
-        self.child.as_mut().ok_or("daemon")?.signal(Signal::CONT);
+        self.notify
+            .as_ref()
+            .ok_or("notify")?
+            .freeze_process(self.child.as_ref().ok_or("daemon")?, false)?;
         self.lab.daemon_complete_tick(root)
     }
     #[allow(clippy::too_many_lines)] // Keep daemon-down loss, gap evidence and recovery adjacent.
@@ -825,8 +831,10 @@ impl DaemonGuard<'_> {
         self.lab.wait_provider()?;
         self.lab.boot_sysctls()?;
         if case == "L18" {
-            self.lab
-                .daemon_sysctl_fixture(self.child.as_mut().ok_or("daemon")?)?;
+            self.lab.daemon_sysctl_fixture(
+                self.child.as_mut().ok_or("daemon")?,
+                self.notify.as_ref().ok_or("notify")?,
+            )?;
         }
         canary.stop(Signal::TERM)?;
         Ok(())

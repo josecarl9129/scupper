@@ -249,6 +249,9 @@ pub enum OpResult, result_samples {
     },
     /// Cached health and its age.
     Status {
+        /// Seconds since a successful external heartbeat, absent until delivered.
+        #[serde(default)]
+        heartbeat_last_success_age: Option<u64> = None,
         /// Cached health.
         health: HealthSummary = sample_health(),
         /// Monotonic age in seconds.

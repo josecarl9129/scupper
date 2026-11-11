@@ -1614,3 +1614,62 @@ fn wireguard_icmpv6_errors_require_the_exact_reverse_listed_tuple() {
     );
     assert_eq!(report.packets[2].class, violation(Reason::NotAllowListed));
 }
+
+#[test]
+fn heartbeat_allowance_is_only_one_host_https_tuple() {
+    let policy = Policy::from_toml(&format!("heartbeat = \"198.51.100.2:443\"\n{POLICY}")).unwrap();
+    let hello = b"\x16\x03\x01\x00\x01\x01";
+    let packets = [
+        ip4(LOCAL, PEER, 6, &tcp(40123, 443, hello)),
+        ip4(PEER, LOCAL, 6, &tcp(443, 40123, b"")),
+        ip4([192, 0, 2, 20], PEER, 6, &tcp(40123, 443, hello)),
+        ip4(LOCAL, [198, 51, 100, 3], 6, &tcp(40123, 443, hello)),
+        ip4(LOCAL, PEER, 6, &tcp(40123, 444, hello)),
+        ip4(CLIENT, PEER, 6, &tcp(40123, 443, hello)),
+    ];
+    let report = classify(&capture(101, &packets), &policy, 20).unwrap();
+    assert_eq!(report.packets[0].class, allowed("heartbeat"));
+    assert_eq!(report.packets[1].class, allowed("heartbeat"));
+    assert!(
+        report.packets[2..]
+            .iter()
+            .all(|p| matches!(p.class, Class::Violation(_)))
+    );
+    let endpoint = "198.51.100.2:443".parse().unwrap();
+    let host = Ipv4Addr::from(LOCAL).into();
+    assert_eq!(
+        xtask::pcap::heartbeat_hellos(&capture(101, &packets[..2]), host, endpoint)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(xtask::pcap::heartbeat_hellos(&capture(101, &packets[2..3]), host, endpoint).is_err());
+    for endpoint in ["198.51.100.2:444", "10.99.0.2:443"] {
+        assert!(Policy::from_toml(&format!("heartbeat = {endpoint:?}\n{POLICY}")).is_err());
+    }
+}
+
+#[test]
+fn heartbeat_deadline_oracle_detects_application_data_without_client_hello() {
+    let application = b"\x17\x03\x03\x00\x06opaque";
+    let packets = [
+        ip4(LOCAL, PEER, 6, &tcp(40123, 443, application)),
+        ip4(LOCAL, PEER, 6, &tcp(40123, 443, b"")),
+        ip4(PEER, LOCAL, 6, &tcp(443, 40123, application)),
+    ];
+    let bytes = capture(101, &packets);
+    let host = Ipv4Addr::from(LOCAL).into();
+    let endpoint = "198.51.100.2:443".parse().unwrap();
+    assert!(
+        xtask::pcap::heartbeat_hellos(&bytes, host, endpoint)
+            .unwrap()
+            .is_empty()
+    );
+    let payloads = xtask::pcap::heartbeat_payloads(&bytes, host, endpoint).unwrap();
+    assert_eq!(payloads.len(), 1);
+    let late_deadline = &payloads[0];
+    assert!(payloads.iter().any(|time| (time.seconds, time.nanoseconds)
+        >= (late_deadline.seconds, late_deadline.nanoseconds)));
+    let wrong_source = capture(101, &[ip4(CLIENT, PEER, 6, &tcp(40123, 443, application))]);
+    assert!(xtask::pcap::heartbeat_payloads(&wrong_source, host, endpoint).is_err());
+}
