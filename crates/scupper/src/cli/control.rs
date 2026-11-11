@@ -183,10 +183,14 @@ pub(super) fn mutation(
 
 pub(super) enum ReadOutcome {
     Rendered(u8),
-    Local {
-        supervisor: scupper_core::verdict::v2::Supervisor,
-        version: Option<u64>,
-    },
+    Local(LocalRead),
+}
+
+pub(super) struct LocalRead {
+    pub supervisor: scupper_core::verdict::v2::Supervisor,
+    pub version: Option<u64>,
+    // The same deadline survives local observations and namespace retries.
+    deadline: Instant,
 }
 
 struct PingObservation {
@@ -195,12 +199,12 @@ struct PingObservation {
     operation: Option<scupper_proto::OperationProgress>,
     version: u64,
 }
-fn ping_supervisor(deps: &Dependencies<'_>) -> Option<PingObservation> {
+fn ping_supervisor(deps: &Dependencies<'_>, deadline: Instant) -> Option<PingObservation> {
     use scupper_core::verdict::v2::Supervisor;
-    let response = control::call(
+    let response = control::call_until(
         deps.writer_root,
         &control::request(Op::Ping {}),
-        Duration::from_secs(2),
+        deadline.min(Instant::now() + Duration::from_secs(2)),
     )
     .ok()?;
     let Ok(OpResult::Ping {
@@ -233,6 +237,7 @@ pub(super) fn read(
     err: &mut dyn Write,
 ) -> Result<ReadOutcome, String> {
     use scupper_core::verdict::v2::Supervisor;
+    let deadline = Instant::now() + control::CHECK_TIMEOUT;
     let mut local = |err: &mut dyn Write, supervisor, version: Option<u64>| {
         if let Some(operation) =
             version.and_then(|from| version_transition(from, applied_version(deps)))
@@ -240,10 +245,11 @@ pub(super) fn read(
             return operation_report(&operation, json, out, err);
         }
         writeln!(err, "transport: local observations").map_err(output_error)?;
-        Ok(ReadOutcome::Local {
+        Ok(ReadOutcome::Local(LocalRead {
             supervisor,
             version,
-        })
+            deadline,
+        }))
     };
     if status {
         return local(err, Supervisor::Dead, None);
@@ -254,7 +260,7 @@ pub(super) fn read(
         busy_age,
         operation,
         version,
-    }) = ping_supervisor(deps)
+    }) = ping_supervisor(deps, deadline)
     else {
         return local(err, Supervisor::Dead, None);
     };
@@ -267,13 +273,9 @@ pub(super) fn read(
     {
         return local(err, supervisor, version);
     }
-    let deadline = Instant::now() + control::CHECK_TIMEOUT;
     for attempt in 0..2 {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        let response = control::call(deps.writer_root, &control::request(Op::Check {}), remaining);
+        let response =
+            control::call_until(deps.writer_root, &control::request(Op::Check {}), deadline);
         match response {
             Ok(response) if response.result.is_ok() => {
                 writeln!(err, "transport: local socket").map_err(output_error)?;
@@ -285,10 +287,11 @@ pub(super) fn read(
                     std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
                 ) =>
             {
+                // Only a timed-out Check may retain the preceding Ping's age.
                 break;
             }
             other => {
-                let fresh = ping_supervisor(deps);
+                let fresh = ping_supervisor(deps, deadline);
                 if let Some(PingObservation {
                     operation: Some(operation),
                     ..
@@ -334,12 +337,12 @@ pub(super) fn read(
 pub(super) fn transition_after_observation(
     deps: &Dependencies<'_>,
     version: u64,
-    supervisor: scupper_core::verdict::v2::Supervisor,
+    local: &LocalRead,
     json: bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<Option<ReadOutcome>, String> {
-    let ping = ping_supervisor(deps);
+    let ping = ping_supervisor(deps, local.deadline);
     let state_version = applied_version(deps);
     if let Some(ping) = ping.as_ref() {
         if let Some(operation) = &ping.operation {
@@ -349,11 +352,12 @@ pub(super) fn transition_after_observation(
             scupper_core::verdict::v2::Supervisor::Alive { netns, .. } => Some(netns),
             _ => None,
         };
-        if ping.version != version || identity(ping.supervisor) != identity(supervisor) {
-            return Ok(Some(ReadOutcome::Local {
+        if ping.version != version || identity(ping.supervisor) != identity(local.supervisor) {
+            return Ok(Some(ReadOutcome::Local(LocalRead {
                 supervisor: ping.supervisor,
                 version: Some(ping.version),
-            }));
+                deadline: local.deadline,
+            })));
         }
     }
     if let Some(operation) = version_transition(version, state_version) {

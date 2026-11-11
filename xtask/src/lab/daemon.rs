@@ -1195,7 +1195,7 @@ impl Lab {
     ) -> Result<String> {
         let stem = format!("daemon-{case}");
         let mut markers = Vec::new();
-        self.capture("wan", A.gwhost.wan_if, &stem)?;
+        self.capture_uplink(&stem)?;
         self.service_check(&mut markers)?;
         let start_port = self.exit_port;
         let measurement = match case {
@@ -1559,7 +1559,7 @@ impl Lab {
     }
     fn daemon_capture_control(&mut self, stem: &str) -> Result<()> {
         let stem = format!("{stem}-control");
-        self.capture("wan", A.gwhost.wan_if, &stem)?;
+        self.capture_uplink(&stem)?;
         let mut markers = Vec::new();
         self.service_check(&mut markers)?;
         self.uplink_fault(&mut markers)?;
@@ -2021,8 +2021,23 @@ fn verify_continuity(path: &Path) -> Result<()> {
     let mut previous = None;
     let mut received = 0;
     let mut last_record = 0;
-    for line in fs::read_to_string(path)?.lines() {
-        let value: serde_json::Value = serde_json::from_str(line)?;
+    // Call only after the flow has exited. Read the complete file through EOF;
+    // retain it verbatim on all failures, including an unterminated last record.
+    let text = fs::read_to_string(path)?;
+    if !text.is_empty() && !text.ends_with('\n') {
+        return fail(format!(
+            "capture harness error: unterminated flow JSON record; raw output retained at {}",
+            path.display()
+        ));
+    }
+    for (index, line) in text.lines().enumerate() {
+        let value: serde_json::Value = serde_json::from_str(line).map_err(|error| {
+            format!(
+                "capture harness error: flow JSON line {}: {error}; raw output retained at {}",
+                index + 1,
+                path.display()
+            )
+        })?;
         last_record = value["elapsed_ms"].as_u64().ok_or("missing flow time")?;
         if value["received"].as_u64().unwrap_or(0) > 0 {
             let at = value["elapsed_ms"].as_u64().ok_or("missing flow time")?;
@@ -2147,6 +2162,48 @@ pub(super) fn daemon_wanted(case: &str) -> &'static str {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continuity_rejects_truncated_or_malformed_evidence_and_retains_raw_output() {
+        let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("continuity-json-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("flow.jsonl");
+        let mut healthy = String::new();
+        for elapsed in (0..=500).step_by(25) {
+            writeln!(
+                healthy,
+                "{{\"elapsed_ms\":{elapsed},\"received\":48,\"sent\":48}}"
+            )
+            .unwrap();
+        }
+        fs::write(&path, &healthy).unwrap();
+        verify_continuity(&path).unwrap();
+        for suffix in [
+            "{\"elapsed_ms\":525,\"local\":null,\"received\":48,\"sent\":48",
+            "invalid\n",
+        ] {
+            let raw = format!("{healthy}{suffix}");
+            fs::write(&path, &raw).unwrap();
+            let error = verify_continuity(&path).unwrap_err().to_string();
+            assert!(error.contains("capture harness error"), "{error}");
+            assert!(error.contains(path.to_str().unwrap()), "{error}");
+            assert_eq!(fs::read_to_string(&path).unwrap(), raw);
+        }
+        // Complete JSON must still prove uninterrupted delivery.
+        fs::write(
+            &path,
+            format!("{healthy}{{\"elapsed_ms\":1100,\"received\":48}}\n"),
+        )
+        .unwrap();
+        assert!(
+            verify_continuity(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("over 500 ms")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn graceful_stop_is_intentional_before_the_signal_and_wait() {

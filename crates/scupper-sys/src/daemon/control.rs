@@ -519,6 +519,30 @@ pub enum ClientError {
 /// # Errors
 /// Distinguishes unavailable transport from an uncertain delivered outcome.
 pub fn call(root: &Path, request: &Request, timeout: Duration) -> Result<Response, ClientError> {
+    call_until(root, request, Instant::now() + timeout)
+}
+
+fn remaining_until(deadline: Instant) -> io::Result<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "control response timeout",
+        ));
+    }
+    Ok(remaining)
+}
+
+/// Send one correlated operation within an absolute deadline shared across calls.
+/// An expired deadline prevents even a new connection attempt.
+/// # Errors
+/// Distinguishes unavailable transport from an uncertain delivered outcome.
+pub fn call_until(
+    root: &Path,
+    request: &Request,
+    deadline: Instant,
+) -> Result<Response, ClientError> {
+    remaining_until(deadline).map_err(ClientError::Unavailable)?;
     // Connect through a held directory descriptor so the run root's length never meets the
     // 108-byte `sun_path` limit; the descriptor stays open until the connect returns.
     let directory = fs::OpenOptions::new()
@@ -533,37 +557,32 @@ pub fn call(root: &Path, request: &Request, timeout: Duration) -> Result<Respons
         directory.as_raw_fd()
     ))
     .map_err(ClientError::Unavailable)?;
-    let deadline = Instant::now() + timeout;
     socket
-        .connect_timeout(&address, timeout.min(Duration::from_secs(2)))
+        .connect_timeout(
+            &address,
+            remaining_until(deadline)
+                .map_err(ClientError::Unavailable)?
+                .min(Duration::from_secs(2)),
+        )
         .map_err(ClientError::Unavailable)?;
     let mut stream = UnixStream::from(std::os::fd::OwnedFd::from(socket));
-    stream
-        .set_read_timeout(Some(
-            deadline
-                .saturating_duration_since(Instant::now())
-                .max(Duration::from_millis(1)),
-        ))
-        .map_err(ClientError::Unavailable)?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(1)))
-        .map_err(ClientError::Unavailable)?;
     let mut bytes =
         serde_json::to_vec(request).map_err(|e| ClientError::Unavailable(io::Error::other(e)))?;
     bytes.push(b'\n');
+    stream
+        .set_write_timeout(Some(
+            remaining_until(deadline)
+                .map_err(ClientError::Unavailable)?
+                .min(Duration::from_secs(1)),
+        ))
+        .map_err(ClientError::Unavailable)?;
     stream
         .write_all(&bytes)
         .map_err(ClientError::OutcomeUnknown)?;
     let mut line = Vec::new();
     let mut reader = BufReader::new(stream);
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(ClientError::OutcomeUnknown(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "control response timeout",
-            )));
-        }
+        let remaining = remaining_until(deadline).map_err(ClientError::OutcomeUnknown)?;
         reader
             .get_ref()
             .set_read_timeout(Some(remaining))
@@ -669,6 +688,67 @@ mod tests {
             assert_eq!(root.join("control.sock").as_os_str().len(), bytes);
             assert_eq!(validate_socket_path(&root).is_ok(), valid);
         }
+    }
+
+    #[test]
+    fn check_and_fresh_ping_share_one_absolute_deadline() {
+        let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("shared-deadline-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let directory = fs::File::open(&root).unwrap();
+        let socket_root =
+            std::path::PathBuf::from(format!("/proc/self/fd/{}/.", directory.as_raw_fd()));
+        let listener = UnixListener::bind(socket_root.join("control.sock")).unwrap();
+        let server = listener.try_clone().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut check, _) = server.accept().unwrap();
+            let request = read_request(&check).unwrap();
+            assert_eq!(request.op, Op::Check {});
+            // Spend part of the budget before asking the caller to refresh Ping.
+            std::thread::sleep(Duration::from_millis(100));
+            serde_json::to_writer(
+                &mut check,
+                &Response {
+                    request_id: request.request_id,
+                    schema: Schema,
+                    replayed: false,
+                    observed_at: None,
+                    result: Err(api(ApiErrorCode::SupervisorUnavailable)),
+                },
+            )
+            .unwrap();
+            check.write_all(b"\n").unwrap();
+            let (mut ping, _) = server.accept().unwrap();
+            assert_eq!(read_request(&ping).unwrap().op, Op::Ping {});
+            ping.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            assert_eq!(ping.read(&mut [0]).unwrap(), 0);
+        });
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let response = call_until(&socket_root, &request(Op::Check {}), deadline).unwrap();
+        assert_eq!(
+            response.result.unwrap_err().code,
+            ApiErrorCode::SupervisorUnavailable
+        );
+        assert!(matches!(
+            call_until(&socket_root, &request(Op::Ping {}), deadline),
+            Err(ClientError::OutcomeUnknown(error))
+                if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)
+        ));
+        assert!(Instant::now() >= deadline);
+        // Neither retrying Check nor opening another Ping can renew the budget.
+        for op in [Op::Check {}, Op::Ping {}] {
+            assert!(matches!(
+                call_until(&socket_root, &request(op), deadline),
+                Err(ClientError::Unavailable(error)) if error.kind() == io::ErrorKind::TimedOut
+            ));
+        }
+        worker.join().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

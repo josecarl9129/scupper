@@ -236,9 +236,7 @@ impl Lab {
             None,
             15,
         )?;
-        let report = serde_json::from_str(&stdout)
-            .map_err(|error| format!("check-v2 JSON: {error}; output: {stdout}"))?;
-        Ok((status.code().ok_or("check-v2 killed by signal")?, report))
+        parse_check_output(&self.artifacts, status, &stdout)
     }
 
     fn check_row(
@@ -420,10 +418,69 @@ impl Lab {
     }
 }
 
+fn parse_check_output(
+    artifacts: &Path,
+    status: std::process::ExitStatus,
+    stdout: &str,
+) -> Result<(i32, serde_json::Value)> {
+    static NEXT_OUTPUT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let output_path = artifacts.join(format!(
+        "check-v2-{}.stdout",
+        NEXT_OUTPUT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    // output_timeout has waited for exit and both pipe readers' EOF. Save
+    // even invalid/partial output before interpreting the command's result.
+    fs::write(&output_path, stdout)?;
+    let code = status.code().filter(|code| (0..=5).contains(code)).ok_or_else(|| format!(
+        "capture harness error: check-v2 command ended with {status}; raw output saved at {}",
+        output_path.display()
+    ))?;
+    let report = serde_json::from_str(stdout).map_err(|error| {
+        format!(
+            "capture harness error: check-v2 JSON ({status}): {error}; raw output saved at {}",
+            output_path.display()
+        )
+    })?;
+    Ok((code, report))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CHECK, verdict_matches};
+    use super::{CHECK, parse_check_output, verdict_matches};
     use serde_json::json;
+
+    #[test]
+    fn check_json_errors_retain_raw_output_and_distinguish_timeout() -> super::Result<()> {
+        use std::{fs, os::unix::process::ExitStatusExt, process::ExitStatus};
+        let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("check-json-errors-{}", std::process::id()));
+        fs::create_dir_all(&root)?;
+        for (code, raw) in [(0, "{\"schema\":1,"), (124, "{\"schema\":1,")] {
+            let error = parse_check_output(&root, ExitStatus::from_raw(code << 8), raw)
+                .err()
+                .ok_or("partial JSON accepted")?
+                .to_string();
+            assert!(error.contains("capture harness error"), "{error}");
+            assert!(error.contains(&format!("exit status: {code}")), "{error}");
+            let saved = error
+                .split("raw output saved at ")
+                .nth(1)
+                .ok_or("missing raw path")?;
+            assert_eq!(fs::read_to_string(saved)?, raw);
+            if code == 124 {
+                assert!(error.contains("command ended"), "{error}");
+            } else {
+                assert!(error.contains("EOF"), "{error}");
+            }
+        }
+        // A valid adverse verdict is still data, rather than a harness failure.
+        let (code, report) =
+            parse_check_output(&root, ExitStatus::from_raw(5 << 8), "{\"schema\":1}")?;
+        assert_eq!(code, 5);
+        assert_eq!(report["schema"], 1);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
 
     #[test]
     fn check_isolates_only_mounted_overlay_ancestors() -> Result<(), Box<dyn std::error::Error>> {

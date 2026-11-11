@@ -95,6 +95,8 @@ fn add_second_client(
 struct Capture {
     process: Group,
     stderr: PathBuf,
+    namespace: String,
+    interface: String,
 }
 
 struct Lab {
@@ -664,14 +666,38 @@ impl Lab {
         Ok(())
     }
     fn capture(&mut self, ns: &str, iface: &str, stem: &str) -> Result<()> {
+        self.capture_direction(ns, iface, stem, false)
+    }
+    // Full-service uplink trials prove both tunnel classes in this direction.
+    // Startup and heartbeat fixtures also need packets arriving at gwhost.
+    fn capture_uplink(&mut self, stem: &str) -> Result<()> {
+        self.capture_direction("wan", A.gwhost.wan_if, stem, true)
+    }
+    fn capture_direction(
+        &mut self,
+        ns: &str,
+        iface: &str,
+        stem: &str,
+        ingress: bool,
+    ) -> Result<()> {
+        if self
+            .captures
+            .iter()
+            .any(|capture| capture.namespace == ns && capture.interface == iface)
+        {
+            return fail(format!(
+                "capture harness error: duplicate active capture on {ns}/{iface}"
+            ));
+        }
         let pcap = self.artifacts.join(format!("{stem}.pcap"));
         let log = self.artifacts.join(format!("{stem}.tcpdump.stdout"));
-        let args = vec![
+        let mut args = vec![
             "-n",
             "-Z",
             "root",
+            "-B",
+            "16384",
             "-U",
-            "--immediate-mode",
             "-s",
             "0",
             "-i",
@@ -679,12 +705,22 @@ impl Lab {
             "-w",
             pcap.to_str().ok_or("non-UTF8 artifact path")?,
         ];
+        // At the WAN end of this veth, ingress is everything emitted by gwhost.
+        // Filter only direction, never address, EtherType, protocol or port:
+        // plaintext, quoted addresses, markers, fragments, malformed WireGuard,
+        // truncated/unknown frames and ARP/ND must all reach the oracle. Other
+        // path captures need both directions (including bridge echo controls).
+        if ingress {
+            args.extend(["-Q", "in", "inbound"]);
+        }
         let group = self
             .runner
             .background(&Invocation::new(ns, "tcpdump", &args), &log)?;
         self.captures.push(Capture {
             process: group,
             stderr: log.with_extension("stderr"),
+            namespace: ns.into(),
+            interface: iface.into(),
         });
         let until = Instant::now() + Duration::from_secs(5);
         loop {

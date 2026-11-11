@@ -358,6 +358,22 @@ fn test_dir(name: &str) -> PathBuf {
     path
 }
 #[test]
+fn command_output_waits_for_exit_and_eof_after_large_and_delayed_writes() {
+    let dir = test_dir("output-eof");
+    let mut runner = Runner::new(
+        fs::File::create(dir.join("trace")).unwrap(),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let (status, stdout) = runner.output(&Invocation::new("", "/bin/sh", &[
+        "-c",
+        r#"printf '{"body":"'; head -c 131072 /dev/zero | tr '\000' x; head -c 131072 /dev/zero >&2; (sleep 0.05; printf '"}') &"#,
+    ]), None).unwrap();
+    assert!(status.success());
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(value["body"].as_str().unwrap(), "x".repeat(131_072));
+    fs::remove_dir_all(dir).unwrap();
+}
+#[test]
 fn command_failure_preserves_stderr_in_case_error() {
     let dir = test_dir("stderr");
     let mut runner = Runner::new(

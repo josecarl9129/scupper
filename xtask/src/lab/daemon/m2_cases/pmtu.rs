@@ -147,22 +147,53 @@ impl DaemonGuard<'_> {
             )?;
         }
         self.configure_pmtu(root, 1420, 1420)?;
-        self.reset_m2_network()?;
+        self.pmtu_v6_trial(root, stem)
+    }
+    fn pmtu_v6_trial(&mut self, root: &Path, stem: &str) -> Result<()> {
         // M2 refuses IPv6 configuration. This separate fixture checks renderer
-        // chains only, with reconciliation suspended until exact restoration.
+        // chains only. Park between iterations: SIGSTOP can interrupt a kernel
+        // read across its deadline and manufacture Unknown observations on resume.
         self.notify
             .as_ref()
             .ok_or("notify")?
-            .freeze_process(self.child.as_ref().ok_or("daemon")?, true)?;
-        self.pmtu_v6_path()?;
-        for reverse in [false, true] {
-            self.pmtu_direction(stem, true, reverse)?;
-        }
-        self.reset_m2_network()?;
-        self.notify
+            .incomplete_tick(root, true)?;
+        let trial = (|| {
+            self.lab.daemon_wait(
+                "PMTU reconciliation parked",
+                Duration::from_secs(40),
+                |_| {
+                    use scupper_proto::{Op, OpResult, Response};
+                    use scupper_sys::daemon::control;
+                    Ok(matches!(
+                        control::call(
+                            &root.join("run/scupper"),
+                            &control::request(Op::Ping {}),
+                            Duration::from_secs(2),
+                        ),
+                        Ok(Response {
+                            result: Ok(OpResult::Ping {
+                                current_iteration_age: None,
+                                operation: None,
+                                ..
+                            }),
+                            ..
+                        })
+                    ))
+                },
+            )?;
+            self.reset_m2_network()?;
+            self.pmtu_v6_path()?;
+            for reverse in [false, true] {
+                self.pmtu_direction(stem, true, reverse)?;
+            }
+            self.reset_m2_network()
+        })();
+        let resumed = self
+            .notify
             .as_ref()
             .ok_or("notify")?
-            .freeze_process(self.child.as_ref().ok_or("daemon")?, false)?;
+            .incomplete_tick(root, false);
+        trial.and(resumed)?;
         self.lab.daemon_complete_tick(root)
     }
     fn pmtu_v6_path(&mut self) -> Result<()> {

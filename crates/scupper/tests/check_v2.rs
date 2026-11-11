@@ -662,67 +662,119 @@ fn check_retries_once_after_apply_invalidates_worker() {
 
 #[test]
 fn hung_socket_check_falls_back_with_real_ping_age_within_six_seconds() {
+    for (age, busy, expected) in [(0, None, 0), (29, None, 5), (2, Some(6), 0)] {
+        timed_out_check_case(age, busy, false, expected, std::time::Duration::ZERO);
+    }
+}
+
+#[test]
+fn timed_out_check_preserves_ruleset_violation_without_a_late_ping() {
+    timed_out_check_case(0, None, true, 2, std::time::Duration::ZERO);
+}
+
+#[test]
+fn initial_ping_and_hung_check_share_one_deadline() {
+    timed_out_check_case(0, None, false, 0, std::time::Duration::from_millis(1500));
+}
+
+fn timed_out_check_case(
+    age: u64,
+    busy: Option<u64>,
+    violation: bool,
+    expected: u8,
+    ping_delay: std::time::Duration,
+) {
     use scupper_proto::{OpResult, Response, Schema};
     use std::{
-        io::Write,
+        io::{Read, Write},
         os::unix::net::UnixListener,
         time::{Duration, Instant},
     };
-    for (age, busy, expected) in [(0, None, 0), (29, None, 5), (2, Some(6), 0)] {
-        let sys = Script::new("ubuntu-24.04");
-        fresh(&sys);
-        let held = testing::handle().unwrap();
-        let text = support::site_text(&sys.runner)
-            .replace("require_daemon = false", "require_daemon = true");
-        let root = Root::with_text(&text, &held);
-        // A read-only fallback must work while both writer capabilities are held.
-        let _lease = scupper_sys::lock::SupervisorLease::try_acquire(&root.path).unwrap();
-        let _writer = scupper_sys::lock::WriterLock::try_acquire(&root.path).unwrap();
-        let listener = UnixListener::bind(root.path.join("control.sock")).unwrap();
-        let (device, inode) = held.identity();
-        let worker = std::thread::spawn(move || {
+    let sys = Script::new("ubuntu-24.04");
+    fresh(&sys);
+    if violation {
+        sys.replace("scupper-nft-ruleset.json", r#"{"nftables":[]}"#);
+    }
+    let held = testing::handle().unwrap();
+    let text =
+        support::site_text(&sys.runner).replace("require_daemon = false", "require_daemon = true");
+    let root = Root::with_text(&text, &held);
+    // A read-only fallback must work while both writer capabilities are held.
+    let _lease = scupper_sys::lock::SupervisorLease::try_acquire(&root.path).unwrap();
+    let _writer = scupper_sys::lock::WriterLock::try_acquire(&root.path).unwrap();
+    let listener = UnixListener::bind(root.path.join("control.sock")).unwrap();
+    let (device, inode) = held.identity();
+    let (finished, fallback_finished) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request = scupper_sys::daemon::control::read_request(&stream).unwrap();
+        assert!(matches!(request.op, scupper_proto::Op::Ping {}));
+        std::thread::sleep(ping_delay);
+        serde_json::to_writer(
+            &mut stream,
+            &Response {
+                request_id: request.request_id,
+                schema: Schema,
+                replayed: false,
+                observed_at: None,
+                result: Ok(OpResult::Ping {
+                    last_complete_iteration_age: Some(age),
+                    current_iteration_age: busy,
+                    operation: None,
+                    netns: scupper_core::verdict::v2::NetnsIdentity { device, inode },
+                    version: 1,
+                    quarantined: false,
+                    selection: scupper_core::verdict::v2::Selection::Auto,
+                }),
+            },
+        )
+        .unwrap();
+        stream.write_all(b"\n").unwrap();
+        if busy.is_none() {
             let (mut stream, _) = listener.accept().unwrap();
             let request = scupper_sys::daemon::control::read_request(&stream).unwrap();
-            serde_json::to_writer(
-                &mut stream,
-                &Response {
-                    request_id: request.request_id,
-                    schema: Schema,
-                    replayed: false,
-                    observed_at: None,
-                    result: Ok(OpResult::Ping {
-                        last_complete_iteration_age: Some(age),
-                        current_iteration_age: busy,
-                        operation: None,
-                        netns: scupper_core::verdict::v2::NetnsIdentity { device, inode },
-                        version: 1,
-                        quarantined: false,
-                        selection: scupper_core::verdict::v2::Selection::Auto,
-                    }),
-                },
-            )
+            assert!(matches!(request.op, scupper_proto::Op::Check {}));
+            // Stay hung until the client's own deadline closes its peer.
+            // A fixed 5.5s sleep can end before the kernel's five-second
+            // receive timeout returns, accidentally simulating daemon death.
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+        } else {
+            listener.set_nonblocking(true).unwrap();
+            assert!(listener.accept().is_err());
+        }
+        fallback_finished
+            .recv_timeout(Duration::from_secs(15))
             .unwrap();
-            stream.write_all(b"\n").unwrap();
-            if busy.is_none() {
-                let (stream, _) = listener.accept().unwrap();
-                let request = scupper_sys::daemon::control::read_request(&stream).unwrap();
-                assert!(matches!(request.op, scupper_proto::Op::Check {}));
-                std::thread::sleep(Duration::from_millis(5500));
-                drop(stream);
-            } else {
-                listener.set_nonblocking(true).unwrap();
-                assert!(listener.accept().is_err());
-            }
-        });
-        let start = Instant::now();
-        let (code, out, err) = run(&sys, &root, &["check", "--json"]);
-        assert!(start.elapsed() < Duration::from_secs(6), "{err}");
-        assert_eq!(code, expected, "{out}: {err}");
-        let report: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(report["schema"], 1);
-        assert!(err.contains("local observations"));
-        worker.join().unwrap();
+    });
+    let start = Instant::now();
+    let (code, out, err) = run(&sys, &root, &["check", "--json"]);
+    let elapsed = start.elapsed();
+    finished.send(()).unwrap();
+    assert_eq!(code, expected, "{out}: {err}");
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(report["schema"], 1);
+    if violation {
+        assert!(out.contains("Ruleset"), "{out}");
+    } else if age == 29 {
+        assert_eq!(report["verdict"]["Unsupervised"]["why"], "Stale");
+    } else {
+        assert!(report["verdict"].get("Protected").is_some(), "{out}");
     }
+    assert!(err.contains("local observations"));
+    worker.join().unwrap();
+    // The bound is the fallback's 5 s Check deadline plus one local check on
+    // this machine: measure that local check (nothing listens any more, so
+    // the CLI falls back at once) instead of assuming an idle machine.
+    let local = Instant::now();
+    let _ = run(&sys, &root, &["check", "--json"]);
+    let local = local.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5) + local + Duration::from_secs(1),
+        "fallback took {elapsed:?}, local check {local:?}: {err}"
+    );
 }
 
 #[test]
@@ -862,10 +914,10 @@ fn ping_followed_by_connection_refused_is_unsupervised() {
 }
 
 #[test]
-fn hung_check_keeps_real_ruleset_violations_and_retries_rebuilt_namespaces() {
+fn failed_check_keeps_real_ruleset_violations_and_retries_rebuilt_namespaces() {
     use scupper_core::verdict::v2::{NetnsIdentity, Selection};
-    use scupper_proto::{Op, OpResult, OperationKind, OperationProgress, Response, Schema};
-    use std::{io::Write, os::unix::net::UnixListener};
+    use scupper_proto::{ApiError, ApiErrorCode, OpResult, OperationKind, OperationProgress};
+    use std::os::unix::net::UnixListener;
 
     // Stable snapshots must preserve a real alarm. An operation may explain a
     // transitional ruleset; a completed rebuild instead requires fresh checks.
@@ -882,7 +934,7 @@ fn hung_check_keeps_real_ruleset_violations_and_retries_rebuilt_namespaces() {
         let text = support::site_text(&sys.runner)
             .replace("require_daemon = false", "require_daemon = true");
         let root = Root::with_text(&text, &held);
-        // Make state and both Pings explicitly agree on the applied version.
+        // Make state and all Pings explicitly agree on the applied version.
         let state_path = root.path.join("state.json");
         let mut state: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
@@ -893,8 +945,8 @@ fn hung_check_keeps_real_ruleset_violations_and_retries_rebuilt_namespaces() {
         }
         let (device, inode) = held.identity();
         let listener = UnixListener::bind(root.path.join("control.sock")).unwrap();
-        let worker = std::thread::spawn(move || {
-            let ping = |netns, operation| OpResult::Ping {
+        let ping = |netns, operation| {
+            Ok(OpResult::Ping {
                 last_complete_iteration_age: Some(0),
                 current_iteration_age: None,
                 operation,
@@ -902,55 +954,34 @@ fn hung_check_keeps_real_ruleset_violations_and_retries_rebuilt_namespaces() {
                 version: 1,
                 quarantined: false,
                 selection: Selection::Auto,
-            };
-            let respond = |stream: &mut std::os::unix::net::UnixStream, result| {
-                let request = scupper_sys::daemon::control::read_request(&*stream).unwrap();
-                assert_eq!(request.op, Op::Ping {});
-                serde_json::to_writer(
-                    &mut *stream,
-                    &Response {
-                        request_id: request.request_id,
-                        schema: Schema,
-                        replayed: false,
-                        observed_at: None,
-                        result: Ok(result),
-                    },
-                )
-                .unwrap();
-                stream.write_all(b"\n").unwrap();
-            };
-            let (mut initial, _) = listener.accept().unwrap();
-            respond(
-                &mut initial,
-                ping(
-                    NetnsIdentity {
-                        device: device + u64::from(device_changed),
-                        inode: inode + u64::from(inode_changed),
-                    },
-                    None,
-                ),
-            );
-            let (hung, _) = listener.accept().unwrap();
-            let request = scupper_sys::daemon::control::read_request(&hung).unwrap();
-            assert_eq!(request.op, Op::Check {});
-            // Keep Check open while serving the final Ping independently.
-            let final_operation = operation.then_some(OperationProgress {
-                kind: OperationKind::Rebuild,
-                from: 1,
-                to: 1,
-                age: 1,
-            });
-            let (mut final_ping, _) = listener.accept().unwrap();
-            respond(
-                &mut final_ping,
-                ping(NetnsIdentity { device, inode }, final_operation),
-            );
-            if (device_changed || inode_changed) && violation {
-                let (mut repeated, _) = listener.accept().unwrap();
-                respond(&mut repeated, ping(NetnsIdentity { device, inode }, None));
-            }
-            drop(hung);
+            })
+        };
+        let initial_netns = NetnsIdentity {
+            device: device + u64::from(device_changed),
+            inode: inode + u64::from(inode_changed),
+        };
+        let final_netns = NetnsIdentity { device, inode };
+        let final_operation = operation.then_some(OperationProgress {
+            kind: OperationKind::Rebuild,
+            from: 1,
+            to: 1,
+            age: 1,
         });
+        // A failed Check leaves time to refresh supervision both before
+        // local observations and after a possible namespace transition.
+        let mut results = vec![
+            ping(initial_netns, None),
+            Err(ApiError {
+                code: ApiErrorCode::Internal,
+                observation: None,
+            }),
+            ping(initial_netns, None),
+            ping(final_netns, final_operation),
+        ];
+        if (device_changed || inode_changed) && violation {
+            results.push(ping(final_netns, None));
+        }
+        let worker = serve_sequence(listener, results);
         let (code, out, err) = run(&sys, &root, &["check", "--json"]);
         assert_eq!(code, expected, "{out}: {err}");
         let report: serde_json::Value = serde_json::from_str(&out).unwrap();

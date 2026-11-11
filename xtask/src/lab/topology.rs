@@ -554,7 +554,7 @@ impl Lab {
         let stem = case.name();
         let mut markers = Vec::new();
         let fault = (|| {
-            self.capture("wan", A.gwhost.wan_if, stem)?;
+            self.capture_uplink(stem)?;
             self.service_check(&mut markers)?;
             match case {
                 Case::Meta => fail("meta trial requires direct selection"),
