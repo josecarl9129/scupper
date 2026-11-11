@@ -132,7 +132,8 @@ fn secret_permissions_ownership_and_https() {
         "http://heartbeat.invalid/check",
         "https://user@heartbeat.invalid/check",
         "https://heartbeat.invalid/#bad",
-        "https://heartbeat.invalid/check\n",
+        "https://heartbeat.invalid/check\n\n",
+        "https://heartbeat.invalid/check\r\n",
     ] {
         temp.write(url);
         assert!(matches!(
@@ -140,7 +141,7 @@ fn secret_permissions_ownership_and_https() {
             Err(Failure::Secret)
         ));
     }
-    temp.write("https://heartbeat.invalid/check?key=private");
+    temp.write("https://heartbeat.invalid/check?key=private\n");
     let url = resolve(&temp.0, &reference(), "/3", uid).unwrap();
     assert_eq!(
         url.expose(),

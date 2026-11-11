@@ -19,6 +19,28 @@ use std::{
 };
 
 #[test]
+fn lab_account_preflight_refuses_users_and_groups_without_claiming_them() {
+    let passwd = "root:x:0:0:root:/root:/bin/bash\n";
+    let group = "root:x:0:\n";
+    super::refuse_lab_accounts(passwd, group).unwrap();
+    for account in super::LAB_ACCOUNTS {
+        for (users, groups) in [
+            (
+                format!("{passwd}{account}:x:991:991::/nonexistent:/usr/sbin/nologin\n"),
+                group.into(),
+            ),
+            (passwd.into(), format!("{group}{account}:x:991:\n")),
+        ] {
+            let error = super::refuse_lab_accounts(&users, &groups).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("refusing occupied {account} lab account/group")
+            );
+        }
+    }
+}
+
+#[test]
 fn address_table_is_disjoint_and_restricted() {
     let mut networks: Vec<IpNet> = A.segments().map(|s| s.network.parse().unwrap()).to_vec();
     networks.extend(

@@ -29,7 +29,7 @@ pub(super) fn short_boot_root(case: &str) -> std::path::PathBuf {
     Path::new("/run/scupper-lab").join(format!("{}-{case}", std::process::id()))
 }
 
-pub(super) const CASES: [&str; 30] = [
+pub(super) const CASES: [&str; 31] = [
     "L1",
     "L2",
     "L5",
@@ -54,6 +54,7 @@ pub(super) const CASES: [&str; 30] = [
     "L4",
     "L10",
     "L53",
+    "L53b",
     "heartbeat",
     "L14",
     "L43",
@@ -176,7 +177,7 @@ struct DaemonGuard<'a> {
 impl DaemonGuard<'_> {
     #[allow(clippy::too_many_lines)] // Keep start/restart continuity and fault cleanup ordering together.
     fn run(&mut self, case: &str) -> Result<String> {
-        if matches!(case, "L53" | "heartbeat") {
+        if matches!(case, "L53" | "L53b" | "heartbeat") {
             return self.run_heartbeat(case);
         }
         if m2_cases::is_m2(case) {
@@ -390,6 +391,7 @@ impl DaemonGuard<'_> {
         } else {
             Ok(())
         };
+        self.lab.runner.probe_ca = None;
         let captures = self.lab.stop_captures();
         // Absent resources are fine. Verify the baseline after ordered boot.
         for (ns, program, args) in [
@@ -407,6 +409,11 @@ impl DaemonGuard<'_> {
             ("gwhost", "ip", vec!["link", "del", "foreign-host"]),
             ("gwhost", "ip", vec!["link", "del", "foreign0"]),
             ("gwhost", "tc", vec!["qdisc", "del", "dev", "eth0", "root"]),
+            (
+                "gwhost",
+                "nft",
+                vec!["delete", "table", "inet", "scupper_hb_test"],
+            ),
             ("wan", "ip", vec!["route", "del", "198.51.100.10/32"]),
             (
                 "internet",
@@ -860,17 +867,26 @@ impl Lab {
     fn daemon_spawn(&mut self, case: &str, root: &Path, stage: &str) -> Result<Group> {
         let daemon = Self::boot_binary()?.with_file_name("scupperd");
         let env = format!("NOTIFY_SOCKET={}", self.daemon_notify_path(case)?.display());
+        let mut invocation = Invocation::new(
+            "gwhost",
+            "env",
+            &[
+                &env,
+                daemon.to_str().ok_or("daemon path")?,
+                "--test-root",
+                root.to_str().ok_or("root path")?,
+            ],
+        );
+        if matches!(case, "L10" | "L53" | "L53b" | "heartbeat") {
+            // Apply the existing executable overlay first, then carry the
+            // copied host accounts and fixture hosts into the daemon and its children.
+            if let Some(fixture) = &self.runner.wg_fixture {
+                invocation = super::transport::overlay(&invocation, fixture);
+            }
+            invocation = heartbeat::overlay(&invocation, root);
+        }
         self.runner.background(
-            &Invocation::new(
-                "gwhost",
-                "env",
-                &[
-                    &env,
-                    daemon.to_str().ok_or("daemon path")?,
-                    "--test-root",
-                    root.to_str().ok_or("root path")?,
-                ],
-            ),
+            &invocation,
             &self.artifacts.join(format!("daemon-{case}/{stage}.stdout")),
         )
     }
@@ -1929,9 +1945,14 @@ pub(super) fn daemon_wanted(case: &str) -> &'static str {
         "L10" => {
             "SIGKILL/SIGSTOP: check 5, traffic continues, heartbeat stops; SIGCONT resumes heartbeat"
         }
-        "L53" => "orphan delivery on delayed host uplink: no ClientHello after verdict deadline",
+        "L53" => {
+            "orphan survives to deadline after TLS handshake and blocked GET; no late TCP payload"
+        }
+        "L53b" => {
+            "stopped child remains alive past deadline; blocked GET never retransmits after drop removal"
+        }
         "heartbeat" => {
-            "healthy heartbeat control, failing ok_only suppression, status code suffixes 0-4 and never 5"
+            "healthy cadence control, failing ok_only suppression, parent status suffix evidence /0, /3, /4 (resolve unit test covers request path)"
         }
         "L14" => "disconnect verifies closure; check 4 across reboot; connect restores 0",
         "L43" => {

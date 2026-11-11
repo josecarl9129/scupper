@@ -43,12 +43,14 @@ pub(super) fn catalog() -> Vec<Spec> {
     let mut cases = Vec::new();
     for id in super::daemon::CASES {
         let seconds = match id {
-            "L3" | "L16" | "L9-host-link" | "L10" => 240,
+            "L3" | "L16" | "L9-host-link" => 240,
+            "L10" => 420,
             "L9" => 900,
             "L9b" => 720,
-            "L44" | "L50" | "L11" | "L53" => 180,
+            "L44" | "L50" | "L11" | "L53" | "L53b" => 180,
             "L43" => 150,
-            "L20" | "heartbeat" => 120,
+            "L20" => 120,
+            "heartbeat" => 300,
             _ => 60,
         };
         cases.push(Spec {
@@ -270,6 +272,7 @@ mod tests {
             "daemon-L52",
             "daemon-L52b",
             "daemon-L53",
+            "daemon-L53b",
             "daemon-heartbeat",
             "daemon-V03",
             "baseline",

@@ -11,7 +11,7 @@ pub const DELIVERY_WINDOW: Duration = Duration::from_secs(30);
 /// A completed scheduler iteration with its independent fresh check result.
 #[derive(Debug, Clone, Copy)]
 pub struct CompleteIteration {
-    /// Monotonic verdict time, not the time the delivery was queued.
+    /// Monotonic check start: the oldest observation used by the verdict.
     pub at: MonoTime,
     /// A fresh staged check ran for this iteration, without cached stages.
     pub full_fresh_check: bool,
@@ -72,8 +72,8 @@ pub fn decide(
         return Decision::Skip(SkipReason::NotHealthy);
     }
     let interval = settings.interval.duration().unwrap_or(Duration::MAX);
-    let deadline = iteration.at.after(DELIVERY_WINDOW);
-    if now < iteration.at || now >= deadline || now.elapsed_since(iteration.at) > interval {
+    let deadline = iteration.at.after(DELIVERY_WINDOW.min(interval));
+    if now < iteration.at || now >= deadline {
         return Decision::Skip(SkipReason::Stale);
     }
     if last_send.is_some_and(|last| now < last || now.elapsed_since(last) < interval) {
@@ -171,6 +171,26 @@ mod tests {
                 iteration,
                 None
             ),
+            Decision::Skip(SkipReason::Stale)
+        );
+    }
+    #[test]
+    fn interval_bounds_deadline_without_an_extra_age_gate() {
+        let iteration = Some(CompleteIteration {
+            at: at(100),
+            full_fresh_check: true,
+            code: 0,
+        });
+        let cfg = settings(HeartbeatReport::OkOnly, 10);
+        assert_eq!(
+            decide(&cfg, at(106), iteration, None),
+            Decision::Send {
+                url_suffix: String::new(),
+                deadline: at(110)
+            }
+        );
+        assert_eq!(
+            decide(&cfg, at(110), iteration, None),
             Decision::Skip(SkipReason::Stale)
         );
     }

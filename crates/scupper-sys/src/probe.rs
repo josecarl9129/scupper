@@ -162,7 +162,7 @@ pub(crate) mod linux {
         address: Ipv4Addr,
         deadline: Instant,
     ) -> Probe<Vec<u8>> {
-        exchange(socket, target, address, deadline, false)
+        exchange(socket, target, address, deadline, false, &|| Ok(()))
     }
 
     // Heartbeats need only the status line/headers, not an IP response body.
@@ -171,8 +171,9 @@ pub(crate) mod linux {
         target: &Target,
         address: Ipv4Addr,
         deadline: Instant,
+        before_request: &dyn Fn() -> Probe<()>,
     ) -> Probe<Vec<u8>> {
-        exchange(socket, target, address, deadline, true)
+        exchange(socket, target, address, deadline, true, before_request)
     }
 
     fn exchange(
@@ -181,6 +182,7 @@ pub(crate) mod linux {
         address: Ipv4Addr,
         deadline: Instant,
         status_only: bool,
+        before_request: &dyn Fn() -> Probe<()>,
     ) -> Probe<Vec<u8>> {
         remaining(deadline)?;
         socket
@@ -192,6 +194,7 @@ pub(crate) mod linux {
         let stream = DeadlineStream {
             stream: socket.into(),
             deadline,
+            abort_at_deadline: status_only,
         };
         stream
             .set_timeouts()
@@ -234,6 +237,7 @@ pub(crate) mod linux {
                 .complete_io(&mut tls.sock)
                 .map_err(|error| io_failure(IoOperation::Path, &error))?;
         }
+        before_request()?;
         write_request(&mut tls, target, deadline)?;
         let mut bytes = Vec::new();
         let mut buffer = [0; 2048];
@@ -277,12 +281,23 @@ pub(crate) mod linux {
     struct DeadlineStream {
         stream: TcpStream,
         deadline: Instant,
+        abort_at_deadline: bool,
     }
 
     impl DeadlineStream {
         fn set_timeouts(&self) -> io::Result<()> {
             let timeout =
                 remaining(self.deadline).map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?;
+            if self.abort_at_deadline {
+                // Refresh before every syscall, including each TLS flight: the
+                // kernel timeout must shrink with the verdict's remaining life.
+                let millis = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+                if millis == 0 {
+                    return Err(io::Error::from(io::ErrorKind::TimedOut));
+                }
+                socket2::SockRef::from(&self.stream)
+                    .set_tcp_user_timeout(Some(std::time::Duration::from_millis(millis)))?;
+            }
             self.stream.set_read_timeout(Some(timeout))?;
             self.stream.set_write_timeout(Some(timeout))
         }
@@ -320,6 +335,7 @@ pub(crate) mod linux {
                 &target,
                 Ipv4Addr::LOCALHOST,
                 Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+                &|| Ok(()),
             );
             assert!(matches!(result, Err(ProbeError::Timeout)));
         }

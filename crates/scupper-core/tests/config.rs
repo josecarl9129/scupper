@@ -1801,3 +1801,15 @@ fn key_lint_catches_embedded_unpadded_and_url_safe_base64() {
         }
     }
 }
+
+#[test]
+#[allow(clippy::unwrap_used)]
+fn heartbeat_interval_bounds() {
+    for (value, valid) in [("9s", false), ("10s", true), ("1h", true), ("3601s", false)] {
+        let cfg =
+            parse_site(&FIXTURE.replace("interval = \"60s\"", &format!("interval = \"{value}\"")))
+                .unwrap();
+        let result = validate(cfg);
+        assert_eq!(result.is_ok(), valid, "{value}: {result:?}");
+    }
+}

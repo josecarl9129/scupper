@@ -795,6 +795,40 @@ pub(crate) fn observe(bytes: &[u8]) -> Result<Vec<Observed>, Error> {
     Ok(observed)
 }
 
+/// Extract every outbound TCP payload timestamp for the heartbeat endpoint.
+/// # Errors
+/// Rejects malformed captures or endpoint traffic from a non-host source.
+pub fn heartbeat_payloads(
+    bytes: &[u8],
+    host: IpAddr,
+    endpoint: SocketAddr,
+) -> Result<Vec<Timestamp>, Error> {
+    let mut times = Vec::new();
+    for packet in observe(bytes)? {
+        if packet.protocol != 6 || packet.destination != endpoint.ip() || packet.payload.len() < 20
+        {
+            continue;
+        }
+        if u16::from_be_bytes([packet.payload[2], packet.payload[3]]) != endpoint.port() {
+            continue;
+        }
+        let offset = usize::from(packet.payload[12] >> 4) * 4;
+        let payload = packet
+            .payload
+            .get(offset..)
+            .ok_or_else(|| Error::Capture("heartbeat TCP header".into()))?;
+        if !payload.is_empty() {
+            if packet.source != host {
+                return Err(Error::Capture(
+                    "heartbeat payload from non-host source".into(),
+                ));
+            }
+            times.push(packet.timestamp);
+        }
+    }
+    Ok(times)
+}
+
 /// Extract outbound heartbeat `ClientHello` timestamps for one configured endpoint.
 /// The host uplink source must match exactly; namespace/client sources fail.
 ///

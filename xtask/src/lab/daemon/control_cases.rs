@@ -527,7 +527,7 @@ impl DaemonGuard<'_> {
         let (text, _) = store.read(state.applied_version.ok_or("missing applied version")?)?;
         let mut site = parse_site(&text)?;
         site.health.require_daemon = true;
-        if matches!(self.case.as_str(), "L10" | "L53" | "heartbeat") {
+        if matches!(self.case.as_str(), "L10" | "L53" | "L53b" | "heartbeat") {
             Self::heartbeat_fixture(root, &mut site)?;
         }
         let text = toml::to_string(&site)?;
@@ -562,13 +562,16 @@ impl DaemonGuard<'_> {
     }
     pub(super) fn reset_control_fixture(&mut self) -> Result<()> {
         let root = self.lab.boot_root.clone();
+        let _ = fs::remove_file(root.join("heartbeat-request-pause"));
         for marker in [
             "crash-after-selection",
             "pause-apply",
             "apply-paused",
             "incomplete-tick",
             "heartbeat-pause",
+            "heartbeat-request-pause",
             "heartbeat-status",
+            "heartbeat-test-code",
         ] {
             let _ = fs::remove_file(root.join("run/scupper").join(marker));
         }
@@ -672,9 +675,10 @@ impl DaemonGuard<'_> {
         match case {
             "L10" => {
                 self.wait_heartbeat(0)?;
+                self.heartbeat_cadence_control()?;
                 let marker = Lab::marker()?;
                 markers.push(marker.clone());
-                let mut flow = self.lab.daemon_flow("udp", "client", &marker, &stem, 90)?;
+                let mut flow = self.lab.daemon_flow("udp", "client", &marker, &stem, 360)?;
                 let path = self.lab.artifacts.join(format!("{stem}-udp.jsonl"));
                 self.lab
                     .daemon_wait("L10 canary control", Duration::from_secs(5), |_| {
@@ -691,6 +695,7 @@ impl DaemonGuard<'_> {
                 fs::remove_file(root.join("run/scupper/incomplete-tick"))?;
                 self.lab.runner.dwell(Duration::from_secs(3))?;
                 self.expect_check(&root, 0, None, "fresh-again")?;
+                self.heartbeat_cadence_control()?;
                 self.child
                     .as_ref()
                     .ok_or("daemon missing")?
@@ -716,6 +721,7 @@ impl DaemonGuard<'_> {
                     .signal(Signal::CONT);
                 self.expect_check(&root, 0, None, "continued")?;
                 self.wait_heartbeat(heartbeat_before)?;
+                self.heartbeat_cadence_control()?;
                 self.control_stop(Signal::KILL)?;
                 let before = flow_counts(&path)?.1;
                 self.expect_check(&root, 5, None, "killed")?;

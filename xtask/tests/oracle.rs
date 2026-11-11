@@ -1648,3 +1648,28 @@ fn heartbeat_allowance_is_only_one_host_https_tuple() {
         assert!(Policy::from_toml(&format!("heartbeat = {endpoint:?}\n{POLICY}")).is_err());
     }
 }
+
+#[test]
+fn heartbeat_deadline_oracle_detects_application_data_without_client_hello() {
+    let application = b"\x17\x03\x03\x00\x06opaque";
+    let packets = [
+        ip4(LOCAL, PEER, 6, &tcp(40123, 443, application)),
+        ip4(LOCAL, PEER, 6, &tcp(40123, 443, b"")),
+        ip4(PEER, LOCAL, 6, &tcp(443, 40123, application)),
+    ];
+    let bytes = capture(101, &packets);
+    let host = Ipv4Addr::from(LOCAL).into();
+    let endpoint = "198.51.100.2:443".parse().unwrap();
+    assert!(
+        xtask::pcap::heartbeat_hellos(&bytes, host, endpoint)
+            .unwrap()
+            .is_empty()
+    );
+    let payloads = xtask::pcap::heartbeat_payloads(&bytes, host, endpoint).unwrap();
+    assert_eq!(payloads.len(), 1);
+    let late_deadline = &payloads[0];
+    assert!(payloads.iter().any(|time| (time.seconds, time.nanoseconds)
+        >= (late_deadline.seconds, late_deadline.nanoseconds)));
+    let wrong_source = capture(101, &[ip4(CLIENT, PEER, 6, &tcp(40123, 443, application))]);
+    assert!(xtask::pcap::heartbeat_payloads(&wrong_source, host, endpoint).is_err());
+}

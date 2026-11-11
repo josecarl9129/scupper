@@ -24,7 +24,16 @@ fn child(input: &[u8]) -> std::process::Output {
 fn expired_stdin_job_exits_without_resolution_or_output() {
     let input = br#"{"url":"https://heartbeat.invalid/private-check","deadline_ns":0}"#;
     let result = child(input);
-    assert_eq!(result.status.code(), Some(21));
+    // An unprivileged test runner cannot clear inherited supplementary groups;
+    // the strengthened child must reject that launch before parsing stdin.
+    let expected = if rustix::process::geteuid().is_root()
+        || rustix::process::getgroups().unwrap().is_empty()
+    {
+        21
+    } else {
+        22
+    };
+    assert_eq!(result.status.code(), Some(expected));
     assert_eq!(result.stdout, [] as [u8; 0]);
     assert_eq!(result.stderr, [] as [u8; 0]);
 }

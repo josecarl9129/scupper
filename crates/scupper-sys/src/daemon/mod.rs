@@ -664,6 +664,13 @@ impl Runtime<'_> {
             } else {
                 Vec::new()
             };
+            if !dry_run
+                && !self
+                    .heartbeat
+                    .drain_checks(Instant::now() + Duration::from_secs(20))
+            {
+                return Err(control::api(ApiErrorCode::Timeout));
+            }
             if !dry_run {
                 self.begin_operation(scupper_proto::OperationKind::Apply, target);
             }
@@ -887,6 +894,13 @@ impl DaemonDeps for Runtime<'_> {
             .with_uplink(uplink_addresses(self.system).unwrap_or_default());
     }
     fn rebuild(&mut self) {
+        if !self
+            .heartbeat
+            .drain_checks(Instant::now() + Duration::from_secs(20))
+        {
+            self.heartbeat_failed_deadline();
+            return;
+        }
         self.begin_operation(scupper_proto::OperationKind::Rebuild, None);
         let deps = self.deps();
         let report = if let Some((machine, _, _)) = &mut self.running {

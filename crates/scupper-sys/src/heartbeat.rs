@@ -68,6 +68,9 @@ impl SecretUrl {
 pub struct Request {
     url: String,
     deadline_ns: u64,
+    #[cfg(feature = "testing")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) test_hold: Option<std::path::PathBuf>,
 }
 impl Drop for Request {
     fn drop(&mut self) {
@@ -79,7 +82,7 @@ impl fmt::Debug for Request {
         f.debug_struct("HeartbeatRequest")
             .field("url", &"[redacted]")
             .field("deadline_ns", &self.deadline_ns)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 impl Request {
@@ -95,6 +98,8 @@ impl Request {
         Ok(Self {
             url: url.into(),
             deadline_ns,
+            #[cfg(feature = "testing")]
+            test_hold: None,
         })
     }
     /// Parse a bounded stdin message. No parser diagnostics escape this boundary.
@@ -110,7 +115,8 @@ impl Request {
             return Err(Failure::Internal);
         }
         let request: Self = serde_json::from_slice(&bytes).map_err(|_| Failure::Internal)?;
-        Self::new(&request.url, request.deadline_ns)
+        Self::new(&request.url, request.deadline_ns)?;
+        Ok(request)
     }
     /// Serialize secret bytes for stdin only.
     /// # Errors
@@ -137,6 +143,7 @@ impl Request {
 }
 
 /// Absolute `CLOCK_MONOTONIC` nanoseconds, shared by parent and child across exec.
+/// Assumes the same time namespace; this clock excludes system suspend (§13).
 #[must_use]
 pub fn monotonic_ns() -> u64 {
     let time = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
@@ -164,11 +171,39 @@ pub fn child(input: impl Read) -> Result<(), Failure> {
     rustix::thread::set_no_new_privs(true).map_err(|_| Failure::Internal)?;
     rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
         .map_err(|_| Failure::Internal)?;
+    let credentials = std::fs::read_to_string("/proc/self/status").map_err(|_| Failure::Account)?;
+    verify_credentials(&credentials)?;
     let request = Request::read(input)?;
     deliver(&request)
 }
+fn verify_credentials(status: &str) -> Result<(), Failure> {
+    let field = |key: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(key))
+            .ok_or(Failure::Account)
+    };
+    for key in ["Uid:", "Gid:"] {
+        let ids = field(key)?
+            .split_whitespace()
+            .map(str::parse::<u32>)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| Failure::Account)?;
+        if ids.len() != 4 || ids.iter().any(|id| *id == 0 || *id == u32::MAX) {
+            return Err(Failure::Account);
+        }
+    }
+    if !field("Groups:")?.trim().is_empty() || field("NoNewPrivs:")?.trim() != "1" {
+        return Err(Failure::Account);
+    }
+    for key in ["CapInh:", "CapPrm:", "CapEff:", "CapAmb:"] {
+        if u64::from_str_radix(field(key)?.trim(), 16).map_err(|_| Failure::Account)? != 0 {
+            return Err(Failure::Account);
+        }
+    }
+    Ok(())
+}
 fn deliver(request: &Request) -> Result<(), Failure> {
-    use socket2::{Domain, Protocol, Socket, Type};
     let deadline = request.deadline()?;
     let target = Url::new(&request.url).map_err(|_| Failure::Internal)?;
     let target = target.target().map_err(|_| Failure::Internal)?;
@@ -186,18 +221,47 @@ fn deliver(request: &Request) -> Result<(), Failure> {
             .ok_or(Failure::Internal)
     })?;
     request.deadline()?; // before connect, including DNS/exec delays
-    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
-        .map_err(|_| Failure::Internal)?;
-    let bytes = probe::linux::exchange_status_socket(socket, &target, address, deadline).map_err(
-        |error| {
+    let socket = deadline_socket(deadline)?;
+    let before_request = || {
+        #[cfg(feature = "testing")]
+        if let Some(path) = &request.test_hold {
+            std::fs::write(path, b"handshake complete")
+                .map_err(|_| crate::verdict::ProbeError::Timeout)?;
+            while path.exists() {
+                probe::remaining(deadline)?;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        Ok(())
+    };
+    let bytes =
+        probe::linux::exchange_status_socket(socket, &target, address, deadline, &before_request)
+            .map_err(|error| {
             if matches!(error, crate::verdict::ProbeError::Timeout) {
                 Failure::Deadline
             } else {
                 Failure::Internal
             }
-        },
-    )?;
+        })?;
     status(&bytes)
+}
+fn deadline_socket(deadline: Instant) -> Result<socket2::Socket, Failure> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|time| time.as_millis() > 0)
+        .ok_or(Failure::Deadline)?;
+    let remaining =
+        Duration::from_millis(u64::try_from(remaining.as_millis()).map_err(|_| Failure::Internal)?);
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
+        .map_err(|_| Failure::Internal)?;
+    socket
+        .set_linger(Some(Duration::ZERO))
+        .map_err(|_| Failure::Internal)?;
+    socket
+        .set_tcp_user_timeout(Some(remaining))
+        .map_err(|_| Failure::Internal)?;
+    Ok(socket)
 }
 fn resolve_before<T: Send + 'static>(
     deadline: Instant,
@@ -295,16 +359,15 @@ pub fn attempt(binary: &Path, request: &Request, identity: ProbeIdentity) -> Res
     {
         return Err(Failure::Account);
     }
-    let timeout = request
-        .deadline()?
-        .saturating_duration_since(Instant::now())
-        .min(Duration::from_secs(8));
     let mut command = std::process::Command::new(binary);
     command
         .args(["deliver", "heartbeat"])
         .uid(identity.uid)
         .gid(identity.gid);
     let input = request.encode()?;
+    let timeout = request
+        .deadline()?
+        .saturating_duration_since(Instant::now());
     let output = crate::system::execute_input_command(command, &input, timeout).map_err(|e| {
         if matches!(e, crate::system::ExecError::Timeout { .. }) {
             Failure::Deadline
@@ -352,6 +415,29 @@ pub fn retry_deadline(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn child_checks_all_ids_groups_and_live_capabilities() {
+        let status = "Uid: 99 99 99 99\nGid: 98 98 98 98\nGroups:\nCapInh: 0\nCapPrm: 0\nCapEff: 0\nCapAmb: 0\nNoNewPrivs: 1\n";
+        assert_eq!(verify_credentials(status), Ok(()));
+        for bad in [
+            status.replace("99 99 99 99", "99 99 0 99"),
+            status.replace("98 98 98 98", "0 98 98 98"),
+            status.replace("Groups:", "Groups: 98"),
+            status.replace("CapAmb: 0", "CapAmb: 1"),
+            status.replace("NoNewPrivs: 1", "NoNewPrivs: 0"),
+        ] {
+            assert_eq!(verify_credentials(&bad), Err(Failure::Account));
+        }
+    }
+    #[test]
+    fn socket_discards_queued_bytes_and_bounds_unacknowledged_data() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let socket = deadline_socket(deadline).unwrap();
+        assert_eq!(socket.linger().unwrap(), Some(Duration::ZERO));
+        let timeout = socket.tcp_user_timeout().unwrap().unwrap();
+        assert!(timeout > Duration::ZERO && timeout <= Duration::from_secs(5));
+        assert!(deadline_socket(Instant::now()).is_err());
+    }
     #[test]
     fn blocked_resolver_cannot_hold_child_past_deadline() {
         let started = Instant::now();
