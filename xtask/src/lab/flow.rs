@@ -16,6 +16,9 @@ use std::{
 /// Returns invalid mode, setup, or evidence-write errors.
 pub fn flow(mode: &str, address: SocketAddr, marker: &str, log: &Path, seconds: u64) -> Result<()> {
     let mut log = OpenOptions::new().create(true).append(true).open(log)?;
+    if mode == "connect" {
+        return connect_canary(address, marker, &mut log, seconds);
+    }
     if mode == "heartbeat-sink" {
         return heartbeat_sink(address, &mut log, seconds);
     }
@@ -73,6 +76,35 @@ pub fn flow(mode: &str, address: SocketAddr, marker: &str, log: &Path, seconds: 
             log,
             "{}",
             serde_json::json!({"elapsed_ms":start.elapsed().as_millis(),"sent":sent,"received":received,"local":local})
+        )?;
+        log.flush()?;
+        thread::sleep(Duration::from_millis(25));
+    }
+    Ok(())
+}
+
+// Repeated connection attempts let an outage canary run without requiring an
+// already healthy TCP session. Successful connects send the marker in plaintext.
+fn connect_canary(
+    address: SocketAddr,
+    marker: &str,
+    log: &mut std::fs::File,
+    seconds: u64,
+) -> Result<()> {
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(seconds) {
+        let mut sent = 0;
+        let mut received = 0;
+        if let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(250)) {
+            stream.set_write_timeout(Some(Duration::from_millis(250)))?;
+            stream.set_read_timeout(Some(Duration::from_millis(250)))?;
+            sent = stream.write(marker.as_bytes()).unwrap_or(0);
+            received = stream.read(&mut [0; 1024]).unwrap_or(0);
+        }
+        writeln!(
+            log,
+            "{}",
+            serde_json::json!({"elapsed_ms":start.elapsed().as_millis(),"attempted":1,"sent":sent,"received":received})
         )?;
         log.flush()?;
         thread::sleep(Duration::from_millis(25));

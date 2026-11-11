@@ -433,6 +433,7 @@ dependencies = [
 name = "scupper-proto"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "scupper-core",
  "serde",
  "serde_json",

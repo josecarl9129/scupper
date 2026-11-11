@@ -5,9 +5,12 @@ use std::{
     process::{Command, Stdio},
 };
 fn child(input: &[u8]) -> std::process::Output {
+    delivery(input, "heartbeat")
+}
+fn delivery(input: &[u8], kind: &str) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_scupper"));
     command
-        .args(["deliver", "heartbeat"])
+        .args(["deliver", kind])
         .env_clear()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -39,4 +42,25 @@ fn malformed_protocol_is_value_free_and_hidden_from_help() {
         .output()
         .unwrap();
     assert!(!String::from_utf8_lossy(&help.stdout).contains("deliver"));
+}
+
+#[test]
+fn alert_child_rejects_expired_or_injected_requests_without_output() {
+    let expired=br#"{"url":"https://fixture.invalid/private-token","deadline_ns":0,"payload":{"content_type":"application/json","headers":{},"body":"{}"}}"#;
+    let result = delivery(expired, "alert");
+    assert_eq!(result.status.code(), Some(21));
+    assert_eq!(result.stdout, [] as [u8; 0]);
+    assert_eq!(result.stderr, [] as [u8; 0]);
+    let missing = delivery(
+        br#"{"url":"https://fixture.invalid/private-token","deadline_ns":0}"#,
+        "alert",
+    );
+    assert_eq!(missing.status.code(), Some(22));
+    assert_eq!(missing.stdout, [] as [u8; 0]);
+    assert_eq!(missing.stderr, [] as [u8; 0]);
+    let injected=br#"{"url":"https://fixture.invalid/private-token","deadline_ns":0,"payload":{"content_type":"application/json","headers":{"Title":"bad\r\nInjected: secret"},"body":"{}"}}"#;
+    let result = delivery(injected, "alert");
+    assert_eq!(result.status.code(), Some(22));
+    assert_eq!(result.stdout, [] as [u8; 0]);
+    assert_eq!(result.stderr, [] as [u8; 0]);
 }

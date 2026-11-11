@@ -136,6 +136,7 @@ fn every_variant_roundtrips_and_keys_are_private() {
                 "patch",
                 "step",
                 "sink",
+                "active",
                 "dropped",
                 "first_seq",
                 "last_seq",
@@ -266,6 +267,7 @@ fn every_variant_roundtrips_and_keys_are_private() {
         "netns",
         "device",
         "inode",
+        "active",
     ];
     let denied = [
         "dst",

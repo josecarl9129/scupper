@@ -31,21 +31,11 @@ struct Harness {
 impl Harness {
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::var_os("CARGO_TARGET_TMPDIR")
-            .map_or_else(
-                || {
-                    std::path::PathBuf::from(concat!(
-                        env!("CARGO_MANIFEST_DIR"),
-                        "/../../target/tmp"
-                    ))
-                },
-                std::path::PathBuf::from,
-            )
-            .join(format!(
-                "scupper-config-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
+        let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+            "scupper-config-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         fs::create_dir(&path).unwrap();
         fs::create_dir(path.join("etc")).unwrap();
         fs::write(path.join("etc/gateway-id"), "gw1\n").unwrap();
@@ -502,4 +492,139 @@ fn boot_refuses_unresponsive_lease_holder_before_kernel_calls() {
     assert!(error.contains("pid"));
     assert!(h.system.calls.borrow().is_empty());
     assert!(!h.path.join("state").exists());
+}
+
+#[test]
+fn alerts_list_redacts_reference_and_test_requires_sink_without_tty() {
+    let h = Harness::new();
+    let original = fs::read_to_string(h.input()).unwrap();
+    h.text(&format!(
+        r#"{original}
+[alerts.sinks.primary]
+kind = "webhook"
+preset = "telegram"
+min_severity = "critical"
+url_ref = "private-reference"
+"#
+    ));
+    h.load();
+    let (code, out, err) = h.run(&["alerts", "list", "--json"]);
+    assert_eq!(code, 0, "{err}");
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let row = value["sinks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["sink"] == "primary")
+        .unwrap();
+    assert_eq!(row["sink"], "primary");
+    assert_eq!(row["preset"], "telegram");
+    assert_eq!(row["cursor"], 0);
+    for forbidden in ["private-reference", "url_ref", "https://"] {
+        assert!(!out.contains(forbidden));
+    }
+    let (code, _, err) = h.run(&["alerts", "test"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("requires SINK"));
+    let (code, _, err) = h.run(&["alerts", "test", "missing"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("unknown alert sink"));
+    let (code, _, err) = h.run(&["alerts", "test", "primary"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("running scupperd"));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Exercise the real command with correlated daemon and worker receipts.
+fn alerts_test_waits_for_individual_receipt_and_returns_the_real_failure() {
+    use scupper_proto::{OpResult, Response, Schema};
+    use std::{
+        io::Write,
+        os::{fd::AsRawFd, unix::net::UnixListener},
+        time::{Duration, Instant},
+    };
+    for (outcome, expected) in [
+        ("delivered", 0),
+        ("permanent", 1),
+        ("transient", 1),
+        ("rate_limited", 1),
+    ] {
+        let h = Harness::new();
+        let original = fs::read_to_string(h.input()).unwrap();
+        h.text(&format!("{original}\n[alerts.sinks.primary]\nkind = \"ntfy\"\nurl_ref = \"private-reference\"\nmin_severity = \"critical\"\n"));
+        h.load();
+        fs::create_dir_all(h.path.join("run")).unwrap();
+        let directory = fs::File::open(h.path.join("run")).unwrap();
+        let listener = UnixListener::bind(format!(
+            "/proc/self/fd/{}/control.sock",
+            directory.as_raw_fd()
+        ))
+        .unwrap();
+        let tests = h.path.join("state/sinks/primary.tests");
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = scupper_sys::daemon::control::read_request(&stream).unwrap();
+            serde_json::to_writer(
+                &mut stream,
+                &Response {
+                    schema: Schema,
+                    request_id: request.request_id,
+                    replayed: false,
+                    observed_at: None,
+                    result: Ok(OpResult::Ping {
+                        netns: scupper_core::verdict::v2::NetnsIdentity {
+                            device: 1,
+                            inode: 1,
+                        },
+                        last_complete_iteration_age: Some(0),
+                        current_iteration_age: None,
+                        operation: None,
+                        version: 1,
+                        quarantined: false,
+                        selection: scupper_core::verdict::v2::Selection::Auto,
+                    }),
+                },
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(request) = fs::read_dir(&tests)
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Result::ok)
+                    .find(|e| e.path().extension().is_some_and(|s| s == "request"))
+                {
+                    fs::write(request.path().with_extension("outcome"), outcome).unwrap();
+                    break;
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let (code, out, err) = h.run(&["alerts", "test", "primary", "--json"]);
+        worker.join().unwrap();
+        assert_eq!(code, expected, "{out} {err}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&out).unwrap()["outcome"],
+            outcome
+        );
+        assert!(!out.contains("private-reference"));
+    }
+}
+
+#[test]
+fn alerts_list_marks_corrupt_row_and_keeps_other_sinks_visible() {
+    let h = Harness::new();
+    let original = fs::read_to_string(h.input()).unwrap();
+    h.text(&format!("{original}\n[alerts.sinks.broken]\nkind = \"ntfy\"\nurl_ref = \"private-reference\"\nmin_severity = \"critical\"\n[alerts.sinks.healthy]\nkind = \"ntfy\"\nurl_ref = \"private-reference\"\nmin_severity = \"critical\"\n"));
+    h.load();
+    fs::create_dir_all(h.path.join("state/sinks")).unwrap();
+    fs::write(h.path.join("state/sinks/broken.cursor"), "broken").unwrap();
+    let (code, out, err) = h.run(&["alerts", "list", "--json"]);
+    assert_eq!(code, 0, "{err}");
+    let rows = serde_json::from_str::<serde_json::Value>(&out).unwrap();
+    assert_eq!(rows["sinks"][0]["unavailable"], true);
+    assert_eq!(rows["sinks"][1]["unavailable"], false);
 }

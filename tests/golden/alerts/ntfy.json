@@ -1,0 +1,8 @@
+{
+  "content_type": "text/plain; charset=utf-8",
+  "headers": {
+    "Title": "Scupper failing closed",
+    "Priority": "4"
+  },
+  "body": "Scupper failing closed: resolved; severity=critical; seq=42; duration=17s; count=1; suppressed=0"
+}

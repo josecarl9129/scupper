@@ -239,7 +239,7 @@ pub struct Alerts {
 }
 
 /// Supported delivery transports; URLs are always local secret references.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 pub enum AlertSink {
     /// ntfy HTTP notification service.

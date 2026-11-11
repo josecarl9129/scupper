@@ -455,6 +455,7 @@ fn run_notified(
         dispatcher: pending::Dispatcher::default(),
         last_complete: None,
         heartbeat: crate::daemon::heartbeat::Heartbeat::default(),
+        alerts: crate::alerts::Workers::default(),
         snapshot: control::SharedSnapshot::default(),
         cached: None,
     };
@@ -484,6 +485,7 @@ struct Runtime<'a> {
     dispatcher: pending::Dispatcher,
     last_complete: Option<Instant>,
     heartbeat: heartbeat::Heartbeat,
+    alerts: crate::alerts::Workers,
     snapshot: control::SharedSnapshot,
     cached: Option<(
         Instant,
@@ -509,6 +511,23 @@ impl<'a> Runtime<'a> {
     }
 }
 impl Runtime<'_> {
+    fn sync_alerts(&mut self) {
+        if let Some((_, _, config)) = &self.running {
+            #[cfg(feature = "testing")]
+            let owner = self.secret_owner;
+            #[cfg(not(feature = "testing"))]
+            let owner = 0;
+            self.alerts.sync(
+                config.site.sinks(),
+                &self.options.state_root,
+                &self.options.config_root,
+                &self.options.probe_binary,
+                &self.audit.handle(),
+                owner,
+            );
+        }
+    }
+
     fn publish_snapshot(&self) {
         let mut snapshot = self
             .snapshot
@@ -712,6 +731,11 @@ impl Runtime<'_> {
         if matches!(op, Op::RepairClear { .. }) && self.running.is_none() {
             admin::durable_intent(&deps, &op, uid)?;
             let _ = self.audit.handle().emit(
+                EventKind::QuarantineChanged { active: false },
+                Actor::Local { uid },
+                None,
+            );
+            let _ = self.audit.handle().emit(
                 EventKind::AdminAction {
                     reason: if let Op::RepairClear { reason } = &op {
                         reason.clone()
@@ -809,6 +833,7 @@ impl DaemonDeps for Runtime<'_> {
         Runtime::control_requests(self);
     }
     fn started(&mut self) {
+        self.sync_alerts();
         if self.running.is_none() {
             return;
         }
@@ -831,6 +856,7 @@ impl DaemonDeps for Runtime<'_> {
         }
     }
     fn notify(&mut self, iteration: &Iteration) {
+        self.sync_alerts();
         self.snapshot
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -856,6 +882,7 @@ impl DaemonDeps for Runtime<'_> {
         self.heartbeat_iteration(true);
     }
     fn shutdown(&mut self) {
+        self.alerts.stop();
         self.running.take();
         if let Err(error) = self.audit.shutdown() {
             eprintln!("scupperd: event flush: {error}");
@@ -1608,6 +1635,7 @@ pub mod testing {
             dispatcher: pending::Dispatcher::default(),
             last_complete: None,
             heartbeat: crate::daemon::heartbeat::Heartbeat::default(),
+            alerts: crate::alerts::Workers::default(),
             snapshot: control::SharedSnapshot::default(),
             cached: None,
         };

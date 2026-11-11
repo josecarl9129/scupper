@@ -5,6 +5,7 @@
 #[cfg(all(feature = "lab-mutation", not(debug_assertions)))]
 compile_error!("lab-mutation is restricted to debug lab builds");
 
+pub mod alerts;
 pub mod canon;
 pub mod config;
 pub mod dns;

@@ -229,7 +229,7 @@ fn failure_event(failure: Failure) -> EventKind {
     let reason = match failure {
         Failure::Secret => Reason::HeartbeatSecret,
         Failure::Account => Reason::HeartbeatAccount,
-        Failure::Http => Reason::HeartbeatHttp,
+        Failure::Http | Failure::Permanent => Reason::HeartbeatHttp,
         Failure::Deadline => Reason::HeartbeatDeadline,
         Failure::Internal => Reason::ExecutionFailed,
         Failure::Exec => Reason::HeartbeatExec,

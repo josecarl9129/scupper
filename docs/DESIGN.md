@@ -1867,32 +1867,105 @@ healthy verdict is never exported as current. `GET /v1/health` means only
 
 No native SMTP sink.
 
-```rust
-pub struct Alert {
-    pub key: AlertKey,          // FailClosed, Failover, Unprotected, RepairSuppressed, ...
-    pub severity: Severity,     // Info | Warning | Critical
-    pub state: AlertState,      // Firing | Resolved
-    pub seq: u64,               // event that produced it
-    pub title: String,
-    pub body: String,           // built from typed fields only
-}
-pub trait AlertSink: Send {
-    fn name(&self) -> &str;
-    fn deliver(&self, alert: &Alert) -> Result<(), SinkError>;  // runs a `scupper deliver` child, bounded
-}
-pub enum SinkError { Transient(String), Permanent(String) }
-```
+Telegram uses the JSON object `{"text": ...}`. Store the bot token and chat ID
+only in the local secret URL, with path `/bot<token>/sendMessage` and query
+`chat_id=<id>`. The Pushover Message API documentation (checked 2026-11-11)
+requires POST body parameters; a query-only JSON convention is not assumed to
+work. Keep its `token` and `user` in the local secret URL query. Only the exec
+child moves those two parameters into an `application/x-www-form-urlencoded`
+body with `title`, `message`, and `priority`, removing the query from the request
+target. Public payloads, the child protocol excluding its URL, journals, argv,
+environment and diagnostics never contain those credentials. No live service
+credentials are used by the tests.
 
-**Delivery** (ADR 0018): alerts are derived from events already fsynced.
-Each sink has a cursor file `/var/lib/scupper/sinks/<name>.cursor`; a worker
-thread with exponential backoff (5 s → 15 min, give up after 24 h with
-`SinkFailed`). **At least once per sink, in order; duplicates possible after a
-crash.** Delivery goes out of the **host namespace via the uplink**, so the
-most important alert (all exits down) can be delivered when it matters. It
-carries no client data. Rate limits: same `key` coalesces for 10 min (one
-Firing, then one Resolved with duration and count); per-sink token bucket
-(burst 5, refill 1 per 5 min); `Critical` bypasses coalescing but not the
-bucket; suppressed alerts are summarized in the next delivered one.
+The alert projection is an explicit closed table. Raw observations never imply
+an Unprotected verdict. Each Critical condition is an independent state machine:
+duplicate Firing observations while active are ignored, and recovery closes only
+its matching key. An intervening ObservationError neither fires nor resolves it.
+
+| Audit transition | Key | Severity | Lifecycle / matching recovery |
+|---|---|---|---|
+| `FailClosedStarted(NoHealthyExit or PinnedExitDown)` | `fail_closed` | Critical | Firing; `FailClosedEnded` resolves |
+| `FailClosedEnded` | `fail_closed` | Critical | Resolved, only for an active incident |
+| verdict changes to Unprotected (ruleset differs, foreign link/tc hook, peer differs, exit IP equals uplink address) | `unprotected` | Critical | Firing; next Protected verdict resolves |
+| verdict changes to Protected, including after ObservationError | `unprotected` | Critical | Resolved, only for an active incident |
+| quarantine latch set (`QuarantineChanged(true)`; legacy `FailClosedStarted(Quarantined)`) | `quarantine` | Critical | Firing; latch clearing resolves |
+| `QuarantineChanged(false)` after durable clear / verified apply | `quarantine` | Critical | Resolved, only for an active incident |
+| `Failover` | `failover` | Warning | Firing |
+| `Failback` | `failover` | Warning | Resolved |
+| `RepairSuppressed` | `repair_suppressed` | Warning | Firing |
+| successful `Repair` | `repair_suppressed` | Warning | Resolved, only after suppression |
+| `PersistenceFailed` | `persistence` | Warning | Firing |
+| recovered event-log `Boot` | `persistence` | Warning | Resolved |
+| `Flapping` | `flapping` | Warning | Coalesced Firing summary |
+| any `DriftDetected` object/reason, observation errors, probe failures/setup failures, lock timeouts | none | none | Audit only; never Unprotected |
+| administrative disconnect, other verdicts and other audit kinds (including `SinkFailed` / `EventSkipped`) | none | none | No alert; no recursive failure storm |
+| explicit `alerts test` request | `test` | Info | One real attempt, bypassing minimum severity |
+
+Payload keys, states and severities use explicit `snake_case` serialization.
+Resolved duration uses the monotonic incident age (or the known FailClosed
+duration if larger). Critical recoveries use ntfy priority 4 / Pushover priority 0;
+Critical Firing uses priority 5 / 1 respectively.
+
+**Delivery** (ADR 0018): workers start with the daemon and synchronize on every
+iteration, including incomplete iterations. They consume only the event log's
+fsync watermark, keeping per-month byte offsets and doing no reads when that
+watermark has not advanced. Undecodable committed records produce `EventSkipped`
+and advance the scan, without terminating the worker.
+
+Each sink has a versioned durable journal at
+`/var/lib/scupper/sinks/<name>.cursor`, containing scan position, at most 64
+pending notifications, bounded per-key incident state, bucket state and public
+success/failure status. A new or renamed sink starts at the current persistent
+fsync watermark, plus one synthetic Firing for each currently active Critical
+condition. It never delivers historical transitions. Missing cursors have the
+same semantics. A corrupt/unsupported journal is renamed to one bounded
+`.corrupt` slot and rebuilt using those same current-state semantics. Status
+listing marks an unavailable row without failing other rows. Workers supervise
+local I/O failures with exponential backoff, recording `SinkFailed` with
+`AlertPersistence` when possible; the tick thread performs no delivery I/O.
+
+**Ordering and suppression:** delivery is at least once for admitted alerts;
+a crash between delivery and acknowledgement may duplicate one. Order is
+preserved within each key. Among ready keys, Critical precedes non-Critical;
+held non-Critical resolutions never block other keys. Thus Failover → Failback
+(held) → all exits down delivers the Critical before the held Failback. Non-Critical
+incidents coalesce for ten minutes (one immediate Firing, counted Resolved after
+the window; active incidents may repeat once per window). Critical transitions
+bypass that hold, while still deduplicating active incidents.
+
+The per-sink token bucket has burst 5 and refills one token per 300 seconds.
+A refused notification is dropped and counted as suppressed, never delayed for
+a refill. Suppression is summarized by the next admitted notification. Retries
+of an admitted notification consume no further tokens. On queue overflow,
+Critical can displace a non-Critical notification, otherwise the new notification
+is suppressed; the oldest admitted item for each key is retained. The queue and
+journal remain bounded under a storm.
+
+All bucket, coalescing, retry and give-up clocks are monotonic; wall time is for
+display only. Persisted monotonic ages are rebased conservatively if a new clock
+origin precedes the stored origin. Retry backoff is 5 seconds through 15 minutes,
+measured from the failure's completion. Failure lifetime is per sink: after
+24 hours of transient failures, one `SinkFailed(AlertGiveUp)` settles the backlog
+and the sink enters a 15-minute retry cadence until success. Local secret,
+account, exec and protocol failures emit an immediate, specific `SinkFailed`;
+permanent HTTP rejection has its own reason. These also enter the slow cadence,
+without one failure event per queued alert.
+
+Explicit Info tests use unique durable requests and individual receipts, sharing
+the real worker and bucket. The CLI waits up to 60 seconds and returns zero only
+for delivery; permanent/transient/configuration failure, suppression and timeout
+return nonzero with a value-free reason. Concurrent requests cannot overwrite or
+acknowledge each other. Pending requests and retained receipts are capped at 64
+per sink; consumed receipts are removed by the CLI.
+
+The namespace lab checks exact ordered deliveries per sink (allowing only
+adjacent retransmissions of the same sequence), runs client canaries including
+the alert endpoint during all-exits-down, and validates generic, ntfy and
+Telegram wire payloads. Testing builds alone may shorten the coalescing hold;
+the lab uses 120 seconds (a 300-second case estimate and 31-minute shard budget,
+including the unchanged five-minute setup/cleanup allowance) and verifies that the resolution stays held and
+that the Critical arrives during the hold. Production always uses ten minutes.
 
 ### External heartbeat (dead-man switch), M2
 
@@ -2684,7 +2757,7 @@ still execute after a client hangs up because they only tighten policy.
 | Key file missing or wrong mode | that exit cannot come up | load check | exit Down, warning, alert |
 | Clock step | handshake ages wrong | future-timestamp check | warning; probes are clock-independent, no false 0; holds, budgets and deadlines use the monotonic clock |
 | Conntrack table full | new flows fail | `nf_conntrack_count` vs max | 3 (warning), alert; never bypass conntrack |
-| Alert sink down | alerts delayed | sink errors | backoff, cursor; `SinkFailed` after 24 h |
+| Alert sink down | admitted alerts retry; excess alerts suppressed | sink errors | bounded queue, per-sink backoff; specific local failure or give-up event |
 | Heartbeat service down | no dead-man coverage | delivery errors | `HeartbeatFailed` warning |
 | Device token leaked (any process of the Mac user can read it) | from the device's tunnel address: the operational API (status, connect/disconnect, exit selection, low-risk config); no device, exit or alert changes (ADR 0029) | events carry the `Device` actor | rotate over SSH |
 | Edge compromised (for example through a DNS parsing bug) | can assert device principals for the operational set, observe and stop client DNS; cannot make high-risk changes, reach the uplink or host proxy sockets | – | unprivileged, no keys, minimal filesystem view; splitting DNS and API into two processes is an R2 option |

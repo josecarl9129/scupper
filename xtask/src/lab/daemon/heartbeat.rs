@@ -168,7 +168,7 @@ impl DaemonGuard<'_> {
             })?;
         Ok(child)
     }
-    fn start_heartbeat_tls(&mut self) -> Result<Group> {
+    pub(super) fn start_heartbeat_tls(&mut self) -> Result<Group> {
         let tls = self
             .lab
             .private

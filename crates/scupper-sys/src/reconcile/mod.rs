@@ -256,6 +256,7 @@ pub struct Reconciler<K, S, C> {
     probe_rounds: Vec<BTreeMap<ExitId, scupper_core::failover::ProbeOutcome>>,
     actions: Vec<FailoverAction>,
     verdict: Option<VerdictCode>,
+    reported_quarantine: bool,
     forwarding: bool,
     deadline: Option<Instant>,
     // Evidence only: no reservations or debounce are committed by emergency work.
@@ -319,6 +320,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             probe_rounds: vec![],
             actions,
             verdict: None,
+            reported_quarantine: false,
             forwarding: false,
             deadline: None,
             emergency_steps: vec![],
@@ -933,6 +935,15 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         self.run_plan(planned, &desired, guard, report, true);
     }
     fn report_verdict(&mut self, report: &mut TickReport) {
+        let active = self.latch.is_some();
+        if active != self.reported_quarantine {
+            self.emit(
+                EventKind::QuarantineChanged { active },
+                Actor::Daemon,
+                report,
+            );
+            self.reported_quarantine = active;
+        }
         let verdict = if !report.complete {
             VerdictCode::ObservationError
         } else if self.latch.is_some()
@@ -1899,6 +1910,12 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         self.store.write(guard, &state)?;
         self.persisted = state;
         self.latch = transition.latch;
+        let _ = self.log.emit(
+            EventKind::QuarantineChanged { active: false },
+            actor.clone(),
+            self.persisted.applied_version,
+        );
+        self.reported_quarantine = false;
         self.kernel.persisted_latch(None);
         self.kernel.hold_latch(self.latch.as_ref());
         self.budgets = transition.budgets;

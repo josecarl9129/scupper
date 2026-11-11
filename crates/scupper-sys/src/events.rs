@@ -1155,6 +1155,77 @@ pub fn read_since(
     records.into_iter().map(Ok).chain(errors)
 }
 
+/// One incremental audit record, with undecodable complete lines represented explicitly.
+pub enum TailRecord {
+    /// Decoded event.
+    Event(Event),
+    /// Undecodable record's sequence, or zero if its header was also malformed.
+    Skipped(u64),
+}
+/// Per-worker file offsets. Reads only newly appended, committed lines.
+#[derive(Default)]
+pub struct Tail {
+    offsets: std::collections::BTreeMap<PathBuf, u64>,
+}
+impl Tail {
+    /// Read committed records and advance offsets, retaining uncommitted/torn tails.
+    /// # Errors
+    /// Returns local event-log I/O failures, never decoding failures.
+    pub fn read(&mut self, root: &Path, after: u64, upper: u64) -> io::Result<Vec<TailRecord>> {
+        let mut records = Vec::new();
+        let files = monthly_files_for_read(&root.join("events"))?;
+        let mut retained = std::collections::BTreeSet::new();
+        for path in files {
+            let path = path?;
+            retained.insert(path.clone());
+            RealFs.check_target(&path)?;
+            let mut file = OpenOptions::new()
+                .read(true)
+                .custom_flags(
+                    (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK)
+                        .bits()
+                        .cast_signed(),
+                )
+                .open(&path)?;
+            if !file.metadata()?.is_file() {
+                return Err(io::Error::other("event month is not a regular file"));
+            }
+            let offset = self.offsets.entry(path).or_default();
+            if *offset > file.metadata()?.len() {
+                *offset = 0;
+            }
+            file.seek(SeekFrom::Start(*offset))?;
+            let mut reader = BufReader::new(file);
+            let mut line = Vec::new();
+            loop {
+                line.clear();
+                let len = reader.read_until(b'\n', &mut line)?;
+                if len == 0 || !line.ends_with(b"\n") {
+                    break;
+                }
+                let head = serde_json::from_slice::<Head>(&line).ok();
+                if head.as_ref().is_some_and(|h| h.seq > upper) {
+                    break;
+                }
+                *offset += len as u64;
+                if head.as_ref().is_some_and(|h| h.seq <= after) {
+                    continue;
+                }
+                records.push(match serde_json::from_slice::<Event>(&line) {
+                    Ok(event) => TailRecord::Event(event),
+                    Err(_) => TailRecord::Skipped(head.map_or(0, |h| h.seq)),
+                });
+            }
+        }
+        self.offsets.retain(|p, _| retained.contains(p));
+        records.sort_by_key(|r| match r {
+            TailRecord::Event(e) => e.seq,
+            TailRecord::Skipped(seq) => *seq,
+        });
+        Ok(records)
+    }
+}
+
 fn located(path: &Path, position: impl std::fmt::Display, error: &io::Error) -> io::Error {
     io::Error::new(
         error.kind(),

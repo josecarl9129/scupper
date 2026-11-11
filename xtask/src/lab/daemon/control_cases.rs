@@ -655,6 +655,9 @@ impl DaemonGuard<'_> {
         if matches!(self.case.as_str(), "L10" | "L53" | "L53b" | "heartbeat") {
             Self::heartbeat_fixture(root, &mut site)?;
         }
+        if self.case == "alerts" {
+            Self::alerts_fixture(root, &mut site)?;
+        }
         let text = toml::to_string(&site)?;
         self.lab.site = validate(site).map_err(|e| format!("supervised fixture: {e:?}"))?;
         let version = store.commit(

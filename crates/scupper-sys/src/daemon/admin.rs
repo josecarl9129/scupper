@@ -442,6 +442,11 @@ fn apply_inner(
             );
             file.write(guard, &state)
                 .map_err(|_| api(ApiErrorCode::PersistenceUnavailable))?;
+            let _ = log.emit(
+                EventKind::QuarantineChanged { active: false },
+                Actor::Local { uid },
+                Some(target),
+            );
             let _ = log.emit(cleared.event.into(), Actor::Local { uid }, Some(target));
         }
         Ok(())

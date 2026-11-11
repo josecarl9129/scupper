@@ -65,7 +65,14 @@ vocabulary!(
     HeartbeatReset,
     HeartbeatCertificate,
     HeartbeatWorkerLimit,
-    Stale
+    Stale,
+    AlertPermanent,
+    AlertGiveUp,
+    AlertSecret,
+    AlertAccount,
+    AlertExec,
+    AlertInternal,
+    AlertPersistence
 );
 vocabulary!(
     ObjectKind,
@@ -198,6 +205,8 @@ event_kinds! {
     ControlUnavailable { count: u64 = 1 },
     DaemonStarted { version: Release = Release {major: 0, minor: 1, patch: 0} },
     Boot { result: Outcome = Outcome::Recovered, step: StepKind = StepKind::EventLog },
+    QuarantineChanged { active: bool = true },
+    EventSkipped { seq: u64 = 1 },
     SinkFailed { sink: Identifier = Identifier("primary".into()), reason: Reason = Reason::ExecutionFailed },
     HeartbeatFailed { reason: Reason = Reason::EdgeDead },
     HeartbeatSkipped { reason: Reason = Reason::Stale },
@@ -267,10 +276,7 @@ impl From<PlannerEvent> for EventKind {
                 object: ObjectKind::Unknown,
                 reason: Reason::ObservationUnknown,
             },
-            PlannerEvent::IngressQuarantined => Self::FailClosedStarted {
-                reason: Reason::Quarantined,
-                exit: None,
-            },
+            PlannerEvent::IngressQuarantined => Self::QuarantineChanged { active: true },
             PlannerEvent::PersistenceFailed => Self::PersistenceFailed {
                 reason: Reason::StateWrite,
             },
