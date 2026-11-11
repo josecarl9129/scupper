@@ -230,12 +230,27 @@ pub struct Device {
 }
 
 /// Optional alert configuration.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Alerts {
+    /// Qualification grace in seconds, bounded to 1..=300.
+    #[serde(default = "default_alert_grace")]
+    pub fail_closed_grace_seconds: u64,
     /// Named delivery sinks.
     #[serde(default)]
     pub sinks: BTreeMap<String, AlertSink>,
+}
+
+fn default_alert_grace() -> u64 {
+    30
+}
+impl Default for Alerts {
+    fn default() -> Self {
+        Self {
+            fail_closed_grace_seconds: default_alert_grace(),
+            sinks: BTreeMap::new(),
+        }
+    }
 }
 
 /// Supported delivery transports; URLs are always local secret references.

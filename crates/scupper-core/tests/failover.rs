@@ -171,9 +171,6 @@ fn unknown_requires_fresh_handshake_and_three_consecutive_successes() {
         vec![
             FailoverAction::SetRoute(target(&cfg, 0)),
             FailoverAction::NotifyEdge(id(0)),
-            FailoverAction::Emit(FailoverEvent::FailClosedEnded {
-                duration: Duration::from_secs(9)
-            })
         ]
     );
     assert_eq!(machine.fail_closed_since(), None);
@@ -311,7 +308,8 @@ fn health_states(cfg: &FailoverConfig) -> Vec<Failover> {
 
 #[test]
 fn hard_down_from_every_health_state_and_fault_precedence() {
-    let cfg = config(2);
+    let mut cfg = config(2);
+    cfg.fail_closed_grace = Duration::from_secs(1);
     let cases = [
         (
             FailoverInput::Handshakes(BTreeMap::from([(id(0), None)])),
@@ -588,12 +586,7 @@ fn admin_candidates_disconnect_pin_and_immediate_re_evaluation() {
         &cfg,
     );
     assert_eq!(machine.active(), &RouteTarget::Unreachable);
-    assert_eq!(
-        actions,
-        vec![FailoverAction::Emit(FailoverEvent::FailClosedStarted(
-            FailClosedReason::NoHealthyExit
-        ))]
-    );
+    assert_eq!(actions, []);
     fresh(&mut machine, 11, &cfg);
     for now in [11, 11] {
         advance(&mut machine, now, all_probes(&cfg, true), &cfg);
@@ -605,9 +598,6 @@ fn admin_candidates_disconnect_pin_and_immediate_re_evaluation() {
         vec![
             FailoverAction::SetRoute(target(&cfg, 3)),
             FailoverAction::NotifyEdge(id(3)),
-            FailoverAction::Emit(FailoverEvent::FailClosedEnded {
-                duration: Duration::from_secs(3)
-            })
         ]
     );
     advance(
@@ -1264,7 +1254,7 @@ fn startup_restart_and_tick_reconciliation_always_assert_the_desired_route() {
         );
         for now in 1..50 {
             let actions = advance(&mut machine, now, FailoverInput::Tick, &cfg);
-            let expected = if now == 1 && selection != Selection::Disconnected {
+            let expected = if now == 31 && selection != Selection::Disconnected {
                 vec![FailoverAction::Emit(FailoverEvent::FailClosedStarted(
                     machine.fail_closed_reason().unwrap().clone(),
                 ))]
@@ -1291,6 +1281,95 @@ fn startup_restart_and_tick_reconciliation_always_assert_the_desired_route() {
             assert_eq!(machine.desired_route(), &target(&cfg, 0));
         }
     }
+}
+
+#[test]
+fn cold_start_and_connect_qualification_do_not_page_and_real_outage_does() {
+    let cfg = config(1);
+    for connect in [false, true] {
+        let mut machine = Failover::new(
+            at(0),
+            if connect {
+                Selection::Disconnected
+            } else {
+                Selection::Auto
+            },
+            &cfg,
+        )
+        .0;
+        let base = if connect { 100 } else { 0 };
+        let mut events = Vec::new();
+        if connect {
+            events.extend(advance(
+                &mut machine,
+                base,
+                FailoverInput::SelectionChanged(Selection::Auto),
+                &cfg,
+            ));
+        }
+        events.extend(advance(&mut machine, base, handshakes(&cfg, None), &cfg));
+        assert_eq!(machine.fail_closed_alert_state(), None);
+        events.extend(advance(
+            &mut machine,
+            base + 1,
+            handshakes(&cfg, Some(0)),
+            &cfg,
+        ));
+        for offset in [1, 3, 5] {
+            events.extend(advance(
+                &mut machine,
+                base + offset,
+                all_probes(&cfg, true),
+                &cfg,
+            ));
+        }
+        assert_eq!(machine.active(), &target(&cfg, 0));
+        assert_eq!(machine.fail_closed_alert_state(), Some(false));
+        assert!(!events.iter().any(|a| matches!(
+            a,
+            FailoverAction::Emit(
+                FailoverEvent::FailClosedStarted(_) | FailoverEvent::FailClosedEnded { .. }
+            )
+        )));
+        let outage = advance(&mut machine, base + 6, handshakes(&cfg, None), &cfg);
+        assert_eq!(
+            outage
+                .iter()
+                .filter(|a| matches!(a, FailoverAction::Emit(FailoverEvent::FailClosedStarted(_))))
+                .count(),
+            1
+        );
+        assert_eq!(machine.fail_closed_alert_state(), Some(true));
+    }
+}
+#[test]
+fn initial_outage_fires_once_after_configured_grace_and_empty_policy_is_immediate() {
+    for grace in [1, 30, 300] {
+        let mut cfg = config(1);
+        cfg.fail_closed_grace = Duration::from_secs(grace);
+        let mut machine = Failover::new(at(0), Selection::Auto, &cfg).0;
+        for now in 0..=grace {
+            assert_eq!(advance(&mut machine, now, FailoverInput::Tick, &cfg), []);
+        }
+        assert_eq!(
+            advance(&mut machine, grace + 1, FailoverInput::Tick, &cfg),
+            vec![FailoverAction::Emit(FailoverEvent::FailClosedStarted(
+                FailClosedReason::NoHealthyExit
+            ))]
+        );
+        assert_eq!(
+            advance(&mut machine, grace + 2, FailoverInput::Tick, &cfg),
+            []
+        );
+    }
+    let cfg = config(0);
+    let mut machine = Failover::new(at(0), Selection::Auto, &cfg).0;
+    assert_eq!(
+        advance(&mut machine, 0, FailoverInput::Tick, &cfg),
+        vec![FailoverAction::Emit(FailoverEvent::FailClosedStarted(
+            FailClosedReason::NoHealthyExit
+        ))]
+    );
 }
 
 #[derive(Default, Debug)]
@@ -1462,11 +1541,11 @@ fn startup_and_reconnect_into_outage_emit_started_once() {
     };
     assert_eq!(
         started(advance(&mut machine, 30, FailoverInput::Tick, &cfg)),
-        1
+        0
     );
     assert_eq!(
         started(advance(&mut machine, 31, FailoverInput::Tick, &cfg)),
-        0
+        1
     );
     advance(
         &mut machine,
@@ -1481,10 +1560,22 @@ fn startup_and_reconnect_into_outage_emit_started_once() {
             FailoverInput::SelectionChanged(Selection::Auto),
             &cfg
         )),
-        1
+        0
     );
     assert_eq!(
         started(advance(&mut machine, 34, FailoverInput::Tick, &cfg)),
+        0
+    );
+    assert_eq!(
+        started(advance(&mut machine, 63, FailoverInput::Tick, &cfg)),
+        0
+    );
+    assert_eq!(
+        started(advance(&mut machine, 64, FailoverInput::Tick, &cfg)),
+        1
+    );
+    assert_eq!(
+        started(advance(&mut machine, 65, FailoverInput::Tick, &cfg)),
         0
     );
 }

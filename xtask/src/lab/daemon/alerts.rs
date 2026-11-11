@@ -102,10 +102,19 @@ impl DaemonGuard<'_> {
             "alerts: missing {path} {key}/{state}; inspect alerts-sink.jsonl, per-sink cursor, daemon stderr and alerts.pcap"
         ))
     }
+    fn assert_alert_silence(&mut self) -> Result<()> {
+        self.lab.runner.dwell(Duration::from_secs(6))?;
+        match fs::read_to_string(self.lab.artifacts.join("alerts-sink.jsonl")) {
+            Ok(text) if !text.is_empty() => fail("healthy restart or connect delivered an alert"),
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
     fn seed_coalesced_events(root: &Path) -> Result<()> {
         // Seed after the sink cursor exists. The real worker must hold these
         // resolutions against its monotonic clock (120 seconds in this lab).
-        let base = timestamp();
+        let base = timestamp().saturating_sub(30);
         let clock = Arc::new(AtomicU64::new(base));
         let at = clock.clone();
         let log = scupper_sys::events::EventLog::open(
@@ -114,7 +123,7 @@ impl DaemonGuard<'_> {
             move || UnixSeconds(at.load(Ordering::Acquire)),
         )?;
         let id = |name: &str| Identifier::try_from(name.to_owned()).map_err(std::io::Error::other);
-        for (_offset, kind) in [
+        for (offset, kind) in [
             (
                 0,
                 EventKind::Failover {
@@ -146,7 +155,7 @@ impl DaemonGuard<'_> {
                 },
             ),
         ] {
-            clock.store(base, Ordering::Release);
+            clock.store(base.saturating_add(offset), Ordering::Release);
             log.handle.emit(kind, Actor::Daemon, None)?;
         }
         log.handle.flush_blocking(Duration::from_secs(5))?;
@@ -219,10 +228,33 @@ impl DaemonGuard<'_> {
             .daemon_wait("sink cursors", Duration::from_secs(5), |_| {
                 Ok(root.join("var-lib/scupper/sinks/coalesce.cursor").exists())
             })?;
+        self.assert_alert_silence()?;
+        self.control_restart(&root, "clean-restart")?;
+        self.assert_alert_silence()?;
+        for command in ["disconnect", "connect"] {
+            let (code, text) = self.control_command(&root, &[command], command)?;
+            if code != 0 {
+                return fail(format!("healthy {command} failed: {text}"));
+            }
+        }
+        self.lab.daemon_route_healthy(Duration::from_secs(30))?;
+        self.assert_alert_silence()?;
         self.control_stop(Signal::TERM)?;
         Self::seed_coalesced_events(&root)?;
         self.control_restart(&root, "coalescing")?;
         let warning = self.wait_alert("/coalesce", "failover", "firing")?;
+        // Complete the Warning-only phase before inducing repair warnings.
+        // The outage then depends solely on the independent Critical allowance.
+        self.control_stop(Signal::KILL)?;
+        self.control_restart(&root, "coalescing-restart")?;
+        let summary = self.wait_alert("/coalesce", "failover", "resolved")?;
+        if summary["at"].as_f64().ok_or("summary time")?
+            - warning["at"].as_f64().ok_or("warning time")?
+            < 119.0
+            || summary["alert"]["count"] != 2
+        {
+            return fail("coalescing did not hold and count the live incident");
+        }
         // The real exit's encrypted transport fails; the alert path stays on uplink.
         self.lab.runner.input(&Invocation::new("wan","nft",&["-f","-"]),Some(b"table inet daemon_exit_down {\n  chain forward {\n    type filter hook forward priority -100;\n    ip daddr 203.0.113.2 udp dport 51820 drop;\n  }\n}\n"))?;
         // Replace the same public peer in one update to reset its handshake
@@ -271,15 +303,8 @@ impl DaemonGuard<'_> {
         }
         let first_seq = firing["alert"]["seq"].as_u64().ok_or("alert sequence")?;
         let critical = self.wait_alert("/coalesce", "fail_closed", "firing")?;
-        if critical["at"].as_f64().ok_or("critical time")?
-            - warning["at"].as_f64().ok_or("warning time")?
-            >= 120.0
-            || self
-                .alert_records("/coalesce")?
-                .iter()
-                .any(|r| r["alert"]["key"] == "failover" && r["alert"]["state"] == "resolved")
-        {
-            return fail("FailClosed was blocked behind a held Failback");
+        if critical["alert"]["seq"] != firing["alert"]["seq"] {
+            return fail("Critical outage state differed between sinks");
         }
         let marker = super::Lab::marker()?;
         self.lab.fault_markers.push(marker.clone());
@@ -315,14 +340,6 @@ impl DaemonGuard<'_> {
 
         self.control_stop(Signal::KILL)?;
         self.control_restart(&root, "after-delivery")?;
-        let summary = self.wait_alert("/coalesce", "failover", "resolved")?;
-        if summary["at"].as_f64().ok_or("summary time")?
-            - warning["at"].as_f64().ok_or("warning time")?
-            < 119.0
-            || summary["alert"]["count"] != 2
-        {
-            return fail("coalescing did not hold and count the live incident");
-        }
         canary.stop(Signal::TERM)?;
         endpoint_canary.stop(Signal::TERM)?;
         if super::flow_counts(&self.lab.artifacts.join("alerts-canary-udp.jsonl"))?.1 != 0
@@ -381,13 +398,25 @@ impl DaemonGuard<'_> {
                 "/coalesce",
                 vec![
                     ("failover", "firing"),
-                    ("fail_closed", "firing"),
                     ("failover", "resolved"),
+                    ("fail_closed", "firing"),
                     ("fail_closed", "resolved"),
                 ],
             ),
         ] {
-            assert_sequence(&self.alert_records(path)?, &expected)?;
+            let mut rows = self.alert_records(path)?;
+            if path == "/coalesce" {
+                // Repair suppression is a genuine Warning with timing-dependent recovery.
+                // Keep exact ordering for outage and seeded failover keys, and reject
+                // every other Critical instead of depending on Warning counts.
+                if rows.iter().any(|r| {
+                    r["alert"]["key"] != "fail_closed" && r["alert"]["severity"] == "critical"
+                }) {
+                    return fail("unexpected Critical on coalescing sink");
+                }
+                rows.retain(|r| r["alert"]["key"] != "repair_suppressed");
+            }
+            assert_sequence(&rows, &expected)?;
         }
         for path in ["/ntfy", "/telegram"] {
             assert_preset_sequence(&self.alert_records(path)?)?;

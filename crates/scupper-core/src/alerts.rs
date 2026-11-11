@@ -442,7 +442,7 @@ impl Coalescer {
         ready
     }
 }
-/// Per-sink burst five, refill one per 300 seconds, including Critical.
+/// Burst five, refill one per 300 seconds; callers keep separate severity allowances.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenBucket {
     tokens: u64,

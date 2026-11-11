@@ -9,12 +9,15 @@ impl Event {
             EventKind::FailClosedStarted {
                 reason: crate::Reason::NoHealthyExit | crate::Reason::PinnedExitDown,
                 ..
-            } => E::FailClosedStarted,
+            }
+            | EventKind::FailClosedState { closed: true } => E::FailClosedStarted,
             EventKind::FailClosedStarted {
                 reason: crate::Reason::Quarantined,
                 ..
             }
-            | EventKind::QuarantineChanged { active: true } => E::QuarantineSet,
+            | EventKind::QuarantineChanged { active: true }
+            | EventKind::QuarantineState { active: true } => E::QuarantineSet,
+            EventKind::FailClosedState { closed: false } => E::FailClosedEnded(0),
             EventKind::FailClosedEnded { duration } => E::FailClosedEnded(duration.as_secs()),
             EventKind::Failover { .. } => E::Failover,
             EventKind::Failback { .. } => E::Failback,
@@ -31,7 +34,8 @@ impl Event {
                 to: VerdictCode::Protected,
                 ..
             } => E::ProtectionRestored,
-            EventKind::QuarantineChanged { active: false } => E::QuarantineCleared,
+            EventKind::QuarantineChanged { active: false }
+            | EventKind::QuarantineState { active: false } => E::QuarantineCleared,
             EventKind::PersistenceFailed { .. } => E::PersistenceFailed,
             EventKind::Flapping {} => E::Flapping,
             EventKind::Boot {

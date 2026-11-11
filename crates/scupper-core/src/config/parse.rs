@@ -145,7 +145,7 @@ fn fields(shape: &str) -> &'static [(&'static str, &'static str)] {
             ("api_token_sha256", ""),
             ("gateways", ""),
         ],
-        "alerts" => &[("sinks", "map:sink")],
+        "alerts" => &[("sinks", "map:sink"), ("fail_closed_grace_seconds", "")],
         "sink" => &[
             ("kind", ""),
             ("preset", ""),

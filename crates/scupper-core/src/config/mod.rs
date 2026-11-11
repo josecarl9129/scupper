@@ -70,6 +70,7 @@ rules! {
     UnknownUser => "A device must reference an existing user.",
     InvalidEndpoint => "Endpoints must contain a literal IP and port 1–65535.",
     InvalidDnsServer => "DNS servers must be literal IP addresses.",
+    InvalidAlertGrace => "Alert qualification grace must be between 1 and 300 seconds inclusive.",
     InvalidHeartbeatInterval => "Heartbeat interval must be between 10 seconds and 1 hour inclusive.",
     InvalidDuration => "Durations must be positive integer seconds, minutes or hours without overflow.",
     FailoverGraceNotLessThanHandshakeStale => "Failover grace must be less than the stale handshake threshold.",

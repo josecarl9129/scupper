@@ -1888,6 +1888,7 @@ its matching key. An intervening ObservationError neither fires nor resolves it.
 |---|---|---|---|
 | `FailClosedStarted(NoHealthyExit or PinnedExitDown)` | `fail_closed` | Critical | Firing; `FailClosedEnded` resolves |
 | `FailClosedEnded` | `fail_closed` | Critical | Resolved, only for an active incident |
+| startup `FailClosedState` / `QuarantineState` | matching Critical key | Critical | State observation; healthy resolves only an owed Firing |
 | fresh full-check `CheckVerdictChanged` to Unprotected (ruleset differs, foreign link/tc hook, peer differs, exit IP equals uplink address) | `unprotected` | Critical | Firing; next Protected verdict resolves |
 | fresh full-check verdict changes to Protected, including after ObservationError | `unprotected` | Critical | Resolved, only for an active incident |
 | quarantine latch set (`QuarantineChanged(true)`; legacy `FailClosedStarted(Quarantined)`) | `quarantine` | Critical | Firing; latch clearing resolves |
@@ -1907,6 +1908,9 @@ Payload keys, states and severities use explicit `snake_case` serialization.
 Resolved duration uses the monotonic incident age (or the known FailClosed
 duration or audit timestamp difference if larger). Critical recoveries use ntfy priority 4 / Pushover priority 0;
 Critical Firing uses priority 5 / 1 respectively.
+
+Containment drift repaired within a tick may produce only an audit `Repair`,
+without an Unprotected alert, before the next fresh full check (at most 60 seconds).
 
 **Delivery** (ADR 0018): workers start with the daemon and synchronize on every
 iteration, including incomplete iterations. They consume only the event log's
@@ -1929,13 +1933,30 @@ listing marks an unavailable row without failing other rows. Workers supervise
 local I/O failures with exponential backoff, recording `SinkFailed` with
 `AlertPersistence` when possible; the tick thread performs no delivery I/O.
 
-Every Critical Firing has a Resolved on every recovery path, including recovery
-while the quarantine latch is set. On worker startup, current Critical state is
-rebuilt from the durable state transitions rather than inherited from stale local
-incident state. Each key waits for a fresh process-local observation, scanned
-through its committed sequence, before delivery; old open incidents cannot fire
-at startup before the current state is known. Boot and reconnect into a non-administrative outage emit
-`FailClosedStarted` after the first complete failover evaluation.
+A Critical Resolved is owed only when the matching Firing was delivered or
+queued; an absent delivered state means Resolved. A queued Firing may collapse
+to one summarized Resolved while its sink is unavailable. On worker startup,
+Critical state is rebuilt through the incident coalescer and compared per key
+with delivered and genuinely queued state. An unmatched historical recovery
+never creates an obligation. Startup observations use distinct `FailClosedState`
+and `QuarantineState` events; they resolve only incidents already owed, while
+`FailClosedEnded` remains a real transition with measured duration.
+
+Durable queued alerts remain deliverable even if the restarted process never
+observes their key again. Only newly reconstructed historical Firing snapshots
+wait for a fresh process observation (through its committed sequence), and that
+wait is bounded to 120 seconds across worker restarts. A healthy observation
+cancels an unobserved historical snapshot without an unsolicited recovery.
+
+Initial fail-closed qualification after cold start or Disconnected → Auto/Prefer/Pin
+has a grace of 30 seconds, configurable as `alerts.fail_closed_grace_seconds`
+within 1..=300 seconds. The Critical fires once only if qualification remains
+closed strictly beyond this grace, by the next failover tick. An exit that was
+healthy going down, quarantine, and all exits becoming unconfigured bypass
+this grace. Healthy connect and clean restart emit no incident notifications.
+An exit awaiting its first handshake stays Unknown within grace, then qualifies
+from fresh handshake and probe evidence. It never forwards on this allowance alone;
+containment stays closed until qualification succeeds.
 
 **Ordering and suppression:** delivery is at least once for admitted alerts;
 a crash between delivery and acknowledgement may duplicate one. Retained
@@ -1947,14 +1968,16 @@ incidents coalesce for ten minutes (one immediate Firing, counted Resolved after
 the window; active incidents may repeat once per window). Critical transitions
 bypass that hold, while still deduplicating active incidents.
 
-The per-sink token bucket has burst 5 and refills one token per 300 seconds.
-Critical bypasses coalescing but not the bucket: a refusal defers its latest
+Each sink has separate Critical and Warning/Info token buckets, each with burst
+5 and one token refilled per 300 seconds. Warnings cannot consume Critical
+allowance. Critical bypasses coalescing but not its own bucket: a refusal defers its latest
 state, never discards it. Each Critical key retains the latest Firing/Resolved
 state, timestamp, duration and count, plus its last delivered state. Pending
 transitions for a key collapse to that latest state; when it already equals the
 last delivered state no delivery is owed. As tokens become available, owed
 Critical state precedes all non-Critical notifications. Non-Critical refusals are
-dropped and counted. Suppression is summarized by the next admitted notification.
+dropped and counted. Suppression is summarized by the next admitted real notification; explicit tests
+neither carry nor clear that summary.
 Retries consume no further tokens. Queue overflow evicts the oldest non-Critical
 item first. At most one pending state per Critical key keeps the queue and
 journal bounded under a storm, including sink outages and permanent failures.
@@ -1987,8 +2010,11 @@ the alert endpoint during all-exits-down, and validates generic, ntfy and
 Telegram wire payloads. Testing builds alone may shorten the coalescing hold;
 the lab uses 120 seconds (a 300-second case estimate, with the shard self-check
 bound to CI's 60-minute leaktest command timeout and a five-minute setup/cleanup
-allowance) and verifies that the resolution stays held and
-that the Critical arrives during the hold. Production always uses ten minutes.
+allowance). The Warning coalescing/restart phase completes before inducing the
+outage, so repair warnings cannot spend its summary allowance. Outage paths retain
+exact ordered assertions; genuine repair suppression warnings are allowed separately.
+Pure worker tests verify that held resolutions cannot block Critical. Production
+always uses ten minutes.
 
 ### External heartbeat (dead-man switch), M2
 

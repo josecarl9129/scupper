@@ -97,6 +97,9 @@ struct Pending {
     first: Option<u64>,
     attempt: u32,
     retry: u64,
+    // Historical snapshots wait briefly for a fresh observation; real outbox work never does.
+    #[serde(default)]
+    observe_until: Option<u64>,
 }
 impl Pending {
     fn new(alert: Alert) -> Self {
@@ -107,6 +110,7 @@ impl Pending {
             first: None,
             attempt: 0,
             retry: 0,
+            observe_until: None,
         }
     }
 }
@@ -138,8 +142,8 @@ struct Journal {
     suppressed: u64,
     #[serde(default)]
     delivered: BTreeMap<alerts::AlertKey, alerts::AlertState>,
-    #[serde(default)]
-    latest: BTreeMap<alerts::AlertKey, Alert>,
+    #[serde(default = "new_test_bucket")]
+    critical_bucket: TokenBucket,
     #[serde(default = "new_test_bucket")]
     test_bucket: TokenBucket,
     queue: Vec<Pending>,
@@ -163,15 +167,37 @@ impl Journal {
             bucket: TokenBucket::new(at),
             suppressed: 0,
             delivered: BTreeMap::new(),
-            latest: BTreeMap::new(),
+            critical_bucket: TokenBucket::new(at),
             test_bucket: TokenBucket::new(at),
             queue: Vec::new(),
         }
     }
+    fn owes_recovery(&self, key: alerts::AlertKey) -> bool {
+        self.delivered.get(&key) == Some(&alerts::AlertState::Firing)
+            || self
+                .queue
+                .iter()
+                .any(|p| p.alert.key == key && p.observe_until.is_none())
+    }
+    fn observe(&mut self, alert: Alert, at: u64) {
+        if alert.severity == alerts::Severity::Critical
+            && alert.state == alerts::AlertState::Firing
+            && let Some(pending) = self.queue.iter_mut().find(|p| p.alert.key == alert.key)
+        {
+            pending.observe_until = None;
+        }
+        let recovery = alert.severity == alerts::Severity::Critical
+            && alert.state == alerts::AlertState::Resolved
+            && self.owes_recovery(alert.key);
+        let mut ready = self.coalescer.push_at(alert.clone(), at);
+        if recovery && !ready.iter().any(|ready| ready.key == alert.key) {
+            ready.push(alert);
+        }
+        self.enqueue(ready);
+    }
     fn enqueue(&mut self, alerts: Vec<Alert>) {
         for mut alert in alerts {
             if alert.severity == alerts::Severity::Critical {
-                self.latest.insert(alert.key, alert.clone());
                 if let Some(index) = self.queue.iter().position(|p| p.alert.key == alert.key) {
                     let pending = self.queue.remove(index);
                     if pending.alert.seq != alert.seq || pending.alert.state != alert.state {
@@ -180,7 +206,11 @@ impl Journal {
                         alert.count = alert.count.max(pending.alert.count);
                         alert.duration = alert.duration.max(pending.alert.duration);
                     }
-                    if self.delivered.get(&alert.key) != Some(&alert.state) {
+                    if (pending.observe_until.is_none()
+                        || alert.state == alerts::AlertState::Firing
+                        || self.delivered.get(&alert.key) == Some(&alerts::AlertState::Firing))
+                        && self.delivered.get(&alert.key) != Some(&alert.state)
+                    {
                         // Collapsing changes state, not the sink's retry schedule
                         // or the admission already paid for this owed key.
                         let mut replacement = pending;
@@ -189,7 +219,13 @@ impl Journal {
                     }
                     continue;
                 }
-                if self.delivered.get(&alert.key) == Some(&alert.state) {
+                if self
+                    .delivered
+                    .get(&alert.key)
+                    .copied()
+                    .unwrap_or(alerts::AlertState::Resolved)
+                    == alert.state
+                {
                     continue;
                 }
             }
@@ -218,12 +254,16 @@ impl Journal {
         if at < self.clock {
             self.bucket.rebase(self.clock, at);
             self.test_bucket.rebase(self.clock, at);
+            self.critical_bucket.rebase(self.clock, at);
             self.coalescer.rebase(self.clock, at);
             self.failing_since = self
                 .failing_since
                 .map(|t| at.saturating_sub(self.clock.saturating_sub(t)));
             self.retry = at.saturating_add(self.retry.saturating_sub(self.clock));
             for p in &mut self.queue {
+                p.observe_until = p
+                    .observe_until
+                    .map(|until| at.saturating_add(until.saturating_sub(self.clock)));
                 p.first = p
                     .first
                     .map(|t| at.saturating_sub(self.clock.saturating_sub(t)));
@@ -369,9 +409,18 @@ fn step_with_ack(
     if !journal.queue.iter().any(|p| p.test.is_none()) {
         journal.failing_since = None;
     }
+    for pending in &mut journal.queue {
+        if journal
+            .live_keys
+            .as_ref()
+            .is_some_and(|keys| keys.contains(&pending.alert.key))
+        {
+            pending.observe_until = None;
+        }
+    }
     // A retained resolution is local to its key. Skip delayed retries, and
     // prioritize Critical among the first outstanding notification of each key.
-    let alert_token_available = journal.bucket.clone().take(at);
+    let alert_token_available = journal.critical_bucket.clone().take(at);
     let index = journal
         .queue
         .iter()
@@ -386,11 +435,11 @@ fn step_with_ack(
             p.alert.severity != alerts::Severity::Critical || p.admitted || alert_token_available
         })
         .filter(|(_, p)| {
-            p.alert.severity != alerts::Severity::Critical
+            p.observe_until.is_none_or(|until| at >= until)
                 || journal
                     .live_keys
                     .as_ref()
-                    .is_none_or(|keys| keys.contains(&p.alert.key))
+                    .is_some_and(|keys| keys.contains(&p.alert.key))
         })
         .max_by_key(|(i, p)| {
             (
@@ -426,6 +475,8 @@ fn step_with_ack(
     if !journal.queue[index].admitted {
         let allowed = if journal.queue[index].test.is_some() {
             journal.test_bucket.take(at)
+        } else if journal.queue[index].alert.severity == alerts::Severity::Critical {
+            journal.critical_bucket.take(at)
         } else {
             journal.bucket.take(at)
         };
@@ -439,11 +490,19 @@ fn step_with_ack(
             return journal.save(path);
         }
         journal.queue[index].admitted = true;
-        journal.queue[index].alert.suppressed = journal.suppressed;
+        journal.queue[index].alert.suppressed = if journal.queue[index].test.is_none() {
+            journal.suppressed
+        } else {
+            0
+        };
     }
     journal.queue[index].first.get_or_insert(at);
     journal.save(path)?; // durable admission before the first attempt
-    journal.queue[index].alert.suppressed = journal.suppressed;
+    journal.queue[index].alert.suppressed = if journal.queue[index].test.is_none() {
+        journal.suppressed
+    } else {
+        0
+    };
     let result = sink.deliver(&journal.queue[index].alert);
     let completed = completed_at();
     before_ack()?;
@@ -642,8 +701,7 @@ fn scan_events(
                             || event.seq > journal.critical_scanned
                     })
                 {
-                    let ready = journal.coalescer.push_at(alert, monotonic());
-                    journal.enqueue(ready);
+                    journal.observe(alert, monotonic());
                 }
             }
             events::TailRecord::Skipped(seq) => {
@@ -1026,7 +1084,10 @@ fn open_journal(root: &Path, path: &Path, log: &LogHandle) -> io::Result<Journal
                 .alert()
                 .filter(|a| a.severity == alerts::Severity::Critical)
         {
-            latest.insert(alert.key, alert.clone());
+            // An orphan recovery is meaningful only to a sink that already owes it.
+            if alert.state == alerts::AlertState::Resolved && journal.owes_recovery(alert.key) {
+                latest.insert(alert.key, alert.clone());
+            }
             for ready in current.push_at(alert, monotonic()) {
                 latest.insert(ready.key, ready);
             }
@@ -1047,7 +1108,14 @@ fn open_journal(root: &Path, path: &Path, log: &LogHandle) -> io::Result<Journal
     }
     for alert in latest.into_values() {
         if existing || alert.state == alerts::AlertState::Firing {
+            let key = alert.key;
+            let snapshot = alert.state == alerts::AlertState::Firing
+                && !journal.queue.iter().any(|p| p.alert.key == key);
             journal.enqueue(vec![alert]);
+            if snapshot && let Some(pending) = journal.queue.iter_mut().find(|p| p.alert.key == key)
+            {
+                pending.observe_until = Some(monotonic().saturating_add(120));
+            }
         }
     }
     journal.save(path)?;
@@ -1573,7 +1641,7 @@ mod tests {
         let sink = Fake::new(Ok(()));
         let mut j = Journal::new(0);
         for _ in 0..5 {
-            assert!(j.bucket.take(0));
+            assert!(j.critical_bucket.take(0));
         }
         j.enqueue(vec![map(OperationalEvent::FailClosedStarted, 1, 0)]);
         let id = request_test(&t.0, "fixture").unwrap();
@@ -1689,7 +1757,7 @@ mod tests {
         assert_eq!(test_outcome(&t.0, "fixture", &id).unwrap(), None);
     }
     #[test]
-    fn new_sink_and_restarted_worker_wait_for_current_process_state() {
+    fn historical_snapshot_waits_for_observation_without_unmatched_recovery() {
         let t = Temp::new();
         let old = t.log();
         old.handle
@@ -1716,12 +1784,9 @@ mod tests {
             step(&mut j, &t.path(), &sink, &log.handle, monotonic()).unwrap();
             assert!(sink.sent.lock().unwrap().is_empty());
         }
-        let ended = log
-            .handle
+        log.handle
             .emit(
-                EventKind::FailClosedEnded {
-                    duration: Duration::from_secs(90),
-                },
+                EventKind::FailClosedState { closed: false },
                 Actor::Daemon,
                 None,
             )
@@ -1747,7 +1812,7 @@ mod tests {
         scan_events(&mut j, &mut tail, &t.0, &t.path(), &log.handle, &settings).unwrap();
         j.live_keys = Some(log.handle.current_critical_keys(j.scanned));
         step(&mut j, &t.path(), &sink, &log.handle, monotonic()).unwrap();
-        assert_eq!(*sink.sent.lock().unwrap(), vec![ended, started]);
+        assert_eq!(*sink.sent.lock().unwrap(), vec![started]);
     }
     #[test]
     fn critical_retry_and_incident_stats_survive_worker_reconstruction() {
@@ -1768,6 +1833,7 @@ mod tests {
         log.handle.flush_blocking(Duration::from_secs(5)).unwrap();
         let mut j = open_journal(&t.0, &t.path(), &log.handle).unwrap();
         assert_eq!(j.queue[0].alert.count, 2);
+        j.live_keys = Some(log.handle.current_critical_keys(j.critical_scanned));
         let at = monotonic();
         let sink = Fake::new(Err(SinkError::Transient));
         step(&mut j, &t.path(), &sink, &log.handle, at).unwrap();
@@ -1800,7 +1866,7 @@ mod tests {
         let log = t.log();
         let mut j = Journal::new(86400);
         for _ in 0..5 {
-            assert!(j.bucket.take(86400));
+            assert!(j.critical_bucket.take(86400));
         }
         j.enqueue(vec![map(OperationalEvent::FailClosedStarted, 1, 100)]);
         j.save(&t.path()).unwrap();
@@ -1842,6 +1908,126 @@ mod tests {
         j.enqueue(ready);
         step(&mut j, &t.path(), &sink, &log.handle, monotonic()).unwrap();
         assert_eq!(*sink.sent.lock().unwrap(), vec![1, 2]);
+    }
+    #[test]
+    fn owed_recovery_is_not_lost_when_another_key_flushes() {
+        let mut j = Journal::new(0);
+        let _ = j
+            .coalescer
+            .push_at(map(OperationalEvent::Failover, 1, 0), 0);
+        let _ = j
+            .coalescer
+            .push_at(map(OperationalEvent::Failback, 2, 1), 1);
+        j.delivered
+            .insert(alerts::AlertKey::FailClosed, alerts::AlertState::Firing);
+        j.observe(map(OperationalEvent::FailClosedEnded(600), 3, 600), 600);
+        assert_eq!(j.queue.len(), 2);
+        assert!(
+            j.queue
+                .iter()
+                .any(|p| p.alert.key == alerts::AlertKey::FailClosed
+                    && p.alert.state == alerts::AlertState::Resolved)
+        );
+        assert!(
+            j.queue
+                .iter()
+                .any(|p| p.alert.key == alerts::AlertKey::Failover
+                    && p.alert.state == alerts::AlertState::Resolved)
+        );
+    }
+    #[test]
+    fn clean_restart_state_reports_and_orphan_recoveries_deliver_nothing() {
+        let t = Temp::new();
+        let log = t.log();
+        Journal::new(monotonic()).save(&t.path()).unwrap();
+        for kind in [
+            EventKind::FailClosedEnded {
+                duration: Duration::ZERO,
+            },
+            EventKind::QuarantineChanged { active: false },
+            EventKind::FailClosedState { closed: false },
+            EventKind::QuarantineState { active: false },
+        ] {
+            log.handle.emit(kind, Actor::Daemon, None).unwrap();
+        }
+        log.handle.flush_blocking(Duration::from_secs(5)).unwrap();
+        let sink = Fake::new(Ok(()));
+        for _ in 0..3 {
+            let mut j = open_journal(&t.0, &t.path(), &log.handle).unwrap();
+            step(&mut j, &t.path(), &sink, &log.handle, monotonic()).unwrap();
+            assert!(j.queue.is_empty());
+        }
+        assert!(sink.sent.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn durable_owed_state_delivers_without_reobserving_its_key() {
+        for resolved in [false, true] {
+            let t = Temp::new();
+            let log = t.log();
+            let mut j = Journal::new(monotonic());
+            j.enqueue(vec![map(OperationalEvent::Unprotected, 1, 100)]);
+            if resolved {
+                j.enqueue(vec![map(OperationalEvent::ProtectionRestored, 2, 101)]);
+            }
+            j.save(&t.path()).unwrap();
+            let mut j = open_journal(&t.0, &t.path(), &log.handle).unwrap();
+            j.live_keys = Some(std::collections::BTreeSet::new());
+            let sink = Fake::new(Ok(()));
+            step(&mut j, &t.path(), &sink, &log.handle, monotonic()).unwrap();
+            assert_eq!(
+                *sink.sent.lock().unwrap(),
+                vec![if resolved { 2 } else { 1 }]
+            );
+            assert!(j.queue.is_empty());
+        }
+    }
+    #[test]
+    fn historical_snapshot_observation_wait_is_bounded() {
+        let t = Temp::new();
+        let log = t.log();
+        log.handle
+            .emit(
+                EventKind::QuarantineState { active: true },
+                Actor::Daemon,
+                None,
+            )
+            .unwrap();
+        log.handle.flush_blocking(Duration::from_secs(5)).unwrap();
+        let mut j = open_journal(&t.0, &t.path(), &log.handle).unwrap();
+        j.live_keys = Some(std::collections::BTreeSet::new());
+        let until = j.queue[0].observe_until.unwrap();
+        let sink = Fake::new(Ok(()));
+        step(&mut j, &t.path(), &sink, &log.handle, until - 1).unwrap();
+        assert!(sink.sent.lock().unwrap().is_empty());
+        step(&mut j, &t.path(), &sink, &log.handle, until).unwrap();
+        assert_eq!(sink.sent.lock().unwrap().len(), 1);
+    }
+    #[test]
+    fn warning_storm_cannot_spend_critical_allowance_and_tests_keep_suppression() {
+        let t = Temp::new();
+        let log = t.log();
+        let mut j = Journal::new(0);
+        for _ in 0..5 {
+            assert!(j.bucket.take(0));
+        }
+        let sink = Fake::new(Ok(()));
+        j.enqueue(vec![map(OperationalEvent::FailClosedStarted, 1, 100)]);
+        step(&mut j, &t.path(), &sink, &log.handle, 0).unwrap();
+        assert_eq!(*sink.sent.lock().unwrap(), vec![1]);
+        j.suppressed = 7;
+        let id = request_test(&t.0, "fixture").unwrap();
+        ingest_tests(&mut j, &t.path()).unwrap();
+        step(&mut j, &t.path(), &sink, &log.handle, 1).unwrap();
+        assert_eq!(
+            test_outcome(&t.0, "fixture", &id).unwrap().as_deref(),
+            Some("delivered")
+        );
+        assert_eq!(j.suppressed, 7);
+        assert_eq!(sink.suppressed.load(Ordering::Acquire), 0);
+        j.enqueue(vec![map(OperationalEvent::QuarantineSet, 3, 101)]);
+        step(&mut j, &t.path(), &sink, &log.handle, 2).unwrap();
+        assert_eq!(sink.suppressed.load(Ordering::Acquire), 7);
+        assert_eq!(j.suppressed, 0);
     }
     #[test]
     fn memory_log_at_start_waits_without_false_sink_failure() {

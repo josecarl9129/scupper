@@ -1813,3 +1813,16 @@ fn heartbeat_interval_bounds() {
         assert_eq!(result.is_ok(), valid, "{value}: {result:?}");
     }
 }
+
+#[test]
+#[allow(clippy::unwrap_used)]
+fn alert_qualification_grace_defaults_and_bounds() {
+    let text = include_str!("fixtures/site-m2.toml");
+    let cfg = parse_site(text).unwrap();
+    assert_eq!(cfg.alerts.fail_closed_grace_seconds, 30);
+    for seconds in [0, 1, 30, 300, 301] {
+        let mut cfg = cfg.clone();
+        cfg.alerts.fail_closed_grace_seconds = seconds;
+        assert_eq!(validate(cfg).is_ok(), (1..=300).contains(&seconds));
+    }
+}

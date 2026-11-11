@@ -180,6 +180,11 @@ pub fn validate(cfg: SiteConfig) -> Result<ValidatedSite, Vec<ValidationError>> 
     errors.duration(&cfg.policy.min_dwell, "policy.min_dwell");
     health(&cfg, &mut errors);
     devices(&cfg, &mut errors);
+    errors.check(
+        (1..=300).contains(&cfg.alerts.fail_closed_grace_seconds),
+        "alerts.fail_closed_grace_seconds",
+        Rule::InvalidAlertGrace,
+    );
     for (id, sink) in &cfg.alerts.sinks {
         errors.secret(
             sink.url_ref(),

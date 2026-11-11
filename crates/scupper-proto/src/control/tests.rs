@@ -137,6 +137,7 @@ fn every_variant_roundtrips_and_keys_are_private() {
                 "step",
                 "sink",
                 "active",
+                "closed",
                 "dropped",
                 "first_seq",
                 "last_seq",
@@ -268,6 +269,7 @@ fn every_variant_roundtrips_and_keys_are_private() {
         "device",
         "inode",
         "active",
+        "closed",
     ];
     let denied = [
         "dst",

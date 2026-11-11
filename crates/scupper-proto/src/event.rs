@@ -197,6 +197,8 @@ event_kinds! {
     Failover { from: Identifier = Identifier("ch1".into()), to: Identifier = Identifier("ch2".into()), cause: Reason = Reason::HealthFailure },
     Failback { from: Identifier = Identifier("ch2".into()), to: Identifier = Identifier("ch1".into()) },
     FailClosedStarted { reason: Reason = Reason::NoHealthyExit, exit: Option<Identifier> = Some(Identifier("ch1".into())) },
+    FailClosedState { closed: bool = false },
+    QuarantineState { active: bool = false },
     FailClosedEnded { duration: Duration = Duration::from_secs(4) },
     ExitHealthChanged { exit: Identifier = Identifier("ch1".into()), from: Health = Health::Healthy, to: Health = Health::Down },
     DriftDetected { object: ObjectKind = ObjectKind::Ruleset, reason: Reason = Reason::SafetyDrift },

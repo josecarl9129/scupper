@@ -2984,11 +2984,12 @@ fn repair_clear_reopens_forwarding_after_quarantined_restart() {
     let mut recovered = false;
     for _ in 0..4 {
         rig.round(true);
-        recovered |= rig
-            .tick()
-            .events
-            .iter()
-            .any(|event| matches!(event, EventKind::FailClosedEnded { .. }));
+        recovered |= rig.tick().events.iter().any(|event| {
+            matches!(
+                event,
+                EventKind::FailClosedEnded { .. } | EventKind::FailClosedState { closed: false }
+            )
+        });
     }
     assert!(recovered, "exit recovery must be reported while latched");
     assert!(rig.kernel.model().forwarding_off());
@@ -3240,4 +3241,49 @@ fn daemon_full_check_uplink_exit_ip_is_critical_and_probe_failure_is_not() {
     let (_, events) =
         scupper_sys::daemon::testing::protection_alerts(&deps, &sys, &held, &config).unwrap();
     assert_eq!(events, []);
+}
+
+#[test]
+fn healthy_restart_and_connect_state_observations_do_not_create_incidents() {
+    let mut rig = Rig::new();
+    for connect in [false, true] {
+        rig.restart();
+        let mut events = Vec::new();
+        if connect {
+            events.extend(
+                rig.machine()
+                    .set_selection(Selection::Disconnected, Actor::Local { uid: 0 })
+                    .unwrap()
+                    .events,
+            );
+            events.extend(
+                rig.machine()
+                    .set_selection(Selection::Auto, Actor::Local { uid: 0 })
+                    .unwrap()
+                    .events,
+            );
+        }
+        for _ in 0..6 {
+            rig.round(true);
+            events.extend(rig.tick().events);
+        }
+        let mut coalescer = scupper_core::alerts::Coalescer::default();
+        for (seq, kind) in events.into_iter().enumerate() {
+            assert!(
+                !matches!(kind, EventKind::FailClosedEnded { .. }),
+                "healthy qualification is not a recovery"
+            );
+            let event = scupper_proto::Event {
+                seq: seq as u64 + 1,
+                at: UnixSeconds(seq as u64),
+                kind,
+                actor: Actor::Daemon,
+                gateway: scupper_proto::Identifier::try_from("gw1".to_owned()).unwrap(),
+                config_version: None,
+            };
+            if let Some(alert) = event.alert() {
+                assert_eq!(coalescer.push(alert), []);
+            }
+        }
+    }
 }

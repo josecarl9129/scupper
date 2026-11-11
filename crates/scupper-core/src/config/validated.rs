@@ -62,6 +62,11 @@ impl ValidatedSite {
     pub fn heartbeat(&self) -> Option<&HeartbeatSettings> {
         self.config.heartbeat.as_ref()
     }
+    /// Returns the bounded initial qualification grace for fail-closed alerts.
+    #[must_use]
+    pub fn fail_closed_grace(&self) -> Duration {
+        Duration::from_secs(self.config.alerts.fail_closed_grace_seconds)
+    }
     /// Returns the supported alert sinks.
     #[must_use]
     pub fn sinks(&self) -> &BTreeMap<String, AlertSink> {
