@@ -1,7 +1,7 @@
-"""Reproduce the saved old/new tcpdump outputs without root or live traffic.
+"""Reproduce the saved classification records without root or live traffic.
 
-Usage: python3 xtask/tests/fixtures/capture-round3.py /path/to/tcpdump
-Temporary files stay in this directory; only the two output pcaps remain.
+Usage: python3 xtask/tests/fixtures/capture-classification.py /path/to/tcpdump
+Temporary files stay in this directory; only the classification pcap remains.
 """
 
 import ipaddress
@@ -55,17 +55,13 @@ for src, dst, sport, dport, payload in [
 ]:
     packets.append(ethernet(ip4(src, dst, sport, dport, payload), True))
 
-with tempfile.TemporaryDirectory(prefix="capture-round3-", dir=directory) as temporary:
+with tempfile.TemporaryDirectory(prefix="capture-classification-", dir=directory) as temporary:
     source = Path(temporary) / "traffic.pcap"
     data = struct.pack("<IHHIIII", 0xa1b2c3d4, 2, 4, 0, 0, 262144, 1)
     for i, packet in enumerate(packets):
         data += struct.pack("<IIII", 1700000000 + i, 0, len(packet), len(packet)) + packet
     source.write_bytes(data)
-    for name, buffering in [
-        ("capture-round3-old.pcap", ["-U", "--immediate-mode"]),
-        ("capture-round3-new.pcap", ["-B", "16384", "-U", "--immediate-mode"]),
-    ]:
-        subprocess.run([
-            sys.argv[1], "-n", "-Z", "root", *buffering, "-s", "0",
-            "-r", str(source), "-w", str(directory / name),
-        ], check=True)
+    subprocess.run([
+        sys.argv[1], "-n", "-Z", "root", "-U", "--immediate-mode", "-s", "0",
+        "-r", str(source), "-w", str(directory / "capture-classification.pcap"),
+    ], check=True)

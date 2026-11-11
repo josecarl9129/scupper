@@ -522,8 +522,8 @@ pub fn call(root: &Path, request: &Request, timeout: Duration) -> Result<Respons
     call_until(root, request, Instant::now() + timeout)
 }
 
-fn remaining_until(deadline: Instant) -> io::Result<Duration> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
+fn remaining_until(deadline: Instant, now: Instant) -> io::Result<Duration> {
+    let remaining = deadline.saturating_duration_since(now);
     if remaining.is_zero() {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
@@ -542,7 +542,7 @@ pub fn call_until(
     request: &Request,
     deadline: Instant,
 ) -> Result<Response, ClientError> {
-    remaining_until(deadline).map_err(ClientError::Unavailable)?;
+    remaining_until(deadline, Instant::now()).map_err(ClientError::Unavailable)?;
     // Connect through a held directory descriptor so the run root's length never meets the
     // 108-byte `sun_path` limit; the descriptor stays open until the connect returns.
     let directory = fs::OpenOptions::new()
@@ -560,7 +560,7 @@ pub fn call_until(
     socket
         .connect_timeout(
             &address,
-            remaining_until(deadline)
+            remaining_until(deadline, Instant::now())
                 .map_err(ClientError::Unavailable)?
                 .min(Duration::from_secs(2)),
         )
@@ -571,7 +571,7 @@ pub fn call_until(
     bytes.push(b'\n');
     stream
         .set_write_timeout(Some(
-            remaining_until(deadline)
+            remaining_until(deadline, Instant::now())
                 .map_err(ClientError::Unavailable)?
                 .min(Duration::from_secs(1)),
         ))
@@ -582,7 +582,8 @@ pub fn call_until(
     let mut line = Vec::new();
     let mut reader = BufReader::new(stream);
     loop {
-        let remaining = remaining_until(deadline).map_err(ClientError::OutcomeUnknown)?;
+        let remaining =
+            remaining_until(deadline, Instant::now()).map_err(ClientError::OutcomeUnknown)?;
         reader
             .get_ref()
             .set_read_timeout(Some(remaining))
@@ -691,64 +692,38 @@ mod tests {
     }
 
     #[test]
-    fn check_and_fresh_ping_share_one_absolute_deadline() {
-        let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("shared-deadline-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
-        let directory = fs::File::open(&root).unwrap();
-        let socket_root =
-            std::path::PathBuf::from(format!("/proc/self/fd/{}/.", directory.as_raw_fd()));
-        let listener = UnixListener::bind(socket_root.join("control.sock")).unwrap();
-        let server = listener.try_clone().unwrap();
-        let worker = std::thread::spawn(move || {
-            let (mut check, _) = server.accept().unwrap();
-            let request = read_request(&check).unwrap();
-            assert_eq!(request.op, Op::Check {});
-            // Spend part of the budget before asking the caller to refresh Ping.
-            std::thread::sleep(Duration::from_millis(100));
-            serde_json::to_writer(
-                &mut check,
-                &Response {
-                    request_id: request.request_id,
-                    schema: Schema,
-                    replayed: false,
-                    observed_at: None,
-                    result: Err(api(ApiErrorCode::SupervisorUnavailable)),
-                },
-            )
-            .unwrap();
-            check.write_all(b"\n").unwrap();
-            let (mut ping, _) = server.accept().unwrap();
-            assert_eq!(read_request(&ping).unwrap().op, Op::Ping {});
-            ping.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-            assert_eq!(ping.read(&mut [0]).unwrap(), 0);
-        });
-        let deadline = Instant::now() + Duration::from_millis(500);
-        let response = call_until(&socket_root, &request(Op::Check {}), deadline).unwrap();
+    fn remaining_budget_uses_the_supplied_absolute_deadline() {
+        let start = Instant::now();
+        let deadline = start + CHECK_TIMEOUT;
+        for elapsed in [Duration::ZERO, Duration::from_millis(1500), CHECK_TIMEOUT] {
+            let remaining = remaining_until(deadline, start + elapsed);
+            if elapsed == CHECK_TIMEOUT {
+                assert_eq!(remaining.unwrap_err().kind(), io::ErrorKind::TimedOut);
+            } else {
+                assert_eq!(
+                    remaining.unwrap(),
+                    CHECK_TIMEOUT.checked_sub(elapsed).unwrap()
+                );
+            }
+        }
         assert_eq!(
-            response.result.unwrap_err().code,
-            ApiErrorCode::SupervisorUnavailable
+            remaining_until(deadline, deadline + Duration::from_secs(1))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
         );
-        assert!(matches!(
-            call_until(&socket_root, &request(Op::Ping {}), deadline),
-            Err(ClientError::OutcomeUnknown(error))
-                if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)
-        ));
-        assert!(Instant::now() >= deadline);
-        // Neither retrying Check nor opening another Ping can renew the budget.
+    }
+
+    #[test]
+    fn expired_check_and_ping_deadline_prevents_connection() {
+        let deadline = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+        // Even an invalid root must return TimedOut before opening the directory.
         for op in [Op::Check {}, Op::Ping {}] {
             assert!(matches!(
-                call_until(&socket_root, &request(op), deadline),
+                call_until(Path::new(""), &request(op), deadline),
                 Err(ClientError::Unavailable(error)) if error.kind() == io::ErrorKind::TimedOut
             ));
         }
-        worker.join().unwrap();
-        listener.set_nonblocking(true).unwrap();
-        assert_eq!(
-            listener.accept().unwrap_err().kind(),
-            io::ErrorKind::WouldBlock
-        );
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

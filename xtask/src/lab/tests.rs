@@ -310,11 +310,12 @@ fn capture_command_keeps_both_directions_and_all_frames() {
 }
 
 #[test]
-fn saved_buffered_capture_preserves_old_oracle_classification() {
+fn saved_bidirectional_capture_classifies_baseline_and_injected_records() {
     use crate::pcap::{Class, Reason};
 
-    let old = include_bytes!("../../tests/fixtures/capture-round3-old.pcap");
-    let new = include_bytes!("../../tests/fixtures/capture-round3-new.pcap");
+    // This proves classification of saved bidirectional records. Live capture
+    // modes are guarded separately by the exact capture-command assertion.
+    let bytes = include_bytes!("../../tests/fixtures/capture-classification.pcap").as_slice();
     let marker = "scupper-canary-00112233445566778899aabbccddeeff".to_owned();
     let baseline_policy =
         Policy::from_toml(&evidence::policy(&vec![marker.clone(); 12], false).unwrap()).unwrap();
@@ -322,28 +323,23 @@ fn saved_buffered_capture_preserves_old_oracle_classification() {
         Policy::from_toml(&evidence::policy(&vec![marker.clone(); 5], false).unwrap()).unwrap();
     // The saved stream starts with 48 fixed-size Ethernet/IPv4/UDP/WG records.
     let baseline_end = 24 + 48 * (16 + 14 + 20 + 8 + 32);
-    let mut reports = Vec::new();
-    for bytes in [old.as_slice(), new.as_slice()] {
-        let baseline = classify(&bytes[..baseline_end], &baseline_policy, 30).unwrap();
-        assert!(evidence::contained(&baseline));
-        assert_eq!(baseline.packet_count, 48);
-        for rule in ["wireguard[0]", "wireguard[1]"] {
-            assert_eq!(baseline.counts[&format!("Allowed({rule})")], 24);
-        }
-        assert_saved_tunnel_directions(&bytes[..baseline_end]);
-        let control = classify(bytes, &control_policy, 30).unwrap();
-        assert_eq!(control.packet_count, 51);
-        assert_eq!(control.violation_count, 3);
-        assert_eq!(control.capture_failures, []);
-        assert_eq!(control.counts["Violation(CanaryMarker)"], 2);
-        assert!(matches!(
-            control.packets[48].class,
-            Class::Violation(Reason::ForbiddenAddress { .. })
-        ));
-        evidence::injected_only(&control, bytes, &marker).unwrap();
-        reports.push(serde_json::to_value((&baseline, &control)).unwrap());
+    let baseline = classify(&bytes[..baseline_end], &baseline_policy, 30).unwrap();
+    assert!(evidence::contained(&baseline));
+    assert_eq!(baseline.packet_count, 48);
+    for rule in ["wireguard[0]", "wireguard[1]"] {
+        assert_eq!(baseline.counts[&format!("Allowed({rule})")], 24);
     }
-    assert_eq!(reports[0], reports[1]);
+    assert_saved_tunnel_directions(&bytes[..baseline_end]);
+    let control = classify(bytes, &control_policy, 30).unwrap();
+    assert_eq!(control.packet_count, 51);
+    assert_eq!(control.violation_count, 3);
+    assert_eq!(control.capture_failures, []);
+    assert_eq!(control.counts["Violation(CanaryMarker)"], 2);
+    assert!(matches!(
+        control.packets[48].class,
+        Class::Violation(Reason::ForbiddenAddress { .. })
+    ));
+    evidence::injected_only(&control, bytes, &marker).unwrap();
 }
 
 fn assert_saved_tunnel_directions(bytes: &[u8]) {

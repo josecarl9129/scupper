@@ -189,8 +189,36 @@ pub(super) enum ReadOutcome {
 pub(super) struct LocalRead {
     pub supervisor: scupper_core::verdict::v2::Supervisor,
     pub version: Option<u64>,
-    // The same deadline survives local observations and namespace retries.
-    deadline: Instant,
+    // Namespace retries share one allowance for the post-observation Ping.
+    transition_deadline: Option<Instant>,
+}
+
+// Each fallback phase may spend at most 500 ms beyond the shared Check budget.
+const PING_ALLOWANCE: Duration = Duration::from_millis(500);
+
+trait ReadClient {
+    fn now(&self) -> Instant;
+    fn call(
+        &self,
+        root: &std::path::Path,
+        op: Op,
+        deadline: Instant,
+    ) -> Result<Response, ClientError>;
+}
+
+struct SocketClient;
+impl ReadClient for SocketClient {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+    fn call(
+        &self,
+        root: &std::path::Path,
+        op: Op,
+        deadline: Instant,
+    ) -> Result<Response, ClientError> {
+        control::call_until(root, &control::request(op), deadline)
+    }
 }
 
 struct PingObservation {
@@ -199,14 +227,19 @@ struct PingObservation {
     operation: Option<scupper_proto::OperationProgress>,
     version: u64,
 }
-fn ping_supervisor(deps: &Dependencies<'_>, deadline: Instant) -> Option<PingObservation> {
+fn ping_supervisor(
+    deps: &Dependencies<'_>,
+    deadline: Instant,
+    client: &impl ReadClient,
+) -> Option<PingObservation> {
     use scupper_core::verdict::v2::Supervisor;
-    let response = control::call_until(
-        deps.writer_root,
-        &control::request(Op::Ping {}),
-        deadline.min(Instant::now() + Duration::from_secs(2)),
-    )
-    .ok()?;
+    let response = client
+        .call(
+            deps.writer_root,
+            Op::Ping {},
+            deadline.min(client.now() + Duration::from_secs(2)),
+        )
+        .ok()?;
     let Ok(OpResult::Ping {
         last_complete_iteration_age,
         current_iteration_age,
@@ -236,8 +269,19 @@ pub(super) fn read(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<ReadOutcome, String> {
+    read_with(deps, status, json, out, err, &SocketClient)
+}
+
+fn read_with(
+    deps: &Dependencies<'_>,
+    status: bool,
+    json: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    client: &impl ReadClient,
+) -> Result<ReadOutcome, String> {
     use scupper_core::verdict::v2::Supervisor;
-    let deadline = Instant::now() + control::CHECK_TIMEOUT;
+    let deadline = client.now() + control::CHECK_TIMEOUT;
     let mut local = |err: &mut dyn Write, supervisor, version: Option<u64>| {
         if let Some(operation) =
             version.and_then(|from| version_transition(from, applied_version(deps)))
@@ -248,19 +292,19 @@ pub(super) fn read(
         Ok(ReadOutcome::Local(LocalRead {
             supervisor,
             version,
-            deadline,
+            transition_deadline: None,
         }))
     };
     if status {
         return local(err, Supervisor::Dead, None);
     }
-    let mut observed = Instant::now();
+    let mut observed = client.now();
     let Some(PingObservation {
         mut supervisor,
         busy_age,
         operation,
         version,
-    }) = ping_supervisor(deps, deadline)
+    }) = ping_supervisor(deps, deadline, client)
     else {
         return local(err, Supervisor::Dead, None);
     };
@@ -274,8 +318,7 @@ pub(super) fn read(
         return local(err, supervisor, version);
     }
     for attempt in 0..2 {
-        let response =
-            control::call_until(deps.writer_root, &control::request(Op::Check {}), deadline);
+        let response = client.call(deps.writer_root, Op::Check {}, deadline);
         match response {
             Ok(response) if response.result.is_ok() => {
                 writeln!(err, "transport: local socket").map_err(output_error)?;
@@ -291,7 +334,8 @@ pub(super) fn read(
                 break;
             }
             other => {
-                let fresh = ping_supervisor(deps, deadline);
+                observed = client.now();
+                let fresh = ping_supervisor(deps, observed + PING_ALLOWANCE, client);
                 if let Some(PingObservation {
                     operation: Some(operation),
                     ..
@@ -301,7 +345,6 @@ pub(super) fn read(
                 }
                 version = fresh.as_ref().map(|ping| ping.version);
                 supervisor = fresh.map_or(Supervisor::Dead, |ping| ping.supervisor);
-                observed = Instant::now();
                 let unavailable = matches!(
                     other,
                     Ok(Response {
@@ -313,6 +356,7 @@ pub(super) fn read(
                     })
                 );
                 if attempt != 0
+                    || client.now() >= deadline
                     || !unavailable
                     || !matches!(supervisor, Supervisor::Alive {iteration_age, ..} if iteration_age < Duration::from_secs(30))
                 {
@@ -327,7 +371,7 @@ pub(super) fn read(
             iteration_age,
         } => Supervisor::Alive {
             netns,
-            iteration_age: iteration_age + observed.elapsed(),
+            iteration_age: iteration_age + client.now().saturating_duration_since(observed),
         },
         other => other,
     };
@@ -342,7 +386,10 @@ pub(super) fn transition_after_observation(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<Option<ReadOutcome>, String> {
-    let ping = ping_supervisor(deps, local.deadline);
+    let deadline = local
+        .transition_deadline
+        .unwrap_or_else(|| Instant::now() + PING_ALLOWANCE);
+    let ping = ping_supervisor(deps, deadline, &SocketClient);
     let state_version = applied_version(deps);
     if let Some(ping) = ping.as_ref() {
         if let Some(operation) = &ping.operation {
@@ -356,7 +403,7 @@ pub(super) fn transition_after_observation(
             return Ok(Some(ReadOutcome::Local(LocalRead {
                 supervisor: ping.supervisor,
                 version: Some(ping.version),
-                deadline: local.deadline,
+                transition_deadline: Some(deadline),
             })));
         }
     }
@@ -483,9 +530,244 @@ fn verdict_code(verdict: VerdictCode) -> u8 {
     }
 }
 
+#[cfg(all(test, feature = "testing"))]
+#[path = "../../../scupper-sys/tests/support/v2.rs"]
+mod test_support;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scupper_core::verdict::v2::{NetnsIdentity, Selection, Supervisor};
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
+
+    type Reply = Result<Result<OpResult, scupper_proto::ApiError>, std::io::ErrorKind>;
+    struct RecordedClient {
+        now: Cell<Instant>,
+        replies: RefCell<VecDeque<(Duration, Reply)>>,
+        calls: RefCell<Vec<(Op, Instant, Instant)>>,
+    }
+    #[allow(clippy::unwrap_used)]
+    impl ReadClient for RecordedClient {
+        fn now(&self) -> Instant {
+            self.now.get()
+        }
+        fn call(
+            &self,
+            _: &std::path::Path,
+            op: Op,
+            deadline: Instant,
+        ) -> Result<Response, ClientError> {
+            self.calls.borrow_mut().push((op, self.now(), deadline));
+            let (elapsed, reply) = self.replies.borrow_mut().pop_front().unwrap();
+            self.now.set(self.now() + elapsed);
+            reply
+                .map(|result| Response {
+                    request_id: control::request(Op::Ping {}).request_id,
+                    schema: Schema,
+                    replayed: false,
+                    observed_at: None,
+                    result,
+                })
+                .map_err(|kind| ClientError::OutcomeUnknown(std::io::Error::from(kind)))
+        }
+    }
+    fn live_ping() -> OpResult {
+        OpResult::Ping {
+            last_complete_iteration_age: Some(0),
+            current_iteration_age: None,
+            operation: None,
+            netns: NetnsIdentity {
+                device: 1,
+                inode: 2,
+            },
+            version: 1,
+            quarantined: false,
+            selection: Selection::Auto,
+        }
+    }
+    #[allow(clippy::unwrap_used)]
+    fn local_read(client: &RecordedClient) -> LocalRead {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let system = scupper_sys::system::RealSystem::default();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/tmp")
+            .join(format!(
+                "control-no-state-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+        std::fs::create_dir_all(root.parent().unwrap()).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        let deps = Dependencies {
+            state_root: &root,
+            config_root: &root,
+            writer_root: &root,
+            probe_exec: &system,
+            system: &system,
+            namespaces: &super::super::ProcNamespaces,
+            privilege: &super::super::EffectiveUid,
+            prompt: &super::super::TerminalPrompt,
+        };
+        let outcome = read_with(&deps, false, true, &mut Vec::new(), &mut Vec::new(), client);
+        std::fs::remove_dir(&root).unwrap();
+        let outcome = outcome.unwrap();
+        let ReadOutcome::Local(local) = outcome else {
+            unreachable!("expected local observations")
+        };
+        assert!(client.replies.borrow().is_empty());
+        local
+    }
+
+    #[test]
+    fn initial_ping_and_hung_check_share_one_deadline() {
+        let start = Instant::now();
+        let client = RecordedClient {
+            now: Cell::new(start),
+            replies: RefCell::new(VecDeque::from([
+                (Duration::from_millis(1500), Ok(Ok(live_ping()))),
+                (
+                    Duration::from_millis(3500),
+                    Err(std::io::ErrorKind::TimedOut),
+                ),
+            ])),
+            calls: RefCell::default(),
+        };
+        let local = local_read(&client);
+        assert!(
+            matches!(local.supervisor, Supervisor::Alive { iteration_age, .. }
+            if iteration_age == control::CHECK_TIMEOUT)
+        );
+        assert_eq!(
+            *client.calls.borrow(),
+            [
+                (Op::Ping {}, start, start + Duration::from_secs(2)),
+                (
+                    Op::Check {},
+                    start + Duration::from_millis(1500),
+                    start + control::CHECK_TIMEOUT
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn check_error_near_or_after_deadline_refreshes_live_supervisor() {
+        // Advancing an injected clock proves the allowance even after expiry,
+        // without requiring a server to wake inside a narrow wall-clock window.
+        for elapsed in [Duration::from_millis(4999), Duration::from_millis(5100)] {
+            for code in [
+                scupper_proto::ApiErrorCode::Internal,
+                scupper_proto::ApiErrorCode::SupervisorUnavailable,
+            ] {
+                let start = Instant::now();
+                let client = RecordedClient {
+                    now: Cell::new(start),
+                    replies: RefCell::new(VecDeque::from([
+                        (Duration::ZERO, Ok(Ok(live_ping()))),
+                        (
+                            elapsed,
+                            Ok(Err(scupper_proto::ApiError {
+                                code,
+                                observation: None,
+                            })),
+                        ),
+                        (Duration::from_millis(200), Ok(Ok(live_ping()))),
+                    ])),
+                    calls: RefCell::default(),
+                };
+                let local = local_read(&client);
+                assert!(matches!(local.supervisor, Supervisor::Alive { .. }));
+                assert_eq!(local.version, Some(1));
+                assert_eq!(
+                    *client.calls.borrow(),
+                    [
+                        (Op::Ping {}, start, start + Duration::from_secs(2)),
+                        (Op::Check {}, start, start + control::CHECK_TIMEOUT),
+                        (
+                            Op::Ping {},
+                            start + elapsed,
+                            start + elapsed + PING_ALLOWANCE
+                        ),
+                    ]
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "testing")]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn near_deadline_check_error_with_live_daemon_renders_protected() {
+        use super::test_support::{Root, Script, fresh};
+        struct Namespaces;
+        impl super::super::NamespaceReader for Namespaces {
+            fn read_namespace(&self, _: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+                unreachable!("not used by the local check")
+            }
+            fn open_gateway(&self) -> Result<Option<scupper_sys::netns::NetnsHandle>, String> {
+                Ok(Some(scupper_sys::netns::testing::handle().unwrap()))
+            }
+        }
+        let sys = Script::new("ubuntu-24.04");
+        fresh(&sys);
+        let held = scupper_sys::netns::testing::handle().unwrap();
+        let text = test_support::site_text(&sys.runner)
+            .replace("require_daemon = false", "require_daemon = true");
+        let root = Root::with_text(&text, &held);
+        let deps = Dependencies {
+            state_root: &root.path,
+            config_root: &root.path,
+            writer_root: &root.path,
+            system: &sys,
+            probe_exec: &sys,
+            namespaces: &Namespaces,
+            privilege: &super::super::EffectiveUid,
+            prompt: &super::super::TerminalPrompt,
+        };
+        let (device, inode) = held.identity();
+        let ping = || {
+            Ok(Ok(OpResult::Ping {
+                last_complete_iteration_age: Some(0),
+                current_iteration_age: None,
+                operation: None,
+                netns: NetnsIdentity { device, inode },
+                version: 1,
+                quarantined: false,
+                selection: Selection::Auto,
+            }))
+        };
+        let client = RecordedClient {
+            now: Cell::new(Instant::now()),
+            replies: RefCell::new(VecDeque::from([
+                (Duration::ZERO, ping()),
+                (
+                    Duration::from_millis(4999),
+                    Ok(Err(scupper_proto::ApiError {
+                        code: scupper_proto::ApiErrorCode::SupervisorUnavailable,
+                        observation: None,
+                    })),
+                ),
+                (Duration::from_millis(200), ping()),
+            ])),
+            calls: RefCell::default(),
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let ReadOutcome::Local(local) =
+            read_with(&deps, false, true, &mut out, &mut err, &client).unwrap()
+        else {
+            unreachable!("expected local fallback")
+        };
+        let config = super::super::m2_config(&deps).unwrap().unwrap();
+        let code =
+            super::super::m2_check(&deps, &config, false, true, local, &mut out, &mut err).unwrap();
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out));
+        assert!(String::from_utf8_lossy(&out).contains("Protected"));
+        assert!(client.replies.borrow().is_empty());
+    }
+
     #[test]
     fn exit_matching_table() {
         let exits = [("ch1", "Zurich"), ("ch2", "Zug")];

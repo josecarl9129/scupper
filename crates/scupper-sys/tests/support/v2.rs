@@ -348,16 +348,18 @@ impl Root {
     }
     pub fn with_text(text: &str, handle: &NetnsHandle) -> Self {
         // Keep fixture sockets below sockaddr_un's path limit in deep worktrees.
-        let temporary = Path::new(env!("CARGO_TARGET_TMPDIR"));
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
             .parent()
             .unwrap();
-        let temporary = temporary.strip_prefix(workspace).map_or_else(
-            |_| temporary.to_path_buf(),
-            |path| Path::new("../..").join(path),
-        );
+        // Cargo only supplies this for integration tests; CLI lib tests also
+        // include this module. Keep their fallback inside the worktree.
+        let temporary = option_env!("CARGO_TARGET_TMPDIR")
+            .map_or_else(|| workspace.join("target/tmp"), PathBuf::from);
+        let temporary = temporary
+            .strip_prefix(workspace)
+            .map_or_else(|_| temporary.clone(), |path| Path::new("../..").join(path));
         let path = temporary.join(format!(
             "scupper-v2-test-{}-{}",
             std::process::id(),
