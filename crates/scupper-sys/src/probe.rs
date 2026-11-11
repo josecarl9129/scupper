@@ -139,6 +139,9 @@ pub(crate) fn io_failure(operation: IoOperation, error: &io::Error) -> ProbeErro
 }
 
 #[cfg(target_os = "linux")]
+mod tcp_info;
+
+#[cfg(target_os = "linux")]
 pub(crate) mod linux {
     use std::{
         io::{Read, Write},
@@ -235,7 +238,7 @@ pub(crate) mod linux {
             remaining(deadline)?;
             tls.conn
                 .complete_io(&mut tls.sock)
-                .map_err(|error| io_failure(IoOperation::Path, &error))?;
+                .map_err(|error| tls_failure(&error))?;
         }
         before_request()?;
         write_request(&mut tls, target, deadline)?;
@@ -261,6 +264,17 @@ pub(crate) mod linux {
             {
                 return Ok(bytes);
             }
+        }
+    }
+
+    fn tls_failure(error: &io::Error) -> ProbeError {
+        if matches!(
+            error.kind(),
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+        ) {
+            ProbeError::Timeout
+        } else {
+            ProbeError::Tls
         }
     }
 
@@ -310,8 +324,21 @@ pub(crate) mod linux {
         }
     }
 
+    // TCP_USER_TIMEOUT cannot advance the first retransmission or tail-loss
+    // probe. Leave room for the current RTO plus scheduling/measurement margin.
+    fn write_allowed(left: std::time::Duration, rto: std::time::Duration) -> bool {
+        left >= std::time::Duration::from_secs(2)
+            && left > rto.saturating_add(std::time::Duration::from_secs(1))
+    }
     impl Write for DeadlineStream {
         fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if self.abort_at_deadline {
+                let rto = super::tcp_info::rto(&self.stream)?;
+                let left = self.deadline.saturating_duration_since(Instant::now());
+                if !write_allowed(left, rto) {
+                    return Err(io::Error::from(io::ErrorKind::TimedOut));
+                }
+            }
             self.set_timeouts()?;
             self.stream.write(buffer)
         }
@@ -326,6 +353,58 @@ pub(crate) mod linux {
         use super::*;
         use socket2::{Domain, Protocol, Type};
         use std::time::Duration;
+        #[test]
+        fn tls_handshake_errors_are_distinct_from_deadlines() {
+            for kind in [
+                io::ErrorKind::InvalidData,
+                io::ErrorKind::UnexpectedEof,
+                io::ErrorKind::ConnectionReset,
+            ] {
+                assert_eq!(tls_failure(&io::Error::from(kind)), ProbeError::Tls);
+            }
+            for kind in [io::ErrorKind::TimedOut, io::ErrorKind::WouldBlock] {
+                assert_eq!(tls_failure(&io::Error::from(kind)), ProbeError::Timeout);
+            }
+        }
+        #[test]
+        fn refuses_writes_without_rto_margin_or_two_seconds() {
+            for (left, rto, allowed) in [
+                (1999, 100, false),
+                (2000, 100, true),
+                (2000, 1000, false),
+                (6000, 5000, false),
+                (6001, 5000, true),
+                (0, 0, false),
+            ] {
+                assert_eq!(
+                    write_allowed(Duration::from_millis(left), Duration::from_millis(rto)),
+                    allowed
+                );
+            }
+        }
+        #[test]
+        fn refused_write_never_reaches_peer() {
+            let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (mut peer, _) = listener.accept().unwrap();
+            let mut stream = DeadlineStream {
+                stream,
+                deadline: Instant::now() + Duration::from_millis(1999),
+                abort_at_deadline: true,
+            };
+            assert_eq!(
+                stream
+                    .write(b"GET /private HTTP/1.1\r\n")
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::TimedOut
+            );
+            peer.set_nonblocking(true).unwrap();
+            assert_eq!(
+                peer.read(&mut [0; 64]).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
         #[test]
         fn expired_before_connect_never_uses_socket() {
             let target = Target::new("heartbeat.invalid", "/secret-path").unwrap();

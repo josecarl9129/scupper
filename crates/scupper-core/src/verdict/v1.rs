@@ -32,6 +32,9 @@ pub enum ProbeError {
     /// The observation did not complete within its deadline.
     #[error("probe timed out")]
     Timeout,
+    /// TLS handshake or peer certificate verification failed.
+    #[error("probe TLS handshake failed")]
+    Tls,
     /// The observation command failed before producing usable output.
     #[error("probe exited unsuccessfully ({}){}", exit_code(*.code), stderr_diagnostic(.stderr))]
     ExitStatus {

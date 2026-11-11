@@ -7,7 +7,7 @@ use crate::{
 };
 use scupper_core::{
     failover::MonoTime,
-    heartbeat::{CompleteIteration, Decision, decide},
+    heartbeat::{CompleteIteration, Decision, SkipReason, decide},
 };
 use scupper_proto::{Actor, EventKind, Reason};
 use std::{
@@ -31,6 +31,7 @@ pub(super) struct Heartbeat {
     sending_deadline: Option<Instant>,
     last_send: Option<Instant>,
     workers: Vec<std::thread::JoinHandle<()>>,
+    last_stale: Option<Instant>,
     pub(super) last_success: Option<Instant>,
 }
 impl Heartbeat {
@@ -65,10 +66,7 @@ impl Heartbeat {
                 && self.sending.is_none()
             {
                 let mono = |at: Instant| MonoTime(at.saturating_duration_since(origin));
-                if let Decision::Send {
-                    url_suffix,
-                    deadline,
-                } = decide(
+                let decision = decide(
                     context.settings,
                     mono(now),
                     Some(CompleteIteration {
@@ -77,7 +75,21 @@ impl Heartbeat {
                         code: checked.code,
                     }),
                     self.last_send.map(mono),
-                ) {
+                );
+                if checked.code == 0
+                    && matches!(decision, Decision::Skip(SkipReason::Stale))
+                    && self.last_stale.is_none_or(|at| {
+                        now.saturating_duration_since(at) >= Duration::from_secs(60)
+                    })
+                {
+                    self.last_stale = Some(now);
+                    return Some(Work::Stale);
+                }
+                if let Decision::Send {
+                    url_suffix,
+                    deadline,
+                } = decision
+                {
                     self.last_send = Some(now);
                     self.sending_deadline = Some(origin + deadline.0);
                     return Some(Work::Send {
@@ -130,20 +142,19 @@ impl Heartbeat {
         }
         (check_stuck || send_stuck).then_some(Failure::Deadline)
     }
-    // Rebuild/apply may close the old namespace only after its read-only check
-    // workers release their handles. This bounded wait occurs during closed
-    // administrative/rebuild work, never on the normal heartbeat iteration.
-    pub(super) fn drain_checks(&mut self, deadline: Instant) -> bool {
+    // Only read-only workers are detached. Their receiver is closed first, so
+    // late results cannot authorize delivery or block replacement of a namespace.
+    // This runs before charging a boot, with a small independent drain budget.
+    pub(super) fn drain_checks(&mut self) {
         self.abandon_check();
+        let deadline = Instant::now() + Duration::from_millis(50);
         loop {
             self.workers.retain(|worker| !worker.is_finished());
-            if self.workers.is_empty() {
-                return true;
+            if self.workers.is_empty() || Instant::now() >= deadline {
+                self.workers.clear();
+                return;
             }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(5));
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
     fn checked(&mut self) -> Option<Checked> {
@@ -188,6 +199,7 @@ struct Context<'a> {
 }
 enum Work {
     Check,
+    Stale,
     Send { suffix: String, deadline: Instant },
 }
 fn failure_event(failure: Failure) -> EventKind {
@@ -197,13 +209,13 @@ fn failure_event(failure: Failure) -> EventKind {
         Failure::Http => Reason::HeartbeatHttp,
         Failure::Deadline => Reason::HeartbeatDeadline,
         Failure::Internal => Reason::ExecutionFailed,
+        Failure::Exec => Reason::HeartbeatExec,
+        Failure::Tls => Reason::HeartbeatTls,
+        Failure::Transport => Reason::HeartbeatTransport,
     };
     EventKind::HeartbeatFailed { reason }
 }
 impl Runtime<'_> {
-    pub(super) fn heartbeat_failed_deadline(&self) {
-        self.heartbeat_failed(Failure::Deadline);
-    }
     fn heartbeat_failed(&self, failure: Failure) {
         eprintln!("scupperd: warning: {failure}");
         let _ = self.audit.handle().emit(
@@ -231,6 +243,16 @@ impl Runtime<'_> {
             .heartbeat
             .iteration(now, self.origin, complete, context);
         match work {
+            Some(Work::Stale) => {
+                eprintln!("scupperd: info: heartbeat skipped: stale verdict");
+                let _ = self.audit.handle().emit(
+                    EventKind::HeartbeatSkipped {
+                        reason: Reason::Stale,
+                    },
+                    Actor::Daemon,
+                    self.running.as_ref().map(|(_, _, cfg)| cfg.stamp.version),
+                );
+            }
             Some(Work::Send { suffix, deadline }) => {
                 if let Some((_, _, config)) = &self.running
                     && let Some(settings) = config.site.heartbeat()
@@ -423,21 +445,155 @@ mod tests {
         .unwrap();
     }
     #[test]
-    fn namespace_worker_is_drained_before_rebuild_and_stuck_worker_refuses() {
-        let lease = std::sync::Arc::new(());
-        let weak = std::sync::Arc::downgrade(&lease);
-        let (release, wait) = mpsc::sync_channel(1);
+    fn stuck_read_only_worker_does_not_veto_or_delay_repair() {
+        let (started, ready) = mpsc::sync_channel(1);
         let mut state = Heartbeat::default();
         state.workers.push(std::thread::spawn(move || {
-            let _ = wait.recv();
-            drop(lease);
+            started.send(()).unwrap();
+            loop {
+                std::thread::park();
+            }
         }));
-        state.abandon_check();
-        assert!(weak.upgrade().is_some());
-        assert!(!state.drain_checks(Instant::now()));
-        release.send(()).unwrap();
-        assert!(state.drain_checks(Instant::now() + Duration::from_secs(1)));
-        assert!(weak.upgrade().is_none());
+        ready.recv().unwrap();
+        let before = Instant::now();
+        state.drain_checks();
+        assert!(before.elapsed() < Duration::from_millis(500));
+        assert!(state.workers.is_empty());
+        assert!(state.check.is_none());
+    }
+    #[test]
+    #[cfg(feature = "testing")]
+    #[allow(clippy::too_many_lines)] // Complete scheduler and worker fault fixture.
+    fn fake_kernel_stuck_worker_drains_before_charge_and_rebuild_continues() {
+        use crate::{
+            daemon::{DaemonDeps, Iteration, run_with},
+            reconcile::{Escalation, Kernel, TickReport, fake::FakeKernel},
+        };
+        use scupper_core::{
+            config::{GatewayId, parse_site, validate},
+            planner::{Desired, Step},
+            render::{RouteTarget, VersionStamp},
+            verdict::v2::Selection,
+        };
+        use std::{
+            path::{Path, PathBuf},
+            sync::atomic::{AtomicBool, Ordering},
+        };
+        struct Rig<'a> {
+            heartbeat: Heartbeat,
+            kernel: FakeKernel,
+            root: PathBuf,
+            stop: &'a AtomicBool,
+            began: Instant,
+            drained: bool,
+            rebuilt: bool,
+        }
+        impl DaemonDeps for Rig<'_> {
+            fn now(&self) -> Instant {
+                Instant::now()
+            }
+            fn sleep(&mut self, _: Duration) {}
+            fn started(&mut self) {}
+            fn initialize(&mut self) {}
+            fn tick(&mut self, _: &AtomicBool) -> Option<TickReport> {
+                Some(TickReport {
+                    escalations: vec![Escalation::RebuildRequired],
+                    ..TickReport::default()
+                })
+            }
+            fn close_only(&mut self) {}
+            fn abandon_probes(&mut self) {
+                assert!(!self.root.join("boot-attempts").exists());
+                self.heartbeat.drain_checks();
+                self.drained = true;
+            }
+            fn rebuild(&mut self) {
+                assert!(self.drained);
+                assert!(self.root.join("boot-attempts").exists());
+                assert!(self.began.elapsed() < Duration::from_millis(500));
+                self.kernel.execute(&Step::ForwardingOff).unwrap();
+                self.rebuilt = true;
+            }
+            fn run_root(&self) -> &Path {
+                &self.root
+            }
+            fn boot_time(&self) -> Duration {
+                Duration::from_secs(1)
+            }
+            fn budget_error(&mut self, error: &std::io::Error) {
+                assert_eq!(error.to_string(), "unexpected budget error");
+            }
+            fn maintenance(&mut self) {
+                self.stop.store(true, Ordering::Relaxed);
+            }
+            fn notify(&mut self, _: &Iteration) {}
+            fn shutdown(&mut self) {}
+        }
+        let site = validate(
+            parse_site(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../scupper-core/tests/fixtures/site-m2.toml"
+            )))
+            .unwrap(),
+        )
+        .unwrap();
+        let desired = Desired::new(
+            &site,
+            &GatewayId("gw1".into()),
+            &VersionStamp {
+                version: 1,
+                sha256: [0; 32],
+            },
+            [7; 32],
+            &RouteTarget::Unreachable,
+            &Selection::Auto,
+        )
+        .unwrap();
+        let worker_desired = desired.clone();
+        let mut heartbeat = Heartbeat::default();
+        let (started, ready) = mpsc::sync_channel(1);
+        heartbeat.workers.push(std::thread::spawn(move || {
+            // The fake check worker observes and then stalls forever.
+            let _kernel = FakeKernel::new(worker_desired);
+            started.send(()).unwrap();
+            loop {
+                std::thread::park();
+            }
+        }));
+        ready.recv().unwrap();
+        let root = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/tmp"))
+            .join(format!("stuck-check-rebuild-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let stop = AtomicBool::new(false);
+        let mut rig = Rig {
+            heartbeat,
+            kernel: FakeKernel::new(desired),
+            root,
+            stop: &stop,
+            began: Instant::now(),
+            drained: false,
+            rebuilt: false,
+        };
+        run_with(&mut rig, &stop);
+        assert!(rig.rebuilt);
+        assert_eq!(rig.kernel.history().len(), 1);
+        std::fs::remove_dir_all(&rig.root).unwrap();
+    }
+    #[test]
+    fn healthy_stale_verdict_emits_rate_limited_skip() {
+        let origin = Instant::now();
+        let cfg = settings("ok_only", 10);
+        let mut state = Heartbeat::default();
+        for (second, emit) in [(10, true), (11, false), (70, true)] {
+            queue(&mut state, origin, 0, true);
+            let work = state.iteration(
+                origin + Duration::from_secs(second),
+                origin,
+                true,
+                Some(context(&cfg)),
+            );
+            assert_eq!(matches!(work, Some(Work::Stale)), emit);
+        }
     }
     #[test]
     fn delivery_exclusivity_consumes_no_second_authorization() {
@@ -494,7 +650,7 @@ mod tests {
                     send.send(Ok(now)).unwrap();
                     assert_eq!(state.collect(), None);
                 }
-                None => {}
+                Some(Work::Stale) | None => {}
             }
         }
         assert!(sends.len() >= 9);
@@ -606,6 +762,22 @@ mod tests {
             Some(Failure::Deadline)
         );
         assert!(state.sending.is_none());
+    }
+    #[test]
+    fn failure_events_distinguish_exec_identity_tls_http_and_transport() {
+        for (failure, reason) in [
+            (Failure::Exec, Reason::HeartbeatExec),
+            (Failure::Account, Reason::HeartbeatAccount),
+            (Failure::Tls, Reason::HeartbeatTls),
+            (Failure::Http, Reason::HeartbeatHttp),
+            (Failure::Transport, Reason::HeartbeatTransport),
+            (Failure::Internal, Reason::ExecutionFailed),
+        ] {
+            assert_eq!(
+                failure_event(failure),
+                EventKind::HeartbeatFailed { reason }
+            );
+        }
     }
     #[test]
     fn two_failed_attempts_produce_one_failure_then_no_repeat() {

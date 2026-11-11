@@ -865,7 +865,13 @@ impl Lab {
         )))
     }
     fn daemon_spawn(&mut self, case: &str, root: &Path, stage: &str) -> Result<Group> {
-        let daemon = Self::boot_binary()?.with_file_name("scupperd");
+        // Unlike root-started probes, heartbeat exec happens after uid/gid drop.
+        // Neither executable may require traversal through a runner's home.
+        let daemon = if matches!(case, "L10" | "L53" | "L53b" | "heartbeat") {
+            heartbeat::delivery_binaries(&Self::boot_binary()?, root)?
+        } else {
+            Self::boot_binary()?.with_file_name("scupperd")
+        };
         let env = format!("NOTIFY_SOCKET={}", self.daemon_notify_path(case)?.display());
         let mut invocation = Invocation::new(
             "gwhost",

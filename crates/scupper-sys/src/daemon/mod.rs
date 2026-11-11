@@ -664,12 +664,8 @@ impl Runtime<'_> {
             } else {
                 Vec::new()
             };
-            if !dry_run
-                && !self
-                    .heartbeat
-                    .drain_checks(Instant::now() + Duration::from_secs(20))
-            {
-                return Err(control::api(ApiErrorCode::Timeout));
+            if !dry_run {
+                self.heartbeat.drain_checks();
             }
             if !dry_run {
                 self.begin_operation(scupper_proto::OperationKind::Apply, target);
@@ -889,18 +885,11 @@ impl DaemonDeps for Runtime<'_> {
         close_only(&self.deps(), self.options);
     }
     fn abandon_probes(&mut self) {
-        self.heartbeat.abandon_check();
+        self.heartbeat.drain_checks();
         self.probes = probes::Probes::new(self.options.probe_binary.clone(), Instant::now())
             .with_uplink(uplink_addresses(self.system).unwrap_or_default());
     }
     fn rebuild(&mut self) {
-        if !self
-            .heartbeat
-            .drain_checks(Instant::now() + Duration::from_secs(20))
-        {
-            self.heartbeat_failed_deadline();
-            return;
-        }
         self.begin_operation(scupper_proto::OperationKind::Rebuild, None);
         let deps = self.deps();
         let report = if let Some((machine, _, _)) = &mut self.running {

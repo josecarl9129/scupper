@@ -23,6 +23,20 @@ fn check_account_failure(root: &Path) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn delivery_binaries(source: &Path, root: &Path) -> Result<std::path::PathBuf> {
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin)?;
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o755))?;
+    for name in ["scupper", "scupperd"] {
+        let target = bin.join(name);
+        if !target.exists() {
+            fs::copy(source.with_file_name(name), &target)?;
+            fs::set_permissions(target, fs::Permissions::from_mode(0o755))?;
+        }
+    }
+    Ok(bin.join("scupperd"))
+}
+
 pub(super) fn overlay(invocation: &Invocation, root: &Path) -> Invocation {
     let mut args = vec![
         "--mount".into(),
@@ -34,8 +48,10 @@ pub(super) fn overlay(invocation: &Invocation, root: &Path) -> Invocation {
         r#"set -eu
 mount --make-private /
 if mountpoint -q /etc; then mount --make-private /etc; fi
-mount --bind "$1/etc" /etc
-mount --make-private /etc
+for name in hosts passwd group; do
+    mount --bind "$1/etc/$name" "/etc/$name"
+    mount --make-private "/etc/$name"
+done
 shift
 exec "$@"
 "#
@@ -65,10 +81,6 @@ impl DaemonGuard<'_> {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         // prepare_check_v2 copied the real lab accounts into this overlay.
         // Keep their allocated IDs; only name resolution needs fixture data.
-        fs::write(
-            root.join("etc/nsswitch.conf"),
-            "passwd: files\ngroup: files\nhosts: files dns\n",
-        )?;
         fs::write(
             root.join("etc/hosts"),
             format!("127.0.0.1 localhost\n{ENDPOINT} heartbeat.invalid\n"),
@@ -129,7 +141,10 @@ impl DaemonGuard<'_> {
         Ok(child)
     }
     fn start_heartbeat_tls(&mut self) -> Result<Group> {
-        let tls = self.lab.private.join("heartbeat-tls");
+        let tls = self
+            .lab
+            .private
+            .join(format!("{}-heartbeat-tls", self.case));
         fs::create_dir(&tls)?;
         let ca = tls.join("ca.pem");
         let ca_key = tls.join("ca.key");
@@ -220,7 +235,7 @@ impl DaemonGuard<'_> {
             write!(hex, "{byte:02x}")?;
         }
         self.lab.runner.probe_ca = Some(hex);
-        let server=self.lab.runner.background(&Invocation::new("internet","/bin/sh",&["-c","cd \"$1\"; exec openssl s_server -quiet -WWW -accept 443 -cert server.pem -key server.key","heartbeat-tls",tls.to_str().ok_or("TLS directory")?]),&self.lab.artifacts.join("heartbeat-tls.stdout"))?;
+        let server=self.lab.runner.background(&Invocation::new("internet","/bin/sh",&["-c","cd \"$1\"; exec openssl s_server -quiet -WWW -accept 443 -cert server.pem -key server.key","heartbeat-tls",tls.to_str().ok_or("TLS directory")?]),&self.lab.artifacts.join(format!("{}-heartbeat-tls.stdout", self.case)))?;
         self.lab
             .daemon_wait("heartbeat HTTPS listener", Duration::from_secs(5), |lab| {
                 Ok(lab.cmd("internet", "ss", &["-ltnH"])?.contains(":443"))
@@ -340,6 +355,32 @@ impl DaemonGuard<'_> {
             sink.stop(Signal::TERM)?;
             self.control_stop(Signal::TERM)?;
             sink = self.start_heartbeat_tls()?;
+            if case == "L53b" {
+                self.lab.stop_captures()?;
+                self.lab
+                    .capture("wan", A.gwhost.wan_if, "L53b-late-release")?;
+                self.late_request_deadline(&root)?;
+                self.lab.stop_captures()?;
+                let timing: serde_json::Value = serde_json::from_slice(&fs::read(
+                    self.lab.artifacts.join("L53b-late-deadline.json"),
+                )?)?;
+                let deadline = timing["deadline_epoch_ns"]
+                    .as_u64()
+                    .ok_or("late deadline missing")?;
+                let bytes = fs::read(self.lab.artifacts.join("L53b-late-release.pcap"))?;
+                let packets = crate::pcap::heartbeat_payloads(
+                    &bytes,
+                    A.gwhost.peer.parse()?,
+                    format!("{ENDPOINT}:443").parse()?,
+                )?;
+                if packets.iter().any(|packet| {
+                    u64::from(packet.seconds) * 1_000_000_000 + u64::from(packet.nanoseconds)
+                        >= deadline
+                }) {
+                    return fail("L53b late release sent TCP payload after deadline");
+                }
+                self.lab.capture("wan", A.gwhost.wan_if, &stem)?;
+            }
             self.control_restart(&root, "tls-deadline")?;
             self.orphan_deadline(&root, case == "L53b")?;
         } else {
@@ -438,7 +479,7 @@ impl DaemonGuard<'_> {
         }
         Ok(())
     }
-    fn drop_heartbeat_request(&mut self, hold: &Path) -> Result<()> {
+    fn block_heartbeat_request(&mut self) -> Result<()> {
         self.lab.cmd(
             "gwhost",
             "nft",
@@ -479,6 +520,10 @@ impl DaemonGuard<'_> {
                 "drop",
             ],
         )?;
+        Ok(())
+    }
+    fn drop_heartbeat_request(&mut self, hold: &Path) -> Result<()> {
+        self.block_heartbeat_request()?;
         fs::remove_file(hold)?;
         self.lab.daemon_wait(
             "request queued behind endpoint drop",
@@ -498,7 +543,83 @@ impl DaemonGuard<'_> {
         )?;
         Ok(())
     }
+    fn late_request_deadline(&mut self, root: &Path) -> Result<()> {
+        rustix::process::set_child_subreaper(Some(rustix::process::getpid()))?;
+        let hold = root.join("heartbeat-request-pause");
+        fs::write(&hold, b"wait for handshake")?;
+        fs::set_permissions(&hold, fs::Permissions::from_mode(0o666))?;
+        self.control_restart(root, "late-release")?;
+        self.lab.daemon_wait(
+            "late-release TLS handshake",
+            Duration::from_secs(25),
+            |_| {
+                check_account_failure(root)?;
+                Ok(fs::read(&hold)? == b"handshake complete")
+            },
+        )?;
+        let parent = self
+            .child
+            .as_ref()
+            .ok_or("daemon missing")?
+            .supervised_pid()?
+            .ok_or("daemon pid missing")?;
+        let child = delivery_child(parent)?.ok_or("late child missing")?;
+        let _cleanup = DeliveryGuard::new(child)?;
+        let trace = fs::read_to_string(root.join("run/scupper/heartbeat-trace.jsonl"))?;
+        let last: serde_json::Value =
+            serde_json::from_str(trace.lines().last().ok_or("late trace missing")?)?;
+        let deadline = last["deadline_ns"]
+            .as_u64()
+            .ok_or("late deadline missing")?;
+        let remaining = deadline.saturating_sub(scupper_sys::heartbeat::monotonic_ns());
+        let wall = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        fs::write(
+            self.lab.artifacts.join("L53b-late-deadline.json"),
+            serde_json::to_vec(
+                &serde_json::json!({"deadline_epoch_ns":u64::try_from(wall + u128::from(remaining))?,"child":child}),
+            )?,
+        )?;
+        self.block_heartbeat_request()?;
+        self.control_stop(Signal::KILL)?;
+        self.lab.runner.dwell(Duration::from_nanos(
+            deadline
+                .saturating_sub(scupper_sys::heartbeat::monotonic_ns())
+                .saturating_sub(1_000_000_000),
+        ))?;
+        if !process_alive(child)? {
+            return fail("late-release child died before release");
+        }
+        // Release with <2s remaining; no request may be queued, even though TLS
+        // already succeeded. Keep capturing well beyond the original deadline.
+        fs::remove_file(&hold)?;
+        self.lab.runner.dwell(Duration::from_secs(5))?;
+        if process_alive(child)? {
+            return fail("late-release child outlived deadline");
+        }
+        let counter = self.lab.cmd(
+            "gwhost",
+            "nft",
+            &["list", "chain", "inet", "scupper_hb_test", "output"],
+        )?;
+        if counter
+            .lines()
+            .any(|line| line.contains("counter packets") && !line.contains("counter packets 0 "))
+        {
+            return fail("L53b late release queued a request without retransmission margin");
+        }
+        self.lab.cmd(
+            "gwhost",
+            "nft",
+            &["delete", "table", "inet", "scupper_hb_test"],
+        )?;
+        self.lab.runner.dwell(Duration::from_secs(5))?;
+        Ok(())
+    }
     fn orphan_deadline(&mut self, root: &Path, stopped: bool) -> Result<()> {
+        // Adopt the orphan so the unconditional guard can reap it.
+        rustix::process::set_child_subreaper(Some(rustix::process::getpid()))?;
         let run = root.join("run/scupper");
         let hold = root.join("heartbeat-request-pause");
         fs::write(&hold, b"wait for handshake")?;
@@ -518,6 +639,7 @@ impl DaemonGuard<'_> {
             .supervised_pid()?
             .ok_or("daemon pid missing")?;
         let child = delivery_child(pid)?.ok_or("TLS child missing")?;
+        let _cleanup = DeliveryGuard::new(child)?;
         let child_ns = fs::metadata(format!("/proc/{child}/ns/net"))?;
         let host_ns = fs::metadata("/run/netns/gwhost")?;
         if (child_ns.dev(), child_ns.ino()) != (host_ns.dev(), host_ns.ino()) {
@@ -599,6 +721,26 @@ impl DaemonGuard<'_> {
         Ok(())
     }
 }
+// Installed as soon as the child is identified, before any assertion or STOP.
+// Every unwind/error path resumes, kills the entire group, and reaps the orphan.
+struct DeliveryGuard(rustix::process::Pid);
+impl DeliveryGuard {
+    fn new(pid: u32) -> Result<Self> {
+        Ok(Self(
+            rustix::process::Pid::from_raw(i32::try_from(pid)?).ok_or("delivery pid")?,
+        ))
+    }
+}
+impl Drop for DeliveryGuard {
+    fn drop(&mut self) {
+        let _ = rustix::process::kill_process_group(self.0, Signal::CONT);
+        let _ = rustix::process::kill_process_group(self.0, Signal::KILL);
+        while let Err(rustix::io::Errno::INTR) =
+            rustix::process::waitpid(Some(self.0), rustix::process::WaitOptions::empty())
+        {}
+    }
+}
+
 fn delivery_child(pid: u32) -> Result<Option<u32>> {
     for task in fs::read_dir(format!("/proc/{pid}/task"))? {
         let path = task?.path().join("children");
@@ -633,6 +775,49 @@ fn process_alive(pid: u32) -> Result<bool> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn stopped_delivery_guard_drop_kills_group_and_reaps() {
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new("/bin/sleep");
+        command.arg("60").process_group(0);
+        let mut child = command.spawn().unwrap();
+        let guard = DeliveryGuard::new(child.id()).unwrap();
+        rustix::process::kill_process(guard.0, Signal::STOP).unwrap();
+        let pid = guard.0;
+        drop(guard);
+        assert!(!process_alive(child.id()).unwrap());
+        assert!(child.wait().is_err()); // The guard has already reaped it.
+        assert!(matches!(
+            rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG),
+            Err(rustix::io::Errno::CHILD)
+        ));
+    }
+    #[test]
+    fn delivery_copy_escapes_inaccessible_source_ancestors() {
+        let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("delivery-copy-{}", std::process::id()));
+        let source = root.join("private");
+        fs::create_dir_all(&source).unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
+        for name in ["scupper", "scupperd"] {
+            fs::write(source.join(name), "#!/bin/sh\nexit 0\n").unwrap();
+        }
+        let daemon = delivery_binaries(&source.join("scupper"), &root).unwrap();
+        assert_eq!(daemon, root.join("bin/scupperd"));
+        for name in ["scupper", "scupperd"] {
+            assert_eq!(
+                fs::metadata(root.join("bin").join(name)).unwrap().mode() & 0o777,
+                0o755
+            );
+            assert!(
+                std::process::Command::new(root.join("bin").join(name))
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn heartbeat_fixture_keeps_system_account_text_and_lookup_uses_allocated_ids() {
         let root = Path::new(env!("CARGO_TARGET_TMPDIR"))

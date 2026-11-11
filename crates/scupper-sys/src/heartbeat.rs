@@ -25,9 +25,18 @@ pub enum Failure {
     /// Deadline elapsed or transport timed out.
     #[error("heartbeat timeout or deadline")]
     Deadline,
-    /// Malformed protocol, URL, transport, or execution failure.
-    #[error("heartbeat internal or transport failure")]
+    /// Malformed child protocol or local setup failure.
+    #[error("heartbeat internal protocol or setup failure")]
     Internal,
+    /// Child could not be executed.
+    #[error("heartbeat child exec failed")]
+    Exec,
+    /// Certificate verification or TLS handshake failed.
+    #[error("heartbeat TLS handshake failed")]
+    Tls,
+    /// DNS, connect or socket transport failed.
+    #[error("heartbeat network transport failed")]
+    Transport,
     /// Missing, unreadable, unsafe or invalid URL secret file.
     #[error("heartbeat URL reference missing, unreadable, unsafe or invalid")]
     Secret,
@@ -36,13 +45,18 @@ pub enum Failure {
     Account,
 }
 impl Failure {
-    /// Stable child status: 0 is delivered; 20/21/22 classify failures.
+    /// Stable, value-free child status; 0 means delivered.
     #[must_use]
     pub fn exit_code(self) -> u8 {
         match self {
             Self::Http => 20,
             Self::Deadline => 21,
-            _ => 22,
+            Self::Internal => 22,
+            Self::Account => 23,
+            Self::Tls => 24,
+            Self::Transport => 25,
+            Self::Exec => 26,
+            Self::Secret => 27,
         }
     }
 }
@@ -157,6 +171,8 @@ pub fn monotonic_ns() -> u64 {
 /// # Errors
 /// All failures are closed, value-free categories.
 pub fn child(input: impl Read) -> Result<(), Failure> {
+    let request = Request::read(input)?;
+    let deadline = request.deadline()?;
     if rustix::process::geteuid().is_root() || rustix::process::getegid().is_root() {
         return Err(Failure::Account);
     }
@@ -173,8 +189,23 @@ pub fn child(input: impl Read) -> Result<(), Failure> {
         .map_err(|_| Failure::Internal)?;
     let credentials = std::fs::read_to_string("/proc/self/status").map_err(|_| Failure::Account)?;
     verify_credentials(&credentials)?;
-    let request = Request::read(input)?;
+    arm_deadline_kill(deadline)?;
     deliver(&request)
+}
+// This timer belongs to the exec child, independent of the daemon. Process exit
+// closes its SO_LINGER(0) sockets even if resolver/TLS/HTTP work is blocked.
+fn arm_deadline_kill(deadline: Instant) -> Result<(), Failure> {
+    std::thread::Builder::new()
+        .name("heartbeat-deadline".into())
+        .spawn(move || {
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            let _ = rustix::process::kill_process(
+                rustix::process::getpid(),
+                rustix::process::Signal::KILL,
+            );
+        })
+        .map(|_| ())
+        .map_err(|_| Failure::Internal)
 }
 fn verify_credentials(status: &str) -> Result<(), Failure> {
     let field = |key: &str| {
@@ -213,12 +244,12 @@ fn deliver(request: &Request) -> Result<(), Failure> {
     let host = target.host().to_owned();
     let address = resolve_before(deadline, move || {
         dns_lookup::lookup_host(&host)
-            .map_err(|_| Failure::Internal)?
+            .map_err(|_| Failure::Transport)?
             .find_map(|ip| match ip {
                 std::net::IpAddr::V4(ip) => Some(ip),
                 std::net::IpAddr::V6(_) => None,
             })
-            .ok_or(Failure::Internal)
+            .ok_or(Failure::Transport)
     })?;
     request.deadline()?; // before connect, including DNS/exec delays
     let socket = deadline_socket(deadline)?;
@@ -236,14 +267,15 @@ fn deliver(request: &Request) -> Result<(), Failure> {
     };
     let bytes =
         probe::linux::exchange_status_socket(socket, &target, address, deadline, &before_request)
-            .map_err(|error| {
-            if matches!(error, crate::verdict::ProbeError::Timeout) {
-                Failure::Deadline
-            } else {
-                Failure::Internal
-            }
-        })?;
+            .map_err(|error| transport_failure(&error))?;
     status(&bytes)
+}
+fn transport_failure(error: &crate::verdict::ProbeError) -> Failure {
+    match error {
+        crate::verdict::ProbeError::Timeout => Failure::Deadline,
+        crate::verdict::ProbeError::Tls => Failure::Tls,
+        _ => Failure::Transport,
+    }
 }
 fn deadline_socket(deadline: Instant) -> Result<socket2::Socket, Failure> {
     use socket2::{Domain, Protocol, Socket, Type};
@@ -291,16 +323,13 @@ fn resolve_before<T: Send + 'static>(
 }
 
 fn status(bytes: &[u8]) -> Result<(), Failure> {
-    let line = bytes
-        .split(|b| *b == b'\r')
-        .next()
-        .ok_or(Failure::Internal)?;
+    let line = bytes.split(|b| *b == b'\r').next().ok_or(Failure::Http)?;
     if line.len() < 12
         || !matches!(&line[..9], b"HTTP/1.1 " | b"HTTP/1.0 ")
         || !line[9..12].iter().all(u8::is_ascii_digit)
         || (line.len() > 12 && line[12] != b' ')
     {
-        return Err(Failure::Internal);
+        return Err(Failure::Http);
     }
     if line[9] == b'2' {
         Ok(())
@@ -368,17 +397,28 @@ pub fn attempt(binary: &Path, request: &Request, identity: ProbeIdentity) -> Res
     let timeout = request
         .deadline()?
         .saturating_duration_since(Instant::now());
-    let output = crate::system::execute_input_command(command, &input, timeout).map_err(|e| {
-        if matches!(e, crate::system::ExecError::Timeout { .. }) {
-            Failure::Deadline
-        } else {
-            Failure::Internal
-        }
-    })?;
-    match output.status {
+    let output = crate::system::execute_input_command(command, &input, timeout).map_err(
+        |error| match error {
+            crate::system::ExecError::Timeout { .. } => Failure::Deadline,
+            crate::system::ExecError::Spawn(_) => Failure::Exec,
+            _ => Failure::Internal,
+        },
+    )?;
+    if output.status.is_none() && monotonic_ns() >= request.deadline_ns {
+        return Err(Failure::Deadline);
+    }
+    child_status(output.status)
+}
+fn child_status(status: Option<i32>) -> Result<(), Failure> {
+    match status {
         Some(0) => Ok(()),
         Some(20) => Err(Failure::Http),
         Some(21) => Err(Failure::Deadline),
+        Some(23) => Err(Failure::Account),
+        Some(24) => Err(Failure::Tls),
+        Some(25) => Err(Failure::Transport),
+        Some(26) => Err(Failure::Exec),
+        Some(27) => Err(Failure::Secret),
         _ => Err(Failure::Internal),
     }
 }
@@ -415,6 +455,80 @@ pub fn retry_deadline(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn distinct_failures_survive_child_exit_and_remain_value_free() {
+        for failure in [
+            Failure::Http,
+            Failure::Deadline,
+            Failure::Internal,
+            Failure::Account,
+            Failure::Tls,
+            Failure::Transport,
+            Failure::Exec,
+            Failure::Secret,
+        ] {
+            assert_eq!(
+                child_status(Some(i32::from(failure.exit_code()))),
+                Err(failure)
+            );
+            assert!(!failure.to_string().contains("private"));
+        }
+        assert_eq!(
+            transport_failure(&crate::verdict::ProbeError::Tls),
+            Failure::Tls
+        );
+        assert_eq!(
+            transport_failure(&crate::verdict::ProbeError::io("private")),
+            Failure::Transport
+        );
+        assert_eq!(
+            transport_failure(&crate::verdict::ProbeError::Timeout),
+            Failure::Deadline
+        );
+    }
+    #[test]
+    fn missing_executable_is_an_exec_failure() {
+        let request = Request::new(
+            "https://heartbeat.invalid/private",
+            monotonic_ns() + 5_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(
+            attempt(
+                Path::new("/nonexistent-scupper-delivery"),
+                &request,
+                ProbeIdentity {
+                    uid: 65534,
+                    gid: 65534
+                }
+            ),
+            Err(Failure::Exec)
+        );
+    }
+    #[test]
+    #[ignore = "subprocess fixture kills itself"]
+    fn deadline_kill_fixture() {
+        arm_deadline_kill(Instant::now() + Duration::from_millis(50)).unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+    #[test]
+    fn child_timer_kills_without_parent_supervision() {
+        use std::os::unix::process::ExitStatusExt;
+        let before = Instant::now();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "heartbeat::tests::deadline_kill_fixture",
+            ])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(status.signal(), Some(9));
+        assert!(before.elapsed() < Duration::from_secs(2));
+    }
     #[test]
     fn child_checks_all_ids_groups_and_live_capabilities() {
         let status = "Uid: 99 99 99 99\nGid: 98 98 98 98\nGroups:\nCapInh: 0\nCapPrm: 0\nCapEff: 0\nCapAmb: 0\nNoNewPrivs: 1\n";
@@ -476,7 +590,7 @@ mod tests {
             b"private-path",
             b"HTTP/1.1 2xx",
         ] {
-            assert_eq!(status(bytes), Err(Failure::Internal));
+            assert_eq!(status(bytes), Err(Failure::Http));
         }
     }
 }
