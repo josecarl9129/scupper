@@ -184,8 +184,7 @@ jobs:
       fail-fast: false
       matrix:
         shard: [1, 2, 3, 4]
-        # Lab branches run one runner to save CI minutes; main runs both.
-        runner: ${{ startsWith(github.ref, 'refs/heads/lab/') && fromJSON('["ubuntu-24.04"]') || fromJSON('["ubuntu-24.04", "ubuntu-22.04"]') }}
+        runner: [ubuntu-24.04, ubuntu-22.04]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 100
     steps:
@@ -234,7 +233,7 @@ jobs:
       fail-fast: false
       matrix:
         mutation: [M-src, M-ct, M-out, M-probe]
-        runner: ${{ startsWith(github.ref, 'refs/heads/lab/') && fromJSON('["ubuntu-24.04"]') || fromJSON('["ubuntu-24.04", "ubuntu-22.04"]') }}
+        runner: [ubuntu-24.04, ubuntu-22.04]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
     steps:
