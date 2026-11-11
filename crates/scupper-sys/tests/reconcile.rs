@@ -417,6 +417,22 @@ fn fs8_disconnect_durable_and_closed_before_ack() {
     assert_eq!(model.links["ex-ch1"].up, Known::Value(false));
     rig.restart();
     assert_eq!(rig.store.state().selection, Selection::Disconnected);
+    // A disconnected restart must keep completing ticks without attempting a
+    // forbidden reopen; complete ticks authorize status-code heartbeats.
+    for _ in 0..4 {
+        let report = rig.tick();
+        assert!(report.complete, "{report:?}");
+        assert_eq!(report.failures.len(), 0, "{:?}", report.failures);
+        assert!(
+            !report
+                .steps
+                .iter()
+                .any(|step| matches!(step, Step::ForwardingOn { .. }))
+        );
+        let model = rig.kernel.model();
+        assert_eq!(model.forwarding_v4, Known::Value(0));
+        assert_eq!(model.forwarding_v6, Known::Value(0));
+    }
 }
 fn foreign(model: &mut KernelModel) {
     let mut link = KernelModel::desired(&desired()).links["wg0"].clone();

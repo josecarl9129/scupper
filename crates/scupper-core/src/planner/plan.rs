@@ -773,7 +773,8 @@ impl Builder<'_> {
         closed.forwarding_v4 = Known::Value(0);
         closed.forwarding_v6 = Known::Value(0);
         closed.client_forwarding_v4 = Known::Value(0);
-        self.model.latch.is_none()
+        !self.desired.disconnected
+            && self.model.latch.is_none()
             && self.model.ruleset == Known::Value(Ruleset::Verified(self.desired.fingerprint))
             && safe(&closed, self.desired)
     }

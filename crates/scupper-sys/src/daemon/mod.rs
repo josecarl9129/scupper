@@ -666,6 +666,10 @@ impl Runtime<'_> {
             };
             if !dry_run {
                 self.heartbeat.drain_checks();
+                self.heartbeat.report_events(
+                    &self.audit.handle(),
+                    self.running.as_ref().map(|(_, _, cfg)| cfg.stamp.version),
+                );
             }
             if !dry_run {
                 self.begin_operation(scupper_proto::OperationKind::Apply, target);
@@ -886,6 +890,10 @@ impl DaemonDeps for Runtime<'_> {
     }
     fn abandon_probes(&mut self) {
         self.heartbeat.drain_checks();
+        self.heartbeat.report_events(
+            &self.audit.handle(),
+            self.running.as_ref().map(|(_, _, cfg)| cfg.stamp.version),
+        );
         self.probes = probes::Probes::new(self.options.probe_binary.clone(), Instant::now())
             .with_uplink(uplink_addresses(self.system).unwrap_or_default());
     }

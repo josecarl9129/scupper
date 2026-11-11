@@ -31,9 +31,21 @@ pub enum Failure {
     /// Child could not be executed.
     #[error("heartbeat child exec failed")]
     Exec,
-    /// Certificate verification or TLS handshake failed.
+    /// TLS protocol failure other than certificate verification.
     #[error("heartbeat TLS handshake failed")]
     Tls,
+    /// Current `TCP_INFO/RTO` could not be read before a write.
+    #[error("heartbeat TCP_INFO/RTO read failed")]
+    RtoRead,
+    /// A socket write lacked the required retransmission margin.
+    #[error("heartbeat write refused by deadline/RTO rule")]
+    WriteRefused,
+    /// Connection reset or broken by the peer.
+    #[error("heartbeat connection reset")]
+    Reset,
+    /// Peer certificate or certificate verification failed.
+    #[error("heartbeat certificate/verification failed")]
+    Certificate,
     /// DNS, connect or socket transport failed.
     #[error("heartbeat network transport failed")]
     Transport,
@@ -57,6 +69,10 @@ impl Failure {
             Self::Transport => 25,
             Self::Exec => 26,
             Self::Secret => 27,
+            Self::RtoRead => 28,
+            Self::WriteRefused => 29,
+            Self::Reset => 30,
+            Self::Certificate => 31,
         }
     }
 }
@@ -171,8 +187,6 @@ pub fn monotonic_ns() -> u64 {
 /// # Errors
 /// All failures are closed, value-free categories.
 pub fn child(input: impl Read) -> Result<(), Failure> {
-    let request = Request::read(input)?;
-    let deadline = request.deadline()?;
     if rustix::process::geteuid().is_root() || rustix::process::getegid().is_root() {
         return Err(Failure::Account);
     }
@@ -187,6 +201,8 @@ pub fn child(input: impl Read) -> Result<(), Failure> {
     rustix::thread::set_no_new_privs(true).map_err(|_| Failure::Internal)?;
     rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
         .map_err(|_| Failure::Internal)?;
+    let request = Request::read(input)?;
+    let deadline = request.deadline()?;
     let credentials = std::fs::read_to_string("/proc/self/status").map_err(|_| Failure::Account)?;
     verify_credentials(&credentials)?;
     arm_deadline_kill(deadline)?;
@@ -274,6 +290,10 @@ fn transport_failure(error: &crate::verdict::ProbeError) -> Failure {
     match error {
         crate::verdict::ProbeError::Timeout => Failure::Deadline,
         crate::verdict::ProbeError::Tls => Failure::Tls,
+        crate::verdict::ProbeError::Certificate => Failure::Certificate,
+        crate::verdict::ProbeError::RtoRead => Failure::RtoRead,
+        crate::verdict::ProbeError::WriteRefused => Failure::WriteRefused,
+        crate::verdict::ProbeError::ConnectionReset => Failure::Reset,
         _ => Failure::Transport,
     }
 }
@@ -419,6 +439,10 @@ fn child_status(status: Option<i32>) -> Result<(), Failure> {
         Some(25) => Err(Failure::Transport),
         Some(26) => Err(Failure::Exec),
         Some(27) => Err(Failure::Secret),
+        Some(28) => Err(Failure::RtoRead),
+        Some(29) => Err(Failure::WriteRefused),
+        Some(30) => Err(Failure::Reset),
+        Some(31) => Err(Failure::Certificate),
         _ => Err(Failure::Internal),
     }
 }
@@ -466,6 +490,10 @@ mod tests {
             Failure::Transport,
             Failure::Exec,
             Failure::Secret,
+            Failure::RtoRead,
+            Failure::WriteRefused,
+            Failure::Reset,
+            Failure::Certificate,
         ] {
             assert_eq!(
                 child_status(Some(i32::from(failure.exit_code()))),
@@ -485,6 +513,60 @@ mod tests {
             transport_failure(&crate::verdict::ProbeError::Timeout),
             Failure::Deadline
         );
+    }
+    #[test]
+    fn transport_causes_survive_delivery_mapping() {
+        for (error, failure) in [
+            (crate::verdict::ProbeError::RtoRead, Failure::RtoRead),
+            (
+                crate::verdict::ProbeError::WriteRefused,
+                Failure::WriteRefused,
+            ),
+            (crate::verdict::ProbeError::ConnectionReset, Failure::Reset),
+            (
+                crate::verdict::ProbeError::Certificate,
+                Failure::Certificate,
+            ),
+        ] {
+            assert_eq!(transport_failure(&error), failure);
+        }
+    }
+    #[test]
+    #[ignore = "isolated process changes irreversible hardening settings"]
+    fn hardened_stdin_fixture() {
+        struct InspectInput(bool);
+        impl Read for InspectInput {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                let limits = rustix::process::getrlimit(rustix::process::Resource::Core);
+                assert_eq!(limits.current, Some(0));
+                assert_eq!(limits.maximum, Some(0));
+                assert_eq!(
+                    rustix::process::dumpable_behavior().unwrap(),
+                    rustix::process::DumpableBehavior::NotDumpable
+                );
+                assert!(rustix::thread::no_new_privs().unwrap());
+                self.0 = true;
+                Err(std::io::ErrorKind::UnexpectedEof.into())
+            }
+        }
+        if rustix::process::geteuid().is_root() || rustix::process::getegid().is_root() {
+            return; // Root delivery is rejected before any input is read.
+        }
+        let mut input = InspectInput(false);
+        assert_eq!(child(&mut input), Err(Failure::Internal));
+        assert!(input.0);
+    }
+    #[test]
+    fn delivery_hardens_before_first_secret_input_read() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "heartbeat::tests::hardened_stdin_fixture",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
     #[test]
     fn missing_executable_is_an_exec_failure() {

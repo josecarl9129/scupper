@@ -453,6 +453,11 @@ impl DaemonGuard<'_> {
                 let _lease = scupper_sys::lock::SupervisorLease::try_acquire(&run)?;
                 let _writer = scupper_sys::lock::WriterLock::try_acquire(&run)?;
                 if run.join("control.sock").exists() {
+                    // SIGKILL leaves the pathname. Both leases are held; use
+                    // production validation to reclaim only a dead owned socket.
+                    drop(scupper_sys::daemon::control::Server::bind(&run)?);
+                }
+                if run.join("control.sock").exists() {
                     return fail("daemon cleanup left control socket");
                 }
                 self.lab.cmd("scupper", "conntrack", &["-F"])?;

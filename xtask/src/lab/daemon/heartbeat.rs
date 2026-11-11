@@ -544,7 +544,6 @@ impl DaemonGuard<'_> {
         Ok(())
     }
     fn late_request_deadline(&mut self, root: &Path) -> Result<()> {
-        rustix::process::set_child_subreaper(Some(rustix::process::getpid()))?;
         let hold = root.join("heartbeat-request-pause");
         fs::write(&hold, b"wait for handshake")?;
         fs::set_permissions(&hold, fs::Permissions::from_mode(0o666))?;
@@ -618,8 +617,6 @@ impl DaemonGuard<'_> {
         Ok(())
     }
     fn orphan_deadline(&mut self, root: &Path, stopped: bool) -> Result<()> {
-        // Adopt the orphan so the unconditional guard can reap it.
-        rustix::process::set_child_subreaper(Some(rustix::process::getpid()))?;
         let run = root.join("run/scupper");
         let hold = root.join("heartbeat-request-pause");
         fs::write(&hold, b"wait for handshake")?;
@@ -722,7 +719,8 @@ impl DaemonGuard<'_> {
     }
 }
 // Installed as soon as the child is identified, before any assertion or STOP.
-// Every unwind/error path resumes, kills the entire group, and reaps the orphan.
+// Every error path resumes and kills the group. Init reaps orphans; a direct
+// child is reaped here. Do not adopt unrelated daemon/probe descendants.
 struct DeliveryGuard(rustix::process::Pid);
 impl DeliveryGuard {
     fn new(pid: u32) -> Result<Self> {
@@ -735,9 +733,22 @@ impl Drop for DeliveryGuard {
     fn drop(&mut self) {
         let _ = rustix::process::kill_process_group(self.0, Signal::CONT);
         let _ = rustix::process::kill_process_group(self.0, Signal::KILL);
-        while let Err(rustix::io::Errno::INTR) =
-            rustix::process::waitpid(Some(self.0), rustix::process::WaitOptions::empty())
-        {}
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match rustix::process::waitpid(Some(self.0), rustix::process::WaitOptions::NOHANG) {
+                Ok(Some(_)) => return,
+                Err(rustix::io::Errno::INTR) => continue,
+                _ => {}
+            }
+            if !Path::new(&format!("/proc/{}", self.0)).exists() {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                eprintln!("delivery cleanup: process still present after group kill");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 

@@ -32,9 +32,21 @@ pub enum ProbeError {
     /// The observation did not complete within its deadline.
     #[error("probe timed out")]
     Timeout,
-    /// TLS handshake or peer certificate verification failed.
+    /// TLS protocol failed, independently of certificate verification.
     #[error("probe TLS handshake failed")]
     Tls,
+    /// Peer certificate or certificate verification failed.
+    #[error("probe certificate verification failed")]
+    Certificate,
+    /// The current TCP retransmission timeout could not be read.
+    #[error("probe TCP_INFO/RTO read failed")]
+    RtoRead,
+    /// A write was refused because the deadline lacks retransmission margin.
+    #[error("probe write refused by deadline/RTO rule")]
+    WriteRefused,
+    /// The peer reset or broke the connection.
+    #[error("probe connection reset")]
+    ConnectionReset,
     /// The observation command failed before producing usable output.
     #[error("probe exited unsuccessfully ({}){}", exit_code(*.code), stderr_diagnostic(.stderr))]
     ExitStatus {

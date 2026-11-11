@@ -719,6 +719,28 @@ impl DaemonGuard<'_> {
                     .as_ref()
                     .ok_or("daemon missing")?
                     .signal(Signal::CONT);
+                self.lab.daemon_wait(
+                    "L10 fresh tick after SIGCONT",
+                    Duration::from_secs(10),
+                    |_| {
+                        use scupper_proto::{Op, OpResult, Response};
+                        use scupper_sys::daemon::control;
+                        Ok(matches!(
+                            control::call(
+                                &root.join("run/scupper"),
+                                &control::request(Op::Ping {}),
+                                Duration::from_millis(250)
+                            ),
+                            Ok(Response {
+                                result: Ok(OpResult::Ping {
+                                    last_complete_iteration_age: Some(0..=2),
+                                    ..
+                                }),
+                                ..
+                            })
+                        ))
+                    },
+                )?;
                 self.expect_check(&root, 0, None, "continued")?;
                 self.wait_heartbeat(heartbeat_before)?;
                 self.heartbeat_cadence_control()?;

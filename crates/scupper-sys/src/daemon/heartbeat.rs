@@ -15,6 +15,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+// Detached checks retain only a completion handle; at most this many may live.
+const MAX_DETACHED_CHECKS: usize = 4;
+
 struct Checked {
     at: Instant,
     version: u64,
@@ -31,6 +34,8 @@ pub(super) struct Heartbeat {
     sending_deadline: Option<Instant>,
     last_send: Option<Instant>,
     workers: Vec<std::thread::JoinHandle<()>>,
+    detached: Vec<std::thread::JoinHandle<()>>,
+    pending_detached: usize,
     last_stale: Option<Instant>,
     pub(super) last_success: Option<Instant>,
 }
@@ -53,6 +58,7 @@ impl Heartbeat {
         }
         let Some(context) = context else {
             self.abandon_check();
+            self.detach_workers();
             return None;
         };
         if let Some(checked) = self.checked() {
@@ -120,6 +126,10 @@ impl Heartbeat {
         );
         if self.check.is_none() && self.sending.is_none() && due {
             self.check_at = Some(now);
+            self.detached.retain(|worker| !worker.is_finished());
+            if self.detached.len() >= MAX_DETACHED_CHECKS {
+                return Some(Work::WorkerLimit);
+            }
             return Some(Work::Check);
         }
         None
@@ -135,6 +145,7 @@ impl Heartbeat {
                 .is_some_and(|at| now >= at + Duration::from_secs(10));
         if check_stuck {
             self.abandon_check();
+            self.detach_workers();
         }
         if send_stuck {
             self.sending = None;
@@ -151,10 +162,21 @@ impl Heartbeat {
         loop {
             self.workers.retain(|worker| !worker.is_finished());
             if self.workers.is_empty() || Instant::now() >= deadline {
-                self.workers.clear();
+                self.detach_workers();
                 return;
             }
             std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    fn detach_workers(&mut self) {
+        self.workers.retain(|worker| !worker.is_finished());
+        self.detached.retain(|worker| !worker.is_finished());
+        self.pending_detached += self.workers.len();
+        self.detached.append(&mut self.workers);
+    }
+    pub(super) fn report_events(&mut self, log: &crate::events::LogHandle, version: Option<u64>) {
+        for _ in 0..std::mem::take(&mut self.pending_detached) {
+            let _ = log.emit(EventKind::HeartbeatCheckDetached {}, Actor::Daemon, version);
         }
     }
     fn checked(&mut self) -> Option<Checked> {
@@ -199,6 +221,7 @@ struct Context<'a> {
 }
 enum Work {
     Check,
+    WorkerLimit,
     Stale,
     Send { suffix: String, deadline: Instant },
 }
@@ -212,6 +235,10 @@ fn failure_event(failure: Failure) -> EventKind {
         Failure::Exec => Reason::HeartbeatExec,
         Failure::Tls => Reason::HeartbeatTls,
         Failure::Transport => Reason::HeartbeatTransport,
+        Failure::RtoRead => Reason::HeartbeatRtoRead,
+        Failure::WriteRefused => Reason::HeartbeatWriteRefused,
+        Failure::Reset => Reason::HeartbeatReset,
+        Failure::Certificate => Reason::HeartbeatCertificate,
     };
     EventKind::HeartbeatFailed { reason }
 }
@@ -242,7 +269,20 @@ impl Runtime<'_> {
         let work = self
             .heartbeat
             .iteration(now, self.origin, complete, context);
+        self.heartbeat.report_events(
+            &self.audit.handle(),
+            self.running.as_ref().map(|(_, _, cfg)| cfg.stamp.version),
+        );
         match work {
+            Some(Work::WorkerLimit) => {
+                let _ = self.audit.handle().emit(
+                    EventKind::HeartbeatSkipped {
+                        reason: Reason::HeartbeatWorkerLimit,
+                    },
+                    Actor::Daemon,
+                    self.running.as_ref().map(|(_, _, cfg)| cfg.stamp.version),
+                );
+            }
             Some(Work::Stale) => {
                 eprintln!("scupperd: info: heartbeat skipped: stale verdict");
                 let _ = self.audit.handle().emit(
@@ -462,6 +502,92 @@ mod tests {
         assert!(state.check.is_none());
     }
     #[test]
+    fn detached_checks_are_bounded_audited_and_capacity_recovers() {
+        use crate::events::{EventLog, read_since};
+        use scupper_core::config::GatewayId;
+        use scupper_proto::UnixSeconds;
+        let root =
+            std::env::temp_dir().join(format!("heartbeat-worker-cap-{}", std::process::id()));
+        let log = EventLog::open(&root, GatewayId("gw1".into()), || UnixSeconds(1)).unwrap();
+        let origin = Instant::now();
+        let mut state = Heartbeat::default();
+        let cfg = settings("ok_only", 10);
+        let mut release = Vec::new();
+        for i in 0..MAX_DETACHED_CHECKS {
+            let now = origin + Duration::from_secs(u64::try_from(i).unwrap() * 60);
+            assert!(matches!(
+                state.iteration(now, origin, true, Some(context(&cfg))),
+                Some(Work::Check)
+            ));
+            let (send, recv) = mpsc::channel();
+            state.workers.push(std::thread::spawn(move || {
+                let _ = recv.recv();
+            }));
+            release.push(send);
+            let (_send, recv) = mpsc::sync_channel(1);
+            state.check = Some(recv);
+            if i % 2 == 0 {
+                assert_eq!(
+                    state.expire(now + Duration::from_secs(40)),
+                    Some(Failure::Deadline)
+                );
+            } else {
+                state.drain_checks();
+            }
+            assert_eq!(state.detached.len(), i + 1);
+            state.report_events(&log.handle, Some(1));
+        }
+        let now = origin + Duration::from_secs(300);
+        assert!(matches!(
+            state.iteration(now, origin, true, Some(context(&cfg))),
+            Some(Work::WorkerLimit)
+        ));
+        assert!(state.check.is_none());
+        assert!(
+            state
+                .iteration(
+                    now + Duration::from_secs(1),
+                    origin,
+                    true,
+                    Some(context(&cfg))
+                )
+                .is_none()
+        );
+        // Re-reporting never duplicates detach events.
+        state.report_events(&log.handle, Some(1));
+        log.handle.flush_blocking(Duration::from_secs(2)).unwrap();
+        let events: Vec<_> = read_since(&root, 0, None).map(Result::unwrap).collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.kind, EventKind::HeartbeatCheckDetached {}))
+                .count(),
+            MAX_DETACHED_CHECKS
+        );
+        release.remove(0).send(()).unwrap();
+        let finished_by = Instant::now() + Duration::from_secs(2);
+        while !state.detached[0].is_finished() {
+            assert!(Instant::now() < finished_by);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(matches!(
+            state.iteration(
+                now + Duration::from_secs(10),
+                origin,
+                true,
+                Some(context(&cfg))
+            ),
+            Some(Work::Check)
+        ));
+        assert_eq!(state.detached.len(), MAX_DETACHED_CHECKS - 1);
+        drop(release);
+        for worker in state.detached {
+            worker.join().unwrap();
+        }
+        drop(log);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     #[cfg(feature = "testing")]
     #[allow(clippy::too_many_lines)] // Complete scheduler and worker fault fixture.
     fn fake_kernel_stuck_worker_drains_before_charge_and_rebuild_continues() {
@@ -650,7 +776,7 @@ mod tests {
                     send.send(Ok(now)).unwrap();
                     assert_eq!(state.collect(), None);
                 }
-                Some(Work::Stale) | None => {}
+                Some(Work::Stale | Work::WorkerLimit) | None => {}
             }
         }
         assert!(sends.len() >= 9);
@@ -772,6 +898,10 @@ mod tests {
             (Failure::Http, Reason::HeartbeatHttp),
             (Failure::Transport, Reason::HeartbeatTransport),
             (Failure::Internal, Reason::ExecutionFailed),
+            (Failure::RtoRead, Reason::HeartbeatRtoRead),
+            (Failure::WriteRefused, Reason::HeartbeatWriteRefused),
+            (Failure::Reset, Reason::HeartbeatReset),
+            (Failure::Certificate, Reason::HeartbeatCertificate),
         ] {
             assert_eq!(
                 failure_event(failure),

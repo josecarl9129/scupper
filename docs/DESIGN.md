@@ -1935,17 +1935,24 @@ deadline. Stuck checks after 40 s and deliveries 10 s past their deadline emit
 `HeartbeatFailed` and release their receiver, permitting another cycle. Before
 rebuild or apply, check workers get at most 50 ms to finish. A stuck read-only
 worker is detached and its receiver closed; its late verdict cannot authorize a
-send or veto repair. The drain runs before the scheduler charges the boot attempt.
+send or veto repair. Each detachment emits `HeartbeatCheckDetached`. Completion
+handles remain tracked until exit; at most four detached checks may remain live.
+While that cap is occupied, no new heartbeat check starts, and each due attempt
+emits `HeartbeatSkipped` with reason `HeartbeatWorkerLimit` (at most once per
+configured interval). The drain runs before the scheduler charges the boot attempt.
 Healthy verdicts rejected as stale emit the informational `HeartbeatSkipped`
 event with reason `Stale`, at most once per minute.
 
 Delivery uses HTTPS GET rather than HEAD. Child exit codes are 20 (HTTP
 non-2xx or malformed response), 21 (deadline/timeout), 22 (internal/protocol),
-23 (identity), 24 (TLS), 25 (network transport), 26 (exec), and 27 (secret); 0 is
+23 (identity), 24 (other TLS protocol failure), 25 (network transport), 26 (exec),
+27 (secret), 28 (TCP_INFO/RTO read failure), 29 (write refused by deadline/RTO
+rule), 30 (connection reset) and 31 (certificate/verification failure); 0 is
 success. Events and daemon stderr preserve these value-free failure categories.
 Status includes `heartbeat_last_success_age`. URL secret files accept exactly
-one trailing newline, with no other whitespace trimming. After parsing the
-secret stdin request and rejecting expired jobs, the child checks all
+one trailing newline, with no other whitespace trimming. Before reading any
+secret stdin bytes, the child disables core dumps, sets NoNewPrivs and becomes
+NotDumpable. After parsing the request and rejecting expired jobs, it checks all
 real/effective/saved/filesystem IDs through Linux procfs (the safe getresuid/getresgid equivalent available here),
 empty supplementary groups, empty inheritable/permitted/effective/ambient
 capability sets and NoNewPrivs. Its inherited capability bounding mask can remain
