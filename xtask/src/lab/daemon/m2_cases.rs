@@ -671,8 +671,7 @@ impl DaemonGuard<'_> {
         self.notify
             .as_ref()
             .ok_or("notify")?
-            .boundary(true, "deliberate SIGSTOP")?;
-        self.child.as_mut().ok_or("daemon")?.signal(Signal::STOP);
+            .freeze_process(self.child.as_ref().ok_or("daemon")?, true)?;
         self.lab.cmd(
             "scupper",
             "wg",
@@ -764,8 +763,7 @@ impl DaemonGuard<'_> {
         self.notify
             .as_ref()
             .ok_or("notify")?
-            .boundary(false, "SIGCONT")?;
-        self.child.as_mut().ok_or("daemon")?.signal(Signal::CONT);
+            .freeze_process(self.child.as_ref().ok_or("daemon")?, false)?;
         self.lab.daemon_complete_tick(root)
     }
     #[allow(clippy::too_many_lines)] // Keep daemon-down loss, gap evidence and recovery adjacent.
@@ -833,8 +831,10 @@ impl DaemonGuard<'_> {
         self.lab.wait_provider()?;
         self.lab.boot_sysctls()?;
         if case == "L18" {
-            self.lab
-                .daemon_sysctl_fixture(self.child.as_mut().ok_or("daemon")?)?;
+            self.lab.daemon_sysctl_fixture(
+                self.child.as_mut().ok_or("daemon")?,
+                self.notify.as_ref().ok_or("notify")?,
+            )?;
         }
         canary.stop(Signal::TERM)?;
         Ok(())

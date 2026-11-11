@@ -1438,7 +1438,8 @@ fn adopting_a_disconnect_closes_routes_before_exits_and_reconnect_opens_exits_be
     drop(calls);
     f.state(|s| s.selection = Selection::Auto);
     f.kernel.calls.borrow_mut().clear();
-    assert!(f.run(None).succeeded());
+    let reconnect = f.run(None);
+    assert!(reconnect.succeeded() && !reconnect.adopted, "{reconnect:?}");
     let calls = f.kernel.calls.borrow();
     let up = calls
         .iter()

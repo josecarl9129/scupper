@@ -30,7 +30,7 @@ impl Watchdog {
     pub fn boundary(&mut self, now: Instant, paused: bool, reason: &'static str) {
         self.observe(now, false);
         self.paused = paused;
-        self.last = None;
+        self.last = if paused { None } else { Some(now) };
         self.boundaries.push((reason, paused));
     }
     pub fn evidence(&self) -> serde_json::Value {
@@ -73,6 +73,21 @@ mod tests {
         clock.ready(now);
         clock.ready(now + Duration::from_secs(29));
         clock.observe(now + Duration::from_secs(30), false);
+        assert!(clock.check().is_err());
+    }
+
+    #[test]
+    fn silence_after_resume_fails_with_a_fresh_deadline() {
+        let now = Instant::now();
+        let mut clock = Watchdog::default();
+        clock.ready(now);
+        clock.boundary(now + Duration::from_secs(1), true, "SIGSTOP");
+        clock.observe(now + Duration::from_secs(90), false);
+        let resumed = now + Duration::from_secs(91);
+        clock.boundary(resumed, false, "SIGCONT");
+        clock.observe(resumed + Duration::from_millis(29_999), false);
+        clock.check().unwrap();
+        clock.observe(resumed + Duration::from_secs(30), false);
         assert!(clock.check().is_err());
     }
 

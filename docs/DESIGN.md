@@ -141,7 +141,8 @@ Phases: **S** steady state, **F** failover, **A** apply, **B** boot,
   provider dropping un-NATed packets (unverified, V-08).
 - B: no namespace exists before `scupper boot`. Boot order: netns →
   forwarding 0 → hardening sysctls → ruleset → verify → links → routes →
-  forwarding 1. A crash leaves a prefix; every prefix is closed.
+  forwarding 1 unless latched or Disconnected. A crash leaves a prefix;
+  every prefix is closed.
 - D: the data path is kernel objects only. With scupperd dead, failover stops;
   if the active exit dies, packets wait inside its WireGuard interface (no
   handshake, nothing sent). With edge dead, DNS fails (closed).
@@ -2287,7 +2288,7 @@ that later releases may not change incompatibly.
    `DeployRollback`), as `config rollback` does.
 4. Start `scupperd`; it converges with the ordered planner (every prefix
    safe); a ruleset change goes through forwarding 0 → load → verify →
-   forwarding 1, so a failed load stays closed.
+   forwarding 1 unless latched or Disconnected, so a failed load stays closed.
 5. Start edge; emit `DeployRolledBack{id, reason}`; alert.
 A failure at any step leaves the gateway closed and alerting; the heartbeat
 reflects the verdict. A first deploy to a fresh host (nothing to roll back
@@ -2664,7 +2665,7 @@ still execute after a client hangs up because they only tighten policy.
 | All exits dead | fail closed | as above | route unreachable; alert via uplink; recover after qualification |
 | Probe targets down | none on the data path | common-mode rule | 3, alert, no switch |
 | Provider DNS down | client DNS fails | path probes, DNS self-test | 3; common mode if on all exits |
-| Netns ruleset flushed or changed | NAT, isolation, DNS forcing lost; no uplink leak | fingerprint ≤ 2 s | forwarding 0, reload, verify, conntrack flush, forwarding 1 |
+| Netns ruleset flushed or changed | NAT, isolation, DNS forcing lost; no uplink leak | fingerprint ≤ 2 s | forwarding 0, reload, verify, conntrack flush, forwarding 1 unless latched or Disconnected |
 | Netns route changed or deleted | clients cut or on another exit | route compare | restore |
 | Foreign link or tc in netns | possible path among tunnels | link/tc scan | down / delete; check 2; alert |
 | Netns name deleted (`ip netns del`) while edge runs | namespace, links and routes survive and keep forwarding via exits | stat vs held inode | re-mount from held fd; no rebuild |

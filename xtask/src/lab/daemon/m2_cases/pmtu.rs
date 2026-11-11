@@ -153,8 +153,7 @@ impl DaemonGuard<'_> {
         self.notify
             .as_ref()
             .ok_or("notify")?
-            .boundary(true, "deliberate SIGSTOP")?;
-        self.child.as_mut().ok_or("daemon")?.signal(Signal::STOP);
+            .freeze_process(self.child.as_ref().ok_or("daemon")?, true)?;
         self.pmtu_v6_path()?;
         for reverse in [false, true] {
             self.pmtu_direction(stem, true, reverse)?;
@@ -163,8 +162,7 @@ impl DaemonGuard<'_> {
         self.notify
             .as_ref()
             .ok_or("notify")?
-            .boundary(false, "SIGCONT")?;
-        self.child.as_mut().ok_or("daemon")?.signal(Signal::CONT);
+            .freeze_process(self.child.as_ref().ok_or("daemon")?, false)?;
         self.lab.daemon_complete_tick(root)
     }
     fn pmtu_v6_path(&mut self) -> Result<()> {

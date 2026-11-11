@@ -89,7 +89,7 @@ fn startup_complete(
 }
 
 // Drain notifications continuously, including while fault commands or probes block.
-struct NotifyCapture {
+pub(super) struct NotifyCapture {
     messages: Arc<Mutex<Vec<String>>>,
     watchdog: Arc<Mutex<watchdog::Watchdog>>,
     evidence: std::path::PathBuf,
@@ -101,6 +101,43 @@ impl NotifyCapture {
         let mut watchdog = self.watchdog.lock().map_err(|_| "watchdog lock poisoned")?;
         watchdog.boundary(Instant::now(), paused, reason);
         watchdog.check()
+    }
+    // Mark the whole shutdown intentional before the caller sends any signal.
+    fn stop(&self, signal: Signal, action: impl FnOnce() -> Result<()>) -> Result<()> {
+        let watched = self.boundary(
+            true,
+            if signal == Signal::KILL {
+                "SIGKILL"
+            } else {
+                "graceful stop"
+            },
+        );
+        // Cleanup must still reap the child if an earlier gap already failed.
+        action().and(watched)
+    }
+    fn freeze_process(&self, child: &Group, frozen: bool) -> Result<()> {
+        if frozen {
+            self.boundary(true, "deliberate SIGSTOP")?;
+            child.signal(Signal::STOP);
+            Ok(())
+        } else {
+            child.signal(Signal::CONT);
+            self.boundary(false, "SIGCONT")
+        }
+    }
+    pub(super) fn incomplete_tick(&self, root: &Path, frozen: bool) -> Result<()> {
+        let hook = root.join("run/scupper/incomplete-tick");
+        if frozen {
+            self.boundary(true, "intentional incomplete-tick")?;
+            fs::write(hook, b"hold")?;
+        } else {
+            match fs::remove_file(hook) {
+                Ok(()) => self.boundary(false, "tick recovery")?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
     }
     fn finish(mut self) -> Result<()> {
         self.stop.store(true, Ordering::Relaxed);
@@ -297,11 +334,12 @@ impl DaemonGuard<'_> {
         if before != self.lab.daemon_snapshot()? {
             return fail("daemon start changed healthy kernel state");
         }
-        self.child
-            .as_mut()
-            .ok_or("missing daemon")?
-            .stop_timeout(Signal::TERM, Duration::from_secs(30))?;
-        notify.boundary(true, "graceful stop")?;
+        notify.stop(Signal::TERM, || {
+            self.child
+                .as_mut()
+                .ok_or("missing daemon")?
+                .stop_timeout(Signal::TERM, Duration::from_secs(30))
+        })?;
         cleanup_control_socket(&root.join("run/scupper"), false)?;
         if before != self.lab.daemon_snapshot()? {
             return fail("SIGTERM changed healthy kernel state");
@@ -363,8 +401,9 @@ impl DaemonGuard<'_> {
         }
         super::mounts::verify_restored_peers(child.supervised_pid()?)?;
         let before = self.lab.daemon_snapshot()?;
-        child.stop_timeout(Signal::TERM, Duration::from_secs(30))?;
-        notify.boundary(true, "graceful stop")?;
+        notify.stop(Signal::TERM, || {
+            child.stop_timeout(Signal::TERM, Duration::from_secs(30))
+        })?;
         cleanup_control_socket(&root.join("run/scupper"), false)?;
         if before != self.lab.daemon_snapshot()? {
             return fail("SIGTERM changed kernel state");
@@ -440,8 +479,15 @@ impl DaemonGuard<'_> {
         })();
         let stopped = if let Some(mut child) = self.child.take() {
             self.deliberately_killed = false;
-            child.signal(Signal::CONT);
-            child.stop_timeout(Signal::TERM, Duration::from_secs(5))
+            let mut stop = || {
+                child.signal(Signal::CONT);
+                child.stop_timeout(Signal::TERM, Duration::from_secs(5))
+            };
+            if let Some(notify) = &self.notify {
+                notify.stop(Signal::TERM, stop)
+            } else {
+                stop()
+            }
         } else {
             Ok(())
         };
@@ -717,7 +763,9 @@ impl Lab {
         if code != 0 || report["verdict"].get("Protected").is_none() {
             return fail(format!("{stem} supervised retry: {code}: {report}"));
         }
-        child.stop_timeout(Signal::TERM, Duration::from_secs(30))?;
+        notify.stop(Signal::TERM, || {
+            child.stop_timeout(Signal::TERM, Duration::from_secs(30))
+        })?;
         cleanup_control_socket(&root.join("run/scupper"), false)?;
         notify.finish()?;
         save_event_artifacts(
@@ -885,13 +933,13 @@ impl Lab {
     // its lifetime around the entire trial, including restoration on failure.
     pub(super) fn meta_supervised<T>(
         &mut self,
-        trial: impl FnOnce(&mut Self, &Path) -> Result<T>,
+        trial: impl FnOnce(&mut Self, &Path, &NotifyCapture) -> Result<T>,
     ) -> Result<T> {
         let root = self.prepare_check_v2()?;
         let (mut child, notify) = self.daemon_start("L19-L3", &root)?;
         let result = self
             .daemon_ready_tick(&notify)
-            .and_then(|()| trial(self, &root))
+            .and_then(|()| trial(self, &root, &notify))
             .and_then(|value| {
                 let (code, report) = self.check_result(&Self::boot_binary()?, &root)?;
                 fs::write(
@@ -903,12 +951,10 @@ impl Lab {
                 }
                 Ok(value)
             });
-        let unfrozen = match fs::remove_file(root.join("run/scupper/incomplete-tick")) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
-        };
-        let stopped = child.stop_timeout(Signal::TERM, Duration::from_secs(30));
+        let unfrozen = notify.incomplete_tick(&root, false);
+        let stopped = notify.stop(Signal::TERM, || {
+            child.stop_timeout(Signal::TERM, Duration::from_secs(30))
+        });
         let saved = save_event_artifacts(
             &root.join("var-lib/scupper/events"),
             &self.artifacts.join("L19-L3-events"),
@@ -921,8 +967,13 @@ impl Lab {
         )
     }
 
-    pub(super) fn meta_resume(&mut self, root: &Path, prefix: &str) -> Result<()> {
-        fs::remove_file(root.join("run/scupper/incomplete-tick"))?;
+    pub(super) fn meta_resume(
+        &mut self,
+        root: &Path,
+        notify: &NotifyCapture,
+        prefix: &str,
+    ) -> Result<()> {
+        notify.incomplete_tick(root, false)?;
         self.daemon_wait(
             "L19 bridge route and rules repaired",
             Duration::from_secs(30),
@@ -1277,7 +1328,7 @@ impl Lab {
                     "forwarding_zero_ms={closed}; all_gates_zero_ms={all_closed}; restored_ms={restored}; conntrack_flush_event=true"
                 )
             }
-            "L13" => self.daemon_foreign(child, &mut markers, &stem, root)?,
+            "L13" => self.daemon_foreign(child, notify, &mut markers, &stem, root)?,
             "L16" => {
                 self.cmd("scupper", "ip", &["link", "set", "ex-ch1", "down"])?;
                 let down = self.daemon_wait("L16 unreachable", Duration::from_secs(8), |lab| {
@@ -1365,7 +1416,7 @@ impl Lab {
                 )
             }
             "L52" | "L52b" => {
-                child.signal(Signal::STOP);
+                notify.freeze_process(child, true)?;
                 let first_seq = read_since(&root.join("var-lib/scupper"), 0, None)
                     .filter_map(std::result::Result::ok)
                     .map(|event| event.seq)
@@ -1395,7 +1446,7 @@ impl Lab {
                     ));
                 }
                 let recovery = Instant::now();
-                child.signal(Signal::CONT);
+                notify.freeze_process(child, false)?;
                 let elapsed =
                     self.daemon_wait("extra route removed", Duration::from_secs(8), |lab| {
                         Ok(!lab
@@ -1442,7 +1493,7 @@ impl Lab {
                     case == "L52b"
                 )
             }
-            "V03" => self.daemon_sysctl_fixture(child)?,
+            "V03" => self.daemon_sysctl_fixture(child, notify)?,
             "L3" | "L4" => self.daemon_dead_flow(case, &mut markers, &stem)?,
             _ => return fail("unknown daemon case"),
         };
@@ -1526,11 +1577,12 @@ impl Lab {
     fn daemon_foreign(
         &mut self,
         child: &mut Group,
+        notify: &NotifyCapture,
         markers: &mut Vec<String>,
         stem: &str,
         root: &Path,
     ) -> Result<String> {
-        child.signal(Signal::STOP);
+        notify.freeze_process(child, true)?;
         self.cmd("gwhost", "sysctl", &["-q", "-w", "net.ipv4.ip_forward=1"])?;
         self.cmd(
             "gwhost",
@@ -1623,7 +1675,7 @@ impl Lab {
         let resumed_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos();
-        child.signal(Signal::CONT);
+        notify.freeze_process(child, false)?;
         let down = self.daemon_wait(
             "L13 foreign link down and redirect removed",
             Duration::from_secs(8),
@@ -1686,8 +1738,12 @@ impl Lab {
             start.elapsed().as_millis()
         ))
     }
-    fn daemon_sysctl_fixture(&mut self, child: &mut Group) -> Result<String> {
-        child.signal(Signal::STOP);
+    fn daemon_sysctl_fixture(
+        &mut self,
+        child: &mut Group,
+        notify: &NotifyCapture,
+    ) -> Result<String> {
+        notify.freeze_process(child, true)?;
         let before = self.daemon_sysctls()?;
         self.cmd("scupper", "sysctl", &["-q", "-w", "net.ipv4.ip_forward=0"])?;
         let zero = self.daemon_sysctls()?;
@@ -1720,7 +1776,7 @@ impl Lab {
                 ));
             }
         }
-        child.signal(Signal::CONT);
+        notify.freeze_process(child, false)?;
         let restored = self.daemon_wait(
             "V03 all hardening restored",
             Duration::from_secs(12),
@@ -2091,6 +2147,70 @@ pub(super) fn daemon_wanted(case: &str) -> &'static str {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graceful_stop_is_intentional_before_the_signal_and_wait() {
+        let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("notify-stop-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let (_send, receive) = UnixDatagram::pair().unwrap();
+        let capture = NotifyCapture::start(receive, &root.join("notify.jsonl")).unwrap();
+        let now = Instant::now();
+        capture.watchdog.lock().unwrap().ready(now);
+        capture
+            .stop(Signal::TERM, || {
+                // This callback sends the signal and waits in production. Even
+                // a full shutdown timeout must already be outside monitoring.
+                let mut clock = capture.watchdog.lock().unwrap();
+                clock.observe(now + Duration::from_secs(30), false);
+                assert_eq!(
+                    clock.evidence()["boundaries"],
+                    serde_json::json!([["graceful stop", true]])
+                );
+                clock.check()
+            })
+            .unwrap();
+        capture.finish().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incomplete_tick_helper_marks_l19_and_l50_freezes_and_rearms_on_removal() {
+        let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("notify-hook-{}", std::process::id()));
+        fs::create_dir_all(root.join("run/scupper")).unwrap();
+        let (_send, receive) = UnixDatagram::pair().unwrap();
+        let capture = NotifyCapture::start(receive, &root.join("notify.jsonl")).unwrap();
+        let now = Instant::now();
+        capture.watchdog.lock().unwrap().ready(now);
+        capture.incomplete_tick(&root, true).unwrap();
+        assert_eq!(
+            fs::read(root.join("run/scupper/incomplete-tick")).unwrap(),
+            b"hold"
+        );
+        {
+            let mut clock = capture.watchdog.lock().unwrap();
+            clock.observe(now + Duration::from_secs(90), false);
+            clock.check().unwrap();
+            assert_eq!(
+                clock.evidence()["boundaries"],
+                serde_json::json!([["intentional incomplete-tick", true]])
+            );
+        }
+        let before_removal = Instant::now();
+        capture.incomplete_tick(&root, false).unwrap();
+        let resumed = Instant::now();
+        assert!(!root.join("run/scupper/incomplete-tick").exists());
+        {
+            let mut clock = capture.watchdog.lock().unwrap();
+            clock.observe(before_removal + Duration::from_secs(29), false);
+            clock.check().unwrap();
+            clock.observe(resumed + Duration::from_secs(30), false);
+            assert!(clock.check().is_err());
+        }
+        assert!(capture.finish().is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn graceful_stop_never_reclaims_a_leftover_socket() {

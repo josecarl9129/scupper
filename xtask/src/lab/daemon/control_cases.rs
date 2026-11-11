@@ -13,7 +13,7 @@ use scupper_sys::{
     store::{MetaInput, VersionStore},
 };
 use sha2::{Digest, Sha256};
-use std::fmt::Write as _;
+use std::{fmt::Write as _, os::unix::fs::MetadataExt};
 
 /// Whether a verdict payload carries `reason`.
 ///
@@ -324,10 +324,10 @@ impl DaemonGuard<'_> {
                     scupper_proto::EventKind::Repair {
                         result: scupper_proto::Outcome::Failed,
                         ..
-                    }
+                    } | scupper_proto::EventKind::ApplyFailed { .. }
                 ) {
                     return fail(format!(
-                        "{} {stem}: repair failed after disconnect",
+                        "{} {stem}: repair or apply failed after disconnect",
                         self.case
                     ));
                 }
@@ -347,7 +347,7 @@ impl DaemonGuard<'_> {
                         .artifacts
                         .join(format!("{}-{stem}-iterations.json", self.case)),
                     serde_json::to_vec_pretty(
-                        &serde_json::json!({"completed":completed, "repair_failures":0, "forwarding":0}),
+                        &serde_json::json!({"completed":completed, "repair_failures":0, "apply_failures":0, "forwarding":0}),
                     )?,
                 )?;
                 return Ok(());
@@ -596,34 +596,47 @@ impl DaemonGuard<'_> {
     }
     pub(super) fn control_restart(&mut self, root: &Path, stage: &str) -> Result<()> {
         self.control_stop(Signal::TERM)?;
+        // Pin the killed daemon's socket inode so immediate inode reuse cannot
+        // make the replacement assertion ambiguous. Only the daemon reclaims it.
+        let pinned_socket = if self.deliberately_killed {
+            Some(fs::File::from(rustix::fs::open(
+                root.join("run/scupper/control.sock"),
+                rustix::fs::OFlags::PATH | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )?))
+        } else {
+            None
+        };
         if let Some(notify) = &self.notify {
             notify.drain()?;
             notify.boundary(false, "restart")?;
         }
-        self.deliberately_killed = false;
         self.child = Some(self.lab.daemon_spawn(&self.case, root, stage)?);
+        self.deliberately_killed = false;
         self.lab
-            .daemon_ready_tick(self.notify.as_ref().ok_or("missing notify")?)
+            .daemon_ready_tick(self.notify.as_ref().ok_or("missing notify")?)?;
+        if let Some(socket) = pinned_socket {
+            let old = socket.metadata()?;
+            let new = fs::symlink_metadata(root.join("run/scupper/control.sock"))?;
+            if (old.dev(), old.ino()) == (new.dev(), new.ino()) {
+                return fail("restarted daemon did not replace stale control socket");
+            }
+        }
+        Ok(())
     }
     pub(super) fn control_stop(&mut self, signal: Signal) -> Result<()> {
         if let Some(mut child) = self.child.take() {
             self.deliberately_killed = signal == Signal::KILL;
-            child.signal(Signal::CONT);
-            child.stop_timeout(signal, Duration::from_secs(30))?;
-            if let Some(notify) = &self.notify {
-                notify.boundary(
-                    true,
-                    if signal == Signal::KILL {
-                        "SIGKILL"
-                    } else {
-                        "graceful stop"
-                    },
-                )?;
+            self.notify
+                .as_ref()
+                .ok_or("missing notify")?
+                .stop(signal, || {
+                    child.signal(Signal::CONT);
+                    child.stop_timeout(signal, Duration::from_secs(30))
+                })?;
+            if !self.deliberately_killed {
+                super::cleanup_control_socket(&self.lab.boot_root.join("run/scupper"), false)?;
             }
-            super::cleanup_control_socket(
-                &self.lab.boot_root.join("run/scupper"),
-                self.deliberately_killed,
-            )?;
         }
         Ok(())
     }
@@ -799,8 +812,7 @@ impl DaemonGuard<'_> {
                 self.notify
                     .as_ref()
                     .ok_or("notify")?
-                    .boundary(true, "L10 intentional incomplete-tick watchdog expiry")?;
-                fs::write(root.join("run/scupper/incomplete-tick"), b"hold")?;
+                    .incomplete_tick(&root, true)?;
                 self.lab.runner.dwell(Duration::from_secs(32))?;
                 let (code, text) =
                     self.control_command(&root, &["check", "--json"], "responsive-stale")?;
@@ -808,22 +820,17 @@ impl DaemonGuard<'_> {
                     return fail(format!("L10 responsive stale supervisor: {code}: {text}"));
                 }
                 self.assert_heartbeat_quiet(Duration::ZERO, Duration::from_secs(5))?;
-                fs::remove_file(root.join("run/scupper/incomplete-tick"))?;
                 self.notify
                     .as_ref()
                     .ok_or("notify")?
-                    .boundary(false, "L10 tick recovery")?;
+                    .incomplete_tick(&root, false)?;
                 self.lab.runner.dwell(Duration::from_secs(3))?;
                 self.expect_check(&root, 0, None, "fresh-again")?;
                 self.heartbeat_cadence_control()?;
                 self.notify
                     .as_ref()
                     .ok_or("notify")?
-                    .boundary(true, "L10 deliberate SIGSTOP")?;
-                self.child
-                    .as_ref()
-                    .ok_or("daemon missing")?
-                    .signal(Signal::STOP);
+                    .freeze_process(self.child.as_ref().ok_or("daemon missing")?, true)?;
                 let before = flow_counts(&path)?.1;
                 let at = Instant::now();
                 self.expect_check(&root, 5, None, "stopped")?;
@@ -842,11 +849,7 @@ impl DaemonGuard<'_> {
                 self.notify
                     .as_ref()
                     .ok_or("notify")?
-                    .boundary(false, "L10 SIGCONT")?;
-                self.child
-                    .as_ref()
-                    .ok_or("daemon missing")?
-                    .signal(Signal::CONT);
+                    .freeze_process(self.child.as_ref().ok_or("daemon missing")?, false)?;
                 self.lab.daemon_wait(
                     "L10 fresh tick after SIGCONT",
                     Duration::from_secs(10),
@@ -873,8 +876,14 @@ impl DaemonGuard<'_> {
                 self.wait_heartbeat(heartbeat_before)?;
                 self.heartbeat_cadence_control()?;
                 self.control_stop(Signal::KILL)?;
+                let socket = root.join("run/scupper/control.sock");
+                let stale = fs::symlink_metadata(&socket)?;
                 let before = flow_counts(&path)?.1;
                 self.expect_check(&root, 5, None, "killed")?;
+                let after_check = fs::symlink_metadata(&socket)?;
+                if (stale.dev(), stale.ino()) != (after_check.dev(), after_check.ino()) {
+                    return fail("L10 check reclaimed or replaced the stale control socket");
+                }
                 self.lab.daemon_wait(
                     "L10 traffic after SIGKILL",
                     Duration::from_secs(3),
@@ -1298,7 +1307,10 @@ impl DaemonGuard<'_> {
                 if code != 0 {
                     return fail(format!("L50 connect: {code}: {text}"));
                 }
-                fs::write(root.join("run/scupper/incomplete-tick"), b"hold")?;
+                self.notify
+                    .as_ref()
+                    .ok_or("notify")?
+                    .incomplete_tick(&root, true)?;
                 // Freeze reconciliation before injecting the ineffective route.
                 self.lab.runner.dwell(Duration::from_millis(2200))?;
                 self.lab
@@ -1311,7 +1323,10 @@ impl DaemonGuard<'_> {
                 self.lab.daemon_route_healthy(Duration::from_secs(2))?;
                 let (code, text) =
                     self.control_command(&root, &["disconnect"], "socket-ineffective")?;
-                fs::remove_file(root.join("run/scupper/incomplete-tick"))?;
+                self.notify
+                    .as_ref()
+                    .ok_or("notify")?
+                    .incomplete_tick(&root, false)?;
                 if code != 3
                     || !text.contains("DisconnectNotEffective")
                     || !text.contains("transport: local socket")

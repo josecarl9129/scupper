@@ -421,7 +421,9 @@ impl Lab {
 
     fn meta_bridge(&mut self, mutation: Mutation) -> Result<Option<serde_json::Value>> {
         if mutation == Mutation::Ct {
-            self.meta_supervised(|lab, root| lab.meta_bridge_trial(mutation, Some(root)))
+            self.meta_supervised(|lab, root, notify| {
+                lab.meta_bridge_trial(mutation, Some((root, notify)))
+            })
         } else {
             self.meta_bridge_trial(mutation, None)
         }
@@ -431,7 +433,7 @@ impl Lab {
     fn meta_bridge_trial(
         &mut self,
         mutation: Mutation,
-        root: Option<&Path>,
+        root: Option<(&Path, &super::daemon::NotifyCapture)>,
     ) -> Result<Option<serde_json::Value>> {
         let stem = if mutation == Mutation::Ct {
             "L19-L3"
@@ -501,8 +503,8 @@ impl Lab {
                 flow.as_ref()
                     .ok_or("missing flow")?
                     .signal(rustix::process::Signal::STOP);
-                let root = root.ok_or("missing L19 daemon root")?;
-                fs::write(root.join("run/scupper/incomplete-tick"), b"hold")?;
+                let (root, notify) = root.ok_or("missing L19 daemon root")?;
+                notify.incomplete_tick(root, true)?;
                 self.runner.dwell(Duration::from_millis(2200))?;
                 established = Some((local.port(), before));
             }
@@ -748,8 +750,8 @@ impl Lab {
         let stopped = flow
             .as_mut()
             .map_or(Ok(()), |flow| flow.stop(rustix::process::Signal::TERM));
-        let resumed = if let Some(root) = root {
-            self.meta_resume(root, &prefix)
+        let resumed = if let Some((root, notify)) = root {
+            self.meta_resume(root, notify, &prefix)
         } else {
             Ok(())
         };
