@@ -1507,7 +1507,7 @@ to a file first:
 | `--clipboard` | read the system clipboard directly (macOS pasteboard; Linux Wayland/X11 when available) |
 | `--paste` | hidden paste prompt: terminal echo off, input ends at end-of-file (Ctrl-D) or after the `[Peer]` section is complete, so the key never appears on screen or in terminal scrollback |
 | `-` | standard input, e.g. `pbpaste \| scupper exit add -` or from another tool |
-| `--from REF` | a whole configuration stored in a secret store, e.g. `pass://VPN/ch-1156/config` |
+| `--from REF` | a whole configuration stored in a secret store, e.g. `pass://VPN/ch-1234/config` |
 | (none, on a TTY) | asks which source to use; offers the clipboard when it holds something that parses as a wg-quick configuration |
 
 **Handling of the private key, whatever the source.** The configuration is
@@ -1537,7 +1537,7 @@ private key). Refused: `PostUp`, `PreUp`, `PostDown`, `PreDown`, `Table`,
 `SaveConfig`, `FwMark`, `ListenPort`, unknown keys, duplicate keys, a
 second peer, and a private key or peer public key already used by another
 configured exit. Provider comment lines (Proton writes the server name, e.g.
-`CH#1156`) seed the suggested `id` (`ch-1156`) and `name` (the country,
+`CH#1234`) seed the suggested `id` (`ch-1234`) and `name` (the country,
 editable), both validated against the id and name grammar before use;
 NetShield level and IPv6 presence are shown. The summary shown for
 confirmation never contains the private key.
@@ -1566,18 +1566,18 @@ argument ever contains the key during `exit add`.
 
 ```
 $ scupper exit add --clipboard
-  Found: Proton CH#1156 · endpoint 203.0.113.10:51820 · NetShield 1 · IPv4 + IPv6
+  Found: Proton CH#1234 · endpoint 203.0.113.10:51820 · NetShield 1 · IPv4 + IPv6
   Key fingerprint: public key k3Vq…9fQ= (compare with the provider dashboard)
   Name [Switzerland]: Zurich
-  ID [ch-1156]:
+  ID [ch-1234]:
   Position: 1) primary  2) standby  3) last   [3]: 2
   Upload key to gw1 over SSH and add as config v44? [Y/n]
-  ✓ Zurich [ch-1156] added (v44), handshake 2s, exit IP verified
+  ✓ Zurich [ch-1234] added (v44), handshake 2s, exit IP verified
   The clipboard holds a private key. Clear it now? [Y/n]
 
 $ scupper exit list
   POS  EXIT                    STATE     HANDSHAKE  EXIT IP          FAMILY
-  1  * Zurich [ch-1156]        active    12s        203.0.113.77     v4+v6
+  1  * Zurich [ch-1234]        active    12s        203.0.113.77     v4+v6
   2    Amsterdam [nl-0042]     standby   18s        verified 2m ago  v4
 ```
 
