@@ -216,6 +216,7 @@ fn omitted_settings_have_documented_defaults() {
                 "failback_hold =",
                 "min_dwell =",
                 "standby =",
+                "initial_qualification_seconds =",
                 "interval =",
                 "report =",
             ]
@@ -1816,13 +1817,46 @@ fn heartbeat_interval_bounds() {
 
 #[test]
 #[allow(clippy::unwrap_used)]
-fn alert_qualification_grace_defaults_and_bounds() {
-    let text = include_str!("fixtures/site-m2.toml");
-    let cfg = parse_site(text).unwrap();
-    assert_eq!(cfg.alerts.fail_closed_grace_seconds, 30);
-    for seconds in [0, 1, 30, 300, 301] {
-        let mut cfg = cfg.clone();
-        cfg.alerts.fail_closed_grace_seconds = seconds;
-        assert_eq!(validate(cfg).is_ok(), (1..=300).contains(&seconds));
+fn policy_initial_qualification_defaults_bounds_and_old_key_rejected() {
+    let cfg = parse_site(&FIXTURE.replace("initial_qualification_seconds = 60\n", "")).unwrap();
+    assert_eq!(cfg.policy.initial_qualification_seconds, 60);
+    assert_eq!(
+        validate(cfg.clone()).unwrap().initial_qualification(),
+        Duration::from_secs(60)
+    );
+    for seconds in [0, 1, 29, 30, 60, 300, 301] {
+        let text = FIXTURE.replace(
+            "initial_qualification_seconds = 60",
+            &format!("initial_qualification_seconds = {seconds}"),
+        );
+        let parsed = parse_site(&text).unwrap();
+        assert_eq!(parsed.policy.initial_qualification_seconds, seconds);
+        if (30..=300).contains(&seconds) {
+            assert!(validate(parsed).is_ok());
+        } else {
+            rejects(
+                parsed,
+                "policy.initial_qualification_seconds",
+                Rule::InvalidInitialQualification,
+            );
+        }
     }
+    let old_key = FIXTURE.replace(
+        "[alerts.sinks.phone]",
+        "[alerts]\nfail_closed_grace_seconds = 60\n\n[alerts.sinks.phone]",
+    );
+    assert_eq!(
+        parse_site(&old_key).unwrap_err(),
+        ConfigError {
+            path: "alerts.fail_closed_grace_seconds".into(),
+            rule: ParseRule::UnknownField,
+        }
+    );
+    let policy = format!("[policy]\n{}", toml::to_string(&cfg.policy).unwrap());
+    assert_eq!(
+        policy,
+        include_str!("../../../tests/golden/config/policy.toml")
+    );
+    let serialized = toml::to_string(&cfg).unwrap();
+    assert!(!serialized.contains("fail_closed_grace_seconds"));
 }

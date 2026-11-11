@@ -757,10 +757,28 @@ cold standbys (L48).
 Unknown ──fresh handshake + 3 consecutive path successes──▶ Healthy
 Healthy ──1 counted failure──▶ Suspect ──1 success──▶ Healthy
 Suspect ──3 consecutive counted failures──▶ Down
-any ──handshake stale > 180 s, link/peer/key missing──▶ Down
+Unknown ──initial window: no new handshake, or link/peer absent before readiness──▶ Unknown
+any ──hard fault outside that exemption (stale handshake, link/peer/key missing)──▶ Down
 Down ──fresh handshake──▶ Recovering ──3 consecutive successes spanning ≥ 30 s──▶ Healthy
 Recovering ──any failure──▶ Down
 ```
+
+The initial window is `policy.initial_qualification_seconds` (default 60 s,
+30..=300 s), measured from cold start or Disconnected → Auto/Prefer/Pin. A
+never-handshaken Unknown exit stays Unknown through the window. A retained
+handshake at or before the window start has the same exemption: its current
+age is at least the time elapsed since the window opened. This holds whether
+the kernel retains or clears the handshake across link down/up. A handshake
+fresh inside the window that then becomes stale is hard Down and pages immediately.
+Link/peer absence before the first ready link/peer observation is also exempt,
+regardless of its cause, including inherited link state on cold start. That
+ready observation ends the link exemption, so later loss is hard Down and pages
+immediately, as does a missing key. At the first tick strictly after the window,
+missing or pre-window stale handshakes and pending link/peer absence become Down
+and page once. A link that never comes up therefore pages by window + one tick
+(2 s at normal cadence). Unknown never authorizes a route.
+Activation or verified resume ends qualification, so a subsequent hard outage
+pages immediately even inside the original window.
 
 Detection of a dead active exit through probes: ≤ 10 s to the first failure,
 then two more at 2 s: about 15 s.
@@ -781,7 +799,8 @@ then the configured order; `Pin(x)` = only x; `Disconnected` = none.
 |---|---|---|---|
 | Active(e) | e Down, first Healthy candidate c ≠ e | Active(c) | SetRoute(c), FlushConntrack, NotifyEdge, Emit(Failover) |
 | Active(e) | e Down, no Healthy candidate | FailClosed(NoHealthyExit \| PinnedExitDown) | SetRoute(Unreachable), FlushConntrack, Emit(FailClosedStarted) |
-| FailClosed(_) | selection ≠ Disconnected, a candidate Healthy | Active(first Healthy) | SetRoute, NotifyEdge, Emit(FailClosedEnded{duration}) |
+| FailClosed(_) | selection ≠ Disconnected, unreported closure; initial window expired or cause is not initial qualification | FailClosed(_) | Emit(FailClosedStarted), once |
+| FailClosed(_) | selection ≠ Disconnected, a candidate Healthy | Active(first Healthy) | SetRoute, NotifyEdge, Emit(FailClosedEnded{duration}) only if closure was reported |
 | any | selection := Disconnected | FailClosed(AdminDisconnected) | SetRoute(Unreachable), FlushConntrack, SetExitsDown |
 | any | selection changed by admin | re-evaluate immediately with the new order | as above |
 | Active(e) | **only if `failback = "auto"`**: a candidate p ordered before e Healthy ≥ `failback_hold` (10 min) and ≥ `min_dwell` (120 s) since the last switch, failback not suppressed | Active(p) | SetRoute(p), FlushConntrack, NotifyEdge, Emit(Failback) |
@@ -1058,6 +1077,7 @@ failback = "manual"                  # manual (default) | auto
 failback_hold = "10m"
 min_dwell = "120s"
 standby = "hot"                      # hot | cold
+initial_qualification_seconds = 60   # 30..=300; cold start and reconnect
 
 [health]
 handshake_stale = "180s"
@@ -1946,16 +1966,25 @@ Durable queued alerts remain deliverable even if the restarted process never
 observes their key again. Only newly reconstructed historical Firing snapshots
 wait for a fresh process observation (through its committed sequence), and that
 wait is bounded to 120 seconds across worker restarts. A healthy observation
-cancels an unobserved historical snapshot without an unsolicited recovery.
+cancels an unobserved historical snapshot without an unsolicited recovery. Once
+first attempted, a snapshot becomes owed, including after a timeout or restart;
+a healthy observation then retains its recovery.
 
 Initial fail-closed qualification after cold start or Disconnected → Auto/Prefer/Pin
-has a grace of 30 seconds, configurable as `alerts.fail_closed_grace_seconds`
-within 1..=300 seconds. The Critical fires once only if qualification remains
-closed strictly beyond this grace, by the next failover tick. An exit that was
-healthy going down, quarantine, and all exits becoming unconfigured bypass
-this grace. Healthy connect and clean restart emit no incident notifications.
-An exit awaiting its first handshake stays Unknown within grace, then qualifies
-from fresh handshake and probe evidence. It never forwards on this allowance alone;
+has a 60-second window, configured by `[policy] initial_qualification_seconds`
+within 30..=300 seconds. This policy value drives both health exemption (§6)
+and Critical emission, independently of configured alert sinks. The Critical
+fires once if qualification remains closed strictly beyond this window,
+by the next failover tick. A previously healthy exit going down, quarantine,
+and all exits becoming unconfigured bypass this window. During qualification,
+all candidates Down bypasses it only for faults the window cannot explain:
+link/peer loss after readiness was observed, missing keys, or a handshake fresh
+inside the window becoming stale. No handshake or a retained handshake at or
+before the window start keeps an Unknown exit Unknown, as does link/peer absence
+before readiness, regardless of cause. These exemptions expire at window + one tick;
+they do not depend on kernel handshake retention across link down/up. Healthy
+connect and clean restart within the window emit no incident notifications.
+An Unknown exit qualifies from fresh handshake and probe evidence. It never forwards on this allowance alone;
 containment stays closed until qualification succeeds.
 
 **Ordering and suppression:** delivery is at least once for admitted alerts;

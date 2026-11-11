@@ -238,6 +238,22 @@ impl DaemonGuard<'_> {
         args: &[&str],
         stem: &str,
     ) -> Result<(i32, String)> {
+        self.control_command_inner(root, args, stem, false)
+    }
+    pub(super) fn control_command_with_link_evidence(
+        &mut self,
+        root: &Path,
+        command: &str,
+    ) -> Result<(i32, String)> {
+        self.control_command_inner(root, &[command], command, true)
+    }
+    fn control_command_inner(
+        &mut self,
+        root: &Path,
+        args: &[&str],
+        stem: &str,
+        record_link: bool,
+    ) -> Result<(i32, String)> {
         let binary = Lab::boot_binary()?;
         let mut command = vec!["--test-root", root.to_str().ok_or("root path")?];
         command.extend_from_slice(args);
@@ -253,6 +269,35 @@ impl DaemonGuard<'_> {
             &Invocation::new("gwhost", binary.to_str().ok_or("binary path")?, &command),
             &output_path,
         )?;
+        if record_link {
+            let expected_up = args.contains(&"connect");
+            let artifact = self
+                .lab
+                .artifacts
+                .join(format!("{}-{stem}-latest-handshakes.txt", self.case));
+            // Sample as soon as the requested link state is visible, before
+            // waiting for the control reply or subsequent health qualification.
+            self.lab
+                .daemon_wait("exit link evidence", Duration::from_secs(30), |lab| {
+                    let links: serde_json::Value = serde_json::from_str(&lab.cmd(
+                        "scupper",
+                        "ip",
+                        &["-j", "link", "show", "ex-ch1"],
+                    )?)?;
+                    let Some(flags) = links[0]["flags"].as_array() else {
+                        return fail("exit link evidence: missing flags");
+                    };
+                    if flags.iter().any(|flag| flag == "UP") != expected_up {
+                        return Ok(false);
+                    }
+                    // No assertion on the timestamp: document kernel retention.
+                    fs::write(
+                        &artifact,
+                        lab.cmd("scupper", "wg", &["show", "ex-ch1", "latest-handshakes"])?,
+                    )?;
+                    Ok(true)
+                })?;
+        }
         let status = child.wait_timeout(Duration::from_secs(245))?;
         if args.contains(&"connect") {
             fs::copy(

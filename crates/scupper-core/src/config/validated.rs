@@ -62,10 +62,10 @@ impl ValidatedSite {
     pub fn heartbeat(&self) -> Option<&HeartbeatSettings> {
         self.config.heartbeat.as_ref()
     }
-    /// Returns the bounded initial qualification grace for fail-closed alerts.
+    /// Returns the bounded policy window for initial exit qualification.
     #[must_use]
-    pub fn fail_closed_grace(&self) -> Duration {
-        Duration::from_secs(self.config.alerts.fail_closed_grace_seconds)
+    pub fn initial_qualification(&self) -> Duration {
+        Duration::from_secs(self.config.policy.initial_qualification_seconds)
     }
     /// Returns the supported alert sinks.
     #[must_use]

@@ -177,7 +177,7 @@ impl Journal {
             || self
                 .queue
                 .iter()
-                .any(|p| p.alert.key == key && p.observe_until.is_none())
+                .any(|p| p.alert.key == key && (p.first.is_some() || p.observe_until.is_none()))
     }
     fn observe(&mut self, alert: Alert, at: u64) {
         if alert.severity == alerts::Severity::Critical
@@ -206,10 +206,11 @@ impl Journal {
                         alert.count = alert.count.max(pending.alert.count);
                         alert.duration = alert.duration.max(pending.alert.duration);
                     }
-                    if (pending.observe_until.is_none()
-                        || alert.state == alerts::AlertState::Firing
-                        || self.delivered.get(&alert.key) == Some(&alerts::AlertState::Firing))
-                        && self.delivered.get(&alert.key) != Some(&alert.state)
+                    if pending.first.is_some()
+                        || ((pending.observe_until.is_none()
+                            || alert.state == alerts::AlertState::Firing
+                            || self.delivered.get(&alert.key) == Some(&alerts::AlertState::Firing))
+                            && self.delivered.get(&alert.key) != Some(&alert.state))
                     {
                         // Collapsing changes state, not the sink's retry schedule
                         // or the admission already paid for this owed key.
@@ -497,6 +498,7 @@ fn step_with_ack(
         };
     }
     journal.queue[index].first.get_or_insert(at);
+    journal.queue[index].observe_until = None;
     journal.save(path)?; // durable admission before the first attempt
     journal.queue[index].alert.suppressed = if journal.queue[index].test.is_none() {
         journal.suppressed
@@ -2001,6 +2003,49 @@ mod tests {
         assert!(sink.sent.lock().unwrap().is_empty());
         step(&mut j, &t.path(), &sink, &log.handle, until).unwrap();
         assert_eq!(sink.sent.lock().unwrap().len(), 1);
+    }
+    #[test]
+    fn attempted_snapshot_owes_recovery_after_timeout_and_restart() {
+        for prior_resolved in [false, true] {
+            let t = Temp::new();
+            let log = t.log();
+            log.handle
+                .emit(
+                    EventKind::QuarantineState { active: true },
+                    Actor::Daemon,
+                    None,
+                )
+                .unwrap();
+            log.handle.flush_blocking(Duration::from_secs(5)).unwrap();
+            let mut j = open_journal(&t.0, &t.path(), &log.handle).unwrap();
+            j.live_keys = Some(std::collections::BTreeSet::new());
+            if prior_resolved {
+                j.delivered
+                    .insert(alerts::AlertKey::Quarantine, alerts::AlertState::Resolved);
+            }
+            let until = j.queue[0].observe_until.unwrap();
+            let sink = Fake::new(Err(SinkError::Transient));
+            step(&mut j, &t.path(), &sink, &log.handle, until).unwrap();
+            assert_eq!(sink.sent.lock().unwrap().len(), 1);
+            assert!(j.queue[0].first.is_some());
+            assert_eq!(j.queue[0].observe_until, None);
+            let retry = j.queue[0].retry;
+            let mut j = open_journal(&t.0, &t.path(), &log.handle).unwrap();
+            j.observe(map(OperationalEvent::QuarantineCleared, 100, 101), until);
+            assert_eq!(j.queue.len(), 1);
+            assert_eq!(j.queue[0].alert.state, alerts::AlertState::Resolved);
+            *sink.result.lock().unwrap() = Ok(());
+            step(
+                &mut j,
+                &t.path(),
+                &sink,
+                &log.handle,
+                retry.max(monotonic()),
+            )
+            .unwrap();
+            assert_eq!(*sink.sent.lock().unwrap(), vec![1, 100]);
+            assert!(j.queue.is_empty());
+        }
     }
     #[test]
     fn warning_storm_cannot_spend_critical_allowance_and_tests_keep_suppression() {

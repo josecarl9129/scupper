@@ -230,9 +230,10 @@ impl DaemonGuard<'_> {
             })?;
         self.assert_alert_silence()?;
         self.control_restart(&root, "clean-restart")?;
+        self.lab.daemon_route_healthy(Duration::from_secs(65))?;
         self.assert_alert_silence()?;
         for command in ["disconnect", "connect"] {
-            let (code, text) = self.control_command(&root, &[command], command)?;
+            let (code, text) = self.control_command_with_link_evidence(&root, command)?;
             if code != 0 {
                 return fail(format!("healthy {command} failed: {text}"));
             }

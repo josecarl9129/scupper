@@ -3287,3 +3287,127 @@ fn healthy_restart_and_connect_state_observations_do_not_create_incidents() {
         }
     }
 }
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep the healthy reset, real cadence, and containment assertions together.
+fn reconnect_with_retained_stale_handshake_qualifies_from_unknown_without_incident() {
+    use scupper_core::{config::ExitId, failover::ExitHealth};
+    for retained in [false, true] {
+        let mut rig = Rig::new();
+        let exit = ExitId("ch1".into());
+        assert!(matches!(
+            rig.machine().health()[&exit],
+            ExitHealth::Healthy {
+                confirmed: true,
+                ..
+            }
+        ));
+        rig.kernel.handshake(exit.clone(), Some(Duration::ZERO));
+        let mut events = rig
+            .machine()
+            .set_selection(Selection::Disconnected, Actor::Local { uid: 0 })
+            .unwrap()
+            .events;
+        assert_eq!(rig.machine().health()[&exit], ExitHealth::Unknown);
+        assert_eq!(rig.kernel.model().links["ex-ch1"].up, Known::Value(false));
+        rig.time.set(rig.time.get() + 600);
+        let base = rig.time.get();
+        rig.kernel
+            .handshake(exit.clone(), retained.then_some(Duration::from_secs(600)));
+        events.extend(
+            rig.machine()
+                .set_selection(Selection::Auto, Actor::Local { uid: 0 })
+                .unwrap()
+                .events,
+        );
+        assert_eq!(rig.machine().health()[&exit], ExitHealth::Unknown);
+        for offset in (2..=42).step_by(2) {
+            let age = if offset < 14 {
+                retained.then_some(Duration::from_secs(600 + offset))
+            } else {
+                Some(Duration::from_secs(offset - 14))
+            };
+            rig.kernel.handshake(exit.clone(), age);
+            if offset % 10 == 2 {
+                rig.round(true);
+            }
+            events.extend(rig.tick().events);
+            assert_eq!(rig.time.get(), base + offset);
+            if offset == 14 {
+                assert_eq!(rig.kernel.model().links["ex-ch1"].up, Known::Value(true));
+            }
+            if offset < 42 {
+                assert_eq!(rig.machine().health()[&exit], ExitHealth::Unknown);
+                assert_eq!(
+                    rig.machine().desired().unwrap().routes()[0].1,
+                    RouteTarget::Unreachable
+                );
+            }
+        }
+        assert!(matches!(
+            rig.machine().health()[&exit],
+            ExitHealth::Healthy {
+                confirmed: true,
+                ..
+            }
+        ));
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            EventKind::FailClosedStarted { .. } | EventKind::FailClosedEnded { .. }
+        )));
+        rig.safe_history();
+    }
+}
+
+#[test]
+fn cold_start_without_resume_qualifies_at_real_cadence_without_incident() {
+    for inherited_down in [false, true] {
+        let mut rig = Rig::new();
+        if inherited_down {
+            rig.kernel
+                .mutate(|model| model.links.get_mut("ex-ch1").unwrap().up = Known::Value(false));
+        }
+        let exit = scupper_core::config::ExitId("ch1".into());
+        rig.kernel.handshake(exit.clone(), None);
+        rig.restart();
+        let base = rig.time.get();
+        // Explicitly attempt resume: a cold boot has no fresh handshake to authorize it.
+        rig.machine().resume_existing();
+        assert_eq!(
+            rig.machine().health()[&exit],
+            scupper_core::failover::ExitHealth::Unknown
+        );
+        let mut events = Vec::new();
+        for offset in (2..=32).step_by(2) {
+            rig.kernel
+                .handshake(exit.clone(), (offset >= 4).then_some(Duration::ZERO));
+            if offset % 10 == 2 {
+                rig.round(true);
+            }
+            events.extend(rig.tick().events);
+            assert_eq!(rig.time.get(), base + offset);
+            if offset < 32 {
+                assert_eq!(
+                    rig.machine().health()[&exit],
+                    scupper_core::failover::ExitHealth::Unknown
+                );
+                assert_eq!(
+                    &rig.machine().desired().unwrap().routes()[0].1,
+                    &RouteTarget::Unreachable
+                );
+            }
+        }
+        assert!(matches!(
+            rig.machine().health()[&exit],
+            scupper_core::failover::ExitHealth::Healthy {
+                confirmed: true,
+                ..
+            }
+        ));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            EventKind::FailClosedStarted { .. } | EventKind::FailClosedEnded { .. }
+        )));
+        rig.safe_history();
+    }
+}

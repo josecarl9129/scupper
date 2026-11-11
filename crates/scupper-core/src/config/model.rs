@@ -161,6 +161,9 @@ pub struct Policy {
     /// Minimum time between switches; defaults to 120 seconds.
     #[serde(default = "default_min_dwell")]
     pub min_dwell: DurationStr,
+    /// Initial qualification window in seconds; defaults to 60, bounded to 30..=300.
+    #[serde(default = "default_initial_qualification")]
+    pub initial_qualification_seconds: u64,
     /// Standby mode, hot by default. With one exit, hot has no effect.
     #[serde(default = "default_standby")]
     pub standby: Standby,
@@ -230,27 +233,16 @@ pub struct Device {
 }
 
 /// Optional alert configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Alerts {
-    /// Qualification grace in seconds, bounded to 1..=300.
-    #[serde(default = "default_alert_grace")]
-    pub fail_closed_grace_seconds: u64,
     /// Named delivery sinks.
     #[serde(default)]
     pub sinks: BTreeMap<String, AlertSink>,
 }
 
-fn default_alert_grace() -> u64 {
-    30
-}
-impl Default for Alerts {
-    fn default() -> Self {
-        Self {
-            fail_closed_grace_seconds: default_alert_grace(),
-            sinks: BTreeMap::new(),
-        }
-    }
+fn default_initial_qualification() -> u64 {
+    60
 }
 
 /// Supported delivery transports; URLs are always local secret references.

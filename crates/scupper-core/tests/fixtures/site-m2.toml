@@ -41,6 +41,7 @@ failback = "manual"
 failback_hold = "10m"
 min_dwell = "120s"
 standby = "hot"
+initial_qualification_seconds = 60
 
 [health]
 handshake_stale = "180s"

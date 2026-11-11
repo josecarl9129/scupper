@@ -75,6 +75,11 @@ impl Failover {
             last_activation: None,
         };
         machine.sync_config(cfg);
+        // Cold start can inherit SetExitsDown from the preceding process.
+        // Only the first ready link observation ends this initial allowance.
+        for signals in machine.signals.values_mut() {
+            signals.initial_link_pending = true;
+        }
         machine.closed_reason = Some(machine.unavailable_reason());
         let mut actions = vec![
             FailoverAction::SetRoute(RouteTarget::Unreachable),
@@ -266,30 +271,31 @@ impl Failover {
             FailoverInput::LinkState(id, link) => {
                 if let Some(signals) = self.signals.get_mut(id) {
                     signals.link = *link;
+                    if link.link_up && link.peer_present {
+                        signals.initial_link_pending = false;
+                    }
                 }
             }
             FailoverInput::PathProbe(_) | FailoverInput::ProbeRound(_) | FailoverInput::Tick => {}
         }
+        let qualification_age = self.fail_closed_since.map(|since| now.elapsed_since(since));
         let initial_window = self.qualifying
-            && self
-                .fail_closed_since
-                .is_some_and(|since| now.elapsed_since(since) <= cfg.fail_closed_grace);
+            && qualification_age.is_some_and(|age| age <= cfg.initial_qualification);
         for (id, signals) in &mut self.signals {
             let Some(state) = self.health.get_mut(id) else {
                 continue;
             };
             if let Some(reason) = signals.hard_fault(now, cfg.handshake_stale) {
-                // No handshake yet is normal during initial bring-up. Stay closed
-                // and Unknown so a fresh handshake can qualify without recovery delay.
-                if initial_window
-                    && matches!(state, ExitHealth::Unknown)
-                    && reason == DownReason::HandshakeStale
-                    && signals.handshake.is_some_and(|(_, age)| age.is_none())
-                {
+                let qualification_fault =
+                    signals.qualification_fault(now, reason, qualification_age);
+                // Link/peer absence before the first ready observation has unknown
+                // provenance. Stay Unknown and closed for the bounded allowance.
+                if initial_window && matches!(state, ExitHealth::Unknown) && qualification_fault {
                     signals.initial_successes = 0;
                     signals.probe = None;
                     continue;
                 }
+                signals.non_qualification_fault = !qualification_fault;
                 health::down(state, now, reason);
                 signals.initial_successes = 0;
                 signals.probe = None;
@@ -370,9 +376,12 @@ impl Failover {
                 self.health
                     .values_mut()
                     .for_each(|state| *state = ExitHealth::Unknown);
-                self.signals
-                    .values_mut()
-                    .for_each(|signals| *signals = health::Signals::default());
+                self.signals.values_mut().for_each(|signals| {
+                    *signals = health::Signals {
+                        initial_link_pending: true,
+                        ..health::Signals::default()
+                    };
+                });
                 actions.extend([
                     FailoverAction::SetRoute(RouteTarget::Unreachable),
                     FailoverAction::FlushConntrack,
@@ -441,10 +450,16 @@ impl Failover {
                     ]);
                 }
                 let alertable = !self.qualifying
-                    || cfg.exits.is_empty()
+                    || candidates.iter().all(|id| {
+                        matches!(self.health.get(*id), Some(ExitHealth::Down { .. }))
+                            && self
+                                .signals
+                                .get(*id)
+                                .is_some_and(|signals| signals.non_qualification_fault)
+                    })
                     || self
                         .fail_closed_since
-                        .is_some_and(|since| now.elapsed_since(since) > cfg.fail_closed_grace);
+                        .is_some_and(|since| now.elapsed_since(since) > cfg.initial_qualification);
                 if !self.closure_reported && alertable {
                     actions.push(FailoverAction::Emit(FailoverEvent::FailClosedStarted(
                         reason.clone(),

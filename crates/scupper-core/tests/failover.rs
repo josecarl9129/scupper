@@ -308,8 +308,7 @@ fn health_states(cfg: &FailoverConfig) -> Vec<Failover> {
 
 #[test]
 fn hard_down_from_every_health_state_and_fault_precedence() {
-    let mut cfg = config(2);
-    cfg.fail_closed_grace = Duration::from_secs(1);
+    let cfg = config(2);
     let cases = [
         (
             FailoverInput::Handshakes(BTreeMap::from([(id(0), None)])),
@@ -353,6 +352,23 @@ fn hard_down_from_every_health_state_and_fault_precedence() {
     for machine in health_states(&cfg) {
         for (input, reason) in &cases {
             let (mut next, _) = machine.step(at(10), input.clone(), &cfg);
+            if matches!(machine.health()[&id(0)], ExitHealth::Unknown)
+                && (matches!(input, FailoverInput::Handshakes(_))
+                    || matches!(reason, DownReason::LinkMissing | DownReason::PeerMissing))
+            {
+                assert_eq!(next.health()[&id(0)], ExitHealth::Unknown);
+                advance(&mut next, 60, input.clone(), &cfg);
+                assert_eq!(next.health()[&id(0)], ExitHealth::Unknown);
+                advance(&mut next, 62, input.clone(), &cfg);
+                assert_eq!(
+                    next.health()[&id(0)],
+                    ExitHealth::Down {
+                        since: at(62),
+                        reason: *reason,
+                    }
+                );
+                continue;
+            }
             let since = if matches!(machine.health()[&id(0)], ExitHealth::Down { .. }) {
                 at(5)
             } else {
@@ -1252,9 +1268,9 @@ fn startup_restart_and_tick_reconciliation_always_assert_the_desired_route() {
             actions.contains(&FailoverAction::SetExitsDown),
             selection == Selection::Disconnected
         );
-        for now in 1..50 {
+        for now in 1..80 {
             let actions = advance(&mut machine, now, FailoverInput::Tick, &cfg);
-            let expected = if now == 31 && selection != Selection::Disconnected {
+            let expected = if now == 61 && selection != Selection::Disconnected {
                 vec![FailoverAction::Emit(FailoverEvent::FailClosedStarted(
                     machine.fail_closed_reason().unwrap().clone(),
                 ))]
@@ -1270,12 +1286,12 @@ fn startup_restart_and_tick_reconciliation_always_assert_the_desired_route() {
             assert_eq!(applied, RouteTarget::Unreachable);
         }
         if selection == Selection::Pin(id(0)) {
-            fresh(&mut machine, 50, &cfg);
-            for now in [50, 52, 54] {
+            fresh(&mut machine, 80, &cfg);
+            for now in [80, 82, 84] {
                 advance(&mut machine, now, probes(&[(1, true)]), &cfg);
                 assert_eq!(machine.desired_route(), &RouteTarget::Unreachable);
             }
-            for now in [56, 58, 60] {
+            for now in [86, 88, 90] {
                 advance(&mut machine, now, probes(&[(0, true)]), &cfg);
             }
             assert_eq!(machine.desired_route(), &target(&cfg, 0));
@@ -1284,83 +1300,259 @@ fn startup_restart_and_tick_reconciliation_always_assert_the_desired_route() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Keep the real cadence and subsequent outage in one scenario.
 fn cold_start_and_connect_qualification_do_not_page_and_real_outage_does() {
     let cfg = config(1);
+    // Each result arrives on the next 2 s tick after a 10 s probe launch.
     for connect in [false, true] {
-        let mut machine = Failover::new(
-            at(0),
-            if connect {
-                Selection::Disconnected
-            } else {
-                Selection::Auto
-            },
-            &cfg,
-        )
-        .0;
-        let base = if connect { 100 } else { 0 };
-        let mut events = Vec::new();
-        if connect {
-            events.extend(advance(
-                &mut machine,
-                base,
-                FailoverInput::SelectionChanged(Selection::Auto),
-                &cfg,
-            ));
+        for (handshake_at, inconclusive_at) in [(0, None), (4, None), (0, Some(12)), (14, None)] {
+            for missing_peer in [false, true] {
+                let (mut machine, mut events) = Failover::new(
+                    at(0),
+                    if connect {
+                        Selection::Disconnected
+                    } else {
+                        Selection::Auto
+                    },
+                    &cfg,
+                );
+                let base = if connect { 100 } else { 0 };
+                if connect {
+                    events.extend(advance(
+                        &mut machine,
+                        base,
+                        FailoverInput::SelectionChanged(Selection::Auto),
+                        &cfg,
+                    ));
+                }
+                let mut healthy_at = None;
+                for offset in (0..=58).step_by(2) {
+                    events.extend(advance(
+                        &mut machine,
+                        base + offset,
+                        handshakes(&cfg, (offset >= handshake_at).then_some(0)),
+                        &cfg,
+                    ));
+                    // Our SetExitsDown is still visible after the 10 s resume deadline.
+                    let link = if offset < handshake_at {
+                        ExitLinkState {
+                            link_up: missing_peer,
+                            peer_present: !missing_peer,
+                            ..ExitLinkState::default()
+                        }
+                    } else {
+                        ExitLinkState::default()
+                    };
+                    events.extend(advance(
+                        &mut machine,
+                        base + offset,
+                        FailoverInput::LinkState(id(0), link),
+                        &cfg,
+                    ));
+                    if offset % 10 == 2 {
+                        let outcome = if inconclusive_at == Some(offset) {
+                            ProbeOutcome::Inconclusive
+                        } else {
+                            ProbeOutcome::Success
+                        };
+                        events.extend(advance(
+                            &mut machine,
+                            base + offset,
+                            FailoverInput::ProbeRound(BTreeMap::from([(id(0), outcome)])),
+                            &cfg,
+                        ));
+                    }
+                    events.extend(advance(
+                        &mut machine,
+                        base + offset,
+                        FailoverInput::Tick,
+                        &cfg,
+                    ));
+                    if machine.active() == &target(&cfg, 0) {
+                        healthy_at = Some(offset);
+                        break;
+                    }
+                    assert_eq!(machine.health()[&id(0)], ExitHealth::Unknown);
+                    assert_eq!(machine.desired_route(), &RouteTarget::Unreachable);
+                    assert_eq!(machine.fail_closed_alert_state(), None);
+                }
+                let expected = if handshake_at == 14 {
+                    42
+                } else if handshake_at == 4 || inconclusive_at.is_some() {
+                    32
+                } else {
+                    22
+                };
+                assert_eq!(healthy_at, Some(expected));
+                assert_eq!(machine.fail_closed_alert_state(), Some(false));
+                assert!(!events.iter().any(|a| matches!(
+                    a,
+                    FailoverAction::Emit(
+                        FailoverEvent::FailClosedStarted(_) | FailoverEvent::FailClosedEnded { .. }
+                    )
+                )));
+                // Qualification ended, so a hard outage inside the original window pages immediately.
+                let outage = advance(
+                    &mut machine,
+                    base + expected + 2,
+                    handshakes(&cfg, None),
+                    &cfg,
+                );
+                assert_eq!(
+                    outage
+                        .iter()
+                        .filter(|a| matches!(
+                            a,
+                            FailoverAction::Emit(FailoverEvent::FailClosedStarted(_))
+                        ))
+                        .count(),
+                    1
+                );
+                assert_eq!(machine.fail_closed_alert_state(), Some(true));
+            }
         }
-        events.extend(advance(&mut machine, base, handshakes(&cfg, None), &cfg));
-        assert_eq!(machine.fail_closed_alert_state(), None);
-        events.extend(advance(
-            &mut machine,
-            base + 1,
-            handshakes(&cfg, Some(0)),
-            &cfg,
-        ));
-        for offset in [1, 3, 5] {
-            events.extend(advance(
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep the real disconnect and both kernel-retention cases together.
+fn reconnect_with_retained_stale_handshake_qualifies_from_unknown_without_incident() {
+    let cfg = config(1);
+    for retained in [false, true] {
+        let mut machine = Failover::new(at(0), Selection::Auto, &cfg).0;
+        for now in (0..=22).step_by(2) {
+            advance(&mut machine, now, handshakes(&cfg, Some(0)), &cfg);
+            advance(
                 &mut machine,
-                base + offset,
-                all_probes(&cfg, true),
+                now,
+                FailoverInput::LinkState(id(0), ExitLinkState::default()),
                 &cfg,
-            ));
+            );
+            if now % 10 == 2 {
+                advance(&mut machine, now, probes(&[(0, true)]), &cfg);
+            }
+            advance(&mut machine, now, FailoverInput::Tick, &cfg);
         }
         assert_eq!(machine.active(), &target(&cfg, 0));
-        assert_eq!(machine.fail_closed_alert_state(), Some(false));
-        assert!(!events.iter().any(|a| matches!(
+        let mut actions = advance(
+            &mut machine,
+            24,
+            FailoverInput::SelectionChanged(Selection::Disconnected),
+            &cfg,
+        );
+        assert_eq!(machine.health()[&id(0)], ExitHealth::Unknown);
+        actions.extend(advance(
+            &mut machine,
+            624,
+            FailoverInput::SelectionChanged(Selection::Auto),
+            &cfg,
+        ));
+        for offset in (0..=42).step_by(2) {
+            let age = if offset < 14 {
+                retained.then_some(600 + offset)
+            } else {
+                Some(offset - 14)
+            };
+            actions.extend(advance(
+                &mut machine,
+                624 + offset,
+                handshakes(&cfg, age),
+                &cfg,
+            ));
+            actions.extend(advance(
+                &mut machine,
+                624 + offset,
+                FailoverInput::LinkState(
+                    id(0),
+                    ExitLinkState {
+                        link_up: offset >= 14,
+                        ..ExitLinkState::default()
+                    },
+                ),
+                &cfg,
+            ));
+            if offset % 10 == 2 {
+                actions.extend(advance(
+                    &mut machine,
+                    624 + offset,
+                    probes(&[(0, true)]),
+                    &cfg,
+                ));
+            }
+            actions.extend(advance(
+                &mut machine,
+                624 + offset,
+                FailoverInput::Tick,
+                &cfg,
+            ));
+            if offset < 42 {
+                assert_eq!(machine.health()[&id(0)], ExitHealth::Unknown);
+                assert_eq!(machine.desired_route(), &RouteTarget::Unreachable);
+            }
+        }
+        assert!(matches!(
+            machine.health()[&id(0)],
+            ExitHealth::Healthy {
+                confirmed: true,
+                ..
+            }
+        ));
+        assert_eq!(machine.active(), &target(&cfg, 0));
+        assert!(!actions.iter().any(|a| matches!(
             a,
             FailoverAction::Emit(
                 FailoverEvent::FailClosedStarted(_) | FailoverEvent::FailClosedEnded { .. }
             )
         )));
-        let outage = advance(&mut machine, base + 6, handshakes(&cfg, None), &cfg);
-        assert_eq!(
-            outage
-                .iter()
-                .filter(|a| matches!(a, FailoverAction::Emit(FailoverEvent::FailClosedStarted(_))))
-                .count(),
-            1
-        );
-        assert_eq!(machine.fail_closed_alert_state(), Some(true));
     }
 }
+
 #[test]
-fn initial_outage_fires_once_after_configured_grace_and_empty_policy_is_immediate() {
-    for grace in [1, 30, 300] {
+fn initial_outage_fires_once_after_configured_window_and_empty_policy_is_immediate() {
+    for (seconds, missing_link) in [30, 60, 299, 300]
+        .into_iter()
+        .flat_map(|s| [(s, false), (s, true)])
+    {
         let mut cfg = config(1);
-        cfg.fail_closed_grace = Duration::from_secs(grace);
+        cfg.initial_qualification = Duration::from_secs(seconds);
         let mut machine = Failover::new(at(0), Selection::Auto, &cfg).0;
-        for now in 0..=grace {
-            assert_eq!(advance(&mut machine, now, FailoverInput::Tick, &cfg), []);
+        let first_after = (seconds / 2 + 1) * 2;
+        for now in (0..=first_after + 4).step_by(2) {
+            let mut actions = advance(&mut machine, now, handshakes(&cfg, None), &cfg);
+            actions.extend(advance(
+                &mut machine,
+                now,
+                FailoverInput::LinkState(
+                    id(0),
+                    ExitLinkState {
+                        link_up: !missing_link,
+                        ..ExitLinkState::default()
+                    },
+                ),
+                &cfg,
+            ));
+            actions.extend(advance(&mut machine, now, FailoverInput::Tick, &cfg));
+            if now == first_after {
+                assert_eq!(
+                    actions,
+                    vec![FailoverAction::Emit(FailoverEvent::FailClosedStarted(
+                        FailClosedReason::NoHealthyExit
+                    ))]
+                );
+            } else {
+                assert_eq!(actions, []);
+            }
+            if now <= seconds {
+                assert_eq!(machine.health()[&id(0)], ExitHealth::Unknown);
+                assert_eq!(machine.fail_closed_alert_state(), None);
+            } else {
+                assert!(
+                    matches!(machine.health()[&id(0)], ExitHealth::Down { reason, .. }
+                    if reason == if missing_link { DownReason::LinkMissing } else { DownReason::HandshakeStale })
+                );
+                assert_eq!(machine.fail_closed_alert_state(), Some(true));
+            }
         }
-        assert_eq!(
-            advance(&mut machine, grace + 1, FailoverInput::Tick, &cfg),
-            vec![FailoverAction::Emit(FailoverEvent::FailClosedStarted(
-                FailClosedReason::NoHealthyExit
-            ))]
-        );
-        assert_eq!(
-            advance(&mut machine, grace + 2, FailoverInput::Tick, &cfg),
-            []
-        );
     }
     let cfg = config(0);
     let mut machine = Failover::new(at(0), Selection::Auto, &cfg).0;
@@ -1370,6 +1562,86 @@ fn initial_outage_fires_once_after_configured_grace_and_empty_policy_is_immediat
             FailClosedReason::NoHealthyExit
         ))]
     );
+}
+
+#[test]
+fn initial_hard_faults_outside_qualification_page_immediately() {
+    let cfg = config(1);
+    for input in [
+        FailoverInput::LinkState(
+            id(0),
+            ExitLinkState {
+                link_up: false,
+                ..ExitLinkState::default()
+            },
+        ),
+        FailoverInput::LinkState(
+            id(0),
+            ExitLinkState {
+                peer_present: false,
+                ..ExitLinkState::default()
+            },
+        ),
+        FailoverInput::LinkState(
+            id(0),
+            ExitLinkState {
+                key_present: false,
+                ..ExitLinkState::default()
+            },
+        ),
+    ] {
+        let mut machine = Failover::new(at(0), Selection::Auto, &cfg).0;
+        // Readiness was observed: later link/peer loss is unrelated to bring-up.
+        advance(
+            &mut machine,
+            0,
+            FailoverInput::LinkState(id(0), ExitLinkState::default()),
+            &cfg,
+        );
+        let actions = advance(&mut machine, 2, input, &cfg);
+        assert!(matches!(machine.health()[&id(0)], ExitHealth::Down { .. }));
+        assert_eq!(
+            actions,
+            vec![FailoverAction::Emit(FailoverEvent::FailClosedStarted(
+                FailClosedReason::NoHealthyExit
+            ))]
+        );
+    }
+}
+
+#[test]
+fn handshake_at_window_start_is_exempt_but_new_handshake_going_stale_pages() {
+    let mut cfg = config(1);
+    cfg.initial_qualification = Duration::from_secs(300);
+    for handshake_at in [0, 2] {
+        let mut machine = Failover::new(at(0), Selection::Auto, &cfg).0;
+        let mut events = Vec::new();
+        for now in (2..=184).step_by(2) {
+            events.extend(advance(
+                &mut machine,
+                now,
+                handshakes(&cfg, Some(now - handshake_at)),
+                &cfg,
+            ));
+            events.extend(advance(&mut machine, now, FailoverInput::Tick, &cfg));
+            if handshake_at == 0 || now < 184 {
+                assert_eq!(machine.health()[&id(0)], ExitHealth::Unknown);
+            }
+        }
+        if handshake_at == 0 {
+            assert_eq!(events, []);
+        } else {
+            assert!(
+                matches!(machine.health()[&id(0)], ExitHealth::Down { reason: DownReason::HandshakeStale, since } if since == at(184))
+            );
+            assert_eq!(
+                events,
+                vec![FailoverAction::Emit(FailoverEvent::FailClosedStarted(
+                    FailClosedReason::NoHealthyExit
+                ))]
+            );
+        }
+    }
 }
 
 #[derive(Default, Debug)]
@@ -1540,42 +1812,42 @@ fn startup_and_reconnect_into_outage_emit_started_once() {
             .count()
     };
     assert_eq!(
-        started(advance(&mut machine, 30, FailoverInput::Tick, &cfg)),
+        started(advance(&mut machine, 60, FailoverInput::Tick, &cfg)),
         0
     );
     assert_eq!(
-        started(advance(&mut machine, 31, FailoverInput::Tick, &cfg)),
+        started(advance(&mut machine, 62, FailoverInput::Tick, &cfg)),
         1
     );
     advance(
         &mut machine,
-        32,
+        64,
         FailoverInput::SelectionChanged(Selection::Disconnected),
         &cfg,
     );
     assert_eq!(
         started(advance(
             &mut machine,
-            33,
+            66,
             FailoverInput::SelectionChanged(Selection::Auto),
             &cfg
         )),
         0
     );
     assert_eq!(
-        started(advance(&mut machine, 34, FailoverInput::Tick, &cfg)),
+        started(advance(&mut machine, 68, FailoverInput::Tick, &cfg)),
         0
     );
     assert_eq!(
-        started(advance(&mut machine, 63, FailoverInput::Tick, &cfg)),
+        started(advance(&mut machine, 126, FailoverInput::Tick, &cfg)),
         0
     );
     assert_eq!(
-        started(advance(&mut machine, 64, FailoverInput::Tick, &cfg)),
+        started(advance(&mut machine, 128, FailoverInput::Tick, &cfg)),
         1
     );
     assert_eq!(
-        started(advance(&mut machine, 65, FailoverInput::Tick, &cfg)),
+        started(advance(&mut machine, 130, FailoverInput::Tick, &cfg)),
         0
     );
 }

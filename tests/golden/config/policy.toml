@@ -1,0 +1,7 @@
+[policy]
+exits = ["ch1"]
+failback = "manual"
+failback_hold = "10m"
+min_dwell = "120s"
+initial_qualification_seconds = 60
+standby = "hot"

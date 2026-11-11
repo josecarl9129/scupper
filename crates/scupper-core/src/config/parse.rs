@@ -126,6 +126,7 @@ fn fields(shape: &str) -> &'static [(&'static str, &'static str)] {
             ("failback_hold", ""),
             ("min_dwell", ""),
             ("standby", ""),
+            ("initial_qualification_seconds", ""),
         ],
         "health" => &[
             ("handshake_stale", ""),
@@ -145,7 +146,7 @@ fn fields(shape: &str) -> &'static [(&'static str, &'static str)] {
             ("api_token_sha256", ""),
             ("gateways", ""),
         ],
-        "alerts" => &[("sinks", "map:sink"), ("fail_closed_grace_seconds", "")],
+        "alerts" => &[("sinks", "map:sink")],
         "sink" => &[
             ("kind", ""),
             ("preset", ""),
