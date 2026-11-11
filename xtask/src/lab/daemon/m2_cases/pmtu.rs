@@ -150,12 +150,20 @@ impl DaemonGuard<'_> {
         self.reset_m2_network()?;
         // M2 refuses IPv6 configuration. This separate fixture checks renderer
         // chains only, with reconciliation suspended until exact restoration.
+        self.notify
+            .as_ref()
+            .ok_or("notify")?
+            .boundary(true, "deliberate SIGSTOP")?;
         self.child.as_mut().ok_or("daemon")?.signal(Signal::STOP);
         self.pmtu_v6_path()?;
         for reverse in [false, true] {
             self.pmtu_direction(stem, true, reverse)?;
         }
         self.reset_m2_network()?;
+        self.notify
+            .as_ref()
+            .ok_or("notify")?
+            .boundary(false, "SIGCONT")?;
         self.child.as_mut().ok_or("daemon")?.signal(Signal::CONT);
         self.lab.daemon_complete_tick(root)
     }

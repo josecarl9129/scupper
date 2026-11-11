@@ -668,6 +668,10 @@ impl DaemonGuard<'_> {
             std::slice::from_ref(&flow),
             &[capture_control(A.client_inner, A.gateway_inner, 1)?],
         )?;
+        self.notify
+            .as_ref()
+            .ok_or("notify")?
+            .boundary(true, "deliberate SIGSTOP")?;
         self.child.as_mut().ok_or("daemon")?.signal(Signal::STOP);
         self.lab.cmd(
             "scupper",
@@ -757,6 +761,10 @@ impl DaemonGuard<'_> {
                 &format!("{}/32", A.client_inner),
             ],
         )?;
+        self.notify
+            .as_ref()
+            .ok_or("notify")?
+            .boundary(false, "SIGCONT")?;
         self.child.as_mut().ok_or("daemon")?.signal(Signal::CONT);
         self.lab.daemon_complete_tick(root)
     }

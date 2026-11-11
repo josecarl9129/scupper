@@ -75,7 +75,7 @@ proptest! {
         let mut targets=BTreeSet::new();
         for (index,step) in p.steps.iter().enumerate() {
             match step {
-                Step::ForwardingOn {requires}=>{prop_assert!(index>0 && p.steps[index-1]==Step::FlushConntrack);prop_assert!(!latched && !set_latch && verified);prop_assert_eq!(*requires,fingerprint);},
+                Step::ForwardingOn {requires}=>{prop_assert!(!disconnected,"Disconnected plan reopened forwarding");prop_assert!(index>0 && p.steps[index-1]==Step::FlushConntrack);prop_assert!(!latched && !set_latch && verified);prop_assert_eq!(*requires,fingerprint);},
                 Step::VerifyRuleset {fingerprint:f}=>verified=*f==fingerprint,
                 Step::RouteReplace {target:RouteTarget::Exit(name),..}=>{prop_assert!(d.exits().values().any(|n|n==name.as_str()));targets.insert(name.as_str());},
                 _=>{},

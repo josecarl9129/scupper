@@ -43,7 +43,7 @@ pub enum BootStep {
     Links = 4,
     /// 5: reassert the persisted default routes.
     Routes = 5,
-    /// 6: enable forwarding only after verification, unless quarantined.
+    /// 6: enable forwarding only after verification, unless quarantined or Disconnected.
     Forwarding = 6,
     /// 7: durably publish the per-boot namespace identity and report.
     Record = 7,
@@ -520,9 +520,14 @@ fn boot_locked(deps: &BootDeps<'_>, mut report: BootReport, open_quarantined: bo
             && !cfg.missing_state_alert
             && links::adoptable(deps, &handle, &cfg).is_ok()
             && containment(deps, &handle, &cfg, &mut owned_links).is_ok()
-            && (sysctls(deps, &handle, &names, true, false).is_ok()
-                || (cfg.state.selection == Selection::Disconnected
-                    && sysctls(deps, &handle, &names, false, false).is_ok()));
+            && sysctls(
+                deps,
+                &handle,
+                &names,
+                cfg.state.selection != Selection::Disconnected,
+                false,
+            )
+            .is_ok();
         let closed = if adopted {
             Ok(())
         } else {
@@ -684,7 +689,9 @@ fn boot_locked(deps: &BootDeps<'_>, mut report: BootReport, open_quarantined: bo
             deps,
             &handle,
             &configured_names(&cfg)?,
-            (cfg.state.quarantine.is_none() || open_quarantined) && !cfg.missing_state_alert,
+            (cfg.state.quarantine.is_none() || open_quarantined)
+                && cfg.state.selection != Selection::Disconnected
+                && !cfg.missing_state_alert,
             true,
         )
     }) {

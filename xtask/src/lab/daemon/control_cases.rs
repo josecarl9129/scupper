@@ -139,6 +139,14 @@ mod verdict_tests {
     }
 }
 
+fn read_event_sequence(root: &Path) -> Result<u64> {
+    let mut seq = 0;
+    for event in scupper_sys::events::read_since(&root.join("var-lib/scupper"), 0, None) {
+        seq = seq.max(event?.seq);
+    }
+    Ok(seq)
+}
+
 fn sole_unreachable(routes: &serde_json::Value) -> bool {
     // Accept old saved text snapshots as well as the current `ip -j` output.
     if let Some(text) = routes.as_str() {
@@ -211,6 +219,18 @@ fn compare_sessions(before: &str, after: &str, traffic: bool) -> bool {
         })
 }
 
+fn boot_trace_keeps_forwarding_closed(calls: &[serde_json::Value]) -> bool {
+    calls.iter().all(|call| {
+        call["program"] != "Sysctl"
+            || call["args"].as_array().is_some_and(|args| {
+                !args
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .any(|arg| arg.ends_with("forwarding=1") || arg == "net.ipv4.ip_forward=1")
+            })
+    })
+}
+
 impl DaemonGuard<'_> {
     pub(super) fn control_command(
         &mut self,
@@ -262,6 +282,84 @@ impl DaemonGuard<'_> {
             status.code().unwrap_or(-1),
             format!("{output}\n{diagnostic}"),
         ))
+    }
+    fn assert_forwarding_closed(&mut self, stem: &str) -> Result<()> {
+        let values = self.lab.daemon_sysctls()?;
+        fs::write(
+            self.lab
+                .artifacts
+                .join(format!("{}-{stem}-gates.json", self.case)),
+            serde_json::to_vec_pretty(&values)?,
+        )?;
+        if values.iter().any(|(key, value)| {
+            (key.ends_with(".forwarding") || key == "net.ipv4.ip_forward") && value != "0"
+        }) {
+            return fail(format!(
+                "{} {stem}: Disconnected forwarding gate is not 0: {values:?}",
+                self.case
+            ));
+        }
+        Ok(())
+    }
+    fn assert_disconnected_boot(&mut self, stem: &str) -> Result<()> {
+        let calls: Vec<serde_json::Value> = serde_json::from_slice(&fs::read(
+            self.lab.artifacts.join(format!("{stem}.calls.json")),
+        )?)?;
+        if !boot_trace_keeps_forwarding_closed(&calls) {
+            return fail(format!(
+                "{stem}: boot enabled forwarding while Disconnected"
+            ));
+        }
+        self.assert_forwarding_closed(stem)
+    }
+    fn assert_disconnected_iterations(&mut self, root: &Path, stem: &str, seq: u64) -> Result<()> {
+        self.notify.as_ref().ok_or("notify")?.drain()?;
+        let mut completed = 0;
+        let start = Instant::now();
+        loop {
+            self.assert_forwarding_closed(stem)?;
+            for event in scupper_sys::events::read_since(&root.join("var-lib/scupper"), seq, None) {
+                if matches!(
+                    event?.kind,
+                    scupper_proto::EventKind::Repair {
+                        result: scupper_proto::Outcome::Failed,
+                        ..
+                    }
+                ) {
+                    return fail(format!(
+                        "{} {stem}: repair failed after disconnect",
+                        self.case
+                    ));
+                }
+            }
+            completed += self
+                .notify
+                .as_ref()
+                .ok_or("notify")?
+                .drain()?
+                .iter()
+                .filter(|message| message.lines().any(|line| line == "WATCHDOG=1"))
+                .count();
+            if completed >= 3 {
+                self.lab.daemon_complete_tick(root)?;
+                fs::write(
+                    self.lab
+                        .artifacts
+                        .join(format!("{}-{stem}-iterations.json", self.case)),
+                    serde_json::to_vec_pretty(
+                        &serde_json::json!({"completed":completed, "repair_failures":0, "forwarding":0}),
+                    )?,
+                )?;
+                return Ok(());
+            }
+            if start.elapsed() >= Duration::from_secs(12) {
+                return fail(format!(
+                    "{} {stem}: disconnected iterations stopped completing",
+                    self.case
+                ));
+            }
+            self.lab.runner.dwell(Duration::from_millis(250))?;
+        }
     }
     fn assert_disconnect_snapshot(&self, stem: &str) -> Result<()> {
         let snapshot: serde_json::Value = serde_json::from_slice(&fs::read(
@@ -497,21 +595,35 @@ impl DaemonGuard<'_> {
         Ok(())
     }
     pub(super) fn control_restart(&mut self, root: &Path, stage: &str) -> Result<()> {
-        if let Some(mut child) = self.child.take() {
-            child.signal(Signal::CONT);
-            child.stop_timeout(Signal::TERM, Duration::from_secs(30))?;
-        }
+        self.control_stop(Signal::TERM)?;
         if let Some(notify) = &self.notify {
             notify.drain()?;
+            notify.boundary(false, "restart")?;
         }
+        self.deliberately_killed = false;
         self.child = Some(self.lab.daemon_spawn(&self.case, root, stage)?);
         self.lab
             .daemon_ready_tick(self.notify.as_ref().ok_or("missing notify")?)
     }
     pub(super) fn control_stop(&mut self, signal: Signal) -> Result<()> {
         if let Some(mut child) = self.child.take() {
+            self.deliberately_killed = signal == Signal::KILL;
             child.signal(Signal::CONT);
             child.stop_timeout(signal, Duration::from_secs(30))?;
+            if let Some(notify) = &self.notify {
+                notify.boundary(
+                    true,
+                    if signal == Signal::KILL {
+                        "SIGKILL"
+                    } else {
+                        "graceful stop"
+                    },
+                )?;
+            }
+            super::cleanup_control_socket(
+                &self.lab.boot_root.join("run/scupper"),
+                self.deliberately_killed,
+            )?;
         }
         Ok(())
     }
@@ -684,6 +796,10 @@ impl DaemonGuard<'_> {
                     .daemon_wait("L10 canary control", Duration::from_secs(5), |_| {
                         Ok(flow_counts(&path)?.1 > 10)
                     })?;
+                self.notify
+                    .as_ref()
+                    .ok_or("notify")?
+                    .boundary(true, "L10 intentional incomplete-tick watchdog expiry")?;
                 fs::write(root.join("run/scupper/incomplete-tick"), b"hold")?;
                 self.lab.runner.dwell(Duration::from_secs(32))?;
                 let (code, text) =
@@ -693,9 +809,17 @@ impl DaemonGuard<'_> {
                 }
                 self.assert_heartbeat_quiet(Duration::ZERO, Duration::from_secs(5))?;
                 fs::remove_file(root.join("run/scupper/incomplete-tick"))?;
+                self.notify
+                    .as_ref()
+                    .ok_or("notify")?
+                    .boundary(false, "L10 tick recovery")?;
                 self.lab.runner.dwell(Duration::from_secs(3))?;
                 self.expect_check(&root, 0, None, "fresh-again")?;
                 self.heartbeat_cadence_control()?;
+                self.notify
+                    .as_ref()
+                    .ok_or("notify")?
+                    .boundary(true, "L10 deliberate SIGSTOP")?;
                 self.child
                     .as_ref()
                     .ok_or("daemon missing")?
@@ -715,6 +839,10 @@ impl DaemonGuard<'_> {
                 )?;
                 self.assert_heartbeat_quiet(Duration::from_secs(32), Duration::from_secs(5))?;
                 let heartbeat_before = self.heartbeat_count()?;
+                self.notify
+                    .as_ref()
+                    .ok_or("notify")?
+                    .boundary(false, "L10 SIGCONT")?;
                 self.child
                     .as_ref()
                     .ok_or("daemon missing")?
@@ -759,6 +887,7 @@ impl DaemonGuard<'_> {
                 self.expect_check(&root, 0, None, "restarted")?;
             }
             "L14" => {
+                let disconnected_seq = read_event_sequence(&root)?;
                 let (code, text) = self.control_command(&root, &["disconnect"], "disconnect")?;
                 if code != 0
                     || !text.contains("traffic is now blocked")
@@ -767,6 +896,7 @@ impl DaemonGuard<'_> {
                     return fail(format!("L14 disconnect: {code}: {text}"));
                 }
                 self.assert_disconnect_snapshot("disconnect")?;
+                self.assert_disconnected_iterations(&root, "disconnect", disconnected_seq)?;
                 self.expect_check(
                     &root,
                     4,
@@ -775,6 +905,7 @@ impl DaemonGuard<'_> {
                 )?;
                 self.control_stop(Signal::TERM)?;
                 self.lab.boot_gateway(&[], &format!("{case}-reboot"))?;
+                self.assert_disconnected_boot(&format!("{case}-reboot"))?;
                 let boot: serde_json::Value = serde_json::from_slice(&fs::read(
                     self.lab.artifacts.join(format!("{case}-reboot.json")),
                 )?)?;
@@ -788,6 +919,7 @@ impl DaemonGuard<'_> {
                     "reboot-closed",
                 )?;
                 self.control_restart(&root, "after-reboot")?;
+                self.assert_disconnected_iterations(&root, "after-reboot", disconnected_seq)?;
                 self.expect_check(
                     &root,
                     4,
@@ -811,11 +943,17 @@ impl DaemonGuard<'_> {
                 self.assert_client_traffic(&mut markers)?;
                 // A real reboot necessarily loses the server session. Do not
                 // reset the client: its ordinary WireGuard rekey must recover.
+                let disconnected_seq = read_event_sequence(&root)?;
                 let (code, text) =
                     self.control_command(&root, &["disconnect"], "real-reboot-disconnect")?;
                 if code != 0 {
                     return fail(text);
                 }
+                self.assert_disconnected_iterations(
+                    &root,
+                    "real-reboot-disconnect",
+                    disconnected_seq,
+                )?;
                 self.control_stop(Signal::TERM)?;
                 let old_identity = self
                     .lab
@@ -823,6 +961,7 @@ impl DaemonGuard<'_> {
                 self.lab.cmd("", "ip", &["netns", "delete", "scupper"])?;
                 self.assert_namespace_released(old_identity.trim())?;
                 self.lab.boot_gateway(&[], &format!("{case}-real-reboot"))?;
+                self.assert_disconnected_boot(&format!("{case}-real-reboot"))?;
                 self.expect_check(
                     &root,
                     4,
@@ -830,6 +969,7 @@ impl DaemonGuard<'_> {
                     "real-reboot-closed",
                 )?;
                 self.control_restart(&root, "real-reboot")?;
+                self.assert_disconnected_iterations(&root, "real-reboot", disconnected_seq)?;
                 let (code, text) =
                     self.control_command(&root, &["connect"], "real-reboot-connect")?;
                 if code != 0 {
@@ -1140,6 +1280,7 @@ impl DaemonGuard<'_> {
                 if code != 3 || !report.to_string().contains("DisconnectNotEffective") {
                     return fail(format!("L50 wrong intent-only failure: {code}: {report}"));
                 }
+                let disconnected_seq = read_event_sequence(&root)?;
                 let (code, text) = self.control_command(&root, &["disconnect"], "tighten")?;
                 if code != 0 || !text.contains("traffic is now blocked") {
                     return fail("L50 tightening did not verify closure");
@@ -1150,7 +1291,9 @@ impl DaemonGuard<'_> {
                     Some(("FailClosed", "AdminDisconnected")),
                     "tightened",
                 )?;
+                self.assert_forwarding_closed("tightened")?;
                 self.control_restart(&root, "socket-closure")?;
+                self.assert_disconnected_iterations(&root, "socket-closure", disconnected_seq)?;
                 let (code, text) = self.control_command(&root, &["connect"], "socket-connect")?;
                 if code != 0 {
                     return fail(format!("L50 connect: {code}: {text}"));
@@ -1183,12 +1326,14 @@ impl DaemonGuard<'_> {
                     ));
                 }
                 self.lab.daemon_route_healthy(Duration::from_secs(5))?;
+                let disconnected_seq = read_event_sequence(&root)?;
                 let (code, text) =
                     self.control_command(&root, &["disconnect"], "socket-tighten")?;
                 if code != 0 || !text.contains("transport: local socket") {
                     return fail(format!("L50 socket closure: {code}: {text}"));
                 }
                 self.assert_disconnect_snapshot("socket-tighten")?;
+                self.assert_disconnected_iterations(&root, "socket-tighten", disconnected_seq)?;
                 self.expect_check(
                     &root,
                     4,
@@ -1273,6 +1418,29 @@ mod session_tests {
             "peer 99 1100 2100",
         ] {
             assert!(!session_continues(before, after));
+        }
+    }
+}
+
+#[cfg(test)]
+mod disconnected_boot_tests {
+    use super::*;
+    #[test]
+    fn boot_trace_rejects_transient_open_gates_even_if_later_closed() {
+        let call = |arg: &str| serde_json::json!({"program":"Sysctl", "args":["-w",arg]});
+        for key in [
+            "net.ipv4.ip_forward",
+            "net.ipv6.conf.all.forwarding",
+            "net.ipv4.conf.wg0.forwarding",
+            "net.ipv6.conf.default.forwarding",
+        ] {
+            assert!(boot_trace_keeps_forwarding_closed(&[call(&format!(
+                "{key}=0"
+            ))]));
+            assert!(!boot_trace_keeps_forwarding_closed(&[
+                call(&format!("{key}=1")),
+                call(&format!("{key}=0"))
+            ]));
         }
     }
 }

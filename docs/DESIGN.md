@@ -894,10 +894,12 @@ upstream generation with scupperd's.
 
 ### Repairs
 
+Disconnected keeps all forwarding gates at 0.
+
 | Drift | Detected by | Repair (in order) | Class |
 |---|---|---|---|
-| Ruleset missing or differs | fingerprint | forwarding 0 (both families, **immediately**, no debounce) → `nft -f` rendered file → verify → `conntrack -F` (drops flows created during the gap) → forwarding 1 → re-apply hardening → read back | Tighten, then Restore |
-| Forwarding 0 with verified ruleset, no quarantine latch | sysctl | forwarding 1 (only with an exact match on the same tick and no latch set), re-apply hardening | Restore |
+| Ruleset missing or differs | fingerprint | forwarding 0 (both families, **immediately**, no debounce) → `nft -f` rendered file → verify → `conntrack -F` (drops flows created during the gap) → forwarding 1 unless latched or Disconnected → re-apply hardening → read back | Tighten, then Restore |
+| Forwarding 0 with verified ruleset, no quarantine latch, not Disconnected | sysctl | forwarding 1 (only with an exact match on the same tick, unless latched or Disconnected), re-apply hardening | Restore |
 | Hardening sysctl differs | sysctl | write, read back | Restore |
 | Route missing or wrong | route table | `route replace` with the failover machine's current target | Restore |
 | Extra route in the netns main table | route table | delete | Tighten |
@@ -2218,7 +2220,7 @@ WantedBy=multi-user.target
    per-link sysctls, `ip link set <if> up`.
 5. Routes for the persisted selection: first candidate exit (packets wait
    inside WireGuard until the first handshake) or `unreachable`.
-6. Forwarding 1 unless the quarantine latch is set; re-apply hardening; read back.
+6. Forwarding 1 unless latched or Disconnected; re-apply hardening; read back.
 7. Write `/run/scupper/boot.json` (step results); scupperd logs `Boot`.
 
 Requirement "ruleset before forwarding" is met inside the namespace by

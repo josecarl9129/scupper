@@ -549,24 +549,50 @@ mod tests {
                 Err(std::io::ErrorKind::UnexpectedEof.into())
             }
         }
-        if rustix::process::geteuid().is_root() || rustix::process::getegid().is_root() {
-            return; // Root delivery is rejected before any input is read.
-        }
+        let sentinel = std::env::var_os("SCUPPER_HARDENING_SENTINEL").unwrap();
         let mut input = InspectInput(false);
-        assert_eq!(child(&mut input), Err(Failure::Internal));
-        assert!(input.0);
+        if rustix::process::geteuid().is_root() || rustix::process::getegid().is_root() {
+            assert_eq!(child(&mut input), Err(Failure::Account));
+            assert!(!input.0);
+            eprintln!("root delivery rejected before stdin; nonroot hardening assertions skipped");
+            std::fs::write(
+                sentinel,
+                "root rejected before stdin; hardening assertions skipped\n",
+            )
+            .unwrap();
+        } else {
+            assert_eq!(child(&mut input), Err(Failure::Internal));
+            assert!(input.0);
+            std::fs::write(sentinel, "hardening verified before stdin\n").unwrap();
+        }
     }
     #[test]
     fn delivery_hardens_before_first_secret_input_read() {
+        let sentinel = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("heartbeat-hardening-{}", std::process::id()));
+        let _ = std::fs::remove_file(&sentinel);
+        assert!(!sentinel.exists(), "hardening sentinel must start absent");
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--ignored",
                 "--exact",
+                "--nocapture",
                 "heartbeat::tests::hardened_stdin_fixture",
             ])
+            .env("SCUPPER_HARDENING_SENTINEL", &sentinel)
             .status()
             .unwrap();
         assert!(status.success());
+        let evidence = std::fs::read_to_string(&sentinel).unwrap();
+        if rustix::process::geteuid().is_root() || rustix::process::getegid().is_root() {
+            assert_eq!(
+                evidence,
+                "root rejected before stdin; hardening assertions skipped\n"
+            );
+        } else {
+            assert_eq!(evidence, "hardening verified before stdin\n");
+        }
+        std::fs::remove_file(sentinel).unwrap();
     }
     #[test]
     fn missing_executable_is_an_exec_failure() {

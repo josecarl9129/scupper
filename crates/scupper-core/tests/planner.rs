@@ -639,6 +639,14 @@ fn closed_or_safe(d: &Desired, m: &KernelModel) -> bool {
     safe(&known, d)
 }
 fn assert_plan(d: &Desired, m: &KernelModel, p: &Plan, latch: Option<&Latch>) {
+    if d.disconnected() {
+        assert!(
+            !p.steps
+                .iter()
+                .any(|step| matches!(step, Step::ForwardingOn { .. })),
+            "Disconnected plan reopened forwarding"
+        );
+    }
     if p.escalations.contains(&Escalation::NamespaceInodeGone) {
         return;
     }
@@ -838,15 +846,18 @@ fn disconnected_routes_precede_exit_down_and_never_promote_a_foreign_target() {
     assert!(!p.debounce.previous.contains("link:ex-ch1"));
     assert_eq!(
         p.steps,
-        [
-            Step::RouteReplace {
-                family: Family::V4,
-                target: RouteTarget::Unreachable
-            },
-            Step::LinkDown {
-                name: "ex-ch1".into()
-            }
-        ]
+        closed_steps(
+            &disconnected,
+            vec![
+                Step::RouteReplace {
+                    family: Family::V4,
+                    target: RouteTarget::Unreachable
+                },
+                Step::LinkDown {
+                    name: "ex-ch1".into()
+                }
+            ]
+        )
     );
     assert!(safe(&run(&m, &p.steps), &disconnected));
     let site = validate(parse_site(include_str!("fixtures/site-m2.toml")).unwrap()).unwrap();
@@ -2513,4 +2524,55 @@ fn external_forwarding_zero_spends_its_budget_and_one_suppressed_object_leaves_o
     );
     assert!(!p.steps.contains(&Step::ForwardingOff));
     assert!(safe(&run(&m, &p.steps), &d));
+}
+
+#[test]
+fn disconnected_plan_never_opens_forwarding() {
+    let connected = desired();
+    let disconnected = desired_with("ch1", [7; 32], &Selection::Disconnected);
+    for mut model in [
+        KernelModel::desired(&connected),
+        KernelModel::desired(&disconnected),
+    ] {
+        // Cover both an open disconnect transition and a closed ruleset repair.
+        model.ruleset = Known::Value(Ruleset::Absent);
+        let plan = settled(&disconnected, &model);
+        assert!(
+            !plan
+                .steps
+                .iter()
+                .any(|step| matches!(step, Step::ForwardingOn { .. }))
+        );
+        assert_plan(&disconnected, &model, &plan, None);
+        assert!(
+            plan.steps
+                .iter()
+                .fold(model, |m, step| m.apply(step))
+                .forwarding_off()
+        );
+    }
+}
+
+#[test]
+fn disconnected_safety_requires_every_forwarding_gate_closed() {
+    let d = desired_with("ch1", [7; 32], &Selection::Disconnected);
+    let m = KernelModel::desired(&d);
+    assert!(m.forwarding_off() && safe(&m, &d));
+    for index in 0..7 {
+        let mut open = m.clone();
+        let gate = match index {
+            0 => &mut open.forwarding_v4,
+            1 => &mut open.forwarding_v6,
+            2 => &mut open.client_forwarding_v4,
+            3 => &mut open.default_forwarding_v4,
+            4 => &mut open.default_forwarding_v6,
+            5 => &mut open.links.get_mut("wg0").unwrap().forwarding_v4,
+            _ => &mut open.links.get_mut("lo").unwrap().forwarding_v6,
+        };
+        *gate = Known::Value(1);
+        assert!(!safe(&open, &d), "open gate {index} was considered safe");
+        let plan = tick(&d, &open, &Debounce::default());
+        assert_eq!(plan.steps.first(), Some(&Step::ForwardingOff));
+        assert_plan(&d, &open, &plan, None);
+    }
 }

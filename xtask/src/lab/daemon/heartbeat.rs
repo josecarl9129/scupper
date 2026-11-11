@@ -3,7 +3,7 @@ use super::{A, DaemonGuard, Duration, Group, Invocation, Path, Result, Signal, f
 use scupper_core::config::{HeartbeatReport, SiteConfig};
 use scupper_proto::{EventKind, Reason};
 use std::fmt::Write as _;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 
 pub(super) const ENDPOINT: &str = "198.51.100.10";
 
@@ -23,18 +23,46 @@ fn check_account_failure(root: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn delivery_binaries(source: &Path, root: &Path) -> Result<std::path::PathBuf> {
-    let bin = root.join("bin");
-    fs::create_dir_all(&bin)?;
-    fs::set_permissions(&bin, fs::Permissions::from_mode(0o755))?;
+fn executable_mount(flags: rustix::fs::StatVfsMountFlags, bin: &Path) -> Result<()> {
+    if flags.contains(rustix::fs::StatVfsMountFlags::NOEXEC) {
+        return fail(format!(
+            "heartbeat lab setup: {} is on a noexec filesystem (statvfs ST_NOEXEC)",
+            bin.display()
+        ));
+    }
+    Ok(())
+}
+
+fn delivery_binaries(source: &Path, bin: &Path) -> Result<std::path::PathBuf> {
+    executable_mount(rustix::fs::statvfs(bin)?.f_flag, bin)?;
     for name in ["scupper", "scupperd"] {
         let target = bin.join(name);
-        if !target.exists() {
-            fs::copy(source.with_file_name(name), &target)?;
-            fs::set_permissions(target, fs::Permissions::from_mode(0o755))?;
-        }
+        fs::copy(source.with_file_name(name), &target)?;
+        fs::set_permissions(target, fs::Permissions::from_mode(0o755))?;
     }
     Ok(bin.join("scupperd"))
+}
+
+impl super::Lab {
+    pub(super) fn heartbeat_binaries(&mut self) -> Result<std::path::PathBuf> {
+        let bin = Path::new("/var/lib").join(format!("scupper-lab-bin-{}", Self::marker()?));
+        fs::DirBuilder::new().mode(0o755).create(&bin)?;
+        self.registry
+            .register(crate::lab::Resource::Directory(bin.clone()));
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755))?;
+        if fs::metadata(&bin)?.uid() != 0 {
+            return fail("heartbeat lab setup: executable directory must be root-owned");
+        }
+        for ancestor in bin.ancestors() {
+            if fs::metadata(ancestor)?.mode() & 0o001 == 0 {
+                return fail(format!(
+                    "heartbeat lab setup: {} is not traversable by scupper-alert",
+                    ancestor.display()
+                ));
+            }
+        }
+        delivery_binaries(&Self::boot_binary()?, &bin)
+    }
 }
 
 pub(super) fn overlay(invocation: &Invocation, root: &Path) -> Invocation {
@@ -804,6 +832,22 @@ mod tests {
         ));
     }
     #[test]
+    fn noexec_mount_has_a_clear_setup_error() {
+        let error = executable_mount(
+            rustix::fs::StatVfsMountFlags::NOEXEC,
+            Path::new("/run/lab/bin"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("noexec") && error.contains("ST_NOEXEC"));
+        executable_mount(
+            rustix::fs::StatVfsMountFlags::empty(),
+            Path::new("/var/lib/lab/bin"),
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn delivery_copy_escapes_inaccessible_source_ancestors() {
         let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
             .join(format!("delivery-copy-{}", std::process::id()));
@@ -813,7 +857,9 @@ mod tests {
         for name in ["scupper", "scupperd"] {
             fs::write(source.join(name), "#!/bin/sh\nexit 0\n").unwrap();
         }
-        let daemon = delivery_binaries(&source.join("scupper"), &root).unwrap();
+        let bin = root.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let daemon = delivery_binaries(&source.join("scupper"), &bin).unwrap();
         assert_eq!(daemon, root.join("bin/scupperd"));
         for name in ["scupper", "scupperd"] {
             assert_eq!(

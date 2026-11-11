@@ -24,6 +24,7 @@ use std::{
 mod control_cases;
 mod heartbeat;
 mod m2_cases;
+mod watchdog;
 
 pub(super) fn short_boot_root(case: &str) -> std::path::PathBuf {
     Path::new("/run/scupper-lab").join(format!("{}-{case}", std::process::id()))
@@ -90,10 +91,34 @@ fn startup_complete(
 // Drain notifications continuously, including while fault commands or probes block.
 struct NotifyCapture {
     messages: Arc<Mutex<Vec<String>>>,
+    watchdog: Arc<Mutex<watchdog::Watchdog>>,
+    evidence: std::path::PathBuf,
     stop: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<io::Result<()>>>,
 }
 impl NotifyCapture {
+    fn boundary(&self, paused: bool, reason: &'static str) -> Result<()> {
+        let mut watchdog = self.watchdog.lock().map_err(|_| "watchdog lock poisoned")?;
+        watchdog.boundary(Instant::now(), paused, reason);
+        watchdog.check()
+    }
+    fn finish(mut self) -> Result<()> {
+        self.stop.store(true, Ordering::Relaxed);
+        let joined = if let Some(worker) = self.worker.take() {
+            worker
+                .join()
+                .map_err(|_| "notify artifact worker panicked")?
+        } else {
+            Ok(())
+        };
+        let watchdog = self.watchdog.lock().map_err(|_| "watchdog lock poisoned")?;
+        fs::write(
+            &self.evidence,
+            serde_json::to_vec_pretty(&watchdog.evidence())?,
+        )?;
+        joined?;
+        watchdog.check()
+    }
     fn drain(&self) -> Result<Vec<String>> {
         if self
             .worker
@@ -102,6 +127,10 @@ impl NotifyCapture {
         {
             return fail("notify artifact worker stopped");
         }
+        self.watchdog
+            .lock()
+            .map_err(|_| "watchdog lock poisoned")?
+            .check()?;
         Ok(std::mem::take(
             &mut *self.messages.lock().map_err(|_| "notify lock poisoned")?,
         ))
@@ -114,12 +143,24 @@ impl NotifyCapture {
         let pending = messages.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
+        let watchdog = Arc::new(Mutex::new(watchdog::Watchdog::default()));
+        let clock = watchdog.clone();
         let worker = std::thread::spawn(move || {
             let mut bytes = vec![0; 65536];
             loop {
                 match socket.recv(&mut bytes) {
                     Ok(len) => {
                         let message = String::from_utf8_lossy(&bytes[..len]).into_owned();
+                        {
+                            let mut watchdog = clock
+                                .lock()
+                                .map_err(|_| io::Error::other("watchdog lock poisoned"))?;
+                            let now = Instant::now();
+                            if message.lines().any(|line| line == "READY=1") {
+                                watchdog.ready(now);
+                            }
+                            watchdog.observe(now, message.lines().any(|line| line == "WATCHDOG=1"));
+                        }
                         writeln!(
                             file,
                             "{}",
@@ -141,6 +182,10 @@ impl NotifyCapture {
                                 | io::ErrorKind::Interrupted
                         ) =>
                     {
+                        clock
+                            .lock()
+                            .map_err(|_| io::Error::other("watchdog lock poisoned"))?
+                            .observe(Instant::now(), false);
                         if stopping.load(Ordering::Relaxed) {
                             return file.sync_all();
                         }
@@ -151,6 +196,8 @@ impl NotifyCapture {
         });
         Ok(Self {
             messages,
+            watchdog,
+            evidence: path.with_extension("watchdog.json"),
             stop,
             worker: Some(worker),
         })
@@ -165,6 +212,25 @@ impl Drop for NotifyCapture {
     }
 }
 
+// Reclamation is permitted only for the pathname left by a deliberate daemon SIGKILL.
+fn cleanup_control_socket(run: &Path, deliberately_killed: bool) -> Result<()> {
+    if fs::symlink_metadata(run.join("control.sock"))
+        .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+    {
+        return Ok(());
+    }
+    if !deliberately_killed {
+        return fail("graceful daemon stop left control socket; refusing stale-socket reclamation");
+    }
+    let _lease = scupper_sys::lock::SupervisorLease::try_acquire(run)?;
+    let _writer = scupper_sys::lock::WriterLock::try_acquire(run)?;
+    drop(scupper_sys::daemon::control::Server::bind(run)?);
+    if fs::symlink_metadata(run.join("control.sock")).is_ok() {
+        return fail("daemon cleanup left control socket after deliberate SIGKILL");
+    }
+    Ok(())
+}
+
 // Own both the daemon and fixture cleanup before any fallible fault operation.
 struct DaemonGuard<'a> {
     lab: &'a mut Lab,
@@ -173,6 +239,7 @@ struct DaemonGuard<'a> {
     case: String,
     notify: Option<NotifyCapture>,
     baseline_version: Option<u64>,
+    deliberately_killed: bool,
 }
 impl DaemonGuard<'_> {
     #[allow(clippy::too_many_lines)] // Keep start/restart continuity and fault cleanup ordering together.
@@ -234,6 +301,8 @@ impl DaemonGuard<'_> {
             .as_mut()
             .ok_or("missing daemon")?
             .stop_timeout(Signal::TERM, Duration::from_secs(30))?;
+        notify.boundary(true, "graceful stop")?;
+        cleanup_control_socket(&root.join("run/scupper"), false)?;
         if before != self.lab.daemon_snapshot()? {
             return fail("SIGTERM changed healthy kernel state");
         }
@@ -249,6 +318,7 @@ impl DaemonGuard<'_> {
             return fail("initial daemon stop did not finish its event log");
         }
         drop(previous_writer);
+        notify.boundary(false, "restart")?;
         self.child = Some(self.lab.daemon_spawn(case, &root, "restart")?);
         self.lab.daemon_ready_tick(notify)?;
         let replies_at_restart = flow_counts(&flow)?.1;
@@ -294,6 +364,8 @@ impl DaemonGuard<'_> {
         super::mounts::verify_restored_peers(child.supervised_pid()?)?;
         let before = self.lab.daemon_snapshot()?;
         child.stop_timeout(Signal::TERM, Duration::from_secs(30))?;
+        notify.boundary(true, "graceful stop")?;
+        cleanup_control_socket(&root.join("run/scupper"), false)?;
         if before != self.lab.daemon_snapshot()? {
             return fail("SIGTERM changed kernel state");
         }
@@ -326,6 +398,7 @@ impl DaemonGuard<'_> {
         if case == "L4" {
             drop(self.child.take());
             notify.drain()?;
+            notify.boundary(false, "recreated restart")?;
             self.child = Some(self.lab.daemon_spawn(case, &root, "recreated-restart")?);
             self.lab.daemon_ready_tick(notify)?;
             self.lab.service_check(&mut Vec::new())?;
@@ -365,14 +438,22 @@ impl DaemonGuard<'_> {
             }
             super::mounts::verify_restored_peers(pid)
         })();
-        if let Some(mut child) = self.child.take() {
+        let stopped = if let Some(mut child) = self.child.take() {
+            self.deliberately_killed = false;
             child.signal(Signal::CONT);
-            let _ = child.stop_timeout(Signal::TERM, Duration::from_secs(5));
-            drop(child); // Group kills/reaps on any failed graceful stop.
-        }
-        if let Some(notify) = self.notify.take() {
-            drop(notify);
-        }
+            child.stop_timeout(Signal::TERM, Duration::from_secs(5))
+        } else {
+            Ok(())
+        };
+        let watched = if let Some(notify) = self.notify.take() {
+            notify.finish()
+        } else {
+            Ok(())
+        };
+        let socket = cleanup_control_socket(
+            &self.lab.boot_root.join("run/scupper"),
+            self.deliberately_killed,
+        );
         let saved = save_event_artifacts(
             &self.lab.private.join("boot-root/var-lib/scupper/events"),
             &self
@@ -453,11 +534,6 @@ impl DaemonGuard<'_> {
                 let _lease = scupper_sys::lock::SupervisorLease::try_acquire(&run)?;
                 let _writer = scupper_sys::lock::WriterLock::try_acquire(&run)?;
                 if run.join("control.sock").exists() {
-                    // SIGKILL leaves the pathname. Both leases are held; use
-                    // production validation to reclaim only a dead owned socket.
-                    drop(scupper_sys::daemon::control::Server::bind(&run)?);
-                }
-                if run.join("control.sock").exists() {
                     return fail("daemon cleanup left control socket");
                 }
                 self.lab.cmd("scupper", "conntrack", &["-F"])?;
@@ -466,7 +542,14 @@ impl DaemonGuard<'_> {
         self.lab.runner.cleanup = cleanup;
         self.lab.runner.phase = phase;
         self.lab.runner.whole = whole;
-        mounts.and(saved).and(marker).and(captures).and(restored)
+        mounts
+            .and(stopped)
+            .and(watched)
+            .and(socket)
+            .and(saved)
+            .and(marker)
+            .and(captures)
+            .and(restored)
     }
 }
 impl Drop for DaemonGuard<'_> {
@@ -582,6 +665,7 @@ impl Lab {
             case: case.into(),
             notify: None,
             baseline_version: None,
+            deliberately_killed: false,
         };
         let result = guard.run(case);
         let cleanup = guard.finish();
@@ -607,8 +691,9 @@ impl Lab {
         let spawned = self.daemon_start(stem, &root);
         self.runner.boot_point = None;
         self.runner.boot_marker = None;
-        let (mut child, _notify) = spawned?;
-        child.wait_timeout(Duration::from_secs(30))
+        let (mut child, notify) = spawned?;
+        let result = child.wait_timeout(Duration::from_secs(30));
+        super::mutation::finish(result, notify.finish())
     }
     pub(super) fn daemon_boot_recover(&mut self, stem: &str) -> Result<String> {
         let root = self.boot_root.clone();
@@ -633,6 +718,8 @@ impl Lab {
             return fail(format!("{stem} supervised retry: {code}: {report}"));
         }
         child.stop_timeout(Signal::TERM, Duration::from_secs(30))?;
+        cleanup_control_socket(&root.join("run/scupper"), false)?;
+        notify.finish()?;
         save_event_artifacts(
             &root.join("var-lib/scupper/events"),
             &self.artifacts.join(format!("{stem}-events")),
@@ -826,7 +913,12 @@ impl Lab {
             &root.join("var-lib/scupper/events"),
             &self.artifacts.join("L19-L3-events"),
         );
-        super::mutation::finish(result, unfrozen.and(stopped).and(saved))
+        let socket = cleanup_control_socket(&root.join("run/scupper"), false);
+        let watched = notify.finish();
+        super::mutation::finish(
+            result,
+            unfrozen.and(stopped).and(socket).and(watched).and(saved),
+        )
     }
 
     pub(super) fn meta_resume(&mut self, root: &Path, prefix: &str) -> Result<()> {
@@ -873,7 +965,7 @@ impl Lab {
         // Unlike root-started probes, heartbeat exec happens after uid/gid drop.
         // Neither executable may require traversal through a runner's home.
         let daemon = if matches!(case, "L10" | "L53" | "L53b" | "heartbeat") {
-            heartbeat::delivery_binaries(&Self::boot_binary()?, root)?
+            self.heartbeat_binaries()?
         } else {
             Self::boot_binary()?.with_file_name("scupperd")
         };
@@ -2001,6 +2093,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn graceful_stop_never_reclaims_a_leftover_socket() {
+        use std::os::fd::AsRawFd;
+        let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("cleanup-socket-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let socket = root.join("control.sock");
+        let directory = fs::File::open(&root).unwrap();
+        let bind_path = format!("/proc/self/fd/{}/control.sock", directory.as_raw_fd());
+        let listener = std::os::unix::net::UnixListener::bind(bind_path).unwrap();
+        drop(listener);
+        let error = cleanup_control_socket(&root, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("graceful") && error.contains("refusing"));
+        assert!(socket.exists());
+        fs::remove_file(socket).unwrap();
+        cleanup_control_socket(&root, false).unwrap();
+        cleanup_control_socket(&root, true).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn readiness_requires_ready_and_a_recent_completed_iteration() {
         // Startup can send READY, STATUS=unconfirmed and WATCHDOG while Ping
         // still has no completed iteration. Those notifications cannot pass.
@@ -2058,6 +2172,33 @@ mod tests {
             0o644
         );
         assert_eq!(fs::read(saved).unwrap(), b"event\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn notify_finish_enforces_a_gap_and_saves_failure_evidence() {
+        let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("notify-gap-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let (_send, receive) = UnixDatagram::pair().unwrap();
+        let path = root.join("notify.jsonl");
+        let capture = NotifyCapture::start(receive, &path).unwrap();
+        capture.watchdog.lock().unwrap().observe(
+            Instant::now().checked_sub(Duration::from_secs(30)).unwrap(),
+            true,
+        );
+        assert!(
+            capture
+                .finish()
+                .unwrap_err()
+                .to_string()
+                .contains("gap >= 30 s")
+        );
+        let evidence: serde_json::Value =
+            serde_json::from_slice(&fs::read(path.with_extension("watchdog.json")).unwrap())
+                .unwrap();
+        assert_eq!(evidence["failed"], true);
+        assert!(evidence["max_gap_ms"].as_u64().unwrap() >= 30_000);
         fs::remove_dir_all(root).unwrap();
     }
 
