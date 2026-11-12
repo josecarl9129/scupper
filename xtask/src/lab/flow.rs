@@ -48,7 +48,7 @@ pub fn flow(mode: &str, address: SocketAddr, marker: &str, log: &Path, seconds: 
     let stop = FlowStop::new()?;
     let mut log = OpenOptions::new().create(true).append(true).open(log)?;
     if mode == "connect" {
-        return connect_canary(address, marker, &mut log, seconds);
+        return connect_canary(address, marker, &mut log, seconds, &stop);
     }
     if mode == "heartbeat-sink" {
         return heartbeat_sink(address, &mut log, seconds, &stop);
@@ -124,9 +124,12 @@ fn connect_canary(
     marker: &str,
     log: &mut std::fs::File,
     seconds: u64,
+    stop: &FlowStop,
 ) -> Result<()> {
     let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(seconds) {
+    // Each attempt is bounded by 250 ms timeouts, so a stop request ends the
+    // loop well inside the supervising timeout's kill-after window.
+    while !stop.requested() && start.elapsed() < Duration::from_secs(seconds) {
         let mut sent = 0;
         let mut received = 0;
         if let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(250)) {
