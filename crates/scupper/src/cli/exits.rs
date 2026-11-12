@@ -29,6 +29,9 @@ pub(super) enum ExitCommand {
         id: Option<String>,
         #[arg(long)]
         yes: bool,
+        /// Replace a differing unreferenced key from an interrupted import.
+        #[arg(long)]
+        replace_leftover_key: bool,
         /// Show the full derived `WireGuard` public key.
         #[arg(long)]
         verbose: bool,
@@ -92,6 +95,7 @@ pub(super) fn run(
             id,
             yes,
             verbose,
+            replace_leftover_key,
         } => {
             super::require_interactive_or_yes(deps, "exit import", yes)?;
             let provider = provider::read_provider(&file)?;
@@ -211,28 +215,28 @@ pub(super) fn run(
                                     key.name()
                                 ));
                             }
-                            writeln!(out, "Existing secret {} is unreferenced by applied_version..=head; a previous import may still be publishing. Check config log. Use --yes only after confirming that operation has finished, or wait until head has moved past {generation}.", key.name()).map_err(output_error)?;
-                            leftovers.push(key);
+                            let existing = SecretFile::open_with_owner(
+                                deps.config_root,
+                                key,
+                                rustix::process::geteuid().as_raw(),
+                            )
+                            .map_err(|e| e.to_string())?;
+                            let supplied = if key == &reference {
+                                Some(provider.private_key())
+                            } else {
+                                provider.preshared_key()
+                            };
+                            if supplied != Some(existing.expose()) {
+                                writeln!(out, "Existing secret {} is unreferenced; check config log before replacing it.", key.name()).map_err(output_error)?;
+                                if !replace_leftover_key {
+                                    return Err("previous import key differs; --replace-leftover-key is required".into());
+                                }
+                                leftovers.push(key);
+                            }
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                         Err(e) => return Err(e.to_string()),
                     }
-                }
-                out.flush().map_err(output_error)?;
-                if !leftovers.is_empty() && !yes {
-                    return Err(
-                        "previous import generation exists; confirmation with --yes is required"
-                            .into(),
-                    );
-                }
-                // Validate every leftover before removing any of them.
-                for key in &leftovers {
-                    SecretFile::open_with_owner(
-                        deps.config_root,
-                        key,
-                        rustix::process::geteuid().as_raw(),
-                    )
-                    .map_err(|e| e.to_string())?;
                 }
                 for key in leftovers {
                     SecretFile::remove(deps.config_root, key).map_err(|e| e.to_string())?;
@@ -529,7 +533,7 @@ fn live_keys(deps: &Dependencies<'_>, store: &VersionStore) -> Result<BTreeSet<S
 }
 
 fn install_key(deps: &Dependencies<'_>, name: &SecretName, bytes: &[u8]) -> Result<(), String> {
-    SecretFile::write_new(deps.config_root, name, bytes).map_err(|e| e.to_string())
+    provider::write_or_reuse(deps.config_root, name, bytes).map(|_| ())
 }
 
 fn selection_reset(deps: &Dependencies<'_>, id: &ExitId) -> Result<bool, String> {

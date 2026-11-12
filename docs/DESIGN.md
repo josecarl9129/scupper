@@ -2327,19 +2327,42 @@ firewall or host sysctls (except the optional `90-scupper.conf`).
    (ADR 0014 enforced in code); warn if a host firewall (ufw,
    cloud firewall rules visible locally) would block UDP 51820 or exit UDP
    (availability, V-13).
+   Ownership evidence is a matching device/inode in `boot.json` (including a
+   failed attempt) or scupperd's Ping. Only an unknown namespace is refused.
+   A down, peerless, unaddressed WireGuard host link with a configured name
+   and without XDP is a removable boot leftover, not a v1 marker. Check v1 evidence before refusing packages.
 2. Packages: `wireguard-tools nftables iproute2 conntrack`.
 3. Users `scupper-edge`, `scupper-probe`, `scupper-alert`; group
    `scupper-admin`; directories and modes.
-4. Binaries to `/usr/local/bin` (temp + rename).
+4. Binaries to `/usr/local/bin` (temp + rename). Require this host directory
+   to exist, be root-owned and not group- or world-writable; never change its
+   owner or mode. `/run/scupper` is runtime state, created privately by locking
+   and boot, excluded from install drift checks.
 5. Config: from `--bundle FILE` (verify `MANIFEST`, restore versions, head,
-   selection) or an initial version from flags.
+   selection) or an initial version from flags. For a new install, `--endpoint IP`
+   accepts a literal IPv4 address. Otherwise the uplink must have exactly
+   one scope-global IPv4 address; ambiguity names the candidates and refuses.
+   Reject unspecified, loopback, multicast, broadcast and link-local addresses
+   in flags, automatic selection and config validation. A sole RFC 1918 or
+   100.64/10 address is accepted with a warning suggesting `--endpoint IP`.
+   Store this endpoint and use it in the Mac peer section.
 6. Secrets: generate `wg0` if missing and no version in the store names a
    public key for it (new client-facing identity; prints its public key);
    if the store already names one, a missing key file is an error, so a
    re-run never silently changes the client-facing identity or use a file the operator placed; `exit import` per provider
    file; tell the operator to delete downloaded provider files.
 7. Units, `systemctl enable --now scupper-net scupperd scupper-edge`.
-8. `scupper check`; print the Mac's `scupper0.conf` peer section.
+   Release the writer lock after durable mutations and before daemon-reload
+   or enabling services: `scupper boot` needs that same lock. Install waits up
+   to 120 seconds for `systemctl enable --now`, beyond the 90-second unit start bound.
+8. `scupper check`; print the Mac's `scupper0.conf` peer section. When head
+   has no devices, also print device setup. M2 has no `device` command:
+   print a ready-to-edit `[devices.mac]` TOML snippet with `user`, a Mac public-key
+   placeholder, the next free client IPv4 /32 and this gateway in `gateways`;
+   include a user entry if needed and omit `address6` (Q7). Save the complete
+   edited config as FILE and commit it with `scupper config load FILE`. An API
+   token digest is optional when no API needs it.
+   A bundle restore or rerun with devices prints no device instructions.
 
 ### Units
 
@@ -2353,6 +2376,8 @@ Before=network-pre.target scupperd.service scupper-edge.service
 Wants=network-pre.target
 [Service]
 Type=oneshot
+TimeoutStartSec=90
+TimeoutStopSec=10s
 RemainAfterExit=yes
 ExecStart=/usr/local/bin/scupper boot
 # no ExecStop: stopping the unit never tears protection down
@@ -2364,6 +2389,14 @@ WantedBy=multi-user.target
 |---|---|---|
 | `scupperd.service` | `Wants=` + `After=scupper-net.service network-online.target`; `Upholds=scupper-edge.service` | `Type=notify`, `WatchdogSec=30`, `Restart=always`, `RestartSec=2s`, `StartLimitIntervalSec=0`, `TimeoutStartSec=90` (covers the bounded 60 s wait for the supervisor lease at start), `LimitCORE=0` (inherited by probe and delivery children). scupperd holds a lifetime supervisor lease (`/run/scupper/scupperd.lock`); while it is held, `scupper boot` (and so a manual `systemctl restart scupper-net`) runs no kernel steps and exits 0 with a notice that scupperd owns the namespace, and the CLI never falls back to local mutation. Deliberately `Wants=`, not `Requires=`: if boot failed, scupperd must still start to alert and to retry the boot procedure under its repair budget (which is the same ordered, closed procedure). |
 | `scupper-edge.service` | `Requires=` + `BindsTo=` + `After=scupper-net.service` | `NetworkNamespacePath=/run/netns/scupper`, `User=scupper-edge`, `AmbientCapabilities=CAP_NET_BIND_SERVICE`, `CapabilityBoundingSet=CAP_NET_BIND_SERVICE`, `NoNewPrivileges=yes`, `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`, `TemporaryFileSystem=/run`, `BindPaths=/run/scupper/edge.sock`, `LimitCORE=0`, `WatchdogSec=30`, `Restart=always`. A failed namespace unit prevents edge from starting; after a rebuild scupperd restarts edge, and every tick it checks that edge runs in the held namespace (§7). |
+
+The 90 s start timeout prevents a hung boot from holding back host networking
+and SSH. A timed-out boot leaves the namespace closed; scupperd starts and
+retries the ordered boot procedure. Ordinary boot commands have a 3 s deadline;
+isolated ruleset canonicalization has an 8 s deadline (the worker wait allows 11 s).
+Writer-lock acquisition is bounded to 5 s; no boot step waits
+for a handshake or network availability. The unit timeout is a backstop, not
+the normal startup path.
 
 ### `scupper boot` (stops at the first failure; every prefix is closed)
 

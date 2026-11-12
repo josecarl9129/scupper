@@ -7,6 +7,8 @@ Before=network-pre.target scupperd.service
 Wants=network-pre.target
 [Service]
 Type=oneshot
+TimeoutStartSec=90
+TimeoutStopSec=10s
 RemainAfterExit=yes
 ExecStart=/usr/local/bin/scupper boot
 # no ExecStop: stopping the unit never tears protection down

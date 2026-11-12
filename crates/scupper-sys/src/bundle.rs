@@ -394,12 +394,21 @@ pub fn restore(bytes: &[u8], target: &Path) -> io::Result<()> {
             Err(e) => return Err(e),
         }
     };
-    fs::create_dir(stage.0.join("config"))?;
-    fs::create_dir(stage.0.join("config/versions"))?;
+    fs::DirBuilder::new()
+        .mode(scupper_core::install::PRIVATE_DIR_MODE)
+        .create(stage.0.join("config"))?;
+    fs::DirBuilder::new()
+        .mode(scupper_core::install::PRIVATE_DIR_MODE)
+        .create(stage.0.join("config/versions"))?;
     for (name, content) in members {
         if name == "MANIFEST" {
             continue;
         }
+        let mode = if name == "state.json" {
+            scupper_core::install::KEY_MODE
+        } else {
+            scupper_core::install::STORE_FILE_MODE
+        };
         let path = if name == "state.json" {
             stage.0.join(name)
         } else {
@@ -408,10 +417,10 @@ pub fn restore(bytes: &[u8], target: &Path) -> io::Result<()> {
         let mut file = fs::OpenOptions::new()
             .create_new(true)
             .write(true)
-            .mode(0o640)
+            .mode(mode)
             .open(path)?;
         file.write_all(&content)?;
-        file.set_permissions(fs::Permissions::from_mode(0o640))?;
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
         file.sync_all()?;
     }
     for path in [
@@ -427,3 +436,26 @@ pub fn restore(bytes: &[u8], target: &Path) -> io::Result<()> {
 }
 
 use std::os::unix::fs::DirBuilderExt;
+
+/// Returns all verified public configurations, in committed version order.
+/// # Errors
+/// Refuses any bundle rejected by `verify` before exposing its configurations.
+pub fn configurations(bytes: &[u8]) -> io::Result<Vec<scupper_core::config::SiteConfig>> {
+    checked(bytes)?
+        .into_iter()
+        .filter(|(name, _)| Path::new(name).extension().is_some_and(|ext| ext == "toml"))
+        .map(|(_, bytes)| {
+            let text =
+                std::str::from_utf8(&bytes).map_err(|_| refused("invalid config encoding"))?;
+            parse_site(text).map_err(|_| refused("invalid bundle configuration"))
+        })
+        .collect()
+}
+
+/// Returns the safety state from a fully verified bundle.
+/// # Errors
+/// Applies all archive, hash, schema and history checks before returning state.
+pub fn read_state(bytes: &[u8]) -> io::Result<crate::state::State> {
+    let members = checked(bytes)?;
+    serde_json::from_str(text(&members, "state.json")?).map_err(|_| refused("invalid state"))
+}

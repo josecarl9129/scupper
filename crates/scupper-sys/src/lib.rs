@@ -2,6 +2,8 @@
 
 pub use scupper_core::{parse, rules, verdict};
 
+pub mod install;
+
 pub mod alerts;
 pub mod boot;
 pub mod bundle;

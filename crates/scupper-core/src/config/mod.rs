@@ -13,6 +13,7 @@ mod validate;
 mod validated;
 
 pub use model::*;
+pub use network::valid_endpoint_ip;
 pub use parse::{ConfigError, ParseRule, parse_site};
 pub use types::*;
 pub use validate::validate;
@@ -69,7 +70,7 @@ rules! {
     DeviceAddressOverlap => "Device addresses must not overlap exit address prefixes or DNS servers.",
     UnknownGateway => "A device must reference existing gateways.",
     UnknownUser => "A device must reference an existing user.",
-    InvalidEndpoint => "Endpoints must contain a literal IP and port 1–65535.",
+    InvalidEndpoint => "Endpoints must contain a literal unicast IP and port 1–65535, excluding unspecified, loopback and link-local addresses.",
     InvalidDnsServer => "DNS servers must be literal IP addresses.",
     InvalidInitialQualification => "Initial qualification window must be between 30 and 300 seconds inclusive.",
     InvalidHeartbeatInterval => "Heartbeat interval must be between 10 seconds and 1 hour inclusive.",

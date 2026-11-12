@@ -1758,10 +1758,18 @@ fn exit_interface_requires_a_suffix() {
 }
 
 #[test]
-fn endpoints_exclude_unspecified_ips_and_ipv6_scopes() {
+fn endpoints_exclude_local_non_unicast_ips_and_ipv6_scopes() {
     for endpoint in [
         "0.0.0.0:51820",
+        "127.0.0.1:51820",
+        "224.0.0.1:51820",
+        "255.255.255.255:51820",
+        "169.254.1.2:51820",
         "[::]:51820",
+        "[::1]:51820",
+        "[ff02::1]:51820",
+        "[fe80::1]:51820",
+        "[::ffff:127.0.0.1]:51820",
         "[fe80::1%eth0]:51820",
         "[fe80::1%2]:51820",
     ] {
