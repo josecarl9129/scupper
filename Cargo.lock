@@ -457,6 +457,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "signal-hook",
  "socket2",
  "thiserror",
  "toml",

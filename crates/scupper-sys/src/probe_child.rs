@@ -83,13 +83,28 @@ impl Url {
     /// # Errors
     /// Rejects non-HTTPS, credentials, fragments, invalid hosts and other ports.
     pub fn new(text: &str) -> Probe<Self> {
-        let url = Self(text.into());
-        url.target()?;
-        Ok(url)
+        Self::validate(text)?;
+        Ok(Self(text.into()))
+    }
+    /// Validate with the delivery parser without retaining credential copies.
+    /// # Errors
+    /// Rejects the same targets as [`Self::new`].
+    pub fn validate(text: &str) -> Probe<()> {
+        Self::validate_with_suffix(text, 0)
+    }
+    pub(crate) fn validate_with_suffix(text: &str, suffix_bytes: usize) -> Probe<()> {
+        let (host, path) = Self::parts(text)?;
+        if path.len().saturating_add(suffix_bytes) > crate::probe::MAX_TARGET_BYTES {
+            return Err(ProbeError::setup("invalid HTTPS probe target"));
+        }
+        Target::validate(host, &path)
     }
     pub(crate) fn target(&self) -> Probe<Target> {
-        let rest = self
-            .0
+        let (host, path) = Self::parts(&self.0)?;
+        Target::new(host, &path)
+    }
+    fn parts(text: &str) -> Probe<(&str, zeroize::Zeroizing<String>)> {
+        let rest = text
             .strip_prefix("https://")
             .ok_or_else(|| ProbeError::setup("probe URL must use HTTPS"))?;
         if rest.contains('#') {
@@ -98,14 +113,12 @@ impl Url {
         let split = rest.find(['/', '?']).unwrap_or(rest.len());
         let host = rest[..split].strip_suffix(":443").unwrap_or(&rest[..split]);
         let path = &rest[split..];
-        let path = if path.is_empty() {
-            "/".into()
-        } else if path.starts_with('?') {
-            format!("/{path}")
-        } else {
-            path.into()
-        };
-        Target::new(host, &path)
+        let mut target = zeroize::Zeroizing::new(String::with_capacity(path.len() + 1));
+        if path.is_empty() || path.starts_with('?') {
+            target.push('/');
+        }
+        target.push_str(path);
+        Ok((host, target))
     }
 }
 impl TryFrom<String> for Url {

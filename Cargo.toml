@@ -23,6 +23,7 @@ dns-lookup = { version = "4", default-features = false }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
 sha2 = { version = "0.10", default-features = false }
+signal-hook = "0.3"
 proptest = { version = "1", default-features = false, features = ["std"] }
 
 serde = { version = "1", default-features = false, features = ["derive", "std"] }

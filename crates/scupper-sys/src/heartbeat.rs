@@ -511,6 +511,9 @@ pub fn account(passwd: &str, group: &str) -> Result<ProbeIdentity, Failure> {
     ProbeIdentity::parse_named(passwd, group, "scupper-alert").map_err(|_| Failure::Account)
 }
 
+/// Longest suffix appended to a stored URL by heartbeat delivery (`/0`..`/4`).
+pub const MAX_SUFFIX_BYTES: usize = 2;
+
 /// Resolve a confined root-owned 0600 URL reference, and append a pure suffix.
 /// # Errors
 /// Missing or unsafe files and non-HTTPS/invalid URLs fail without exposing values.
@@ -523,8 +526,12 @@ pub fn resolve(
     let secret =
         SecretFile::open_with_owner(root, reference, owner).map_err(|_| Failure::Secret)?;
     let url = std::str::from_utf8(secret.expose()).map_err(|_| Failure::Secret)?;
-    Url::new(url).map_err(|_| Failure::Secret)?;
-    if !suffix.is_empty() && !matches!(suffix, "/0" | "/1" | "/2" | "/3" | "/4") {
+    if !crate::secrets::valid_delivery_url(url) {
+        return Err(Failure::Secret);
+    }
+    if suffix.len() > MAX_SUFFIX_BYTES
+        || (!suffix.is_empty() && !matches!(suffix, "/0" | "/1" | "/2" | "/3" | "/4"))
+    {
         return Err(Failure::Internal);
     }
     let (base, query) = url
@@ -535,7 +542,9 @@ pub fn resolve(
     } else {
         base.trim_end_matches('/')
     };
-    let mut result = Zeroizing::new(format!("{base}{suffix}"));
+    let mut result = Zeroizing::new(String::with_capacity(url.len() + suffix.len()));
+    result.push_str(base);
+    result.push_str(suffix);
     if let Some(query) = query {
         result.push('?');
         result.push_str(query);

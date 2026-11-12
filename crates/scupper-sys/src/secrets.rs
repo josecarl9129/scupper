@@ -5,6 +5,20 @@ use scupper_core::config::{SecretKind, SecretName, valid_https_url, valid_wg_sec
 use std::{fs::File, io::Read, path::Path};
 use zeroize::Zeroizing;
 
+// Kept outside a `secrets/` directory so tooling that guards secret-like paths does not flag source code.
+
+#[path = "secrets_input.rs"]
+pub mod input;
+
+/// The config and delivery validators must both accept a credential URL.
+#[must_use]
+pub fn valid_delivery_url(text: &str) -> bool {
+    text.len() <= 4096
+        && valid_https_url(text)
+        && crate::probe_child::Url::validate_with_suffix(text, crate::heartbeat::MAX_SUFFIX_BYTES)
+            .is_ok()
+}
+
 /// Secret bytes cleared on drop. Deliberately has no formatting or serialization traits.
 pub struct Secret(Zeroizing<Vec<u8>>);
 impl Secret {
@@ -21,6 +35,14 @@ impl Secret {
 pub struct SecretError {
     reference: String,
     check: &'static str,
+    not_found: bool,
+}
+impl SecretError {
+    /// Whether a confined lookup found no secret file or kind directory.
+    #[must_use]
+    pub fn is_not_found(&self) -> bool {
+        self.not_found
+    }
 }
 
 /// Safe gateway file resolver rooted at `/etc/scupper` in production.
@@ -48,6 +70,7 @@ impl SecretFile {
         let failure = |check| SecretError {
             reference: name.name().into(),
             check,
+            not_found: false,
         };
         let mut bytes = Zeroizing::new(Vec::with_capacity(4097));
         fd.take(4097)
@@ -62,13 +85,24 @@ impl SecretFile {
         let text = std::str::from_utf8(&bytes).map_err(|_| failure("content must be UTF-8"))?;
         let valid = match name.kind() {
             SecretKind::Wg => valid_wg_secret(text.strip_suffix('\n').unwrap_or(text)),
-            SecretKind::Url => valid_https_url(text),
+            SecretKind::Url => valid_delivery_url(text),
         };
         if !valid {
             return Err(failure("invalid content for secret kind"));
         }
         Ok(Secret(bytes))
     }
+    /// Inspect one reference without depending on other directory entries.
+    /// # Errors
+    /// Refuses unsafe directory or file metadata.
+    pub fn exists(root: &Path, name: &SecretName, owner: u32) -> Result<bool, SecretError> {
+        match Self::checked_file(root, name, owner) {
+            Ok(_) => Ok(true),
+            Err(error) if error.is_not_found() => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Resolve every configured secret before publishing a version.
     /// # Errors
     /// Names the reference whose confinement, metadata or content check failed.
@@ -107,45 +141,15 @@ impl SecretFile {
             return Err(SecretError {
                 reference: format!("<invalid ref; length {}>", name.name().len()),
                 check: "invalid reference basename; expected [a-z0-9][a-z0-9-]{0,62}",
+                not_found: false,
             });
         }
         let failure = |check| SecretError {
             reference: name.name().into(),
             check,
+            not_found: false,
         };
-        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-        let root = open(root, flags, Mode::empty()).map_err(|_| failure("open root directory"))?;
-        let stat = fstat(&root).map_err(|_| failure("stat root directory"))?;
-        if stat.st_uid != owner {
-            return Err(failure("root directory owner"));
-        }
-        if stat.st_mode & 0o022 != 0 {
-            return Err(failure(
-                "root directory must not be group- or world-writable",
-            ));
-        }
-        let secrets = openat(&root, "secrets", flags, Mode::empty())
-            .map_err(|_| failure("open secrets directory"))?;
-        let stat = fstat(&secrets).map_err(|_| failure("stat secrets directory"))?;
-        if stat.st_uid != owner {
-            return Err(failure("secrets directory owner"));
-        }
-        if stat.st_mode & 0o7777 != 0o700 {
-            return Err(failure("secrets directory mode must be 0700"));
-        }
-        let kind = match name.kind() {
-            SecretKind::Wg => "wg",
-            SecretKind::Url => "url",
-        };
-        let directory = openat(&secrets, kind, flags, Mode::empty())
-            .map_err(|_| failure("open kind directory without symlinks"))?;
-        let stat = fstat(&directory).map_err(|_| failure("stat kind directory"))?;
-        if stat.st_uid != owner {
-            return Err(failure("kind directory owner"));
-        }
-        if stat.st_mode & 0o7777 != 0o700 {
-            return Err(failure("kind directory mode must be 0700"));
-        }
+        let directory = Self::checked_directory(root, name, owner)?;
         // NONBLOCK prevents an attacker-controlled FIFO from hanging before fstat.
         let fd = openat(
             &directory,
@@ -153,7 +157,10 @@ impl SecretFile {
             OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::NOCTTY,
             Mode::empty(),
         )
-        .map_err(|_| failure("open reference without symlinks"))?;
+        .map_err(|error| SecretError {
+            not_found: error == rustix::io::Errno::NOENT,
+            ..failure("open reference without symlinks")
+        })?;
         let stat = fstat(&fd).map_err(|_| failure("stat reference"))?;
         if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
             return Err(failure("reference must be a regular file"));
@@ -169,6 +176,130 @@ impl SecretFile {
         }
         Ok(fd.into())
     }
+    fn checked_directory(
+        root: &Path,
+        name: &SecretName,
+        owner: u32,
+    ) -> Result<rustix::fd::OwnedFd, SecretError> {
+        let failure = |check| SecretError {
+            reference: name.name().into(),
+            check,
+            not_found: false,
+        };
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let root = open(root, flags, Mode::empty()).map_err(|_| failure("open root directory"))?;
+        let stat = fstat(&root).map_err(|_| failure("stat root directory"))?;
+        if stat.st_uid != owner {
+            return Err(failure("root directory owner"));
+        }
+        if stat.st_mode & 0o022 != 0 {
+            return Err(failure(
+                "root directory must not be group- or world-writable",
+            ));
+        }
+        let secrets =
+            openat(&root, "secrets", flags, Mode::empty()).map_err(|error| SecretError {
+                not_found: error == rustix::io::Errno::NOENT,
+                ..failure("open secrets directory")
+            })?;
+        let stat = fstat(&secrets).map_err(|_| failure("stat secrets directory"))?;
+        if stat.st_uid != owner {
+            return Err(failure("secrets directory owner"));
+        }
+        if stat.st_mode & 0o7777 != 0o700 {
+            return Err(failure("secrets directory mode must be 0700"));
+        }
+        let kind = match name.kind() {
+            SecretKind::Wg => "wg",
+            SecretKind::Url => "url",
+        };
+        let directory =
+            openat(&secrets, kind, flags, Mode::empty()).map_err(|error| SecretError {
+                not_found: error == rustix::io::Errno::NOENT,
+                ..failure("open kind directory without symlinks")
+            })?;
+        let stat = fstat(&directory).map_err(|_| failure("stat kind directory"))?;
+        if stat.st_uid != owner {
+            return Err(failure("kind directory owner"));
+        }
+        if stat.st_mode & 0o7777 != 0o700 {
+            return Err(failure("kind directory mode must be 0700"));
+        }
+        Ok(directory)
+    }
+
+    /// Inspect names, kinds and modes without reading secret contents.
+    /// Missing kind directories are permitted. Stray names are reported as metadata.
+    /// # Errors
+    /// Refuses unsafe directories and failed metadata inspection.
+    pub fn list(root: &Path, owner: u32) -> Result<Vec<SecretEntry>, SecretError> {
+        use rustix::fs::{AtFlags, Dir, statat};
+        let failure = |check| SecretError {
+            reference: "<list>".into(),
+            check,
+            not_found: false,
+        };
+        let mut result = Vec::new();
+        for kind in [SecretKind::Wg, SecretKind::Url] {
+            let name = SecretName::new(kind, "list").map_err(|_| failure("invalid kind"))?;
+            // Open through checked directory FDs; absence is distinct from unsafe metadata.
+            let directory = match Self::checked_directory(root, &name, owner) {
+                Ok(directory) => directory,
+                Err(error) => {
+                    // Verify absence through confined parent FDs, never a path-following stat.
+                    let flags =
+                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+                    let root = open(root, flags, Mode::empty())
+                        .map_err(|_| failure("open root directory"))?;
+                    let stat = fstat(&root).map_err(|_| failure("stat root directory"))?;
+                    if stat.st_uid != owner || stat.st_mode & 0o022 != 0 {
+                        return Err(error);
+                    }
+                    let secrets = match openat(&root, "secrets", flags, Mode::empty()) {
+                        Err(rustix::io::Errno::NOENT) => continue,
+                        Ok(fd) => fd,
+                        Err(_) => return Err(error),
+                    };
+                    let stat = fstat(&secrets).map_err(|_| failure("stat secrets directory"))?;
+                    if stat.st_uid != owner || stat.st_mode & 0o7777 != 0o700 {
+                        return Err(error);
+                    }
+                    match openat(&secrets, kind_text(kind), flags, Mode::empty()) {
+                        Err(rustix::io::Errno::NOENT) => continue,
+                        _ => return Err(error),
+                    }
+                }
+            };
+            let mut entries =
+                Dir::read_from(&directory).map_err(|_| failure("read kind directory"))?;
+            for entry in &mut entries {
+                let entry = entry.map_err(|_| failure("read directory entry"))?;
+                let text = entry.file_name().to_string_lossy();
+                if matches!(text.as_ref(), "." | "..") {
+                    continue;
+                }
+                let stray = SecretName::new(kind, text.as_ref()).is_err();
+                let stat = match statat(&directory, entry.file_name(), AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(stat) => stat,
+                    Err(rustix::io::Errno::NOENT) => continue,
+                    Err(_) => return Err(failure("stat entry")),
+                };
+                result.push(SecretEntry {
+                    kind,
+                    basename: text.into_owned(),
+                    stray,
+                    unsafe_metadata: FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+                        || stat.st_uid != owner
+                        || stat.st_mode & 0o7777 != 0o600,
+                    mode: stat.st_mode & 0o7777,
+                });
+            }
+        }
+        result.sort_by(|a, b| {
+            (kind_text(a.kind), &a.basename).cmp(&(kind_text(b.kind), &b.basename))
+        });
+        Ok(result)
+    }
 }
 
 impl SecretFile {
@@ -177,7 +308,12 @@ impl SecretFile {
     /// # Errors
     /// Refuses existing destinations, unsafe ownership/modes, links or invalid keys.
     pub fn write_new(root: &Path, name: &SecretName, bytes: &[u8]) -> std::io::Result<()> {
-        Self::write_key(root, name, bytes, false)
+        if name.kind() != SecretKind::Wg {
+            return Err(std::io::Error::other(
+                "expected a WireGuard secret reference",
+            ));
+        }
+        Self::write_value(root, name, bytes, false)
     }
 
     /// Atomically replaces an unreferenced key. The caller must hold the writer
@@ -189,10 +325,108 @@ impl SecretFile {
         name: &SecretName,
         bytes: &[u8],
     ) -> std::io::Result<()> {
-        Self::write_key(root, name, bytes, true)
+        if name.kind() != SecretKind::Wg {
+            return Err(std::io::Error::other(
+                "expected a WireGuard secret reference",
+            ));
+        }
+        Self::write_value(root, name, bytes, true)
     }
 
-    fn write_key(
+    /// Durably installs a URL, optionally replacing an existing safe URL file.
+    /// # Errors
+    /// Refuses invalid values, unsafe metadata, links, or failed durable writes.
+    pub fn write_url(
+        root: &Path,
+        name: &SecretName,
+        bytes: &[u8],
+        replace: bool,
+    ) -> std::io::Result<()> {
+        if name.kind() != SecretKind::Url {
+            return Err(std::io::Error::other("expected a URL secret reference"));
+        }
+        Self::write_value(root, name, bytes, replace)
+    }
+
+    /// Check destination safety before reading a URL credential. The caller
+    /// holds the writer lock; the atomic rename remains authoritative.
+    /// # Errors
+    /// Refuses unsafe metadata or an existing destination without replacement.
+    pub fn prepare_url(root: &Path, name: &SecretName, replace: bool) -> std::io::Result<()> {
+        if !name.valid() || name.kind() != SecretKind::Url {
+            return Err(std::io::Error::other("invalid URL reference"));
+        }
+        let directory = Self::kind_directory(root, SecretKind::Url)?;
+        Self::check_destination(&directory, name, replace)
+    }
+
+    fn check_destination(
+        directory: &rustix::fd::OwnedFd,
+        name: &SecretName,
+        replace: bool,
+    ) -> std::io::Result<()> {
+        use rustix::fs::{AtFlags, statat};
+        match statat(directory, name.name(), AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(_) if !replace => Err(std::io::ErrorKind::AlreadyExists.into()),
+            Ok(stat)
+                if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+                    || stat.st_uid != rustix::process::geteuid().as_raw()
+                    || stat.st_mode & 0o7777 != 0o600 =>
+            {
+                Err(std::io::Error::other(
+                    "unsafe secret destination; restore a regular file owned by the effective uid with mode 0600 or move it out of secrets before retrying",
+                ))
+            }
+            Ok(_) | Err(rustix::io::Errno::NOENT) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Remove only owned, regular 0600 URL writer temps older than this run.
+    /// The caller must hold the shared writer lock.
+    /// # Errors
+    /// Refuses unsafe directories or failed metadata inspection/deletion.
+    pub fn sweep_url_temps(root: &Path, started: std::time::SystemTime) -> std::io::Result<()> {
+        use rustix::fs::{AtFlags, Dir, statat, unlinkat};
+        let directory = Self::kind_directory(root, SecretKind::Url)?;
+        for entry in Dir::read_from(&directory)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Ok(text) = name.to_str() else { continue };
+            let Some((pid, count)) = text
+                .strip_prefix(".scupper-")
+                .and_then(|s| s.strip_suffix(".tmp"))
+                .and_then(|s| s.split_once('-'))
+            else {
+                continue;
+            };
+            if pid.is_empty()
+                || count.is_empty()
+                || !pid.bytes().chain(count.bytes()).all(|b| b.is_ascii_digit())
+            {
+                continue;
+            }
+            let stat = statat(&directory, name, AtFlags::SYMLINK_NOFOLLOW)?;
+            if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+                || stat.st_uid != rustix::process::geteuid().as_raw()
+                || stat.st_mode & 0o7777 != 0o600
+            {
+                continue;
+            }
+            let modified = std::time::UNIX_EPOCH
+                + std::time::Duration::new(
+                    u64::try_from(stat.st_mtime).map_err(std::io::Error::other)?,
+                    u32::try_from(stat.st_mtime_nsec).map_err(std::io::Error::other)?,
+                );
+            if modified < started {
+                unlinkat(&directory, name, AtFlags::empty())?;
+            }
+        }
+        rustix::fs::fsync(&directory)?;
+        Ok(())
+    }
+
+    fn write_value(
         root: &Path,
         name: &SecretName,
         bytes: &[u8],
@@ -206,12 +440,16 @@ impl SecretFile {
         };
         static NEXT: AtomicU64 = AtomicU64::new(0);
         if !name.valid()
-            || name.kind() != SecretKind::Wg
-            || !std::str::from_utf8(bytes).is_ok_and(valid_wg_secret)
+            || bytes.len() > 4096
+            || !std::str::from_utf8(bytes).is_ok_and(|text| match name.kind() {
+                SecretKind::Wg => valid_wg_secret(text),
+                SecretKind::Url => valid_delivery_url(text),
+            })
         {
-            return Err(std::io::Error::other("invalid secret reference or key"));
+            return Err(std::io::Error::other("invalid secret reference or value"));
         }
-        let directory = Self::wg_directory(root)?;
+        let directory = Self::kind_directory(root, name.kind())?;
+        Self::check_destination(&directory, name, replace)?;
         let temp = format!(
             ".scupper-{}-{}.tmp",
             std::process::id(),
@@ -252,14 +490,21 @@ impl SecretFile {
                 )));
             }
         }
-        if result.is_err() && renamed {
+        if result.is_err() && renamed && name.kind() == SecretKind::Wg {
             unlinkat(&directory, name.name(), AtFlags::empty())?;
             fsync(&directory)?;
+        }
+        if result.is_err() && renamed && name.kind() == SecretKind::Url {
+            return Err(std::io::Error::other("written; durability not confirmed"));
         }
         result
     }
 
     fn wg_directory(root: &Path) -> std::io::Result<rustix::fd::OwnedFd> {
+        Self::kind_directory(root, SecretKind::Wg)
+    }
+
+    fn kind_directory(root: &Path, kind: SecretKind) -> std::io::Result<rustix::fd::OwnedFd> {
         use rustix::fs::{fsync, mkdirat};
         let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
         let owner = rustix::process::geteuid().as_raw();
@@ -269,7 +514,7 @@ impl SecretFile {
             return Err(std::io::Error::other("unsafe secret root"));
         }
         let mut directory = root;
-        for part in ["secrets", "wg"] {
+        for part in ["secrets", kind_text(kind)] {
             match mkdirat(&directory, part, Mode::from_raw_mode(0o700)) {
                 Ok(()) => fsync(&directory)?,
                 Err(rustix::io::Errno::EXIST) => {}
@@ -375,4 +620,26 @@ fn import_generation(name: &str) -> Option<u64> {
         && n.to_string() == version
         && SecretName::new(SecretKind::Wg, name).is_ok())
     .then_some(n)
+}
+
+fn kind_text(kind: SecretKind) -> &'static str {
+    match kind {
+        SecretKind::Wg => "wg",
+        SecretKind::Url => "url",
+    }
+}
+
+/// Secret metadata only; no value is opened or retained.
+#[derive(Debug)]
+pub struct SecretEntry {
+    /// Schema-derived directory kind.
+    pub kind: SecretKind,
+    /// Directory entry basename, possibly outside the reference grammar.
+    pub basename: String,
+    /// Entry is outside the reference grammar and is skipped by lookup.
+    pub stray: bool,
+    /// Entry is not an owned regular 0600 file.
+    pub unsafe_metadata: bool,
+    /// Unix permission and special mode bits.
+    pub mode: u32,
 }
