@@ -12,6 +12,7 @@ use super::{
 };
 use guards::HostSnapshot;
 use scupper_core::config::{parse_site, validate};
+use scupper_sys::boot::BootReport;
 use std::{
     fmt::Write as _,
     fs,
@@ -738,80 +739,85 @@ impl SystemdLab {
                     fs::remove_dir_all("/run/scupper")?;
                 }
             }
-            RebootStep::StartUnits => {
-                let loaded_before = Path::new("/sys/module/nf_conntrack").exists();
-                let (unload_status, unload_output) = self.lab.runner.output(
-                    &Invocation::new("", "modprobe", &["-r", "nf_conntrack"]),
-                    None,
-                )?;
-                let loaded_after = Path::new("/sys/module/nf_conntrack").exists();
-                let namespace_absent = !Path::new("/run/netns/scupper").exists();
-                let kernel_release = fs::read_to_string("/proc/sys/kernel/osrelease")?;
-                fs::write(
-                    self.lab.artifacts.join("reboot-modules.json"),
-                    serde_json::to_vec_pretty(
-                        &serde_json::json!({"loaded_before": loaded_before, "unload_exit": unload_status.code(),
-                        "unload_output": unload_output, "loaded_after": loaded_after,
-                        "kernel_release": kernel_release.trim(),
-                        "namespace_absent_before_boot": namespace_absent,
-                        "mode": if loaded_after { "fresh-namespace-preloaded-module" } else { "fresh-namespace-cold-module" }}),
-                    )?,
-                )?;
-                if !namespace_absent {
-                    return fail("reboot simulation left a pre-existing namespace");
-                }
-
-                self.lab.runner.output(
-                    &Invocation::new(
-                        "",
-                        "systemctl",
-                        &["reset-failed", "scupper-net", "scupperd"],
-                    ),
-                    None,
-                )?;
-                let ifindex = fs::read_to_string("/sys/class/net/up0/ifindex")?;
-                self.lab.ensure_services()?;
-                self.cmd("ip", &["link", "set", "up0", "down"])?;
-                let net = self.systemctl(&["start", "scupper-net"]);
-                // Restore even on failed boot, so diagnostics retain lab access.
-                let up = self.cmd("ip", &["link", "set", "up0", "up"]).map(|_| ());
-                super::mutation::finish(net.map(|_| ()), up)?;
-                self.restore_uplink_routes()?;
-                if fs::read_to_string("/sys/class/net/up0/ifindex")? != ifindex {
-                    return fail("uplink ifindex changed across reboot capture");
-                }
-                self.lab.ensure_services()?;
-                let report: serde_json::Value =
-                    serde_json::from_slice(&fs::read("/run/scupper/boot.json")?)?;
-                fs::write(
-                    self.lab.artifacts.join("reboot-modules-boot.json"),
-                    serde_json::to_vec_pretty(&report)?,
-                )?;
-                verify_module_boot(&report)?;
-                if self
-                    .lab
-                    .cmd(
-                        "scupper",
-                        "sysctl",
-                        &["-n", "net.netfilter.nf_conntrack_tcp_loose"],
-                    )?
-                    .trim()
-                    != "0"
-                {
-                    return fail("reboot hardening depended on previous conntrack sysctl state");
-                }
-                self.systemctl(&["start", "scupperd"])?;
-                // A disconnected exit has no socket. Record only live ports.
-                let port: u16 = self
-                    .lab
-                    .cmd("scupper", "wg", &["show", "ex-0", "listen-port"])?
-                    .trim()
-                    .parse()?;
-                if port != 0 {
-                    self.record_port(port);
-                }
-            }
+            RebootStep::StartUnits => self.start_boot_units(true)?,
             RebootStep::FlushConntrack | RebootStep::DeleteLinks => {}
+        }
+        Ok(())
+    }
+    // Prefix recovery must retain the namespace and host leftovers so boot can
+    // prove adoption/repair. Only a full reboot requires a fresh namespace and
+    // attempts to unload conntrack.
+    fn start_boot_units(&mut self, fresh_namespace: bool) -> Result<()> {
+        if fresh_namespace {
+            let loaded_before = Path::new("/sys/module/nf_conntrack").exists();
+            let (unload_status, unload_output) = self.lab.runner.output(
+                &Invocation::new("", "modprobe", &["-r", "nf_conntrack"]),
+                None,
+            )?;
+            let loaded_after = Path::new("/sys/module/nf_conntrack").exists();
+            let namespace_absent = !Path::new("/run/netns/scupper").exists();
+            let kernel_release = fs::read_to_string("/proc/sys/kernel/osrelease")?;
+            fs::write(
+                self.lab.artifacts.join("reboot-modules.json"),
+                serde_json::to_vec_pretty(
+                    &serde_json::json!({"loaded_before": loaded_before, "unload_exit": unload_status.code(),
+                    "unload_output": unload_output, "loaded_after": loaded_after,
+                    "kernel_release": kernel_release.trim(),
+                    "namespace_absent_before_boot": namespace_absent,
+                    "mode": if loaded_after { "fresh-namespace-preloaded-module" } else { "fresh-namespace-cold-module" }}),
+                )?,
+            )?;
+            if !namespace_absent {
+                return fail("reboot simulation left a pre-existing namespace");
+            }
+        }
+        self.lab.runner.output(
+            &Invocation::new(
+                "",
+                "systemctl",
+                &["reset-failed", "scupper-net", "scupperd"],
+            ),
+            None,
+        )?;
+        let ifindex = fs::read_to_string("/sys/class/net/up0/ifindex")?;
+        self.lab.ensure_services()?;
+        self.cmd("ip", &["link", "set", "up0", "down"])?;
+        let net = self.systemctl(&["start", "scupper-net"]);
+        // Restore even on failed boot, so diagnostics retain lab access.
+        let up = self.cmd("ip", &["link", "set", "up0", "up"]).map(|_| ());
+        super::mutation::finish(net.map(|_| ()), up)?;
+        self.restore_uplink_routes()?;
+        if fs::read_to_string("/sys/class/net/up0/ifindex")? != ifindex {
+            return fail("uplink ifindex changed across reboot capture");
+        }
+        self.lab.ensure_services()?;
+        let report: BootReport = serde_json::from_slice(&fs::read("/run/scupper/boot.json")?)?;
+        fs::write(
+            self.lab.artifacts.join("reboot-modules-boot.json"),
+            serde_json::to_vec_pretty(&report)?,
+        )?;
+        verify_module_boot(&report, fresh_namespace)?;
+        if self
+            .lab
+            .cmd(
+                "scupper",
+                "sysctl",
+                &["-n", "net.netfilter.nf_conntrack_tcp_loose"],
+            )?
+            .trim()
+            != "0"
+        {
+            return fail("reboot hardening depended on previous conntrack sysctl state");
+        }
+        self.systemctl(&["start", "scupperd"])?;
+        // A disconnected exit has no socket. Record only live ports.
+        let port: u16 = self
+            .lab
+            .cmd("scupper", "wg", &["show", "ex-0", "listen-port"])?
+            .trim()
+            .parse()?;
+        if port != 0 {
+            self.record_port(port);
         }
         Ok(())
     }
@@ -995,26 +1001,10 @@ fn site_with_clients(
     Ok(site)
 }
 
-fn verify_module_boot(report: &serde_json::Value) -> Result<()> {
-    let steps = report["steps"].as_array().ok_or("missing boot steps")?;
-    let expected = [
-        "Lock",
-        "Modules",
-        "Inputs",
-        "Close",
-        "Ruleset",
-        "Links",
-        "Routes",
-        "Forwarding",
-        "Record",
-    ];
-    if report["adopted"] != false
-        || steps.len() != expected.len()
-        || steps.iter().zip(expected).any(|(step, name)| {
-            step["step"] != name || step.get("error") != Some(&serde_json::Value::Null)
-        })
-    {
-        return fail("reboot did not load modules successfully before namespace sysctls");
+fn verify_module_boot(report: &BootReport, fresh_namespace: bool) -> Result<()> {
+    super::boot::verify_modules(report)?;
+    if fresh_namespace && report.adopted {
+        return fail("reboot adopted a namespace instead of creating one");
     }
     Ok(())
 }
@@ -1050,31 +1040,55 @@ fn uplink_policy(markers: &[String], ports: &[u16], current_port: u16) -> Result
 mod tests {
     use super::*;
     #[test]
-    fn reboot_rejects_missing_failed_or_late_module_evidence() {
-        let names = [
-            "Lock",
-            "Modules",
-            "Inputs",
-            "Close",
-            "Ruleset",
-            "Links",
-            "Routes",
-            "Forwarding",
-            "Record",
-        ];
-        let mut report = serde_json::json!({"adopted": false, "steps": names.map(|name| serde_json::json!({"step": name, "error": null}))});
-        assert!(verify_module_boot(&report).is_ok());
-        report["adopted"] = true.into();
-        assert!(verify_module_boot(&report).is_err());
-        report["adopted"] = false.into();
-        report["steps"][1]["error"] = "missing nf_conntrack".into();
-        assert!(verify_module_boot(&report).is_err());
-        report["steps"][1]["error"] = serde_json::Value::Null;
-        report["steps"].as_array_mut().unwrap().swap(1, 2);
-        assert!(verify_module_boot(&report).is_err());
-        report["steps"].as_array_mut().unwrap().remove(2);
-        assert!(verify_module_boot(&report).is_err());
+    fn labs_derive_kill_points_from_every_product_boot_step_in_order() {
+        use scupper_sys::boot::BootStep;
+        let netns = super::super::boot::kill_points();
+        let systemd = cases::systemd_kill_points();
+        let expected: Vec<_> = BootStep::ALL
+            .iter()
+            .map(|step| (*step as u8).to_string())
+            .collect();
+        assert_eq!(netns, expected);
+        assert_eq!(&systemd[..expected.len()], expected.as_slice());
+        assert_eq!(
+            &systemd[expected.len()..],
+            ["link-add-wg0", "link-add-ex-0"]
+        );
+        let modules = (BootStep::Modules as u8).to_string();
+        assert!(netns.contains(&modules));
+        assert!(systemd.contains(&modules));
     }
+
+    #[test]
+    fn reboot_rejects_missing_failed_or_late_module_evidence() {
+        use scupper_sys::boot::{BootStep, StepResult};
+        let mut report = BootReport {
+            steps: BootStep::ALL
+                .iter()
+                .map(|step| StepResult {
+                    step: *step,
+                    error: None,
+                    adopted: false,
+                })
+                .collect(),
+            ..BootReport::default()
+        };
+        assert!(verify_module_boot(&report, true).is_ok());
+        report.adopted = true;
+        assert!(verify_module_boot(&report, true).is_err());
+        assert!(verify_module_boot(&report, false).is_ok());
+        report.adopted = false;
+        report.steps[1].error = Some("missing nf_conntrack".into());
+        assert!(verify_module_boot(&report, true).is_err());
+        report.steps[1].error = None;
+        report.steps.swap(1, 2);
+        assert!(verify_module_boot(&report, true).is_err());
+        report.steps.remove(2);
+        assert!(report.succeeded()); // The product accepts this legacy shape.
+        assert!(verify_module_boot(&report, true).is_err());
+        assert!(verify_module_boot(&report, false).is_err());
+    }
+
     #[test]
     fn adding_clients_preserves_installed_gateway_and_secrets() {
         let mut installed = parse_site(SITE).unwrap();

@@ -2990,6 +2990,17 @@ after Lock, before Inputs, and that boot did not adopt a namespace; they then
 verify the sysctl is 0 before starting scupperd. Artifacts retain the kernel
 release, unload exit/output, module state, namespace absence and first boot report.
 The deterministic cold-module reproduction is in the fake-kernel unit test.
+
+Lab boot success checks deserialize the product's `BootReport` and use its
+`succeeded()` definition, including its exact legacy upgrade compatibility.
+Both labs derive L9 checkpoint IDs and prefix expectations from the product's
+ordered `BootStep::ALL`, including Modules (ID 8, immediately after Lock).
+Prefix recovery retains any namespace and host leftovers for boot to adopt or
+repair; only the subsequent full reboot requires namespace absence and attempts
+module unloading. Each L9 recovery requires successful Modules evidence before
+Inputs, and a full reboot additionally forbids adoption. Per-prefix boot reports
+retain this evidence alongside the checkpoint markers.
+
 Runners may pin conntrack (for example through Docker NAT); in that case the lab
 proves module commands succeeded on the real kernel and fresh namespace creation,
 not reproduction of the missing-module sysctl failure. Runner unload behaviour

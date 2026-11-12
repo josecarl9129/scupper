@@ -8,12 +8,52 @@ use super::{
     fail,
 };
 use scupper_core::{canon::canonicalize, render::desired_sysctls, rules::IfName};
+use scupper_sys::boot::{BootReport, BootStep};
 use std::{
     fs,
     os::unix::process::ExitStatusExt,
     path::PathBuf,
     time::{Duration, Instant},
 };
+
+pub(super) fn kill_points() -> Vec<String> {
+    BootStep::ALL
+        .iter()
+        .map(|step| (*step as u8).to_string())
+        .collect()
+}
+
+pub(super) fn at_or_after(point: &str, first: BootStep) -> bool {
+    BootStep::ALL
+        .iter()
+        .skip_while(|step| **step != first)
+        .any(|step| point == (*step as u8).to_string())
+}
+
+fn successful_report(status: std::process::ExitStatus, stdout: &str) -> Result<BootReport> {
+    let report: BootReport = serde_json::from_str(stdout)
+        .map_err(|error| format!("invalid boot report: {status}: {error}: {stdout}"))?;
+    if !status.success() || !report.succeeded() {
+        return fail(format!("boot failed: {status}: {stdout}"));
+    }
+    Ok(report)
+}
+
+pub(super) fn verify_modules(report: &BootReport) -> Result<()> {
+    // succeeded enforces order and errors. Recovery additionally needs current
+    // module evidence, even though upgrade handoffs accept the legacy report.
+    if !report.succeeded()
+        || report
+            .steps
+            .get(1)
+            .is_none_or(|step| step.step != BootStep::Modules)
+    {
+        return fail(
+            "boot did not load modules successfully immediately after Lock, before Inputs",
+        );
+    }
+    Ok(())
+}
 
 pub(super) fn client_handshake(text: &str, expected: &str) -> u64 {
     text.lines()
@@ -135,7 +175,7 @@ impl Lab {
         &mut self,
         extra: &[&str],
         stem: &str,
-    ) -> Result<(std::process::ExitStatus, serde_json::Value)> {
+    ) -> Result<(std::process::ExitStatus, String)> {
         let binary = Self::boot_binary()?;
         let root = self.boot_root.clone();
         let trace = self.artifacts.join(format!("{stem}.calls.json"));
@@ -152,18 +192,12 @@ impl Lab {
             None,
         )?;
         fs::write(self.artifacts.join(format!("{stem}.json")), &stdout)?;
-        let report = serde_json::from_str(&stdout).unwrap_or(serde_json::Value::Null);
-        Ok((status, report))
+        // A killed boot may emit no report. Parse only the success path.
+        Ok((status, stdout))
     }
-    pub(super) fn boot_gateway(&mut self, extra: &[&str], stem: &str) -> Result<serde_json::Value> {
-        let (status, report) = self.boot_output(extra, stem)?;
-        if !status.success()
-            || report["steps"]
-                .as_array()
-                .is_none_or(|steps| steps.len() != 8 || steps.iter().any(|s| !s["error"].is_null()))
-        {
-            return fail(format!("boot failed: {status}: {report}"));
-        }
+    pub(super) fn boot_gateway(&mut self, extra: &[&str], stem: &str) -> Result<BootReport> {
+        let (status, stdout) = self.boot_output(extra, stem)?;
+        let report = successful_report(status, &stdout)?;
         self.exit_port = self
             .cmd("scupper", "wg", &["show", "ex-ch1", "listen-port"])?
             .trim()
@@ -173,7 +207,7 @@ impl Lab {
     }
     pub(super) fn boot_adopt(&mut self) -> Result<()> {
         let report = self.boot_gateway(&[], "boot-adopt")?;
-        if report["adopted"] != true {
+        if !report.adopted {
             return fail("second boot did not adopt");
         }
         let calls: Vec<serde_json::Value> =
@@ -288,11 +322,13 @@ impl Lab {
     }
     pub(super) fn supervised_boot_cases(&mut self, case: &str) -> Result<()> {
         let points: Vec<String> = match case {
-            "L9" => [0_u8, 8, 1, 2, 3, 4, 5, 6, 7]
+            "L9" => kill_points(),
+            "L9b" => kill_points()
                 .into_iter()
-                .map(|n| n.to_string())
+                .filter(|point| {
+                    at_or_after(point, BootStep::Inputs) && !at_or_after(point, BootStep::Record)
+                })
                 .collect(),
-            "L9b" => (1_u8..=6).map(|n| n.to_string()).collect(),
             "L9-host-link" => vec!["link-add-wg0".into(), "link-add-ex-ch1".into()],
             _ => return fail("unknown boot crash group"),
         };
@@ -409,7 +445,8 @@ impl Lab {
             return fail(format!("L9 did not kill boot at {point}: {status}"));
         }
         let exists = fs::symlink_metadata("/run/netns/scupper").is_ok();
-        let expected_exists = live || !matches!(point, "0" | "8");
+        let expected_exists =
+            live || at_or_after(point, BootStep::Inputs) || point.starts_with("link-add-");
         if exists != expected_exists {
             return fail(format!(
                 "L9 {point}: namespace exists={exists}, expected={expected_exists}"
@@ -431,7 +468,7 @@ impl Lab {
             for key in ["net.ipv4.ip_forward", "net.ipv6.conf.all.forwarding"] {
                 let forwarding = self.cmd("scupper", "sysctl", &["-n", key])?;
                 if forwarding.trim() == "1"
-                    && (point != "6" && point != "7"
+                    && (!at_or_after(point, BootStep::Forwarding)
                         || canonicalize(&self.cmd(
                             "scupper",
                             "nft",
@@ -464,7 +501,7 @@ impl Lab {
             }
         }
         let client_ready =
-            exists && (live || matches!(point, "4" | "5" | "6" | "7" | "link-add-ex-ch1"));
+            exists && (live || at_or_after(point, BootStep::Links) || point == "link-add-ex-ch1");
         let rx_before = if client_ready {
             self.boot_fresh_client_handshake()?;
             self.capture("scupper", "wg0", &format!("{stem}-wg0"))?;
@@ -534,7 +571,7 @@ impl Lab {
             &stem,
             &markers,
             exit_port,
-            matches!(point, "6" | "7"),
+            at_or_after(point, BootStep::Forwarding),
         )?;
         self.registry
             .register(Resource::Namespace("scupper".into()));
@@ -583,6 +620,88 @@ pub(super) fn boot_canary_arrival(
 #[allow(clippy::unwrap_used)]
 mod restore_tests {
     use super::*;
+
+    fn current_report() -> BootReport {
+        BootReport {
+            steps: BootStep::ALL
+                .iter()
+                .map(|step| scupper_sys::boot::StepResult {
+                    step: *step,
+                    error: None,
+                    adopted: false,
+                })
+                .collect(),
+            ..BootReport::default()
+        }
+    }
+
+    fn check_lab_matches_product(report: &BootReport) {
+        let stdout = serde_json::to_string(report).unwrap();
+        assert_eq!(
+            successful_report(std::process::ExitStatus::from_raw(0), &stdout).is_ok(),
+            report.succeeded()
+        );
+        assert!(successful_report(std::process::ExitStatus::from_raw(256), &stdout).is_err());
+    }
+
+    #[test]
+    fn boot_success_uses_product_semantics_for_current_legacy_and_invalid_reports() {
+        let current = current_report();
+        assert!(current.succeeded());
+        let legacy: BootReport = serde_json::from_str(include_str!(
+            "../../../crates/scupper-sys/tests/fixtures/boot-pre-modules.json"
+        ))
+        .unwrap();
+        assert!(legacy.succeeded());
+        assert!(verify_modules(&legacy).is_err());
+        for report in [current, legacy] {
+            check_lab_matches_product(&report);
+            for index in 0..report.steps.len() {
+                let mut failed = report.clone();
+                failed.steps[index].error = Some("failed checkpoint".into());
+                check_lab_matches_product(&failed);
+                assert!(verify_modules(&failed).is_err());
+
+                let mut missing = report.clone();
+                missing.steps.remove(index);
+                check_lab_matches_product(&missing);
+
+                let mut duplicate = report.clone();
+                duplicate.steps.insert(index, report.steps[index].clone());
+                check_lab_matches_product(&duplicate);
+
+                if index + 1 < report.steps.len() {
+                    let mut reordered = report.clone();
+                    reordered.steps.swap(index, index + 1);
+                    check_lab_matches_product(&reordered);
+                }
+            }
+        }
+        check_lab_matches_product(&BootReport::default());
+        for stdout in [
+            "",
+            "null",
+            "{}",
+            "{",
+            r#"{"steps":[{"step":"Unknown","error":null}]}"#,
+        ] {
+            assert!(successful_report(std::process::ExitStatus::from_raw(0), stdout).is_err());
+        }
+    }
+
+    #[test]
+    fn checkpoint_order_uses_execution_order_instead_of_numeric_ids() {
+        let module = (BootStep::Modules as u8).to_string();
+        assert!(at_or_after(&module, BootStep::Lock));
+        assert!(!at_or_after(&module, BootStep::Inputs));
+        assert!(!at_or_after(&module, BootStep::Forwarding));
+        assert!(at_or_after(
+            &(BootStep::Record as u8).to_string(),
+            BootStep::Forwarding
+        ));
+        assert!(!at_or_after("link-add-ex-0", BootStep::Links));
+    }
+
     #[test]
     fn restore_continues_after_missing_interfaces_and_other_errors() {
         let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))

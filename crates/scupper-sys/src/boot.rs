@@ -51,6 +51,21 @@ pub enum BootStep {
     Record = 7,
 }
 
+impl BootStep {
+    /// Current checkpoints in execution order; numeric IDs remain stable for test hooks.
+    pub const ALL: &[Self] = &[
+        Self::Lock,
+        Self::Modules,
+        Self::Inputs,
+        Self::Close,
+        Self::Ruleset,
+        Self::Links,
+        Self::Routes,
+        Self::Forwarding,
+        Self::Record,
+    ];
+}
+
 /// A single step's outcome. Unrun steps do not appear in the report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepResult {
@@ -106,10 +121,7 @@ impl BootReport {
         ];
         let steps = || self.steps.iter().map(|step| step.step);
         self.steps.iter().all(|step| step.error.is_none())
-            && (steps().eq(legacy)
-                || steps().eq([BootStep::Lock, BootStep::Modules]
-                    .into_iter()
-                    .chain(legacy.into_iter().skip(1))))
+            && (steps().eq(legacy) || steps().eq(BootStep::ALL.iter().copied()))
     }
 }
 
