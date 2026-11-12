@@ -13,6 +13,8 @@ const OUTPUT_CAP: u64 = 1024 * 1024;
 #[derive(Debug)]
 pub(crate) struct ProcessError {
     pub(crate) reason: String,
+    // Read only by the gateway-side `remote` command, which is Linux-only.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) started: bool,
 }
 impl std::fmt::Display for ProcessError {

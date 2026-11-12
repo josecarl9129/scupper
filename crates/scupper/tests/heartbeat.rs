@@ -1,5 +1,5 @@
-#![cfg(target_os = "linux")]
 //! Exercise the real hidden executable and secret stdin, including expired jobs.
+#![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used)]
 use std::{
     io::Write,

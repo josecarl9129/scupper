@@ -3,6 +3,7 @@
 mod control;
 mod decode;
 mod dns;
+#[cfg(target_os = "linux")]
 pub(crate) mod path;
 mod policy;
 mod reader;
