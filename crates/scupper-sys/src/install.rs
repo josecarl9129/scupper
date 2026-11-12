@@ -24,7 +24,7 @@ use zeroize::Zeroizing;
 
 mod execute;
 mod observe;
-pub use execute::{apply, apply_with_fs};
+pub use execute::{ApplyError, apply, apply_with_fs};
 use observe::observe;
 
 /// Flag inputs. No field holds key material.

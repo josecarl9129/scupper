@@ -3,7 +3,7 @@ use clap::Args;
 use scupper_core::release;
 use scupper_proto::{
     Identifier,
-    deploy::{DeployOp, DeployPlan, DeployRequest, ReleaseHash},
+    deploy::{DeployOp, DeployPlan, DeployRequest, ReleaseHash, SwitchOutcome},
 };
 use std::{
     ffi::OsString,
@@ -33,7 +33,9 @@ pub struct DeployArgs {
 }
 /// One fixed command for hosts with or without scupper. Bootstrap only stages files.
 pub const REMOTE_COMMAND: &str = concat!(
-    "if test -x /usr/local/bin/scupper; then if timeout 15 /usr/local/bin/scupper remote --help >/dev/null 2>&1; then exec timeout 420 /usr/local/bin/scupper remote; else echo 'Deployment requires scupper 0.1.0 with M2-2u remote support. Manually copy the matching release archive to the gateway, verify SHA256SUMS and MANIFEST, extract it, then run the extracted scupper install --binaries with that directory.' >&2; exit 1; fi; else exec timeout 120 python3 -c '",
+    "if test -x /usr/local/bin/scupper; then if timeout 15 /usr/local/bin/scupper remote --help >/dev/null 2>&1; then exec timeout 420 /usr/local/bin/scupper remote; else echo 'Deployment requires scupper ",
+    env!("CARGO_PKG_VERSION"),
+    " with M2-2u remote support. Manually copy the matching release archive to the gateway, verify SHA256SUMS and MANIFEST, extract it, then run the extracted scupper install --binaries with that directory.' >&2; exit 1; fi; else exec timeout 120 python3 -c '",
     include_str!("deploy_bootstrap.py"),
     "'; fi"
 );
@@ -51,21 +53,69 @@ pub struct Invocation {
     /// Deployment step used in timeout and failure diagnostics.
     pub step: &'static str,
 }
+/// Completed transport process, preserving the remote status and both output streams.
+#[derive(Debug, Clone)]
+pub struct TransportOutput {
+    /// Exit status, including reserved switch outcome codes.
+    pub code: u8,
+    /// Captured standard output.
+    pub stdout: String,
+    /// Captured standard error.
+    pub stderr: String,
+}
+impl TransportOutput {
+    pub(crate) fn success(self) -> Result<String, String> {
+        if self.code == 0 {
+            Ok(self.stdout)
+        } else {
+            Err(format!(
+                "child exited {}\n{}{}",
+                self.code, self.stdout, self.stderr
+            ))
+        }
+    }
+}
+pub(crate) fn switch_message(outcome: SwitchOutcome, reason: &str) -> String {
+    let reason = reason.trim_end();
+    match outcome {
+        SwitchOutcome::RefusedNoChange
+            if reason.starts_with("Switch refused, nothing changed: ") =>
+        {
+            reason.into()
+        }
+        SwitchOutcome::RefusedNoChange => format!("Switch refused, nothing changed: {reason}"),
+        // The gateway already renders its diagnostic. Reuse it once, while still
+        // generating recovery locally when a typed status arrives without text.
+        SwitchOutcome::FailedAfterRename | SwitchOutcome::Unknown
+            if reason.contains(scupper_core::install::RESTORE_COMMANDS) =>
+        {
+            reason.into()
+        }
+        SwitchOutcome::FailedAfterRename | SwitchOutcome::Unknown => format!(
+            "Switch {}: {reason}. Gateway binaries may be mixed or services stopped. Restore manually:\n{}",
+            if outcome == SwitchOutcome::Unknown {
+                "outcome unknown"
+            } else {
+                "failed after binary rename"
+            },
+            scupper_core::install::RESTORE_COMMANDS
+        ),
+    }
+}
 /// SSH/SCP execution boundary.
 pub trait Transport {
-    /// Execute a command, preserving stdout; reject unsuccessful status.
+    /// Execute a command, preserving its status and output streams.
     /// # Errors
-    /// Returns transport or remote failure.
-    fn execute(&self, invocation: Invocation) -> Result<String, String>;
+    /// Returns transport failure, including timeouts and lost connections.
+    fn execute(&self, invocation: Invocation) -> Result<TransportOutput, String>;
 }
 /// Production system SSH/SCP adapter.
 pub struct Ssh;
 impl Transport for Ssh {
-    fn execute(&self, call: Invocation) -> Result<String, String> {
+    fn execute(&self, call: Invocation) -> Result<TransportOutput, String> {
         let mut command = Command::new(call.program);
         command.args(call.args);
         crate::deploy_process::execute(command, &call.stdin, call.timeout)
-            .map(|(_, stdout)| stdout)
             .map_err(|e| format!("{} step failed: {e}. {}", call.step, step_state(call.step)))
     }
 }
@@ -158,6 +208,10 @@ fn options(values: &[String], scp: bool) -> Result<Vec<OsString>, String> {
         "ServerAliveInterval=15",
         "-o",
         "ServerAliveCountMax=4",
+        "-o",
+        "ControlMaster=no",
+        "-o",
+        "ControlPath=none",
     ]
     .into_iter()
     .map(Into::into)
@@ -200,6 +254,14 @@ impl Client<'_> {
         stdin: Vec<u8>,
         step: &'static str,
     ) -> Result<String, String> {
+        self.invoke(command, stdin, step)?.success()
+    }
+    fn invoke(
+        &self,
+        command: &'static str,
+        stdin: Vec<u8>,
+        step: &'static str,
+    ) -> Result<TransportOutput, String> {
         let mut args = options(self.options, false)?;
         args.extend(["--".into(), self.destination.clone().into(), command.into()]);
         self.transport.execute(Invocation {
@@ -218,7 +280,17 @@ impl Client<'_> {
             DeployOp::Switch { .. } => "Switch",
             DeployOp::Check { .. } => "Check",
         };
-        self.ssh(
+        self.request(operation, request_id, step)?
+            .success()
+            .map_err(|e| format!("{step} step: {e}. {}", step_state(step)))
+    }
+    fn request(
+        &self,
+        operation: DeployOp,
+        request_id: &Identifier,
+        step: &'static str,
+    ) -> Result<TransportOutput, String> {
+        self.invoke(
             REMOTE_COMMAND,
             serde_json::to_vec(&DeployRequest {
                 request_id: request_id.clone(),
@@ -254,6 +326,7 @@ impl Client<'_> {
                 timeout: copy_budget(fs::metadata(path).map_err(|e| e.to_string())?.len()),
                 step: "Copy",
             })
+            .and_then(TransportOutput::success)
             .map_err(|e| format!("Copy step: {e}. {}", step_state("Copy")))?;
         Ok(())
     }
@@ -366,22 +439,28 @@ pub fn run(
     if !args.yes && !prompt.confirm()? {
         return Err("deploy cancelled".into());
     }
-    let switched = client.remote(
+    let switched = client.request(
         DeployOp::Switch {
             id: id.clone(),
             plan_sha256: plan.plan_sha256,
         },
         &id,
+        "Switch",
     );
     let switched = match switched {
-        Ok(text) => text,
-        Err(error) => {
-            let recovery = format!(
-                "Deploy {id_text}: switch failed; gateway binaries may be mixed or services stopped. If switching began, restore manually:\n{}",
-                scupper_core::install::RESTORE_COMMANDS
-            );
-            let _ = writeln!(out, "{recovery}");
-            return Err(format!("{error}\n{recovery}"));
+        Ok(result) if result.code == 0 => result.stdout,
+        result => {
+            let message = match result {
+                Ok(result) => {
+                    let outcome = SwitchOutcome::from_exit_code(result.code);
+                    let reason = format!("{}{}", result.stdout, result.stderr);
+                    switch_message(outcome, &reason)
+                }
+                Err(error) => switch_message(SwitchOutcome::Unknown, &error),
+            };
+            let message = format!("Deploy {id_text}: Switch step: {message}");
+            let _ = writeln!(out, "{message}");
+            return Err(message);
         }
     };
     write!(out, "{switched}").map_err(|e| e.to_string())?;

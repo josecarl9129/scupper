@@ -90,6 +90,36 @@ pub struct DeployPlan {
     /// Digest of the plan and all installation preconditions.
     pub plan_sha256: ReleaseHash,
 }
+/// Failed switch outcome, carried across re-exec and SSH by distinct exit codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwitchOutcome {
+    /// This switch has not renamed a binary, including empty and unit-only plans.
+    RefusedNoChange,
+    /// This switch renamed at least one binary before failing.
+    FailedAfterRename,
+    /// The child or connection was lost after starting the switch.
+    Unknown,
+}
+impl SwitchOutcome {
+    /// Reserved remote exit status for this outcome.
+    #[must_use]
+    pub const fn exit_code(self) -> u8 {
+        match self {
+            Self::RefusedNoChange => 20,
+            Self::FailedAfterRename => 21,
+            Self::Unknown => 22,
+        }
+    }
+    /// Decode a remote outcome; unrecognized failures have an unknown outcome.
+    #[must_use]
+    pub const fn from_exit_code(code: u8) -> Self {
+        match code {
+            20 => Self::RefusedNoChange,
+            21 => Self::FailedAfterRename,
+            _ => Self::Unknown,
+        }
+    }
+}
 /// One correlated SSH request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeployRequest {

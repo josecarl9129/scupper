@@ -56,30 +56,42 @@ fn new_identity() -> Result<Zeroizing<Vec<u8>>, String> {
 /// Stops at the first failed operation. Never rotates an existing identity.
 #[allow(clippy::too_many_lines)]
 pub fn apply(system: &dyn System, paths: &Paths, prepared: Prepared) -> Result<String, String> {
-    apply_with_fs(system, paths, prepared, &RealFs)
+    let recoverable = model::BINARIES
+        .iter()
+        .all(|name| paths.at(&format!("{}/{name}", model::BIN_ROOT)).is_file());
+    apply_with_fs(system, paths, prepared, &RealFs).map_err(|error| {
+        if error.replaced && recoverable {
+            format!(
+                "{}\nGateway binaries may be mixed or services stopped. Restore manually:\n{}",
+                error.reason,
+                model::RESTORE_COMMANDS
+            )
+        } else {
+            error.reason
+        }
+    })
+}
+/// Installation failure with the actual binary rename state.
+#[derive(Debug)]
+pub struct ApplyError {
+    /// Underlying operation or precondition failure.
+    pub reason: String,
+    /// At least one live binary was renamed, even if directory sync then failed.
+    pub replaced: bool,
 }
 /// Applies installation using an injected binary-replacement filesystem boundary.
 /// # Errors
-/// Includes manual recovery commands on every error after a binary rename.
+/// Reports whether any binary was renamed; callers choose recovery diagnostics.
 pub fn apply_with_fs(
     system: &dyn System,
     paths: &Paths,
     prepared: Prepared,
     filesystem: &dyn Fs,
-) -> Result<String, String> {
+) -> Result<String, ApplyError> {
     let replaced = std::cell::Cell::new(false);
-    let recoverable = model::BINARIES
-        .iter()
-        .all(|name| paths.at(&format!("{}/{name}", model::BIN_ROOT)).is_file());
-    apply_inner(system, paths, prepared, filesystem, &replaced).map_err(|error| {
-        if replaced.get() && recoverable {
-            format!(
-                "{error}\nGateway binaries may be mixed or services stopped. Restore manually:\n{}",
-                model::RESTORE_COMMANDS
-            )
-        } else {
-            error
-        }
+    apply_inner(system, paths, prepared, filesystem, &replaced).map_err(|reason| ApplyError {
+        reason,
+        replaced: replaced.get(),
     })
 }
 #[allow(clippy::too_many_lines)]

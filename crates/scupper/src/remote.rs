@@ -3,7 +3,9 @@ use scupper_core::{
     install::{self as model, Change},
     release,
 };
-use scupper_proto::deploy::{DeployOp, DeployPlan, DeployRequest, ReleaseHash, read_deploy};
+use scupper_proto::deploy::{
+    DeployOp, DeployPlan, DeployRequest, ReleaseHash, SwitchOutcome, read_deploy,
+};
 use scupper_sys::{
     fs::{Fs, RealFs},
     install::{self, Options, Paths},
@@ -167,6 +169,11 @@ pub fn run(input: impl Read, out: &mut dyn Write) -> Result<u8, String> {
 /// Returns bounded execution or installation failures.
 pub fn run_mode(input: impl Read, out: &mut dyn Write, staged: bool) -> Result<u8, String> {
     let request = read_deploy(input).map_err(|e| e.to_string())?;
+    let switching = matches!(request.operation, DeployOp::Switch { .. });
+    let result = run_request(request, out, staged);
+    finish_refusal(result, switching, out)
+}
+fn run_request(request: DeployRequest, out: &mut dyn Write, staged: bool) -> Result<u8, String> {
     if !rustix::process::geteuid().is_root() {
         return Err("remote requires root".into());
     }
@@ -193,24 +200,7 @@ pub fn run_mode(input: impl Read, out: &mut dyn Write, staged: bool) -> Result<u
             &serde_json::to_vec(&request).map_err(|e| e.to_string())?,
             timeout,
         );
-        match result {
-            Ok((code, text)) => {
-                out.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
-                return Ok(code);
-            }
-            Err(error) => {
-                let error = if switching {
-                    format!(
-                        "Switch child failed: {error}. Gateway binaries may be mixed or services stopped. Restore manually:\n{}",
-                        model::RESTORE_COMMANDS
-                    )
-                } else {
-                    format!("Plan child failed: {error}. Live binaries were not switched.")
-                };
-                let _ = writeln!(out, "{error}");
-                return Err(error);
-            }
-        }
+        return forward_child(result, switching, out);
     }
     dispatch(request, out, &system, &paths, &RealFs)
 }
@@ -226,7 +216,65 @@ pub fn run_staged(
     filesystem: &dyn Fs,
 ) -> Result<u8, String> {
     let request = read_deploy(input).map_err(|e| e.to_string())?;
-    dispatch(request, out, system, paths, filesystem)
+    let switching = matches!(request.operation, DeployOp::Switch { .. });
+    let result = dispatch(request, out, system, paths, filesystem);
+    finish_refusal(result, switching, out)
+}
+fn report_switch(outcome: SwitchOutcome, reason: &str, out: &mut dyn Write) -> u8 {
+    // A failed output pipe must not replace the actual switch outcome with a refusal.
+    let _ = writeln!(out, "{}", crate::deploy::switch_message(outcome, reason));
+    outcome.exit_code()
+}
+fn finish_refusal(
+    result: Result<u8, String>,
+    switching: bool,
+    out: &mut dyn Write,
+) -> Result<u8, String> {
+    match result {
+        Err(reason) if switching => Ok(report_switch(SwitchOutcome::RefusedNoChange, &reason, out)),
+        result => result,
+    }
+}
+// This is the production outer gateway boundary: preserve typed child failures,
+// classify missing status/timeouts conservatively, and print only one gateway copy.
+fn forward_child(
+    result: Result<crate::deploy::TransportOutput, crate::deploy_process::ProcessError>,
+    switching: bool,
+    out: &mut dyn Write,
+) -> Result<u8, String> {
+    match result {
+        Ok(result) if switching && result.code != 0 => {
+            let outcome = SwitchOutcome::from_exit_code(result.code);
+            let reason = format!("{}{}", result.stdout, result.stderr);
+            Ok(report_switch(outcome, &reason, out))
+        }
+        Ok(result) => {
+            let text = result.success()?;
+            if let Err(error) = out.write_all(text.as_bytes()) {
+                if switching {
+                    return Ok(report_switch(
+                        SwitchOutcome::Unknown,
+                        &error.to_string(),
+                        out,
+                    ));
+                }
+                return Err(error.to_string());
+            }
+            Ok(0)
+        }
+        Err(error) if switching => Ok(report_switch(
+            if error.started {
+                SwitchOutcome::Unknown
+            } else {
+                SwitchOutcome::RefusedNoChange
+            },
+            &error.reason,
+            out,
+        )),
+        Err(error) => Err(format!(
+            "Plan child failed: {error}. Live binaries were not switched."
+        )),
+    }
 }
 #[allow(clippy::too_many_lines)]
 fn dispatch(
@@ -291,20 +339,30 @@ fn dispatch(
             Ok(0)
         }
         DeployOp::Switch { plan_sha256, .. } => {
-            verified(&stage)?;
-            let prepared = prepare_install(system, paths, &stage)?;
-            if prepared.confirmation_digest() != plan_sha256.as_str() {
-                return Err("deployment plan changed since confirmation; no change made; request and confirm a new plan".into());
-            }
-            if model::BINARIES
-                .iter()
-                .any(|name| !paths.at(&format!("{}/{name}", model::BIN_ROOT)).is_file())
-            {
-                return Err("Switch requires both installed binaries for manual recovery; copy and install the release manually".into());
-            }
-            let net_changed = prepared.plan.steps.iter().any(|s| matches!(&s.change, Change::File(path, _) if path == &format!("{}/scupper-net.service", model::UNIT_ROOT)));
+            let mut replaced = false;
             let result: Result<u8, String> = (|| {
-                install::apply_with_fs(system, paths, prepared, filesystem)?;
+                verified(&stage)?;
+                let prepared = prepare_install(system, paths, &stage)?;
+                if prepared.confirmation_digest() != plan_sha256.as_str() {
+                    return Err("deployment plan changed since confirmation; no change made; request and confirm a new plan".into());
+                }
+                if model::BINARIES
+                    .iter()
+                    .any(|name| !paths.at(&format!("{}/{name}", model::BIN_ROOT)).is_file())
+                {
+                    return Err("Switch requires both installed binaries for manual recovery; copy and install the release manually".into());
+                }
+                let net_changed = prepared.plan.steps.iter().any(|s| matches!(&s.change, Change::File(path, _) if path == &format!("{}/scupper-net.service", model::UNIT_ROOT)));
+                let binary_changed = prepared
+                    .plan
+                    .steps
+                    .iter()
+                    .any(|s| matches!(s.change, Change::Binary(..)));
+                install::apply_with_fs(system, paths, prepared, filesystem).map_err(|error| {
+                    replaced = error.replaced;
+                    error.reason
+                })?;
+                replaced = binary_changed;
                 service(system, &["daemon-reload"])?;
                 if net_changed {
                     service(system, &["restart", "scupper-net"])?;
@@ -312,11 +370,18 @@ fn dispatch(
                 service(system, &["restart", "scupperd"])?;
                 Ok(0)
             })();
-            result.map_err(|e| {
-                let message = format!("Switch failed: {e}. Gateway binaries may be mixed or services stopped. Restore manually:\n{}", model::RESTORE_COMMANDS);
-                let _ = writeln!(out, "{message}");
-                message
-            })
+            match result {
+                Ok(code) => Ok(code),
+                Err(reason) => Ok(report_switch(
+                    if replaced {
+                        SwitchOutcome::FailedAfterRename
+                    } else {
+                        SwitchOutcome::RefusedNoChange
+                    },
+                    &reason,
+                    out,
+                )),
+            }
         }
         DeployOp::Check { .. } => {
             let result = system
@@ -339,3 +404,110 @@ fn dispatch(
     }
 }
 use std::os::unix::fs::DirBuilderExt;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    #[test]
+    fn outer_gateway_preserves_typed_outcomes_without_duplicate_recovery() {
+        for outcome in [
+            SwitchOutcome::RefusedNoChange,
+            SwitchOutcome::FailedAfterRename,
+            SwitchOutcome::Unknown,
+        ] {
+            let message = crate::deploy::switch_message(outcome, "injected failure");
+            let mut command = Command::new("sh");
+            command.args([
+                "-c",
+                "cat; exit \"$1\"",
+                "switch-child",
+                &outcome.exit_code().to_string(),
+            ]);
+            let result =
+                crate::deploy_process::execute(command, message.as_bytes(), Duration::from_secs(2));
+            let mut out = Vec::new();
+            let code = forward_child(result, true, &mut out).unwrap();
+            assert_eq!(code, outcome.exit_code());
+            let text = String::from_utf8(out).unwrap();
+            assert_eq!(text, format!("{message}\n"));
+            assert_eq!(
+                text.matches(model::RESTORE_COMMANDS).count(),
+                usize::from(outcome != SwitchOutcome::RefusedNoChange)
+            );
+        }
+    }
+    #[test]
+    fn outer_gateway_timeout_signal_or_unrecognized_exit_is_unknown() {
+        for script in ["sleep 10", "exit 255", "kill -KILL $$"] {
+            let mut command = Command::new("sh");
+            command.args(["-c", script]);
+            let result = crate::deploy_process::execute(command, b"", Duration::from_millis(50));
+            let mut out = Vec::new();
+            assert_eq!(
+                forward_child(result, true, &mut out).unwrap(),
+                SwitchOutcome::Unknown.exit_code()
+            );
+            let text = String::from_utf8(out).unwrap();
+            assert!(text.contains("outcome unknown"));
+            assert_eq!(text.matches(model::RESTORE_COMMANDS).count(), 1);
+        }
+    }
+    #[test]
+    fn outer_gateway_pre_exec_refusal_and_spawn_failure_have_no_recovery() {
+        let mut out = Vec::new();
+        let code = finish_refusal(Err("staged member mismatch".into()), true, &mut out).unwrap();
+        assert_eq!(code, SwitchOutcome::RefusedNoChange.exit_code());
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("refused, nothing changed: staged member mismatch"));
+        assert!(!text.contains(model::RESTORE_COMMANDS));
+        let result = crate::deploy_process::execute(
+            Command::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("no-such-switch-child")),
+            b"",
+            Duration::from_secs(1),
+        );
+        let mut out = Vec::new();
+        assert_eq!(
+            forward_child(result, true, &mut out).unwrap(),
+            SwitchOutcome::RefusedNoChange.exit_code()
+        );
+        assert!(
+            !String::from_utf8(out)
+                .unwrap()
+                .contains(model::RESTORE_COMMANDS)
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod empty_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn outer_gateway_uses_typed_status_even_without_child_diagnostics() {
+        for outcome in [
+            SwitchOutcome::RefusedNoChange,
+            SwitchOutcome::FailedAfterRename,
+            SwitchOutcome::Unknown,
+        ] {
+            let result = crate::deploy::TransportOutput {
+                code: outcome.exit_code(),
+                stdout: String::new(),
+                stderr: String::new(),
+            };
+            let mut out = Vec::new();
+            assert_eq!(
+                forward_child(Ok(result), true, &mut out).unwrap(),
+                outcome.exit_code()
+            );
+            let text = String::from_utf8(out).unwrap();
+            assert_eq!(
+                text.matches(model::RESTORE_COMMANDS).count(),
+                usize::from(outcome != SwitchOutcome::RefusedNoChange)
+            );
+            if outcome == SwitchOutcome::RefusedNoChange {
+                assert!(text.contains("refused, nothing changed"));
+            }
+        }
+    }
+}

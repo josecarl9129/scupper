@@ -1,17 +1,24 @@
 //! Deploy orchestration with no real SSH connection or host mutation.
 #![allow(clippy::unwrap_used)]
 use proptest::prelude::*;
-use scupper::deploy::{self, Confirmation, DeployArgs, Invocation, Transport};
+use scupper::deploy::{self, Confirmation, DeployArgs, Invocation, Transport, TransportOutput};
 use scupper_core::release::{self, Members};
 use scupper_proto::deploy::{self as wire, DeployOp};
 use std::{cell::RefCell, collections::VecDeque, fs, path::PathBuf};
 
+fn output(code: u8, text: &str) -> TransportOutput {
+    TransportOutput {
+        code,
+        stdout: text.into(),
+        stderr: String::new(),
+    }
+}
 struct Fake {
     calls: RefCell<Vec<Invocation>>,
-    responses: RefCell<VecDeque<Result<String, String>>>,
+    responses: RefCell<VecDeque<Result<TransportOutput, String>>>,
 }
 impl Transport for Fake {
-    fn execute(&self, call: Invocation) -> Result<String, String> {
+    fn execute(&self, call: Invocation) -> Result<TransportOutput, String> {
         self.calls.borrow_mut().push(call);
         self.responses.borrow_mut().pop_front().unwrap()
     }
@@ -89,7 +96,7 @@ impl Fixture {
             args,
             Fake {
                 calls: RefCell::default(),
-                responses: RefCell::new(responses.into_iter().map(|r| Ok(r.into())).collect()),
+                responses: RefCell::new(responses.into_iter().map(|r| Ok(output(0, r))).collect()),
             },
         )
     }
@@ -118,6 +125,10 @@ fn every_step_uses_fixed_remote_command_and_typed_stdin() {
         "ServerAliveInterval=15",
         "-o",
         "ServerAliveCountMax=4",
+        "-o",
+        "ControlMaster=no",
+        "-o",
+        "ControlPath=none",
         "-i",
         "/tmp/example-key",
         "-p",
@@ -162,11 +173,11 @@ fn every_step_uses_fixed_remote_command_and_typed_stdin() {
     let copy = &calls[2];
     assert_eq!(copy.program, "scp");
     assert_eq!(copy.stdin, [] as [u8; 0]);
-    assert_eq!(copy.args[10], "-P");
-    assert_eq!(copy.args[15], args.archive.unwrap().canonicalize().unwrap());
+    assert_eq!(copy.args[14], "-P");
+    assert_eq!(copy.args[19], args.archive.unwrap().canonicalize().unwrap());
     let prepare = wire::read_deploy(calls[1].stdin.as_slice()).unwrap();
     assert_eq!(
-        copy.args[16],
+        copy.args[20],
         format!(
             "root@192.0.2.10:/usr/local/lib/scupper/deploy/{}/new/archive.tar.gz",
             prepare.operation.id()
@@ -375,7 +386,7 @@ fn explicit_archive_can_have_another_version_but_not_another_architecture() {
     args.archive = Some(renamed);
     deploy::run(&args, &fake, &Prompt(false), &mut Vec::new()).unwrap();
     let (_fixture, args, fake) = Fixture::new("wrong-arch", false);
-    fake.responses.borrow_mut()[0] = Ok("aarch64\n".into());
+    fake.responses.borrow_mut()[0] = Ok(output(0, "aarch64\n"));
     let error = deploy::run(&args, &fake, &Prompt(false), &mut Vec::new()).unwrap_err();
     assert!(error.contains("binaries do not match gateway architecture"));
     assert_eq!(fake.calls.borrow().len(), 1);
@@ -391,6 +402,8 @@ fn confirmed_digest_and_bounded_budgets_reach_transport() {
             "ConnectTimeout=15",
             "ServerAliveInterval=15",
             "ServerAliveCountMax=4",
+            "ControlMaster=no",
+            "ControlPath=none",
         ] {
             assert!(
                 call.args.windows(2).any(|a| a == ["-o", option]),
@@ -494,12 +507,104 @@ fn invalid_or_missing_plan_digest_prevents_confirmation_and_switch() {
         ("invalid-digest", r#"{"plan":"text","plan_sha256":"$(x)"}"#),
     ] {
         let (_fixture, args, fake) = Fixture::new(label, false);
-        fake.responses.borrow_mut()[4] = Ok(response.into());
+        fake.responses.borrow_mut()[4] = Ok(output(0, response));
         assert!(
             deploy::run(&args, &fake, &Prompt(false), &mut Vec::new())
                 .unwrap_err()
                 .contains("invalid remote plan")
         );
         assert_eq!(fake.calls.borrow().len(), 5);
+    }
+}
+
+#[test]
+fn typed_gateway_refusals_omit_recovery_on_client() {
+    for reason in [
+        "plan digest mismatch",
+        "Switch requires both installed binaries",
+        "host changed since install was planned",
+        "prepare refused",
+        "previous file write failed",
+        "empty plan restart failed",
+        "unit-only plan restart failed",
+    ] {
+        let (_fixture, args, fake) = Fixture::new(reason, false);
+        fake.responses.borrow_mut()[5] = Ok(output(
+            wire::SwitchOutcome::RefusedNoChange.exit_code(),
+            reason,
+        ));
+        let mut out = Vec::new();
+        let error = deploy::run(&args, &fake, &Prompt(false), &mut out).unwrap_err();
+        for message in [String::from_utf8(out).unwrap(), error] {
+            assert!(message.contains("refused, nothing changed"), "{message}");
+            assert!(message.contains(reason), "{message}");
+            assert!(
+                !message.contains(scupper_core::install::RESTORE_COMMANDS),
+                "{message}"
+            );
+        }
+        assert_eq!(fake.calls.borrow().len(), 6);
+    }
+}
+#[test]
+fn typed_gateway_failure_and_unknown_include_one_client_recovery() {
+    for outcome in [
+        wire::SwitchOutcome::FailedAfterRename,
+        wire::SwitchOutcome::Unknown,
+    ] {
+        let (_fixture, args, fake) = Fixture::new(&format!("{outcome:?}"), false);
+        fake.responses.borrow_mut()[5] = Ok(output(outcome.exit_code(), "restart failed"));
+        let mut out = Vec::new();
+        let error = deploy::run(&args, &fake, &Prompt(false), &mut out).unwrap_err();
+        for message in [String::from_utf8(out).unwrap(), error] {
+            assert_eq!(
+                message
+                    .matches(scupper_core::install::RESTORE_COMMANDS)
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(fake.calls.borrow().len(), 6);
+    }
+}
+
+#[test]
+fn typed_status_without_diagnostics_still_controls_client_recovery() {
+    for outcome in [
+        wire::SwitchOutcome::RefusedNoChange,
+        wire::SwitchOutcome::FailedAfterRename,
+        wire::SwitchOutcome::Unknown,
+    ] {
+        let (_fixture, args, fake) = Fixture::new(&format!("empty-{outcome:?}"), false);
+        fake.responses.borrow_mut()[5] = Ok(output(outcome.exit_code(), ""));
+        let mut out = Vec::new();
+        let error = deploy::run(&args, &fake, &Prompt(false), &mut out).unwrap_err();
+        for text in [String::from_utf8(out).unwrap(), error] {
+            assert_eq!(
+                text.matches(scupper_core::install::RESTORE_COMMANDS)
+                    .count(),
+                usize::from(outcome != wire::SwitchOutcome::RefusedNoChange)
+            );
+            if outcome == wire::SwitchOutcome::RefusedNoChange {
+                assert!(text.contains("refused, nothing changed"));
+            }
+        }
+    }
+}
+#[test]
+fn rendered_gateway_failure_is_not_duplicated_on_client() {
+    let (_fixture, args, fake) = Fixture::new("rendered-failure", false);
+    let message = format!(
+        "Switch failed after binary rename: restart failed. Gateway binaries may be mixed or services stopped. Restore manually:\n{}",
+        scupper_core::install::RESTORE_COMMANDS
+    );
+    fake.responses.borrow_mut()[5] = Ok(output(
+        wire::SwitchOutcome::FailedAfterRename.exit_code(),
+        &message,
+    ));
+    let mut out = Vec::new();
+    let error = deploy::run(&args, &fake, &Prompt(false), &mut out).unwrap_err();
+    for text in [String::from_utf8(out).unwrap(), error] {
+        assert_eq!(text.matches(&message).count(), 1);
     }
 }

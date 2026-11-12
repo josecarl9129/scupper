@@ -406,7 +406,7 @@ dependencies = [
 
 [[package]]
 name = "scupper"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "proptest",
@@ -421,7 +421,7 @@ dependencies = [
 
 [[package]]
 name = "scupper-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ipnet",
  "proptest",
@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "scupper-proto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "proptest",
  "scupper-core",
@@ -445,7 +445,7 @@ dependencies = [
 
 [[package]]
 name = "scupper-sys"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dns-lookup",
  "ipnet",
@@ -466,7 +466,7 @@ dependencies = [
 
 [[package]]
 name = "scupperd"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "scupper-sys",
@@ -789,7 +789,7 @@ checksum = "8c3b93199df0ab874cdf0c6a94f0a0dc3423fe41f1cafb62b8bd7b1deb277aef"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "ipnet",

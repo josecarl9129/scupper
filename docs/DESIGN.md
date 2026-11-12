@@ -2506,8 +2506,13 @@ and 5): enough for the migration to a fresh host, where the old host is the
 rollback. Confirm-or-rollback, `upgrade` and the guard unit arrive in M6.
 M2 recovery remains manual. Before replacing either binary, Switch durably
 writes both existing binaries to their `.prev` paths, then replaces the pair
-back to back. Errors after a rename and switch transport timeouts print these
-commands on the gateway and again on the client with the deploy identifier:
+back to back. Switch failures carry typed outcomes through reserved exit statuses:
+`RefusedNoChange` (20), `FailedAfterRename` (21), and `Unknown` (22).
+Only a failure after an actual binary rename, or an unknown outcome after the
+child or SSH connection is lost, prints these commands on the gateway and
+again on the client with the deploy identifier. Precondition/digest refusals,
+backup failures before a live rename, and failed restarts for empty or unit-only
+plans report "refused, nothing changed" with the reason and omit recovery commands:
 
 ```sh
 install -m 0755 /usr/local/bin/scupperd.prev /usr/local/bin/scupperd
@@ -2521,8 +2526,9 @@ and print the staged `scupper install --binaries DIR` command; no install or
 service start runs automatically. Upgrading a gateway without the `remote`
 subcommand requires a manual copy of the matching release archive, verification
 of SHA256SUMS and MANIFEST, extraction, and running that release's
-`scupper install --binaries DIR`. Automated deploy requires scupper 0.1.0 with
-M2-2u remote support; the version number alone does not identify pre-2u builds.
+`scupper install --binaries DIR`. The first release with the `remote` subcommand
+is scupper 0.1.1; the capability failure message names the shipping package
+version at compile time.
 
 Plan runs the verified staged installer and returns the displayed plan with a
 SHA-256 digest binding its full observed preconditions and desired inputs.
@@ -2532,8 +2538,9 @@ own precondition check still runs before applying. There is no deploy lock in
 M2; concurrent operators must still coordinate.
 
 SSH and SCP use ConnectTimeout=15, ServerAliveInterval=15 and
-ServerAliveCountMax=4. Client wall-clock budgets are 60 seconds for discovery
-and preparation, 180 seconds for stage, plan and check, 480 seconds for switch,
+ServerAliveCountMax=4, with ControlMaster=no and ControlPath=none to disable
+connection sharing from the operator's SSH config. Client wall-clock budgets are
+60 seconds for discovery and preparation, 180 seconds for stage, plan and check, 480 seconds for switch,
 and 60 seconds plus archive size at 128 KiB/s (rounded up) for copy. The gateway
 dispatcher bounds capability detection to 15 seconds, bootstrap to 120 seconds,
 and remote dispatch to 420 seconds. Staged plan and switch children are bounded

@@ -8,7 +8,7 @@ use scupper_core::{
     install as model,
     release::{self, Members},
 };
-use scupper_proto::deploy::DeployPlan;
+use scupper_proto::deploy::{DeployPlan, SwitchOutcome};
 use scupper_sys::{
     fs::{Fs, RealFs, TempFile},
     system::{ExecError, ExecOutput, ExecTarget, Program, System},
@@ -27,6 +27,7 @@ struct Gateway {
     fake: Fake,
     fail: RefCell<Option<&'static str>>,
     services: RefCell<Vec<Vec<String>>>,
+    change_on_observe: RefCell<Option<(PathBuf, usize)>>,
 }
 impl System for Gateway {
     fn install_uid(&self) -> u32 {
@@ -38,6 +39,16 @@ impl System for Gateway {
         args: &[String],
         timeout: Duration,
     ) -> Result<ExecOutput, ExecError> {
+        if program == Program::Uname && args[0] == "-r" {
+            let mut hook = self.change_on_observe.borrow_mut();
+            if let Some((path, remaining)) = hook.as_mut() {
+                *remaining -= 1;
+                if *remaining == 0 {
+                    fs::write(path, "external change before apply").unwrap();
+                    hook.take();
+                }
+            }
+        }
         if program == Program::Systemctl && matches!(args[0].as_str(), "restart" | "daemon-reload")
         {
             self.services.borrow_mut().push(args.to_vec());
@@ -246,7 +257,15 @@ fn tampered_members_refuse_plan_and_switch_without_mutations() {
         ("Plan", None),
         ("Switch", Some(("plan_sha256", digest.as_str()))),
     ] {
-        let error = call(&host, &gateway, &RealFs, op, extra).0.unwrap_err();
+        let (result, output) = call(&host, &gateway, &RealFs, op, extra);
+        let error = if op == "Switch" {
+            assert_eq!(result.unwrap(), SwitchOutcome::RefusedNoChange.exit_code());
+            assert!(output.contains("refused, nothing changed"));
+            assert!(!output.contains(model::RESTORE_COMMANDS));
+            output
+        } else {
+            result.unwrap_err()
+        };
         assert!(error.contains("staged member mismatch"), "{error}");
         assert_eq!(host.snapshot(), before);
         assert!(gateway.services.borrow().is_empty());
@@ -283,10 +302,11 @@ fn changed_plan_is_refused_before_any_write_or_restart() {
     // Change the old binary, keeping the displayed replacement plan identical.
     fs::write(host.paths.at(model::SCUPPER_FILE), "different old binary").unwrap();
     let before = host.snapshot();
-    let error = switch(&host, &gateway, &RealFs, digest.as_str())
-        .0
-        .unwrap_err();
+    let (result, error) = switch(&host, &gateway, &RealFs, digest.as_str());
+    assert_eq!(result.unwrap(), SwitchOutcome::RefusedNoChange.exit_code());
     assert!(error.contains("plan changed since confirmation"), "{error}");
+    assert!(error.contains("refused, nothing changed"));
+    assert!(!error.contains(model::RESTORE_COMMANDS));
     assert_eq!(before, host.snapshot());
     assert!(gateway.services.borrow().is_empty());
 }
@@ -303,9 +323,12 @@ fn failed_reload_never_restarts_and_failed_restart_or_timeout_prints_recovery() 
         let digest = plan(&host, &gateway).plan_sha256;
         *gateway.fail.borrow_mut() = Some(failure);
         let (result, output) = switch(&host, &gateway, &RealFs, digest.as_str());
-        let error = result.unwrap_err();
-        assert!(error.contains(model::RESTORE_COMMANDS), "{error}");
-        assert!(output.contains(model::RESTORE_COMMANDS));
+        assert_eq!(
+            result.unwrap(),
+            SwitchOutcome::FailedAfterRename.exit_code()
+        );
+        let error = &output;
+        assert_eq!(output.matches(model::RESTORE_COMMANDS).count(), 1);
         if failure == "reload" {
             assert!(gateway.services.borrow().iter().all(|a| a[0] != "restart"));
         }
@@ -366,8 +389,11 @@ fn first_rename_fault_has_both_previous_files_and_prints_recovery() {
         renames: RefCell::default(),
     };
     let (result, output) = switch(&host, &gateway, &filesystem, digest.as_str());
-    assert!(result.unwrap_err().contains(model::RESTORE_COMMANDS));
-    assert!(output.contains(model::RESTORE_COMMANDS));
+    assert_eq!(
+        result.unwrap(),
+        SwitchOutcome::FailedAfterRename.exit_code()
+    );
+    assert_eq!(output.matches(model::RESTORE_COMMANDS).count(), 1);
     assert_eq!(
         *filesystem.renames.borrow(),
         ["scupper.prev", "scupperd.prev", "scupper"]
@@ -380,7 +406,166 @@ fn first_rename_fault_has_both_previous_files_and_prints_recovery() {
 }
 #[test]
 fn dispatcher_has_clear_manual_upgrade_instructions() {
-    assert!(deploy::REMOTE_COMMAND.contains("requires scupper 0.1.0 with M2-2u remote support"));
+    assert!(deploy::REMOTE_COMMAND.contains(&format!(
+        "requires scupper {} with M2-2u remote support",
+        env!("CARGO_PKG_VERSION")
+    )));
     assert!(deploy::REMOTE_COMMAND.contains("copy the matching release archive"));
     assert!(deploy::REMOTE_COMMAND.contains("install --binaries"));
+}
+
+#[test]
+fn missing_binary_and_prepare_refusal_omit_recovery() {
+    for refusal in ["missing-binary", "prepare"] {
+        let (host, mut gateway) = installed();
+        stage(&host, &gateway);
+        if refusal == "missing-binary" {
+            fs::remove_file(host.paths.at(model::SCUPPER_FILE)).unwrap();
+        } else {
+            gateway.fake.missing_packages = true;
+        }
+        let digest = if refusal == "prepare" {
+            "0".repeat(64)
+        } else {
+            String::from(plan(&host, &gateway).plan_sha256)
+        };
+        let before = host.snapshot();
+        let (result, output) = switch(&host, &gateway, &RealFs, &digest);
+        assert_eq!(result.unwrap(), SwitchOutcome::RefusedNoChange.exit_code());
+        assert!(output.contains("refused, nothing changed"), "{output}");
+        if refusal == "missing-binary" {
+            assert!(
+                output.contains("requires both installed binaries"),
+                "{output}"
+            );
+        }
+        assert!(!output.contains(model::RESTORE_COMMANDS));
+        assert_eq!(before, host.snapshot());
+        assert!(gateway.services.borrow().is_empty());
+    }
+}
+#[test]
+fn empty_and_unit_only_plan_restart_failure_omit_recovery() {
+    for unit_only in [false, true] {
+        let (host, gateway) = installed();
+        let stage = stage(&host, &gateway);
+        // Match the release without creating .prev files in this switch.
+        for binary in model::BINARIES {
+            fs::copy(
+                stage.join(binary),
+                host.paths.at(&format!("/usr/local/bin/{binary}")),
+            )
+            .unwrap();
+        }
+        if unit_only {
+            fs::write(
+                host.paths.at("/etc/systemd/system/scupperd.service"),
+                "old unit",
+            )
+            .unwrap();
+        }
+        let plan = plan(&host, &gateway);
+        if !unit_only {
+            assert!(plan.plan.contains("no changes"), "{}", plan.plan);
+        }
+        *gateway.fail.borrow_mut() = Some("restart");
+        let (result, output) = switch(&host, &gateway, &RealFs, plan.plan_sha256.as_str());
+        assert_eq!(result.unwrap(), SwitchOutcome::RefusedNoChange.exit_code());
+        assert!(output.contains("refused, nothing changed"));
+        assert!(output.contains("restart scupperd"));
+        assert!(!output.contains(model::RESTORE_COMMANDS));
+        for binary in model::BINARIES {
+            assert!(
+                !host
+                    .paths
+                    .at(&format!("/usr/local/bin/{binary}.prev"))
+                    .exists()
+            );
+        }
+    }
+}
+
+#[test]
+fn apply_precondition_error_reports_no_rename_without_recovery() {
+    let (host, gateway) = installed();
+    let stage = stage(&host, &gateway);
+    let prepared = scupper_sys::install::prepare(
+        &gateway,
+        &host.paths,
+        &scupper_sys::install::Options {
+            binaries: stage,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    fs::write(host.paths.at(model::SCUPPER_FILE), "changed after prepare").unwrap();
+    let before = host.snapshot();
+    let error =
+        scupper_sys::install::apply_with_fs(&gateway, &host.paths, prepared, &RealFs).unwrap_err();
+    assert!(!error.replaced);
+    assert!(error.reason.contains("host changed"), "{}", error.reason);
+    assert!(!error.reason.contains(model::RESTORE_COMMANDS));
+    assert_eq!(before, host.snapshot());
+    assert!(gateway.services.borrow().is_empty());
+}
+
+#[test]
+fn apply_error_directly_records_first_rename() {
+    let (host, gateway) = installed();
+    let stage = stage(&host, &gateway);
+    let prepared = scupper_sys::install::prepare(
+        &gateway,
+        &host.paths,
+        &scupper_sys::install::Options {
+            binaries: stage,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let filesystem = FailAfterFirstRename {
+        bin: host.paths.at(model::BIN_ROOT),
+        renames: RefCell::default(),
+    };
+    let error = scupper_sys::install::apply_with_fs(&gateway, &host.paths, prepared, &filesystem)
+        .unwrap_err();
+    assert!(error.replaced);
+    assert!(error.reason.contains("after first rename"));
+}
+
+#[test]
+fn previous_file_failure_before_live_rename_omits_recovery() {
+    let (host, gateway) = installed();
+    stage(&host, &gateway);
+    // A directory at .prev makes the durable backup write refuse before live renames.
+    fs::create_dir(host.paths.at("/usr/local/bin/scupper.prev")).unwrap();
+    let digest = plan(&host, &gateway).plan_sha256;
+    let before = host.snapshot();
+    let (result, output) = switch(&host, &gateway, &RealFs, digest.as_str());
+    assert_eq!(result.unwrap(), SwitchOutcome::RefusedNoChange.exit_code());
+    assert!(output.contains("refused, nothing changed"));
+    assert!(!output.contains(model::RESTORE_COMMANDS));
+    assert_eq!(before, host.snapshot());
+    assert!(gateway.services.borrow().is_empty());
+}
+
+#[test]
+fn apply_precondition_refusal_reaches_gateway_without_recovery() {
+    let (host, gateway) = installed();
+    stage(&host, &gateway);
+    let digest = plan(&host, &gateway).plan_sha256;
+    let path = host.paths.at(model::SCUPPER_FILE);
+    let mut expected = host.snapshot();
+    expected.get_mut(&path).unwrap().0 = b"external change before apply".to_vec();
+    // Switch prepares once, then apply observes again under its own preconditions.
+    *gateway.change_on_observe.borrow_mut() = Some((path, 2));
+    let (result, output) = switch(&host, &gateway, &RealFs, digest.as_str());
+    assert_eq!(result.unwrap(), SwitchOutcome::RefusedNoChange.exit_code());
+    assert!(
+        output.contains("host changed since install was planned"),
+        "{output}"
+    );
+    assert!(output.contains("refused, nothing changed"));
+    assert!(!output.contains(model::RESTORE_COMMANDS));
+    assert_eq!(host.snapshot(), expected);
+    assert!(gateway.services.borrow().is_empty());
 }

@@ -10,11 +10,22 @@ use std::{
 
 const OUTPUT_CAP: u64 = 1024 * 1024;
 
+#[derive(Debug)]
+pub(crate) struct ProcessError {
+    pub(crate) reason: String,
+    pub(crate) started: bool,
+}
+impl std::fmt::Display for ProcessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
 pub(crate) fn execute(
     mut command: Command,
     input: &[u8],
     timeout: Duration,
-) -> Result<(u8, String), String> {
+) -> Result<crate::deploy::TransportOutput, ProcessError> {
     let started = Instant::now();
     let mut child = command
         .process_group(0)
@@ -22,7 +33,10 @@ pub(crate) fn execute(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| ProcessError {
+            reason: e.to_string(),
+            started: false,
+        })?;
     let result = (|| {
         let mut stdin = child.stdin.take();
         if let Some(pipe) = &stdin {
@@ -30,33 +44,7 @@ pub(crate) fn execute(
             rustix::fs::fcntl_setfl(pipe, flags | rustix::fs::OFlags::NONBLOCK)
                 .map_err(|e| e.to_string())?;
         }
-        let (sender, receiver) = mpsc::channel();
-        let stdout = child.stdout.take().ok_or("missing child stdout")?;
-        let stderr = child.stderr.take().ok_or("missing child stderr")?;
-        for (index, pipe) in [
-            (0, Box::new(stdout) as Box<dyn Read + Send>),
-            (1, Box::new(stderr) as Box<dyn Read + Send>),
-        ] {
-            let sender = sender.clone();
-            thread::Builder::new()
-                .name("deploy-output".into())
-                .spawn(move || {
-                    let mut bytes = Vec::new();
-                    let result = pipe
-                        .take(OUTPUT_CAP + 1)
-                        .read_to_end(&mut bytes)
-                        .map_err(|e| e.to_string())
-                        .and_then(|_| {
-                            if bytes.len() as u64 > OUTPUT_CAP {
-                                Err("child output exceeds limit".into())
-                            } else {
-                                Ok(String::from_utf8_lossy(&bytes).into_owned())
-                            }
-                        });
-                    let _ = sender.send((index, result));
-                })
-                .map_err(|e| e.to_string())?;
-        }
+        let receiver = spawn_output_readers(&mut child)?;
         let mut remaining = input;
         let mut streams = [None, None];
         loop {
@@ -93,10 +81,11 @@ pub(crate) fn execute(
                     .code()
                     .and_then(|c| u8::try_from(c).ok())
                     .unwrap_or(1);
-                if code != 0 {
-                    return Err(format!("child exited {code}\n{stdout}{stderr}"));
-                }
-                return Ok((code, std::mem::take(stdout)));
+                return Ok(crate::deploy::TransportOutput {
+                    code,
+                    stdout: std::mem::take(stdout),
+                    stderr: std::mem::take(stderr),
+                });
             }
             thread::sleep(Duration::from_millis(5).min(timeout.saturating_sub(started.elapsed())));
         }
@@ -112,7 +101,10 @@ pub(crate) fn execute(
                 let _ = child.wait();
             });
     }
-    result
+    result.map_err(|reason| ProcessError {
+        reason,
+        started: true,
+    })
 }
 
 #[cfg(test)]
@@ -129,8 +121,59 @@ mod tests {
             command.args(["-c", script]);
             let start = Instant::now();
             let error = execute(command, &input, Duration::from_millis(50)).unwrap_err();
-            assert!(error.contains("timed out"), "{error}");
+            assert!(error.reason.contains("timed out"), "{error}");
             assert!(start.elapsed() < Duration::from_secs(2));
         }
     }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod status_tests {
+    use super::*;
+    #[test]
+    fn nonzero_exit_preserves_status_and_both_streams() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf refusal; printf detail >&2; exit 20"]);
+        let result = execute(command, b"", Duration::from_secs(2)).unwrap();
+        assert_eq!(result.code, 20);
+        assert_eq!(result.stdout, "refusal");
+        assert_eq!(result.stderr, "detail");
+    }
+}
+
+type StreamResult = (usize, Result<String, String>);
+
+/// Read stdout and stderr on their own threads, each capped at `OUTPUT_CAP`.
+fn spawn_output_readers(
+    child: &mut std::process::Child,
+) -> Result<mpsc::Receiver<StreamResult>, String> {
+    let (sender, receiver) = mpsc::channel();
+    let stdout = child.stdout.take().ok_or("missing child stdout")?;
+    let stderr = child.stderr.take().ok_or("missing child stderr")?;
+    for (index, pipe) in [
+        (0, Box::new(stdout) as Box<dyn Read + Send>),
+        (1, Box::new(stderr) as Box<dyn Read + Send>),
+    ] {
+        let sender = sender.clone();
+        thread::Builder::new()
+            .name("deploy-output".into())
+            .spawn(move || {
+                let mut bytes = Vec::new();
+                let result = pipe
+                    .take(OUTPUT_CAP + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| e.to_string())
+                    .and_then(|_| {
+                        if bytes.len() as u64 > OUTPUT_CAP {
+                            Err("child output exceeds limit".into())
+                        } else {
+                            Ok(String::from_utf8_lossy(&bytes).into_owned())
+                        }
+                    });
+                let _ = sender.send((index, result));
+            })
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(receiver)
 }
