@@ -5,9 +5,39 @@ use std::{
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream, UdpSocket},
     path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
+
+// Stop between records: default SIGTERM can interrupt Display's individual
+// writes and leave an otherwise successfully reaped flow with truncated JSON.
+struct FlowStop {
+    requested: Arc<AtomicBool>,
+    registration: signal_hook::SigId,
+}
+impl FlowStop {
+    fn new() -> std::io::Result<Self> {
+        let requested = Arc::new(AtomicBool::new(false));
+        let registration =
+            signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&requested))?;
+        Ok(Self {
+            requested,
+            registration,
+        })
+    }
+    fn requested(&self) -> bool {
+        self.requested.load(Ordering::Relaxed)
+    }
+}
+impl Drop for FlowStop {
+    fn drop(&mut self) {
+        signal_hook::low_level::unregister(self.registration);
+    }
+}
 
 /// Run a lab stream for the requested seconds; log actual transmitted/received
 /// bytes so each fault case can prove that its established-flow control worked.
@@ -15,12 +45,13 @@ use std::{
 /// # Errors
 /// Returns invalid mode, setup, or evidence-write errors.
 pub fn flow(mode: &str, address: SocketAddr, marker: &str, log: &Path, seconds: u64) -> Result<()> {
+    let stop = FlowStop::new()?;
     let mut log = OpenOptions::new().create(true).append(true).open(log)?;
     if mode == "connect" {
         return connect_canary(address, marker, &mut log, seconds);
     }
     if mode == "heartbeat-sink" {
-        return heartbeat_sink(address, &mut log, seconds);
+        return heartbeat_sink(address, &mut log, seconds, &stop);
     }
     let start = Instant::now();
     let payload = format!("{marker}\n");
@@ -30,6 +61,9 @@ pub fn flow(mode: &str, address: SocketAddr, marker: &str, log: &Path, seconds: 
             listener.set_nonblocking(true)?;
             let mut accepted = None;
             while start.elapsed() < Duration::from_secs(10) {
+                if stop.requested() {
+                    return Ok(());
+                }
                 if let Ok((stream, _)) = listener.accept() {
                     accepted = Some(stream);
                     break;
@@ -58,7 +92,7 @@ pub fn flow(mode: &str, address: SocketAddr, marker: &str, log: &Path, seconds: 
     }
     let local = udp.as_ref().map(UdpSocket::local_addr).transpose()?;
     let mut buffer = [0; 1024];
-    while start.elapsed() < Duration::from_secs(seconds) {
+    while !stop.requested() && start.elapsed() < Duration::from_secs(seconds) {
         let (sent, received) = if let Some(stream) = &mut tcp {
             (
                 stream.write(payload.as_bytes()).unwrap_or(0),
@@ -114,11 +148,16 @@ fn connect_canary(
 
 // A TCP observer only: records ClientHello receipt, never terminates TLS or
 // decrypts a request, and needs no lab certificate in the delivery binary.
-fn heartbeat_sink(address: SocketAddr, log: &mut std::fs::File, seconds: u64) -> Result<()> {
+fn heartbeat_sink(
+    address: SocketAddr,
+    log: &mut std::fs::File,
+    seconds: u64,
+    stop: &FlowStop,
+) -> Result<()> {
     let listener = TcpListener::bind(address)?;
     listener.set_nonblocking(true)?;
     let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(seconds) {
+    while !stop.requested() && start.elapsed() < Duration::from_secs(seconds) {
         if let Ok((mut stream, peer)) = listener.accept() {
             stream.set_read_timeout(Some(Duration::from_millis(250)))?;
             let mut bytes = [0; 4096];

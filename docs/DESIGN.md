@@ -1688,6 +1688,16 @@ and elapsed age. Check reports `Degraded::OperationInProgress` (3) during this
 transition, including rollback, without comparing the kernel to the version
 being published in state.json. This is an availability indication; no topology
 verdict is asserted until the transition publishes its attached snapshot.
+The initial Ping and Check (including one retry after SupervisorUnavailable)
+share one absolute 5 s deadline established before the initial Ping. The Ping
+itself is capped at 2 s; its elapsed time reduces the remaining Check budget.
+After an explicit Check error, a fresh Ping receives its own fixed 500 ms
+allowance, even when the shared deadline has expired. No Check retry starts
+after that deadline. After a local violation, the transition Ping likewise gets
+500 ms; namespace retries reuse that Ping deadline rather than renewing it.
+The fallback bound is 5 s plus one local check, a second local check if a
+namespace retry is needed (at most two local checks total), and at most 1 s for
+these two Ping allowances.
 Only a Check with no reply before its deadline retains the first Ping's age
 for stage 8. Explicit refusal, EOF or SupervisorUnavailable uses a fresh Ping,
 with an unavailable supervisor treated as Dead.

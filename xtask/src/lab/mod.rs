@@ -95,6 +95,34 @@ fn add_second_client(
 struct Capture {
     process: Group,
     stderr: PathBuf,
+    namespace: String,
+    interface: String,
+}
+
+fn capture_invocation(ns: &str, iface: &str, pcap: &Path) -> Result<Invocation> {
+    // The oracle classifies both directions, including replies and link control.
+    // Keep every frame: neither a direction selector nor a BPF filter is safe.
+    // Retain main's immediate delivery for low-rate controls as well as -U's
+    // packet-buffered file writes; only enlarge the socket buffer.
+    Ok(Invocation::new(
+        ns,
+        "tcpdump",
+        &[
+            "-n",
+            "-Z",
+            "root",
+            "-B",
+            "16384",
+            "-U",
+            "--immediate-mode",
+            "-s",
+            "0",
+            "-i",
+            iface,
+            "-w",
+            pcap.to_str().ok_or("non-UTF8 artifact path")?,
+        ],
+    ))
 }
 
 struct Lab {
@@ -664,27 +692,25 @@ impl Lab {
         Ok(())
     }
     fn capture(&mut self, ns: &str, iface: &str, stem: &str) -> Result<()> {
+        if self
+            .captures
+            .iter()
+            .any(|capture| capture.namespace == ns && capture.interface == iface)
+        {
+            return fail(format!(
+                "capture harness error: duplicate active capture on {ns}/{iface}"
+            ));
+        }
         let pcap = self.artifacts.join(format!("{stem}.pcap"));
         let log = self.artifacts.join(format!("{stem}.tcpdump.stdout"));
-        let args = vec![
-            "-n",
-            "-Z",
-            "root",
-            "-U",
-            "--immediate-mode",
-            "-s",
-            "0",
-            "-i",
-            iface,
-            "-w",
-            pcap.to_str().ok_or("non-UTF8 artifact path")?,
-        ];
         let group = self
             .runner
-            .background(&Invocation::new(ns, "tcpdump", &args), &log)?;
+            .background(&capture_invocation(ns, iface, &pcap)?, &log)?;
         self.captures.push(Capture {
             process: group,
             stderr: log.with_extension("stderr"),
+            namespace: ns.into(),
+            interface: iface.into(),
         });
         let until = Instant::now() + Duration::from_secs(5);
         loop {
@@ -701,6 +727,9 @@ impl Lab {
         }
         self.runner.dwell(Duration::from_secs(1))?;
         Ok(())
+    }
+    fn capture_uplink(&mut self, stem: &str) -> Result<()> {
+        self.capture("wan", A.gwhost.wan_if, stem)
     }
     fn stop_capture(&mut self) -> Result<()> {
         let mut capture = self.captures.pop().ok_or("missing capture process")?;

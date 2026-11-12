@@ -528,20 +528,17 @@ fn dispatch(
         Command::Repair { command } => control::repair(deps, command, json, stdout, stderr),
         Command::Status | Command::Check => {
             let status = matches!(command, Command::Status);
-            let (supervisor, version) = match control::read(deps, status, json, stdout, stderr)? {
+            let local = match control::read(deps, status, json, stdout, stderr)? {
                 control::ReadOutcome::Rendered(code) => return Ok(code),
-                control::ReadOutcome::Local {
-                    supervisor,
-                    version,
-                } => (supervisor, version),
+                control::ReadOutcome::Local(local) => local,
             };
-            let config = match m2_config_at(deps, version) {
+            let config = match m2_config_at(deps, local.version) {
                 Ok(Some(config)) => config,
                 Ok(None) => return Err("not an M2 gateway (no /var/lib/scupper store)".into()),
                 Err(error) if status => return status_error(stdout, json, &error),
                 Err(error) => return Err(error),
             };
-            m2_check(deps, &config, status, json, supervisor, stdout, stderr)
+            m2_check(deps, &config, status, json, local, stdout, stderr)
         }
         Command::Alerts { command } => alerts::run(command, deps, json, stdout),
         Command::Config { command } => config::run(command, deps, stdout),
@@ -662,13 +659,13 @@ fn m2_check(
     config: &AppliedConfig,
     status: bool,
     json: bool,
-    supervisor: scupper_core::verdict::v2::Supervisor,
+    mut local: control::LocalRead,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<u8, String> {
     let mut refreshed_config = None;
-    let mut supervisor = supervisor;
     loop {
+        let supervisor = local.supervisor;
         let config = refreshed_config.as_ref().unwrap_or(config);
         let handle = match deps.namespaces.open_gateway() {
             Ok(handle) => handle,
@@ -721,7 +718,7 @@ fn m2_check(
                     && let Some(outcome) = control::transition_after_observation(
                         deps,
                         config.stamp.version,
-                        supervisor,
+                        &local,
                         json,
                         stdout,
                         stderr,
@@ -729,18 +726,15 @@ fn m2_check(
                 {
                     match outcome {
                         control::ReadOutcome::Rendered(code) => return Ok(code),
-                        control::ReadOutcome::Local {
-                            supervisor: fresh,
-                            version,
-                        } if refreshed_config.is_none() => {
+                        control::ReadOutcome::Local(fresh) if refreshed_config.is_none() => {
                             refreshed_config = Some(
-                                m2_config_at(deps, version)?
+                                m2_config_at(deps, fresh.version)?
                                     .ok_or("not an M2 gateway (no /var/lib/scupper store)")?,
                             );
-                            supervisor = fresh;
+                            local = fresh;
                             continue;
                         }
-                        control::ReadOutcome::Local { .. } => {}
+                        control::ReadOutcome::Local(_) => {}
                     }
                 }
                 if json {
