@@ -22,6 +22,9 @@ pub enum Failure {
     /// Valid HTTP response with a non-success status.
     #[error("heartbeat HTTP non-2xx")]
     Http,
+    /// A permanently rejected alert request.
+    #[error("alert HTTP permanent rejection")]
+    Permanent,
     /// Deadline elapsed or transport timed out.
     #[error("heartbeat timeout or deadline")]
     Deadline,
@@ -61,6 +64,7 @@ impl Failure {
     #[must_use]
     pub fn exit_code(self) -> u8 {
         match self {
+            Self::Permanent => 32,
             Self::Http => 20,
             Self::Deadline => 21,
             Self::Internal => 22,
@@ -98,6 +102,10 @@ impl SecretUrl {
 pub struct Request {
     url: String,
     deadline_ns: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    payload: Option<scupper_core::alerts::Payload>,
+    #[serde(default)]
+    form_credentials: bool,
     #[cfg(feature = "testing")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) test_hold: Option<std::path::PathBuf>,
@@ -105,6 +113,9 @@ pub struct Request {
 impl Drop for Request {
     fn drop(&mut self) {
         self.url.zeroize();
+        if let Some(payload) = &mut self.payload {
+            payload.body.zeroize();
+        }
     }
 }
 impl fmt::Debug for Request {
@@ -128,6 +139,8 @@ impl Request {
         Ok(Self {
             url: url.into(),
             deadline_ns,
+            payload: None,
+            form_credentials: false,
             #[cfg(feature = "testing")]
             test_hold: None,
         })
@@ -146,6 +159,9 @@ impl Request {
         }
         let request: Self = serde_json::from_slice(&bytes).map_err(|_| Failure::Internal)?;
         Self::new(&request.url, request.deadline_ns)?;
+        if request.payload.as_ref().is_some_and(|p| !valid_payload(p)) {
+            return Err(Failure::Internal);
+        }
         Ok(request)
     }
     /// Serialize secret bytes for stdin only.
@@ -155,6 +171,70 @@ impl Request {
         serde_json::to_vec(self)
             .map(Zeroizing::new)
             .map_err(|_| Failure::Internal)
+    }
+    /// Construct one bounded POST request with a safe rendered entity.
+    /// # Errors
+    /// Rejects invalid URLs, deadlines or payload headers.
+    pub fn alert(
+        url: &str,
+        deadline_ns: u64,
+        payload: scupper_core::alerts::Payload,
+    ) -> Result<Self, Failure> {
+        if !valid_payload(&payload) {
+            return Err(Failure::Internal);
+        }
+        let mut request = Self::new(url, deadline_ns)?;
+        request.payload = Some(payload);
+        Ok(request)
+    }
+    /// Move Pushover URL credentials into the POST body inside the exec child only.
+    #[must_use]
+    pub fn pushover(mut self) -> Self {
+        self.form_credentials = true;
+        self
+    }
+    fn prepare_credentials(&mut self) -> Result<(), Failure> {
+        if !self.form_credentials {
+            return Ok(());
+        }
+        let (base, query) = self.url.split_once('?').ok_or(Failure::Secret)?;
+        let mut credentials = std::collections::BTreeMap::new();
+        for pair in query.split('&') {
+            let (key, value) = pair.split_once('=').ok_or(Failure::Secret)?;
+            if !matches!(key, "token" | "user")
+                || value.is_empty()
+                || credentials.insert(key, value).is_some()
+            {
+                return Err(Failure::Secret);
+            }
+        }
+        if credentials.len() != 2 {
+            return Err(Failure::Secret);
+        }
+        let payload = self.payload.as_mut().ok_or(Failure::Internal)?;
+        let fields: serde_json::Value =
+            serde_json::from_str(&payload.body).map_err(|_| Failure::Internal)?;
+        let mut body = Zeroizing::new(format!(
+            "token={}&user={}",
+            credentials["token"], credentials["user"]
+        ));
+        for key in ["title", "message", "priority"] {
+            let field = fields.get(key).ok_or(Failure::Internal)?;
+            let value = field
+                .as_str()
+                .map_or_else(|| field.to_string(), str::to_owned);
+            body.push('&');
+            body.push_str(key);
+            body.push('=');
+            body.push_str(&form_encode(&value));
+        }
+        let base = base.to_owned();
+        self.url.zeroize();
+        self.url = base;
+        payload.body.zeroize();
+        payload.body = body.to_string();
+        payload.content_type = "application/x-www-form-urlencoded".into();
+        Ok(())
     }
     fn deadline(&self) -> Result<Instant, Failure> {
         let remaining = self
@@ -187,6 +267,15 @@ pub fn monotonic_ns() -> u64 {
 /// # Errors
 /// All failures are closed, value-free categories.
 pub fn child(input: impl Read) -> Result<(), Failure> {
+    child_for(input, false)
+}
+/// Reads a bounded alert stdin request and performs exactly one HTTPS POST.
+/// # Errors
+/// Returns only value-free setup, protocol and delivery categories.
+pub fn alert_child(input: impl Read) -> Result<(), Failure> {
+    child_for(input, true)
+}
+fn child_for(input: impl Read, alert: bool) -> Result<(), Failure> {
     if rustix::process::geteuid().is_root() || rustix::process::getegid().is_root() {
         return Err(Failure::Account);
     }
@@ -201,7 +290,11 @@ pub fn child(input: impl Read) -> Result<(), Failure> {
     rustix::thread::set_no_new_privs(true).map_err(|_| Failure::Internal)?;
     rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
         .map_err(|_| Failure::Internal)?;
-    let request = Request::read(input)?;
+    let mut request = Request::read(input)?;
+    if request.payload.is_some() != alert {
+        return Err(Failure::Internal);
+    }
+    request.prepare_credentials()?;
     let deadline = request.deadline()?;
     let credentials = std::fs::read_to_string("/proc/self/status").map_err(|_| Failure::Account)?;
     verify_credentials(&credentials)?;
@@ -281,10 +374,20 @@ fn deliver(request: &Request) -> Result<(), Failure> {
         }
         Ok(())
     };
-    let bytes =
-        probe::linux::exchange_status_socket(socket, &target, address, deadline, &before_request)
-            .map_err(|error| transport_failure(&error))?;
-    status(&bytes)
+    let bytes = probe::linux::exchange_delivery_socket(
+        socket,
+        &target,
+        address,
+        deadline,
+        &before_request,
+        request.payload.as_ref(),
+    )
+    .map_err(|error| transport_failure(&error))?;
+    if request.payload.is_some() {
+        alert_status(&bytes)
+    } else {
+        status(&bytes)
+    }
 }
 fn transport_failure(error: &crate::verdict::ProbeError) -> Failure {
     match error {
@@ -340,6 +443,49 @@ fn resolve_before<T: Send + 'static>(
             std::sync::mpsc::RecvTimeoutError::Timeout => Failure::Deadline,
             std::sync::mpsc::RecvTimeoutError::Disconnected => Failure::Internal,
         })?
+}
+
+fn form_encode(value: &str) -> String {
+    use std::fmt::Write;
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+            encoded.push(char::from(byte));
+        } else {
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+fn valid_payload(payload: &scupper_core::alerts::Payload) -> bool {
+    payload.body.len() <= 16384
+        && matches!(
+            payload.content_type.as_str(),
+            "application/json" | "text/plain; charset=utf-8"
+        )
+        && payload.headers.iter().all(|(name, value)| {
+            matches!(name.as_str(), "Title" | "Priority")
+                && value.len() <= 128
+                && value.bytes().all(|b| (32..127).contains(&b))
+        })
+}
+fn alert_status(bytes: &[u8]) -> Result<(), Failure> {
+    let line = bytes.split(|b| *b == b'\r').next().ok_or(Failure::Http)?;
+    if line.len() < 12
+        || !matches!(&line[..9], b"HTTP/1.1 " | b"HTTP/1.0 ")
+        || !line[9..12].iter().all(u8::is_ascii_digit)
+        || (line.len() > 12 && line[12] != b' ')
+    {
+        return Err(Failure::Http);
+    }
+    let code = u16::from(line[9] - b'0') * 100
+        + u16::from(line[10] - b'0') * 10
+        + u16::from(line[11] - b'0');
+    scupper_core::alerts::http_status(code).map_err(|e| match e {
+        scupper_core::alerts::SinkError::Permanent => Failure::Permanent,
+        scupper_core::alerts::SinkError::Transient => Failure::Http,
+        _ => Failure::Internal,
+    })
 }
 
 fn status(bytes: &[u8]) -> Result<(), Failure> {
@@ -401,18 +547,13 @@ pub fn resolve(
 /// # Errors
 /// Returns only value-free failures, never process or parser error text.
 pub fn attempt(binary: &Path, request: &Request, identity: ProbeIdentity) -> Result<(), Failure> {
-    use std::os::unix::process::CommandExt;
     if [identity.uid, identity.gid]
         .iter()
         .any(|id| *id == 0 || *id == u32::MAX)
     {
         return Err(Failure::Account);
     }
-    let mut command = std::process::Command::new(binary);
-    command
-        .args(["deliver", "heartbeat"])
-        .uid(identity.uid)
-        .gid(identity.gid);
+    let command = delivery_command(binary, request, identity);
     let input = request.encode()?;
     let timeout = request
         .deadline()?
@@ -429,9 +570,34 @@ pub fn attempt(binary: &Path, request: &Request, identity: ProbeIdentity) -> Res
     }
     child_status(output.status)
 }
+fn delivery_command(
+    binary: &Path,
+    request: &Request,
+    identity: ProbeIdentity,
+) -> std::process::Command {
+    use std::os::unix::process::CommandExt;
+    let mut command = std::process::Command::new(binary);
+    command
+        .args([
+            "deliver",
+            if request.payload.is_some() {
+                "alert"
+            } else {
+                "heartbeat"
+            },
+        ])
+        .uid(identity.uid)
+        .gid(identity.gid);
+    command
+        .env_clear()
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .env("LC_ALL", "C");
+    command
+}
 fn child_status(status: Option<i32>) -> Result<(), Failure> {
     match status {
         Some(0) => Ok(()),
+        Some(32) => Err(Failure::Permanent),
         Some(20) => Err(Failure::Http),
         Some(21) => Err(Failure::Deadline),
         Some(23) => Err(Failure::Account),
@@ -699,6 +865,110 @@ mod tests {
             b"HTTP/1.1 2xx",
         ] {
             assert_eq!(status(bytes), Err(Failure::Http));
+        }
+    }
+}
+
+#[cfg(test)]
+mod alert_tests {
+    use super::*;
+    #[test]
+    fn alert_http_classes_and_redacted_protocol() {
+        assert_eq!(alert_status(b"HTTP/1.1 200 OK\r\n"), Ok(()));
+        for code in [400, 401, 403, 404, 302] {
+            assert_eq!(
+                alert_status(format!("HTTP/1.1 {code} rejected\r\n").as_bytes()),
+                Err(Failure::Permanent)
+            );
+        }
+        for code in [408, 429, 500, 503] {
+            assert_eq!(
+                alert_status(format!("HTTP/1.1 {code} retry\r\n").as_bytes()),
+                Err(Failure::Http)
+            );
+        }
+        assert_eq!(
+            child_status(Some(i32::from(Failure::Permanent.exit_code()))),
+            Err(Failure::Permanent)
+        );
+        let request = Request::alert(
+            "https://fixture.invalid/private-token",
+            0,
+            scupper_core::alerts::Payload {
+                content_type: "application/json".into(),
+                headers: std::collections::BTreeMap::new(),
+                body: "{}".into(),
+            },
+        );
+        assert!(request.is_ok());
+        assert!(!format!("{request:?}").contains("private-token"));
+        assert_eq!(alert_status(b"private-secret"), Err(Failure::Http));
+    }
+    #[test]
+    fn pushover_credentials_move_only_inside_child_and_invalid_credentials_fail_closed() {
+        use scupper_core::{
+            alerts::{OperationalEvent, map, render},
+            config::AlertSink,
+        };
+        let settings: AlertSink = serde_json::from_value(serde_json::json!({"kind":"webhook","preset":"pushover","min_severity":"info","url_ref":"fixture"})).unwrap();
+        let alert = map(OperationalEvent::FailClosedEnded(17), 42, 100);
+        let mut request = Request::alert(
+            "https://fixture.invalid/messages?token=fixture-token&user=fixture-user",
+            monotonic_ns() + 10_000_000_000,
+            render(&settings, &alert),
+        )
+        .unwrap()
+        .pushover();
+        let mut protocol = serde_json::to_value(&request).unwrap();
+        protocol.as_object_mut().unwrap().remove("url");
+        for forbidden in ["fixture-token", "fixture-user"] {
+            assert!(!protocol.to_string().contains(forbidden));
+            assert!(!format!("{request:?}").contains(forbidden));
+        }
+        request.prepare_credentials().unwrap();
+        assert_eq!(request.url, "https://fixture.invalid/messages");
+        let payload = request.payload.as_ref().unwrap();
+        assert_eq!(payload.content_type, "application/x-www-form-urlencoded");
+        assert!(
+            payload
+                .body
+                .starts_with("token=fixture-token&user=fixture-user&title=")
+        );
+        assert!(payload.body.ends_with("&priority=0"));
+        assert_eq!(form_encode("hello &="), "hello%20%26%3D");
+        for query in [
+            "token=fixture",
+            "token=&user=fixture",
+            "token=a&token=b&user=c",
+            "token=a&user=b&extra=c",
+        ] {
+            let mut request = Request::alert(
+                &format!("https://fixture.invalid/messages?{query}"),
+                monotonic_ns() + 10_000_000_000,
+                render(&settings, &alert),
+            )
+            .unwrap()
+            .pushover();
+            assert_eq!(request.prepare_credentials(), Err(Failure::Secret));
+        }
+    }
+    proptest::proptest! {
+        #[test]
+        fn alert_protocol_excludes_injected_strings_outside_secret_url(suffix in "[a-z]{16,24}") {
+            use scupper_core::{alerts::{map, render, OperationalEvent}, config::AlertSink};
+            let secret = format!("secret-{suffix}");
+            for preset in ["generic", "telegram", "pushover", "ntfy"] {
+                let value = if preset=="ntfy" { serde_json::json!({"kind":"ntfy","url_ref":secret,"min_severity":"info"}) } else { serde_json::json!({"kind":"webhook","preset":preset,"url_ref":secret,"min_severity":"info"}) };
+                let settings: AlertSink = serde_json::from_value(value).unwrap();
+                let request = Request::alert(&format!("https://fixture.invalid/{secret}"), monotonic_ns()+10_000_000_000, render(&settings, &map(OperationalEvent::FailClosedStarted, 1, 100))).unwrap();
+                let mut wire = serde_json::to_value(&request).unwrap(); wire.as_object_mut().unwrap().remove("url");
+                let command = delivery_command(Path::new("/fixture/scupper"), &request, ProbeIdentity { uid:99, gid:98 });
+                let process = format!("{:?} {:?}", command.get_args().collect::<Vec<_>>(), command.get_envs().collect::<Vec<_>>());
+                proptest::prop_assert!(!process.contains(&secret));
+                proptest::prop_assert!(!wire.to_string().contains(&secret));
+                let debug = format!("{request:?}");
+                proptest::prop_assert!(!debug.contains(&secret));
+            }
         }
     }
 }

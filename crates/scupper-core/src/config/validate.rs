@@ -178,6 +178,11 @@ pub fn validate(cfg: SiteConfig) -> Result<ValidatedSite, Vec<ValidationError>> 
     }
     errors.duration(&cfg.policy.failback_hold, "policy.failback_hold");
     errors.duration(&cfg.policy.min_dwell, "policy.min_dwell");
+    errors.check(
+        (30..=300).contains(&cfg.policy.initial_qualification_seconds),
+        "policy.initial_qualification_seconds",
+        Rule::InvalidInitialQualification,
+    );
     health(&cfg, &mut errors);
     devices(&cfg, &mut errors);
     for (id, sink) in &cfg.alerts.sinks {

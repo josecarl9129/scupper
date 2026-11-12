@@ -119,7 +119,7 @@ jobs:
       - name: Verify testing hooks absent from release artifacts
         run: |
           for binary in scupper scupperd; do
-            if grep -aEq 'SCUPPER_TEST_BOOT_POINT|SCUPPER_TEST_CA_DER|SCUPPER_LAB_MUTATION|injected boot stop' target/release/$binary; then
+            if grep -aEq 'SCUPPER_TEST_BOOT_POINT|SCUPPER_TEST_CA_DER|SCUPPER_TEST_ALERT_WINDOW_SECONDS|SCUPPER_LAB_MUTATION|injected boot stop' target/release/$binary; then
               echo "testing hook found in release $binary"
               exit 1
             fi
@@ -164,7 +164,7 @@ jobs:
           printf '%s\n' "$description"
           [[ "$description" == *'ELF 64-bit LSB'* && "$description" == *'x86-64'* ]]
           [[ "$description" == *'statically linked'* || "$description" == *'static-pie linked'* ]]
-            if grep -aEq 'SCUPPER_TEST_BOOT_POINT|SCUPPER_TEST_CA_DER|SCUPPER_LAB_MUTATION|injected boot stop' target/x86_64-unknown-linux-musl/release/$binary; then
+            if grep -aEq 'SCUPPER_TEST_BOOT_POINT|SCUPPER_TEST_CA_DER|SCUPPER_TEST_ALERT_WINDOW_SECONDS|SCUPPER_LAB_MUTATION|injected boot stop' target/x86_64-unknown-linux-musl/release/$binary; then
               echo "testing hook found in musl $binary"
               exit 1
             fi
@@ -199,7 +199,7 @@ jobs:
         run: |
           # conntrack is required by boot when rebuilding an existing namespace.
           sudo timeout 300 apt-get update
-          sudo timeout 300 apt-get install -y wireguard-tools nftables iproute2 tcpdump dnsmasq-base util-linux iputils-ping conntrack slirp4netns openssl
+          sudo timeout 300 apt-get install -y wireguard-tools nftables iproute2 tcpdump dnsmasq-base util-linux iputils-ping conntrack slirp4netns openssl python3
 
       - name: Check shard budget using built-in duration estimates
         run: timeout 600 cargo test -p xtask --lib ci_shard_budget_uses_builtin_estimates_and_rejects_over_budget --locked
@@ -253,7 +253,7 @@ jobs:
       - name: Install lab tools
         run: |
           sudo timeout 300 apt-get update
-          sudo timeout 300 apt-get install -y wireguard-tools nftables iproute2 tcpdump dnsmasq-base util-linux iputils-ping conntrack slirp4netns openssl
+          sudo timeout 300 apt-get install -y wireguard-tools nftables iproute2 tcpdump dnsmasq-base util-linux iputils-ping conntrack slirp4netns openssl python3
       - name: Build mutation lab and testing binaries
         run: |
           timeout 600 cargo build -p xtask --features lab-mutation --locked

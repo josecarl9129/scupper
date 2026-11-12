@@ -21,6 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod alerts;
 mod control_cases;
 mod heartbeat;
 mod m2_cases;
@@ -30,7 +31,7 @@ pub(super) fn short_boot_root(case: &str) -> std::path::PathBuf {
     Path::new("/run/scupper-lab").join(format!("{}-{case}", std::process::id()))
 }
 
-pub(super) const CASES: [&str; 31] = [
+pub(super) const CASES: [&str; 32] = [
     "L1",
     "L2",
     "L5",
@@ -57,6 +58,7 @@ pub(super) const CASES: [&str; 31] = [
     "L53",
     "L53b",
     "heartbeat",
+    "alerts",
     "L14",
     "L43",
     "L44",
@@ -281,6 +283,9 @@ struct DaemonGuard<'a> {
 impl DaemonGuard<'_> {
     #[allow(clippy::too_many_lines)] // Keep start/restart continuity and fault cleanup ordering together.
     fn run(&mut self, case: &str) -> Result<String> {
+        if case == "alerts" {
+            return self.run_alerts();
+        }
         if matches!(case, "L53" | "L53b" | "heartbeat") {
             return self.run_heartbeat(case);
         }
@@ -1015,7 +1020,7 @@ impl Lab {
     fn daemon_spawn(&mut self, case: &str, root: &Path, stage: &str) -> Result<Group> {
         // Unlike root-started probes, heartbeat exec happens after uid/gid drop.
         // Neither executable may require traversal through a runner's home.
-        let daemon = if matches!(case, "L10" | "L53" | "L53b" | "heartbeat") {
+        let daemon = if matches!(case, "L10" | "L53" | "L53b" | "heartbeat" | "alerts") {
             self.heartbeat_binaries()?
         } else {
             Self::boot_binary()?.with_file_name("scupperd")
@@ -1031,7 +1036,19 @@ impl Lab {
                 root.to_str().ok_or("root path")?,
             ],
         );
-        if matches!(case, "L10" | "L53" | "L53b" | "heartbeat") {
+        if case == "alerts" {
+            // `Invocation::new` with a namespace prepends nsenter options, so insert the
+            // assignment right after NOTIFY_SOCKET (an `env` argument), never at a fixed index.
+            let at = invocation
+                .args
+                .iter()
+                .position(|arg| *arg == env)
+                .ok_or("NOTIFY_SOCKET argument missing")?;
+            invocation
+                .args
+                .insert(at + 1, "SCUPPER_TEST_ALERT_WINDOW_SECONDS=120".into());
+        }
+        if matches!(case, "L10" | "L53" | "L53b" | "heartbeat" | "alerts") {
             // Apply the existing executable overlay first, then carry the
             // copied host accounts and fixture hosts into the daemon and its children.
             if let Some(fixture) = &self.runner.wg_fixture {
@@ -1160,7 +1177,25 @@ impl Lab {
         port: u16,
         seconds: u64,
     ) -> Result<Group> {
-        let address = format!("{}:{port}", A.internet.peer);
+        self.daemon_flow_to(
+            mode,
+            ns,
+            marker,
+            stem,
+            &format!("{}:{port}", A.internet.peer),
+            seconds,
+        )
+    }
+    #[allow(clippy::too_many_arguments)] // Explicit endpoint keeps canary destinations reviewable.
+    fn daemon_flow_to(
+        &mut self,
+        mode: &str,
+        ns: &str,
+        marker: &str,
+        stem: &str,
+        address: &str,
+        seconds: u64,
+    ) -> Result<Group> {
         self.runner.background(
             &Invocation::new(
                 ns,
@@ -1172,7 +1207,7 @@ impl Lab {
                     "--seconds",
                     &seconds.to_string(),
                     "--address",
-                    &address,
+                    address,
                     "--marker",
                     marker,
                     "--log",
@@ -1516,8 +1551,11 @@ impl Lab {
         new_port: u16,
     ) -> Result<()> {
         let mut text = evidence::policy_for_case(markers, false, old_port, stem == "daemon-L11")?;
-        if stem.contains("heartbeat") || stem == "control-L10" {
+        if stem.contains("heartbeat") || stem == "control-L10" || stem == "alerts" {
             text = format!("heartbeat = \"{}:443\"\n{text}", heartbeat::ENDPOINT);
+        }
+        if stem == "alerts" {
+            text = format!("heartbeat_dscp = 56\n{text}");
         }
         let combined: Vec<_> = markers.iter().chain(&self.fault_markers).collect();
         text = text
@@ -2124,6 +2162,9 @@ pub(super) fn daemon_wanted(case: &str) -> &'static str {
         }
         "L53b" => {
             "stopped child remains alive past deadline; blocked GET never retransmits after drop removal"
+        }
+        "alerts" => {
+            "Critical uplink delivery, resolved duration, ordered backlog/restart, Warning coalescing and CLI test"
         }
         "heartbeat" => {
             "healthy cadence control, failing ok_only suppression, parent status suffix evidence /0, /3, /4 (resolve unit test covers request path)"

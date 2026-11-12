@@ -126,6 +126,7 @@ fn fields(shape: &str) -> &'static [(&'static str, &'static str)] {
             ("failback_hold", ""),
             ("min_dwell", ""),
             ("standby", ""),
+            ("initial_qualification_seconds", ""),
         ],
         "health" => &[
             ("handshake_stale", ""),

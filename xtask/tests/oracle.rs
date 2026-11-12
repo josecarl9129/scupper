@@ -1673,3 +1673,17 @@ fn heartbeat_deadline_oracle_detects_application_data_without_client_hello() {
     let wrong_source = capture(101, &[ip4(CLIENT, PEER, 6, &tcp(40123, 443, application))]);
     assert!(xtask::pcap::heartbeat_payloads(&wrong_source, host, endpoint).is_err());
 }
+
+#[test]
+fn alert_identity_mark_rejects_client_syn_even_after_uplink_source_translation() {
+    let policy = Policy::from_toml(&format!(
+        "heartbeat = \"198.51.100.2:443\"\nheartbeat_dscp = 56\n{POLICY}"
+    ))
+    .unwrap();
+    let client_syn = ip4(LOCAL, PEER, 6, &tcp(40123, 443, b""));
+    let mut delivery_syn = client_syn.clone();
+    delivery_syn[1] = 56 << 2;
+    let report = classify(&capture(101, &[client_syn, delivery_syn]), &policy, 20).unwrap();
+    assert_eq!(report.packets[0].class, violation(Reason::NotAllowListed));
+    assert_eq!(report.packets[1].class, allowed("heartbeat"));
+}

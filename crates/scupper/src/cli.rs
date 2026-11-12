@@ -12,6 +12,7 @@ use crate::{
 };
 use clap::{Parser, Subcommand, error::ErrorKind};
 
+mod alerts;
 mod config;
 mod control;
 use config::ConfigCommand;
@@ -95,6 +96,11 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Inspect alert sinks or send a test notification.
+    Alerts {
+        #[command(subcommand)]
+        command: alerts::AlertsCommand,
+    },
     /// Print head's rendered namespace ruleset or compare it with live rules.
     Rules {
         /// Show a canonical diff against the live scupper namespace.
@@ -106,6 +112,7 @@ enum Command {
 #[derive(Clone, Subcommand)]
 enum DeliverCommand {
     Heartbeat,
+    Alert,
 }
 
 /// Namespace identity reader used before any canon command execution.
@@ -187,6 +194,34 @@ impl Privilege for EffectiveUid {
 pub trait Prompt {
     /// Whether input, preview output and prompt output are terminals.
     fn is_terminal(&self) -> bool;
+
+    /// Select an exact or uniquely matching configured sink on a terminal.
+    /// # Errors
+    /// Returns cancellation, ambiguity or input/output failures.
+    fn choose(&self, candidates: &[&str]) -> io::Result<String> {
+        if !self.is_terminal() || candidates.is_empty() {
+            return Err(io::Error::other("no interactive choices"));
+        }
+        let mut output = io::stderr();
+        writeln!(output, "Sinks: {}", candidates.join(", "))?;
+        write!(output, "Filter or exact sink: ")?;
+        output.flush()?;
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        let input = input.trim();
+        let exact = candidates.iter().find(|s| **s == input);
+        if let Some(name) = exact {
+            return Ok((*name).to_owned());
+        }
+        let matches: Vec<_> = candidates
+            .iter()
+            .filter(|s| !input.is_empty() && s.contains(input))
+            .collect();
+        match matches.as_slice() {
+            [name] => Ok((***name).to_owned()),
+            _ => Err(io::Error::other("sink filter must match one choice")),
+        }
+    }
 
     /// Shows the optional preview, then asks the question; the default is no.
     ///
@@ -439,6 +474,10 @@ fn dispatch(
             command: DeliverCommand::Heartbeat,
         } => Ok(scupper_sys::heartbeat::child(std::io::stdin().lock())
             .map_or_else(scupper_sys::heartbeat::Failure::exit_code, |()| 0)),
+        Command::Deliver {
+            command: DeliverCommand::Alert,
+        } => Ok(scupper_sys::heartbeat::alert_child(std::io::stdin().lock())
+            .map_or_else(scupper_sys::heartbeat::Failure::exit_code, |()| 0)),
         Command::Probe { request } => {
             let outcome = scupper_sys::probe_child::child_main(&request)?;
             serde_json::to_writer(&mut *stdout, &outcome).map_err(|error| error.to_string())?;
@@ -501,6 +540,7 @@ fn dispatch(
             };
             m2_check(deps, &config, status, json, local, stdout, stderr)
         }
+        Command::Alerts { command } => alerts::run(command, deps, json, stdout),
         Command::Config { command } => config::run(command, deps, stdout),
         Command::Rules { diff } => config::rules(deps, diff, stdout),
     }

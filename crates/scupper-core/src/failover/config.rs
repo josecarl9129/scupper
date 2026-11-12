@@ -18,6 +18,8 @@ pub struct FailoverConfig {
     pub min_dwell: Duration,
     /// Handshake ages strictly greater than this are hard Down.
     pub handshake_stale: Duration,
+    /// Initial qualification window for health exemptions and fail-closed paging.
+    pub initial_qualification: Duration,
     /// Reserved standby policy. Hot/cold bring-up and the 60 s qualifier are
     /// no-ops in M2, which validates one exit; M3 will supply those mechanics.
     /// Candidate selection remains correct for any number of observed exits.
@@ -61,6 +63,7 @@ impl FailoverConfig {
             min_dwell: interval(site.policy().min_dwell.duration())?,
             handshake_stale: site.health().handshake_stale(),
             standby: site.policy().standby,
+            initial_qualification: site.initial_qualification(),
         })
     }
 }

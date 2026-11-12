@@ -44,6 +44,8 @@ pub struct Failover {
     failback_suppressed_until: Option<MonoTime>,
     fail_closed_since: Option<MonoTime>,
     closed_reason: Option<FailClosedReason>,
+    closure_reported: bool,
+    qualifying: bool,
     signals: BTreeMap<ExitId, health::Signals>,
     last_activation: Option<MonoTime>,
 }
@@ -67,10 +69,17 @@ impl Failover {
             failback_suppressed_until: None,
             fail_closed_since: Some(now),
             closed_reason: None,
+            closure_reported: false,
+            qualifying: true,
             signals: BTreeMap::new(),
             last_activation: None,
         };
         machine.sync_config(cfg);
+        // Cold start can inherit SetExitsDown from the preceding process.
+        // Only the first ready link observation ends this initial allowance.
+        for signals in machine.signals.values_mut() {
+            signals.initial_link_pending = true;
+        }
         machine.closed_reason = Some(machine.unavailable_reason());
         let mut actions = vec![
             FailoverAction::SetRoute(RouteTarget::Unreachable),
@@ -106,6 +115,8 @@ impl Failover {
         }
         self.fail_closed_since = None;
         self.closed_reason = None;
+        self.closure_reported = false;
+        self.qualifying = false;
         self.last_activation = Some(now);
         true
     }
@@ -159,6 +170,16 @@ impl Failover {
     #[must_use]
     pub fn fail_closed_reason(&self) -> Option<&FailClosedReason> {
         self.closed_reason.as_ref()
+    }
+
+    /// Current alert state; qualification has no definitive incident state yet.
+    #[must_use]
+    pub fn fail_closed_alert_state(&self) -> Option<bool> {
+        if self.qualifying && !self.closure_reported && self.selection != Selection::Disconnected {
+            None
+        } else {
+            Some(self.closure_reported)
+        }
     }
 
     /// Advances the health diagrams and global transition table without side effects.
@@ -231,7 +252,15 @@ impl Failover {
 
     fn observe(&mut self, now: MonoTime, input: &FailoverInput, cfg: &FailoverConfig) {
         match input {
-            FailoverInput::SelectionChanged(selection) => self.selection = selection.clone(),
+            FailoverInput::SelectionChanged(selection) => {
+                if self.selection == Selection::Disconnected
+                    && *selection != Selection::Disconnected
+                {
+                    self.qualifying = true;
+                    self.fail_closed_since = Some(now);
+                }
+                self.selection = selection.clone();
+            }
             FailoverInput::Handshakes(ages) => {
                 for (id, age) in ages {
                     if let Some(signals) = self.signals.get_mut(id) {
@@ -242,15 +271,31 @@ impl Failover {
             FailoverInput::LinkState(id, link) => {
                 if let Some(signals) = self.signals.get_mut(id) {
                     signals.link = *link;
+                    if link.link_up && link.peer_present {
+                        signals.initial_link_pending = false;
+                    }
                 }
             }
             FailoverInput::PathProbe(_) | FailoverInput::ProbeRound(_) | FailoverInput::Tick => {}
         }
+        let qualification_age = self.fail_closed_since.map(|since| now.elapsed_since(since));
+        let initial_window = self.qualifying
+            && qualification_age.is_some_and(|age| age <= cfg.initial_qualification);
         for (id, signals) in &mut self.signals {
             let Some(state) = self.health.get_mut(id) else {
                 continue;
             };
             if let Some(reason) = signals.hard_fault(now, cfg.handshake_stale) {
+                let qualification_fault =
+                    signals.qualification_fault(now, reason, qualification_age);
+                // Link/peer absence before the first ready observation has unknown
+                // provenance. Stay Unknown and closed for the bounded allowance.
+                if initial_window && matches!(state, ExitHealth::Unknown) && qualification_fault {
+                    signals.initial_successes = 0;
+                    signals.probe = None;
+                    continue;
+                }
+                signals.non_qualification_fault = !qualification_fault;
                 health::down(state, now, reason);
                 signals.initial_successes = 0;
                 signals.probe = None;
@@ -331,9 +376,12 @@ impl Failover {
                 self.health
                     .values_mut()
                     .for_each(|state| *state = ExitHealth::Unknown);
-                self.signals
-                    .values_mut()
-                    .for_each(|signals| *signals = health::Signals::default());
+                self.signals.values_mut().for_each(|signals| {
+                    *signals = health::Signals {
+                        initial_link_pending: true,
+                        ..health::Signals::default()
+                    };
+                });
                 actions.extend([
                     FailoverAction::SetRoute(RouteTarget::Unreachable),
                     FailoverAction::FlushConntrack,
@@ -344,6 +392,7 @@ impl Failover {
             self.active_exit = None;
             self.fail_closed_since.get_or_insert(now);
             self.closed_reason = Some(FailClosedReason::AdminDisconnected);
+            self.closure_reported = false;
             return;
         }
         let previous = self.active_exit.clone();
@@ -398,8 +447,24 @@ impl Failover {
                     actions.extend([
                         FailoverAction::SetRoute(RouteTarget::Unreachable),
                         FailoverAction::FlushConntrack,
-                        FailoverAction::Emit(FailoverEvent::FailClosedStarted(reason.clone())),
                     ]);
+                }
+                let alertable = !self.qualifying
+                    || candidates.iter().all(|id| {
+                        matches!(self.health.get(*id), Some(ExitHealth::Down { .. }))
+                            && self
+                                .signals
+                                .get(*id)
+                                .is_some_and(|signals| signals.non_qualification_fault)
+                    })
+                    || self
+                        .fail_closed_since
+                        .is_some_and(|since| now.elapsed_since(since) > cfg.initial_qualification);
+                if !self.closure_reported && alertable {
+                    actions.push(FailoverAction::Emit(FailoverEvent::FailClosedStarted(
+                        reason.clone(),
+                    )));
+                    self.closure_reported = true;
                 }
                 self.active = RouteTarget::Unreachable;
                 self.active_exit = None;
@@ -467,6 +532,9 @@ impl Failover {
         self.active_exit = Some(to.clone());
         self.last_activation = Some(now);
         self.closed_reason = None;
+        let was_reported = self.closure_reported;
+        self.closure_reported = false;
+        self.qualifying = false;
         actions.push(FailoverAction::SetRoute(self.active.clone()));
         if let Some(from) = from {
             actions.push(FailoverAction::FlushConntrack);
@@ -489,7 +557,7 @@ impl Failover {
             }
         } else {
             actions.push(FailoverAction::NotifyEdge(to.clone()));
-            if let Some(since) = self.fail_closed_since {
+            if let Some(since) = self.fail_closed_since.filter(|_| was_reported) {
                 actions.push(FailoverAction::Emit(FailoverEvent::FailClosedEnded {
                     duration: now.elapsed_since(since),
                 }));

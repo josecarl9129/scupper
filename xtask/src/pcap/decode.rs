@@ -85,6 +85,7 @@ pub(super) struct Ip<'a> {
     pub fragment: Option<Fragment>,
     pub truncated: bool,
     pub hop_limit: u8,
+    pub dscp: u8,
 }
 
 pub(super) fn ip(data: &[u8], quoted: bool) -> Parsed<Ip<'_>> {
@@ -137,6 +138,7 @@ fn ipv4(data: &[u8], quoted: bool) -> Parsed<Ip<'_>> {
         fragment,
         truncated: !quoted && total > data.len(),
         hop_limit: header[8],
+        dscp: header[1] >> 2,
     })
 }
 
@@ -186,6 +188,7 @@ fn ipv6(data: &[u8], quoted: bool) -> Parsed<Ip<'_>> {
         fragment,
         truncated: !quoted && total > data.len(),
         hop_limit: h[7],
+        dscp: ((h[0] & 15) << 2) | (h[1] >> 6),
     })
 }
 

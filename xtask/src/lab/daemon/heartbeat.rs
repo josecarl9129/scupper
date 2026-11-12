@@ -168,7 +168,7 @@ impl DaemonGuard<'_> {
             })?;
         Ok(child)
     }
-    fn start_heartbeat_tls(&mut self) -> Result<Group> {
+    pub(super) fn start_heartbeat_tls(&mut self) -> Result<Group> {
         let tls = self
             .lab
             .private
@@ -847,6 +847,19 @@ mod tests {
         .unwrap();
     }
 
+    /// Run a file this test just wrote. A concurrent test's fork can briefly hold
+    /// the write descriptor (until its exec closes it), so exec may see ETXTBSY.
+    fn run_fresh_executable(path: &Path) -> std::process::ExitStatus {
+        for _ in 0..50 {
+            match std::process::Command::new(path).status() {
+                Err(error) if error.raw_os_error() == Some(26) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                result => return result.unwrap(),
+            }
+        }
+        std::process::Command::new(path).status().unwrap()
+    }
     #[test]
     fn delivery_copy_escapes_inaccessible_source_ancestors() {
         let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
@@ -866,12 +879,7 @@ mod tests {
                 fs::metadata(root.join("bin").join(name)).unwrap().mode() & 0o777,
                 0o755
             );
-            assert!(
-                std::process::Command::new(root.join("bin").join(name))
-                    .status()
-                    .unwrap()
-                    .success()
-            );
+            assert!(run_fresh_executable(&root.join("bin").join(name)).success());
         }
         fs::remove_dir_all(root).unwrap();
     }

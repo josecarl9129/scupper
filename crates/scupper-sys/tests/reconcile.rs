@@ -2981,16 +2981,17 @@ fn repair_clear_reopens_forwarding_after_quarantined_restart() {
         }
     });
     rig.restart();
+    let mut recovered = false;
     for _ in 0..4 {
         rig.round(true);
-        let tick = rig.tick();
-        assert!(
-            !tick
-                .events
-                .iter()
-                .any(|event| matches!(event, EventKind::FailClosedEnded { .. }))
-        );
+        recovered |= rig.tick().events.iter().any(|event| {
+            matches!(
+                event,
+                EventKind::FailClosedEnded { .. } | EventKind::FailClosedState { closed: false }
+            )
+        });
     }
+    assert!(recovered, "exit recovery must be reported while latched");
     assert!(rig.kernel.model().forwarding_off());
     rig.machine().clear_latch(Actor::Local { uid: 0 }).unwrap();
     for _ in 0..4 {
@@ -3009,4 +3010,404 @@ fn repair_clear_reopens_forwarding_after_quarantined_restart() {
     }
     assert!(rig.store.state().quarantine.is_none());
     assert!(rig.machine().latch().is_none());
+}
+
+#[test]
+fn outage_latch_recovery_clear_and_second_outage_emit_two_firings() {
+    use scupper_sys::reconcile::StateStore;
+    let mut rig = Rig::new();
+    let mut events = Vec::new();
+    rig.kernel
+        .handshake(scupper_core::config::ExitId("ch1".into()), None);
+    events.extend(rig.tick().events);
+    let mut state = rig.store.state();
+    state.quarantine = Some(scupper_sys::state::Quarantine {
+        reason: "repair budget".into(),
+        object: "safety:ruleset".into(),
+        since_unix: 1000,
+    });
+    let guard = WriterLock::acquire(&rig.root).unwrap();
+    rig.store.write(&guard, &state).unwrap();
+    drop(guard);
+    events.extend(rig.tick().events);
+    rig.kernel.handshake(
+        scupper_core::config::ExitId("ch1".into()),
+        Some(Duration::ZERO),
+    );
+    for _ in 0..6 {
+        rig.time.set(rig.time.get() + 30);
+        rig.round(true);
+        events.extend(rig.tick().events);
+    }
+    assert!(rig.machine().latch().is_some());
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EventKind::FailClosedEnded { .. }))
+    );
+    rig.machine().clear_latch(Actor::Local { uid: 0 }).unwrap();
+    rig.tick();
+    rig.kernel
+        .handshake(scupper_core::config::ExitId("ch1".into()), None);
+    events.extend(rig.tick().events);
+    let mut coalescer = scupper_core::alerts::Coalescer::default();
+    let mut queued = Vec::new();
+    for (seq, kind) in events.into_iter().enumerate() {
+        let event = scupper_proto::Event {
+            seq: seq as u64 + 1,
+            at: UnixSeconds(seq as u64),
+            kind,
+            actor: Actor::Daemon,
+            gateway: scupper_proto::Identifier::try_from("gw1".to_owned()).unwrap(),
+            config_version: None,
+        };
+        if let Some(alert) = event.alert() {
+            queued.extend(coalescer.push(alert));
+        }
+    }
+    assert_eq!(
+        queued
+            .iter()
+            .filter(|a| a.key == scupper_core::alerts::AlertKey::FailClosed
+                && a.state == scupper_core::alerts::AlertState::Firing)
+            .count(),
+        2
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep FakeKernel drift, the real check, and the alert lifecycle in one fixture.
+fn fake_kernel_ruleset_drift_reaches_daemon_full_check_alert_and_recovers() {
+    use scupper_core::alerts::{AlertKey, AlertState, Coalescer};
+    use scupper_sys::boot::{BootDeps, GatewayNamespace};
+    let mut rig = Rig::new();
+    rig.flush_rules();
+    let sys = support::Script::new("ubuntu-24.04");
+    support::fresh(&sys);
+    let root = support::Root::new("ubuntu-24.04", &rig.held);
+    let site = support::site("ubuntu-24.04");
+    let config = Config {
+        site,
+        gateway: GatewayId("gw1".into()),
+        stamp: root.stamp,
+        fingerprint: [7; 32],
+        run_root: root.path.clone(),
+        lock_wait: Duration::ZERO,
+    };
+    let deps = BootDeps {
+        system: &sys,
+        namespace: &GatewayNamespace,
+        run_root: &root.path,
+        state_root: &root.path,
+        config_root: &root.path,
+        hook: None,
+        secret_owner: 0,
+    };
+    assert_eq!(rig.kernel.model().ruleset, Known::Value(Ruleset::Absent));
+    sys.replace("scupper-nft-ruleset.json", r#"{"nftables":[]}"#);
+    let (report, firing) =
+        scupper_sys::daemon::testing::protection_alerts(&deps, &sys, &rig.held, &config).unwrap();
+    assert_eq!(report.verdict.exit_code(), 2);
+    assert!(matches!(
+        firing.as_slice(),
+        [EventKind::CheckVerdictChanged {
+            to: scupper_proto::VerdictCode::Unprotected,
+            reason: scupper_proto::ObjectKind::Ruleset,
+            ..
+        }]
+    ));
+    rig.tick();
+    assert!(matches!(
+        rig.kernel.model().ruleset,
+        Known::Value(Ruleset::Verified(_))
+    ));
+    sys.replacements
+        .borrow_mut()
+        .remove("scupper-nft-ruleset.json");
+    let (report, recovered) =
+        scupper_sys::daemon::testing::protection_alerts(&deps, &sys, &rig.held, &config).unwrap();
+    assert_eq!(report.verdict.exit_code(), 0, "{report:?}");
+    let mut queue = Vec::new();
+    let mut coalescer = Coalescer::default();
+    for (seq, kind) in firing.into_iter().chain(recovered).enumerate() {
+        let event = scupper_proto::Event {
+            seq: seq as u64 + 1,
+            at: UnixSeconds(seq as u64 * 60),
+            kind,
+            actor: Actor::Daemon,
+            gateway: scupper_proto::Identifier::try_from("gw1".to_owned()).unwrap(),
+            config_version: None,
+        };
+        queue.extend(coalescer.push(event.alert().unwrap()));
+    }
+    assert_eq!(
+        queue.iter().map(|a| (a.key, a.state)).collect::<Vec<_>>(),
+        vec![
+            (AlertKey::Unprotected, AlertState::Firing),
+            (AlertKey::Unprotected, AlertState::Resolved)
+        ]
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Exercise the real full-check emitter for each protection reason in one fixture.
+fn daemon_full_check_uplink_exit_ip_is_critical_and_probe_failure_is_not() {
+    use scupper_sys::boot::{BootDeps, GatewayNamespace};
+    let held = testing::handle().unwrap();
+    let sys = support::Script::new("ubuntu-24.04");
+    support::fresh(&sys);
+    let root = support::Root::new("ubuntu-24.04", &held);
+    let config = Config {
+        site: support::site("ubuntu-24.04"),
+        gateway: GatewayId("gw1".into()),
+        stamp: root.stamp,
+        fingerprint: [7; 32],
+        run_root: root.path.clone(),
+        lock_wait: Duration::ZERO,
+    };
+    let deps = BootDeps {
+        system: &sys,
+        namespace: &GatewayNamespace,
+        run_root: &root.path,
+        state_root: &root.path,
+        config_root: &root.path,
+        hook: None,
+        secret_owner: 0,
+    };
+    let links = sys.text("scupper--4-link.json");
+    let mut foreign: serde_json::Value = serde_json::from_str(&links).unwrap();
+    foreign
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|l| l["ifname"] == "wg0")
+        .unwrap()["linkinfo"]["info_kind"] = serde_json::json!("veth");
+    let peer = support::fixture("ubuntu-24.04", "scupper-wg-ex-ch1-peers.txt");
+    for (file, value, reason) in [
+        (
+            "scupper--4-link.json",
+            foreign.to_string(),
+            scupper_proto::ObjectKind::ForeignLink,
+        ),
+        (
+            "scupper-tc-lo-ingress.json",
+            r#"[{"kind":"bpf"}]"#.into(),
+            scupper_proto::ObjectKind::TcHook,
+        ),
+        (
+            "scupper-wg-ex-ch1-allowed-ips.txt",
+            format!("{}\t192.0.2.0/24\n", peer.trim()),
+            scupper_proto::ObjectKind::Peer,
+        ),
+    ] {
+        let original = sys.text(file);
+        sys.replace(file, &value);
+        let (report, events) =
+            scupper_sys::daemon::testing::protection_alerts(&deps, &sys, &held, &config).unwrap();
+        assert_eq!(report.verdict.exit_code(), 2, "{report:?}");
+        assert!(
+            matches!(events.as_slice(), [EventKind::CheckVerdictChanged { to: scupper_proto::VerdictCode::Unprotected, reason: r, .. }] if *r == reason),
+            "{events:?}"
+        );
+        sys.replace(file, &original);
+    }
+    let original = sys.probe.borrow().clone();
+    let mut probe: serde_json::Value = serde_json::from_str(&original).unwrap();
+    // The real check reads the uplink address from the host address fixture.
+    let addresses: serde_json::Value =
+        serde_json::from_str(&sys.text("gwhost--4-addr.json")).unwrap();
+    let uplink = addresses
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["ifname"] == "eth0")
+        .unwrap()["addr_info"][0]["local"]
+        .clone();
+    probe["result"]["ip"] = uplink;
+    *sys.probe.borrow_mut() = probe.to_string();
+    let (report, events) =
+        scupper_sys::daemon::testing::protection_alerts(&deps, &sys, &held, &config).unwrap();
+    assert_eq!(report.verdict.exit_code(), 2, "{report:?}");
+    assert!(matches!(
+        events.as_slice(),
+        [EventKind::CheckVerdictChanged {
+            to: scupper_proto::VerdictCode::Unprotected,
+            reason: scupper_proto::ObjectKind::ExitIp,
+            ..
+        }]
+    ));
+    probe["result"] = serde_json::json!({"class":"timeout"});
+    *sys.probe.borrow_mut() = probe.to_string();
+    let (_, events) =
+        scupper_sys::daemon::testing::protection_alerts(&deps, &sys, &held, &config).unwrap();
+    assert_eq!(events, []);
+}
+
+#[test]
+fn healthy_restart_and_connect_state_observations_do_not_create_incidents() {
+    let mut rig = Rig::new();
+    for connect in [false, true] {
+        rig.restart();
+        let mut events = Vec::new();
+        if connect {
+            events.extend(
+                rig.machine()
+                    .set_selection(Selection::Disconnected, Actor::Local { uid: 0 })
+                    .unwrap()
+                    .events,
+            );
+            events.extend(
+                rig.machine()
+                    .set_selection(Selection::Auto, Actor::Local { uid: 0 })
+                    .unwrap()
+                    .events,
+            );
+        }
+        for _ in 0..6 {
+            rig.round(true);
+            events.extend(rig.tick().events);
+        }
+        let mut coalescer = scupper_core::alerts::Coalescer::default();
+        for (seq, kind) in events.into_iter().enumerate() {
+            assert!(
+                !matches!(kind, EventKind::FailClosedEnded { .. }),
+                "healthy qualification is not a recovery"
+            );
+            let event = scupper_proto::Event {
+                seq: seq as u64 + 1,
+                at: UnixSeconds(seq as u64),
+                kind,
+                actor: Actor::Daemon,
+                gateway: scupper_proto::Identifier::try_from("gw1".to_owned()).unwrap(),
+                config_version: None,
+            };
+            if let Some(alert) = event.alert() {
+                assert_eq!(coalescer.push(alert), []);
+            }
+        }
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep the healthy reset, real cadence, and containment assertions together.
+fn reconnect_with_retained_stale_handshake_qualifies_from_unknown_without_incident() {
+    use scupper_core::{config::ExitId, failover::ExitHealth};
+    for retained in [false, true] {
+        let mut rig = Rig::new();
+        let exit = ExitId("ch1".into());
+        assert!(matches!(
+            rig.machine().health()[&exit],
+            ExitHealth::Healthy {
+                confirmed: true,
+                ..
+            }
+        ));
+        rig.kernel.handshake(exit.clone(), Some(Duration::ZERO));
+        let mut events = rig
+            .machine()
+            .set_selection(Selection::Disconnected, Actor::Local { uid: 0 })
+            .unwrap()
+            .events;
+        assert_eq!(rig.machine().health()[&exit], ExitHealth::Unknown);
+        assert_eq!(rig.kernel.model().links["ex-ch1"].up, Known::Value(false));
+        rig.time.set(rig.time.get() + 600);
+        let base = rig.time.get();
+        rig.kernel
+            .handshake(exit.clone(), retained.then_some(Duration::from_secs(600)));
+        events.extend(
+            rig.machine()
+                .set_selection(Selection::Auto, Actor::Local { uid: 0 })
+                .unwrap()
+                .events,
+        );
+        assert_eq!(rig.machine().health()[&exit], ExitHealth::Unknown);
+        for offset in (2..=42).step_by(2) {
+            let age = if offset < 14 {
+                retained.then_some(Duration::from_secs(600 + offset))
+            } else {
+                Some(Duration::from_secs(offset - 14))
+            };
+            rig.kernel.handshake(exit.clone(), age);
+            if offset % 10 == 2 {
+                rig.round(true);
+            }
+            events.extend(rig.tick().events);
+            assert_eq!(rig.time.get(), base + offset);
+            if offset == 14 {
+                assert_eq!(rig.kernel.model().links["ex-ch1"].up, Known::Value(true));
+            }
+            if offset < 42 {
+                assert_eq!(rig.machine().health()[&exit], ExitHealth::Unknown);
+                assert_eq!(
+                    rig.machine().desired().unwrap().routes()[0].1,
+                    RouteTarget::Unreachable
+                );
+            }
+        }
+        assert!(matches!(
+            rig.machine().health()[&exit],
+            ExitHealth::Healthy {
+                confirmed: true,
+                ..
+            }
+        ));
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            EventKind::FailClosedStarted { .. } | EventKind::FailClosedEnded { .. }
+        )));
+        rig.safe_history();
+    }
+}
+
+#[test]
+fn cold_start_without_resume_qualifies_at_real_cadence_without_incident() {
+    for inherited_down in [false, true] {
+        let mut rig = Rig::new();
+        if inherited_down {
+            rig.kernel
+                .mutate(|model| model.links.get_mut("ex-ch1").unwrap().up = Known::Value(false));
+        }
+        let exit = scupper_core::config::ExitId("ch1".into());
+        rig.kernel.handshake(exit.clone(), None);
+        rig.restart();
+        let base = rig.time.get();
+        // Explicitly attempt resume: a cold boot has no fresh handshake to authorize it.
+        rig.machine().resume_existing();
+        assert_eq!(
+            rig.machine().health()[&exit],
+            scupper_core::failover::ExitHealth::Unknown
+        );
+        let mut events = Vec::new();
+        for offset in (2..=32).step_by(2) {
+            rig.kernel
+                .handshake(exit.clone(), (offset >= 4).then_some(Duration::ZERO));
+            if offset % 10 == 2 {
+                rig.round(true);
+            }
+            events.extend(rig.tick().events);
+            assert_eq!(rig.time.get(), base + offset);
+            if offset < 32 {
+                assert_eq!(
+                    rig.machine().health()[&exit],
+                    scupper_core::failover::ExitHealth::Unknown
+                );
+                assert_eq!(
+                    &rig.machine().desired().unwrap().routes()[0].1,
+                    &RouteTarget::Unreachable
+                );
+            }
+        }
+        assert!(matches!(
+            rig.machine().health()[&exit],
+            scupper_core::failover::ExitHealth::Healthy {
+                confirmed: true,
+                ..
+            }
+        ));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            EventKind::FailClosedStarted { .. } | EventKind::FailClosedEnded { .. }
+        )));
+        rig.safe_history();
+    }
 }

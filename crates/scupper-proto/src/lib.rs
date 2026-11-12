@@ -1,5 +1,6 @@
 //! Pure schema-1 event, local control socket, and JSON output vocabulary.
 
+mod alerts;
 mod control;
 mod event;
 

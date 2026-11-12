@@ -62,6 +62,11 @@ impl ValidatedSite {
     pub fn heartbeat(&self) -> Option<&HeartbeatSettings> {
         self.config.heartbeat.as_ref()
     }
+    /// Returns the bounded policy window for initial exit qualification.
+    #[must_use]
+    pub fn initial_qualification(&self) -> Duration {
+        Duration::from_secs(self.config.policy.initial_qualification_seconds)
+    }
     /// Returns the supported alert sinks.
     #[must_use]
     pub fn sinks(&self) -> &BTreeMap<String, AlertSink> {

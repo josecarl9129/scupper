@@ -1,0 +1,5 @@
+{
+  "content_type": "application/json",
+  "headers": {},
+  "body": "{\"at\":100,\"body\":\"Scupper failing closed: resolved; severity=critical; seq=42; duration=17s; count=1; suppressed=0\",\"count\":1,\"duration\":17,\"key\":\"fail_closed\",\"seq\":42,\"severity\":\"critical\",\"state\":\"resolved\",\"suppressed\":0,\"title\":\"Scupper failing closed\"}"
+}

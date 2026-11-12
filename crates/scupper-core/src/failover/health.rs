@@ -15,6 +15,9 @@ pub(super) struct Signals {
     pub probe: Option<(MonoTime, bool)>,
     pub initial_successes: u8,
     pub unconfirmed: bool,
+    pub initial_link_pending: bool,
+    // Only an unexplained hard fault may bypass the initial paging window.
+    pub non_qualification_fault: bool,
 }
 
 impl Signals {
@@ -35,6 +38,26 @@ impl Signals {
             Some(DownReason::HandshakeStale)
         } else {
             None
+        }
+    }
+
+    pub fn qualification_fault(
+        &self,
+        now: MonoTime,
+        reason: DownReason,
+        qualification_age: Option<Duration>,
+    ) -> bool {
+        match reason {
+            // A retained handshake at/before the window start is equivalent
+            // to no handshake in this qualification. Account for Tick aging too.
+            DownReason::HandshakeStale => self.handshake.is_some_and(|(at, age)| {
+                age.is_none_or(|age| {
+                    qualification_age
+                        .is_some_and(|elapsed| age.saturating_add(now.elapsed_since(at)) >= elapsed)
+                })
+            }),
+            DownReason::LinkMissing | DownReason::PeerMissing => self.initial_link_pending,
+            DownReason::KeyMissing | DownReason::PathProbeFailed => false,
         }
     }
 

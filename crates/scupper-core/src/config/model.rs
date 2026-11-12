@@ -161,6 +161,9 @@ pub struct Policy {
     /// Minimum time between switches; defaults to 120 seconds.
     #[serde(default = "default_min_dwell")]
     pub min_dwell: DurationStr,
+    /// Initial qualification window in seconds; defaults to 60, bounded to 30..=300.
+    #[serde(default = "default_initial_qualification")]
+    pub initial_qualification_seconds: u64,
     /// Standby mode, hot by default. With one exit, hot has no effect.
     #[serde(default = "default_standby")]
     pub standby: Standby,
@@ -238,8 +241,12 @@ pub struct Alerts {
     pub sinks: BTreeMap<String, AlertSink>,
 }
 
+fn default_initial_qualification() -> u64 {
+    60
+}
+
 /// Supported delivery transports; URLs are always local secret references.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 pub enum AlertSink {
     /// ntfy HTTP notification service.

@@ -455,11 +455,35 @@ fn run_notified(
         dispatcher: pending::Dispatcher::default(),
         last_complete: None,
         heartbeat: crate::daemon::heartbeat::Heartbeat::default(),
+        alerts: crate::alerts::Workers::default(),
+        alert_startup: AlertStartup::default(),
         snapshot: control::SharedSnapshot::default(),
         cached: None,
     };
     run_with(&mut runtime, stop);
     Ok(())
+}
+type AlertSettings = std::collections::BTreeMap<String, scupper_core::config::AlertSink>;
+#[derive(Default)]
+struct AlertStartup {
+    settings: Option<AlertSettings>,
+    loading: Option<Receiver<Option<AlertSettings>>>,
+    failed: bool,
+}
+impl AlertStartup {
+    fn boot_event(&mut self, running: bool, pending_canon: bool) -> Option<EventKind> {
+        if running {
+            // Attachment success is not evidence that an exit is healthy.
+            self.failed = false;
+        } else if self.settings.is_some() && !self.failed && !pending_canon {
+            self.failed = true;
+            return Some(EventKind::FailClosedStarted {
+                reason: scupper_proto::Reason::NoHealthyExit,
+                exit: None,
+            });
+        }
+        None
+    }
 }
 struct Runtime<'a> {
     options: &'a Options,
@@ -484,6 +508,8 @@ struct Runtime<'a> {
     dispatcher: pending::Dispatcher,
     last_complete: Option<Instant>,
     heartbeat: heartbeat::Heartbeat,
+    alerts: crate::alerts::Workers,
+    alert_startup: AlertStartup,
     snapshot: control::SharedSnapshot,
     cached: Option<(
         Instant,
@@ -509,6 +535,61 @@ impl<'a> Runtime<'a> {
     }
 }
 impl Runtime<'_> {
+    #[allow(clippy::too_many_lines)] // Keep applied settings and failed-boot fallback synchronization together.
+    fn sync_alerts(&mut self) {
+        if let Some((_, _, config)) = &self.running {
+            self.alert_startup.settings = Some(config.site.sinks().clone());
+        } else if self.alert_startup.settings.is_none() && self.alert_startup.loading.is_none() {
+            let state_root = self.options.state_root.clone();
+            let config_root = self.options.config_root.clone();
+            let (send, receive) = mpsc::sync_channel(1);
+            self.alert_startup.loading = Some(receive);
+            let _ = std::thread::Builder::new()
+                .name("scupper-alert-config".into())
+                .spawn(move || {
+                    let settings = (|| {
+                        let StateRead::Present(state) =
+                            StateFile::open(&state_root, None).ok()?.read().ok()?
+                        else {
+                            return None;
+                        };
+                        let (text, _) = VersionStore::read_only(&state_root, &config_root)
+                            .read(state.applied_version?)
+                            .ok()?;
+                        Some(validate(parse_site(&text).ok()?).ok()?.sinks().clone())
+                    })();
+                    let _ = send.send(settings);
+                });
+        }
+        if self.running.is_none()
+            && let Some(receive) = &self.alert_startup.loading
+            && let Ok(settings) = receive.try_recv()
+        {
+            self.alert_startup.settings = settings;
+            self.alert_startup.loading = None;
+        }
+        if let Some(event) = self
+            .alert_startup
+            .boot_event(self.running.is_some(), self.pending_canon)
+        {
+            let _ = self.audit.handle().emit(event, Actor::Daemon, None);
+        }
+        if let Some(settings) = &self.alert_startup.settings {
+            #[cfg(feature = "testing")]
+            let owner = self.secret_owner;
+            #[cfg(not(feature = "testing"))]
+            let owner = 0;
+            self.alerts.sync(
+                settings,
+                &self.options.state_root,
+                &self.options.config_root,
+                &self.options.probe_binary,
+                &self.audit.handle(),
+                owner,
+            );
+        }
+    }
+
     fn publish_snapshot(&self) {
         let mut snapshot = self
             .snapshot
@@ -712,6 +793,11 @@ impl Runtime<'_> {
         if matches!(op, Op::RepairClear { .. }) && self.running.is_none() {
             admin::durable_intent(&deps, &op, uid)?;
             let _ = self.audit.handle().emit(
+                EventKind::QuarantineChanged { active: false },
+                Actor::Local { uid },
+                None,
+            );
+            let _ = self.audit.handle().emit(
                 EventKind::AdminAction {
                     reason: if let Op::RepairClear { reason } = &op {
                         reason.clone()
@@ -809,6 +895,7 @@ impl DaemonDeps for Runtime<'_> {
         Runtime::control_requests(self);
     }
     fn started(&mut self) {
+        self.sync_alerts();
         if self.running.is_none() {
             return;
         }
@@ -831,6 +918,7 @@ impl DaemonDeps for Runtime<'_> {
         }
     }
     fn notify(&mut self, iteration: &Iteration) {
+        self.sync_alerts();
         self.snapshot
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -856,6 +944,7 @@ impl DaemonDeps for Runtime<'_> {
         self.heartbeat_iteration(true);
     }
     fn shutdown(&mut self) {
+        self.alerts.stop();
         self.running.take();
         if let Err(error) = self.audit.shutdown() {
             eprintln!("scupperd: event flush: {error}");
@@ -980,7 +1069,9 @@ impl DaemonDeps for Runtime<'_> {
                 if !round.paths.is_empty() {
                     machine.submit_probe_outcomes(round.paths);
                 }
-                if round.exit_ok == Some(false) && round.setup_failures == 0 {
+                if round.exit_ok == Some(probes::ExitIpOutcome::ProbeFailed)
+                    && round.setup_failures == 0
+                {
                     let _ = audit.handle().emit(
                         EventKind::DriftDetected {
                             object: scupper_proto::ObjectKind::Unknown,
@@ -1144,6 +1235,224 @@ fn testing_boot_hook(point: boot::BootPoint) -> Result<(), String> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "testing")]
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep startup, real reconciliation, and alert projection in one lifecycle.
+    fn failed_boot_then_success_with_healthy_exit_resolves_via_reconciler_state() {
+        use crate::{
+            reconcile::{
+                Reconciler,
+                fake::{FakeKernel, MemoryStore},
+            },
+            state::State,
+        };
+        use scupper_core::{
+            alerts::{AlertKey, AlertState, Coalescer},
+            config::{parse_site, validate},
+            failover::{ExitHealth, MonoTime},
+            planner::Desired,
+            render::{RouteTarget, VersionStamp},
+            verdict::v2::Selection,
+        };
+        use std::{cell::Cell, collections::BTreeMap, rc::Rc};
+        let mut startup = AlertStartup {
+            settings: Some(AlertSettings::new()),
+            ..AlertStartup::default()
+        };
+        let mut events = vec![(0, startup.boot_event(false, false).unwrap())];
+        assert!(startup.boot_event(false, false).is_none());
+        assert!(startup.boot_event(true, false).is_none());
+        let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("failed-boot-healthy-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let site = validate(
+            parse_site(include_str!(
+                "../../../scupper-core/tests/fixtures/site-m2.toml"
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let gateway = GatewayId("gw1".into());
+        let stamp = VersionStamp {
+            version: 1,
+            sha256: [0; 32],
+        };
+        let desired = Desired::new(
+            &site,
+            &gateway,
+            &stamp,
+            [7; 32],
+            &RouteTarget::Unreachable,
+            &Selection::Auto,
+        )
+        .unwrap();
+        let exit = site.gateway(&gateway).unwrap().exits()[0].id().clone();
+        let kernel = FakeKernel::new(desired);
+        let store = MemoryStore::new(State {
+            applied_version: Some(1),
+            ..State::default()
+        });
+        let log = EventLog::memory_only(gateway.clone(), || UnixSeconds(1_000)).unwrap();
+        let time = Rc::new(Cell::new(0));
+        let clock = time.clone();
+        let mut machine = Reconciler::new(
+            kernel,
+            store,
+            log.handle.clone(),
+            crate::reconcile::Config {
+                site,
+                gateway,
+                stamp,
+                fingerprint: [7; 32],
+                run_root: root.clone(),
+                lock_wait: Duration::ZERO,
+            },
+            std::sync::Arc::new(crate::netns::testing::handle().unwrap()),
+            move || {
+                (
+                    MonoTime(Duration::from_secs(clock.get())),
+                    1_000 + clock.get(),
+                )
+            },
+        )
+        .unwrap();
+        for offset in (2..=22).step_by(2) {
+            time.set(offset);
+            if offset % 10 == 2 {
+                machine.submit_probe_round(BTreeMap::from([(exit.clone(), true)]));
+            }
+            let report = machine.tick();
+            assert!(report.complete);
+            assert!(!report.events.iter().any(|e| matches!(
+                e,
+                EventKind::FailClosedStarted { .. } | EventKind::FailClosedEnded { .. }
+            )));
+            if offset < 22 {
+                assert_eq!(machine.health()[&exit], ExitHealth::Unknown);
+                assert!(
+                    !report
+                        .events
+                        .iter()
+                        .any(|e| matches!(e, EventKind::FailClosedState { closed: false }))
+                );
+            } else {
+                assert!(matches!(
+                    machine.health()[&exit],
+                    ExitHealth::Healthy {
+                        confirmed: true,
+                        ..
+                    }
+                ));
+                assert_eq!(
+                    report
+                        .events
+                        .iter()
+                        .filter(|e| matches!(e, EventKind::FailClosedState { closed: false }))
+                        .count(),
+                    1
+                );
+            }
+            events.extend(report.events.into_iter().map(|e| (offset, e)));
+        }
+        let mut coalescer = Coalescer::default();
+        let mut sent = Vec::new();
+        for (seq, (offset, kind)) in events.into_iter().enumerate() {
+            let event = scupper_proto::Event {
+                seq: seq as u64 + 1,
+                at: UnixSeconds(offset),
+                kind,
+                actor: Actor::Daemon,
+                gateway: scupper_proto::Identifier::try_from("gw1".to_owned()).unwrap(),
+                config_version: None,
+            };
+            if let Some(alert) = event.alert() {
+                sent.extend(coalescer.push(alert));
+            }
+        }
+        assert_eq!(
+            sent.iter()
+                .filter(|a| a.key == AlertKey::FailClosed)
+                .map(|a| (a.state, a.at))
+                .collect::<Vec<_>>(),
+            vec![(AlertState::Firing, 0), (AlertState::Resolved, 22)]
+        );
+        drop(machine);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_boot_then_success_with_down_exit_resolves_only_after_health() {
+        use scupper_core::{
+            alerts::AlertState,
+            config::{parse_site, validate},
+            failover::{Failover, FailoverAction, FailoverConfig, FailoverInput, MonoTime},
+        };
+        let mut startup = AlertStartup {
+            settings: Some(AlertSettings::new()),
+            ..AlertStartup::default()
+        };
+        let mut coalescer = scupper_core::alerts::Coalescer::default();
+        let mut sent = Vec::new();
+        let mut seq = 0;
+        let mut deliver = |kind, seconds| {
+            seq += 1;
+            let event = scupper_proto::Event {
+                seq,
+                at: UnixSeconds(seconds),
+                kind,
+                actor: Actor::Daemon,
+                gateway: scupper_proto::Identifier::try_from("gw1".to_owned()).unwrap(),
+                config_version: None,
+            };
+            if let Some(alert) = event.alert() {
+                sent.extend(coalescer.push(alert));
+            }
+        };
+        deliver(startup.boot_event(false, false).unwrap(), 0);
+        assert!(startup.boot_event(false, false).is_none());
+        assert!(startup.boot_event(true, false).is_none());
+        let site = validate(
+            parse_site(include_str!(
+                "../../../scupper-core/tests/fixtures/site-m2.toml"
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let cfg = FailoverConfig::from_site(&site, &GatewayId("gw1".into())).unwrap();
+        let exit = cfg.exits[0].0.clone();
+        let (mut machine, _) = Failover::new(
+            MonoTime(Duration::ZERO),
+            crate::state::Selection::Auto,
+            &cfg,
+        );
+        for seconds in (0..=94).step_by(2) {
+            let mut inputs = vec![FailoverInput::Handshakes(std::collections::BTreeMap::from(
+                [(exit.clone(), (seconds >= 64).then_some(Duration::ZERO))],
+            ))];
+            if [64, 74, 84, 94].contains(&seconds) {
+                inputs.push(FailoverInput::PathProbe(std::collections::BTreeMap::from(
+                    [(exit.clone(), true)],
+                )));
+            }
+            inputs.push(FailoverInput::Tick);
+            for input in inputs {
+                let (next, actions) =
+                    machine.step(MonoTime(Duration::from_secs(seconds)), input, &cfg);
+                machine = next;
+                for action in actions {
+                    if let FailoverAction::Emit(event) = action {
+                        deliver(event.into(), seconds);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            sent.iter().map(|a| (a.state, a.at)).collect::<Vec<_>>(),
+            vec![(AlertState::Firing, 0), (AlertState::Resolved, 94)]
+        );
+        assert_eq!(sent[1].duration, 94);
+    }
 
     #[test]
     fn daemon_run_waits_for_lease_and_sends_status_before_reading_config() {
@@ -1509,9 +1818,35 @@ mod tests {
 #[cfg(feature = "testing")]
 pub mod testing {
     use super::{
-        Audit, BootDeps, DaemonDeps, Duration, EventKind, EventLog, GatewayId, Instant, Options,
-        Runtime, StartupRead, UnixSeconds, control, io, mpsc, notify, pending, probes, unix,
+        AlertStartup, Audit, BootDeps, DaemonDeps, Duration, EventKind, EventLog, GatewayId,
+        Instant, Options, Runtime, StartupRead, UnixSeconds, control, io, mpsc, notify, pending,
+        probes, unix,
     };
+    /// Run the daemon's fresh full check and its production alert projection.
+    /// # Errors
+    /// Returns fixture or observation failures.
+    pub fn protection_alerts(
+        deps: &BootDeps<'_>,
+        probe: &dyn crate::probe_child::ProbeExec,
+        held: &crate::netns::NetnsHandle,
+        config: &crate::reconcile::Config,
+    ) -> io::Result<(scupper_core::verdict::v2::Report, Vec<EventKind>)> {
+        let report = super::admin::check_live(
+            deps,
+            probe,
+            held,
+            config,
+            Some(Instant::now() + Duration::from_secs(20)),
+            &|| Some(Instant::now()),
+        )
+        .map_err(|_| io::Error::other("full check failed"))?;
+        let mut heartbeat = super::heartbeat::Heartbeat::default();
+        heartbeat.record_verdict(
+            report.verdict.exit_code(),
+            super::heartbeat::protection_reason(&report.verdict),
+        );
+        Ok((report, heartbeat.verdict_events))
+    }
     /// Drives one apply through the real runtime using injected kernel I/O.
     /// Returns the response, Ping before/after, retained completion age, and next tick.
     /// # Errors
@@ -1608,6 +1943,8 @@ pub mod testing {
             dispatcher: pending::Dispatcher::default(),
             last_complete: None,
             heartbeat: crate::daemon::heartbeat::Heartbeat::default(),
+            alerts: crate::alerts::Workers::default(),
+            alert_startup: AlertStartup::default(),
             snapshot: control::SharedSnapshot::default(),
             cached: None,
         };

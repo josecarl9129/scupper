@@ -192,10 +192,11 @@ pub(crate) mod linux {
         address: Ipv4Addr,
         deadline: Instant,
     ) -> Probe<Vec<u8>> {
-        exchange(socket, target, address, deadline, false, &|| Ok(()))
+        exchange(socket, target, address, deadline, false, &|| Ok(()), None)
     }
 
     // Heartbeats need only the status line/headers, not an IP response body.
+    #[cfg(test)]
     pub(crate) fn exchange_status_socket(
         socket: Socket,
         target: &Target,
@@ -203,9 +204,37 @@ pub(crate) mod linux {
         deadline: Instant,
         before_request: &dyn Fn() -> Probe<()>,
     ) -> Probe<Vec<u8>> {
-        exchange(socket, target, address, deadline, true, before_request)
+        exchange(
+            socket,
+            target,
+            address,
+            deadline,
+            true,
+            before_request,
+            None,
+        )
     }
 
+    pub(crate) fn exchange_delivery_socket(
+        socket: Socket,
+        target: &Target,
+        address: Ipv4Addr,
+        deadline: Instant,
+        before_request: &dyn Fn() -> Probe<()>,
+        payload: Option<&scupper_core::alerts::Payload>,
+    ) -> Probe<Vec<u8>> {
+        exchange(
+            socket,
+            target,
+            address,
+            deadline,
+            true,
+            before_request,
+            payload,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn exchange(
         socket: Socket,
         target: &Target,
@@ -213,6 +242,7 @@ pub(crate) mod linux {
         deadline: Instant,
         status_only: bool,
         before_request: &dyn Fn() -> Probe<()>,
+        payload: Option<&scupper_core::alerts::Payload>,
     ) -> Probe<Vec<u8>> {
         remaining(deadline)?;
         socket
@@ -268,7 +298,27 @@ pub(crate) mod linux {
                 .map_err(|error| tls_failure(&error))?;
         }
         before_request()?;
-        write_request(&mut tls, target, deadline)?;
+        if let Some(payload) = payload {
+            let mut request = format!(
+                "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                target.path,
+                target.host,
+                payload.content_type,
+                payload.body.len()
+            );
+            for (name, value) in &payload.headers {
+                use std::fmt::Write as _;
+                let _ = write!(request, "{name}: {value}\r\n");
+            }
+            request.push_str("\r\n");
+            request.push_str(&payload.body);
+            remaining(deadline)?;
+            tls.write_all(request.as_bytes())
+                .map_err(|error| tls_failure(&error))?;
+            tls.flush().map_err(|error| tls_failure(&error))?;
+        } else {
+            write_request(&mut tls, target, deadline)?;
+        }
         let mut bytes = Vec::new();
         let mut buffer = [0; 2048];
         loop {

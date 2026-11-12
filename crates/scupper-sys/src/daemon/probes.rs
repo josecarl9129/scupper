@@ -36,13 +36,23 @@ impl ProbeExec for ProbeCommand {
         crate::system::execute_file_command(command, namespace, timeout)
     }
 }
+/// Exit IP results keep an observed leak distinct from ordinary probe failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitIpOutcome {
+    /// A non-uplink exit address was observed.
+    Ok,
+    /// No usable exit address was obtained.
+    ProbeFailed,
+    /// The exit address equals a host uplink address.
+    UplinkAddress,
+}
 /// Completed round, delivered atomically to its owner.
 #[derive(Debug)]
 pub struct Round {
     /// Path results, including failed child setup.
     pub paths: BTreeMap<ExitId, ProbeOutcome>,
     /// Exit-IP observations completed successfully.
-    pub exit_ok: Option<bool>,
+    pub exit_ok: Option<ExitIpOutcome>,
     /// Number of child setup failures in this round.
     pub setup_failures: u64,
 }
@@ -144,7 +154,7 @@ impl Probes {
 fn failed_round(exit: &ExitId, kind: ProbeKind) -> Round {
     Round {
         paths: BTreeMap::from([(exit.clone(), ProbeOutcome::Inconclusive)]),
-        exit_ok: (kind == ProbeKind::ExitIp).then_some(false),
+        exit_ok: (kind == ProbeKind::ExitIp).then_some(ExitIpOutcome::ProbeFailed),
         setup_failures: 1,
     }
 }
@@ -179,11 +189,22 @@ fn spawn_with(
                 round.setup_failures += u64::from(setup);
                 if setup || (request.kind == ProbeKind::ExitIp && uplink.is_empty()) {
                     round.paths.insert(exit, ProbeOutcome::Inconclusive);
-                    if !setup { round.setup_failures += 1; }
+                    if !setup {
+                        round.setup_failures += 1;
+                    }
                 } else if request.kind == ProbeKind::ExitIp {
-                    round.exit_ok = Some(matches!(result, Ok(ProbeResult::Success { ip: Some(ip) }) if !uplink.is_empty() && !uplink.contains(&ip)));
+                    round.exit_ok = Some(match result {
+                        Ok(ProbeResult::Success { ip: Some(ip) }) if uplink.contains(&ip) => {
+                            ExitIpOutcome::UplinkAddress
+                        }
+                        Ok(ProbeResult::Success { ip: Some(_) }) => ExitIpOutcome::Ok,
+                        _ => ExitIpOutcome::ProbeFailed,
+                    });
                 } else {
-                    round.paths.insert(exit, matches!(result, Ok(ProbeResult::Success { .. })).into());
+                    round.paths.insert(
+                        exit,
+                        matches!(result, Ok(ProbeResult::Success { .. })).into(),
+                    );
                 }
             }
             let _ = send.send(round);
@@ -371,7 +392,10 @@ mod tests {
     #[test]
     fn exit_ip_must_differ_from_real_uplink_addresses() {
         let held = Arc::new(crate::netns::testing::handle().unwrap());
-        for (observed, expected) in [("192.0.2.1", false), ("198.51.100.1", true)] {
+        for (observed, expected) in [
+            ("192.0.2.1", ExitIpOutcome::UplinkAddress),
+            ("198.51.100.1", ExitIpOutcome::Ok),
+        ] {
             let outcome = ChildOutcome {
                 result: ProbeResult::Success {
                     ip: Some(observed.parse().unwrap()),
