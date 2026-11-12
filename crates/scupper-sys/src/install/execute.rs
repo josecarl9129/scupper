@@ -55,7 +55,53 @@ fn new_identity() -> Result<Zeroizing<Vec<u8>>, String> {
 /// # Errors
 /// Stops at the first failed operation. Never rotates an existing identity.
 #[allow(clippy::too_many_lines)]
-pub fn apply(system: &dyn System, paths: &Paths, mut prepared: Prepared) -> Result<String, String> {
+pub fn apply(system: &dyn System, paths: &Paths, prepared: Prepared) -> Result<String, String> {
+    let recoverable = model::BINARIES
+        .iter()
+        .all(|name| paths.at(&format!("{}/{name}", model::BIN_ROOT)).is_file());
+    apply_with_fs(system, paths, prepared, &RealFs).map_err(|error| {
+        if error.replaced && recoverable {
+            format!(
+                "{}\nGateway binaries may be mixed or services stopped. Restore manually:\n{}",
+                error.reason,
+                model::RESTORE_COMMANDS
+            )
+        } else {
+            error.reason
+        }
+    })
+}
+/// Installation failure with the actual binary rename state.
+#[derive(Debug)]
+pub struct ApplyError {
+    /// Underlying operation or precondition failure.
+    pub reason: String,
+    /// At least one live binary was renamed, even if directory sync then failed.
+    pub replaced: bool,
+}
+/// Applies installation using an injected binary-replacement filesystem boundary.
+/// # Errors
+/// Reports whether any binary was renamed; callers choose recovery diagnostics.
+pub fn apply_with_fs(
+    system: &dyn System,
+    paths: &Paths,
+    prepared: Prepared,
+    filesystem: &dyn Fs,
+) -> Result<String, ApplyError> {
+    let replaced = std::cell::Cell::new(false);
+    apply_inner(system, paths, prepared, filesystem, &replaced).map_err(|reason| ApplyError {
+        reason,
+        replaced: replaced.get(),
+    })
+}
+#[allow(clippy::too_many_lines)]
+fn apply_inner(
+    system: &dyn System,
+    paths: &Paths,
+    mut prepared: Prepared,
+    filesystem: &dyn Fs,
+    replaced: &std::cell::Cell<bool>,
+) -> Result<String, String> {
     // No directory or lock is created until the full plan and refusals exist.
     let mut current = observe(system, paths).map_err(|e| e.to_string())?;
     for path in prepared
@@ -129,21 +175,39 @@ pub fn apply(system: &dyn System, paths: &Paths, mut prepared: Prepared) -> Resu
                         .map_err(|e| e.to_string())?;
                 }
                 Change::Binary(name, _) => {
-                    let destination = paths.at(&format!("{}/{name}", model::BIN_ROOT));
-                    if destination.exists() {
-                        let previous = destination.with_file_name(format!("{name}.prev"));
-                        // Copy old bytes durably without removing the executable;
-                        // a failure cannot leave a gap at the live pathname.
-                        write(
-                            &previous,
-                            &read_regular(&destination, 128 * 1024 * 1024)
-                                .map_err(|e| e.to_string())?,
-                            model::BINARY_MODE,
-                        )
-                        .map_err(|e| e.to_string())?;
+                    // The planner places both binaries together. Before the first
+                    // rename, persist BOTH old executables, even if only one changes.
+                    if !replaced.get() {
+                        for binary in model::BINARIES {
+                            let destination = paths.at(&format!("{}/{binary}", model::BIN_ROOT));
+                            if destination.exists() {
+                                fs::durable_replace(
+                                    filesystem,
+                                    &destination.with_file_name(format!("{binary}.prev")),
+                                    &read_regular(&destination, 128 * 1024 * 1024)
+                                        .map_err(|e| e.to_string())?,
+                                    model::BINARY_MODE,
+                                    &|_| Ok(()),
+                                    &|_| Ok(()),
+                                )
+                                .map_err(|e| e.to_string())?;
+                            }
+                        }
                     }
-                    write(&destination, &prepared.binaries[name], model::BINARY_MODE)
-                        .map_err(|e| e.to_string())?;
+                    fs::durable_replace(
+                        filesystem,
+                        &paths.at(&format!("{}/{name}", model::BIN_ROOT)),
+                        &prepared.binaries[name],
+                        model::BINARY_MODE,
+                        &|_| Ok(()),
+                        &|step| {
+                            if step == fs::DurableStep::Renamed {
+                                replaced.set(true);
+                            }
+                            Ok(())
+                        },
+                    )
+                    .map_err(|e| e.to_string())?;
                 }
                 Change::GenerateIdentity => {
                     let key = new_identity()?;

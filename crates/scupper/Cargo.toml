@@ -12,14 +12,17 @@ testing = ["scupper-sys/testing"]
 
 [dependencies]
 scupper-core.workspace = true
-scupper-sys.workspace = true
 scupper-proto.workspace = true
 clap.workspace = true
-rustix.workspace = true
 serde_json.workspace = true
+rustix.workspace = true
 toml = { workspace = true, features = ["display"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+scupper-sys.workspace = true
+
 [dev-dependencies]
+proptest.workspace = true
 sha2.workspace = true
 
 [lints]

@@ -24,7 +24,7 @@ use zeroize::Zeroizing;
 
 mod execute;
 mod observe;
-pub use execute::apply;
+pub use execute::{ApplyError, apply, apply_with_fs};
 use observe::observe;
 
 /// Flag inputs. No field holds key material.
@@ -77,6 +77,24 @@ pub struct Prepared {
     client_public: Option<PublicKey>,
     secret_hashes: BTreeMap<String, String>,
 }
+impl Prepared {
+    /// Digest binds confirmation to the plan, its full observations and desired inputs.
+    /// `BTree` collections and the staged installer's fixed types give deterministic
+    /// encoding within this release. Secret bytes are never included.
+    #[must_use]
+    pub fn confirmation_digest(&self) -> String {
+        hash(
+            format!(
+                "{:?}\n{:?}\n{:?}\n{}",
+                self.facts,
+                self.request,
+                self.secret_hashes,
+                self.plan.text()
+            )
+            .as_bytes(),
+        )
+    }
+}
 impl std::fmt::Debug for Prepared {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Prepared")
@@ -98,18 +116,21 @@ fn command(system: &dyn System, program: Program, args: &[&str]) -> Result<Strin
     } else {
         SYSTEMCTL_TIMEOUT
     };
-    let out = system
-        .run(
-            program,
-            &args.iter().map(|s| (*s).into()).collect::<Vec<_>>(),
-            timeout,
-        )
-        .map_err(|_| {
-            Refusal::CommandFailed(format!(
-                "{program_path} {} failed (execution error)",
-                args.join(" ")
-            ))
-        })?;
+    let mut arguments: Vec<String> = args.iter().map(|s| (*s).into()).collect();
+    if program == Program::Systemctl && matches!(args.first(), Some(&"enable" | &"daemon-reload")) {
+        arguments.push("--job-mode=replace".into());
+    }
+    let out = system.run(program, &arguments, timeout).map_err(|error| {
+        let detail = if matches!(error, crate::system::ExecError::Timeout { .. }) {
+            "timed out"
+        } else {
+            "execution error"
+        };
+        Refusal::CommandFailed(format!(
+            "{program_path} {} failed ({detail})",
+            args.join(" ")
+        ))
+    })?;
     if out.status != Some(0) {
         return Err(Refusal::CommandFailed(format!(
             "{program_path} {} failed (exit {})",

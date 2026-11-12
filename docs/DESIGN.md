@@ -394,7 +394,7 @@ the start of M2.
 | `ipnet` | core | prefixes |
 | `clap` (derive), `clap_complete`, `clap_mangen` | CLI | command tree, completions, man pages |
 | `dialoguer`, `comfy-table`, `anstream` | CLI | prompts and pickers, TTY tables, TTY-aware colour (§11) |
-| `rustix` | sys | `setns`, credential drop, sockopts, without first-party unsafe |
+| `rustix` | sys, CLI deploy | `setns`, credential drop, sockopts; nonblocking deploy stdin and process-group termination on Linux/macOS, without first-party unsafe |
 | `socket2` | sys, edge | `bind_device`, `IP_FREEBIND` |
 | `ureq` (rustls) | CLI, delivery child | sync HTTPS for API client, sinks, heartbeat |
 | `tokio` (rt, net, time), `hyper`, `hyper-util` | edge only | concurrent DNS and HTTP |
@@ -1367,6 +1367,15 @@ the same stream. The gateway validates the operation and its arguments with
 the same types as the local socket. Tests feed quotes, newlines, `$(…)`,
 backticks, leading hyphens and malformed identifiers through every
 operation.
+
+M2 fresh-host exception: deploy uses one constant shell dispatcher that executes
+`/usr/local/bin/scupper remote` when installed, or a constant Python 3 bootstrap
+otherwise. Both receive the same bounded JSON envelope on stdin. The bootstrap
+accepts only prepare/stage, verifies the archive and its complete manifest before
+writing members, and never installs configuration or starts services. Python 3
+is required only on a fresh host. M2 release archives use deterministic stored
+DEFLATE blocks in gzip (larger archives, no compressor-version dependency);
+`MANIFEST` hashes all payload members, excluding itself. M2 has no edge binary.
 
 ### API authentication (ADR 0007)
 
@@ -2495,6 +2504,55 @@ itself, upgrades go through Homebrew.
 In M2, `deploy --host ADDR` exists without the rollback timer (steps 1-3
 and 5): enough for the migration to a fresh host, where the old host is the
 rollback. Confirm-or-rollback, `upgrade` and the guard unit arrive in M6.
+M2 recovery remains manual. Before replacing either binary, Switch durably
+writes both existing binaries to their `.prev` paths, then replaces the pair
+back to back. Switch failures carry typed outcomes through reserved exit statuses:
+`RefusedNoChange` (20), `FailedAfterRename` (21), and `Unknown` (22).
+Only a failure after an actual binary rename, or an unknown outcome after the
+child or SSH connection is lost, prints these commands on the gateway and
+again on the client with the deploy identifier. Precondition/digest refusals,
+backup failures before a live rename, and failed restarts for empty or unit-only
+plans report "refused, nothing changed" with the reason and omit recovery commands:
+
+```sh
+install -m 0755 /usr/local/bin/scupperd.prev /usr/local/bin/scupperd
+install -m 0755 /usr/local/bin/scupper.prev /usr/local/bin/scupper
+systemctl restart scupperd
+```
+
+Prepare reports installed only when the version store has a head and both
+systemd units exist. Binary-only hosts take the fresh-host path: copy, verify,
+and print the staged `scupper install --binaries DIR` command; no install or
+service start runs automatically. Upgrading a gateway without the `remote`
+subcommand requires a manual copy of the matching release archive, verification
+of SHA256SUMS and MANIFEST, extraction, and running that release's
+`scupper install --binaries DIR`. The first release with the `remote` subcommand
+is scupper 0.1.1; the capability failure message names the shipping package
+version at compile time.
+
+Plan runs the verified staged installer and returns the displayed plan with a
+SHA-256 digest binding its full observed preconditions and desired inputs.
+Switch re-prepares with the same staged installer and refuses without changes
+if the digest differs from the one confirmed by the operator. The installer's
+own precondition check still runs before applying. There is no deploy lock in
+M2; concurrent operators must still coordinate.
+
+SSH and SCP use ConnectTimeout=15, ServerAliveInterval=15 and
+ServerAliveCountMax=4, with ControlMaster=no and ControlPath=none to disable
+connection sharing from the operator's SSH config. Client wall-clock budgets are
+60 seconds for discovery and preparation, 180 seconds for stage, plan and check, 480 seconds for switch,
+and 60 seconds plus archive size at 128 KiB/s (rounded up) for copy. The gateway
+dispatcher bounds capability detection to 15 seconds, bootstrap to 120 seconds,
+and remote dispatch to 420 seconds. Staged plan and switch children are bounded
+to 150 and 360 seconds. Each systemctl child has a deadline (30 seconds for
+reload, 120 seconds for each unit restart, exceeding TimeoutStartSec=90) and
+uses explicit job-mode=replace. Timeout diagnostics name the step and possible
+gateway state; a switch timeout includes manual recovery commands.
+
+M2 still restarts scupperd unconditionally, even for an empty plan; scupper-net
+restarts only when its unit content changes. Confirmation displays the install
+plan, without a separate config diff. Archive unit files are integrity-checked;
+the staged installer's compiled-in templates supply the installed unit bytes.
 
 ### `scupper gateway create` (ADR 0027)
 

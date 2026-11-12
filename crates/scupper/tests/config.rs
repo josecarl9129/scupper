@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 //! Configuration transactions and namespace rule previews, without host mutations.
 #![cfg(feature = "testing")]
 #![allow(clippy::unwrap_used)]

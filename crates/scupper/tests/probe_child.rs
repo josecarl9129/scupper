@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 //! Real CLI process checks that require neither root nor a foreign namespace.
 use scupper_sys::probe_child::{ProbeOutcome, ProbeResult};
 use std::{
