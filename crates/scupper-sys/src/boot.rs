@@ -33,6 +33,8 @@ use std::{collections::BTreeMap, path::Path};
 pub enum BootStep {
     /// 0: acquire the global writer lock, with a bounded wait.
     Lock = 0,
+    /// 8: load modules before Inputs; existing checkpoint IDs stay stable.
+    Modules = 8,
     /// 1: resolve all inputs and open or create the foreign namespace.
     Inputs = 1,
     /// 2: close forwarding and verify hardening.
@@ -87,10 +89,27 @@ pub struct BootReport {
     pub owned_links: BTreeMap<String, u32>,
 }
 impl BootReport {
-    /// True only after every checkpoint, including durable publication, succeeded.
+    /// True only after all checkpoints succeeded in order, including publication.
+    /// Accept the pre-module eight-step writer for seamless upgrade handoffs;
+    /// new reports must have Modules immediately after Lock and before Inputs.
     #[must_use]
     pub fn succeeded(&self) -> bool {
-        self.steps.len() == 8 && self.steps.iter().all(|step| step.error.is_none())
+        let legacy = [
+            BootStep::Lock,
+            BootStep::Inputs,
+            BootStep::Close,
+            BootStep::Ruleset,
+            BootStep::Links,
+            BootStep::Routes,
+            BootStep::Forwarding,
+            BootStep::Record,
+        ];
+        let steps = || self.steps.iter().map(|step| step.step);
+        self.steps.iter().all(|step| step.error.is_none())
+            && (steps().eq(legacy)
+                || steps().eq([BootStep::Lock, BootStep::Modules]
+                    .into_iter()
+                    .chain(legacy.into_iter().skip(1))))
     }
 }
 
@@ -577,6 +596,21 @@ pub(crate) fn save_report_at(run_root: &Path, report: &BootReport) -> Result<()>
 #[allow(clippy::too_many_lines)] // Keep the ordered build and its failure boundaries together.
 fn boot_locked(deps: &BootDeps<'_>, mut report: BootReport, open_quarantined: bool) -> BootReport {
     if !step(&mut report, deps, BootStep::Lock, false, || Ok(())) {
+        return report;
+    }
+    if !step(&mut report, deps, BootStep::Modules, false, || {
+        for module in scupper_core::install::BOOT_MODULES {
+            execute(
+                deps,
+                ExecTarget::Host,
+                Program::Modprobe,
+                &strings(&[module]),
+                None,
+            )
+            .map_err(|error| format!("required kernel module {module}: {error}"))?;
+        }
+        Ok(())
+    }) {
         return report;
     }
     let mut owned_links = BTreeMap::new();

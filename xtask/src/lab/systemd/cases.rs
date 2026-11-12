@@ -93,6 +93,7 @@ impl SystemdLab {
         if case == "L9" {
             for point in [
                 "0",
+                "8",
                 "1",
                 "2",
                 "3",

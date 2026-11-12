@@ -52,6 +52,7 @@ impl Link {
     }
 }
 pub struct Kernel {
+    pub conntrack_loaded: Cell<bool>,
     pub exists: Cell<bool>,
     pub host: RefCell<BTreeMap<String, Link>>,
     pub ns: RefCell<BTreeMap<String, Link>>,
@@ -73,6 +74,7 @@ pub struct Kernel {
 impl Kernel {
     pub fn new() -> Self {
         Self {
+            conntrack_loaded: Cell::new(false),
             exists: Cell::new(false),
             host: RefCell::default(),
             ns: RefCell::new(BTreeMap::from([("lo".into(), Link::new("loopback"))])),
@@ -177,7 +179,22 @@ impl Kernel {
         }
         let mut stdout = String::new();
         let map = if ns { &self.ns } else { &self.host };
+        if p == Program::Sysctl && words.contains("net.netfilter.") && !self.conntrack_loaded.get()
+        {
+            return Ok(ExecOutput {
+                status: Some(1),
+                stdout: String::new(),
+                stderr: "sysctl path absent before modprobe".into(),
+            });
+        }
         match p {
+            Program::Modprobe => {
+                assert!(!ns);
+                if a(0) == "nf_conntrack" {
+                    self.conntrack_loaded.set(true);
+                }
+            }
+
             Program::Ip if a(0) == "netns" => {
                 self.exists.set(true);
                 self.values
@@ -437,8 +454,12 @@ impl System for Kernel {
         t: ExecTarget<'_>,
         p: Program,
         a: &[String],
-        _: Duration,
+        timeout: Duration,
     ) -> Result<ExecOutput, ExecError> {
+        if p == Program::Modprobe {
+            assert_eq!(timeout, scupper_sys::system::EXEC_TIMEOUT);
+            assert_eq!(a.len(), 1);
+        }
         self.exec(t, p, a, None)
     }
     fn run_with_stdin(

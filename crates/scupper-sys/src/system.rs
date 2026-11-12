@@ -50,6 +50,8 @@ pub enum Program {
     Tc,
     /// Enter a held network namespace.
     Nsenter,
+    /// Load required kernel modules.
+    Modprobe,
     /// Namespace sysctl access.
     Sysctl,
     /// Connection tracking maintenance.
@@ -73,6 +75,7 @@ impl Program {
             Self::Scupper => scupper_core::install::SCUPPER_FILE,
             Self::Cat => "/usr/bin/cat",
             Self::Nsenter => "/usr/bin/nsenter",
+            Self::Modprobe => "/usr/sbin/modprobe",
             Self::Sysctl => "/usr/sbin/sysctl",
             Self::Conntrack => "/usr/sbin/conntrack",
             Self::Wg => "/usr/bin/wg",
@@ -104,6 +107,7 @@ pub struct Programs {
     systemctl: PathBuf,
     unshare: PathBuf,
     nsenter: PathBuf,
+    modprobe: PathBuf,
     sysctl: PathBuf,
     conntrack: PathBuf,
 }
@@ -126,6 +130,7 @@ impl Default for Programs {
             systemctl: Program::Systemctl.default_path().into(),
             unshare: Program::Unshare.default_path().into(),
             nsenter: Program::Nsenter.default_path().into(),
+            modprobe: Program::Modprobe.default_path().into(),
             sysctl: Program::Sysctl.default_path().into(),
             conntrack: Program::Conntrack.default_path().into(),
         }
@@ -158,6 +163,7 @@ impl Programs {
                 Program::Scupper => &mut paths.scupper,
                 Program::Cat => &mut paths.cat,
                 Program::Nsenter => &mut paths.nsenter,
+                Program::Modprobe => &mut paths.modprobe,
                 Program::Sysctl => &mut paths.sysctl,
                 Program::Conntrack => &mut paths.conntrack,
                 Program::Wg => &mut paths.wg,
@@ -185,6 +191,7 @@ impl Programs {
             Program::Scupper => &self.scupper,
             Program::Cat => &self.cat,
             Program::Nsenter => &self.nsenter,
+            Program::Modprobe => &self.modprobe,
             Program::Sysctl => &self.sysctl,
             Program::Conntrack => &self.conntrack,
             Program::Wg => &self.wg,
@@ -1527,6 +1534,7 @@ mod tests {
             Program::Nsenter,
             Program::Sysctl,
             Program::Conntrack,
+            Program::Modprobe,
         ] {
             assert!(Programs::new([(program, "relative")]).is_err());
             assert_eq!(

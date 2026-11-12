@@ -105,6 +105,16 @@ impl Fixture {
     }
 }
 
+fn assert_only_module_calls(f: &Fixture) {
+    assert!(
+        f.kernel
+            .calls
+            .borrow()
+            .iter()
+            .all(|call| call.starts_with("host Modprobe "))
+    );
+}
+
 #[test]
 fn fresh_and_adopt_call_goldens() {
     let fixture = Fixture::new();
@@ -130,7 +140,7 @@ fn fresh_and_adopt_call_goldens() {
     );
     let persisted: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
-    assert_eq!(persisted["steps"].as_array().unwrap().len(), 8);
+    assert_eq!(persisted["steps"].as_array().unwrap().len(), 9);
     assert_eq!(persisted["applied_version"], 1);
     let identities =
         scupper_core::parse::parse_ip_link(&Kernel::json_links(&fixture.kernel.ns.borrow()))
@@ -194,6 +204,7 @@ fn fs9_every_command_and_checkpoint_prefix_is_closed_and_retry_completes() {
     }
     for point in [
         BootStep::Lock,
+        BootStep::Modules,
         BootStep::Inputs,
         BootStep::Close,
         BootStep::Ruleset,
@@ -281,7 +292,7 @@ fn leftovers_secrets_latch_and_absent_state_fail_closed() {
     let report = f.run(None);
     assert!(!report.succeeded());
     assert_eq!(report.steps.last().unwrap().step, BootStep::Inputs);
-    assert!(f.kernel.calls.borrow().is_empty());
+    assert_only_module_calls(&f);
     let f = Fixture::new();
     f.state(|s| {
         s.quarantine = Some(Quarantine {
@@ -319,7 +330,7 @@ fn leftovers_secrets_latch_and_absent_state_fail_closed() {
         report.steps.last().unwrap().error.as_deref(),
         Some("no configuration")
     );
-    assert!(f.kernel.calls.borrow().is_empty());
+    assert_only_module_calls(&f);
 }
 #[test]
 fn sysctl_mismatch_and_canonical_mismatch_stop_before_links() {
@@ -494,11 +505,11 @@ fn invalid_secret_and_corrupt_render_fail_before_kernel_changes() {
         .path();
     fs::write(secret, "invalid key\n").unwrap();
     assert!(!f.run(None).succeeded());
-    assert!(f.kernel.calls.borrow().is_empty());
+    assert_only_module_calls(&f);
     let f = Fixture::new();
     fs::write(f.root.path.join("rendered/000001.nft"), "flush ruleset\n").unwrap();
     assert!(!f.run(None).succeeded());
-    assert!(f.kernel.calls.borrow().is_empty());
+    assert_only_module_calls(&f);
 }
 
 #[test]
@@ -805,7 +816,7 @@ fn failed_boot_replaces_prior_success_even_when_inputs_cannot_be_resolved() {
     assert!(!f.run(None).succeeded());
     let saved: serde_json::Value =
         serde_json::from_slice(&fs::read(f.root.path.join("run/boot.json")).unwrap()).unwrap();
-    assert_eq!(saved["steps"][1]["error"], "no configuration");
+    assert_eq!(saved["steps"][2]["error"], "no configuration");
 }
 
 #[test]
@@ -830,6 +841,7 @@ fn writer_diagnostics_are_bounded_sanitized_and_secret_stdin_is_redacted() {
 fn fs9b_live_rebuild_checkpoint_prefixes_are_closed_and_retry_completes() {
     for point in [
         BootStep::Lock,
+        BootStep::Modules,
         BootStep::Inputs,
         BootStep::Close,
         BootStep::Ruleset,
@@ -2472,5 +2484,109 @@ fn host_link_inspection_keeps_status_and_sanitized_bounded_stderr() {
         assert!(error.contains("inspection failed "), "{error}");
         assert!(!error.chars().any(char::is_control));
         assert!(error.len() < 2200);
+    }
+}
+
+#[test]
+fn modules_precede_sysctls_on_a_cold_host_and_failures_name_the_module() {
+    let f = Fixture::new();
+    assert!(!f.kernel.conntrack_loaded.get());
+    let report = f.run(None);
+    assert!(report.succeeded(), "{report:?}");
+    let calls = f.kernel.calls.borrow();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.contains("Modprobe"))
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["host Modprobe nf_conntrack", "host Modprobe wireguard"]
+    );
+    let first_sysctl = calls.iter().position(|c| c.contains("Sysctl")).unwrap();
+    for module in scupper_core::install::BOOT_MODULES {
+        let position = calls
+            .iter()
+            .position(|c| c == &format!("host Modprobe {module}"))
+            .unwrap();
+        assert!(position < first_sysctl);
+    }
+    drop(calls);
+    for module in scupper_core::install::BOOT_MODULES {
+        for diagnostic in ["module unavailable", "missing-binary"] {
+            let f = Fixture::new();
+            *f.kernel.failure.borrow_mut() =
+                Some((Program::Modprobe, (*module).into(), diagnostic.into()));
+            let report = f.run(None);
+            assert!(!report.succeeded());
+            let last = report.steps.last().unwrap();
+            assert_eq!(last.step, BootStep::Modules);
+            assert!(last.error.as_ref().unwrap().contains(module));
+            assert!(!f.kernel.exists.get());
+            assert!(!f.kernel.calls.borrow().iter().any(|c| c.contains("Sysctl")));
+            let saved: BootReport =
+                serde_json::from_slice(&fs::read(f.root.path.join("run/boot.json")).unwrap())
+                    .unwrap();
+            assert_eq!(saved.steps, report.steps);
+        }
+    }
+}
+
+#[test]
+fn upgraded_daemon_restarts_adopt_legacy_boot_file_without_closing_or_rebuilding() {
+    use scupper_core::planner::Step;
+    use scupper_sys::reconcile::Escalation;
+
+    let fixture = Fixture::new();
+    let running = fixture.run(None);
+    assert!(running.succeeded());
+    // Model the real kernel's propagation of all.forwarding=1 to per-link gates;
+    // this fake stores each sysctl independently. Handshakes are already fresh.
+    for name in fixture.kernel.ns.borrow().keys() {
+        for family in ["ipv4", "ipv6"] {
+            fixture
+                .kernel
+                .values
+                .borrow_mut()
+                .insert(format!("net.{family}.conf.{name}.forwarding"), "1".into());
+        }
+    }
+    let mut legacy: BootReport =
+        serde_json::from_str(include_str!("fixtures/boot-pre-modules.json")).unwrap();
+    assert_eq!(legacy.owned_links, running.owned_links);
+    // The only fixture substitution is the identity of this run's held namespace.
+    legacy.netns = running.netns;
+    let bytes = serde_json::to_vec(&legacy).unwrap();
+    let run_root = fixture.root.path.join("run");
+    fs::write(run_root.join("boot.json"), &bytes).unwrap();
+
+    for _ in 0..2 {
+        fixture.kernel.calls.borrow_mut().clear();
+        let tick = scupper_sys::daemon::testing::restart_tick(BootDeps {
+            system: &fixture.kernel,
+            namespace: &fixture.kernel,
+            state_root: &fixture.root.path,
+            config_root: &fixture.root.path,
+            run_root: &run_root,
+            hook: None,
+            secret_owner: rustix::process::geteuid().as_raw(),
+        })
+        .unwrap();
+        assert!(tick.complete, "{tick:?}");
+        assert!(!tick.steps.contains(&Step::ForwardingOff), "{tick:?}");
+        assert!(!tick.escalations.contains(&Escalation::RebuildRequired));
+        assert!(!tick.escalations.contains(&Escalation::ReinitializeRequired));
+        let calls = fixture.kernel.calls.borrow();
+        assert!(
+            calls
+                .iter()
+                .all(|call| !["Modprobe", "Sysctl -w", "Ip netns add", "Nft -f"]
+                    .iter()
+                    .any(|write| call.contains(write))),
+            "{calls:?}"
+        );
+        for key in ["net.ipv4.ip_forward", "net.ipv6.conf.all.forwarding"] {
+            assert_eq!(fixture.kernel.values.borrow()[key], "1");
+        }
+        assert_eq!(fs::read(run_root.join("boot.json")).unwrap(), bytes);
     }
 }

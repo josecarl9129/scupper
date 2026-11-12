@@ -361,6 +361,7 @@ impl SystemdLab {
             "/run/scupper",
             "/usr/local/bin/scupper",
             "/usr/local/bin/scupperd",
+            "/etc/modules-load.d/scupper.conf",
             "/etc/systemd/system/scupper-net.service",
             "/etc/systemd/system/scupperd.service",
         ] {
@@ -738,6 +739,28 @@ impl SystemdLab {
                 }
             }
             RebootStep::StartUnits => {
+                let loaded_before = Path::new("/sys/module/nf_conntrack").exists();
+                let (unload_status, unload_output) = self.lab.runner.output(
+                    &Invocation::new("", "modprobe", &["-r", "nf_conntrack"]),
+                    None,
+                )?;
+                let loaded_after = Path::new("/sys/module/nf_conntrack").exists();
+                let namespace_absent = !Path::new("/run/netns/scupper").exists();
+                let kernel_release = fs::read_to_string("/proc/sys/kernel/osrelease")?;
+                fs::write(
+                    self.lab.artifacts.join("reboot-modules.json"),
+                    serde_json::to_vec_pretty(
+                        &serde_json::json!({"loaded_before": loaded_before, "unload_exit": unload_status.code(),
+                        "unload_output": unload_output, "loaded_after": loaded_after,
+                        "kernel_release": kernel_release.trim(),
+                        "namespace_absent_before_boot": namespace_absent,
+                        "mode": if loaded_after { "fresh-namespace-preloaded-module" } else { "fresh-namespace-cold-module" }}),
+                    )?,
+                )?;
+                if !namespace_absent {
+                    return fail("reboot simulation left a pre-existing namespace");
+                }
+
                 self.lab.runner.output(
                     &Invocation::new(
                         "",
@@ -758,6 +781,25 @@ impl SystemdLab {
                     return fail("uplink ifindex changed across reboot capture");
                 }
                 self.lab.ensure_services()?;
+                let report: serde_json::Value =
+                    serde_json::from_slice(&fs::read("/run/scupper/boot.json")?)?;
+                fs::write(
+                    self.lab.artifacts.join("reboot-modules-boot.json"),
+                    serde_json::to_vec_pretty(&report)?,
+                )?;
+                verify_module_boot(&report)?;
+                if self
+                    .lab
+                    .cmd(
+                        "scupper",
+                        "sysctl",
+                        &["-n", "net.netfilter.nf_conntrack_tcp_loose"],
+                    )?
+                    .trim()
+                    != "0"
+                {
+                    return fail("reboot hardening depended on previous conntrack sysctl state");
+                }
                 self.systemctl(&["start", "scupperd"])?;
                 // A disconnected exit has no socket. Record only live ports.
                 let port: u16 = self
@@ -953,6 +995,30 @@ fn site_with_clients(
     Ok(site)
 }
 
+fn verify_module_boot(report: &serde_json::Value) -> Result<()> {
+    let steps = report["steps"].as_array().ok_or("missing boot steps")?;
+    let expected = [
+        "Lock",
+        "Modules",
+        "Inputs",
+        "Close",
+        "Ruleset",
+        "Links",
+        "Routes",
+        "Forwarding",
+        "Record",
+    ];
+    if report["adopted"] != false
+        || steps.len() != expected.len()
+        || steps.iter().zip(expected).any(|(step, name)| {
+            step["step"] != name || step.get("error") != Some(&serde_json::Value::Null)
+        })
+    {
+        return fail("reboot did not load modules successfully before namespace sysctls");
+    }
+    Ok(())
+}
+
 fn dispatch_reboot_steps(
     steps: &[RebootStep],
     mut execute: impl FnMut(RebootStep) -> Result<()>,
@@ -983,6 +1049,32 @@ fn uplink_policy(markers: &[String], ports: &[u16], current_port: u16) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reboot_rejects_missing_failed_or_late_module_evidence() {
+        let names = [
+            "Lock",
+            "Modules",
+            "Inputs",
+            "Close",
+            "Ruleset",
+            "Links",
+            "Routes",
+            "Forwarding",
+            "Record",
+        ];
+        let mut report = serde_json::json!({"adopted": false, "steps": names.map(|name| serde_json::json!({"step": name, "error": null}))});
+        assert!(verify_module_boot(&report).is_ok());
+        report["adopted"] = true.into();
+        assert!(verify_module_boot(&report).is_err());
+        report["adopted"] = false.into();
+        report["steps"][1]["error"] = "missing nf_conntrack".into();
+        assert!(verify_module_boot(&report).is_err());
+        report["steps"][1]["error"] = serde_json::Value::Null;
+        report["steps"].as_array_mut().unwrap().swap(1, 2);
+        assert!(verify_module_boot(&report).is_err());
+        report["steps"].as_array_mut().unwrap().remove(2);
+        assert!(verify_module_boot(&report).is_err());
+    }
     #[test]
     fn adding_clients_preserves_installed_gateway_and_secrets() {
         let mut installed = parse_site(SITE).unwrap();

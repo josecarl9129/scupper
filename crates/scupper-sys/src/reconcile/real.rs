@@ -650,6 +650,7 @@ mod tests {
             owned_links: std::collections::BTreeMap::from([("wg0".into(), 3)]),
             steps: [
                 BootStep::Lock,
+                BootStep::Modules,
                 BootStep::Inputs,
                 BootStep::Close,
                 BootStep::Ruleset,

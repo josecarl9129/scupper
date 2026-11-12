@@ -6,6 +6,18 @@ use std::{
 
 /// Manual recovery after a deployment may have replaced either executable.
 pub const RESTORE_COMMANDS: &str = "install -m 0755 /usr/local/bin/scupperd.prev /usr/local/bin/scupperd\ninstall -m 0755 /usr/local/bin/scupper.prev /usr/local/bin/scupper\nsystemctl restart scupperd";
+/// Modules loaded before namespace hardening: `nf_conntrack` provides the
+/// conntrack sysctls; `wireguard` is defensive (link creation can autoload it).
+/// nft autoloads its own dependencies. Do not list nft expression modules:
+/// expressions can move into `nf_tables` itself (e.g. `nft_counter` on Linux 6.x).
+pub const BOOT_MODULES: &[&str] = &["nf_conntrack", "wireguard"];
+/// Early systemd module configuration managed by install.
+pub const MODULES_FILE: &str = "/etc/modules-load.d/scupper.conf";
+/// Exact modules-load.d contents, derived from the boot list.
+#[must_use]
+pub fn modules_config() -> String {
+    BOOT_MODULES.join("\n") + "\n"
+}
 /// Required distribution packages, in the order used in diagnostics.
 pub const PACKAGES: [&str; 4] = ["wireguard-tools", "nftables", "iproute2", "conntrack"];
 /// Unprivileged helper accounts; M2 has no edge account.
@@ -73,7 +85,7 @@ pub const STORE_FILE_MODE: u32 = 0o640;
 /// Executable mode.
 pub const BINARY_MODE: u32 = 0o755;
 /// Installation directories in parent-first order.
-pub const DIRECTORIES: [(&str, u32); 8] = [
+pub const DIRECTORIES: [(&str, u32); 9] = [
     (CONFIG_ROOT, PRIVATE_DIR_MODE),
     (SECRETS_ROOT, PRIVATE_DIR_MODE),
     (WG_ROOT, PRIVATE_DIR_MODE),
@@ -82,6 +94,7 @@ pub const DIRECTORIES: [(&str, u32); 8] = [
     (STORE_CONFIG_ROOT, PRIVATE_DIR_MODE),
     (VERSIONS_ROOT, PRIVATE_DIR_MODE),
     (RENDERED_ROOT, PRIVATE_DIR_MODE),
+    ("/etc/modules-load.d", 0o755),
 ];
 /// Executables installed as one atomic replacement each.
 pub const BINARIES: [&str; 2] = ["scupper", "scupperd"];

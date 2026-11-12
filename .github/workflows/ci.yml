@@ -307,6 +307,23 @@ jobs:
           sudo timeout 30 systemctl start systemd-udevd systemd-networkd
       - name: Run installed-unit case
         run: sudo timeout --kill-after=150 1380 target/systemd-bin/xtask systemd-lab --case ${{ matrix.case }} --binaries target/systemd-bin --artifacts systemd-lab-out
+      - name: Report reboot module evidence
+        if: always()
+        env:
+          LAB_RUNNER: ${{ matrix.runner }}
+          LAB_CASE: ${{ matrix.case }}
+        run: |
+          sudo --preserve-env=GITHUB_STEP_SUMMARY,LAB_RUNNER,LAB_CASE python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          reports = sorted(Path('systemd-lab-out').rglob('reboot-modules.json'))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write(f"### Reboot modules: {os.environ['LAB_RUNNER']} / {os.environ['LAB_CASE']}\n\n")
+              if not reports:
+                  summary.write('No reboot module evidence collected; see case diagnostics.\n')
+              for path in reports:
+                  summary.write(f'{path}\n\n```json\n{json.dumps(json.loads(path.read_text()), indent=2)}\n```\n\n')
+          PY
       - name: Unit test actual enabled ufw dumps in both UDP directions
         if: ${{ matrix.case == 'V-13' }}
         env:

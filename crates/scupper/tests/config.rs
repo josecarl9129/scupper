@@ -492,7 +492,7 @@ fn machine_output_never_prompts_for_config_writes() {
 }
 
 #[test]
-fn boot_is_hidden_root_only_and_reports_input_failure_without_kernel_writes() {
+fn boot_is_hidden_root_only_and_reports_input_failure_after_modules() {
     let mut h = Harness::new();
     let (code, help, _) = h.run(&["--help"]);
     assert_eq!(code, 0);
@@ -507,10 +507,23 @@ fn boot_is_hidden_root_only_and_reports_input_failure_without_kernel_writes() {
     let (code, out, err) = h.run(&["boot"]);
     assert_eq!(code, 1, "{out} {err}");
     let report: serde_json::Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(report["steps"].as_array().unwrap().len(), 2);
-    assert_eq!(report["steps"][1]["step"], "Inputs");
-    assert_eq!(report["steps"][1]["error"], "no configuration");
-    assert!(h.system.calls.borrow().is_empty());
+    assert_eq!(report["steps"].as_array().unwrap().len(), 3);
+    assert_eq!(report["steps"][1]["step"], "Modules");
+    assert_eq!(report["steps"][2]["step"], "Inputs");
+    assert_eq!(report["steps"][2]["error"], "no configuration");
+    assert_eq!(
+        h.system
+            .calls
+            .borrow()
+            .iter()
+            .map(|(ns, p, args)| {
+                assert!(!ns);
+                assert_eq!(*p, scupper_sys::system::Program::Modprobe);
+                args[0].clone()
+            })
+            .collect::<Vec<_>>(),
+        scupper_core::install::BOOT_MODULES
+    );
 }
 
 #[test]

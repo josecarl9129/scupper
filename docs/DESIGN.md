@@ -2442,7 +2442,13 @@ firewall or host sysctls (except the optional `90-scupper.conf`).
    if the store already names one, a missing key file is an error, so a
    re-run never silently changes the client-facing identity or use a file the operator placed; `exit import` per provider
    file; tell the operator to delete downloaded provider files.
-7. Units, `systemctl enable --now scupper-net scupperd scupper-edge`.
+7. Atomically install root-owned mode 0644 `/etc/modules-load.d/scupper.conf`
+   from the shared boot module list: exactly `nf_conntrack` and `wireguard`.
+   Conntrack must precede its sysctls; WireGuard is defensive because link creation
+   can autoload it. nft autoloads its own dependencies; expression modules must not
+   be listed (for example, counter is part of `nf_tables` on Linux 6.x).
+   Install checks content, ownership and mode; unchanged reruns
+   do no writes. Then units, `systemctl enable --now scupper-net scupperd scupper-edge`.
    Release the writer lock after durable mutations and before daemon-reload
    or enabling services: `scupper boot` needs that same lock. Install waits up
    to 120 seconds for `systemctl enable --now`, beyond the 90-second unit start bound.
@@ -2492,6 +2498,12 @@ the normal startup path.
 ### `scupper boot` (stops at the first failure; every prefix is closed)
 
 0. Take the writer lock (ADR 0028).
+8. Load the shared install module list with bounded host `modprobe <module>`
+   commands before Inputs or any sysctl. Missing modules stop boot with the
+   module named in `boot.json`. This also supports older installs and manual
+   starts without the modules-load file. Checkpoint IDs 0–7 remain stable;
+   execution order is Lock, Modules (8), Inputs (1), Close (2), then 3–7.
+   The two commands each have a 3 s deadline (at most 6 s under the writer lock).
 1. If `/run/netns/scupper` exists and holds our links: adopt (verify only).
    Else `ip netns add scupper`; `lo` up.
 2. In the namespace: forwarding 0 (v4, v6); all hardening sysctls (§5.4);
@@ -2508,6 +2520,15 @@ the normal startup path.
    inside WireGuard until the first handshake) or `unreachable`.
 6. Forwarding 1 unless latched or Disconnected; re-apply hardening; read back.
 7. Write `/run/scupper/boot.json` (step results); scupperd logs `Boot`.
+
+Successful handoffs accept both the pre-module eight-step report (Lock, Inputs,
+Close, Ruleset, Links, Routes, Forwarding, Record) and the new report with a
+successful Modules step immediately after Lock. Both require every step exactly
+once in order, without errors. Thus a binary swap can adopt a healthy namespace
+using the previous release's report without closing forwarding or rebuilding.
+Namespace, applied-version and owned-link identity checks still apply. An older
+binary cannot read the new Modules variant; rolling back after a new boot report
+has been written can require a closed rebuild.
 
 Requirement "ruleset before forwarding" is met inside the namespace by
 steps 2-6. The host `ip_forward` is irrelevant to the client path. The v1
@@ -2961,6 +2982,18 @@ boot retry and apply outcomes without request contents or destinations.
 The reboot simulation stops units, deletes namespace links and the named namespace,
 asserts and removes only scupper-named root leftovers (unexpected leftovers fail),
 clears runtime state and only lab conntrack entries, and preserves durable state.
+Before starting units it records whether `nf_conntrack` is loaded and attempts
+`modprobe -r nf_conntrack`. It never pre-creates a namespace: `scupper-net` must
+exercise the real fresh-namespace path whether unloading succeeds or conntrack
+remains pinned. Both modes require boot.json to show Modules succeeded immediately
+after Lock, before Inputs, and that boot did not adopt a namespace; they then
+verify the sysctl is 0 before starting scupperd. Artifacts retain the kernel
+release, unload exit/output, module state, namespace absence and first boot report.
+The deterministic cold-module reproduction is in the fake-kernel unit test.
+Runners may pin conntrack (for example through Docker NAT); in that case the lab
+proves module commands succeeded on the real kernel and fresh namespace creation,
+not reproduction of the missing-module sysctl failure. Runner unload behaviour
+must be measured in CI, not inferred from the passing sysctl check.
 It holds `up0` down until `scupper-net` completes, restores lab routes, then starts
 scupperd, retaining the same capture ifindex. L9 proves udev initialization and
 networkd observation, records per-point timings and asserts recovery removed host

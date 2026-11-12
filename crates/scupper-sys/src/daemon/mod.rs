@@ -1704,14 +1704,24 @@ mod tests {
         let held = Arc::new(crate::netns::testing::handle().unwrap());
         let (dev, ino) = held.identity();
         let report = BootReport {
-            steps: vec![
-                boot::StepResult {
-                    step: boot::BootStep::Lock,
-                    error: None,
-                    adopted: true
-                };
-                8
-            ],
+            steps: [
+                boot::BootStep::Lock,
+                boot::BootStep::Modules,
+                boot::BootStep::Inputs,
+                boot::BootStep::Close,
+                boot::BootStep::Ruleset,
+                boot::BootStep::Links,
+                boot::BootStep::Routes,
+                boot::BootStep::Forwarding,
+                boot::BootStep::Record,
+            ]
+            .into_iter()
+            .map(|step| boot::StepResult {
+                step,
+                error: None,
+                adopted: true,
+            })
+            .collect(),
             applied_version: Some(1),
             netns: Some(boot::NamespaceIdentity { dev, ino }),
             owned_links: std::collections::BTreeMap::from([
@@ -1855,6 +1865,27 @@ pub mod testing {
         Instant, Options, Runtime, StartupRead, UnixSeconds, control, io, mpsc, notify, pending,
         probes, unix,
     };
+    /// Initialize through the production boot-file handoff and run the first
+    /// reconciler tick, as on a daemon restart after a binary swap.
+    /// # Errors
+    /// Returns startup or audit persistence failures.
+    pub fn restart_tick(deps: BootDeps<'_>) -> io::Result<crate::reconcile::TickReport> {
+        let options = Options {
+            state_root: deps.state_root.into(),
+            config_root: deps.config_root.into(),
+            run_root: deps.run_root.into(),
+            probe_binary: deps.run_root.join("unused-probe"),
+        };
+        let mut runtime = runtime(deps, &options)?;
+        let report = runtime
+            .running
+            .as_mut()
+            .ok_or_else(|| io::Error::other("no reconciler after restart"))?
+            .0
+            .tick();
+        runtime.shutdown();
+        Ok(report)
+    }
     /// Run the daemon's fresh full check and its production alert projection.
     /// # Errors
     /// Returns fixture or observation failures.

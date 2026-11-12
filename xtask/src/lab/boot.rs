@@ -288,7 +288,10 @@ impl Lab {
     }
     pub(super) fn supervised_boot_cases(&mut self, case: &str) -> Result<()> {
         let points: Vec<String> = match case {
-            "L9" => (0_u8..=7).map(|n| n.to_string()).collect(),
+            "L9" => [0_u8, 8, 1, 2, 3, 4, 5, 6, 7]
+                .into_iter()
+                .map(|n| n.to_string())
+                .collect(),
             "L9b" => (1_u8..=6).map(|n| n.to_string()).collect(),
             "L9-host-link" => vec!["link-add-wg0".into(), "link-add-ex-ch1".into()],
             _ => return fail("unknown boot crash group"),
@@ -406,7 +409,7 @@ impl Lab {
             return fail(format!("L9 did not kill boot at {point}: {status}"));
         }
         let exists = fs::symlink_metadata("/run/netns/scupper").is_ok();
-        let expected_exists = live || point != "0";
+        let expected_exists = live || !matches!(point, "0" | "8");
         if exists != expected_exists {
             return fail(format!(
                 "L9 {point}: namespace exists={exists}, expected={expected_exists}"

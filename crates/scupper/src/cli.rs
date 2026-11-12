@@ -50,7 +50,7 @@ enum Command {
     Boot {
         /// Test-only process kill after a numbered checkpoint.
         #[cfg(feature = "testing")]
-        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=7))]
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=8))]
         stop_after: Option<u8>,
         /// Test-only process kill between host link creation and movement.
         #[cfg(feature = "testing")]
