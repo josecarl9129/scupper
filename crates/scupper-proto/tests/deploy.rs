@@ -10,6 +10,9 @@ fn all_operations_are_strictly_validated() {
         if op == "Stage" {
             args["sha256"] = "0".repeat(64).into();
         }
+        if op == "Switch" {
+            args["plan_sha256"] = "0".repeat(64).into();
+        }
         let request = json!({"op":op, "args":args, "request_id":"r1"});
         assert!(read_deploy(request.to_string().as_bytes()).is_ok(), "{op}");
         for hostile in ["'", "\"", "x\ny", "$(id)", "`id`", "-option", "../x"] {
@@ -71,9 +74,27 @@ proptest::proptest! {
             for hostile in [format!("-{payload}"), format!("a\n{payload}"), format!("a'\"{payload}"), format!("$(x){payload}"), format!("`x`{payload}")] {
                 let mut args = json!({"id":hostile});
                 if op == "Stage" { args["sha256"] = "0".repeat(64).into(); }
+                if op == "Switch" { args["plan_sha256"] = "0".repeat(64).into(); }
                 let request = json!({"op":op, "args":args, "request_id":"r1"});
                 proptest::prop_assert!(read_deploy(request.to_string().as_bytes()).is_err());
             }
         }
+    }
+}
+
+#[test]
+fn switch_requires_a_strict_plan_digest() {
+    for digest in [
+        None,
+        Some("abc"),
+        Some("$(x)"),
+        Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+    ] {
+        let mut args = json!({"id":"d1"});
+        if let Some(digest) = digest {
+            args["plan_sha256"] = digest.into();
+        }
+        let request = json!({"op":"Switch","args":args,"request_id":"r1"});
+        assert!(read_deploy(request.to_string().as_bytes()).is_err());
     }
 }

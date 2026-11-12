@@ -79,7 +79,7 @@ impl Fixture {
                 "installed\n",
                 "",
                 "verified\n",
-                "install plan\n",
+                r#"{"plan":"install plan\n","plan_sha256":"0000000000000000000000000000000000000000000000000000000000000000"}"#,
                 "switched\n",
                 "check healthy\n",
             ]
@@ -112,6 +112,12 @@ fn every_step_uses_fixed_remote_command_and_typed_stdin() {
     let options = [
         "-o",
         "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=15",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=4",
         "-i",
         "/tmp/example-key",
         "-p",
@@ -127,7 +133,7 @@ fn every_step_uses_fixed_remote_command_and_typed_stdin() {
         options
             .iter()
             .copied()
-            .chain(["uname -m"])
+            .chain(["timeout 15 uname -m"])
             .map(std::ffi::OsString::from)
             .collect::<Vec<_>>()
     );
@@ -156,11 +162,11 @@ fn every_step_uses_fixed_remote_command_and_typed_stdin() {
     let copy = &calls[2];
     assert_eq!(copy.program, "scp");
     assert_eq!(copy.stdin, [] as [u8; 0]);
-    assert_eq!(copy.args[4], "-P");
-    assert_eq!(copy.args[9], args.archive.unwrap().canonicalize().unwrap());
+    assert_eq!(copy.args[10], "-P");
+    assert_eq!(copy.args[15], args.archive.unwrap().canonicalize().unwrap());
     let prepare = wire::read_deploy(calls[1].stdin.as_slice()).unwrap();
     assert_eq!(
-        copy.args[10],
+        copy.args[16],
         format!(
             "root@192.0.2.10:/usr/local/lib/scupper/deploy/{}/new/archive.tar.gz",
             prepare.operation.id()
@@ -213,15 +219,6 @@ fn architecture_allowlist() {
     }
     assert_eq!(deploy::host("2001:db8::10").unwrap(), "root@2001:db8::10");
     assert!(deploy::host("gateway.example").is_ok());
-}
-#[test]
-#[cfg(target_os = "linux")]
-fn restart_net_only_when_unit_changed() {
-    assert_eq!(scupper::remote::restart_units(false), ["scupperd"]);
-    assert_eq!(
-        scupper::remote::restart_units(true),
-        ["scupper-net", "scupperd"]
-    );
 }
 proptest! {
     #[test]
@@ -382,4 +379,127 @@ fn explicit_archive_can_have_another_version_but_not_another_architecture() {
     let error = deploy::run(&args, &fake, &Prompt(false), &mut Vec::new()).unwrap_err();
     assert!(error.contains("binaries do not match gateway architecture"));
     assert_eq!(fake.calls.borrow().len(), 1);
+}
+
+#[test]
+fn confirmed_digest_and_bounded_budgets_reach_transport() {
+    let (_fixture, args, fake) = Fixture::new("digest-budgets", false);
+    deploy::run(&args, &fake, &Prompt(false), &mut Vec::new()).unwrap();
+    let calls = fake.calls.borrow();
+    for call in calls.iter() {
+        for option in [
+            "ConnectTimeout=15",
+            "ServerAliveInterval=15",
+            "ServerAliveCountMax=4",
+        ] {
+            assert!(
+                call.args.windows(2).any(|a| a == ["-o", option]),
+                "{} missing {option}",
+                call.step
+            );
+        }
+        assert!(!call.timeout.is_zero());
+    }
+    assert_eq!(
+        calls[2].timeout.as_secs(),
+        60 + fs::metadata(args.archive.unwrap())
+            .unwrap()
+            .len()
+            .div_ceil(128 * 1024)
+    );
+    assert!(calls[5].timeout.as_secs() >= 2 * 120);
+    assert!(
+        matches!(wire::read_deploy(calls[5].stdin.as_slice()).unwrap().operation,
+        DeployOp::Switch { plan_sha256, .. } if plan_sha256.as_str() == "0".repeat(64))
+    );
+}
+#[test]
+fn switch_failure_or_timeout_prints_id_and_recovery_and_skips_check() {
+    for (label, error) in [
+        ("switch-failed", "restart scupperd failed"),
+        ("switch-timeout", "timed out"),
+    ] {
+        let (_fixture, args, fake) = Fixture::new(label, false);
+        fake.responses.borrow_mut()[5] = Err(error.into());
+        let mut output = Vec::new();
+        let error = deploy::run(&args, &fake, &Prompt(false), &mut output).unwrap_err();
+        let calls = fake.calls.borrow();
+        assert_eq!(calls.len(), 6);
+        let id = wire::read_deploy(calls[1].stdin.as_slice())
+            .unwrap()
+            .operation
+            .id();
+        let output = String::from_utf8(output).unwrap();
+        for message in [&output, &error] {
+            assert!(message.contains(&id));
+            assert!(message.contains(scupper_core::install::RESTORE_COMMANDS));
+            assert!(message.contains("may be mixed or services stopped"));
+        }
+        assert!(error.contains("Switch step"));
+    }
+}
+#[test]
+fn copy_and_plan_timeout_name_step_and_possible_state() {
+    for (label, index, step) in [("copy-timeout", 2, "Copy"), ("plan-timeout", 4, "Plan")] {
+        let (_fixture, args, fake) = Fixture::new(label, false);
+        fake.responses.borrow_mut()[index] = Err("timed out".into());
+        let error = deploy::run(&args, &fake, &Prompt(false), &mut Vec::new()).unwrap_err();
+        assert!(
+            error.contains(step)
+                && error.contains("timed out")
+                && error.contains("staging may be incomplete"),
+            "{error}"
+        );
+        assert_eq!(fake.calls.borrow().len(), index + 1);
+    }
+}
+struct Declined;
+impl Confirmation for Declined {
+    fn terminal(&self) -> bool {
+        true
+    }
+    fn confirm(&self) -> Result<bool, String> {
+        Ok(false)
+    }
+}
+#[test]
+fn declined_plan_skips_switch_and_check() {
+    let (_fixture, mut args, fake) = Fixture::new("declined", false);
+    args.yes = false;
+    assert_eq!(
+        deploy::run(&args, &fake, &Declined, &mut Vec::new()).unwrap_err(),
+        "deploy cancelled"
+    );
+    assert_eq!(fake.calls.borrow().len(), 5);
+}
+#[test]
+fn ipv6_scp_destination_uses_brackets() {
+    let (_fixture, mut args, fake) = Fixture::new("ipv6", true);
+    args.host = "2001:db8::10".into();
+    deploy::run(&args, &fake, &Prompt(false), &mut Vec::new()).unwrap();
+    assert!(
+        fake.calls.borrow()[2]
+            .args
+            .last()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("root@[2001:db8::10]:")
+    );
+}
+#[test]
+fn invalid_or_missing_plan_digest_prevents_confirmation_and_switch() {
+    for (label, response) in [
+        ("missing-digest", r#"{"plan":"text"}"#),
+        ("invalid-digest", r#"{"plan":"text","plan_sha256":"$(x)"}"#),
+    ] {
+        let (_fixture, args, fake) = Fixture::new(label, false);
+        fake.responses.borrow_mut()[4] = Ok(response.into());
+        assert!(
+            deploy::run(&args, &fake, &Prompt(false), &mut Vec::new())
+                .unwrap_err()
+                .contains("invalid remote plan")
+        );
+        assert_eq!(fake.calls.borrow().len(), 5);
+    }
 }

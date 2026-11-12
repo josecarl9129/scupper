@@ -3,7 +3,7 @@ use clap::Args;
 use scupper_core::release;
 use scupper_proto::{
     Identifier,
-    deploy::{DeployOp, DeployRequest, ReleaseHash},
+    deploy::{DeployOp, DeployPlan, DeployRequest, ReleaseHash},
 };
 use std::{
     ffi::OsString,
@@ -11,7 +11,8 @@ use std::{
     io::{self, IsTerminal, Write},
     net::IpAddr,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
+    time::Duration,
 };
 
 /// Deploy flags accepted on both operator platforms.
@@ -32,7 +33,7 @@ pub struct DeployArgs {
 }
 /// One fixed command for hosts with or without scupper. Bootstrap only stages files.
 pub const REMOTE_COMMAND: &str = concat!(
-    "if test -x /usr/local/bin/scupper; then exec /usr/local/bin/scupper remote; else exec python3 -c '",
+    "if test -x /usr/local/bin/scupper; then if timeout 15 /usr/local/bin/scupper remote --help >/dev/null 2>&1; then exec timeout 420 /usr/local/bin/scupper remote; else echo 'Deployment requires scupper 0.1.0 with M2-2u remote support. Manually copy the matching release archive to the gateway, verify SHA256SUMS and MANIFEST, extract it, then run the extracted scupper install --binaries with that directory.' >&2; exit 1; fi; else exec timeout 120 python3 -c '",
     include_str!("deploy_bootstrap.py"),
     "'; fi"
 );
@@ -45,6 +46,10 @@ pub struct Invocation {
     pub args: Vec<OsString>,
     /// Bounded JSON request; empty for constant uname and scp.
     pub stdin: Vec<u8>,
+    /// Wall-clock budget covering input, output and child completion.
+    pub timeout: Duration,
+    /// Deployment step used in timeout and failure diagnostics.
+    pub step: &'static str,
 }
 /// SSH/SCP execution boundary.
 pub trait Transport {
@@ -57,27 +62,11 @@ pub trait Transport {
 pub struct Ssh;
 impl Transport for Ssh {
     fn execute(&self, call: Invocation) -> Result<String, String> {
-        let mut child = Command::new(call.program)
-            .args(call.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|e| e.to_string())?;
-        let mut input = child.stdin.take().ok_or("cannot open transport stdin")?;
-        let sent = input.write_all(&call.stdin);
-        drop(input);
-        let result = child.wait_with_output().map_err(|e| e.to_string())?;
-        if !result.status.success() {
-            return Err(format!(
-                "{} failed: {}\n{}",
-                call.program,
-                result.status,
-                String::from_utf8_lossy(&result.stdout)
-            ));
-        }
-        sent.map_err(|e| e.to_string())?;
-        String::from_utf8(result.stdout).map_err(|_| "non-UTF8 remote response".into())
+        let mut command = Command::new(call.program);
+        command.args(call.args);
+        crate::deploy_process::execute(command, &call.stdin, call.timeout)
+            .map(|(_, stdout)| stdout)
+            .map_err(|e| format!("{} step failed: {e}. {}", call.step, step_state(call.step)))
     }
 }
 /// Interactive confirmation boundary shared by operator platforms.
@@ -141,8 +130,38 @@ pub fn target(uname: &str) -> Result<&'static str, String> {
         _ => Err("unsupported gateway architecture".into()),
     }
 }
+fn step_state(step: &str) -> &'static str {
+    match step {
+        "Switch" => "Gateway binaries may be mixed or services stopped; switch outcome is unknown.",
+        "Check" => "Switch completed; gateway health is unconfirmed.",
+        _ => "Live binaries were not switched by this deployment; staging may be incomplete.",
+    }
+}
+fn budget(step: &str) -> Duration {
+    Duration::from_secs(match step {
+        "Switch" => 480, // Two bounded 120s unit starts, preparation and re-exec.
+        "Plan" | "Stage" | "Check" => 180,
+        _ => 60,
+    })
+}
+fn copy_budget(bytes: u64) -> Duration {
+    // Allow 128 KiB/s plus connection/setup time, rounded upward.
+    Duration::from_secs(60 + bytes.div_ceil(128 * 1024))
+}
 fn options(values: &[String], scp: bool) -> Result<Vec<OsString>, String> {
-    let mut args = vec!["-o".into(), "BatchMode=yes".into()];
+    let mut args: Vec<OsString> = [
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=15",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=4",
+    ]
+    .into_iter()
+    .map(Into::into)
+    .collect();
     for value in values {
         let (flag, data) = value
             .split_once(' ')
@@ -175,16 +194,30 @@ struct Client<'a> {
     options: &'a [String],
 }
 impl Client<'_> {
-    fn ssh(&self, command: &'static str, stdin: Vec<u8>) -> Result<String, String> {
+    fn ssh(
+        &self,
+        command: &'static str,
+        stdin: Vec<u8>,
+        step: &'static str,
+    ) -> Result<String, String> {
         let mut args = options(self.options, false)?;
         args.extend(["--".into(), self.destination.clone().into(), command.into()]);
         self.transport.execute(Invocation {
             program: "ssh",
             args,
             stdin,
+            timeout: budget(step),
+            step,
         })
     }
     fn remote(&self, operation: DeployOp, request_id: &Identifier) -> Result<String, String> {
+        let step = match operation {
+            DeployOp::Prepare { .. } => "Prepare",
+            DeployOp::Stage { .. } => "Stage",
+            DeployOp::Plan { .. } => "Plan",
+            DeployOp::Switch { .. } => "Switch",
+            DeployOp::Check { .. } => "Check",
+        };
         self.ssh(
             REMOTE_COMMAND,
             serde_json::to_vec(&DeployRequest {
@@ -192,7 +225,9 @@ impl Client<'_> {
                 operation,
             })
             .map_err(|e| e.to_string())?,
+            step,
         )
+        .map_err(|e| format!("{step} step: {e}. {}", step_state(step)))
     }
     fn copy(&self, path: &Path, id: &str) -> Result<(), String> {
         let mut args = options(self.options, true)?;
@@ -211,11 +246,15 @@ impl Client<'_> {
             path.as_os_str().into(),
             format!("{dest}:/usr/local/lib/scupper/deploy/{id}/new/archive.tar.gz").into(),
         ]);
-        self.transport.execute(Invocation {
-            program: "scp",
-            args,
-            stdin: Vec::new(),
-        })?;
+        self.transport
+            .execute(Invocation {
+                program: "scp",
+                args,
+                stdin: Vec::new(),
+                timeout: copy_budget(fs::metadata(path).map_err(|e| e.to_string())?.len()),
+                step: "Copy",
+            })
+            .map_err(|e| format!("Copy step: {e}. {}", step_state("Copy")))?;
         Ok(())
     }
 }
@@ -284,7 +323,7 @@ pub fn run(
     if !args.yes && !prompt.terminal() {
         return Err("deploy requires --yes without a TTY".into());
     }
-    let triple = target(&client.ssh("uname -m", Vec::new())?)?;
+    let triple = target(&client.ssh("timeout 15 uname -m", Vec::new(), "Architecture")?)?;
     let name = format!("scupper-{}-{triple}.tar.gz", env!("CARGO_PKG_VERSION"));
     let path = args
         .archive
@@ -318,19 +357,34 @@ pub fn run(
         writeln!(out, "Archive verified. Run on the gateway next:\n/usr/local/lib/scupper/deploy/{id_text}/new/scupper install --binaries /usr/local/lib/scupper/deploy/{id_text}/new\nSupply initial install flags or --bundle using files already on the gateway.").map_err(|e| e.to_string())?;
         return Ok(0);
     }
-    let plan = client.remote(DeployOp::Plan { id: id.clone() }, &id)?;
-    write!(out, "{plan}")
+    let plan: DeployPlan =
+        serde_json::from_str(&client.remote(DeployOp::Plan { id: id.clone() }, &id)?)
+            .map_err(|_| "invalid remote plan response")?;
+    write!(out, "{}", plan.plan)
         .and_then(|()| out.flush())
         .map_err(|e| e.to_string())?;
     if !args.yes && !prompt.confirm()? {
         return Err("deploy cancelled".into());
     }
-    write!(
-        out,
-        "{}",
-        client.remote(DeployOp::Switch { id: id.clone() }, &id)?
-    )
-    .map_err(|e| e.to_string())?;
+    let switched = client.remote(
+        DeployOp::Switch {
+            id: id.clone(),
+            plan_sha256: plan.plan_sha256,
+        },
+        &id,
+    );
+    let switched = match switched {
+        Ok(text) => text,
+        Err(error) => {
+            let recovery = format!(
+                "Deploy {id_text}: switch failed; gateway binaries may be mixed or services stopped. If switching began, restore manually:\n{}",
+                scupper_core::install::RESTORE_COMMANDS
+            );
+            let _ = writeln!(out, "{recovery}");
+            return Err(format!("{error}\n{recovery}"));
+        }
+    };
+    write!(out, "{switched}").map_err(|e| e.to_string())?;
     write!(
         out,
         "{}",

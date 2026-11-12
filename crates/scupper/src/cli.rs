@@ -39,7 +39,11 @@ enum Command {
     Deploy(crate::deploy::DeployArgs),
     /// Internal bounded SSH operation dispatcher.
     #[command(hide = true)]
-    Remote,
+    Remote {
+        /// Internal marker for the verified staged installer.
+        #[arg(long, hide = true)]
+        staged: bool,
+    },
     /// Construct or adopt the gateway namespace, stopping at the first failure.
     #[command(hide = true)]
     Boot {
@@ -412,7 +416,7 @@ fn dispatch(
         Command::Deploy(args) => {
             crate::deploy::run(&args, &crate::deploy::Ssh, &crate::deploy::Terminal, stdout)
         }
-        Command::Remote => crate::remote::run(io::stdin().lock(), stdout),
+        Command::Remote { staged } => crate::remote::run_mode(io::stdin().lock(), stdout, staged),
         Command::Boot {
             #[cfg(feature = "testing")]
             stop_after,

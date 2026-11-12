@@ -60,6 +60,8 @@ pub enum DeployOp {
     Switch {
         /// Deployment identifier.
         id: Identifier,
+        /// Digest returned with the exact confirmed plan.
+        plan_sha256: ReleaseHash,
     },
     /// Run the installed gateway check.
     Check {
@@ -74,10 +76,19 @@ impl DeployOp {
         let (Self::Prepare { id }
         | Self::Stage { id, .. }
         | Self::Plan { id }
-        | Self::Switch { id }
+        | Self::Switch { id, .. }
         | Self::Check { id }) = self;
         String::from(id.clone())
     }
+}
+/// Read-only plan and the digest that must accompany Switch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeployPlan {
+    /// Human-readable installation plan.
+    pub plan: String,
+    /// Digest of the plan and all installation preconditions.
+    pub plan_sha256: ReleaseHash,
 }
 /// One correlated SSH request.
 #[derive(Debug, Clone, Serialize, Deserialize)]

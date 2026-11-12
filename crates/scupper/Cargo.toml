@@ -15,11 +15,11 @@ scupper-core.workspace = true
 scupper-proto.workspace = true
 clap.workspace = true
 serde_json.workspace = true
+rustix.workspace = true
 toml = { workspace = true, features = ["display"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 scupper-sys.workspace = true
-rustix.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

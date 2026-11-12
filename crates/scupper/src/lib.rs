@@ -10,6 +10,7 @@ pub mod cli;
 #[path = "portable_cli.rs"]
 pub mod cli;
 pub mod deploy;
+mod deploy_process;
 #[cfg(target_os = "linux")]
 pub mod remote;
 
