@@ -718,6 +718,9 @@ impl Runtime<'_> {
         {
             return admin::commit(&deps, &self.audit.handle(), parent, &toml, reason, uid);
         }
+        if let Op::ResetSelection { replaced } = op {
+            return admin::reset_selection(&deps, &self.audit.handle(), &replaced, uid);
+        }
         if let Op::Apply { version, dry_run } = op {
             let _keepalive = notify::ApplyKeepalive::start();
             let guard =
@@ -729,17 +732,20 @@ impl Runtime<'_> {
                     .read(target)
                     .map_err(admin::store_error)?;
             }
+            let target = match version {
+                Some(version) => Some(version),
+                None => VersionStore::read_only(deps.state_root, deps.config_root)
+                    .head()
+                    .map_err(admin::store_error)?,
+            };
+            if let Some(target) = target {
+                admin::apply_preflight(&deps, target)?;
+            }
             if !dry_run && let Some((machine, _, _)) = &mut self.running {
                 machine
                     .preserve_latch_locked(&guard)
                     .map_err(|_| control::api(ApiErrorCode::PersistenceUnavailable))?;
             }
-            let target = match version {
-                Some(version) => Some(version),
-                None => VersionStore::read_only(deps.state_root, deps.config_root)
-                    .head()
-                    .map_err(|_| control::api(ApiErrorCode::Internal))?,
-            };
             let prefix = if dry_run {
                 admin::preview_locked(&deps, &guard, target)?
             } else {
@@ -1914,6 +1920,47 @@ pub mod testing {
             .tick();
         Ok((response, before, after, retained_completion, tick))
     }
+    /// Pass a reset through socket decoding, the dispatcher and Runtime operation.
+    /// Peer authorization is injected as root, as in dispatcher adapter tests.
+    /// The callback models a new intent after the import has read its selection.
+    /// # Errors
+    /// Returns fixture, socket or response failures.
+    pub fn dispatch_reset_selection(
+        deps: BootDeps<'_>,
+        replaced: scupper_proto::Identifier,
+        before_reset: impl FnOnce(),
+    ) -> io::Result<scupper_proto::Response> {
+        use std::io::Write;
+        let options = Options {
+            state_root: deps.state_root.into(),
+            config_root: deps.config_root.into(),
+            run_root: deps.run_root.into(),
+            probe_binary: deps.run_root.join("unused-probe"),
+        };
+        let mut runtime = runtime(deps, &options)?;
+        let request = control::request(scupper_proto::Op::ResetSelection { replaced });
+        let (mut client, server) = std::os::unix::net::UnixStream::pair()?;
+        serde_json::to_writer(&mut client, &request)?;
+        client.write_all(b"\n")?;
+        let request = control::read_request(server)?;
+        before_reset();
+        let (reply, receive) = mpsc::sync_channel(1);
+        pending::Dispatcher::default().dispatch(
+            control::Pending {
+                request,
+                uid: 0,
+                until: Instant::now() + Duration::from_secs(10),
+                reply,
+                peer: None,
+            },
+            &mut runtime,
+            Instant::now(),
+        );
+        receive
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(io::Error::other)
+    }
+
     fn runtime<'a>(deps: BootDeps<'a>, options: &'a Options) -> io::Result<Runtime<'a>> {
         let origin = Instant::now();
         let gateway = GatewayId("gw1".into());

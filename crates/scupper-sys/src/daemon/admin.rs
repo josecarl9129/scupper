@@ -156,7 +156,7 @@ pub fn execute_locked<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)>(
                 })
             }
         }
-        Op::Status {} | Op::Apply { .. } | Op::Commit { .. } => {
+        Op::Status {} | Op::Apply { .. } | Op::Commit { .. } | Op::ResetSelection { .. } => {
             Err(api(ApiErrorCode::InvalidRequest))
         }
     }
@@ -271,6 +271,14 @@ pub fn commit_locked(
 ) -> Result<OpResult, ApiError> {
     let store = VersionStore::open_with_mirror_root(deps.state_root, deps.config_root, Some(guard))
         .map_err(internal)?;
+    let site = scupper_core::config::parse_site(toml).map_err(internal)?;
+    scupper_core::config::validate(site.clone()).map_err(|_| api(ApiErrorCode::InvalidRequest))?;
+    #[cfg(feature = "testing")]
+    let owner = deps.secret_owner;
+    #[cfg(not(feature = "testing"))]
+    let owner = 0;
+    crate::secrets::SecretFile::preflight(deps.config_root, &site, owner)
+        .map_err(|e| input_error(e.to_string()))?;
     let version = store
         .commit(
             guard,
@@ -295,6 +303,25 @@ pub fn commit_locked(
         Some(version),
     );
     Ok(OpResult::Commit { version })
+}
+
+/// Resolve target inputs before any persistent or kernel mutation.
+pub(crate) fn apply_preflight(
+    deps: &BootDeps<'_>,
+    target: u64,
+) -> Result<crate::boot::BootReport, ApiError> {
+    let mut preflight = crate::boot::BootReport::default();
+    crate::boot::inputs_for_version(deps, &mut preflight, None, Some(target)).map_err(|error| {
+        match error {
+            crate::boot::InputError::Secret(_) | crate::boot::InputError::Selection(_) => {
+                input_error(error.to_string())
+            }
+            crate::boot::InputError::Persistence(_) => api(ApiErrorCode::PersistenceUnavailable),
+            crate::boot::InputError::Internal(_) => internal(error),
+            crate::boot::InputError::Store(error) => store_error(error),
+        }
+    })?;
+    Ok(preflight)
 }
 
 /// Explicit full apply: close first, run boot, then durably clear quarantine
@@ -356,7 +383,7 @@ fn apply_inner(
     let store = VersionStore::read_only(deps.state_root, deps.config_root);
     let target = match version {
         Some(version) => Some(version),
-        None => store.head().map_err(internal)?,
+        None => store.head().map_err(store_error)?,
     }
     .ok_or_else(|| api(ApiErrorCode::NotFound))?;
     store.read(target).map_err(store_error)?;
@@ -374,10 +401,12 @@ fn apply_inner(
         scupper_proto::StepKind::RouteReplace,
         scupper_proto::StepKind::ForwardingOn,
     ];
+    let preflight = apply_preflight(deps, target)?;
     if dry_run {
         return Ok(OpResult::Apply {
             version: target,
             dry_run,
+            warnings: preflight.warnings,
             repair_plan: Vec::new(),
             plan,
         });
@@ -517,6 +546,7 @@ fn apply_inner(
     Ok(OpResult::Apply {
         version: target,
         dry_run,
+        warnings: preflight.warnings,
         repair_plan: Vec::new(),
         plan,
     })
@@ -790,6 +820,11 @@ pub fn local(
         scupper_proto::UnixSeconds(unix())
     })
     .map_err(|e| e.to_string())?;
+    if let Op::ResetSelection { replaced } = op {
+        let result = reset_selection_locked(&deps, &log.handle, &guard, &replaced, uid);
+        let _ = log.handle.flush_blocking(Duration::from_secs(2));
+        return result.map_err(LocalError::Api);
+    }
     if let Op::Commit {
         parent,
         toml,
@@ -804,8 +839,11 @@ pub fn local(
             Some(version) => Some(version),
             None => VersionStore::read_only(deps.state_root, deps.config_root)
                 .head()
-                .map_err(|e| e.to_string())?,
+                .map_err(store_error)?,
         };
+        if let Some(target) = target {
+            apply_preflight(&deps, target)?;
+        }
         let prefix = if dry_run {
             preview_locked(&deps, &guard, target)?
         } else {
@@ -833,4 +871,56 @@ pub fn local(
     });
     let _ = log.handle.flush_blocking(Duration::from_secs(2));
     result.map_err(LocalError::Api)
+}
+
+fn input_error(error: String) -> ApiError {
+    ApiError {
+        code: ApiErrorCode::InvalidRequest,
+        observation: Some(serde_json::json!({"input_error": serde_json::Value::String(error)})),
+    }
+}
+
+/// Compare-and-set a replaced exit selection to Auto without a readiness wait.
+/// # Errors
+/// Returns authorization, lock, state or durability failures.
+pub fn reset_selection(
+    deps: &BootDeps<'_>,
+    log: &LogHandle,
+    replaced: &scupper_proto::Identifier,
+    uid: u32,
+) -> Result<OpResult, ApiError> {
+    if !super::control::authorized(uid) {
+        return Err(api(ApiErrorCode::Unauthorized));
+    }
+    let guard =
+        WriterLock::acquire_timeout(deps.run_root, Duration::from_secs(2)).map_err(internal)?;
+    reset_selection_locked(deps, log, &guard, replaced, uid)
+}
+fn reset_selection_locked(
+    deps: &BootDeps<'_>,
+    log: &LogHandle,
+    guard: &WriterGuard,
+    replaced: &scupper_proto::Identifier,
+    uid: u32,
+) -> Result<OpResult, ApiError> {
+    let file = StateFile::open(deps.state_root, None).map_err(internal)?;
+    let StateRead::Present(mut state) = file.read().map_err(internal)? else {
+        return Ok(OpResult::ResetSelection {});
+    };
+    if !matches!(&state.selection, Selection::Pin(id) | Selection::Prefer(id) if id.as_str() == String::from(replaced.clone()))
+    {
+        return Ok(OpResult::ResetSelection {});
+    }
+    state.selection = Selection::Auto;
+    file.write(guard, &state).map_err(internal)?;
+    log.emit(
+        EventKind::AdminAction {
+            reason: None,
+            command: Command::ResetSelection,
+        },
+        Actor::Local { uid },
+        state.applied_version,
+    )
+    .map_err(internal)?;
+    Ok(OpResult::ResetSelection {})
 }

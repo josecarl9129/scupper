@@ -414,6 +414,8 @@ dependencies = [
  "scupper-proto",
  "scupper-sys",
  "serde_json",
+ "sha2",
+ "toml",
 ]
 
 [[package]]
@@ -427,6 +429,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "toml",
+ "zeroize",
 ]
 
 [[package]]

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use super::types::{
     DurationStr, ExitId, ExitName, Failback, GatewayId, HeartbeatKind, HeartbeatReport, PublicKey,
-    Role, SecretName, Severity, Standby, Tag, WebhookPreset, url_ref, wg_ref,
+    Role, SecretName, Severity, Standby, Tag, WebhookPreset, optional_wg_ref, url_ref, wg_ref,
 };
 
 /// An editable site document. Call `validate` before using it to render.
@@ -125,6 +125,13 @@ pub struct Exit {
     /// Local private-key reference.
     #[serde(deserialize_with = "wg_ref")]
     pub private_key_ref: SecretName,
+    /// Optional local preshared-key reference, never inline key material.
+    #[serde(
+        default,
+        deserialize_with = "optional_wg_ref",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub preshared_key_ref: Option<SecretName>,
     /// Provider peer's public key.
     pub peer_public_key: PublicKey,
     /// Provider literal IP and UDP port.

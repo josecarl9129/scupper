@@ -30,6 +30,7 @@ impl Backend for Rig {
         Ok(OpResult::Apply {
             version: 1,
             dry_run: false,
+            warnings: Vec::new(),
             repair_plan: Vec::new(),
             plan: Vec::new(),
         })

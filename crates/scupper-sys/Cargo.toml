@@ -24,10 +24,10 @@ ipnet.workspace = true
 serde.workspace = true
 sha2.workspace = true
 zeroize.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
-toml.workspace = true
 
 [lints]
 workspace = true

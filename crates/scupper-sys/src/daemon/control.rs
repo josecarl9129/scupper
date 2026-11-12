@@ -612,6 +612,7 @@ pub fn call_until(
                     | (Op::Status {}, OpResult::Status { .. })
                     | (Op::Check {}, OpResult::Check { .. })
                     | (Op::Connect { .. }, OpResult::Connect { .. })
+                    | (Op::ResetSelection { .. }, OpResult::ResetSelection {})
                     | (Op::Disconnect {}, OpResult::Disconnect {})
                     | (Op::Apply { .. }, OpResult::Apply { .. })
                     | (Op::Commit { .. }, OpResult::Commit { .. })

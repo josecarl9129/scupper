@@ -80,6 +80,13 @@ pub enum WgCmd {
         /// Validated interface.
         ifname: IfName,
     },
+    /// Set an exit preshared key exclusively through stdin.
+    SetPresharedKeyFromStdin {
+        /// Validated interface.
+        ifname: IfName,
+        /// Public peer key.
+        public_key: PeerKey,
+    },
     /// Configure the UDP listen port.
     SetListenPort {
         /// Validated interface.
@@ -87,7 +94,7 @@ pub enum WgCmd {
         /// UDP port (zero requests an automatic port).
         port: u16,
     },
-    /// Configure a public peer, without preshared-key support.
+    /// Configure a public peer, clearing any previous preshared key.
     SetPeer {
         /// Validated interface.
         ifname: IfName,
@@ -245,6 +252,14 @@ impl WgCmd {
             Self::SetPrivateKeyFromStdin { ifname } => {
                 strings(&["set", ifname.as_str(), "private-key", "/dev/stdin"])
             }
+            Self::SetPresharedKeyFromStdin { ifname, public_key } => strings(&[
+                "set",
+                ifname.as_str(),
+                "peer",
+                public_key.as_str(),
+                "preshared-key",
+                "/dev/stdin",
+            ]),
             Self::SetListenPort { ifname, port } => {
                 strings(&["set", ifname.as_str(), "listen-port", &port.to_string()])
             }
@@ -355,6 +370,7 @@ impl KernelCmd {
                     | IpCmd::LinkDelete(_)
             ) | Self::Wg(
                 WgCmd::SetPrivateKeyFromStdin { .. }
+                    | WgCmd::SetPresharedKeyFromStdin { .. }
                     | WgCmd::SetListenPort { .. }
                     | WgCmd::SetPeer { .. }
                     | WgCmd::RemovePeer { .. }
@@ -369,8 +385,11 @@ impl KernelCmd {
     pub const fn needs_stdin(&self) -> bool {
         matches!(
             self,
-            Self::Wg(WgCmd::SetPrivateKeyFromStdin { .. } | WgCmd::Pubkey)
-                | Self::Nft(NftCmd::LoadStdin | NftCmd::CheckStdin)
+            Self::Wg(
+                WgCmd::SetPrivateKeyFromStdin { .. }
+                    | WgCmd::SetPresharedKeyFromStdin { .. }
+                    | WgCmd::Pubkey
+            ) | Self::Nft(NftCmd::LoadStdin | NftCmd::CheckStdin)
         )
     }
 }

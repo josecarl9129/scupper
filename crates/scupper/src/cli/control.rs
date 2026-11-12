@@ -43,7 +43,11 @@ pub(super) fn connect(deps: &Dependencies<'_>, name: Option<String>) -> Result<O
     })
 }
 
-fn match_exit(name: &str, candidates: &[(&str, &str)], tty: bool) -> Result<String, String> {
+pub(super) fn match_exit(
+    name: &str,
+    candidates: &[(&str, &str)],
+    tty: bool,
+) -> Result<String, String> {
     if name.is_empty() {
         return Err("exit must not be empty".into());
     }
@@ -146,7 +150,7 @@ pub(super) fn mutation(
                     #[cfg(feature = "testing")]
                     hook: None,
                     #[cfg(feature = "testing")]
-                    secret_owner: 0,
+                    secret_owner: rustix::process::geteuid().as_raw(),
                 },
                 deps.probe_exec,
                 op,
@@ -511,7 +515,10 @@ fn render(response: Response, json: bool, out: &mut dyn Write) -> Result<u8, Str
         match response.result {
             Ok(OpResult::Disconnect {}) => writeln!(out, "traffic is now blocked"),
             Ok(OpResult::Connect { exit }) => writeln!(out, "connected via {}", String::from(exit)),
-            Ok(OpResult::Apply { version, dry_run, repair_plan, plan }) => writeln!(out, "version {version}; dry run: {dry_run}\nRepair preview: {repair_plan:?}\nTarget boot: {plan:?}"),
+            Ok(OpResult::Apply { version, dry_run, repair_plan, plan, warnings }) => {
+                for warning in warnings { writeln!(out, "Warning: {warning}").map_err(output_error)?; }
+                writeln!(out, "version {version}; dry run: {dry_run}\nPreflight: passed\nRepair preview: {repair_plan:?}\nTarget boot: {plan:?}")
+            },
             Ok(result) => writeln!(out, "{result:?}"),
             Err(error) => writeln!(out, "{error}"),
         }

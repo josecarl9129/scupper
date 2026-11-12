@@ -412,6 +412,20 @@ fn local_dry_run_includes_hardening_repair_preview() {
     let sys = Script::new("ubuntu-24.04");
     fresh(&sys);
     let root = Root::new(&sys.runner, &testing::handle().unwrap());
+    let site = scupper_core::config::parse_site(&support::site_text(&sys.runner)).unwrap();
+    for reference in site.identities.values().map(|i| &i.private_key_ref).chain(
+        site.gateways
+            .values()
+            .flat_map(|g| &g.exits)
+            .map(|e| &e.private_key_ref),
+    ) {
+        scupper_sys::secrets::SecretFile::write_new(
+            &root.path,
+            reference,
+            b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        )
+        .unwrap();
+    }
     let file = scupper_sys::state::StateFile::open(&root.path, None).unwrap();
     let scupper_sys::state::StateRead::Present(mut state) = file.read().unwrap() else {
         unreachable!()
@@ -442,6 +456,17 @@ fn local_dry_run_includes_hardening_repair_preview() {
         "{out}: {err}"
     );
     assert!(out.contains("Target boot:"), "{out}: {err}");
+    assert!(out.contains("Preflight: passed"));
+    let reference = &site.gateways.values().next().unwrap().exits[0].private_key_ref;
+    std::fs::remove_file(root.path.join("secrets/wg").join(reference.name())).unwrap();
+    let calls = sys.calls.borrow().clone();
+    let (code, out, err) = run(&sys, &root, &["apply", "--dry-run"]);
+    assert_eq!(code, 1);
+    assert!(
+        out.contains("InvalidRequest") && out.contains(reference.name()),
+        "{out}: {err}"
+    );
+    assert_eq!(*sys.calls.borrow(), calls);
     assert_eq!(before, std::fs::read(root.path.join("state.json")).unwrap());
 }
 #[test]

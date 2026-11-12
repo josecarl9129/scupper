@@ -327,3 +327,22 @@ pub fn valid_wg_secret(text: &str) -> bool {
             )
         })
 }
+
+pub(super) fn optional_wg_ref<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Option<SecretName>, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.map(|name| SecretName {
+        kind: SecretKind::Wg,
+        name,
+    }))
+}
+
+impl ExitName {
+    /// Checks the printable, nonblank 1–32 character exit-name grammar.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        (1..=32).contains(&self.0.chars().count())
+            && !self.0.trim().is_empty()
+            && self.0.chars().all(|c| !c.is_control())
+    }
+}

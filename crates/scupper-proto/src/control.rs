@@ -50,6 +50,11 @@ pub enum Op, op_samples {
         /// Validated immutable exit identity.
         exit: Option<Identifier> = Some(Identifier("ch1".into())),
     },
+    /// Reset a replaced exit selection to Auto, only if it still names that exit.
+    ResetSelection {
+        /// Expected current Pin or Prefer exit; Disconnected is never changed.
+        replaced: Identifier = Identifier("ch1".into()),
+    },
     /// Close routes and lower exits, verifying closure before success.
     Disconnect {},
     /// Converge to an immutable version (head when omitted).
@@ -97,13 +102,13 @@ vocabulary!(
     Quarantined,
     NotReady
 );
-/// Public error with a stable code and no reflected input or diagnostic string.
+/// Public error with a stable code; input diagnostics contain references and checks only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApiError {
     /// Stable caller-visible classification.
     pub code: ApiErrorCode,
-    /// Fresh staged report when a disconnect could not prove kernel closure.
+    /// Fresh staged report, rollback status, or value-free input refusal details.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observation: Option<serde_json::Value>,
 }
@@ -118,6 +123,14 @@ impl std::fmt::Display for ApiError {
             } else {
                 write!(f, ": rollback failed: closure unverified")?;
             }
+        }
+        if let Some(error) = self
+            .observation
+            .as_ref()
+            .and_then(|o| o.get("input_error"))
+            .and_then(serde_json::Value::as_str)
+        {
+            write!(f, ": {error}")?;
         }
         Ok(())
     }
@@ -271,6 +284,8 @@ pub enum OpResult, result_samples {
         /// Observed active exit.
         exit: Identifier = Identifier("ch1".into()),
     },
+    /// Selection reset completed, including a no-op if the selection changed.
+    ResetSelection {},
     /// Observed closure completed.
     Disconnect {},
     /// Applied version or proposed version for a dry run.
@@ -279,6 +294,9 @@ pub enum OpResult, result_samples {
         version: u64 = 2,
         /// True when no mutation was executed.
         dry_run: bool = false,
+        /// Nonfatal preflight diagnostics, including unavailable alert URLs.
+        #[serde(default)]
+        warnings: Vec<String> = vec![],
         /// Same-version repair preview; never executed before the full boot.
         repair_plan: Vec<crate::StepKind> = vec![crate::StepKind::WriteSysctl],
         /// Ordered target-version boot operations, without kernel command text.
@@ -355,6 +373,7 @@ pub fn decode_request(line: &[u8]) -> Result<Request, ApiError> {
         | Op::Status {}
         | Op::Check {}
         | Op::Connect { .. }
+        | Op::ResetSelection { .. }
         | Op::Disconnect {}
         | Op::Apply { .. }
         | Op::RepairStatus {} => {}
