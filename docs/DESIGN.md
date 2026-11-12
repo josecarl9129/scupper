@@ -394,7 +394,7 @@ the start of M2.
 | `ipnet` | core | prefixes |
 | `clap` (derive), `clap_complete`, `clap_mangen` | CLI | command tree, completions, man pages |
 | `dialoguer`, `comfy-table`, `anstream` | CLI | prompts and pickers, TTY tables, TTY-aware colour (§11) |
-| `rustix` | sys | `setns`, credential drop, sockopts, without first-party unsafe |
+| `rustix` | sys, CLI deploy | `setns`, credential drop, sockopts; nonblocking deploy stdin and process-group termination on Linux/macOS, without first-party unsafe |
 | `socket2` | sys, edge | `bind_device`, `IP_FREEBIND` |
 | `ureq` (rustls) | CLI, delivery child | sync HTTPS for API client, sinks, heartbeat |
 | `tokio` (rt, net, time), `hyper`, `hyper-util` | edge only | concurrent DNS and HTTP |
@@ -1367,6 +1367,15 @@ the same stream. The gateway validates the operation and its arguments with
 the same types as the local socket. Tests feed quotes, newlines, `$(…)`,
 backticks, leading hyphens and malformed identifiers through every
 operation.
+
+M2 fresh-host exception: deploy uses one constant shell dispatcher that executes
+`/usr/local/bin/scupper remote` when installed, or a constant Python 3 bootstrap
+otherwise. Both receive the same bounded JSON envelope on stdin. The bootstrap
+accepts only prepare/stage, verifies the archive and its complete manifest before
+writing members, and never installs configuration or starts services. Python 3
+is required only on a fresh host. M2 release archives use deterministic stored
+DEFLATE blocks in gzip (larger archives, no compressor-version dependency);
+`MANIFEST` hashes all payload members, excluding itself. M2 has no edge binary.
 
 ### API authentication (ADR 0007)
 
@@ -2497,6 +2506,55 @@ itself, upgrades go through Homebrew.
 In M2, `deploy --host ADDR` exists without the rollback timer (steps 1-3
 and 5): enough for the migration to a fresh host, where the old host is the
 rollback. Confirm-or-rollback, `upgrade` and the guard unit arrive in M6.
+M2 recovery remains manual. Before replacing either binary, Switch durably
+writes both existing binaries to their `.prev` paths, then replaces the pair
+back to back. Switch failures carry typed outcomes through reserved exit statuses:
+`RefusedNoChange` (20), `FailedAfterRename` (21), and `Unknown` (22).
+Only a failure after an actual binary rename, or an unknown outcome after the
+child or SSH connection is lost, prints these commands on the gateway and
+again on the client with the deploy identifier. Precondition/digest refusals,
+backup failures before a live rename, and failed restarts for empty or unit-only
+plans report "refused, nothing changed" with the reason and omit recovery commands:
+
+```sh
+install -m 0755 /usr/local/bin/scupperd.prev /usr/local/bin/scupperd
+install -m 0755 /usr/local/bin/scupper.prev /usr/local/bin/scupper
+systemctl restart scupperd
+```
+
+Prepare reports installed only when the version store has a head and both
+systemd units exist. Binary-only hosts take the fresh-host path: copy, verify,
+and print the staged `scupper install --binaries DIR` command; no install or
+service start runs automatically. Upgrading a gateway without the `remote`
+subcommand requires a manual copy of the matching release archive, verification
+of SHA256SUMS and MANIFEST, extraction, and running that release's
+`scupper install --binaries DIR`. The first release with the `remote` subcommand
+is scupper 0.1.1; the capability failure message names the shipping package
+version at compile time.
+
+Plan runs the verified staged installer and returns the displayed plan with a
+SHA-256 digest binding its full observed preconditions and desired inputs.
+Switch re-prepares with the same staged installer and refuses without changes
+if the digest differs from the one confirmed by the operator. The installer's
+own precondition check still runs before applying. There is no deploy lock in
+M2; concurrent operators must still coordinate.
+
+SSH and SCP use ConnectTimeout=15, ServerAliveInterval=15 and
+ServerAliveCountMax=4, with ControlMaster=no and ControlPath=none to disable
+connection sharing from the operator's SSH config. Client wall-clock budgets are
+60 seconds for discovery and preparation, 180 seconds for stage, plan and check, 480 seconds for switch,
+and 60 seconds plus archive size at 128 KiB/s (rounded up) for copy. The gateway
+dispatcher bounds capability detection to 15 seconds, bootstrap to 120 seconds,
+and remote dispatch to 420 seconds. Staged plan and switch children are bounded
+to 150 and 360 seconds. Each systemctl child has a deadline (30 seconds for
+reload, 120 seconds for each unit restart, exceeding TimeoutStartSec=90) and
+uses explicit job-mode=replace. Timeout diagnostics name the step and possible
+gateway state; a switch timeout includes manual recovery commands.
+
+M2 still restarts scupperd unconditionally, even for an empty plan; scupper-net
+restarts only when its unit content changes. Confirmation displays the install
+plan, without a separate config diff. Archive unit files are integrity-checked;
+the staged installer's compiled-in templates supply the installed unit bytes.
 
 ### `scupper gateway create` (ADR 0027)
 
@@ -2745,7 +2803,10 @@ boot-attempt budgets are saved and reset between prefixes; production
 retry limits are unchanged.
 The separate installed-unit systemd lab uses the runner's root namespace as
 its gateway host. It guards default routes (ignoring expiry countdowns), policy
-rules, `eth0` addresses/link state/MTU, resolver configuration and root forwarding.
+rules, addresses/link state/MTU and DNS on every IPv4/IPv6 default-route interface
+(including multipath devices), resolver configuration and root forwarding. The
+interface names are discovered at lab start and recorded in host snapshots; no
+runner uplink name is fixed.
 Root IPv4 forwarding must already be 1 to exercise adverse namespace inheritance.
 Networkd must report `up0` unmanaged; setup waits for transient states and reloads
 only when a matching `.network` file requires a lab-only runtime override.
@@ -2763,10 +2824,27 @@ for reporting only. No detector rule drops traffic. Judged rules count before a
 rate-limited `scupper-lab-egress` log action, retaining interface, addresses and
 protocol in kernel-journal artifacts. A raw IP positive control binds the real
 IPv4 default-route interface and sends a lab-source UDP packet with TTL 1 to
-`192.0.2.254`; both IPv4 selectors and the attributed kernel log must observe it.
-A local probe of the host's `up0` address must increment excluded `lo` counters
-without changing judged counts. All counters are reset before install; every
-judge requires complete per-interface counters and zero judged hits.
+`192.0.2.254`; a temporary dedicated rule counts it and returns before case
+selectors, with an attributed kernel log. Its counter must be exactly one and
+judged counters must stay zero. A local probe of the host's `up0` address must
+increment excluded `lo` counters without changing judged counts. One atomic nft
+transaction removes the control exemption and resets all counters before install;
+every judge, including finalization, requires complete per-interface source and
+destination counters and zero judged hits in this case window. Control logs and
+the case journal cursor are saved separately.
+Before install, exclusive root blackhole routes cover `10.99.0.0/24`,
+`10.2.0.0/24`, `fd00::/8`, `2001:db8::/32` and the three documentation IPv4 /24s.
+More-specific lab-link routes continue to work. Every host guard asserts the
+blackholes; finalization removes only successfully added routes, including on
+partial setup failure, and records removal readbacks. These destination routes
+prevent sink replies to forged client sources following the runner default;
+they do not filter a lab source sending to an internet destination.
+The oracle positive control saves its injection marker and three packet tuples
+separately from service markers. Its temporary `wan` `lab_inject` table drops
+both marker-only input controls and the forwarded client-source control after
+the capture point, preventing sink delivery and replies. Artifacts retain the
+rules and counters, and a matching injected marker in the sink log fails the
+control. The table is removed even if control injection or evaluation fails.
 Install completion is judged separately from its final check status; transient
 check failures are recorded and recovery to check 0 has a deadline. Setup waits
 for check 0 after install and again after config load, before apply. It preserves
@@ -2802,6 +2880,12 @@ writer plus convergence to check 0. The supervisor lease can refuse boot or appl
 before writer.lock is reached, and nonblocking polling creates no kernel waiter
 rows. Two product PIDs waiting on writer.lock are therefore reported when visible,
 but judgement uses each actor's wait/refusal plus a successful writer and recovery.
+L44 waits for check 0 (bounded to the existing 90-second readiness deadline),
+verifies provider transport and records the exit port immediately before its
+service canaries, including after the final scupper-net start. It records wait
+and canary elapsed times, markers and errors for each phase. Delivery assertions
+and probe timeouts are unchanged; a later timeout remains a failure, with probe,
+sink, command, check/status, unit, boot and journal evidence retained.
 V-13 requires absent/present/absent firewall warning controls; a pre-existing
 warning makes the case inconclusive and failing. Ufw's user denies name `up0`;
 its built-in before rules are global even with allow defaults, so this case runs

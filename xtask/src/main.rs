@@ -11,6 +11,11 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Build a deterministic release archive.
+    Dist {
+        #[arg(long)]
+        target: String,
+    },
     /// L19 namespace policy drift check (lab only).
     #[command(hide = true)]
     RouteCheck { root: PathBuf, binary: PathBuf },
@@ -112,6 +117,10 @@ enum Command {
 #[allow(clippy::too_many_lines)] // Keep the platform-gated command dispatch together.
 fn run(command: Command) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     match command {
+        Command::Dist { target } => {
+            xtask::dist::run(&target)?;
+            Ok(true)
+        }
         Command::RouteCheck { .. } => Err("route-check requires Linux".into()),
         #[cfg(target_os = "linux")]
         Command::SendPacket { interface, file } => {

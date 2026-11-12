@@ -153,7 +153,7 @@ jobs:
           rustup target add x86_64-unknown-linux-musl
 
       - name: Build musl release
-        run: timeout 600 cargo build -p scupper -p scupperd --bins --release --locked --target x86_64-unknown-linux-musl
+        run: timeout 600 env -u CARGO_TARGET_TMPDIR cargo xtask dist --target x86_64-unknown-linux-musl
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
 
@@ -174,8 +174,35 @@ jobs:
         with:
           name: scupper-x86_64-linux-musl
           path: |
-            target/x86_64-unknown-linux-musl/release/scupper
-            target/x86_64-unknown-linux-musl/release/scupperd
+            dist/scupper-*-x86_64-unknown-linux-musl.tar.gz
+            dist/SHA256SUMS
+          retention-days: 14
+          if-no-files-found: error
+
+  macos:
+    if: ${{ !startsWith(github.ref, 'refs/heads/lab/') }}
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Format
+        run: env -u CARGO_TARGET_TMPDIR cargo fmt --all -- --check
+      - name: Clippy portable CLI and release tooling
+        run: env -u CARGO_TARGET_TMPDIR cargo clippy -p scupper -p scupper-core -p scupper-proto -p xtask --all-targets --locked -- -D warnings
+      - name: Portable tests
+        run: env -u CARGO_TARGET_TMPDIR cargo test -p scupper -p scupper-core -p scupper-proto -p xtask --locked
+      - name: Build CLI archive
+        run: env -u CARGO_TARGET_TMPDIR cargo xtask dist --target aarch64-apple-darwin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scupper-aarch64-apple-darwin
+          path: |
+            dist/scupper-*-aarch64-apple-darwin.tar.gz
+            dist/SHA256SUMS
           retention-days: 14
           if-no-files-found: error
 

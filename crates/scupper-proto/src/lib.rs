@@ -83,3 +83,5 @@ macro_rules! vocabulary {
     };
 }
 pub(crate) use vocabulary;
+
+pub mod deploy;

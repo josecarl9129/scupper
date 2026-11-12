@@ -2,6 +2,7 @@
 mod cases;
 mod egress;
 mod guards;
+mod routes;
 use super::{
     Lab, Result, SITE,
     addresses::A,
@@ -50,6 +51,7 @@ struct SystemdLab {
     baseline: HostSnapshot,
     egress: egress::Scope,
     ports: Vec<u16>,
+    root_routes: Vec<(&'static str, &'static str)>,
     samples: usize,
     timings: Vec<serde_json::Value>,
 }
@@ -91,6 +93,7 @@ pub fn run(artifacts: &Path, binaries: &Path, case: &str) -> Result<()> {
         baseline,
         egress: egress::Scope::default(),
         ports: Vec::new(),
+        root_routes: Vec::new(),
         samples: 0,
         timings: Vec::new(),
         lab: Lab {
@@ -138,20 +141,22 @@ pub fn run(artifacts: &Path, binaries: &Path, case: &str) -> Result<()> {
     harness.lab.runner.phase = harness.lab.runner.whole;
     let guard = harness.guard("case-after");
     let journal = harness.journal("journal.txt");
-    let egress_log = harness.egress_log("final");
+    let egress_log = harness.egress_final();
     let captures = harness.lab.stop_captures();
+    let routes_cleanup = harness.root_routes_cleanup();
     let diagnostics = if outcome.is_err()
         || guard.is_err()
         || journal.is_err()
         || egress_log.is_err()
         || captures.is_err()
+        || routes_cleanup.is_err()
     {
         harness.failure_diagnostics()
     } else {
         Ok(())
     };
     let result = super::mutation::finish(
-        outcome,
+        super::mutation::finish(outcome, routes_cleanup),
         super::mutation::finish(
             guard,
             super::mutation::finish(
@@ -206,6 +211,7 @@ impl SystemdLab {
             serde_json::to_vec_pretty(&now)?,
         )?;
         self.baseline.verify(&now)?;
+        self.root_routes_verify(label)?;
         if Path::new("/sys/class/net/up0").exists() {
             let state = self.cmd("networkctl", &["--no-pager", "status", "up0"])?;
             fs::write(
@@ -415,6 +421,7 @@ impl SystemdLab {
         self.lab.build_wan_mode(true)?;
         self.uplink()?;
         self.egress_setup()?;
+        self.root_routes_setup()?;
         self.lab.capture("", "up0", "install-uplink")?;
         self.lab.build_provider()?;
         let provider = self.lab.private.join("provider.conf");
@@ -581,13 +588,28 @@ impl SystemdLab {
         Ok(out)
     }
     fn ready(&mut self) -> Result<()> {
-        let until = Instant::now() + Duration::from_secs(90);
+        self.ready_recorded(None)
+    }
+    fn ready_recorded(&mut self, label: Option<&str>) -> Result<()> {
+        let started = Instant::now();
+        let until = started + Duration::from_secs(90);
         loop {
             self.lab.runner.check()?;
-            let (status, _) = self
+            let (status, output) = self
                 .lab
                 .runner
-                .output(&Invocation::new("", CLI, &["check"]), None)?;
+                .output(&Invocation::new("", CLI, &["check", "--json"]), None)?;
+            if let Some(label) = label {
+                let mut log = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(self.lab.artifacts.join(format!("{label}-check.jsonl")))?;
+                writeln!(
+                    log,
+                    "{}",
+                    serde_json::json!({"elapsed_ms":started.elapsed().as_millis(),"exit":status.code(),"output":output})
+                )?;
+            }
             if status.code() == Some(0) {
                 break;
             }

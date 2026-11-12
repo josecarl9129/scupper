@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 //! Run the shipped rules command in isolated subprocesses for feature fencing.
 #![allow(clippy::unwrap_used)]
 use std::{fs, path::PathBuf, process::Command};

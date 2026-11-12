@@ -18,6 +18,10 @@ pub(super) struct Scope {
     control_interface: String,
     #[serde(skip)]
     log_cursor: String,
+    #[serde(skip)]
+    control_active: bool,
+    #[serde(skip)]
+    installed: bool,
 }
 fn lab_links() -> BTreeSet<String> {
     let mut links: BTreeSet<_> = ["lo", "up0", "ctl0", "wg0", "ex-0", "ex-ch1"]
@@ -79,6 +83,8 @@ impl Scope {
             defaults,
             control_interface,
             log_cursor: String::new(),
+            control_active: false,
+            installed: false,
         })
     }
     fn selectors(&self) -> impl Iterator<Item = (&str, &str, &str, &str)> {
@@ -93,7 +99,7 @@ impl Scope {
                 })
             })
     }
-    fn rules(&self) -> String {
+    fn rules(&self, control: bool) -> String {
         let mut text = format!("table inet {TABLE} {{\n");
         for chain in ["judged", "excluded"] {
             writeln!(
@@ -101,6 +107,13 @@ impl Scope {
                 " chain {chain} {{\n  type filter hook postrouting priority 300; policy accept;"
             )
             .ok();
+            if chain == "judged" && control {
+                // This temporary rule returns before the case selectors. Remove
+                // it atomically when opening the case window, so no case packet
+                // can inherit the positive control's exemption.
+                let interface = serde_json::json!(self.control_interface);
+                writeln!(text, "  oifname {interface} ip saddr {} ip daddr 192.0.2.254 ip ttl 1 udp sport 40001 udp dport 8080 counter log prefix \"scupper-lab-egress-control \" return comment \"positive-control\"", A.client_inner).ok();
+            }
             for (_, interface, family, direction) in self.selectors().filter(|s| s.0 == chain) {
                 let prefixes = PREFIXES.iter().find(|p| p.0 == family).map_or("", |p| p.1);
                 // JSON string quoting is also valid nft string quoting.
@@ -152,12 +165,14 @@ impl SystemdLab {
         if status.success() {
             return fail("occupied root egress detector");
         }
-        let rules = self.egress.rules();
+        let rules = self.egress.rules(true);
         fs::write(self.lab.artifacts.join("root-egress.nft"), &rules)?;
         self.lab.runner.input(
             &Invocation::new("", "nft", &["-f", "-"]),
             Some(rules.as_bytes()),
         )?;
+        self.egress.installed = true;
+        self.egress.control_active = true;
         let destination = "192.0.2.254";
         let packet = helpers::spoofed_packet(
             A.client_inner.parse()?,
@@ -177,11 +192,12 @@ impl SystemdLab {
         packet[8] = 1; // IP_HDRINCL makes the kernel recompute the IP checksum.
         socket.send_to(&packet, &SocketAddr::new(destination.parse()?, 0).into())?;
         let counts = self.egress_count("egress-uplink-positive-control")?;
-        for direction in ["saddr", "daddr"] {
-            let key = format!("judged:{}:ip:{direction}", self.egress.control_interface);
-            if counts[&key] == 0 {
-                return fail("real-uplink egress positive control was blind");
-            }
+        if counts["positive-control"] != 1
+            || counts
+                .iter()
+                .any(|(key, n)| key.starts_with("judged:") && *n != 0)
+        {
+            return fail("real-uplink control was blind or counted in the case window");
         }
         let judged_before: u64 = counts
             .iter()
@@ -225,11 +241,15 @@ impl SystemdLab {
             }
             self.lab.runner.dwell(super::Duration::from_millis(100))?;
         }
-        self.cmd("nft", &["delete", "table", "inet", TABLE])?;
+        let rules = self.egress.rules(false);
+        fs::write(self.lab.artifacts.join("root-egress-case.nft"), &rules)?;
+        // One nft transaction leaves no gap and no control exemption in the
+        // judged window. All source and destination counters start at zero.
         self.lab.runner.input(
             &Invocation::new("", "nft", &["-f", "-"]),
-            Some(rules.as_bytes()),
+            Some(format!("delete table inet {TABLE}\n{rules}").as_bytes()),
         )?;
+        self.egress.control_active = false;
         let counts = self.egress_count("egress-reset")?;
         if counts.values().any(|n| *n != 0) {
             return fail("egress counters did not reset");
@@ -249,6 +269,13 @@ impl SystemdLab {
             &text,
         )?;
         count(&text, &self.egress)
+    }
+    pub(super) fn egress_final(&mut self) -> Result<()> {
+        if self.egress.installed && !self.egress.control_active {
+            self.egress_zero("final")
+        } else {
+            self.egress_log("final")
+        }
     }
     pub(super) fn egress_log(&mut self, label: &str) -> Result<()> {
         if self.egress.log_cursor.is_empty() {
@@ -285,6 +312,9 @@ impl SystemdLab {
         Ok(())
     }
     pub(super) fn egress_zero(&mut self, label: &str) -> Result<()> {
+        if !self.egress.installed || self.egress.control_active {
+            return fail("root egress case window has not opened");
+        }
         let counts = self.egress_count(label)?;
         self.egress_log(label)?;
         if counts
@@ -322,10 +352,13 @@ fn count(text: &str, scope: &Scope) -> Result<std::collections::BTreeMap<String,
             return fail("duplicate egress counter");
         }
     }
-    let expected: BTreeSet<_> = scope
+    let mut expected: BTreeSet<_> = scope
         .selectors()
         .map(|(c, i, f, d)| format!("{c}:{i}:{f}:{d}"))
         .collect();
+    if scope.control_active {
+        expected.insert("positive-control".into());
+    }
     if counts.keys().cloned().collect::<BTreeSet<_>>() != expected {
         return fail("root egress detector missing per-interface counters");
     }
@@ -362,11 +395,41 @@ mod tests {
         ] {
             assert!(Scope::new(links, routes, "[]", routes).is_err());
         }
-        let rules = scope.rules();
+        let rules = scope.rules(false);
         assert!(
             !rules.contains(" drop") && !rules.contains(" reject") && !rules.contains("oifname !=")
         );
         assert_eq!(rules.matches("log prefix").count(), scope.judged.len() * 4);
+    }
+    #[test]
+    fn control_is_separate_and_exemption_is_removed_for_case_window() {
+        let mut scope = scope();
+        scope.control_active = true;
+        let control_rules = scope.rules(true);
+        let case_rules = scope.rules(false);
+        assert!(control_rules.contains("return comment \"positive-control\""));
+        assert!(
+            control_rules.find("positive-control").unwrap()
+                < control_rules.find("judged:docker0").unwrap()
+        );
+        assert!(!case_rules.contains("positive-control"));
+        let mut rules: Vec<_> = scope.selectors().map(|(c,i,f,d)| serde_json::json!({"rule":{"comment":format!("{c}:{i}:{f}:{d}"),"expr":[{"counter":{"packets":0}}]}})).collect();
+        rules.push(serde_json::json!({"rule":{"comment":"positive-control","expr":[{"counter":{"packets":1}}]}}));
+        let snapshot = |rules: &Vec<Value>| serde_json::json!({"nftables":rules}).to_string();
+        let counts = count(&snapshot(&rules), &scope).unwrap();
+        assert_eq!(counts["positive-control"], 1);
+        assert!(
+            counts
+                .iter()
+                .filter(|(k, _)| k.starts_with("judged:"))
+                .all(|(_, n)| *n == 0)
+        );
+        scope.control_active = false;
+        assert!(count(&snapshot(&rules), &scope).is_err());
+        rules.pop();
+        rules[0]["rule"]["expr"][0]["counter"]["packets"] = 1.into();
+        let counts = count(&snapshot(&rules), &scope).unwrap();
+        assert_eq!(counts["judged:docker0:ip:saddr"], 1);
     }
     #[test]
     fn counts_require_complete_unique_attribution_and_keep_excluded_separate() {

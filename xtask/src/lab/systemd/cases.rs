@@ -9,6 +9,13 @@ use std::{
     os::unix::{fs::MetadataExt, process::ExitStatusExt},
 };
 
+// AF_PACKET capture on up0 sees the forged packets before wan's IPv4
+// forwarding/input hooks. Silently drop all three, so the source-spoof control
+// cannot solicit a reply that follows the root namespace's default route.
+fn oracle_control_drop() -> &'static str {
+    "table inet lab_inject { chain input { type filter hook input priority filter; ip saddr 198.51.100.2 ip daddr 198.51.100.1 udp sport { 40002, 40003 } udp dport { 53, 8080 } counter drop;\n }\n chain forward { type filter hook forward priority filter; ip saddr 10.99.0.2 ip daddr 192.0.2.6 udp sport 40001 udp dport 8080 counter drop;\n }\n}\n"
+}
+
 impl SystemdLab {
     pub(super) fn capture_control(&mut self) -> Result<()> {
         let stem = "oracle-positive-control";
@@ -17,33 +24,69 @@ impl SystemdLab {
         self.lab.service_check(&mut markers)?;
         let marker = Lab::marker()?;
         markers.push(marker.clone());
-        self.lab.runner.input(&Invocation::new("wan", "nft", &["-f", "-"]), Some(b"table inet lab_inject { chain input { type filter hook input priority filter; ip saddr 198.51.100.2 ip daddr 198.51.100.1 udp sport { 40002, 40003 } udp dport { 53, 8080 } drop;\n\t}\n}\n"))?;
-        for (index, bytes) in helpers::injection_packets(&marker)?.iter().enumerate() {
-            let path = self.lab.private.join(format!("control-{index}.packet"));
-            fs::write(&path, bytes)?;
-            let exe = self.lab.executable.clone();
-            self.lab.cmd(
-                "",
-                &exe,
-                &[
-                    "send-packet",
-                    "--interface",
-                    "up0",
-                    "--file",
-                    path.to_str().ok_or("packet path")?,
-                ],
+        fs::write(
+            self.lab
+                .artifacts
+                .join("oracle-positive-control-markers.json"),
+            serde_json::to_vec_pretty(
+                &serde_json::json!({"service_markers":markers[..markers.len()-1],"injection_marker":marker,"packets":[{"file":"control-0.packet","source":"10.99.0.2:40001","destination":"192.0.2.6:8080"},{"file":"control-1.packet","source":"198.51.100.2:40002","destination":"198.51.100.1:53"},{"file":"control-2.packet","source":"198.51.100.2:40003","destination":"198.51.100.1:8080"}]}),
+            )?,
+        )?;
+        let rules = oracle_control_drop();
+        fs::write(
+            self.lab.artifacts.join("oracle-positive-control-drop.nft"),
+            rules,
+        )?;
+        self.lab.runner.input(
+            &Invocation::new("wan", "nft", &["-f", "-"]),
+            Some(rules.as_bytes()),
+        )?;
+        let trial = (|| {
+            for (index, bytes) in helpers::injection_packets(&marker)?.iter().enumerate() {
+                let path = self.lab.private.join(format!("control-{index}.packet"));
+                fs::write(&path, bytes)?;
+                let exe = self.lab.executable.clone();
+                self.lab.cmd(
+                    "",
+                    &exe,
+                    &[
+                        "send-packet",
+                        "--interface",
+                        "up0",
+                        "--file",
+                        path.to_str().ok_or("packet path")?,
+                    ],
+                )?;
+            }
+            self.lab.runner.dwell(Duration::from_secs(1))?;
+            let report = self.evaluate(stem, &markers)?;
+            let drops =
+                self.lab
+                    .cmd("wan", "nft", &["-j", "list", "table", "inet", "lab_inject"])?;
+            fs::write(
+                self.lab
+                    .artifacts
+                    .join("oracle-positive-control-drops.json"),
+                drops,
             )?;
-        }
-        self.lab.runner.dwell(Duration::from_secs(1))?;
-        let report = self.evaluate(stem, &markers)?;
-        let result = super::super::evidence::injected_only(
-            &report,
-            &fs::read(self.lab.artifacts.join(format!("{stem}.pcap")))?,
-            &marker,
-        );
-        self.lab
-            .cmd("wan", "nft", &["delete", "table", "inet", "lab_inject"])?;
-        result
+            let receipts =
+                helpers::receipts(&fs::read_to_string(self.lab.artifacts.join("sink.jsonl"))?)?;
+            if receipts.iter().any(|receipt| receipt.marker == marker) {
+                return fail(
+                    "oracle forged control reached the internet sink; see marker manifest and drop counters",
+                );
+            }
+            super::super::evidence::injected_only(
+                &report,
+                &fs::read(self.lab.artifacts.join(format!("{stem}.pcap")))?,
+                &marker,
+            )
+        })();
+        let cleanup = self
+            .lab
+            .cmd("wan", "nft", &["delete", "table", "inet", "lab_inject"])
+            .map(|_| ());
+        super::super::mutation::finish(trial, cleanup)
     }
 
     pub(super) fn case(&mut self, case: &str) -> Result<()> {
@@ -73,7 +116,11 @@ impl SystemdLab {
         self.lab.capture("", "up0", case)?;
         let mut stream = self.stream(case, &mut markers)?;
         let trial = (|| {
-            self.lab.service_check(&mut markers)?;
+            if case == "L44" {
+                self.writers_canary("before-race", &mut markers)?;
+            } else {
+                self.lab.service_check(&mut markers)?;
+            }
             match case {
                 "L10" => self.daemon_faults(&mut markers)?,
                 "L14" => self.disconnect_reboot(&mut markers)?,
@@ -83,7 +130,11 @@ impl SystemdLab {
             }
             self.ready()?;
             self.safety()?;
-            self.lab.service_check(&mut markers)
+            if case == "L44" {
+                self.writers_canary("after-trial", &mut markers)
+            } else {
+                self.lab.service_check(&mut markers)
+            }
         })();
         let flow = self.finish_stream(&mut stream, case, case == "L10");
         let oracle = self.judge(case, &markers);
@@ -569,6 +620,26 @@ impl SystemdLab {
         self.systemctl(&["daemon-reload"])?;
         Ok(())
     }
+    fn writers_canary(&mut self, label: &str, markers: &mut Vec<String>) -> Result<()> {
+        let started = Instant::now();
+        let first_marker = markers.len();
+        let mut ready_ms = None;
+        let result = (|| {
+            // ready polls check=0 for at most 90 seconds and proves provider
+            // transport. Do this after the final unit start, before any probe.
+            self.ready_recorded(Some(&format!("L44-{label}")))?;
+            ready_ms = Some(started.elapsed().as_millis());
+            self.check_code(0)?;
+            self.lab.service_check(markers)
+        })();
+        fs::write(
+            self.lab.artifacts.join(format!("L44-{label}-canary.json")),
+            serde_json::to_vec_pretty(
+                &serde_json::json!({"check_zero_wait_ms":ready_ms,"elapsed_ms":started.elapsed().as_millis(),"markers":markers[first_marker..],"passed":result.is_ok(),"error":result.as_ref().err().map(ToString::to_string),"probe_evidence":"probes.jsonl and sink.jsonl; phase check samples in L44-*-check.jsonl; command output in commands.jsonl"}),
+            )?,
+        )?;
+        result
+    }
     #[allow(clippy::too_many_lines)] // Keep restart, lock contention and bounded writer outcomes together.
     fn writers(&mut self, markers: &mut Vec<String>) -> Result<()> {
         self.reboot_stop()?;
@@ -788,7 +859,7 @@ impl SystemdLab {
             )?;
             self.systemctl(&["start", "scupper-net"])?;
             self.safety()?;
-            self.lab.service_check(markers)
+            self.writers_canary("after-writers", markers)
         })();
         let cleanup = self.clear_faults();
         super::super::mutation::finish(trial, cleanup)

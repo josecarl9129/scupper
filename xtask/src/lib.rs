@@ -4,3 +4,5 @@ pub mod pcap;
 
 #[cfg(target_os = "linux")]
 pub mod lab;
+
+pub mod dist;

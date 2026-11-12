@@ -2,19 +2,50 @@
 use super::{A, Invocation, Result, Runner, SystemdLab, fail, fs};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{fs::OpenOptions, io::Write};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::OpenOptions,
+    io::Write,
+};
 
 #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct HostSnapshot {
     defaults4: Vec<String>,
     defaults6: Vec<String>,
-    eth0: Vec<String>,
+    uplinks: BTreeMap<String, UplinkSnapshot>,
     rules4: String,
     rules6: String,
-    eth0_link: Value,
     resolv_conf: String,
-    eth0_dns: String,
     ip_forward: String,
+}
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct UplinkSnapshot {
+    addresses: Vec<String>,
+    link: Value,
+    dns: String,
+}
+fn default_devices(routes: &[String]) -> Result<BTreeSet<String>> {
+    let mut devices = BTreeSet::new();
+    for text in routes {
+        let route: Value = serde_json::from_str(text)?;
+        if let Some(dev) = route["dev"].as_str() {
+            devices.insert(dev.to_owned());
+        }
+        if let Some(hops) = route["nexthops"].as_array() {
+            for hop in hops {
+                devices.insert(
+                    hop["dev"]
+                        .as_str()
+                        .ok_or("default nexthop device")?
+                        .to_owned(),
+                );
+            }
+        }
+    }
+    if devices.is_empty() {
+        return fail("runner has no default-route interface");
+    }
+    Ok(devices)
 }
 fn routes(text: &str) -> Result<Vec<String>> {
     let mut rows: Vec<Value> = serde_json::from_str(text)?;
@@ -28,18 +59,18 @@ fn routes(text: &str) -> Result<Vec<String>> {
     routes.sort();
     Ok(routes)
 }
-fn addresses(text: &str) -> Result<Vec<String>> {
+fn addresses(text: &str, interface: &str) -> Result<Vec<String>> {
     let rows: Vec<Value> = serde_json::from_str(text)?;
-    if rows.len() != 1 || rows[0]["ifname"] != "eth0" {
-        return fail("guard requires exactly one eth0");
+    if rows.len() != 1 || rows[0]["ifname"] != interface {
+        return fail("guard requires exactly one matching uplink");
     }
     let mut result = Vec::new();
     for address in rows[0]["addr_info"]
         .as_array()
-        .ok_or("missing eth0 addr_info")?
+        .ok_or("missing uplink addr_info")?
     {
         if !address["local"].is_string() || !address["prefixlen"].is_number() {
-            return fail("malformed eth0 address");
+            return fail("malformed uplink address");
         }
         // DHCP/IPv6 lifetimes count down without a configuration change.
         let mut address = address.clone();
@@ -50,7 +81,7 @@ fn addresses(text: &str) -> Result<Vec<String>> {
     }
     result.sort();
     if result.is_empty() {
-        return fail("runner eth0 has no addresses");
+        return fail("runner uplink has no addresses");
     }
     Ok(result)
 }
@@ -66,24 +97,38 @@ impl HostSnapshot {
             "ip",
             &["-6", "-j", "route", "show", "table", "all", "default"],
         ))?)?;
-        let eth0 = addresses(&runner.run(&Invocation::new(
-            "",
-            "ip",
-            &["-j", "address", "show", "dev", "eth0"],
-        ))?)?;
         if defaults4.is_empty() {
             return fail("runner has no IPv4 default route");
         }
+        let mut uplinks = BTreeMap::new();
+        for interface in default_devices(&[defaults4.clone(), defaults6.clone()].concat())? {
+            let addresses = addresses(
+                &runner.run(&Invocation::new(
+                    "",
+                    "ip",
+                    &["-j", "address", "show", "dev", &interface],
+                ))?,
+                &interface,
+            )?;
+            let links: Value = serde_json::from_str(&runner.run(&Invocation::new(
+                "",
+                "ip",
+                &["-j", "link", "show", "dev", &interface],
+            ))?)?;
+            let link = serde_json::json!({"flags":links[0]["flags"],"operstate":links[0]["operstate"],"mtu":links[0]["mtu"],"address":links[0]["address"]});
+            let dns = runner.run(&Invocation::new("", "resolvectl", &["dns", &interface]))?;
+            uplinks.insert(
+                interface,
+                UplinkSnapshot {
+                    addresses,
+                    link,
+                    dns,
+                },
+            );
+        }
         let rules4 = runner.run(&Invocation::new("", "ip", &["-4", "-j", "rule", "show"]))?;
         let rules6 = runner.run(&Invocation::new("", "ip", &["-6", "-j", "rule", "show"]))?;
-        let links: Value = serde_json::from_str(&runner.run(&Invocation::new(
-            "",
-            "ip",
-            &["-j", "link", "show", "dev", "eth0"],
-        ))?)?;
-        let eth0_link = serde_json::json!({"flags":links[0]["flags"],"operstate":links[0]["operstate"],"mtu":links[0]["mtu"],"address":links[0]["address"]});
         let resolv_conf = fs::read_to_string("/etc/resolv.conf")?;
-        let eth0_dns = runner.run(&Invocation::new("", "resolvectl", &["dns", "eth0"]))?;
         let ip_forward = runner.run(&Invocation::new(
             "",
             "sysctl",
@@ -95,18 +140,16 @@ impl HostSnapshot {
         Ok(Self {
             defaults4,
             defaults6,
-            eth0,
+            uplinks,
             rules4,
             rules6,
-            eth0_link,
             resolv_conf,
-            eth0_dns,
             ip_forward,
         })
     }
     pub fn verify(&self, now: &Self) -> Result<()> {
         if self != now {
-            return fail("runner routes, rules, eth0, DNS or forwarding changed");
+            return fail("runner routes, rules, uplinks, DNS or forwarding changed");
         }
         Ok(())
     }
@@ -263,17 +306,31 @@ mod tests {
         }
     }
     #[test]
-    fn eth0_normalizes_order_and_lifetimes_but_detects_changes() {
+    fn uplink_normalizes_order_and_lifetimes_but_detects_changes() {
         let a = r#"[{"ifname":"eth0","addr_info":[{"local":"192.0.2.9","prefixlen":24,"valid_life_time":90},{"local":"2001:db8::1","prefixlen":64}]}]"#;
         let b = r#"[{"ifname":"eth0","addr_info":[{"local":"2001:db8::1","prefixlen":64},{"local":"192.0.2.9","prefixlen":24,"valid_life_time":80}]}]"#;
-        assert_eq!(addresses(a).unwrap(), addresses(b).unwrap());
+        assert_eq!(addresses(a, "eth0").unwrap(), addresses(b, "eth0").unwrap());
         assert_ne!(
-            addresses(a).unwrap(),
-            addresses(&a.replace("192.0.2.9", "192.0.2.10")).unwrap()
+            addresses(a, "eth0").unwrap(),
+            addresses(&a.replace("192.0.2.9", "192.0.2.10"), "eth0").unwrap()
         );
-        assert!(addresses("[]").is_err());
-        assert!(addresses(&a.replace("eth0", "up0")).is_err());
-        assert!(addresses(r#"[{"ifname":"eth0","addr_info":[{}]}]"#).is_err());
+        assert!(addresses("[]", "eth0").is_err());
+        assert!(addresses(&a.replace("eth0", "up0"), "eth0").is_err());
+        assert!(addresses(r#"[{"ifname":"eth0","addr_info":[{}]}]"#, "eth0").is_err());
+    }
+    #[test]
+    fn discovers_named_and_multipath_defaults_in_both_families() {
+        let defaults =
+            routes(r#"[{"dev":"enp39s0"},{"nexthops":[{"dev":"ens6"},{"dev":"enp39s0"}]}]"#)
+                .unwrap();
+        assert_eq!(
+            default_devices(&defaults).unwrap(),
+            ["enp39s0".to_owned(), "ens6".to_owned()].into()
+        );
+        let text = r#"[{"ifname":"enp39s0","addr_info":[{"local":"192.0.2.9","prefixlen":24}]}]"#;
+        assert!(addresses(text, "enp39s0").is_ok());
+        assert!(default_devices(&[]).is_err());
+        assert!(default_devices(&routes(r#"[{"nexthops":[{}]}]"#).unwrap()).is_err());
     }
     #[test]
     fn route_guard_detects_gateway_interface_and_metric_drift() {
@@ -289,17 +346,15 @@ mod tests {
         let original = HostSnapshot {
             defaults4: routes(text).unwrap(),
             defaults6: vec![],
-            eth0: vec!["a".into()],
             ..HostSnapshot::default()
         };
         let mut changed = HostSnapshot {
             defaults4: routes(text).unwrap(),
             defaults6: vec![],
-            eth0: vec!["a".into()],
             ..HostSnapshot::default()
         };
         original.verify(&changed).unwrap();
-        changed.eth0.push("b".into());
+        changed.ip_forward = "0".into();
         assert!(original.verify(&changed).is_err());
     }
     #[test]

@@ -4,6 +4,8 @@ use std::{
     fmt::{self, Write},
 };
 
+/// Manual recovery after a deployment may have replaced either executable.
+pub const RESTORE_COMMANDS: &str = "install -m 0755 /usr/local/bin/scupperd.prev /usr/local/bin/scupperd\ninstall -m 0755 /usr/local/bin/scupper.prev /usr/local/bin/scupper\nsystemctl restart scupperd";
 /// Required distribution packages, in the order used in diagnostics.
 pub const PACKAGES: [&str; 4] = ["wireguard-tools", "nftables", "iproute2", "conntrack"];
 /// Unprivileged helper accounts; M2 has no edge account.
