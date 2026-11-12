@@ -514,6 +514,7 @@ impl SystemdLab {
         let mut samples = Vec::new();
         while Instant::now() < until {
             self.safety()?;
+            let forwarding = self.disconnected_forwarding()?;
             let stamp: u64 = self
                 .systemctl(&[
                     "show",
@@ -527,7 +528,7 @@ impl SystemdLab {
                 ticks += 1;
             }
             previous = stamp;
-            samples.push(serde_json::json!({"elapsed_ms":started.elapsed().as_millis(),"watchdog_usec":stamp}));
+            samples.push(serde_json::json!({"elapsed_ms":started.elapsed().as_millis(),"watchdog_usec":stamp,"forwarding":forwarding}));
             self.lab.runner.dwell(Duration::from_millis(500))?;
         }
         fs::write(
@@ -543,14 +544,25 @@ impl SystemdLab {
         self.cli(&["connect"])?;
         self.ready()
     }
+    fn disconnected_forwarding(&mut self) -> Result<Vec<String>> {
+        let mut values = Vec::new();
+        for key in ["net.ipv4.ip_forward", "net.ipv6.conf.all.forwarding"] {
+            let value = self
+                .lab
+                .cmd("scupper", "sysctl", &["-n", key])?
+                .trim()
+                .to_owned();
+            if value != "0" {
+                return fail("disconnect lost across reboot or during dwell");
+            }
+            values.push(value);
+        }
+        Ok(values)
+    }
     fn disconnected(&mut self, stem: &str, markers: &mut Vec<String>) -> Result<()> {
         self.check_code(4)?;
         self.safety()?;
-        for key in ["net.ipv4.ip_forward", "net.ipv6.conf.all.forwarding"] {
-            if self.lab.cmd("scupper", "sysctl", &["-n", key])?.trim() != "0" {
-                return fail("disconnect lost across reboot");
-            }
-        }
+        self.disconnected_forwarding()?;
         let links = scupper_core::parse::parse_ip_link(&self.lab.cmd(
             "scupper",
             "ip",
@@ -937,6 +949,86 @@ impl SystemdLab {
         }
         Ok(())
     }
+    fn firewall_dump(&mut self, label: &str) -> Result<()> {
+        let rules = self.cmd("nft", &["-j", "list", "ruleset"])?;
+        fs::write(
+            self.lab.artifacts.join(format!("{label}-ruleset.json")),
+            rules,
+        )?;
+        Ok(())
+    }
+    fn firewall_positive(&mut self, label: &str) -> Result<()> {
+        let out = self.cli(&["install", "--check"])?;
+        fs::write(
+            self.lab
+                .artifacts
+                .join(format!("{label}-install-check.txt")),
+            &out,
+        )?;
+        if !out.contains("warning: host firewall may block UDP 51820")
+            || !out.contains("install: no changes")
+        {
+            return fail("missing UDP firewall availability warning");
+        }
+        self.firewall_dump(label)
+    }
+    fn client2_no_handshake(&mut self) -> Result<()> {
+        let handshakes = self
+            .lab
+            .cmd("scupper", "wg", &["show", "wg0", "latest-handshakes"])?;
+        fs::write(
+            self.lab.artifacts.join("V-13-client2-handshakes.txt"),
+            &handshakes,
+        )?;
+        let key = &self.lab.public_keys[4];
+        let mut rows = handshakes
+            .lines()
+            .filter_map(|line| line.split_once('\t'))
+            .filter(|(peer, _)| *peer == key);
+        if rows.next().map(|(_, stamp)| stamp.trim()) != Some("0") || rows.next().is_some() {
+            return fail("client2 has a gateway handshake while inbound UDP is blocked");
+        }
+        Ok(())
+    }
+    fn ufw_controls(&mut self) -> Result<()> {
+        self.cmd("ufw", &["--force", "enable"])?;
+        // Real default deny-in/allow-out ruleset: only client UDP warns.
+        self.firewall_positive("V-13-default")?;
+        self.cmd(
+            "ufw",
+            &[
+                "allow", "in", "on", "up0", "proto", "udp", "to", "any", "port", "51820",
+            ],
+        )?;
+        self.firewall_dump("V-13-allow")?;
+        self.firewall_negative("V-13-allow")?;
+        // With client ingress allowed, an exit-only block must also warn.
+        self.cmd(
+            "ufw",
+            &[
+                "deny", "out", "on", "up0", "proto", "udp", "to", "any", "port", "51820",
+            ],
+        )?;
+        self.firewall_positive("V-13-exit")?;
+        self.cmd(
+            "ufw",
+            &[
+                "--force", "delete", "allow", "in", "on", "up0", "proto", "udp", "to", "any",
+                "port", "51820",
+            ],
+        )?;
+        self.cmd(
+            "ufw",
+            &[
+                "deny", "in", "on", "up0", "proto", "udp", "to", "any", "port", "51820",
+            ],
+        )?;
+        self.guard("ufw-enabled")?;
+        let rules = self.cmd("ufw", &["status", "verbose"])?;
+        fs::write(self.lab.artifacts.join("V-13-ufw.txt"), rules)?;
+        self.firewall_positive("V-13")?;
+        Ok(())
+    }
     fn ufw(&mut self, markers: &mut Vec<String>) -> Result<()> {
         self.firewall_negative("V-13-before")?;
         let status = self.cmd("ufw", &["status"])?;
@@ -947,30 +1039,12 @@ impl SystemdLab {
         if added.lines().any(|line| line.trim().starts_with("ufw ")) {
             return fail("refusing pre-existing ufw user rules");
         }
-        // Defaults accept every interface; the only deny rules name up0.
-        for direction in ["incoming", "outgoing", "routed"] {
+        self.cmd("ufw", &["default", "deny", "incoming"])?;
+        for direction in ["outgoing", "routed"] {
             self.cmd("ufw", &["default", "allow", direction])?;
         }
-        for direction in ["in", "out"] {
-            self.cmd(
-                "ufw",
-                &[
-                    "deny", direction, "on", "up0", "proto", "udp", "to", "any", "port", "51820",
-                ],
-            )?;
-        }
         let trial = (|| {
-            self.cmd("ufw", &["--force", "enable"])?;
-            self.guard("ufw-enabled")?;
-            let rules = self.cmd("ufw", &["status", "verbose"])?;
-            fs::write(self.lab.artifacts.join("V-13-ufw.txt"), rules)?;
-            let out = self.cli(&["install", "--check"])?;
-            fs::write(self.lab.artifacts.join("V-13-install-check.txt"), &out)?;
-            if !out.contains("warning: host firewall may block UDP 51820")
-                || !out.contains("install: no changes")
-            {
-                return fail("missing UDP firewall availability warning");
-            }
+            self.ufw_controls()?;
             // Existing established UDP is accepted by ufw's before rules. Remove
             // only lab tuples, then require a fresh handshake to be blocked.
             for (source, destination) in [
@@ -1010,6 +1084,7 @@ impl SystemdLab {
             {
                 return fail("ufw did not block fresh client2 handshake");
             }
+            self.client2_no_handshake()?;
             Ok(())
         })();
         let disabled = (|| {

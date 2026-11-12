@@ -17,6 +17,9 @@ pub(super) struct HostSnapshot {
     rules6: String,
     resolv_conf: String,
     ip_forward: String,
+    rp_filter: BTreeMap<String, String>,
+    nft_chains: Value,
+    iptables_forward_policy: String,
 }
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct UplinkSnapshot {
@@ -137,6 +140,30 @@ impl HostSnapshot {
         if ip_forward.trim() != "1" {
             return fail("root ip_forward=1 required for adversarial inheritance");
         }
+        let mut rp_filter = BTreeMap::new();
+        for interface in ["all", "default", "up0"] {
+            if interface != "up0" || std::path::Path::new("/sys/class/net/up0").exists() {
+                let key = format!("net.ipv4.conf.{interface}.rp_filter");
+                rp_filter.insert(
+                    interface.into(),
+                    runner
+                        .run(&Invocation::new("", "sysctl", &["-n", &key]))?
+                        .trim()
+                        .into(),
+                );
+            }
+        }
+        let nft_chains = serde_json::from_str(&runner.run(&Invocation::new(
+            "",
+            "nft",
+            &["-j", "list", "chains"],
+        ))?)?;
+        let iptables_forward_policy = runner
+            .run(&Invocation::new("", "iptables", &["-S", "FORWARD"]))?
+            .lines()
+            .find(|line| line.starts_with("-P FORWARD "))
+            .ok_or("missing iptables FORWARD policy")?
+            .into();
         Ok(Self {
             defaults4,
             defaults6,
@@ -145,10 +172,25 @@ impl HostSnapshot {
             rules6,
             resolv_conf,
             ip_forward,
+            rp_filter,
+            nft_chains,
+            iptables_forward_policy,
         })
     }
     pub fn verify(&self, now: &Self) -> Result<()> {
-        if self != now {
+        // Record hook policies, including lab/ufw chains, without treating the
+        // deliberately installed lab firewall as runner configuration drift.
+        if self.defaults4 != now.defaults4
+            || self.defaults6 != now.defaults6
+            || self.uplinks != now.uplinks
+            || self.rules4 != now.rules4
+            || self.rules6 != now.rules6
+            || self.resolv_conf != now.resolv_conf
+            || self.ip_forward != now.ip_forward
+            || ["all", "default"]
+                .iter()
+                .any(|key| self.rp_filter.get(*key) != now.rp_filter.get(*key))
+        {
             return fail("runner routes, rules, uplinks, DNS or forwarding changed");
         }
         Ok(())

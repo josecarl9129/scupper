@@ -697,10 +697,47 @@ fn firewall_warning(system: &dyn System, site: &SiteConfig) -> Result<bool, Refu
         .gateways
         .get(&site.site.primary)
         .ok_or_else(|| input("unknown gateway"))?;
-    Ok(gateway
-        .uplinks
+    let client_port = site
+        .identities
+        .get(&gateway.client_tunnel.identity)
+        .ok_or_else(|| input("unknown client identity"))?
+        .listen_port;
+    let client_port =
+        u16::try_from(client_port).map_err(|_| input("invalid client listen port"))?;
+    let client_endpoint: std::net::SocketAddr = gateway
+        .endpoint
+        .parse()
+        .map_err(|_| input("invalid client endpoint"))?;
+    let exits = gateway
+        .exits
         .iter()
-        .any(|uplink| firewall::may_block(&ruleset, uplink)))
+        .map(|exit| {
+            exit.endpoint
+                .parse::<std::net::SocketAddr>()
+                .map_err(|_| input("invalid exit endpoint"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(gateway.uplinks.iter().any(|uplink| {
+        firewall::may_block(
+            &ruleset,
+            firewall::Packet {
+                hook: "input",
+                uplink,
+                port: client_port,
+                destination: client_endpoint.ip(),
+            },
+        ) || exits.iter().any(|endpoint| {
+            firewall::may_block(
+                &ruleset,
+                firewall::Packet {
+                    hook: "output",
+                    uplink,
+                    port: endpoint.port(),
+                    destination: endpoint.ip(),
+                },
+            )
+        })
+    }))
 }
 fn verify_same_key(paths: &Paths, reference: &SecretName, key: &[u8]) -> Result<(), Refusal> {
     let secret = read_install_secret(paths, reference)?;

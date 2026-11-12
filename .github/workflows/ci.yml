@@ -303,11 +303,16 @@ jobs:
       - name: Install lab tools
         run: |
           sudo timeout 300 apt-get update
-          sudo timeout 300 apt-get install -y wireguard-tools nftables iproute2 tcpdump dnsmasq-base util-linux iputils-ping conntrack slirp4netns ufw strace
+          sudo timeout 300 apt-get install -y wireguard-tools nftables iproute2 tcpdump dnsmasq-base util-linux iputils-ping conntrack slirp4netns ufw strace python3
           chmod +x target/systemd-bin/*
           sudo timeout 30 systemctl start systemd-udevd systemd-networkd
       - name: Run installed-unit case
         run: sudo timeout --kill-after=150 1380 target/systemd-bin/xtask systemd-lab --case ${{ matrix.case }} --binaries target/systemd-bin --artifacts systemd-lab-out
+      - name: Unit test actual enabled ufw dumps in both UDP directions
+        if: ${{ matrix.case == 'V-13' }}
+        env:
+          SCUPPER_TEST_UFW_DUMPS: ${{ github.workspace }}/systemd-lab-out
+        run: timeout 600 env -u CARGO_TARGET_TMPDIR cargo test -p scupper-sys --lib --locked install::firewall::tests::real_ufw_enable_ruleset_dumps -- --ignored --exact
       - name: Collect journal
         if: always()
         run: |

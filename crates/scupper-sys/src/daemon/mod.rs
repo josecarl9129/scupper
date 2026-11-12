@@ -416,19 +416,21 @@ fn run_notified(
         || {
             let _ = lease_notify.status("waiting for supervisor lease; local writer active");
         },
-    )?;
+    )
+    .map_err(|error| io::Error::new(error.kind(), "cannot acquire supervisor lease"))?;
     let origin = Instant::now();
     let gateway = GatewayId(
         RealFs
-            .read(&options.config_root.join("gateway-id"))?
+            .read(&options.config_root.join("gateway-id"))
+            .map_err(|error| io::Error::new(error.kind(), "cannot read gateway identity"))?
             .trim()
             .into(),
     );
     let system = RealSystem::default()
         .with_canon_paths(options.probe_binary.clone(), options.run_root.clone());
     let namespace = GatewayNamespace;
-    let mut audit =
-        Audit::open(&options.state_root, gateway.clone(), origin).map_err(io::Error::other)?;
+    let mut audit = Audit::open(&options.state_root, gateway.clone(), origin)
+        .map_err(|_| io::Error::other("cannot open daemon audit state"))?;
     audit.poll(origin);
     let mut runtime = Runtime {
         options,
@@ -1536,14 +1538,12 @@ mod tests {
         );
         drop(lease);
         // The first post-lease operation now reaches the deliberately missing config.
-        assert_eq!(
-            receive
-                .recv_timeout(Duration::from_secs(3))
-                .unwrap()
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::NotFound
-        );
+        let error = receive
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(error.to_string(), "cannot read gateway identity");
         worker.join().unwrap();
         assert!(!root.join("state").exists());
         std::fs::remove_dir_all(root).unwrap();

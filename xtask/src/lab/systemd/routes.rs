@@ -1,16 +1,14 @@
-//! Root containment for lab destinations, without filtering lab source leaks.
+//! Root containment for documentation destinations only.
 use super::{Result, SystemdLab, fail, fs};
 use serde_json::Value;
 
-// More-specific connected/routed lab links remain usable. Everything else in
+// Never blackhole IPv4 client/tunnel sources: reverse-path validation would drop
+// incoming packets before forwarding. More-specific lab links remain usable. Everything else in
 // these ranges must terminate here instead of following a runner default route.
 const BLACKHOLES: &[(&str, &str)] = &[
-    ("-4", "10.99.0.0/24"),
-    ("-4", "10.2.0.0/24"),
     ("-4", "192.0.2.0/24"),
     ("-4", "198.51.100.0/24"),
     ("-4", "203.0.113.0/24"),
-    ("-6", "fd00::/8"),
     ("-6", "2001:db8::/32"),
 ];
 fn blackhole(text: &str, prefix: &str) -> Result<()> {
@@ -108,6 +106,9 @@ mod tests {
             blackhole(&text, prefix).unwrap();
             assert!(blackhole(&text.replace("blackhole", "unicast"), prefix).is_err());
             assert!(blackhole(&text, "0.0.0.0/0").is_err());
+        }
+        for source in ["10.99.0.0/24", "10.2.0.0/24", "fd00::/8"] {
+            assert!(!BLACKHOLES.iter().any(|(_, prefix)| *prefix == source));
         }
         assert!(blackhole("[]", "10.99.0.0/24").is_err());
         assert!(blackhole(r#"[{"dst":"10.99.0.0/24","dev":"eth0"}]"#, "10.99.0.0/24").is_err());

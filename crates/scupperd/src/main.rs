@@ -44,7 +44,7 @@ fn main() -> std::process::ExitCode {
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("scupperd: fatal ({:?})", error.kind());
+            eprintln!("scupperd: fatal ({:?}): {error}", error.kind());
             std::process::ExitCode::FAILURE
         }
     }

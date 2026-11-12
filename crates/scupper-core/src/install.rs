@@ -519,7 +519,9 @@ pub fn plan(facts: &Facts, request: &Request) -> Result<Plan, Refusal> {
     Ok(Plan {
         steps,
         warnings: if facts.firewall_warning {
-            vec!["host firewall may block UDP 51820; inspect locally visible rules"]
+            vec![
+                "host firewall may block UDP 51820 or configured exit UDP; inspect locally visible input/output rules",
+            ]
         } else {
             vec![]
         },

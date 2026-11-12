@@ -1,4 +1,4 @@
-//! Per-interface root egress evidence, with separate internal-path observations.
+//! Root ingress and per-interface egress evidence, with internal-path observations.
 use super::{A, Invocation, Result, SystemdLab, fail, fs, helpers};
 use serde_json::Value;
 use std::{collections::BTreeSet, fmt::Write as _, net::SocketAddr};
@@ -101,10 +101,20 @@ impl Scope {
     }
     fn rules(&self, control: bool) -> String {
         let mut text = format!("table inet {TABLE} {{\n");
+        text.push_str(
+            " chain ingress {\n  type filter hook prerouting priority -300; policy accept;\n",
+        );
+        for (family, prefixes) in [
+            ("ip", "{ 10.99.0.0/24, 10.2.0.0/24 }"),
+            ("ip6", "{ fd00::/8, 2001:db8:2::/64 }"),
+        ] {
+            writeln!(text, "  {family} saddr {prefixes} counter limit rate 5/second burst 10 packets log prefix \"scupper-lab-egress-ingress \" comment \"judged:prerouting:{family}:saddr\"").ok();
+        }
+        text.push_str(" }\n");
         for chain in ["judged", "excluded"] {
             writeln!(
                 text,
-                " chain {chain} {{\n  type filter hook postrouting priority 300; policy accept;"
+                " chain {chain} {{\n  type filter hook postrouting priority -300; policy accept;"
             )
             .ok();
             if chain == "judged" && control {
@@ -112,7 +122,7 @@ impl Scope {
                 // it atomically when opening the case window, so no case packet
                 // can inherit the positive control's exemption.
                 let interface = serde_json::json!(self.control_interface);
-                writeln!(text, "  oifname {interface} ip saddr {} ip daddr 192.0.2.254 ip ttl 1 udp sport 40001 udp dport 8080 counter log prefix \"scupper-lab-egress-control \" return comment \"positive-control\"", A.client_inner).ok();
+                writeln!(text, "  oifname {interface} ip saddr {} ip daddr 198.18.255.254 ip ttl 1 udp sport 40001 udp dport 8080 counter log prefix \"scupper-lab-egress-control \" return comment \"positive-control\"", A.client_inner).ok();
             }
             for (_, interface, family, direction) in self.selectors().filter(|s| s.0 == chain) {
                 let prefixes = PREFIXES.iter().find(|p| p.0 == family).map_or("", |p| p.1);
@@ -173,7 +183,7 @@ impl SystemdLab {
         )?;
         self.egress.installed = true;
         self.egress.control_active = true;
-        let destination = "192.0.2.254";
+        let destination = "198.18.255.254";
         let packet = helpers::spoofed_packet(
             A.client_inner.parse()?,
             destination.parse()?,
@@ -231,7 +241,7 @@ impl SystemdLab {
             if log.lines().any(|line| {
                 line.contains(&format!("OUT={} ", self.egress.control_interface))
                     && line.contains(&format!("SRC={} ", A.client_inner))
-                    && line.contains("DST=192.0.2.254 ")
+                    && line.contains("DST=198.18.255.254 ")
                     && line.contains("PROTO=UDP")
             }) {
                 break;
@@ -241,6 +251,7 @@ impl SystemdLab {
             }
             self.lab.runner.dwell(super::Duration::from_millis(100))?;
         }
+        self.ingress_positive_control()?;
         let rules = self.egress.rules(false);
         fs::write(self.lab.artifacts.join("root-egress-case.nft"), &rules)?;
         // One nft transaction leaves no gap and no control exemption in the
@@ -261,6 +272,86 @@ impl SystemdLab {
             &self.egress.log_cursor,
         )?;
         Ok(())
+    }
+    fn ingress_positive_control(&mut self) -> Result<()> {
+        // A helper-side raw IP socket traverses root prerouting, even when
+        // rp_filter or a runner's FORWARD policy would later discard it.
+        self.cmd(
+            "ip",
+            &[
+                "link", "add", "ctl0", "type", "veth", "peer", "name", "ctlpeer",
+            ],
+        )?;
+        let trial = (|| {
+            self.cmd("ip", &["link", "set", "ctlpeer", "netns", "internet"])?;
+            self.cmd("ip", &["addr", "add", "198.18.0.1/30", "dev", "ctl0"])?;
+            self.cmd("ip", &["link", "set", "ctl0", "up"])?;
+            self.lab.cmd(
+                "internet",
+                "ip",
+                &["addr", "add", "198.18.0.2/30", "dev", "ctlpeer"],
+            )?;
+            self.lab
+                .cmd("internet", "ip", &["link", "set", "ctlpeer", "up"])?;
+            self.lab.cmd(
+                "internet",
+                "ip",
+                &[
+                    "route",
+                    "add",
+                    "198.18.255.254/32",
+                    "via",
+                    "198.18.0.1",
+                    "dev",
+                    "ctlpeer",
+                ],
+            )?;
+            let mut packet = helpers::spoofed_packet(
+                A.client_inner.parse()?,
+                "198.18.255.254".parse()?,
+                b"ingress-control",
+            )?;
+            packet[8] = 1; // IP_HDRINCL recomputes the checksum; TTL prevents onward transit.
+            fs::write(
+                self.lab.artifacts.join("root-ingress-control.packet"),
+                &packet,
+            )?;
+            let before = self.egress_count("ingress-control-before")?;
+            let mut hex = String::with_capacity(packet.len() * 2);
+            for byte in &packet {
+                write!(hex, "{byte:02x}").ok();
+            }
+            self.lab.cmd("internet", "python3", &["-c", "import socket,sys; s=socket.socket(socket.AF_INET,socket.SOCK_RAW,socket.IPPROTO_UDP); s.setsockopt(socket.IPPROTO_IP,socket.IP_HDRINCL,1); s.setsockopt(socket.SOL_SOCKET,socket.SO_BINDTODEVICE,b'ctlpeer'); s.sendto(bytes.fromhex(sys.argv[1]),('198.18.255.254',0))", &hex])?;
+            let until = super::Instant::now() + super::Duration::from_secs(5);
+            loop {
+                let counts = self.egress_count("ingress-positive-control")?;
+                if counts["judged:prerouting:ip:saddr"] == before["judged:prerouting:ip:saddr"] + 1
+                {
+                    self.egress_log("ingress-positive-control")?;
+                    let log = fs::read_to_string(
+                        self.lab
+                            .artifacts
+                            .join("ingress-positive-control-root-egress-kernel.txt"),
+                    )?;
+                    if log.lines().any(|line| {
+                        line.contains("scupper-lab-egress-ingress ")
+                            && line.contains("IN=ctl0 ")
+                            && line.contains(&format!("SRC={} ", A.client_inner))
+                            && line.contains("DST=198.18.255.254 ")
+                            && line.contains("PROTO=UDP")
+                    }) {
+                        break;
+                    }
+                }
+                if super::Instant::now() >= until {
+                    return fail("root prerouting source control missing count or attributed log");
+                }
+                self.lab.runner.dwell(super::Duration::from_millis(100))?;
+            }
+            Ok(())
+        })();
+        let cleanup = self.cmd("ip", &["link", "del", "ctl0"]).map(|_| ());
+        super::super::mutation::finish(trial, cleanup)
     }
     fn egress_count(&mut self, label: &str) -> Result<std::collections::BTreeMap<String, u64>> {
         let text = self.cmd("nft", &["-j", "list", "table", "inet", TABLE])?;
@@ -322,7 +413,7 @@ impl SystemdLab {
             .any(|(key, n)| key.starts_with("judged:") && *n != 0)
         {
             return fail(
-                "lab or tunnel prefix escaped root namespace through a runner interface; see per-interface counters and kernel log",
+                "client/tunnel source reached root namespace or lab prefix escaped through a runner interface; see counters and kernel log",
             );
         }
         Ok(())
@@ -356,6 +447,7 @@ fn count(text: &str, scope: &Scope) -> Result<std::collections::BTreeMap<String,
         .selectors()
         .map(|(c, i, f, d)| format!("{c}:{i}:{f}:{d}"))
         .collect();
+    expected.extend(["ip", "ip6"].map(|family| format!("judged:prerouting:{family}:saddr")));
     if scope.control_active {
         expected.insert("positive-control".into());
     }
@@ -399,7 +491,10 @@ mod tests {
         assert!(
             !rules.contains(" drop") && !rules.contains(" reject") && !rules.contains("oifname !=")
         );
-        assert_eq!(rules.matches("log prefix").count(), scope.judged.len() * 4);
+        assert_eq!(
+            rules.matches("log prefix").count(),
+            scope.judged.len() * 4 + 2
+        );
     }
     #[test]
     fn control_is_separate_and_exemption_is_removed_for_case_window() {
@@ -415,6 +510,7 @@ mod tests {
         assert!(!case_rules.contains("positive-control"));
         let mut rules: Vec<_> = scope.selectors().map(|(c,i,f,d)| serde_json::json!({"rule":{"comment":format!("{c}:{i}:{f}:{d}"),"expr":[{"counter":{"packets":0}}]}})).collect();
         rules.push(serde_json::json!({"rule":{"comment":"positive-control","expr":[{"counter":{"packets":1}}]}}));
+        rules.extend(["ip", "ip6"].map(|f| serde_json::json!({"rule":{"comment":format!("judged:prerouting:{f}:saddr"),"expr":[{"counter":{"packets":0}}]}})));
         let snapshot = |rules: &Vec<Value>| serde_json::json!({"nftables":rules}).to_string();
         let counts = count(&snapshot(&rules), &scope).unwrap();
         assert_eq!(counts["positive-control"], 1);
@@ -426,7 +522,7 @@ mod tests {
         );
         scope.control_active = false;
         assert!(count(&snapshot(&rules), &scope).is_err());
-        rules.pop();
+        rules.remove(rules.len() - 3);
         rules[0]["rule"]["expr"][0]["counter"]["packets"] = 1.into();
         let counts = count(&snapshot(&rules), &scope).unwrap();
         assert_eq!(counts["judged:docker0:ip:saddr"], 1);
@@ -435,6 +531,7 @@ mod tests {
     fn counts_require_complete_unique_attribution_and_keep_excluded_separate() {
         let scope = scope();
         let mut rules: Vec<_> = scope.selectors().map(|(c,i,f,d)| serde_json::json!({"rule":{"comment":format!("{c}:{i}:{f}:{d}"),"expr":[{"counter":{"packets":u64::from(c == "excluded")}}]}})).collect();
+        rules.extend(["ip", "ip6"].map(|f| serde_json::json!({"rule":{"comment":format!("judged:prerouting:{f}:saddr"),"expr":[{"counter":{"packets":0}}]}})));
         let snapshot = |rules: &Vec<Value>| serde_json::json!({"nftables":rules}).to_string();
         let counts = count(&snapshot(&rules), &scope).unwrap();
         assert!(

@@ -2806,7 +2806,10 @@ its gateway host. It guards default routes (ignoring expiry countdowns), policy
 rules, addresses/link state/MTU and DNS on every IPv4/IPv6 default-route interface
 (including multipath devices), resolver configuration and root forwarding. The
 interface names are discovered at lab start and recorded in host snapshots; no
-runner uplink name is fixed.
+runner uplink name is fixed. Snapshots also record root IPv4 forwarding,
+`net.ipv4.conf.{all,default,up0}.rp_filter` (`up0` once present), all nft chain
+hooks/policies (`nft -j list chains`) and the iptables FORWARD policy. These
+policies are evidence, not assumptions that forwarded packets reach postrouting.
 Root IPv4 forwarding must already be 1 to exercise adverse namespace inheritance.
 Networkd must report `up0` unmanaged; setup waits for transient states and reloads
 only when a matching `.network` file requires a lab-only runtime override.
@@ -2817,28 +2820,44 @@ networkd and systemd on both Ubuntu CI versions. An unfiltered `up0` capture sta
 before install and records each live exit port for exact tuples. Before creating
 any lab links, it snapshots every existing non-loopback interface (including
 `docker0` when present) and all IPv4/IPv6 default-route devices. The judged set
-must be non-empty and contain every default-route device. Root postrouting rules
-count lab/tunnel source and destination prefixes separately for each judged
-interface. Separate per-interface counters observe `lo` and lab-created links
+must be non-empty and contain every default-route device. Root prerouting
+rules at priority -300 count client/tunnel sources
+(`10.99.0.0/24`, `10.2.0.0/24`, `fd00::/8`, and the IPv6 lab tunnel
+prefix `2001:db8:2::/64`) on every interface, before
+reverse-path validation or the forward hook can discard them. No legitimate
+root packet carries these sources; every judge requires zero hits. Root
+postrouting rules at priority -300, before srcnat, count lab/tunnel source and
+destination prefixes separately for each judged interface. Separate per-interface
+counters observe `lo` and lab-created links
 for reporting only. No detector rule drops traffic. Judged rules count before a
 rate-limited `scupper-lab-egress` log action, retaining interface, addresses and
 protocol in kernel-journal artifacts. A raw IP positive control binds the real
 IPv4 default-route interface and sends a lab-source UDP packet with TTL 1 to
-`192.0.2.254`; a temporary dedicated rule counts it and returns before case
+`198.18.255.254`; a temporary dedicated rule counts it and returns before case
 selectors, with an attributed kernel log. Its counter must be exactly one and
 judged counters must stay zero. A local probe of the host's `up0` address must
-increment excluded `lo` counters without changing judged counts. One atomic nft
-transaction removes the control exemption and resets all counters before install;
+increment excluded `lo` counters without changing judged counts. Both run after
+root route setup, in the case-window routing state. A third control sends exactly
+one `10.99.0.2`-sourced UDP datagram with TTL 1 from the `internet` helper namespace
+through a temporary `ctlpeer`/`ctl0` veth into root. It must increment the judged
+IPv4 prerouting counter by one, independently of rp_filter or forward policy,
+and produce an attributed kernel log before the case journal cursor is opened.
+After that control, one atomic nft transaction removes the uplink control
+exemption and resets all prerouting and postrouting counters before install;
 every judge, including finalization, requires complete per-interface source and
 destination counters and zero judged hits in this case window. Control logs and
 the case journal cursor are saved separately.
-Before install, exclusive root blackhole routes cover `10.99.0.0/24`,
-`10.2.0.0/24`, `fd00::/8`, `2001:db8::/32` and the three documentation IPv4 /24s.
-More-specific lab-link routes continue to work. Every host guard asserts the
-blackholes; finalization removes only successfully added routes, including on
-partial setup failure, and records removal readbacks. These destination routes
-prevent sink replies to forged client sources following the runner default;
-they do not filter a lab source sending to an internet destination.
+Before install, exclusive root blackhole routes cover only `2001:db8::/32`
+and the three documentation IPv4 /24s. More-specific lab-link routes continue
+to work. Every host guard asserts these routes; finalization removes only
+successfully added routes, including on partial setup failure, and records
+removal readbacks. No blackholes cover `10.99.0.0/24`, `10.2.0.0/24` or
+`fd00::/8`. An IPv4 reverse lookup of a blackholed source makes a forwarded
+packet a martian under Ubuntu's loose rp_filter, hiding it before postrouting. The prerouting detector catches
+root ingress even when the runner later drops it. Documentation-destination
+postrouting selectors cannot fire for packets dropped by these blackholes;
+they are not evidence of detection along that path. Client/tunnel destination
+selectors remain live because those prefixes are no longer blackholed.
 The oracle positive control saves its injection marker and three packet tuples
 separately from service markers. Its temporary `wan` `lab_inject` table drops
 both marker-only input controls and the forwarded client-source control after
@@ -2867,29 +2886,48 @@ scupperd, retaining the same capture ifindex. L9 proves udev initialization and
 networkd observation, records per-point timings and asserts recovery removed host
 WireGuard links and addresses. L14 dwells two 2s ticks plus the 30s watchdog period
 before closed checks, requiring two changed completed-loop watchdog timestamps
-from the same daemon and gateway wg0 ingress controls. L10 observes check 5 while
-the same daemon is stopped, and scopes restart/watchdog journal evidence by cursor.
-L44 first proves scupperd retries an interrupted boot, then stops its automatic
-restart. The harness acquires the product's `/run/scupper/writer.lock` with flock
-before launching scupperd again, `systemctl restart scupper-net` and local `apply`.
-It retains the lock until all three actors have verified product-exec traces with
-failed nonblocking lock calls, retaining evidence even after a process exits.
-It records the lock inode and holder, stdout/stderr, scoped journal and per-actor
-wait/refusal evidence, then releases the lock and requires a successful product
-writer plus convergence to check 0. The supervisor lease can refuse boot or apply
-before writer.lock is reached, and nonblocking polling creates no kernel waiter
-rows. Two product PIDs waiting on writer.lock are therefore reported when visible,
-but judgement uses each actor's wait/refusal plus a successful writer and recovery.
+from the same daemon and gateway wg0 ingress controls. Every L14 dwell sample
+asserts IPv4/IPv6 forwarding 0/0 and records both values. L10 observes check 5
+while the same daemon is stopped, and scopes restart/watchdog journal evidence
+by cursor. Heartbeat stopping is covered by the netns lab and M2 acceptance on a
+real host; the systemd site has no heartbeat sink and does not prove that part
+of L10. Systemd mode has no IPv6 route via `up0` and does not prove IPv6
+containment or delivery; the netns lab covers IPv6.
+L44 first proves scupperd retries an interrupted boot serially, then stops its
+automatic restart. The harness acquires `/run/scupper/writer.lock` with flock.
+The contended race is local apply holding the supervisor lease and waiting on
+writer.lock, `systemctl restart scupper-net` refused at the lease, and
+`systemctl start scupperd` waiting at the lease. When apply acquires writer.lock
+after the harness releases it, apply retains the lease through the mutation.
+Boot retry does not participate in that race. Product-exec traces record failed nonblocking locks for each
+actor; the lock is held until all three show wait/refusal evidence. Artifacts
+retain the lock inode/holder, stdout/stderr and scoped journal. Release must
+produce a successful product writer and convergence to check 0. No restarting
+SubState sample or two product PIDs waiting on writer.lock is required or
+claimed; judgement uses the actual lease/writer-lock wait and refusal evidence.
 L44 waits for check 0 (bounded to the existing 90-second readiness deadline),
 verifies provider transport and records the exit port immediately before its
 service canaries, including after the final scupper-net start. It records wait
 and canary elapsed times, markers and errors for each phase. Delivery assertions
 and probe timeouts are unchanged; a later timeout remains a failure, with probe,
 sink, command, check/status, unit, boot and journal evidence retained.
-V-13 requires absent/present/absent firewall warning controls; a pre-existing
-warning makes the case inconclusive and failing. Ufw's user denies name `up0`;
-its built-in before rules are global even with allow defaults, so this case runs
-only on ephemeral runners with no active firewall or existing user rules.
+V-13 covers both client-facing and exit WireGuard UDP. It requires no warning
+before ufw, a warning with real default deny-in/allow-out rules and no client
+allow rule (inbound only), no warning after `allow 51820/udp` on `up0`, a warning
+with only exit UDP denied on `up0`, a warning with both directions denied, and
+no warning after disable. A pre-existing warning makes the case inconclusive
+and failing. Every enabled ruleset is saved with `nft -j list ruleset`; CI unit
+tests those real dumps in both directions. The availability heuristic follows
+input/output jumps and gotos for fresh client UDP and each configured exit
+endpoint's port/address. It ignores other protocols, ports, families and ct
+states excluding new; unknown predicates cannot prove an accept. Ufw's invalid
+drop therefore does not warn for a fresh handshake. Local-destination returns
+in ufw-not-local are interpreted in the input-hook routing context.
+The blocked client2 probe must time out and its exact public-key row on the
+gateway's wg0 must still have handshake timestamp zero; after disable the
+probe must deliver with a provider NAT receipt. Ufw's built-in before rules
+are global, so this case runs only on ephemeral runners with no active
+firewall or existing user rules.
 Internal case deadlines are 20 minutes, outer timeout 23 minutes with 150 seconds
 before SIGKILL, finalization at most 120 seconds, and job timeout 40 minutes.
 L19 replays source policy routing in a lab-only table (R1 production has no
@@ -2937,7 +2975,7 @@ R1's policy-rule and route inventories catch steady-state drift first.
 | L7 | flush netns ruleset during canary stream | no uplink leak; forwarding 0 ≤ 2 s; restored; conntrack flushed; I7 window measured | M2 |
 | L8 | host nft flush, host `ip_forward=1`, permissive host table with `dup to … device eth0` | no effect on client traffic | M2 |
 | L9 | boot fault injection: kill `scupper boot` after each step (including between `ip link add` and the move, with udev and networkd watching the host link), then canaries and a reboot simulation | never a leak; forwarding never 1 without verified ruleset; the next boot adopts or removes the leftover link and completes | M2 |
-| L10 | scupperd SIGKILL and SIGSTOP; edge SIGKILL (M4+) | traffic continues; check 5 (3 for edge/DNS); watchdog restart; heartbeat stops | M2 |
+| L10 | scupperd SIGKILL and SIGSTOP; edge SIGKILL (M4+) | traffic continues; check 5 (3 for edge/DNS); watchdog restart; heartbeat stops (netns lab and real-host M2 acceptance, not systemd mode) | M2 |
 | L11 | isolation: second client stand-in pings client 1, scans gateway; provider side probes gateway ports | all dropped except allowed services from clients | M2 |
 | L12 | spoofing: forged client source; gateway peer AllowedIPs widened by hand | WireGuard drops; with widened peer `antispoof` drops and check 2 | M2 |
 | L13 | foreign veth into netns (host side with `ip_forward=1`); tc ingress `mirred` redirect from wg0 to it | check 2; link set down and hook removed in the first tick that sees them; capture at the foreign link's host side: client packets only within the detection window, which is measured and must not exceed one tick plus the safety group (§7) | M2 |
@@ -2971,7 +3009,7 @@ R1's policy-rule and route inventories catch steady-state drift first.
 | L41 | nft userspace upgraded (recorded nft version changed) while a canonical cache exists | no false `Differs`; re-canonicalized; no forwarding change | M2 |
 | L42 | DNS self-test with the upstream broken and the cache warm | check 3 within one self-test interval | M4 |
 | L43 | quarantine latch: a recurring foreign link exhausts the budget; then restart scupperd; then reboot | forwarding stays 0 throughout; check 4 `Quarantined`; cleared only by `repair clear` | M2 |
-| L44 | concurrent writers: boot retry by scupperd, a manual `systemctl restart scupper-net`, a local `apply` while scupperd restarts | one writer at a time; no stuck boot; every intermediate state closed or exact | M2 |
+| L44 | serial scupperd boot retry, then apply holding the lease and waiting on writer.lock vs refused `restart scupper-net` vs `start scupperd` waiting at the lease | wait/refusal evidence for all three; successful writer and recovery; every intermediate state closed or exact | M2 |
 | L45 | from the installed edge unit, attempt host-mediated resolution (resolved Varlink, D-Bus) | fails; no DNS from the host on the uplink | M4 |
 | L46 | availability faults: host default route deleted; host UDP 51820 dropped (ufw); `wg0` listen port taken | no leak; check 4 or 3 `ClientSideBroken` as specified; client-handshake warning; recovery after restore | M2 |
 | L47 | failover with established TCP and UDP client flows | TCP gets a reset from the gateway; new flows use the new exit; nothing on the uplink | M3 |
@@ -3097,7 +3135,7 @@ hardware) before anything depends on them.
 | V-10 | WireGuard handshake cadence on an **idle** hot standby with keepalive 25 s stays below 180 s | real gateway, 24 h | M3 |
 | V-11 | Whether the provider configs carry a v6 address and the v6 exit works end to end | real account | M4 |
 | V-12 | The forwarder passes the provider's filtered answers unchanged and signed zones resolve through it (no DNSSEC validation in the path) | real gateway | M4 |
-| V-13 | Host firewall tools (ufw, cloud firewall) do not block WireGuard UDP for clients and exits; `install --check` detects it | VM | M2 (warning), M6 |
+| V-13 | Host firewall tools may block client and exit WireGuard UDP; `install --check` warns on locally visible input/output drops or rejects for client UDP or configured exit endpoints/ports; cloud rules require external observation | systemd lab: ufw default/allow/deny controls in both directions; VM for cloud rules | M2 (warning), M6 |
 | V-14 | `ip netns del` while edge holds the namespace keeps links and routes alive; the held-fd re-mount restores the name without a second namespace | L17 | M2 |
 | V-15 | `BindsTo=`/`Requires=` keep edge from starting without the namespace and stop it with the namespace unit | VM | M2 |
 | V-16 | Probes inside the namespace work without any host resolver (`/etc/resolv.conf` → 127.0.0.53 unreachable there) | L1 + probe test | M2 |

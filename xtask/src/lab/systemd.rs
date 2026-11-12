@@ -420,8 +420,8 @@ impl SystemdLab {
         }
         self.lab.build_wan_mode(true)?;
         self.uplink()?;
-        self.egress_setup()?;
         self.root_routes_setup()?;
+        self.egress_setup()?;
         self.lab.capture("", "up0", "install-uplink")?;
         self.lab.build_provider()?;
         let provider = self.lab.private.join("provider.conf");
