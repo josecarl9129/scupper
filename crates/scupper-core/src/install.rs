@@ -197,6 +197,14 @@ pub enum Refusal {
     /// Public host command failed; stderr is never included.
     #[error("{0}")]
     CommandFailed(String),
+    /// Unrecognized systemctl is-enabled response, with bounded public diagnostics.
+    #[error("install input: cannot inspect unit enabled state (status {status:?}): {stderr}")]
+    UnitState {
+        /// Exit code, or signal termination.
+        status: Option<i32>,
+        /// Size-capped stderr with control characters removed.
+        stderr: String,
+    },
     /// Input validation, with value-free diagnostics.
     #[error("install input: {0}")]
     Input(&'static str),

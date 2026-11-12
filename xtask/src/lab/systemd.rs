@@ -10,7 +10,7 @@ use super::{
     evidence, fail, helpers,
 };
 use guards::HostSnapshot;
-use scupper_core::config::{GatewayId, parse_site, validate};
+use scupper_core::config::{parse_site, validate};
 use std::{
     fmt::Write as _,
     fs,
@@ -136,9 +136,18 @@ pub fn run(artifacts: &Path, binaries: &Path, case: &str) -> Result<()> {
     let guard = harness.guard("case-after");
     let journal = harness.journal("journal.txt");
     let captures = harness.lab.stop_captures();
+    let diagnostics = if outcome.is_err() || guard.is_err() || journal.is_err() || captures.is_err()
+    {
+        harness.failure_diagnostics()
+    } else {
+        Ok(())
+    };
     let result = super::mutation::finish(
         outcome,
-        super::mutation::finish(guard, super::mutation::finish(journal, captures)),
+        super::mutation::finish(
+            guard,
+            super::mutation::finish(diagnostics, super::mutation::finish(journal, captures)),
+        ),
     );
     fs::write(
         harness.lab.artifacts.join(format!("{case}.json")),
@@ -212,6 +221,94 @@ impl SystemdLab {
             ],
         )?;
         fs::write(self.lab.artifacts.join(name), journal)?;
+        Ok(())
+    }
+    fn failure_diagnostics(&mut self) -> Result<()> {
+        // A failed check or inactive unit is diagnostic data, not a reason to
+        // skip the remaining commands. Keep each attempt independently bounded.
+        let mut errors = Vec::new();
+        for (name, program, args) in [
+            ("failure-status.json", CLI, vec!["status", "--json"]),
+            ("failure-check.json", CLI, vec!["check", "--json"]),
+            ("failure-boot.json", "cat", vec!["/run/scupper/boot.json"]),
+            (
+                "failure-units.txt",
+                "systemctl",
+                vec!["--no-pager", "--full", "status", "scupper-net", "scupperd"],
+            ),
+            (
+                "failure-journal.txt",
+                "journalctl",
+                vec![
+                    "--no-pager",
+                    "-n",
+                    "1000",
+                    "-o",
+                    "short-monotonic",
+                    "-u",
+                    "scupperd",
+                ],
+            ),
+        ] {
+            let output = self
+                .lab
+                .runner
+                .output(&Invocation::new("", program, &args), None);
+            let text = match output {
+                Ok((_, text)) => text,
+                Err(error) => {
+                    errors.push(format!("{name}: {error}"));
+                    format!("diagnostic unavailable: {error}\n")
+                }
+            };
+            fs::write(self.lab.artifacts.join(name), text)?;
+        }
+        // Read newest months first, requesting only the records still needed.
+        // This keeps a long history from overwhelming the command output cap.
+        let events = (|| -> Result<String> {
+            let mut files = fs::read_dir("/var/lib/scupper/events")?
+                .map(|entry| entry.map(|e| e.path()))
+                .collect::<std::io::Result<Vec<_>>>()?;
+            files.retain(|p| p.extension().is_some_and(|ext| ext == "jsonl"));
+            files.sort();
+            let mut remaining: usize = 200;
+            let mut chunks = Vec::new();
+            for path in files.iter().rev() {
+                let count = remaining.to_string();
+                let (_, text) = self.lab.runner.output(
+                    &Invocation::new(
+                        "",
+                        "tail",
+                        &["-n", &count, "--", path.to_str().ok_or("event path")?],
+                    ),
+                    None,
+                )?;
+                let lines = text.lines().map(str::to_owned).collect::<Vec<_>>();
+                remaining = remaining.saturating_sub(lines.len());
+                chunks.push(lines);
+                if remaining == 0 {
+                    break;
+                }
+            }
+            Ok(chunks
+                .into_iter()
+                .rev()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("\n"))
+        })();
+        let text = match events {
+            Ok(text) => text,
+            Err(error) => {
+                errors.push(format!("events: {error}"));
+                format!("diagnostic unavailable: {error}\n")
+            }
+        };
+        fs::write(self.lab.artifacts.join("failure-events.jsonl"), text)?;
+        fs::write(
+            self.lab.artifacts.join("failure-diagnostics-errors.json"),
+            serde_json::to_vec_pretty(&errors)?,
+        )?;
         Ok(())
     }
     fn journal_cursor(&mut self) -> Result<String> {
@@ -371,21 +468,9 @@ impl SystemdLab {
         self.record_port(first_port);
         let mut site = parse_site(&self.cli(&["config", "show"])?)?;
         self.lab.public_keys[0].clone_from(&site.identities["edge"].public_key.0);
-        let template = parse_site(SITE)?;
-        site.users = template.users;
-        site.devices = template.devices;
-        site.devices
-            .get_mut("client")
-            .ok_or("client")?
-            .public_key
-            .0
-            .clone_from(&self.lab.public_keys[3]);
-        super::add_second_client(&mut site, &self.lab.public_keys[4])?;
-        site.gateways
-            .get_mut(&GatewayId("gw1".into()))
-            .ok_or("gw1")?
-            .exits[0]
-            .ifname = "ex-ch1".into();
+        self.lab.site = validate(site.clone()).map_err(|e| format!("site: {e:?}"))?;
+        self.ready()?;
+        site = site_with_clients(site, &self.lab.public_keys[3], &self.lab.public_keys[4])?;
         let config = self.lab.private.join("site.toml");
         fs::write(&config, toml::to_string(&site)?)?;
         self.cli(&[
@@ -394,6 +479,8 @@ impl SystemdLab {
             config.to_str().ok_or("config path")?,
             "--yes",
         ])?;
+        // Loading changes head only; check still observes the applied version.
+        self.ready()?;
         self.cli(&["apply"])?;
         self.lab.site = validate(site).map_err(|e| format!("site: {e:?}"))?;
         self.lab.build_client()?;
@@ -501,7 +588,7 @@ impl SystemdLab {
         self.lab.wait_provider()?;
         let port = self
             .lab
-            .cmd("scupper", "wg", &["show", "ex-ch1", "listen-port"])?
+            .cmd("scupper", "wg", &["show", "ex-0", "listen-port"])?
             .trim()
             .parse()?;
         if port == 0 {
@@ -591,12 +678,12 @@ impl SystemdLab {
                 let links = self.host_wireguard("reboot-host-links")?;
                 if links
                     .iter()
-                    .any(|l| !matches!(l["ifname"].as_str(), Some("wg0" | "ex-0" | "ex-ch1")))
+                    .any(|l| !matches!(l["ifname"].as_str(), Some("wg0" | "ex-0")))
                 {
                     return fail("unexpected foreign root WireGuard link");
                 }
                 let mut unexpected = Vec::new();
-                for name in ["wg0", "ex-0", "ex-ch1"] {
+                for name in ["wg0", "ex-0"] {
                     let (status, _) = self.lab.runner.output(
                         &Invocation::new("", "ip", &["link", "show", "dev", name]),
                         None,
@@ -642,7 +729,7 @@ impl SystemdLab {
                 // A disconnected exit has no socket. Record only live ports.
                 let port: u16 = self
                     .lab
-                    .cmd("scupper", "wg", &["show", "ex-ch1", "listen-port"])?
+                    .cmd("scupper", "wg", &["show", "ex-0", "listen-port"])?
                     .trim()
                     .parse()?;
                 if port != 0 {
@@ -669,7 +756,7 @@ impl SystemdLab {
         )?;
         let links: Vec<serde_json::Value> = serde_json::from_str(&text)?;
         if links.iter().any(|l| {
-            matches!(l["ifname"].as_str(), Some("wg0" | "ex-0" | "ex-ch1"))
+            matches!(l["ifname"].as_str(), Some("wg0" | "ex-0"))
                 || l["addr_info"].as_array().into_iter().flatten().any(|a| {
                     a["local"].as_str().is_some_and(|ip| {
                         ip.starts_with("10.99.")
@@ -817,6 +904,22 @@ impl SystemdLab {
     }
 }
 
+// Add lab clients to the installed site without changing exit names, secret
+// references, health settings or selection IDs. A rename leaves a foreign link
+// in the live namespace, which boot correctly refuses rather than deleting.
+fn site_with_clients(
+    mut site: scupper_core::config::SiteConfig,
+    client: &str,
+    second_client: &str,
+) -> Result<scupper_core::config::SiteConfig> {
+    let template = parse_site(SITE)?;
+    site.users = template.users;
+    site.devices = template.devices;
+    site.devices.get_mut("client").ok_or("client")?.public_key.0 = client.into();
+    super::add_second_client(&mut site, second_client)?;
+    Ok(site)
+}
+
 fn dispatch_reboot_steps(
     steps: &[RebootStep],
     mut execute: impl FnMut(RebootStep) -> Result<()>,
@@ -847,6 +950,25 @@ fn uplink_policy(markers: &[String], ports: &[u16], current_port: u16) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn adding_clients_preserves_installed_gateway_and_secrets() {
+        let mut installed = parse_site(SITE).unwrap();
+        let gateway = installed.gateways.values_mut().next().unwrap();
+        gateway.exits[0].ifname = "ex-0".into();
+        let before = toml::to_string(&installed.gateways).unwrap();
+        let identities = toml::to_string(&installed.identities).unwrap();
+        let client = installed.devices["client"].public_key.0.clone();
+        let configured = site_with_clients(
+            installed,
+            &client,
+            "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=",
+        )
+        .unwrap();
+        assert_eq!(toml::to_string(&configured.gateways).unwrap(), before);
+        assert_eq!(toml::to_string(&configured.identities).unwrap(), identities);
+        assert!(configured.devices.contains_key("client2"));
+        assert!(validate(configured).is_ok());
+    }
     #[test]
     fn reboot_dispatch_executes_in_order_and_stops_on_failure() {
         let mut calls = Vec::new();

@@ -175,6 +175,7 @@ impl Runner {
         let mut group = Group {
             child: cmd.spawn()?,
             done: false,
+            drains: Vec::new(),
         };
         // Drain concurrently: an ip/nft JSON response can exceed pipe capacity.
         let stdout = group.child.stdout.take().ok_or("missing stdout")?;
@@ -221,16 +222,31 @@ impl Runner {
         let stdout = stdout.ok_or("missing command stdout")?;
         let stderr = stderr.ok_or("missing command stderr")?;
         group.done = true;
-        self.last_stderr = String::from_utf8_lossy(&stderr).into_owned();
-        if !status.success() {
-            writeln!(
-                self.trace,
-                "{}",
-                serde_json::json!({"exit": status.to_string(), "stderr": String::from_utf8_lossy(&stderr)})
-            )?;
+        self.last_stderr = String::from_utf8_lossy(&stderr.bytes).into_owned();
+        let secret_output = (invocation.program == "wg"
+            && invocation.args.first().is_some_and(|a| a == "genkey"))
+            || invocation
+                .args
+                .windows(2)
+                .any(|words| words == ["wg", "genkey"]);
+        writeln!(
+            self.trace,
+            "{}",
+            serde_json::json!({
+                "exit": status.to_string(),
+                "stdout": if secret_output { "[redacted]".into() } else { trace_text(&stdout.bytes) },
+                "stderr": if secret_output { "[redacted]".into() } else { trace_text(&stderr.bytes) },
+                "stdout_truncated": stdout.truncated || stdout.bytes.len() > TRACE_LIMIT,
+                "stderr_truncated": stderr.truncated || stderr.bytes.len() > TRACE_LIMIT,
+            })
+        )?;
+        self.trace.flush()?;
+        if stdout.truncated {
+            return fail("command stdout exceeded 1 MiB; see commands.jsonl");
         }
-        Ok((status, String::from_utf8(stdout)?))
+        Ok((status, String::from_utf8(stdout.bytes)?))
     }
+
     pub fn run(&mut self, invocation: &Invocation) -> Result<String> {
         self.input(invocation, None)
     }
@@ -253,12 +269,42 @@ impl Runner {
             + 2;
         let mut cmd = self.command(invocation, seconds)?;
         cmd.stdin(Stdio::null())
-            .stdout(File::create(log)?)
-            .stderr(File::create(log.with_extension("stderr"))?);
-        let child = cmd.spawn()?;
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn()?;
         self.background_groups.push(child.id());
-        Ok(Group { child, done: false })
+        let stdout = child.stdout.take().ok_or("missing background stdout")?;
+        let stderr = child.stderr.take().ok_or("missing background stderr")?;
+        let mut group = Group {
+            child,
+            done: false,
+            drains: Vec::new(),
+        };
+        for (stream, file) in [
+            (Box::new(stdout) as Box<dyn Read + Send>, File::create(log)?),
+            (
+                Box::new(stderr) as Box<dyn Read + Send>,
+                File::create(log.with_extension("stderr"))?,
+            ),
+        ] {
+            let (send, receive) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = send.send(copy_log(stream, file));
+            });
+            group.drains.push(receive);
+        }
+        writeln!(
+            self.trace,
+            "{}",
+            serde_json::json!({
+                "background_stdout": log, "background_stderr": log.with_extension("stderr"),
+                "stream_limit_bytes": OUTPUT_LIMIT,
+            })
+        )?;
+        self.trace.flush()?;
+        Ok(group)
     }
+
     pub fn background_checkpoint(&self) -> usize {
         self.background_groups.len()
     }
@@ -284,24 +330,71 @@ impl Runner {
         Ok(())
     }
 }
-fn receive(channel: &mpsc::Receiver<std::io::Result<Vec<u8>>>) -> Result<Option<Vec<u8>>> {
+fn receive(channel: &mpsc::Receiver<std::io::Result<Captured>>) -> Result<Option<Captured>> {
     match channel.try_recv() {
         Ok(data) => Ok(Some(data?)),
         Err(mpsc::TryRecvError::Empty) => Ok(None),
         Err(mpsc::TryRecvError::Disconnected) => fail("command pipe reader failed"),
     }
 }
-fn read(mut stream: impl Read) -> std::io::Result<Vec<u8>> {
-    let mut data = Vec::new();
-    stream.read_to_end(&mut data)?;
-    Ok(data)
+const OUTPUT_LIMIT: usize = 1024 * 1024;
+const TRACE_LIMIT: usize = 64 * 1024;
+struct Captured {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+fn trace_text(bytes: &[u8]) -> String {
+    let mut text = String::from_utf8_lossy(&bytes[..bytes.len().min(TRACE_LIMIT)]).into_owned();
+    text.truncate(text.floor_char_boundary(TRACE_LIMIT));
+    text
+}
+fn copy_log(mut stream: impl Read, mut file: impl Write) -> std::io::Result<()> {
+    let mut retained = 0;
+    let mut buffer = [0; 8192];
+    loop {
+        let count = stream.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(());
+        }
+        let keep = count.min(OUTPUT_LIMIT - retained);
+        file.write_all(&buffer[..keep])?;
+        retained += keep;
+    }
+}
+fn read(mut stream: impl Read) -> std::io::Result<Captured> {
+    let mut captured = Captured {
+        bytes: Vec::new(),
+        truncated: false,
+    };
+    let mut buffer = [0; 8192];
+    loop {
+        let count = stream.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        let keep = count.min(OUTPUT_LIMIT - captured.bytes.len());
+        captured.bytes.extend_from_slice(&buffer[..keep]);
+        captured.truncated |= keep < count;
+        // Continue draining after the cap so the child cannot block on its pipe.
+    }
+    Ok(captured)
 }
 
 pub(super) struct Group {
     child: Child,
     done: bool,
+    drains: Vec<mpsc::Receiver<std::io::Result<()>>>,
 }
 impl Group {
+    fn finish_logs(&mut self) -> Result<()> {
+        let until = Instant::now() + Duration::from_secs(2);
+        for drain in self.drains.drain(..) {
+            drain
+                .recv_timeout(until.saturating_duration_since(Instant::now()))
+                .map_err(|_| "background log drain deadline exceeded")??;
+        }
+        Ok(())
+    }
     pub(super) fn supervised_pid(&self) -> Result<Option<u32>> {
         if self.done {
             return Ok(None);
@@ -343,6 +436,7 @@ impl Group {
         if let Some(status) = self.child.try_wait()? {
             self.signal(Signal::KILL);
             self.done = true;
+            self.finish_logs()?;
             return fail(format!("background process exited: {status}"));
         }
         Ok(())
@@ -352,6 +446,7 @@ impl Group {
         if status.is_some() {
             self.signal(Signal::KILL);
             self.done = true;
+            self.finish_logs()?;
         }
         Ok(status)
     }
@@ -362,6 +457,7 @@ impl Group {
             if let Some(status) = self.child.try_wait()? {
                 self.signal(Signal::KILL);
                 self.done = true;
+                self.finish_logs()?;
                 return Ok(status);
             }
             if Instant::now() >= until {
@@ -384,6 +480,7 @@ impl Group {
             if let Some(status) = self.child.try_wait()? {
                 self.signal(Signal::KILL);
                 self.done = true;
+                self.finish_logs()?;
                 // GNU timeout may return 124 after forwarding our explicit
                 // stop signal; only this requested-stop path accepts it.
                 if status.success()
@@ -400,6 +497,7 @@ impl Group {
         self.signal(Signal::KILL);
         self.child.wait()?;
         self.done = true;
+        self.finish_logs()?;
         fail("background process needed SIGKILL")
     }
 }
@@ -409,5 +507,27 @@ impl Drop for Group {
             self.signal(Signal::KILL);
             let _ = self.child.wait();
         }
+    }
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+    #[test]
+    fn output_is_capped_and_excess_is_drained() {
+        let bytes = vec![b'x'; OUTPUT_LIMIT + 17];
+        let mut stream = bytes.as_slice();
+        let captured = read(&mut stream).unwrap();
+        assert_eq!(captured.bytes.len(), OUTPUT_LIMIT);
+        assert!(captured.truncated);
+        assert_eq!(stream, &[] as &[u8]);
+        assert_eq!(trace_text(&captured.bytes).len(), TRACE_LIMIT);
+        assert!(trace_text(&vec![0xff; TRACE_LIMIT]).len() <= TRACE_LIMIT);
+        let mut output = Vec::new();
+        let mut stream = bytes.as_slice();
+        copy_log(&mut stream, &mut output).unwrap();
+        assert_eq!(output.len(), OUTPUT_LIMIT);
+        assert_eq!(stream, &[] as &[u8]);
+        assert!(!read(&b"small"[..]).unwrap().truncated);
     }
 }

@@ -8,7 +8,9 @@ use super::{
     evidence::{self, Case},
     fail, helpers,
 };
-use scupper_core::{canon::canonicalize, render::desired_sysctls, rules::IfName};
+use scupper_core::{
+    canon::canonicalize, config::GatewayId, render::desired_sysctls, rules::IfName,
+};
 use std::{
     fmt::Write as _,
     fs,
@@ -353,7 +355,15 @@ impl Lab {
         let until = Instant::now() + Duration::from_secs(20);
         loop {
             self.ensure_services()?;
-            let handshakes = self.cmd("scupper", "wg", &["show", "ex-ch1", "latest-handshakes"])?;
+            let exit = self
+                .site
+                .gateway(&GatewayId("gw1".into()))
+                .ok_or("gateway")?
+                .exits()[0]
+                .ifname()
+                .as_str()
+                .to_owned();
+            let handshakes = self.cmd("scupper", "wg", &["show", &exit, "latest-handshakes"])?;
             if handshakes
                 .split_whitespace()
                 .nth(1)

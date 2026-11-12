@@ -2757,7 +2757,19 @@ before install and records each live exit port for exact tuples. Counter-only
 root postrouting rules detect non-`up0` egress of lab/tunnel prefixes, with a dummy
 link positive control, reset before install and zero assertions at every judge.
 Install completion is judged separately from its final check status; transient
-check failures are recorded and recovery to check 0 has a deadline.
+check failures are recorded and recovery to check 0 has a deadline. Setup waits
+for check 0 after install and again after config load, before apply. It preserves
+the installer's `ex-0` exit and secret references when adding lab clients; renaming
+a live exit would leave an unconfigured link that boot must refuse. The shared
+provider handshake check resolves the exit interface from the validated site.
+Command records retain stdout and stderr as JSON data (64 KiB per stream, with
+truncation flags); pipe reads retain at most 1 MiB while draining excess bytes.
+Generated private-key output is redacted. Background stdout/stderr logs are capped
+at 1 MiB each and drained before final capture statistics are read. On failure,
+independent bounded attempts save status/check JSON, boot.json, the last 200 event
+records, unit status and the
+scupperd journal in short-monotonic format. Daemon stderr reports start, ready,
+boot retry and apply outcomes without request contents or destinations.
 The reboot simulation stops units, deletes namespace links and the named namespace,
 asserts and removes only scupper-named root leftovers (unexpected leftovers fail),
 clears runtime state and only lab conntrack entries, and preserves durable state.

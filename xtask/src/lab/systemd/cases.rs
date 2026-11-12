@@ -58,7 +58,7 @@ impl SystemdLab {
                 "6",
                 "7",
                 "link-add-wg0",
-                "link-add-ex-ch1",
+                "link-add-ex-0",
             ] {
                 self.guard(&format!("L9-{point}-before"))?;
                 let started = Instant::now();
@@ -281,13 +281,13 @@ impl SystemdLab {
             if matches!(point, "4" | "5" | "6" | "7") {
                 let port = self
                     .lab
-                    .cmd("scupper", "wg", &["show", "ex-ch1", "listen-port"])?
+                    .cmd("scupper", "wg", &["show", "ex-0", "listen-port"])?
                     .trim()
                     .parse()?;
                 self.record_port(port);
             }
             self.fresh_session()?;
-            let has_client = matches!(point, "4" | "5" | "6" | "7" | "link-add-ex-ch1");
+            let has_client = matches!(point, "4" | "5" | "6" | "7" | "link-add-ex-0");
             let rx = if has_client {
                 let until = Instant::now() + Duration::from_secs(15);
                 loop {
@@ -362,7 +362,7 @@ impl SystemdLab {
         fs::write(
             self.lab.artifacts.join(format!("{stem}.json")),
             serde_json::to_vec_pretty(
-                &serde_json::json!({"point":point,"elapsed_ms":started.elapsed().as_millis(),"closed_canary_has_ingress_proof":matches!(point,"4"|"5"|"6"|"7"|"link-add-ex-ch1"),"early_prefix_assertions":"Without gateway wg0, closed probes prove no delivery; safety and recovery are the meaningful controls.","passed":result.is_ok(),"error":result.as_ref().err().map(ToString::to_string)}),
+                &serde_json::json!({"point":point,"elapsed_ms":started.elapsed().as_millis(),"closed_canary_has_ingress_proof":matches!(point,"4"|"5"|"6"|"7"|"link-add-ex-0"),"early_prefix_assertions":"Without gateway wg0, closed probes prove no delivery; safety and recovery are the meaningful controls.","passed":result.is_ok(),"error":result.as_ref().err().map(ToString::to_string)}),
             )?,
         )?;
         result
@@ -503,12 +503,12 @@ impl SystemdLab {
         let links = scupper_core::parse::parse_ip_link(&self.lab.cmd(
             "scupper",
             "ip",
-            &["-d", "-j", "link", "show", "dev", "ex-ch1"],
+            &["-d", "-j", "link", "show", "dev", "ex-0"],
         )?)?;
         if links.iter().any(|l| l.flags.iter().any(|f| f == "UP"))
             && !self
                 .lab
-                .cmd("scupper", "wg", &["show", "ex-ch1", "peers"])?
+                .cmd("scupper", "wg", &["show", "ex-0", "peers"])?
                 .trim()
                 .is_empty()
         {

@@ -285,7 +285,7 @@ jobs:
         if: always()
         run: |
           sudo mkdir -p systemd-lab-out
-          sudo timeout 30 journalctl --no-pager -u scupper-net -u scupperd | sudo tee systemd-lab-out/ci-journal.txt > /dev/null
+          sudo timeout 30 journalctl --no-pager -o short-monotonic -u scupper-net -u scupperd | sudo tee systemd-lab-out/ci-journal.txt > /dev/null
       - name: Make installed-unit diagnostics readable
         if: always()
         run: |
