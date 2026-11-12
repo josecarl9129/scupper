@@ -1,0 +1,113 @@
+//! Narrow, bounded SSH deploy protocol. No caller-supplied command or path.
+use crate::Identifier;
+use serde::{Deserialize, Serialize};
+use std::io::{self, Read};
+
+/// Maximum request size on SSH stdin.
+pub const MAX_REMOTE_REQUEST: usize = 1024 * 1024;
+/// Validated SHA256 digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ReleaseHash(String);
+impl TryFrom<String> for ReleaseHash {
+    type Error = &'static str;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if value.len() == 64
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            Ok(Self(value))
+        } else {
+            Err("invalid sha256")
+        }
+    }
+}
+impl From<ReleaseHash> for String {
+    fn from(value: ReleaseHash) -> Self {
+        value.0
+    }
+}
+impl ReleaseHash {
+    /// Lowercase hexadecimal digest.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+/// Allow-listed operations, each with strictly typed arguments.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", content = "args", deny_unknown_fields)]
+pub enum DeployOp {
+    /// Create a unique staging directory; report installed/fresh.
+    Prepare {
+        /// Deployment identifier, using the socket identifier type.
+        id: Identifier,
+    },
+    /// Verify the copied archive before extracting any member.
+    Stage {
+        /// Deployment identifier.
+        id: Identifier,
+        /// Expected release checksum from SHA256SUMS.
+        sha256: ReleaseHash,
+    },
+    /// Run the staged installer's read-only plan.
+    Plan {
+        /// Deployment identifier.
+        id: Identifier,
+    },
+    /// Apply the staged installer and restart services in order.
+    Switch {
+        /// Deployment identifier.
+        id: Identifier,
+    },
+    /// Run the installed gateway check.
+    Check {
+        /// Deployment identifier.
+        id: Identifier,
+    },
+}
+impl DeployOp {
+    /// Validated staging identifier.
+    #[must_use]
+    pub fn id(&self) -> String {
+        let (Self::Prepare { id }
+        | Self::Stage { id, .. }
+        | Self::Plan { id }
+        | Self::Switch { id }
+        | Self::Check { id }) = self;
+        String::from(id.clone())
+    }
+}
+/// One correlated SSH request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeployRequest {
+    /// Same identifier validator used by the local control socket.
+    pub request_id: Identifier,
+    /// A fixed operation with typed data.
+    #[serde(flatten)]
+    pub operation: DeployOp,
+}
+/// Reads at most 1 MiB plus one sentinel, rejecting unknown fields and operations.
+/// # Errors
+/// Rejects oversized, malformed, extra-field and invalid-identifier requests.
+pub fn read_deploy(reader: impl Read) -> io::Result<DeployRequest> {
+    let mut bytes = Vec::new();
+    reader
+        .take((MAX_REMOTE_REQUEST + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    let invalid = || io::Error::other("invalid remote request");
+    if bytes.len() > MAX_REMOTE_REQUEST {
+        return Err(invalid());
+    }
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    let object = value.as_object().ok_or_else(invalid)?;
+    if object.len() != 3
+        || !["request_id", "op", "args"]
+            .iter()
+            .all(|key| object.contains_key(*key))
+    {
+        return Err(invalid());
+    }
+    serde_json::from_slice(&bytes).map_err(|_| invalid())
+}

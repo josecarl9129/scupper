@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 //! Install flag parsing, confirmation, --plan and --check contracts.
 #![allow(clippy::unwrap_used)]
 #[path = "../../scupper-sys/tests/support/install.rs"]

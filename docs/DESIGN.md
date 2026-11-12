@@ -1368,6 +1368,15 @@ the same types as the local socket. Tests feed quotes, newlines, `$(…)`,
 backticks, leading hyphens and malformed identifiers through every
 operation.
 
+M2 fresh-host exception: deploy uses one constant shell dispatcher that executes
+`/usr/local/bin/scupper remote` when installed, or a constant Python 3 bootstrap
+otherwise. Both receive the same bounded JSON envelope on stdin. The bootstrap
+accepts only prepare/stage, verifies the archive and its complete manifest before
+writing members, and never installs configuration or starts services. Python 3
+is required only on a fresh host. M2 release archives use deterministic stored
+DEFLATE blocks in gzip (larger archives, no compressor-version dependency);
+`MANIFEST` hashes all payload members, excluding itself. M2 has no edge binary.
+
 ### API authentication (ADR 0007)
 
 1. **WireGuard identity.** Edge maps the connection's source address to

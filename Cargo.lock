@@ -409,6 +409,7 @@ name = "scupper"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "proptest",
  "rustix",
  "scupper-core",
  "scupper-proto",

@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 //! CLI parsing, isolated-canon safety guards, and interaction contracts.
 #![allow(clippy::unwrap_used)]
 use scupper::{

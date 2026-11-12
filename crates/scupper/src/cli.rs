@@ -35,6 +35,11 @@ struct Cli {
 
 #[derive(Clone, Subcommand)]
 enum Command {
+    /// Stage and deploy a gateway release over SSH.
+    Deploy(crate::deploy::DeployArgs),
+    /// Internal bounded SSH operation dispatcher.
+    #[command(hide = true)]
+    Remote,
     /// Construct or adopt the gateway namespace, stopping at the first failure.
     #[command(hide = true)]
     Boot {
@@ -404,6 +409,10 @@ fn dispatch(
         return Err("--json is supported only for check and status".into());
     }
     match command {
+        Command::Deploy(args) => {
+            crate::deploy::run(&args, &crate::deploy::Ssh, &crate::deploy::Terminal, stdout)
+        }
+        Command::Remote => crate::remote::run(io::stdin().lock(), stdout),
         Command::Boot {
             #[cfg(feature = "testing")]
             stop_after,
