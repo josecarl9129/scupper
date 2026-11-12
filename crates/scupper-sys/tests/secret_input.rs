@@ -35,7 +35,7 @@ proptest! {
     }
 
     #[test]
-    fn valid_url_targets_never_change_confirmation(path in "[a-zA-Z0-9/?=&%#_-]{0,2000}") {
+    fn valid_url_targets_never_change_confirmation(path in "[a-zA-Z0-9/?=&%_-]{0,2000}") {
         let value = UrlValue::url(format!("https://example.com/{path}").as_bytes()).unwrap();
         prop_assert_eq!(value.confirmation(), "https://example.com/…");
         prop_assert_eq!(format!("{value:?}"), "UrlValue(<redacted>)");

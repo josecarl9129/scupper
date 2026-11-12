@@ -1,8 +1,8 @@
 //! Bounded secret input and value-free validation for gateway URL provisioning.
-use scupper_core::config::valid_https_url;
+use super::valid_delivery_url;
 use std::{
     fmt,
-    io::{self, BufRead, Read, Write},
+    io::{self, Read, Write},
 };
 use zeroize::Zeroizing;
 
@@ -22,7 +22,7 @@ impl UrlValue {
     /// Returns a fixed message for invalid syntax or more than 4 KiB.
     pub fn url(value: &[u8]) -> Result<Self, &'static str> {
         let text = std::str::from_utf8(value).map_err(|_| "invalid HTTPS URL")?;
-        if value.len() > 4096 || !valid_https_url(text) {
+        if value.len() > 4096 || !valid_delivery_url(text) {
             return Err("invalid HTTPS URL (https, host, no userinfo, at most 4 KiB required)");
         }
         let authority = text
@@ -69,9 +69,13 @@ impl UrlValue {
         {
             return Err("Telegram URL exceeds 4 KiB");
         }
-        let value = Zeroizing::new(format!(
-            "https://api.telegram.org/bot{token}/sendMessage?chat_id={chat}"
+        let mut value = Zeroizing::new(String::with_capacity(
+            token.len() + chat.len() + "https://api.telegram.org/bot/sendMessage?chat_id=".len(),
         ));
+        value.push_str("https://api.telegram.org/bot");
+        value.push_str(token);
+        value.push_str("/sendMessage?chat_id=");
+        value.push_str(chat);
         let mut result = Self::url(value.as_bytes())?;
         let digits = token
             .split(':')
@@ -126,14 +130,20 @@ pub fn valid_telegram_chat(chat: &str) -> bool {
 
 /// Read one bounded line; permit a final EOF in place of a newline.
 /// All read failures have fixed, value-free diagnostics.
-fn line(reader: &mut impl BufRead) -> Result<Zeroizing<Vec<u8>>, &'static str> {
+fn line(reader: &mut impl Read) -> Result<Zeroizing<Vec<u8>>, &'static str> {
     let mut bytes = Zeroizing::new(Vec::with_capacity(4097));
-    reader
-        .take(4098)
-        .read_until(b'\n', &mut bytes)
-        .map_err(|_| "secret input read failed")?;
-    if bytes.last() == Some(&b'\n') {
-        bytes.pop();
+    let mut byte = Zeroizing::new([0]);
+    loop {
+        let count = reader
+            .read(&mut *byte)
+            .map_err(|_| "secret input read failed")?;
+        if count == 0 || byte[0] == b'\n' {
+            break;
+        }
+        bytes.push(byte[0]);
+        if bytes.len() > 4096 {
+            break;
+        }
     }
     if bytes.len() > 4096 {
         return Err("secret input exceeds 4 KiB");
@@ -147,16 +157,16 @@ fn line(reader: &mut impl BufRead) -> Result<Zeroizing<Vec<u8>>, &'static str> {
 /// Read one URL line or two Telegram lines from a pipe, requiring EOF afterward.
 /// # Errors
 /// Rejects missing/extra lines, oversized input and invalid credentials.
-pub fn read_stdin(reader: &mut impl BufRead, telegram: bool) -> Result<UrlValue, &'static str> {
+pub fn read_stdin(reader: &mut impl Read, telegram: bool) -> Result<UrlValue, &'static str> {
     let first = line(reader)?;
     let value = if telegram {
         UrlValue::telegram(&first, &line(reader)?)?
     } else {
         UrlValue::url(&first)?
     };
-    let mut extra = [0];
+    let mut extra = Zeroizing::new([0]);
     let count = reader
-        .read(&mut extra)
+        .read(&mut *extra)
         .map_err(|_| "secret input read failed")?;
     extra.fill(0);
     if count != 0 {
@@ -165,23 +175,118 @@ pub fn read_stdin(reader: &mut impl BufRead, telegram: bool) -> Result<UrlValue,
     Ok(value)
 }
 
-struct EchoGuard(rustix::termios::Termios);
-impl Drop for EchoGuard {
-    fn drop(&mut self) {
-        let _ = rustix::termios::tcsetattr(
-            rustix::stdio::stdin(),
-            rustix::termios::OptionalActions::Now,
-            &self.0,
-        );
+/// Disable core dumps before the process first reads a credential.
+/// # Errors
+/// Returns a fixed message if hardening cannot be applied.
+pub fn disable_core_dumps() -> Result<(), &'static str> {
+    rustix::process::setrlimit(
+        rustix::process::Resource::Core,
+        rustix::process::Rlimit {
+            current: Some(0),
+            maximum: Some(0),
+        },
+    )
+    .map_err(|_| "cannot disable secret core dumps")?;
+    rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
+        .map_err(|_| "cannot disable secret core dumps")
+}
+
+/// Duplicate stdin without using the unzeroized global buffered reader.
+/// # Errors
+/// Returns a fixed message if stdin cannot be duplicated.
+pub fn stdin_reader() -> Result<std::fs::File, &'static str> {
+    rustix::io::dup(rustix::stdio::stdin())
+        .map(std::fs::File::from)
+        .map_err(|_| "cannot open secret input")
+}
+
+// Keep one listener alive for the process: signal-hook does not restore default
+// dispositions when a subscription is removed. Between prompts the listener
+// still applies the default action, without touching terminal settings.
+mod prompt_signals {
+    use rustix::termios::{OptionalActions, Termios, tcsetattr};
+    use signal_hook::{
+        consts::{SIGHUP, SIGINT, SIGTERM},
+        iterator::Signals,
+    };
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    type Saved = Arc<Mutex<Option<Termios>>>;
+    static SAVED: OnceLock<Result<Saved, &'static str>> = OnceLock::new();
+    const ERROR: &str = "cannot protect secret terminal settings";
+
+    fn listen() -> Result<Saved, &'static str> {
+        // Linux exposes dispositions safely through procfs. Inspect before
+        // registering anything so inherited SIG_IGN (including nohup) survives.
+        let status = std::fs::read_to_string("/proc/self/status").map_err(|_| ERROR)?;
+        let ignored = status
+            .lines()
+            .find_map(|line| line.strip_prefix("SigIgn:"))
+            .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+            .ok_or(ERROR)?;
+        let mut signals = Signals::new(
+            [SIGHUP, SIGINT, SIGTERM]
+                .into_iter()
+                .filter(|number| ignored & (1_u64 << (number - 1)) == 0),
+        )
+        .map_err(|_| ERROR)?;
+        let saved: Saved = Arc::new(Mutex::new(None));
+        let thread_saved = Arc::clone(&saved);
+        std::thread::Builder::new()
+            .name("secret-terminal".into())
+            .spawn(move || {
+                for number in signals.forever() {
+                    // Serialize restoration with hiding and normal guard cleanup.
+                    let settings = thread_saved
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Some(original) = settings.as_ref() {
+                        let _ = tcsetattr(rustix::stdio::stdin(), OptionalActions::Now, original);
+                    }
+                    let _ = signal_hook::low_level::emulate_default_handler(number);
+                }
+            })
+            .map_err(|_| ERROR)?;
+        Ok(saved)
+    }
+
+    pub(super) struct Guard {
+        saved: Saved,
+    }
+    impl Guard {
+        pub(super) fn hide(original: Termios, hidden: &Termios) -> Result<Self, &'static str> {
+            let saved = SAVED.get_or_init(listen).as_ref().map_err(|error| *error)?;
+            let mut settings = saved.lock().map_err(|_| ERROR)?;
+            if settings.is_some() {
+                return Err("secret prompt already active");
+            }
+            tcsetattr(rustix::stdio::stdin(), OptionalActions::Now, hidden)
+                .map_err(|_| "cannot hide terminal input")?;
+            *settings = Some(original);
+            Ok(Self {
+                saved: Arc::clone(saved),
+            })
+        }
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let mut settings = self
+                .saved
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(original) = settings.take() {
+                let _ = tcsetattr(rustix::stdio::stdin(), OptionalActions::Now, &original);
+            }
+        }
     }
 }
 
 fn prompt(
-    reader: &mut impl BufRead,
+    reader: &mut impl Read,
     label: &str,
     hidden: bool,
 ) -> Result<Zeroizing<Vec<u8>>, &'static str> {
-    use rustix::termios::{LocalModes, OptionalActions, tcgetattr, tcsetattr};
+    use rustix::termios::{LocalModes, tcgetattr};
     let guard = if hidden {
         let original =
             tcgetattr(rustix::stdio::stdin()).map_err(|_| "cannot read terminal settings")?;
@@ -189,9 +294,7 @@ fn prompt(
         settings
             .local_modes
             .remove(LocalModes::ECHO | LocalModes::ECHONL | LocalModes::ICANON | LocalModes::ISIG);
-        tcsetattr(rustix::stdio::stdin(), OptionalActions::Now, &settings)
-            .map_err(|_| "cannot hide terminal input")?;
-        Some(EchoGuard(original))
+        Some(prompt_signals::Guard::hide(original, &settings)?)
     } else {
         None
     };
@@ -213,20 +316,26 @@ fn prompt(
     result
 }
 
-fn hidden_line(reader: &mut impl BufRead) -> Result<Zeroizing<Vec<u8>>, &'static str> {
+fn hidden_line(reader: &mut impl Read) -> Result<Zeroizing<Vec<u8>>, &'static str> {
     let mut value = Zeroizing::new(Vec::with_capacity(4096));
     loop {
-        let mut byte = [0];
+        let mut byte = Zeroizing::new([0]);
         reader
-            .read_exact(&mut byte)
+            .read_exact(&mut *byte)
             .map_err(|_| "secret input read failed")?;
         match byte[0] {
             b'\n' | b'\r' => return Ok(value),
             3 | 4 => return Err("secret input cancelled"),
             8 | 127 => {
+                if let Some(last) = value.last_mut() {
+                    *last = 0;
+                }
                 value.pop();
             }
-            21 => value.clear(),
+            21 => {
+                value.fill(0);
+                value.clear();
+            }
             b => {
                 if value.len() == 4096 {
                     return Err("secret input exceeds 4 KiB");
@@ -241,7 +350,7 @@ fn hidden_line(reader: &mut impl BufRead) -> Result<Zeroizing<Vec<u8>>, &'static
 /// # Errors
 /// Returns fixed diagnostics for failed terminal access, input or validation.
 pub fn read_tty(telegram: bool) -> Result<UrlValue, &'static str> {
-    let mut reader = io::stdin().lock();
+    let mut reader = stdin_reader()?;
     if telegram {
         let token = prompt(&mut reader, "Bot token", true)?;
         let chat = prompt(&mut reader, "Chat id", false)?;
@@ -261,12 +370,16 @@ mod tests {
         for value in [
             "https://example.com",
             "https://hc-ping.example/fake-check?key=fake",
-            "https://example.com:8443/path",
-            "https://[2001:db8::1]/fake",
+            "https://example.com:443/path",
         ] {
             assert!(UrlValue::url(value.as_bytes()).is_ok());
         }
         for value in [
+            "https://example.com:8443/path",
+            "https://[2001:db8::1]/fake",
+            "https://example.com/path#fragment",
+            "https://example.com/é",
+            "https://example.com/?é",
             "http://example.com/path",
             "https:///path",
             "https://user@example.com/path",
@@ -282,7 +395,10 @@ mod tests {
             assert!(UrlValue::url(value.as_bytes()).is_err());
         }
         let mut boundary = "https://example.com/".to_owned();
-        boundary.extend(std::iter::repeat_n('x', 4096 - boundary.len()));
+        boundary.extend(std::iter::repeat_n(
+            'x',
+            crate::probe::MAX_TARGET_BYTES - crate::heartbeat::MAX_SUFFIX_BYTES - 1,
+        ));
         assert!(UrlValue::url(boundary.as_bytes()).is_ok());
         assert!(read_stdin(&mut format!("{boundary}\n").as_bytes(), false).is_ok());
         boundary.push('x');
@@ -341,6 +457,8 @@ mod tests {
         ] {
             assert!(!valid_telegram_chat(chat));
         }
+        let too_long_for_delivery = format!("0000:{}", "x".repeat(2048));
+        assert!(UrlValue::telegram(too_long_for_delivery.as_bytes(), b"@fake_channel").is_err());
         let oversized = format!("0000:{}", "x".repeat(4096));
         assert!(UrlValue::telegram(oversized.as_bytes(), b"@fake_channel").is_err());
         assert!(read_stdin(&mut format!("{token}\n@fake_channel\n").as_bytes(), true).is_ok());
@@ -351,6 +469,20 @@ mod tests {
                 true
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn stdin_line_limit_is_independent_of_url_validation() {
+        let boundary = vec![b'x'; 4096];
+        assert_eq!(&*line(&mut boundary.as_slice()).unwrap(), &boundary);
+        let mut newline = boundary.clone();
+        newline.push(b'\n');
+        assert_eq!(&*line(&mut newline.as_slice()).unwrap(), &boundary);
+        let oversized = vec![b'x'; 4097];
+        assert_eq!(
+            line(&mut oversized.as_slice()).unwrap_err(),
+            "secret input exceeds 4 KiB"
         );
     }
 

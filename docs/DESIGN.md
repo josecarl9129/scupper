@@ -1240,7 +1240,11 @@ missing, too old or not logged in, resolution fails with an actionable
 message (`pass-cli is not logged in; run: pass-cli login`) and **never falls
 back silently** to another backend. Example:
 `scupper gateway create --provider digitalocean --token pass://Infra/digitalocean/token`.
-`scupper secret check REF` resolves a reference and prints only whether it
+`scupper secret check REF` dispatches by reference form: a bare basename
+(`[a-z0-9][a-z0-9-]{0,62}`, no colon) checks gateway files; `scheme:` or
+`scheme://` selects operator-side backend lookup. Backend lookup is not
+implemented in M2: it prints that limitation and exits 1. Once implemented,
+operator-side lookup resolves a reference and prints only whether it
 worked and the value's length, never the value.
 
 Reference strings are not secret and may be stored in Mac-side config
@@ -1505,7 +1509,7 @@ scupper                                 bare: short status summary with next-ste
 ├── gateway
 │   └── create --provider digitalocean [--region R] [--size S] [--name N] [--token REF]
 ├── secret
-│   ├── check REF                       resolve REF, print ok + value length only (never the value)
+│   ├── check REF                       bare REF: gateway files; scheme: or scheme://: operator backend (not implemented in M2, exit 1); ok + length only
 │   ├── set url REF [--replace]          gateway: hidden URL prompt or one stdin line; root only
 │   ├── set telegram REF [--replace]     gateway: hidden bot token + visible chat id, or two stdin lines
 │   ├── list                            gateway: names, kinds, modes, referenced by any committed version; root only
@@ -1912,29 +1916,56 @@ No native SMTP sink.
 
 On Linux gateways, `scupper secret set url REF [--replace]` reads a URL
 from a hidden TTY prompt or one stdin line (at most 4 KiB, excluding the
-optional final newline). It uses the same HTTPS, host and no-userinfo
-validation as delivery. `scupper secret set telegram REF [--replace]`
-reads a hidden bot token followed by a visible chat id, or two stdin lines.
+optional final newline). It uses the same validation as delivery, including
+the config HTTPS/no-userinfo check and the delivery parser: port 443 only,
+DNS-style hosts (no IPv6 literals), no fragments, and an ASCII request target
+of at most 2046 bytes, reserving two bytes for heartbeat verdict suffixes.
+`scupper secret set telegram REF [--replace]` reads a hidden bot token followed by a visible chat id, or two stdin lines.
 Tokens have a decimal bot id, a colon and at least 35 URL-safe characters;
 chat ids are decimal with an optional leading minus, or `@channelname`
 (ASCII letters, digits and underscores). The assembled URL is also capped
-at 4 KiB. Neither command accepts values in arguments or the environment.
+at 4 KiB and must pass the same delivery validation. Neither command accepts
+values in arguments or the environment. For a remote hidden prompt use
+`ssh -t`; non-TTY input prints a warning before reading. Redirect a protected
+file into stdin instead of placing a value in a shell command. Core dumps
+are disabled before reading secret bytes. Hidden prompts restore terminal
+settings on cancellation and on SIGTERM, SIGHUP or SIGINT, then re-raise
+external termination signals. Inherited ignored signals remain ignored.
 
 Both commands require root, validate the reference basename, and durably
 write `/etc/scupper/secrets/url/REF` (root 0600; directories 0700) through
 confined directory descriptors and the shared temporary-file, fsync, rename,
 directory-fsync writer. Existing files require `--replace`; replacement
-refuses symlinks, special files and unsafe ownership or modes. Confirmation
+refuses symlinks, special files and unsafe ownership or modes. The shared
+WireGuard replacement writer also requires an effective-owner-owned regular
+0600 destination. Confirmation
 shows only the ref and `https://example.com/…`, or
 `telegram bot 0000… chat @fake_channel`, never the URL path/query or token.
-The current config head determines the next step: `scupper alerts test SINK`
-for each matching sink, or heartbeat use at its next interval. Unreferenced
-and historical-only refs point to `scupper config edit`.
+Root, basename, directory and destination checks run before prompting; the
+writer lock covers those prechecks, is released throughout input, and is
+reacquired with the standard five-second bound for the write. Directory and
+destination checks, including `--replace`, are repeated under that lock before
+cleanup and writing. The current config head alone determines the next step: `scupper alerts test SINK` for each matching sink,
+or heartbeat use at its next interval. Refs absent from head point to
+`scupper config edit`. An unreadable or unparsable head makes the hint
+unavailable but does not block storage; old versions are not parsed for this
+hint. Before writing, the locked URL writer removes only its own
+`.scupper-<pid>-<counter>.tmp` regular, owned 0600 files older than this run.
+Other entries remain untouched. If rename succeeds but directory fsync
+fails, the command reports that the secret was written and durability is
+not confirmed.
 
 `scupper secret list` shows names, kinds, modes and whether any committed
-config version references each file, without reading contents.
-`scupper secret check REF` uses the daemon's resolver and prints only ok and
-value length, checking both kinds if the same basename exists in both.
+config version references each file, without reading contents. If config
+references cannot be inspected it prints `referenced=?`. Unsafe file type,
+owner or mode gets an `unsafe` marker; stray entries get a fix hint and are
+skipped as secret references.
+`scupper secret check REF` with a bare basename uses the daemon's resolver
+for URL files and its confined file reader for WireGuard files, printing
+only ok and value length after checking both kinds if the same basename
+exists in both. It opens each reference directly, so unrelated stray
+entries cannot break a check. Scheme references select the operator-side
+lookup described in §11 (not implemented in M2; exit 1).
 Both gateway inspection commands also require root.
 
 Telegram uses the JSON object `{"text": ...}`. Store the bot token and chat ID

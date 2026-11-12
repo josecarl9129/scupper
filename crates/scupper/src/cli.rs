@@ -337,6 +337,33 @@ where
     )
 }
 
+fn secret_subcommand(args: &[OsString]) -> bool {
+    #[cfg(feature = "testing")]
+    let mut skip_root = false;
+    for arg in args.iter().skip(1) {
+        #[cfg(feature = "testing")]
+        if skip_root {
+            skip_root = false;
+            continue;
+        }
+        if arg == "--json" {
+            continue;
+        }
+        #[cfg(feature = "testing")]
+        {
+            if arg == "--test-root" {
+                skip_root = true;
+                continue;
+            }
+            if arg.to_str().is_some_and(|s| s.starts_with("--test-root=")) {
+                continue;
+            }
+        }
+        return arg == "secret";
+    }
+    false
+}
+
 /// Runs in-process with injected dependencies and captured output streams.
 /// Argument errors use code 1 so they cannot collide with unprotected code 2.
 #[must_use]
@@ -353,7 +380,7 @@ where
     let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
     // A mistaken extra argument can itself be a credential. Clap diagnostics
     // normally quote such arguments; secret commands must keep them value-free.
-    let secret_command = args.iter().any(|arg| arg == "secret");
+    let secret_command = secret_subcommand(&args);
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
         Err(error) => {

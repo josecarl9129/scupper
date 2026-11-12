@@ -20,6 +20,9 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+const STDIN_NOTICE: &str =
+    "reading the secret from stdin (not a terminal); over SSH use `ssh -t` for a hidden prompt\n";
+
 struct Disk(PathBuf);
 impl Disk {
     fn new() -> Self {
@@ -137,6 +140,15 @@ fn secret_child() {
         &mut std::io::stdout(),
         &mut std::io::stderr(),
     );
+    if code == 0 && command.starts_with("secret set ") {
+        let limits = rustix::process::getrlimit(rustix::process::Resource::Core);
+        assert_eq!(limits.current, Some(0));
+        assert_eq!(limits.maximum, Some(0));
+        assert_eq!(
+            rustix::process::dumpable_behavior().unwrap(),
+            rustix::process::DumpableBehavior::NotDumpable
+        );
+    }
     std::process::exit(i32::from(code));
 }
 
@@ -164,7 +176,7 @@ fn stdin_permissions_replacement_and_only_target_persists() {
     assert_eq!(code, 0, "{out} {err}");
     assert!(out.contains("fake-ref: https://hc-ping.example/…"));
     assert!(!out.contains("FAKE_PRIVATE") && !out.contains("FAKE_QUERY"));
-    assert_eq!(err, "");
+    assert_eq!(err, STDIN_NOTICE);
     assert_eq!(fs::read(disk.target()).unwrap(), value);
     for (path, mode) in [
         (disk.0.join("etc/secrets"), 0o700),
@@ -295,7 +307,7 @@ fn list_and_check_cover_both_kinds_and_unsafe_metadata() {
 }
 
 #[test]
-fn references_use_head_and_preserve_historical_information() {
+fn set_hints_use_only_head_and_list_preserves_historical_information() {
     let disk = Disk::new();
     let refs = "\n[alerts.sinks.fake-sink]\nkind = 'ntfy'\nmin_severity = 'warning'\nurl_ref = 'fake-ref'\n[heartbeat]\nkind = 'healthchecks'\nurl_ref = 'fake-ref'\n";
     disk.commit(None, refs);
@@ -314,7 +326,7 @@ fn references_use_head_and_preserve_historical_information() {
         b"https://example.com/FAKE_NEW",
     );
     assert_eq!(code, 0, "{out} {err}");
-    assert!(out.contains("Only historical config versions reference"));
+    assert!(out.contains("No current config references"));
     assert!(!out.contains("alerts test"));
     assert!(
         disk.run("secret list", b"")
@@ -326,8 +338,354 @@ fn references_use_head_and_preserve_historical_information() {
         empty
             .run("secret set url fake-ref", b"https://example.com/FAKE_PATH")
             .1
-            .contains("No config version references this ref; use scupper config edit")
+            .contains("No current config references this ref; use scupper config edit")
     );
+}
+
+#[test]
+fn delivery_rejections_fail_set_write_and_check_without_values() {
+    let disk = Disk::new();
+    let name = SecretName::new(SecretKind::Url, "fake-ref").unwrap();
+    let invalid = [
+        "https://example.com:8443/FAKE_PATH".to_owned(),
+        "https://[2001:db8::1]/FAKE_PATH".to_owned(),
+        "https://example.com/FAKE_PATH#fragment".to_owned(),
+        "https://example.com/FAKE_PATH/é".to_owned(),
+        "https://example.com/FAKE_PATH?é".to_owned(),
+        format!("https://example.com/{}", "x".repeat(2048)),
+    ];
+    for value in invalid {
+        let (code, out, err) = disk.run("secret set url fake-ref --replace", value.as_bytes());
+        assert_eq!(code, 1);
+        assert!(!out.contains("ok") && !out.contains("FAKE_PATH") && !err.contains("FAKE_PATH"));
+        assert!(SecretFile::write_url(&disk.0.join("etc"), &name, value.as_bytes(), true).is_err());
+        // Simulate a credential installed by hand or an older binary.
+        fs::write(disk.target(), value).unwrap();
+        fs::set_permissions(disk.target(), fs::Permissions::from_mode(0o600)).unwrap();
+        let (code, out, err) = disk.run("secret check fake-ref", b"");
+        assert_eq!(code, 1);
+        assert!(!out.contains("ok length") && !err.contains("FAKE_PATH"));
+    }
+    let token = format!("00000000:{}", "x".repeat(2048));
+    assert_eq!(
+        disk.run(
+            "secret set telegram fake-ref --replace",
+            format!("{token}\n@fake_channel\n").as_bytes()
+        )
+        .0,
+        1
+    );
+}
+
+#[test]
+fn stray_entries_are_reported_and_only_stale_url_writer_temps_are_removed() {
+    use std::time::{Duration, SystemTime};
+    let disk = Disk::new();
+    assert_eq!(
+        disk.run("secret set url fake-ref", b"https://example.com/FAKE_PATH")
+            .0,
+        0
+    );
+    fs::create_dir(disk.0.join("etc/secrets/wg")).unwrap();
+    fs::set_permissions(
+        disk.0.join("etc/secrets/wg"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let old = SystemTime::now() - Duration::from_secs(60);
+    for (kind, name) in [
+        ("wg", ".scupper-1-0.tmp"),
+        ("url", ".scupper-1-0.tmp"),
+        ("url", ".scupper-other.tmp"),
+        ("url", ".scupper-2-0.tmp"),
+        ("url", "README"),
+    ] {
+        let file = fs::File::create(disk.0.join(format!("etc/secrets/{kind}/{name}"))).unwrap();
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .unwrap();
+        file.set_modified(if name == ".scupper-2-0.tmp" {
+            SystemTime::now() + Duration::from_secs(3600)
+        } else {
+            old
+        })
+        .unwrap();
+    }
+    symlink(
+        disk.0.join("victim"),
+        disk.0.join("etc/secrets/url/.scupper-3-0.tmp"),
+    )
+    .unwrap();
+    let (code, out, err) = disk.run("secret list", b"");
+    assert_eq!(code, 0, "{out} {err}");
+    assert!(out.contains("stray entry; inspect and move it out"));
+    assert!(out.contains(".scupper-1-0.tmp") && out.contains("README"));
+    assert_eq!(disk.run("secret check fake-ref", b"").0, 0);
+    assert_eq!(
+        disk.run(
+            "secret set url fake-ref --replace",
+            b"https://example.com/FAKE_NEW"
+        )
+        .0,
+        0
+    );
+    assert!(!disk.0.join("etc/secrets/url/.scupper-1-0.tmp").exists());
+    for path in [
+        "wg/.scupper-1-0.tmp",
+        "url/.scupper-other.tmp",
+        "url/.scupper-2-0.tmp",
+        "url/README",
+        "url/.scupper-3-0.tmp",
+    ] {
+        assert!(fs::symlink_metadata(disk.0.join("etc/secrets").join(path)).is_ok());
+    }
+}
+
+fn invalidate_version(disk: &Disk, version: u64) {
+    use sha2::{Digest, Sha256};
+    let dir = disk.0.join("state/config/versions");
+    let text = "not valid config";
+    fs::write(dir.join(format!("{version:06}.toml")), text).unwrap();
+    let path = dir.join(format!("{version:06}.meta.json"));
+    let mut meta: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    meta["sha256"] = format!("{:x}", Sha256::digest(text)).into();
+    fs::write(path, serde_json::to_vec(&meta).unwrap()).unwrap();
+}
+
+#[test]
+fn bad_old_config_never_blocks_set_and_bad_head_only_loses_hint() {
+    let disk = Disk::new();
+    disk.commit(None, "");
+    disk.commit(
+        Some(1),
+        "\n[heartbeat]\nkind = 'healthchecks'\nurl_ref = 'fake-ref'\n",
+    );
+    invalidate_version(&disk, 1);
+    let (code, out, err) = disk.run("secret set url fake-ref", b"https://example.com/FAKE_PATH");
+    assert_eq!(code, 0, "{out} {err}");
+    assert!(out.contains("heartbeat uses this ref"));
+    let (code, out, err) = disk.run("secret list", b"");
+    assert_eq!(code, 0, "{out} {err}");
+    assert!(out.contains("referenced=?"));
+    invalidate_version(&disk, 2);
+    let (code, out, err) = disk.run(
+        "secret set url fake-ref --replace",
+        b"https://example.com/FAKE_NEW",
+    );
+    assert_eq!(code, 0, "{out} {err}");
+    assert!(out.contains("next-step hint unavailable"));
+    assert_eq!(
+        fs::read(disk.target()).unwrap(),
+        b"https://example.com/FAKE_NEW"
+    );
+}
+
+#[test]
+fn writer_lock_is_free_during_input_and_destination_is_rechecked() {
+    for change in ["none", "created", "unsafe", "replace"] {
+        let disk = Disk::new();
+        let replace = change == "replace";
+        if replace {
+            assert_eq!(
+                disk.run("secret set url fake-ref", b"https://example.com/FAKE_OLD")
+                    .0,
+                0
+            );
+        }
+        let mut child = disk.spawn(if replace {
+            "secret set url fake-ref --replace"
+        } else {
+            "secret set url fake-ref"
+        });
+        let mut stderr = child.stderr.take().unwrap();
+        let mut notice = vec![0; STDIN_NOTICE.len()];
+        read_bounded(&mut stderr, &mut notice);
+        assert_eq!(notice, STDIN_NOTICE.as_bytes());
+        assert!(child.try_wait().unwrap().is_none());
+        // The child has passed its prechecks and is blocked on our open pipe.
+        // A separate descriptor must acquire the global lock immediately.
+        let writer = WriterLock::try_acquire(disk.0.join("run")).unwrap();
+        if change == "created" {
+            let name = SecretName::new(SecretKind::Url, "fake-ref").unwrap();
+            SecretFile::write_url(
+                &disk.0.join("etc"),
+                &name,
+                b"https://example.com/FAKE_OTHER",
+                false,
+            )
+            .unwrap();
+        } else if change == "unsafe" || replace {
+            if replace {
+                fs::remove_file(disk.target()).unwrap();
+            }
+            symlink("missing", disk.target()).unwrap();
+        }
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(b"https://example.com/FAKE_NEW\n").unwrap();
+        drop(stdin);
+        drop(writer);
+        assert_eq!(
+            wait_bounded(&mut child).code(),
+            Some(i32::from(change != "none"))
+        );
+        let output = child.wait_with_output().unwrap();
+        let mut error = String::new();
+        std::io::Read::read_to_string(&mut stderr, &mut error).unwrap();
+        assert!(!error.contains("FAKE_"));
+        if change == "created" {
+            assert!(error.contains("use --replace"));
+            assert_eq!(
+                fs::read(disk.target()).unwrap(),
+                b"https://example.com/FAKE_OTHER"
+            );
+        } else if change == "none" {
+            assert!(output.status.success());
+            assert_eq!(
+                fs::read(disk.target()).unwrap(),
+                b"https://example.com/FAKE_NEW"
+            );
+        } else {
+            assert!(
+                fs::symlink_metadata(disk.target())
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+    }
+}
+
+#[test]
+fn writer_reacquisition_times_out_after_input() {
+    let disk = Disk::new();
+    let mut child = disk.spawn("secret set url fake-ref");
+    let mut stderr = child.stderr.take().unwrap();
+    let mut notice = vec![0; STDIN_NOTICE.len()];
+    read_bounded(&mut stderr, &mut notice);
+    assert_eq!(notice, STDIN_NOTICE.as_bytes());
+    let _writer = WriterLock::try_acquire(disk.0.join("run")).unwrap();
+    let started = std::time::Instant::now();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"https://example.com/FAKE_NEW\n")
+        .unwrap();
+    let status = wait_bounded_for(&mut child, std::time::Duration::from_secs(7));
+    assert_eq!(status.code(), Some(1));
+    assert!(started.elapsed() >= std::time::Duration::from_secs(5));
+    assert!(!disk.target().exists());
+    let mut error = String::new();
+    std::io::Read::read_to_string(&mut stderr, &mut error).unwrap();
+    assert!(error.contains("secret writer lock unavailable"));
+    assert!(!error.contains("FAKE_"));
+}
+
+#[test]
+fn stored_target_boundary_allows_every_delivery_suffix() {
+    let disk = Disk::new();
+    let name = SecretName::new(SecretKind::Url, "fake-ref").unwrap();
+    let limit = scupper_sys::probe::MAX_TARGET_BYTES - scupper_sys::heartbeat::MAX_SUFFIX_BYTES;
+    for query in ["", "?fake=query"] {
+        let value = format!(
+            "https://example.com/{}{query}",
+            "x".repeat(limit - 1 - query.len())
+        );
+        let (code, out, err) = disk.run("secret set url fake-ref --replace", value.as_bytes());
+        assert_eq!(code, 0, "{out} {err}");
+        assert_eq!(disk.run("secret check fake-ref", b"").0, 0);
+        for suffix in ["", "/0", "/1", "/2", "/3", "/4"] {
+            let resolved = scupper_sys::heartbeat::resolve(
+                &disk.0.join("etc"),
+                &name,
+                suffix,
+                rustix::process::geteuid().as_raw(),
+            )
+            .unwrap();
+            assert!(scupper_sys::probe_child::Url::new(resolved.expose()).is_ok());
+        }
+        let oversized = format!("{value}x");
+        assert_eq!(
+            disk.run("secret set url fake-ref --replace", oversized.as_bytes())
+                .0,
+            1
+        );
+        assert!(
+            SecretFile::write_url(&disk.0.join("etc"), &name, oversized.as_bytes(), true).is_err()
+        );
+        fs::write(disk.target(), oversized).unwrap();
+        assert_eq!(disk.run("secret check fake-ref", b"").0, 1);
+    }
+}
+
+#[test]
+fn prechecks_fail_without_reading_stdin_and_backend_check_is_explicit() {
+    let disk = Disk::new();
+    assert_eq!(
+        disk.run("secret set url fake-ref", b"https://example.com/FAKE_PATH")
+            .0,
+        0
+    );
+    for command in [
+        "secret set url fake-ref",
+        "secret set url ../bad",
+        "secret check pass://fake/path",
+        "secret check op:fake",
+    ] {
+        let mut child = disk.spawn(command);
+        // Keep stdin open: any attempt to read would block until this deadline.
+        let status = wait_bounded(&mut child);
+        assert_eq!(status.code(), Some(1));
+        let output = child.wait_with_output().unwrap();
+        let err = String::from_utf8(output.stderr).unwrap();
+        assert!(!err.contains(STDIN_NOTICE));
+        if command.contains("check") {
+            assert!(err.contains("operator-side secret lookup is not implemented in M2"));
+            assert!(!err.contains("fake/path"));
+        }
+    }
+}
+
+fn wait_bounded(child: &mut std::process::Child) -> std::process::ExitStatus {
+    wait_bounded_for(child, std::time::Duration::from_secs(5))
+}
+
+fn wait_bounded_for(
+    child: &mut std::process::Child,
+    limit: std::time::Duration,
+) -> std::process::ExitStatus {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "secret child exceeded its deadline"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+fn read_bounded(reader: &mut (impl std::io::Read + std::os::fd::AsFd), buffer: &mut [u8]) {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut offset = 0;
+    while offset < buffer.len() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let timeout = Timespec::try_from(remaining).unwrap();
+        assert_ne!(
+            poll(&mut [PollFd::new(&*reader, PollFlags::IN)], Some(&timeout)).unwrap(),
+            0,
+            "terminal read timed out"
+        );
+        let n = reader.read(&mut buffer[offset..]).unwrap();
+        assert_ne!(n, 0, "terminal closed before prompt");
+        offset += n;
+    }
 }
 
 #[test]
@@ -435,26 +793,82 @@ proptest::proptest! {
         match expected {
             Ok(value) => {
                 proptest::prop_assert_eq!(code, 0);
-                proptest::prop_assert_eq!(err, "");
-                proptest::prop_assert_eq!(out, format!("{harness}fake-ref: {}\nNo config version references this ref; use scupper config edit.\n", value.confirmation()));
+                proptest::prop_assert_eq!(err, STDIN_NOTICE);
+                proptest::prop_assert_eq!(out, format!("{harness}fake-ref: {}\nNo current config references this ref; use scupper config edit.\n", value.confirmation()));
             }
             Err(error) => {
                 proptest::prop_assert_eq!(code, 1);
                 proptest::prop_assert_eq!(out, harness);
-                proptest::prop_assert_eq!(err, format!("scupper: {error}\n"));
+                proptest::prop_assert_eq!(err, format!("{STDIN_NOTICE}scupper: {error}\n"));
             }
         }
     }
 }
 
+fn spawn_tty(disk: &Disk, slave: &fs::File, ignored: Option<i32>) -> std::process::Child {
+    let mut command = if let Some(number) = ignored {
+        let mut shell = Command::new("sh");
+        shell
+            .args(["-c", "trap '' \"$1\"; shift; exec \"$@\"", "secret-test"])
+            .arg(number.to_string())
+            .arg(std::env::current_exe().unwrap());
+        shell
+    } else {
+        Command::new(std::env::current_exe().unwrap())
+    };
+    command
+        .args(["--exact", "secret_child", "--nocapture", "--quiet"])
+        .env_clear()
+        .env("SCUPPER_SECRET_TEST_ROOT", &disk.0)
+        .env(
+            "SCUPPER_SECRET_TEST_COMMAND",
+            "secret set telegram fake-ref",
+        )
+        .stdin(slave.try_clone().unwrap())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+fn send_ignored_signal(child: &std::process::Child, number: i32) {
+    let status = fs::read_to_string(format!("/proc/{}/status", child.id())).unwrap();
+    let mask = status
+        .lines()
+        .find_map(|line| line.strip_prefix("SigIgn:"))
+        .unwrap();
+    let mask = u64::from_str_radix(mask.trim(), 16).unwrap();
+    assert_ne!(mask & (1_u64 << (number - 1)), 0);
+    let signal = match number {
+        1 => rustix::process::Signal::HUP,
+        2 => rustix::process::Signal::INT,
+        _ => rustix::process::Signal::TERM,
+    };
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap(),
+        signal,
+    )
+    .unwrap();
+}
+
 #[test]
-fn tty_hides_token_shows_chat_and_restores_echo_on_cancel() {
+fn tty_hides_token_shows_chat_and_restores_echo_on_cancel_and_signals() {
     use rustix::{
         pty::{OpenptFlags, grantpt, ioctl_tiocgptpeer, openpt, unlockpt},
         termios::{LocalModes, tcgetattr},
     };
-    use std::io::Read;
-    for cancel in [false, true] {
+    use std::{io::Read, os::unix::process::ExitStatusExt};
+    for (interruption, ignored) in [
+        (0, false),
+        (3, false),
+        (1, false),
+        (2, false),
+        (15, false),
+        (1, true),
+        (2, true),
+        (15, true),
+    ] {
+        let cancel = interruption != 0 && !ignored;
         let disk = Disk::new();
         let master =
             openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC).unwrap();
@@ -468,22 +882,10 @@ fn tty_hides_token_shows_chat_and_restores_echo_on_cancel() {
             .unwrap(),
         );
         let original = tcgetattr(&slave).unwrap();
-        let mut child = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "secret_child", "--nocapture", "--quiet"])
-            .env_clear()
-            .env("SCUPPER_SECRET_TEST_ROOT", &disk.0)
-            .env(
-                "SCUPPER_SECRET_TEST_COMMAND",
-                "secret set telegram fake-ref",
-            )
-            .stdin(slave.try_clone().unwrap())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut child = spawn_tty(&disk, &slave, ignored.then_some(interruption));
         let mut stderr = child.stderr.take().unwrap();
         let mut prompt = [0; 11];
-        stderr.read_exact(&mut prompt).unwrap();
+        read_bounded(&mut stderr, &mut prompt);
         assert_eq!(&prompt, b"Bot token: ");
         assert!(
             !tcgetattr(&slave)
@@ -492,14 +894,29 @@ fn tty_hides_token_shows_chat_and_restores_echo_on_cancel() {
                 .contains(LocalModes::ECHO)
         );
         let mut terminal = std::fs::File::from(master);
-        if cancel {
+        if ignored {
+            send_ignored_signal(&child, interruption);
+        }
+        if interruption == 3 {
             terminal.write_all(b"FAKE_PARTIAL_TOKEN\x03").unwrap();
+        } else if cancel {
+            terminal.write_all(b"FAKE_PARTIAL_TOKEN").unwrap();
+            let signal = match interruption {
+                1 => rustix::process::Signal::HUP,
+                2 => rustix::process::Signal::INT,
+                _ => rustix::process::Signal::TERM,
+            };
+            rustix::process::kill_process(
+                rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap(),
+                signal,
+            )
+            .unwrap();
         } else {
             terminal
                 .write_all(b"00000000:FAKE_TOKEN_for_tests_only_00000000000\n")
                 .unwrap();
             let mut prompt = [0; 10];
-            stderr.read_exact(&mut prompt).unwrap();
+            read_bounded(&mut stderr, &mut prompt);
             assert_eq!(&prompt, b"\nChat id: ");
             assert!(
                 tcgetattr(&slave)
@@ -509,19 +926,24 @@ fn tty_hides_token_shows_chat_and_restores_echo_on_cancel() {
             );
             terminal.write_all(b"@fake_channel\n").unwrap();
         }
+        wait_bounded(&mut child);
         let output = child.wait_with_output().unwrap();
-        assert_eq!(output.status.code(), Some(i32::from(cancel)));
+        if cancel && interruption != 3 {
+            assert_eq!(output.status.signal(), Some(interruption));
+        } else {
+            assert_eq!(output.status.code(), Some(i32::from(cancel)));
+        }
         let final_settings = tcgetattr(&slave).unwrap();
         assert_eq!(final_settings.local_modes, original.local_modes);
         let mut error = String::new();
         stderr.read_to_string(&mut error).unwrap();
         assert!(!error.contains("FAKE_"));
-        if cancel {
+        if interruption == 3 {
             assert!(error.contains("cancelled"));
-        } else {
-            let mut echo = [0; 64];
-            let count = terminal.read(&mut echo).unwrap();
-            assert_eq!(&echo[..count], b"@fake_channel\r\n");
+        } else if !cancel {
+            let mut echo = [0; 15];
+            read_bounded(&mut terminal, &mut echo);
+            assert_eq!(&echo, b"@fake_channel\r\n");
             assert!(
                 String::from_utf8(output.stdout)
                     .unwrap()

@@ -22,7 +22,7 @@ toml = { workspace = true, features = ["display"] }
 scupper-sys.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-rustix = { workspace = true, features = ["pty"] }
+rustix = { workspace = true, features = ["pty", "event"] }
 
 [dev-dependencies]
 proptest.workspace = true

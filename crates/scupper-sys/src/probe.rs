@@ -16,6 +16,9 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 /// Maximum complete HTTP response, including headers and chunk framing.
 pub const MAX_RESPONSE_BYTES: usize = 16 * 1024;
 
+/// Maximum origin-form request target, including its query string.
+pub const MAX_TARGET_BYTES: usize = 2048;
+
 /// A verified HTTPS host and origin-form path; the port is always 443.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
@@ -29,6 +32,14 @@ impl Target {
     /// # Errors
     /// Returns a setup error for an invalid DNS name or origin-form path.
     pub fn new(host: &str, path: &str) -> Probe<Self> {
+        Self::validate(host, path)?;
+        Ok(Self {
+            host: host.into(),
+            path: path.into(),
+        })
+    }
+
+    pub(crate) fn validate(host: &str, path: &str) -> Probe<()> {
         if host.is_empty()
             || host.len() > 253
             || host.split('.').any(|label| {
@@ -41,17 +52,14 @@ impl Target {
                         .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
             })
             || !path.starts_with('/')
-            || path.len() > 2048
+            || path.len() > MAX_TARGET_BYTES
             || !path
                 .bytes()
                 .all(|byte| byte.is_ascii_graphic() && byte != b'#')
         {
             return Err(ProbeError::setup("invalid HTTPS probe target"));
         }
-        Ok(Self {
-            host: host.into(),
-            path: path.into(),
-        })
+        Ok(())
     }
 
     /// Target host used for DNS, certificate verification, SNI and HTTP Host.
