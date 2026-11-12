@@ -84,11 +84,6 @@ pub(super) fn observe(system: &dyn System, paths: &Paths) -> Result<Facts, Refus
         .map_err(|_| input("invalid configuration store"))?;
     observe_history(paths, &store, &mut facts)?;
     normalize_owner(system, &mut facts);
-    let firewall = command(system, Program::Nft, &["-j", "list", "ruleset"])?;
-    let json: serde_json::Value =
-        serde_json::from_str(&firewall).map_err(|_| input("invalid firewall observation"))?;
-    facts.firewall_warning =
-        json.to_string().contains("drop") || json.to_string().contains("reject");
     Ok(facts)
 }
 fn observe_history(paths: &Paths, store: &VersionStore, facts: &mut Facts) -> Result<(), Refusal> {

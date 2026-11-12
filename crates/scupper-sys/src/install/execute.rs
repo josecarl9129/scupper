@@ -58,6 +58,8 @@ fn new_identity() -> Result<Zeroizing<Vec<u8>>, String> {
 pub fn apply(system: &dyn System, paths: &Paths, mut prepared: Prepared) -> Result<String, String> {
     // No directory or lock is created until the full plan and refusals exist.
     let mut current = observe(system, paths).map_err(|e| e.to_string())?;
+    current.firewall_warning =
+        super::firewall_warning(system, &prepared.site).map_err(|e| e.to_string())?;
     for path in prepared
         .facts
         .nodes

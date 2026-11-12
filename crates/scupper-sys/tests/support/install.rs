@@ -157,7 +157,7 @@ impl System for Fake {
                 if self.marker == Some("table") {
                     r#"{"nftables":[{"table":{"family":"inet","name":"scupper"}}]}"#.into()
                 } else if self.firewall && args.last().is_some_and(|a| a == "ruleset") {
-                    r#"{"nftables":[{"chain":{"policy":"drop"}}]}"#.into()
+                    r#"{"nftables":[{"chain":{"family":"inet","table":"filter","name":"input","hook":"input","policy":"drop"}}]}"#.into()
                 } else {
                     r#"{"nftables":[]}"#.into()
                 }

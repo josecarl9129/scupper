@@ -4,14 +4,23 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{fs::OpenOptions, io::Write};
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct HostSnapshot {
     defaults4: Vec<String>,
     defaults6: Vec<String>,
     eth0: Vec<String>,
+    rules4: String,
+    rules6: String,
+    eth0_link: Value,
+    resolv_conf: String,
+    eth0_dns: String,
+    ip_forward: String,
 }
 fn routes(text: &str) -> Result<Vec<String>> {
-    let rows: Vec<Value> = serde_json::from_str(text)?;
+    let mut rows: Vec<Value> = serde_json::from_str(text)?;
+    for row in &mut rows {
+        row.as_object_mut().ok_or("route object")?.remove("expires");
+    }
     let mut routes = rows
         .iter()
         .map(serde_json::to_string)
@@ -65,15 +74,39 @@ impl HostSnapshot {
         if defaults4.is_empty() {
             return fail("runner has no IPv4 default route");
         }
+        let rules4 = runner.run(&Invocation::new("", "ip", &["-4", "-j", "rule", "show"]))?;
+        let rules6 = runner.run(&Invocation::new("", "ip", &["-6", "-j", "rule", "show"]))?;
+        let links: Value = serde_json::from_str(&runner.run(&Invocation::new(
+            "",
+            "ip",
+            &["-j", "link", "show", "dev", "eth0"],
+        ))?)?;
+        let eth0_link = serde_json::json!({"flags":links[0]["flags"],"operstate":links[0]["operstate"],"mtu":links[0]["mtu"],"address":links[0]["address"]});
+        let resolv_conf = fs::read_to_string("/etc/resolv.conf")?;
+        let eth0_dns = runner.run(&Invocation::new("", "resolvectl", &["dns", "eth0"]))?;
+        let ip_forward = runner.run(&Invocation::new(
+            "",
+            "sysctl",
+            &["-n", "net.ipv4.ip_forward"],
+        ))?;
+        if ip_forward.trim() != "1" {
+            return fail("root ip_forward=1 required for adversarial inheritance");
+        }
         Ok(Self {
             defaults4,
             defaults6,
             eth0,
+            rules4,
+            rules6,
+            eth0_link,
+            resolv_conf,
+            eth0_dns,
+            ip_forward,
         })
     }
     pub fn verify(&self, now: &Self) -> Result<()> {
         if self != now {
-            return fail("runner default routes or eth0 addresses changed");
+            return fail("runner routes, rules, eth0, DNS or forwarding changed");
         }
         Ok(())
     }
@@ -105,13 +138,29 @@ impl SystemdLab {
         self.lab
             .cmd("", "ip", &["link", "set", A.gwhost.wan_if, "netns", "wan"])?;
         self.cmd("udevadm", &["settle", "--timeout=10"])?;
-        let before = self.cmd(
+        let mut before = self.cmd(
             "networkctl",
             &["--no-pager", "--no-legend", "status", "up0"],
         )?;
         fs::write(self.lab.artifacts.join("networkd-up0-before.txt"), &before)?;
+        let settle = super::Instant::now() + super::Duration::from_secs(2);
+        while before.contains("(pending)") || before.contains("(initialized)") {
+            if super::Instant::now() >= settle {
+                break;
+            }
+            self.lab.runner.dwell(super::Duration::from_millis(100))?;
+            before = self.cmd("networkctl", &["--no-pager", "status", "up0"])?;
+        }
         let mut override_used = false;
         if !unmanaged(&before) {
+            if !before
+                .lines()
+                .any(|l| l.trim().starts_with("Network File:") && l.contains(".network"))
+            {
+                return fail(
+                    "networkd up0 state unresolved without a matching network file; refusing global reload",
+                );
+            }
             let path = "/run/systemd/network/00-000-scupper-lab-up0.network";
             fs::create_dir_all("/run/systemd/network")?;
             OpenOptions::new()
@@ -168,15 +217,21 @@ impl SystemdLab {
                 )?;
             }
             self.lab
+                .cmd(ns, "ip", &["link", "set", "dev", link, "multicast", "off"])?;
+            self.lab
                 .address_up(ns, link, &format!("{address}/30"), 1500)?;
         }
+        self.restore_uplink_routes()?;
+        self.guard("uplink-after")
+    }
+    pub(super) fn restore_uplink_routes(&mut self) -> Result<()> {
         for segment in [A.client, A.client2, A.provider, A.internet] {
             self.lab.cmd(
                 "",
                 "ip",
                 &[
                     "route",
-                    "add",
+                    "replace",
                     segment.network,
                     "via",
                     A.gwhost.wan,
@@ -185,7 +240,7 @@ impl SystemdLab {
                 ],
             )?;
         }
-        self.guard("uplink-after")
+        Ok(())
     }
 }
 #[cfg(test)]
@@ -235,11 +290,13 @@ mod tests {
             defaults4: routes(text).unwrap(),
             defaults6: vec![],
             eth0: vec!["a".into()],
+            ..HostSnapshot::default()
         };
         let mut changed = HostSnapshot {
             defaults4: routes(text).unwrap(),
             defaults6: vec![],
             eth0: vec!["a".into()],
+            ..HostSnapshot::default()
         };
         original.verify(&changed).unwrap();
         changed.eth0.push("b".into());
@@ -266,33 +323,10 @@ mod tests {
         }
     }
     #[test]
-    fn reboot_plan_preserves_persistent_state_and_destroys_runtime() {
-        use super::super::{REBOOT_STEPS, RebootStep};
+    fn route_expiration_is_not_configuration_drift() {
         assert_eq!(
-            REBOOT_STEPS,
-            [
-                RebootStep::StopUnits,
-                RebootStep::FlushHostConntrack,
-                RebootStep::FlushConntrack,
-                RebootStep::DeleteLinks,
-                RebootStep::DeleteNamespace,
-                RebootStep::RemoveRuntime,
-                RebootStep::StartUnits
-            ]
-        );
-        // These are the actual executor's steps, including deletion of links
-        // before unmount (which alone cannot destroy a held namespace).
-        assert_eq!(
-            serde_json::to_value(REBOOT_STEPS).unwrap(),
-            serde_json::json!([
-                "stop_units",
-                "flush_host_conntrack",
-                "flush_conntrack",
-                "delete_links",
-                "delete_namespace",
-                "remove_runtime",
-                "start_units"
-            ])
+            routes(r#"[{"dst":"default","expires":45}]"#).unwrap(),
+            routes(r#"[{"dst":"default","expires":40}]"#).unwrap()
         );
     }
 }

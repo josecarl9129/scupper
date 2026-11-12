@@ -2324,9 +2324,11 @@ firewall or host sysctls (except the optional `90-scupper.conf`).
    in R1) a host with the v1 layout or anything like it: an enabled
    `wg-quick@*` unit, a host link with a configured link name, `table inet
    scupper` in the host ruleset, or a v1 binary at `/usr/local/bin/scupper`
-   (ADR 0014 enforced in code); warn if a host firewall (ufw,
-   cloud firewall rules visible locally) would block UDP 51820 or exit UDP
-   (availability, V-13).
+   (ADR 0014 enforced in code); warn if a locally visible input-hook chain's
+   policy or reachable drop/reject rule can block UDP 51820 on a configured
+   uplink (including rules with no interface match). Follow input-chain jumps;
+   unrelated forward/output drops, names, comments and other UDP ports do not
+   trigger this availability heuristic (V-13).
    Ownership evidence is a matching device/inode in `boot.json` (including a
    failed attempt) or scupperd's Ping. Only an unknown namespace is refused.
    A down, peerless, unaddressed WireGuard host link with a configured name
@@ -2742,15 +2744,39 @@ crash prefixes are independent simulated boots: their lab-private `/run`
 boot-attempt budgets are saved and reset between prefixes; production
 retry limits are unchanged.
 The separate installed-unit systemd lab uses the runner's root namespace as
-its gateway host, with only a lab veth `up0` to `wan`. Default routes and
-`eth0` addresses are guarded; networkd must report `up0` unmanaged (a
-lab-only runtime `.network` file is added if needed). It installs release
-binaries and tests L9, L10, L14, L44 and V-13 under real udev, networkd and
-systemd on both Ubuntu CI versions. Unlike the namespace lab's port pinning,
-it records each real boot's exit port for exact uplink tuples. Its reboot
-simulation stops the units, deletes namespace links and the named namespace,
-clears runtime state and only lab conntrack entries, preserves configuration
-and durable state, and starts the installed units in dependency order.
+its gateway host. It guards default routes (ignoring expiry countdowns), policy
+rules, `eth0` addresses/link state/MTU, resolver configuration and root forwarding.
+Root IPv4 forwarding must already be 1 to exercise adverse namespace inheritance.
+Networkd must report `up0` unmanaged; setup waits for transient states and reloads
+only when a matching `.network` file requires a lab-only runtime override.
+On ephemeral CI images setup records `/usr/local/bin` owner/mode before and after
+setting `root:root 0755`; the product continues to refuse unsafe directories.
+It installs release binaries and tests L9, L10, L14, L44 and V-13 under real udev,
+networkd and systemd on both Ubuntu CI versions. An unfiltered `up0` capture starts
+before install and records each live exit port for exact tuples. Counter-only
+root postrouting rules detect non-`up0` egress of lab/tunnel prefixes, with a dummy
+link positive control, reset before install and zero assertions at every judge.
+Install completion is judged separately from its final check status; transient
+check failures are recorded and recovery to check 0 has a deadline.
+The reboot simulation stops units, deletes namespace links and the named namespace,
+asserts and removes only scupper-named root leftovers (unexpected leftovers fail),
+clears runtime state and only lab conntrack entries, and preserves durable state.
+It holds `up0` down until `scupper-net` completes, restores lab routes, then starts
+scupperd, retaining the same capture ifindex. L9 proves udev initialization and
+networkd observation, records per-point timings and asserts recovery removed host
+WireGuard links and addresses. L14 dwells two 2s ticks plus the 30s watchdog period
+before closed checks, requiring two changed completed-loop watchdog timestamps
+from the same daemon and gateway wg0 ingress controls. L10 observes check 5 while
+the same daemon is stopped, and scopes restart/watchdog journal evidence by cursor.
+L44 records distinct product PIDs whose nonblocking flock calls returned EAGAIN,
+scoped exact refusal messages, a restarting SubState, and at least one successful
+writer; these show contention, not an independent count of simultaneous mutations.
+V-13 requires absent/present/absent firewall warning controls; a pre-existing
+warning makes the case inconclusive and failing. Ufw's user denies name `up0`;
+its built-in before rules are global even with allow defaults, so this case runs
+only on ephemeral runners with no active firewall or existing user rules.
+Internal case deadlines are 20 minutes, outer timeout 23 minutes with 150 seconds
+before SIGKILL, finalization at most 120 seconds, and job timeout 40 minutes.
 L19 replays source policy routing in a lab-only table (R1 production has no
 client policy rule), and extends L2/L3/L4/L6 with focused provenance, established-flow,
 local-output and route-stage subtrials. L3/L4 deliberately add a preferred veth

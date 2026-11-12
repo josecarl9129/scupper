@@ -1,5 +1,6 @@
 //! Installed-unit lab. Only CI runs this against the real root namespace.
 mod cases;
+mod egress;
 mod guards;
 use super::{
     Lab, Result, SITE,
@@ -29,6 +30,7 @@ enum RebootStep {
     FlushConntrack,
     DeleteLinks,
     DeleteNamespace,
+    DeleteHostLinks,
     RemoveRuntime,
     StartUnits,
 }
@@ -38,6 +40,7 @@ const REBOOT_STEPS: &[RebootStep] = &[
     RebootStep::FlushConntrack,
     RebootStep::DeleteLinks,
     RebootStep::DeleteNamespace,
+    RebootStep::DeleteHostLinks,
     RebootStep::RemoveRuntime,
     RebootStep::StartUnits,
 ];
@@ -47,6 +50,7 @@ struct SystemdLab {
     baseline: HostSnapshot,
     ports: Vec<u16>,
     samples: usize,
+    timings: Vec<serde_json::Value>,
 }
 
 /// Run one systemd case on an otherwise unused ephemeral Linux CI runner.
@@ -71,7 +75,7 @@ pub fn run(artifacts: &Path, binaries: &Path, case: &str) -> Result<()> {
         fs::File::create(artifacts.join("commands.jsonl"))?,
         Arc::clone(&cancel),
     );
-    runner.whole = Instant::now() + Duration::from_mins(25);
+    runner.whole = Instant::now() + Duration::from_mins(20);
     runner.phase = runner.whole;
     let baseline = HostSnapshot::read(&mut runner)?;
     fs::write(
@@ -86,6 +90,7 @@ pub fn run(artifacts: &Path, binaries: &Path, case: &str) -> Result<()> {
         baseline,
         ports: Vec::new(),
         samples: 0,
+        timings: Vec::new(),
         lab: Lab {
             boot_root: private.clone(),
             boot_root_ready: false,
@@ -138,9 +143,11 @@ pub fn run(artifacts: &Path, binaries: &Path, case: &str) -> Result<()> {
     fs::write(
         harness.lab.artifacts.join(format!("{case}.json")),
         serde_json::to_vec_pretty(&serde_json::json!({
-            "case":case, "passed":result.is_ok(), "error":result.as_ref().err().map(ToString::to_string),
+            "case":case, "passed":result.is_ok(),
+            "outcome":if result.is_ok() { "passed" } else if result.as_ref().err().is_some_and(|e| e.to_string().contains("INCONCLUSIVE:")) { "inconclusive" } else { "failed" },
+            "error":result.as_ref().err().map(ToString::to_string),
             "safety_samples":harness.samples, "exit_ports":harness.ports,
-            "reboot_steps":REBOOT_STEPS,
+            "reboot_steps":REBOOT_STEPS, "point_timings":harness.timings,
         }))?,
     )?;
     // No uninstall: the runner is ephemeral. Stop only harness children; retain
@@ -207,6 +214,32 @@ impl SystemdLab {
         fs::write(self.lab.artifacts.join(name), journal)?;
         Ok(())
     }
+    fn journal_cursor(&mut self) -> Result<String> {
+        let text = self.cmd("journalctl", &["--no-pager", "-n", "0", "--show-cursor"])?;
+        Ok(text
+            .lines()
+            .find_map(|l| l.strip_prefix("-- cursor: "))
+            .ok_or("missing journal cursor")?
+            .to_owned())
+    }
+    fn journal_since(&mut self, cursor: &str, name: &str) -> Result<String> {
+        let text = self.cmd(
+            "journalctl",
+            &[
+                "--no-pager",
+                "-o",
+                "short-iso-precise",
+                "--after-cursor",
+                cursor,
+                "-u",
+                "scupper-net.service",
+                "-u",
+                "scupperd.service",
+            ],
+        )?;
+        fs::write(self.lab.artifacts.join(name), &text)?;
+        Ok(text)
+    }
     fn preflight(&mut self) -> Result<()> {
         for path in [
             "/etc/scupper",
@@ -226,7 +259,7 @@ impl SystemdLab {
                 return fail(format!("occupied namespace {ns}"));
             }
         }
-        for link in ["up0", "wg0", "ex-0", "ex-ch1", A.gwhost.wan_if] {
+        for link in ["ctl0", "up0", "wg0", "ex-0", "ex-ch1", A.gwhost.wan_if] {
             if self
                 .lab
                 .runner
@@ -273,6 +306,8 @@ impl SystemdLab {
         }
         self.lab.build_wan_mode(true)?;
         self.uplink()?;
+        self.egress_setup()?;
+        self.lab.capture("", "up0", "install-uplink")?;
         self.lab.build_provider()?;
         let provider = self.lab.private.join("provider.conf");
         let text = format!(
@@ -302,16 +337,38 @@ impl SystemdLab {
             binaries.to_str().ok_or("binary path")?,
             "--yes",
         ];
+        // Ephemeral CI images can ship a group-writable binary directory.
+        // Preserve evidence and satisfy the product's existing refusal contract.
+        let before = self.cmd("stat", &["-c", "%u:%g %a", "/usr/local/bin"])?;
+        self.cmd("chown", &["root:root", "/usr/local/bin"])?;
+        self.cmd("chmod", &["0755", "/usr/local/bin"])?;
+        let after = self.cmd("stat", &["-c", "%u:%g %a", "/usr/local/bin"])?;
+        fs::write(
+            self.lab.artifacts.join("install-bin-directory.json"),
+            serde_json::to_vec_pretty(
+                &serde_json::json!({"before":before.trim(),"after":after.trim()}),
+            )?,
+        )?;
         let plan = self.cmd(
             binaries.join("scupper").to_str().ok_or("binary path")?,
             &[&args[..], &["--plan"]].concat(),
         )?;
         fs::write(self.lab.artifacts.join("install-plan.txt"), plan)?;
-        let installed = self.cmd(
+        let installed = self.install_output(
+            "install",
             binaries.join("scupper").to_str().ok_or("binary path")?,
             &args,
         )?;
         fs::write(self.lab.artifacts.join("install.txt"), installed)?;
+        let first_port: u16 = self
+            .lab
+            .cmd("scupper", "wg", &["show", "ex-0", "listen-port"])?
+            .trim()
+            .parse()?;
+        if first_port == 0 {
+            return fail("installed exit has zero listen port");
+        }
+        self.record_port(first_port);
         let mut site = parse_site(&self.cli(&["config", "show"])?)?;
         self.lab.public_keys[0].clone_from(&site.identities["edge"].public_key.0);
         let template = parse_site(SITE)?;
@@ -386,18 +443,44 @@ impl SystemdLab {
         if !checked.contains("install: no changes") {
             return fail("install drift after config load");
         }
-        let again = self.cli(&[
-            "install",
-            "--binaries",
-            binaries.to_str().ok_or("binaries")?,
-            "--yes",
-        ])?;
+        let again = self.install_output(
+            "install-again",
+            CLI,
+            &[
+                "install",
+                "--binaries",
+                binaries.to_str().ok_or("binaries")?,
+                "--yes",
+            ],
+        )?;
         if !again.contains("install: no changes") {
             return fail("second install was not a no-op");
         }
         fs::write(self.lab.artifacts.join("install-check.txt"), checked)?;
         fs::write(self.lab.artifacts.join("install-again.txt"), again)?;
+        self.ready()?;
+        let mut markers = Vec::new();
+        self.lab.service_check(&mut markers)?;
+        self.judge("install-uplink", &markers)?;
         self.guard("setup-after")
+    }
+    fn install_output(&mut self, label: &str, binary: &str, args: &[&str]) -> Result<String> {
+        let (status, out) =
+            self.lab
+                .runner
+                .output_timeout(&Invocation::new("", binary, args), None, 120)?;
+        fs::write(self.lab.artifacts.join(format!("{label}.txt")), &out)?;
+        let installed = out.contains("scupper check:") && out.contains("Mac scupper0.conf:");
+        fs::write(
+            self.lab.artifacts.join(format!("{label}-result.json")),
+            serde_json::to_vec_pretty(
+                &serde_json::json!({"install_completed":installed,"final_check_exit":status.code()}),
+            )?,
+        )?;
+        if !installed || !matches!(status.code(), Some(0..=5)) {
+            return fail(format!("install did not complete: {status}"));
+        }
+        Ok(out)
     }
     fn ready(&mut self) -> Result<()> {
         let until = Instant::now() + Duration::from_secs(90);
@@ -421,6 +504,9 @@ impl SystemdLab {
             .cmd("scupper", "wg", &["show", "ex-ch1", "listen-port"])?
             .trim()
             .parse()?;
+        if port == 0 {
+            return fail("ready exit has zero listen port");
+        }
         self.record_port(port);
         Ok(())
     }
@@ -441,14 +527,14 @@ impl SystemdLab {
         Ok(())
     }
     fn reboot_stop(&mut self) -> Result<()> {
-        for step in &REBOOT_STEPS[..REBOOT_STEPS.len() - 1] {
-            self.reboot_step(*step)?;
-        }
-        Ok(())
+        dispatch_reboot_steps(&REBOOT_STEPS[..REBOOT_STEPS.len() - 1], |step| {
+            self.reboot_step(step)
+        })
     }
     fn reboot_start(&mut self) -> Result<()> {
         self.reboot_step(RebootStep::StartUnits)
     }
+    #[allow(clippy::too_many_lines)] // Keep the ordered reboot effects and their assertions together.
     fn reboot_step(&mut self, step: RebootStep) -> Result<()> {
         let exists = Path::new("/run/netns/scupper").exists();
         match step {
@@ -499,22 +585,101 @@ impl SystemdLab {
                     return fail("reboot left named namespace");
                 }
             }
+            RebootStep::DeleteHostLinks => {
+                // A real reboot destroys host links too. Snapshot and refuse
+                // unexpected leftovers before deleting only configured names.
+                let links = self.host_wireguard("reboot-host-links")?;
+                if links
+                    .iter()
+                    .any(|l| !matches!(l["ifname"].as_str(), Some("wg0" | "ex-0" | "ex-ch1")))
+                {
+                    return fail("unexpected foreign root WireGuard link");
+                }
+                let mut unexpected = Vec::new();
+                for name in ["wg0", "ex-0", "ex-ch1"] {
+                    let (status, _) = self.lab.runner.output(
+                        &Invocation::new("", "ip", &["link", "show", "dev", name]),
+                        None,
+                    )?;
+                    if status.success() {
+                        unexpected.push(name);
+                        self.cmd("ip", &["link", "delete", "dev", name])?;
+                    }
+                }
+                if !unexpected.is_empty() {
+                    return fail(format!(
+                        "unexpected root leftovers before reboot deletion: {unexpected:?}"
+                    ));
+                }
+            }
             RebootStep::RemoveRuntime => {
                 if Path::new("/run/scupper").exists() {
                     fs::remove_dir_all("/run/scupper")?;
                 }
             }
             RebootStep::StartUnits => {
-                self.systemctl(&["reset-failed", "scupper-net", "scupperd"])?;
-                self.systemctl(&["start", "scupper-net", "scupperd"])?;
-                let port = self
+                self.lab.runner.output(
+                    &Invocation::new(
+                        "",
+                        "systemctl",
+                        &["reset-failed", "scupper-net", "scupperd"],
+                    ),
+                    None,
+                )?;
+                let ifindex = fs::read_to_string("/sys/class/net/up0/ifindex")?;
+                self.lab.ensure_services()?;
+                self.cmd("ip", &["link", "set", "up0", "down"])?;
+                let net = self.systemctl(&["start", "scupper-net"]);
+                // Restore even on failed boot, so diagnostics retain lab access.
+                let up = self.cmd("ip", &["link", "set", "up0", "up"]).map(|_| ());
+                super::mutation::finish(net.map(|_| ()), up)?;
+                self.restore_uplink_routes()?;
+                if fs::read_to_string("/sys/class/net/up0/ifindex")? != ifindex {
+                    return fail("uplink ifindex changed across reboot capture");
+                }
+                self.lab.ensure_services()?;
+                self.systemctl(&["start", "scupperd"])?;
+                // A disconnected exit has no socket. Record only live ports.
+                let port: u16 = self
                     .lab
                     .cmd("scupper", "wg", &["show", "ex-ch1", "listen-port"])?
                     .trim()
                     .parse()?;
-                self.record_port(port);
+                if port != 0 {
+                    self.record_port(port);
+                }
             }
             RebootStep::FlushConntrack | RebootStep::DeleteLinks => {}
+        }
+        Ok(())
+    }
+    fn host_wireguard(&mut self, label: &str) -> Result<Vec<serde_json::Value>> {
+        let text = self.cmd("ip", &["-d", "-j", "link", "show", "type", "wireguard"])?;
+        fs::write(self.lab.artifacts.join(format!("{label}.json")), &text)?;
+        Ok(serde_json::from_str(&text)?)
+    }
+    fn assert_no_host_wireguard(&mut self, label: &str) -> Result<()> {
+        if !self.host_wireguard(label)?.is_empty() {
+            return fail("recovery left root WireGuard links");
+        }
+        let text = self.cmd("ip", &["-j", "address", "show"])?;
+        fs::write(
+            self.lab.artifacts.join(format!("{label}-addresses.json")),
+            &text,
+        )?;
+        let links: Vec<serde_json::Value> = serde_json::from_str(&text)?;
+        if links.iter().any(|l| {
+            matches!(l["ifname"].as_str(), Some("wg0" | "ex-0" | "ex-ch1"))
+                || l["addr_info"].as_array().into_iter().flatten().any(|a| {
+                    a["local"].as_str().is_some_and(|ip| {
+                        ip.starts_with("10.99.")
+                            || ip.starts_with("10.2.")
+                            || ip.starts_with("fd00:99:")
+                            || ip.starts_with("2001:db8:")
+                    })
+                })
+        }) {
+            return fail("recovery left root scupper addresses or links");
         }
         Ok(())
     }
@@ -537,7 +702,10 @@ impl SystemdLab {
         Ok(report)
     }
     fn judge(&mut self, stem: &str, markers: &[String]) -> Result<()> {
-        let report = self.evaluate(stem, markers)?;
+        let evaluated = self.evaluate(stem, markers);
+        let egress = self.egress_zero(stem);
+        let report = evaluated?;
+        egress?;
         if !evidence::contained(&report) {
             return fail(format!("uplink oracle failed: {report:?}"));
         }
@@ -647,12 +815,13 @@ impl SystemdLab {
         }
         Ok(())
     }
-    fn closed_canary(&mut self, markers: &mut Vec<String>) -> Result<()> {
-        let marker = Lab::marker()?;
-        markers.push(marker.clone());
-        self.negative_udp("client", &marker)?;
-        Ok(())
-    }
+}
+
+fn dispatch_reboot_steps(
+    steps: &[RebootStep],
+    mut execute: impl FnMut(RebootStep) -> Result<()>,
+) -> Result<()> {
+    steps.iter().try_for_each(|step| execute(*step))
 }
 
 fn uplink_policy(markers: &[String], ports: &[u16], current_port: u16) -> Result<String> {
@@ -673,4 +842,44 @@ fn uplink_policy(markers: &[String], ports: &[u16], current_port: u16) -> Result
         )?;
     }
     Ok(policy)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn reboot_dispatch_executes_in_order_and_stops_on_failure() {
+        let mut calls = Vec::new();
+        dispatch_reboot_steps(REBOOT_STEPS, |step| {
+            calls.push(step);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            calls,
+            vec![
+                RebootStep::StopUnits,
+                RebootStep::FlushHostConntrack,
+                RebootStep::FlushConntrack,
+                RebootStep::DeleteLinks,
+                RebootStep::DeleteNamespace,
+                RebootStep::DeleteHostLinks,
+                RebootStep::RemoveRuntime,
+                RebootStep::StartUnits
+            ]
+        );
+        calls.clear();
+        assert!(
+            dispatch_reboot_steps(REBOOT_STEPS, |step| {
+                calls.push(step);
+                if step == RebootStep::DeleteLinks {
+                    return fail("injected dispatcher failure");
+                }
+                Ok(())
+            })
+            .is_err()
+        );
+        assert_eq!(calls.last(), Some(&RebootStep::DeleteLinks));
+        assert_eq!(calls.len(), 4);
+    }
 }

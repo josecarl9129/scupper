@@ -23,6 +23,7 @@ use std::{
 use zeroize::Zeroizing;
 
 mod execute;
+mod firewall;
 mod observe;
 pub use execute::apply;
 use observe::observe;
@@ -341,6 +342,8 @@ pub fn prepare(system: &dyn System, paths: &Paths, options: &Options) -> Result<
         return Err(Refusal::V1);
     }
     let gateway = site.site.primary.clone();
+    facts.firewall_warning = firewall_warning(system, &site)?;
+
     if facts.head.is_some()
         && endpoint.is_some_and(|ip| site.gateways[&gateway].endpoint != format!("{ip}:51820"))
     {
@@ -664,6 +667,19 @@ pub fn prepare(system: &dyn System, paths: &Paths, options: &Options) -> Result<
         client_public,
         secret_hashes,
     })
+}
+fn firewall_warning(system: &dyn System, site: &SiteConfig) -> Result<bool, Refusal> {
+    let ruleset = command(system, Program::Nft, &["-j", "list", "ruleset"])?;
+    let ruleset =
+        serde_json::from_str(&ruleset).map_err(|_| input("invalid firewall observation"))?;
+    let gateway = site
+        .gateways
+        .get(&site.site.primary)
+        .ok_or_else(|| input("unknown gateway"))?;
+    Ok(gateway
+        .uplinks
+        .iter()
+        .any(|uplink| firewall::may_block(&ruleset, uplink)))
 }
 fn verify_same_key(paths: &Paths, reference: &SecretName, key: &[u8]) -> Result<(), Refusal> {
     let secret = read_install_secret(paths, reference)?;
