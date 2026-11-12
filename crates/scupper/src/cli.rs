@@ -36,6 +36,8 @@ struct Cli {
 
 #[derive(Clone, Subcommand)]
 enum Command {
+    /// Manage macOS client settings.
+    Mac(crate::mac_app::MacArgs),
     /// Stage and deploy a gateway release over SSH.
     Deploy(crate::deploy::DeployArgs),
     /// Internal bounded SSH operation dispatcher.
@@ -458,6 +460,7 @@ fn dispatch(
         return Err("--json is supported only for check and status".into());
     }
     match command {
+        Command::Mac(args) => crate::mac_app::run(&args, stdout),
         Command::Deploy(args) => {
             crate::deploy::run(&args, &crate::deploy::Ssh, &crate::deploy::Terminal, stdout)
         }

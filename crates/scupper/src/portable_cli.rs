@@ -10,6 +10,8 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Manage macOS client settings.
+    Mac(crate::mac_app::MacArgs),
     /// Stage and deploy a gateway release over SSH.
     Deploy(crate::deploy::DeployArgs),
     #[command(external_subcommand)]
@@ -35,6 +37,13 @@ where
         }
     };
     match cli.command {
+        Command::Mac(args) => match crate::mac_app::run(&args, &mut std::io::stdout()) {
+            Ok(code) => code,
+            Err(error) => {
+                eprintln!("scupper: {error}");
+                1
+            }
+        },
         Command::Deploy(args) => match crate::deploy::run(
             &args,
             &crate::deploy::Ssh,

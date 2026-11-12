@@ -1517,6 +1517,9 @@ scupper                                 bare: short status summary with next-ste
 ├── version
 ├── completion SHELL
 ├── mac                                 (macOS builds only)
+│   ├── app status [APP]                transmission | qbittorrent; bind/profile match/tunnel up or down
+│   ├── app bind APP [--address A]       pin to tunnel IPv4; --profile FILE (default ~/.scupper/scupper0.conf)
+│   ├── app unbind APP                  clear binding; bind/unbind require the app to be quit
 │   ├── join | leave | status
 │   ├── trust add [--current] | trust rm NAME | trust list
 │   ├── enroll --gateway HOST           generate device key + API token locally, register over SSH
