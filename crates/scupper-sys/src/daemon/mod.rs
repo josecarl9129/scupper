@@ -399,6 +399,7 @@ impl Drop for Audit {
 /// Returns invalid identity/configuration roots or notify socket setup errors.
 #[allow(clippy::too_many_lines)]
 pub fn run(options: &Options, stop: &AtomicBool) -> io::Result<()> {
+    eprintln!("scupperd: start");
     let lease_notify = notify::Notify::new(std::env::var_os("NOTIFY_SOCKET").as_deref())
         .unwrap_or_else(|_| notify::Notify::disabled());
     run_notified(options, stop, lease_notify)
@@ -415,19 +416,21 @@ fn run_notified(
         || {
             let _ = lease_notify.status("waiting for supervisor lease; local writer active");
         },
-    )?;
+    )
+    .map_err(|error| io::Error::new(error.kind(), "cannot acquire supervisor lease"))?;
     let origin = Instant::now();
     let gateway = GatewayId(
         RealFs
-            .read(&options.config_root.join("gateway-id"))?
+            .read(&options.config_root.join("gateway-id"))
+            .map_err(|error| io::Error::new(error.kind(), "cannot read gateway identity"))?
             .trim()
             .into(),
     );
     let system = RealSystem::default()
         .with_canon_paths(options.probe_binary.clone(), options.run_root.clone());
     let namespace = GatewayNamespace;
-    let mut audit =
-        Audit::open(&options.state_root, gateway.clone(), origin).map_err(io::Error::other)?;
+    let mut audit = Audit::open(&options.state_root, gateway.clone(), origin)
+        .map_err(|_| io::Error::other("cannot open daemon audit state"))?;
     audit.poll(origin);
     let mut runtime = Runtime {
         options,
@@ -699,8 +702,23 @@ impl Runtime<'_> {
         }
         self.dispatcher = dispatcher;
     }
-    #[allow(clippy::too_many_lines)] // Keep the apply writer lifetime and reattachment boundary visible.
     fn operation(
+        &mut self,
+        op: scupper_proto::Op,
+        uid: u32,
+    ) -> Result<scupper_proto::OpResult, scupper_proto::ApiError> {
+        let applying = matches!(op, scupper_proto::Op::Apply { .. });
+        let result = self.operation_inner(op, uid);
+        if applying {
+            match &result {
+                Ok(_) => eprintln!("scupperd: apply result: success"),
+                Err(error) => eprintln!("scupperd: apply result: refused ({:?})", error.code),
+            }
+        }
+        result
+    }
+    #[allow(clippy::too_many_lines)] // Keep the apply writer lifetime and reattachment boundary visible.
+    fn operation_inner(
         &mut self,
         op: scupper_proto::Op,
         uid: u32,
@@ -875,7 +893,10 @@ impl Runtime<'_> {
             }
             Err(error) => {
                 self.pending_canon = error.kind() == io::ErrorKind::TimedOut;
-                eprintln!("scupperd: reconciler startup refused: {error}");
+                eprintln!(
+                    "scupperd: boot retry: reconciler startup refused ({:?})",
+                    error.kind()
+                );
                 let _ = self.audit.handle().emit(
                     EventKind::DriftDetected {
                         object: scupper_proto::ObjectKind::Unknown,
@@ -910,6 +931,7 @@ impl DaemonDeps for Runtime<'_> {
         }
         if !self.started_event {
             self.started_event = true;
+            eprintln!("scupperd: ready");
             let _ = self.audit.handle().emit(
                 EventKind::DaemonStarted {
                     version: Release {
@@ -993,6 +1015,7 @@ impl DaemonDeps for Runtime<'_> {
             .with_uplink(uplink_addresses(self.system).unwrap_or_default());
     }
     fn rebuild(&mut self) {
+        eprintln!("scupperd: boot retry: rebuilding");
         self.begin_operation(scupper_proto::OperationKind::Rebuild, None);
         let deps = self.deps();
         let report = if let Some((machine, _, _)) = &mut self.running {
@@ -1000,8 +1023,14 @@ impl DaemonDeps for Runtime<'_> {
         } else {
             Some(boot::boot(&deps))
         };
-        if report.is_some_and(|report| report.succeeded()) {
+        if report.as_ref().is_some_and(BootReport::succeeded) {
+            eprintln!("scupperd: boot retry: success");
             self.initialize();
+        } else {
+            eprintln!(
+                "scupperd: boot retry: failed (step {:?})",
+                report.as_ref().and_then(|r| r.steps.last()).map(|s| s.step)
+            );
         }
         self.end_operation();
     }
@@ -1509,14 +1538,12 @@ mod tests {
         );
         drop(lease);
         // The first post-lease operation now reaches the deliberately missing config.
-        assert_eq!(
-            receive
-                .recv_timeout(Duration::from_secs(3))
-                .unwrap()
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::NotFound
-        );
+        let error = receive
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(error.to_string(), "cannot read gateway identity");
         worker.join().unwrap();
         assert!(!root.join("state").exists());
         std::fs::remove_dir_all(root).unwrap();

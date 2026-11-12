@@ -842,3 +842,69 @@ fn writer_lock_creates_private_runtime_directory() {
     let _guard = scupper_sys::lock::WriterLock::acquire(&root).unwrap();
     assert_eq!(fs::metadata(root).unwrap().mode() & 0o7777, 0o700);
 }
+
+#[test]
+fn active_ufw_decides_despite_opaque_nft_and_names_its_warning() {
+    let mut host = Host::new();
+    let mut fake = Fake {
+        firewall: true,
+        ufw_status: Some(include_str!("fixtures/firewall/ufw-status-default.txt")),
+        ..Fake::default()
+    };
+    let plan = host.prepare(&fake).unwrap().plan;
+    assert_eq!(
+        plan.warnings,
+        ["ufw status: ufw is active and does not allow UDP 51820 on eth0"]
+    );
+    assert_eq!(plan.text().matches("provider/cloud firewalls").count(), 1);
+    assert!(
+        !fake
+            .calls
+            .borrow()
+            .iter()
+            .any(|(program, args)| *program == Program::Nft && args == &["-j", "list", "ruleset"])
+    );
+    host.options.uplink = Some("up0".into());
+    fake.ufw_status = Some(include_str!(
+        "fixtures/firewall/ufw-status-uplink-allow.txt"
+    ));
+    assert_eq!(
+        host.prepare(&fake).unwrap().plan.warnings,
+        [] as [String; 0]
+    );
+    host.options.uplink = Some("eth0".into());
+    assert_eq!(host.prepare(&fake).unwrap().plan.warnings.len(), 1);
+    fake.ufw_status = Some(include_str!("fixtures/firewall/ufw-status-any-allow.txt"));
+    assert_eq!(
+        host.prepare(&fake).unwrap().plan.warnings,
+        [] as [String; 0]
+    );
+    fake.ufw_status = Some(include_str!("fixtures/firewall/ufw-status-inactive.txt"));
+    let plan = host.prepare(&fake).unwrap().plan;
+    assert_eq!(plan.warnings.len(), 1);
+    assert!(plan.warnings[0].starts_with("nft rules:"));
+    fake.ufw_status = None;
+    assert_eq!(host.prepare(&fake).unwrap().plan.warnings, plan.warnings);
+}
+
+#[test]
+fn fresh_install_checks_exit_port_and_rerun_preserves_both_direction_warnings() {
+    const BLOCKED: &str =
+        "Status: active\nDefault: deny (incoming), reject (outgoing), disabled (routed)\n";
+    const EXIT_ALLOW: &str = "Status: active\nDefault: deny (incoming), deny (outgoing), disabled (routed)\n\nTo Action From\n-- ------ ----\n203.0.113.10 51820/udp ALLOW OUT Anywhere\n";
+    let host = Host::new();
+    let mut fake = Fake {
+        ufw_status: Some(BLOCKED),
+        ..Fake::default()
+    };
+    let before = host.snapshot();
+    let plan = host.prepare(&fake).unwrap().plan;
+    assert_eq!(host.snapshot(), before);
+    assert_eq!(plan.warnings.len(), 2);
+    assert_eq!(plan.text().matches("provider/cloud firewalls").count(), 1);
+    assert!(plan.warnings[1].contains("outgoing UDP to 203.0.113.10:51820 on eth0"));
+    host.apply(&fake);
+    assert_eq!(host.prepare(&fake).unwrap().plan.warnings, plan.warnings);
+    fake.ufw_status = Some(EXIT_ALLOW);
+    assert_eq!(host.prepare(&fake).unwrap().plan.warnings.len(), 1);
+}

@@ -36,6 +36,7 @@ pub struct Fake {
     pub missing_packages: bool,
     pub marker: Option<&'static str>,
     pub firewall: bool,
+    pub ufw_status: Option<&'static str>,
     pub fail_pubkey: bool,
 }
 impl Default for Fake {
@@ -57,6 +58,7 @@ impl Default for Fake {
             missing_packages: false,
             marker: None,
             firewall: false,
+            ufw_status: None,
             fail_pubkey: false,
         }
     }
@@ -153,11 +155,18 @@ impl System for Fake {
                 let _guard = guard.unwrap();
                 String::new()
             }
+            (Program::Ufw, Some("status")) => {
+                assert_eq!(timeout, scupper_sys::system::EXEC_TIMEOUT);
+                assert!(args == ["status"] || args == ["status", "verbose"]);
+                self.ufw_status
+                    .ok_or_else(|| ExecError::spawn("optional executable absent"))?
+                    .into()
+            }
             (Program::Nft, _) => {
                 if self.marker == Some("table") {
                     r#"{"nftables":[{"table":{"family":"inet","name":"scupper"}}]}"#.into()
                 } else if self.firewall && args.last().is_some_and(|a| a == "ruleset") {
-                    r#"{"nftables":[{"chain":{"policy":"drop"}}]}"#.into()
+                    r#"{"nftables":[{"chain":{"family":"inet","table":"filter","name":"input","hook":"input","policy":"drop"}}]}"#.into()
                 } else {
                     r#"{"nftables":[]}"#.into()
                 }

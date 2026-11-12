@@ -1,3 +1,4 @@
+note: provider/cloud firewalls (e.g. DigitalOcean cloud firewall) are not visible from the host.
 1. groupadd --system scupper-admin
 2. useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin --user-group scupper-probe
 3. useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin --user-group scupper-alert

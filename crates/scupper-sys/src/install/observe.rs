@@ -84,11 +84,6 @@ pub(super) fn observe(system: &dyn System, paths: &Paths) -> Result<Facts, Refus
         .map_err(|_| input("invalid configuration store"))?;
     observe_history(paths, &store, &mut facts)?;
     normalize_owner(system, &mut facts);
-    let firewall = command(system, Program::Nft, &["-j", "list", "ruleset"])?;
-    let json: serde_json::Value =
-        serde_json::from_str(&firewall).map_err(|_| input("invalid firewall observation"))?;
-    facts.firewall_warning =
-        json.to_string().contains("drop") || json.to_string().contains("reject");
     Ok(facts)
 }
 fn observe_history(paths: &Paths, store: &VersionStore, facts: &mut Facts) -> Result<(), Refusal> {
@@ -231,25 +226,8 @@ fn observe_files(system: &dyn System, paths: &Paths, facts: &mut Facts) -> Resul
                 EXEC_TIMEOUT,
             )
             .map_err(|_| input("cannot inspect units"))?;
-        if out.status == Some(0) && out.stdout.trim() == "enabled" {
+        if unit_enabled(&out)? {
             facts.enabled.insert(unit.into());
-        } else if !matches!(out.status, Some(0 | 1 | 3 | 4))
-            || !matches!(
-                out.stdout.trim(),
-                "disabled"
-                    | "static"
-                    | "indirect"
-                    | "not-found"
-                    | "masked"
-                    | "masked-runtime"
-                    | "enabled-runtime"
-                    | "linked"
-                    | "linked-runtime"
-                    | "generated"
-                    | "transient"
-            )
-        {
-            return Err(input("cannot inspect unit enabled state"));
         }
     }
     if facts.nodes.contains_key(model::GATEWAY_FILE) {
@@ -258,4 +236,120 @@ fn observe_files(system: &dyn System, paths: &Paths, facts: &mut Facts) -> Resul
         facts.gateway_id = Some(id.trim().into());
     }
     Ok(())
+}
+
+// is-enabled uses nonzero statuses for ordinary states, including missing units.
+// Interpret the state before the exit code: systemd 249 can emit only stderr.
+fn unit_enabled(out: &crate::system::ExecOutput) -> Result<bool, Refusal> {
+    match out.stdout.trim() {
+        // Installation requires persistent enablement across reboots.
+        "enabled" => Ok(true),
+        "enabled-runtime" | "alias" | "linked" | "linked-runtime" | "static" | "indirect"
+        | "generated" | "transient" | "disabled" | "masked" | "masked-runtime" | "not-found"
+        | "bad" => Ok(false),
+        "" if out.status.is_some_and(|code| code != 0)
+            && out.stderr.lines().any(|line| {
+                line.starts_with("Failed to get unit file state for ")
+                    && line.ends_with(": No such file or directory")
+            }) =>
+        {
+            Ok(false)
+        }
+        _ => Err(Refusal::UnitState {
+            status: out.status,
+            stderr: out
+                .stderr
+                .chars()
+                .take(2048)
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect(),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::system::ExecOutput;
+
+    #[test]
+    fn systemd_249_and_255_unit_states() {
+        // 249 reports a missing file on stderr; 255 prints not-found.
+        for (status, stdout, stderr, enabled) in [
+            (0, "enabled\n", "", true),
+            (1, "disabled\n", "", false),
+            (1, "masked\n", "", false),
+            (
+                1,
+                "",
+                "Failed to get unit file state for scupperd.service: No such file or directory\n",
+                false,
+            ),
+            (4, "not-found\n", "", false),
+            (
+                1,
+                "disabled\n",
+                "Failed to get unit file state for scupperd.service: No such file or directory\n",
+                false,
+            ),
+        ] {
+            assert_eq!(
+                unit_enabled(&ExecOutput {
+                    status: Some(status),
+                    stdout: stdout.into(),
+                    stderr: stderr.into(),
+                })
+                .unwrap(),
+                enabled
+            );
+        }
+        for state in [
+            "enabled-runtime",
+            "alias",
+            "linked",
+            "linked-runtime",
+            "static",
+            "indirect",
+            "generated",
+            "transient",
+            "masked-runtime",
+            "bad",
+        ] {
+            assert!(
+                !unit_enabled(&ExecOutput {
+                    status: Some(1),
+                    stdout: state.into(),
+                    stderr: String::new(),
+                })
+                .unwrap(),
+                "{state}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_unit_state_keeps_bounded_sanitized_diagnostics() {
+        let error = unit_enabled(&ExecOutput {
+            status: Some(7),
+            stdout: String::new(),
+            stderr: format!("bus\n\u{1b}{}", "x".repeat(3000)),
+        })
+        .unwrap_err();
+        let Refusal::UnitState { status, stderr } = &error else {
+            panic!("{error}")
+        };
+        assert_eq!(*status, Some(7));
+        assert_eq!(stderr.len(), 2048);
+        assert!(stderr.starts_with("bus  "));
+        assert!(!stderr.chars().any(char::is_control));
+        assert!(error.to_string().contains("Some(7)"));
+        assert!(
+            unit_enabled(&ExecOutput {
+                status: None,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+            .is_err()
+        );
+    }
 }

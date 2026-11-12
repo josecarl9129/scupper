@@ -397,7 +397,11 @@ pub(super) fn injection_packets(marker: &str) -> Result<Vec<Vec<u8>>> {
     payload[20..22].copy_from_slice(&40003_u16.to_be_bytes());
     Ok(vec![forbidden, dns, payload])
 }
-fn spoofed_packet(source: IpAddr, destination: IpAddr, marker: &[u8]) -> Result<Vec<u8>> {
+pub(super) fn spoofed_packet(
+    source: IpAddr,
+    destination: IpAddr,
+    marker: &[u8],
+) -> Result<Vec<u8>> {
     let (IpAddr::V4(src), IpAddr::V4(dst)) = (source, destination) else {
         return fail("injection requires IPv4");
     };

@@ -44,6 +44,8 @@ pub enum Program {
     Ip,
     /// Firewall inspection.
     Nft,
+    /// Host ufw status inspection.
+    Ufw,
     /// Traffic-control inspection.
     Tc,
     /// Enter a held network namespace.
@@ -76,6 +78,7 @@ impl Program {
             Self::Wg => "/usr/bin/wg",
             Self::Ip => "/usr/sbin/ip",
             Self::Nft => "/usr/sbin/nft",
+            Self::Ufw => "/usr/sbin/ufw",
             Self::Tc => "/usr/sbin/tc",
             Self::Unshare => "/usr/bin/unshare",
             Self::Systemctl => "/usr/bin/systemctl",
@@ -96,6 +99,7 @@ pub struct Programs {
     wg: PathBuf,
     ip: PathBuf,
     nft: PathBuf,
+    ufw: PathBuf,
     tc: PathBuf,
     systemctl: PathBuf,
     unshare: PathBuf,
@@ -117,6 +121,7 @@ impl Default for Programs {
             wg: Program::Wg.default_path().into(),
             ip: Program::Ip.default_path().into(),
             nft: Program::Nft.default_path().into(),
+            ufw: Program::Ufw.default_path().into(),
             tc: Program::Tc.default_path().into(),
             systemctl: Program::Systemctl.default_path().into(),
             unshare: Program::Unshare.default_path().into(),
@@ -158,6 +163,7 @@ impl Programs {
                 Program::Wg => &mut paths.wg,
                 Program::Ip => &mut paths.ip,
                 Program::Nft => &mut paths.nft,
+                Program::Ufw => &mut paths.ufw,
                 Program::Tc => &mut paths.tc,
                 Program::Unshare => &mut paths.unshare,
                 Program::Systemctl => &mut paths.systemctl,
@@ -184,6 +190,7 @@ impl Programs {
             Program::Wg => &self.wg,
             Program::Ip => &self.ip,
             Program::Nft => &self.nft,
+            Program::Ufw => &self.ufw,
             Program::Tc => &self.tc,
             Program::Systemctl => &self.systemctl,
             Program::Unshare => &self.unshare,
@@ -1513,6 +1520,7 @@ mod tests {
             Program::Wg,
             Program::Ip,
             Program::Nft,
+            Program::Ufw,
             Program::Tc,
             Program::Systemctl,
             Program::Unshare,

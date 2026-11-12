@@ -23,7 +23,9 @@ use std::{
 use zeroize::Zeroizing;
 
 mod execute;
+mod firewall;
 mod observe;
+mod ufw;
 pub use execute::{ApplyError, apply, apply_with_fs};
 use observe::observe;
 
@@ -73,6 +75,7 @@ pub struct Prepared {
     provider: Option<config::provider::ProviderConfig>,
     archive: Option<Vec<u8>>,
     site: SiteConfig,
+    firewall_site: SiteConfig,
     exit_id: Option<ExitId>,
     client_public: Option<PublicKey>,
     secret_hashes: BTreeMap<String, String>,
@@ -362,6 +365,7 @@ pub fn prepare(system: &dyn System, paths: &Paths, options: &Options) -> Result<
         return Err(Refusal::V1);
     }
     let gateway = site.site.primary.clone();
+
     if facts.head.is_some()
         && endpoint.is_some_and(|ip| site.gateways[&gateway].endpoint != format!("{ip}:51820"))
     {
@@ -382,6 +386,7 @@ pub fn prepare(system: &dyn System, paths: &Paths, options: &Options) -> Result<
         .as_ref()
         .map(|p| provider::read_provider(p).map_err(|_| input("invalid provider file")))
         .transpose()?;
+    let mut firewall_site = site.clone();
     let configuration;
     let mut initial_refs = Vec::new();
     if facts.head.is_some() {
@@ -489,6 +494,7 @@ pub fn prepare(system: &dyn System, paths: &Paths, options: &Options) -> Result<
         configuration = Configuration::Initial {
             sha256: hash(text.as_bytes()),
         };
+        firewall_site = site.clone();
         site.gateways
             .get_mut(&gateway)
             .ok_or_else(|| input("unknown gateway"))?
@@ -496,6 +502,7 @@ pub fn prepare(system: &dyn System, paths: &Paths, options: &Options) -> Result<
             .clear();
         site.policy.exits.clear();
     }
+    facts.firewall_warnings = firewall_warnings(system, &firewall_site)?;
     // Fresh intent is persisted before publishing version one, so a crash never
     // leaves a committed fresh gateway with missing safety state.
     let saved = crate::state::StateFile::open(paths.at(model::STATE_ROOT), None)
@@ -670,7 +677,7 @@ pub fn prepare(system: &dyn System, paths: &Paths, options: &Options) -> Result<
     };
     let mut plan = model::plan(&facts, &request)?;
     if private_endpoint {
-        plan.warnings.push("the sole uplink IPv4 address is private or shared; use --endpoint IP to specify the public address clients can reach");
+        plan.warnings.push("the sole uplink IPv4 address is private or shared; use --endpoint IP to specify the public address clients can reach".into());
     }
     Ok(Prepared {
         plan,
@@ -681,10 +688,85 @@ pub fn prepare(system: &dyn System, paths: &Paths, options: &Options) -> Result<
         provider,
         archive,
         site,
+        firewall_site,
         exit_id: options.exit_id.clone().map(ExitId),
         client_public,
         secret_hashes,
     })
+}
+fn firewall_warnings(system: &dyn System, site: &SiteConfig) -> Result<Vec<String>, Refusal> {
+    let ufw = ufw::observe(system)?;
+    let ruleset = if ufw.is_none() {
+        let text = command(system, Program::Nft, &["-j", "list", "ruleset"])?;
+        serde_json::from_str(&text).map_err(|_| input("invalid firewall observation"))?
+    } else {
+        serde_json::Value::Null
+    };
+    let gateway = site
+        .gateways
+        .get(&site.site.primary)
+        .ok_or_else(|| input("unknown gateway"))?;
+    let client_port = site
+        .identities
+        .get(&gateway.client_tunnel.identity)
+        .ok_or_else(|| input("unknown client identity"))?
+        .listen_port;
+    let client_port =
+        u16::try_from(client_port).map_err(|_| input("invalid client listen port"))?;
+    let client_endpoint: std::net::SocketAddr = gateway
+        .endpoint
+        .parse()
+        .map_err(|_| input("invalid client endpoint"))?;
+    let exits = gateway
+        .exits
+        .iter()
+        .map(|exit| {
+            exit.endpoint
+                .parse::<std::net::SocketAddr>()
+                .map_err(|_| input("invalid exit endpoint"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut warnings = Vec::new();
+    for uplink in &gateway.uplinks {
+        for (hook, port, destination) in
+            std::iter::once(("input", client_port, client_endpoint.ip())).chain(
+                exits
+                    .iter()
+                    .map(|endpoint| ("output", endpoint.port(), endpoint.ip())),
+            )
+        {
+            let packet = firewall::Packet {
+                hook,
+                uplink,
+                port,
+                destination,
+            };
+            let blocked = ufw.as_ref().map_or_else(
+                || firewall::may_block(&ruleset, packet),
+                |status| status.may_block(packet),
+            );
+            if blocked {
+                let reason = if ufw.is_some() {
+                    if hook == "input" {
+                        format!(
+                            "ufw status: ufw is active and does not allow UDP {port} on {uplink}"
+                        )
+                    } else {
+                        format!(
+                            "ufw status: ufw is active and does not allow outgoing UDP to {} on {uplink}",
+                            std::net::SocketAddr::new(destination, port)
+                        )
+                    }
+                } else {
+                    format!(
+                        "nft rules: host firewall may block {hook} UDP {port} on {uplink} (destination {destination}; unknown predicates, including xt, cannot prove an allow)"
+                    )
+                };
+                warnings.push(reason);
+            }
+        }
+    }
+    Ok(warnings)
 }
 fn verify_same_key(paths: &Paths, reference: &SecretName, key: &[u8]) -> Result<(), Refusal> {
     let secret = read_install_secret(paths, reference)?;

@@ -254,6 +254,88 @@ jobs:
           retention-days: 14
           if-no-files-found: warn
 
+  systemd-build:
+    name: release binaries for systemd lab
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Build release harness
+        run: timeout 600 env -u CARGO_TARGET_TMPDIR cargo build -p xtask --release --locked
+      - name: Build release testing CLI and daemon
+        # Only the existing boot checkpoints need testing. No lab-mutation.
+        run: timeout 600 env -u CARGO_TARGET_TMPDIR cargo build -p scupper -p scupperd --release --features testing --locked
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: systemd-lab-binaries
+          path: |
+            target/release/xtask
+            target/release/scupper
+            target/release/scupperd
+          if-no-files-found: error
+          retention-days: 14
+
+  systemd-lab:
+    needs: systemd-build
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-22.04]
+        # Each fault gets a fresh runner and a 20 minute internal deadline.
+        # L9 point timings determine whether later runs need sharding.
+        case: [L9, L10, L14, L44, V-13]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: systemd-lab-binaries
+          path: target/systemd-bin
+      - name: Install lab tools
+        run: |
+          sudo timeout 300 apt-get update
+          sudo timeout 300 apt-get install -y wireguard-tools nftables iproute2 tcpdump dnsmasq-base util-linux iputils-ping conntrack slirp4netns ufw strace python3
+          chmod +x target/systemd-bin/*
+          sudo timeout 30 systemctl start systemd-udevd systemd-networkd
+      - name: Run installed-unit case
+        run: sudo timeout --kill-after=150 1380 target/systemd-bin/xtask systemd-lab --case ${{ matrix.case }} --binaries target/systemd-bin --artifacts systemd-lab-out
+      - name: Unit test actual enabled ufw dumps in both UDP directions
+        if: ${{ matrix.case == 'V-13' }}
+        env:
+          SCUPPER_TEST_UFW_DUMPS: ${{ github.workspace }}/systemd-lab-out
+        run: timeout 600 env -u CARGO_TARGET_TMPDIR cargo test -p scupper-sys --lib --locked install::firewall::tests::real_ufw_enable_ruleset_dumps -- --ignored --exact
+      - name: Collect journal
+        if: always()
+        run: |
+          sudo mkdir -p systemd-lab-out
+          sudo timeout 30 journalctl --no-pager -o short-monotonic -u scupper-net -u scupperd | sudo tee systemd-lab-out/ci-journal.txt > /dev/null
+      - name: Collect root egress kernel journal
+        if: always()
+        run: |
+          sudo mkdir -p systemd-lab-out
+          sudo timeout 30 journalctl --no-pager -k -o short-monotonic | sudo tee systemd-lab-out/ci-kernel-journal.txt > /dev/null
+      - name: Make installed-unit diagnostics readable
+        if: always()
+        run: |
+          sudo mkdir -p systemd-lab-out
+          sudo find systemd-lab-out -type d -exec chmod a+rx {} +
+          sudo find systemd-lab-out -type f -exec chmod a+r {} +
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: systemd-lab-${{ matrix.runner }}-${{ matrix.case }}
+          path: systemd-lab-out
+          retention-days: 14
+          if-no-files-found: error
+
   mutations:
     strategy:
       fail-fast: false
