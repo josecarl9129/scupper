@@ -519,6 +519,30 @@ pub enum ClientError {
 /// # Errors
 /// Distinguishes unavailable transport from an uncertain delivered outcome.
 pub fn call(root: &Path, request: &Request, timeout: Duration) -> Result<Response, ClientError> {
+    call_until(root, request, Instant::now() + timeout)
+}
+
+fn remaining_until(deadline: Instant, now: Instant) -> io::Result<Duration> {
+    let remaining = deadline.saturating_duration_since(now);
+    if remaining.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "control response timeout",
+        ));
+    }
+    Ok(remaining)
+}
+
+/// Send one correlated operation within an absolute deadline shared across calls.
+/// An expired deadline prevents even a new connection attempt.
+/// # Errors
+/// Distinguishes unavailable transport from an uncertain delivered outcome.
+pub fn call_until(
+    root: &Path,
+    request: &Request,
+    deadline: Instant,
+) -> Result<Response, ClientError> {
+    remaining_until(deadline, Instant::now()).map_err(ClientError::Unavailable)?;
     // Connect through a held directory descriptor so the run root's length never meets the
     // 108-byte `sun_path` limit; the descriptor stays open until the connect returns.
     let directory = fs::OpenOptions::new()
@@ -533,37 +557,33 @@ pub fn call(root: &Path, request: &Request, timeout: Duration) -> Result<Respons
         directory.as_raw_fd()
     ))
     .map_err(ClientError::Unavailable)?;
-    let deadline = Instant::now() + timeout;
     socket
-        .connect_timeout(&address, timeout.min(Duration::from_secs(2)))
+        .connect_timeout(
+            &address,
+            remaining_until(deadline, Instant::now())
+                .map_err(ClientError::Unavailable)?
+                .min(Duration::from_secs(2)),
+        )
         .map_err(ClientError::Unavailable)?;
     let mut stream = UnixStream::from(std::os::fd::OwnedFd::from(socket));
-    stream
-        .set_read_timeout(Some(
-            deadline
-                .saturating_duration_since(Instant::now())
-                .max(Duration::from_millis(1)),
-        ))
-        .map_err(ClientError::Unavailable)?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(1)))
-        .map_err(ClientError::Unavailable)?;
     let mut bytes =
         serde_json::to_vec(request).map_err(|e| ClientError::Unavailable(io::Error::other(e)))?;
     bytes.push(b'\n');
+    stream
+        .set_write_timeout(Some(
+            remaining_until(deadline, Instant::now())
+                .map_err(ClientError::Unavailable)?
+                .min(Duration::from_secs(1)),
+        ))
+        .map_err(ClientError::Unavailable)?;
     stream
         .write_all(&bytes)
         .map_err(ClientError::OutcomeUnknown)?;
     let mut line = Vec::new();
     let mut reader = BufReader::new(stream);
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(ClientError::OutcomeUnknown(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "control response timeout",
-            )));
-        }
+        let remaining =
+            remaining_until(deadline, Instant::now()).map_err(ClientError::OutcomeUnknown)?;
         reader
             .get_ref()
             .set_read_timeout(Some(remaining))
@@ -668,6 +688,41 @@ mod tests {
             let root = std::path::PathBuf::from(format!("/{}", "x".repeat(bytes - 14)));
             assert_eq!(root.join("control.sock").as_os_str().len(), bytes);
             assert_eq!(validate_socket_path(&root).is_ok(), valid);
+        }
+    }
+
+    #[test]
+    fn remaining_budget_uses_the_supplied_absolute_deadline() {
+        let start = Instant::now();
+        let deadline = start + CHECK_TIMEOUT;
+        for elapsed in [Duration::ZERO, Duration::from_millis(1500), CHECK_TIMEOUT] {
+            let remaining = remaining_until(deadline, start + elapsed);
+            if elapsed == CHECK_TIMEOUT {
+                assert_eq!(remaining.unwrap_err().kind(), io::ErrorKind::TimedOut);
+            } else {
+                assert_eq!(
+                    remaining.unwrap(),
+                    CHECK_TIMEOUT.checked_sub(elapsed).unwrap()
+                );
+            }
+        }
+        assert_eq!(
+            remaining_until(deadline, deadline + Duration::from_secs(1))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    #[test]
+    fn expired_check_and_ping_deadline_prevents_connection() {
+        let deadline = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+        // Even an invalid root must return TimedOut before opening the directory.
+        for op in [Op::Check {}, Op::Ping {}] {
+            assert!(matches!(
+                call_until(Path::new(""), &request(op), deadline),
+                Err(ClientError::Unavailable(error)) if error.kind() == io::ErrorKind::TimedOut
+            ));
         }
     }
 
