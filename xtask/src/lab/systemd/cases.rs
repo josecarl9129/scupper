@@ -590,10 +590,17 @@ impl SystemdLab {
                 }
                 self.lab.runner.dwell(Duration::from_millis(50))?;
             }
-            let retry_seen = Instant::now();
             fs::copy(
                 "/run/scupper/daemon-reached",
                 self.lab.artifacts.join("L44-daemon-retry.txt"),
+            )?;
+            // Stop the automatic restart before preparing the contention trial.
+            // Its later start is explicit and happens with writer.lock held.
+            self.systemctl(&["stop", "scupperd"])?;
+            let initial = start.try_wait()?;
+            fs::write(
+                self.lab.artifacts.join("L44-initial-start-status.txt"),
+                format!("{initial:?}\n"),
             )?;
             self.clear_faults()?;
             let net_trace = self.lab.artifacts.join("L44-net-flock");
@@ -602,22 +609,15 @@ impl SystemdLab {
             // -D leaves the real daemon as systemd's main process, so notify
             // and watchdog attribution remain the installed unit's behavior.
             self.fault_dropin("scupperd", &format!("RestartSec=3s\nExecStart=\nExecStart=/usr/bin/strace -D -ff -tt -yy -e trace=flock,execve -o {} /usr/local/bin/scupperd", daemon_trace.display()))?;
-            self.lab
-                .runner
-                .dwell(Duration::from_millis(1500).saturating_sub(retry_seen.elapsed()))?;
             let cursor = self.journal_cursor()?;
-            let substate =
-                self.systemctl(&["show", "scupperd", "--property=SubState", "--value"])?;
-            fs::write(
-                self.lab.artifacts.join("L44-launch-substate.txt"),
-                &substate,
-            )?;
-            if !matches!(substate.trim(), "auto-restart" | "activating" | "start") {
-                return fail("apply was not launched while scupperd restarted");
-            }
-            // The daemon was killed at its boot retry; the local apply races
-            // systemd's automatic restart and a manual namespace-unit restart.
             let guard = scupper_sys::lock::WriterLock::acquire(Path::new("/run/scupper"))?;
+            let inode = fs::metadata("/run/scupper/writer.lock")?.ino();
+            fs::write(
+                self.lab.artifacts.join("L44-harness-lock.json"),
+                serde_json::to_vec_pretty(
+                    &serde_json::json!({"path":"/run/scupper/writer.lock","inode":inode,"holder_pid":std::process::id(),"held_before_launch":true}),
+                )?,
+            )?;
             let mut apply = self.lab.runner.background(
                 &Invocation::new(
                     "",
@@ -640,27 +640,81 @@ impl SystemdLab {
                 ),
                 &self.lab.artifacts.join("L44-apply.stdout"),
             )?;
+            // Observe local fallback before bringing the daemon back. This
+            // prevents apply from reaching a newly published control socket
+            // and delegating its writer work to the daemon instead.
+            let apply_deadline = Instant::now() + Duration::from_secs(10);
+            while !self
+                .writer_sample()?
+                .iter()
+                .any(|e| e.actor == "apply" && e.writer_lock)
+            {
+                if Instant::now() >= apply_deadline {
+                    return fail("local apply did not wait on the held product writer lock");
+                }
+                self.lab.runner.dwell(Duration::from_millis(25))?;
+            }
             let mut restart = self.lab.runner.background(
                 &Invocation::new("", "systemctl", &["restart", "scupper-net"]),
                 &self.lab.artifacts.join("L44-net-restart.stdout"),
             )?;
-            let until = Instant::now() + Duration::from_millis(1900);
-            loop {
-                if self.writer_sample()?.len() >= 2 {
-                    break;
+            let mut daemon = self.lab.runner.background(
+                &Invocation::new("", "systemctl", &["start", "scupperd"]),
+                &self.lab.artifacts.join("L44-daemon-start.stdout"),
+            )?;
+            // Supervisor exclusion can refuse boot/apply before writer.lock is
+            // reached. Judge each actor's observed refusal/wait, not a count of
+            // live PIDs racing within a sub-two-second window.
+            let until = Instant::now() + Duration::from_secs(45);
+            let evidence = loop {
+                let evidence = self.writer_sample()?;
+                if ["apply", "net", "daemon"]
+                    .iter()
+                    .all(|actor| evidence.iter().any(|e| e.actor == *actor))
+                {
+                    break evidence;
                 }
                 if Instant::now() >= until {
-                    return fail("fewer than two product writer PIDs contended on flock");
+                    return fail(
+                        "missing refusal or wait evidence for an L44 writer while harness held writer.lock",
+                    );
                 }
-                self.lab.runner.dwell(Duration::from_millis(20))?;
+                self.lab.runner.dwell(Duration::from_millis(100))?;
+            };
+            let locks = fs::read_to_string("/proc/locks")?;
+            if fs::metadata("/run/scupper/writer.lock")?.ino() != inode
+                || !writer_holders(&locks, inode).iter().any(|line| {
+                    line.split_whitespace()
+                        .nth(4)
+                        .and_then(|s| s.parse::<u32>().ok())
+                        == Some(std::process::id())
+                })
+            {
+                return fail("harness lost the product writer lock during contention");
             }
+            let held_journal = self.journal_since(&cursor, "L44-held-lock-journal.txt")?;
+            let writer_pids: std::collections::BTreeSet<_> = evidence
+                .iter()
+                .filter(|e| e.writer_lock)
+                .map(|e| e.pid)
+                .collect();
+            fs::write(
+                self.lab.artifacts.join("L44-contention.json"),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "harness_lock_held":true,"inode":inode,"writers":evidence,"product_writer_pids":writer_pids,
+                    "judgement":"Each launch must wait or refuse on a product lock while the harness holds writer.lock; at least one writer must succeed after release and check must converge to 0.",
+                    "two_writer_pids_observed":writer_pids.len() >= 2,
+                    "observability":"The supervisor lease may refuse boot or apply before writer.lock. Nonblocking flock polling does not create kernel waiter rows; two writer-lock PIDs are not required.",
+                    "held_lock_journal":held_journal,
+                }))?,
+            )?;
             drop(guard);
             let mut statuses = [None, None, None];
             let until = Instant::now() + Duration::from_secs(120);
             while statuses.iter().any(Option::is_none) {
                 self.safety()?;
                 self.writer_sample()?;
-                for (index, child) in [&mut start, &mut apply, &mut restart]
+                for (index, child) in [&mut daemon, &mut apply, &mut restart]
                     .into_iter()
                     .enumerate()
                 {
@@ -673,31 +727,29 @@ impl SystemdLab {
                 }
             }
             let journal = self.journal_since(&cursor, "L44-contention-journal.txt")?;
-            if !statuses[1..]
+            if !statuses
                 .iter()
                 .flatten()
                 .any(std::process::ExitStatus::success)
             {
-                return fail("neither apply nor namespace restart succeeded");
+                return fail("no product writer completed after releasing writer.lock");
             }
             // Contention may be refused, but must be bounded and explicit.
             for (index, status) in statuses.into_iter().enumerate() {
                 let status = status.ok_or("missing writer status")?;
                 if !status.success() {
                     let log = [
-                        "L44-initial-start.stderr",
+                        "L44-daemon-start.stderr",
                         "L44-apply.stderr",
                         "L44-net-restart.stderr",
                     ][index];
                     let text = fs::read_to_string(self.lab.artifacts.join(log))?;
-                    if index == 0 && status.code() == Some(1) {
-                        continue;
-                    } // injected pre-READY crash
                     if index == 2
                         && status.code() == Some(1)
                         && [
                             "boot refused; stop scupperd, then rerun",
                             "supervisor lease unavailable:",
+                            "writer lock timeout:",
                             "boot skipped successfully; use scupper apply for a verified update",
                         ]
                         .iter()
@@ -720,6 +772,20 @@ impl SystemdLab {
                 }
             }
             self.ready()?;
+            self.check_code(0)?;
+            let journal = self.journal_since(&cursor, "L44-contention-journal.txt")?;
+            let writer_succeeded = journal.contains("scupperd: boot retry: success")
+                || statuses[1].is_some_and(|s| s.success())
+                || (statuses[2].is_some_and(|s| s.success()) && self.product_boot_completed()?);
+            if !writer_succeeded {
+                return fail("no successful product mutation after releasing writer.lock");
+            }
+            fs::write(
+                self.lab.artifacts.join("L44-convergence.json"),
+                serde_json::to_vec_pretty(
+                    &serde_json::json!({"check_exit":0,"writer_exit_statuses":statuses.map(|s| s.and_then(|s| s.code())),"harness_lock_released":true,"successful_product_writer":writer_succeeded}),
+                )?,
+            )?;
             self.systemctl(&["start", "scupper-net"])?;
             self.safety()?;
             self.lab.service_check(markers)
@@ -727,43 +793,48 @@ impl SystemdLab {
         let cleanup = self.clear_faults();
         super::super::mutation::finish(trial, cleanup)
     }
-    fn writer_sample(&mut self) -> Result<Vec<u32>> {
-        let Ok(meta) = fs::metadata("/run/scupper/writer.lock") else {
-            return Ok(Vec::new());
-        };
+    fn product_boot_completed(&self) -> Result<bool> {
+        for entry in fs::read_dir(&self.lab.artifacts)? {
+            let entry = entry?;
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("L44-net-flock.")
+            {
+                let trace = fs::read_to_string(entry.path())?;
+                if trace.lines().any(|line| {
+                    line.contains("flock(")
+                        && line.contains("/run/scupper/writer.lock>")
+                        && line.ends_with("= 0")
+                }) {
+                    let report: scupper_sys::boot::BootReport =
+                        serde_json::from_str(&fs::read_to_string("/run/scupper/boot.json")?)?;
+                    return Ok(report.succeeded());
+                }
+            }
+        }
+        Ok(false)
+    }
+    fn writer_sample(&mut self) -> Result<Vec<WriterEvidence>> {
+        let meta = fs::metadata("/run/scupper/writer.lock")?;
         let locks = fs::read_to_string("/proc/locks")?;
         let holders = writer_holders(&locks, meta.ino());
-        let mut waiters = Vec::new();
-        let mut traces = Vec::new();
+        let mut evidence = Vec::new();
         for entry in fs::read_dir(&self.lab.artifacts)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
-            if !["L44-apply-flock.", "L44-net-flock.", "L44-daemon-flock."]
-                .iter()
-                .any(|p| name.starts_with(p))
-            {
+            let Some(actor) = ["apply", "net", "daemon"]
+                .into_iter()
+                .find(|actor| name.starts_with(&format!("L44-{actor}-flock.")))
+            else {
                 continue;
-            }
+            };
             let Some(pid) = name.rsplit('.').next().and_then(|p| p.parse::<u32>().ok()) else {
                 continue;
             };
-            let comm = fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
             let text = fs::read_to_string(entry.path())?;
-            // Product flock is LOCK_NB + retry, so the kernel never emits ->
-            // waiter rows. EAGAIN on the named lock is direct waiting evidence.
-            let blocked: Vec<_> = text.lines().filter(|l| polling_waiter(l)).collect();
-            let product_exec = text.lines().any(|l| {
-                [
-                    "execve(\"/usr/local/bin/scupper\"",
-                    "execve(\"/usr/local/bin/scupperd\"",
-                ]
-                .iter()
-                .any(|exec| l.contains(exec))
-                    && l.ends_with("= 0")
-            });
-            if matches!(comm.trim(), "scupper" | "scupperd") && blocked.len() >= 2 {
-                waiters.push(pid);
-                traces.push(serde_json::json!({"pid":pid,"comm":comm.trim(),"verified_product_exec":product_exec,"blocked_flock":blocked}));
+            if let Some(observed) = writer_evidence(actor, pid, &text) {
+                evidence.push(observed);
             }
         }
         let mut log = fs::OpenOptions::new()
@@ -773,9 +844,9 @@ impl SystemdLab {
         writeln!(
             log,
             "{}",
-            serde_json::json!({"holders":holders,"inode":meta.ino(),"polling_waiters":traces,"kernel_locks":locks})
+            serde_json::json!({"holders":holders,"inode":meta.ino(),"product_lock_evidence":evidence,"kernel_locks":locks})
         )?;
-        Ok(waiters)
+        Ok(evidence)
     }
     fn firewall_negative(&mut self, label: &str) -> Result<()> {
         let out = self.cli(&["install", "--check"])?;
@@ -901,6 +972,45 @@ impl SystemdLab {
     }
 }
 
+#[derive(serde::Serialize)]
+struct WriterEvidence {
+    actor: String,
+    pid: u32,
+    writer_lock: bool,
+    failed_flock: Vec<String>,
+}
+fn writer_evidence(actor: &str, pid: u32, text: &str) -> Option<WriterEvidence> {
+    let binary = if actor == "daemon" {
+        "scupperd"
+    } else {
+        "scupper"
+    };
+    // Trace files persist after exit. Verify exec in the same PID's trace
+    // rather than requiring /proc/PID/comm to survive until sampling.
+    let exec = format!("execve(\"/usr/local/bin/{binary}\"");
+    if !text
+        .lines()
+        .any(|line| line.contains(&exec) && line.ends_with("= 0"))
+    {
+        return None;
+    }
+    let failed_flock: Vec<_> = text
+        .lines()
+        .filter(|line| polling_waiter(line))
+        .map(str::to_owned)
+        .collect();
+    if failed_flock.is_empty() {
+        return None;
+    }
+    Some(WriterEvidence {
+        actor: actor.into(),
+        pid,
+        writer_lock: failed_flock
+            .iter()
+            .any(|l| l.contains("/run/scupper/writer.lock>")),
+        failed_flock,
+    })
+}
 fn polling_waiter(line: &str) -> bool {
     line.contains("flock(")
         && line.contains("LOCK_EX|LOCK_NB")
@@ -937,6 +1047,25 @@ mod tests {
         ] {
             assert!(!super::polling_waiter(line));
         }
+    }
+    #[test]
+    fn exited_writer_and_single_lease_refusal_remain_evidence() {
+        let trace = "12:00:00 execve(\"/usr/local/bin/scupper\", [\"scupper\", \"apply\"], []) = 0\n12:00:00 flock(3</run/scupper/scupperd.lock>, LOCK_EX|LOCK_NB) = -1 EAGAIN (Resource temporarily unavailable)\n";
+        let evidence = super::writer_evidence("apply", 424_242, trace).unwrap();
+        assert!(!evidence.writer_lock);
+        assert_eq!(evidence.failed_flock.len(), 1);
+        assert!(super::writer_evidence("daemon", 424_242, trace).is_none());
+        assert!(
+            super::writer_evidence("apply", 424_242, &trace.replace("= -1 EAGAIN", "= 0"))
+                .is_none()
+        );
+        let writer = trace.replace("scupperd.lock", "writer.lock");
+        assert!(
+            super::writer_evidence("apply", 424_242, &writer)
+                .unwrap()
+                .writer_lock
+        );
+        assert!(super::writer_evidence("apply", 424_242, writer.lines().last().unwrap()).is_none());
     }
     #[test]
     fn writer_lock_parser_excludes_waiters_and_other_locks() {

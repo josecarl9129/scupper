@@ -2753,9 +2753,20 @@ On ephemeral CI images setup records `/usr/local/bin` owner/mode before and afte
 setting `root:root 0755`; the product continues to refuse unsafe directories.
 It installs release binaries and tests L9, L10, L14, L44 and V-13 under real udev,
 networkd and systemd on both Ubuntu CI versions. An unfiltered `up0` capture starts
-before install and records each live exit port for exact tuples. Counter-only
-root postrouting rules detect non-`up0` egress of lab/tunnel prefixes, with a dummy
-link positive control, reset before install and zero assertions at every judge.
+before install and records each live exit port for exact tuples. Before creating
+any lab links, it snapshots every existing non-loopback interface (including
+`docker0` when present) and all IPv4/IPv6 default-route devices. The judged set
+must be non-empty and contain every default-route device. Root postrouting rules
+count lab/tunnel source and destination prefixes separately for each judged
+interface. Separate per-interface counters observe `lo` and lab-created links
+for reporting only. No detector rule drops traffic. Judged rules count before a
+rate-limited `scupper-lab-egress` log action, retaining interface, addresses and
+protocol in kernel-journal artifacts. A raw IP positive control binds the real
+IPv4 default-route interface and sends a lab-source UDP packet with TTL 1 to
+`192.0.2.254`; both IPv4 selectors and the attributed kernel log must observe it.
+A local probe of the host's `up0` address must increment excluded `lo` counters
+without changing judged counts. All counters are reset before install; every
+judge requires complete per-interface counters and zero judged hits.
 Install completion is judged separately from its final check status; transient
 check failures are recorded and recovery to check 0 has a deadline. Setup waits
 for check 0 after install and again after config load, before apply. It preserves
@@ -2780,9 +2791,17 @@ WireGuard links and addresses. L14 dwells two 2s ticks plus the 30s watchdog per
 before closed checks, requiring two changed completed-loop watchdog timestamps
 from the same daemon and gateway wg0 ingress controls. L10 observes check 5 while
 the same daemon is stopped, and scopes restart/watchdog journal evidence by cursor.
-L44 records distinct product PIDs whose nonblocking flock calls returned EAGAIN,
-scoped exact refusal messages, a restarting SubState, and at least one successful
-writer; these show contention, not an independent count of simultaneous mutations.
+L44 first proves scupperd retries an interrupted boot, then stops its automatic
+restart. The harness acquires the product's `/run/scupper/writer.lock` with flock
+before launching scupperd again, `systemctl restart scupper-net` and local `apply`.
+It retains the lock until all three actors have verified product-exec traces with
+failed nonblocking lock calls, retaining evidence even after a process exits.
+It records the lock inode and holder, stdout/stderr, scoped journal and per-actor
+wait/refusal evidence, then releases the lock and requires a successful product
+writer plus convergence to check 0. The supervisor lease can refuse boot or apply
+before writer.lock is reached, and nonblocking polling creates no kernel waiter
+rows. Two product PIDs waiting on writer.lock are therefore reported when visible,
+but judgement uses each actor's wait/refusal plus a successful writer and recovery.
 V-13 requires absent/present/absent firewall warning controls; a pre-existing
 warning makes the case inconclusive and failing. Ufw's user denies name `up0`;
 its built-in before rules are global even with allow defaults, so this case runs

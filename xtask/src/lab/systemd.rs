@@ -48,6 +48,7 @@ const REBOOT_STEPS: &[RebootStep] = &[
 struct SystemdLab {
     lab: Lab,
     baseline: HostSnapshot,
+    egress: egress::Scope,
     ports: Vec<u16>,
     samples: usize,
     timings: Vec<serde_json::Value>,
@@ -88,6 +89,7 @@ pub fn run(artifacts: &Path, binaries: &Path, case: &str) -> Result<()> {
     let site = validate(parse_site(SITE)?).map_err(|e| format!("lab config: {e:?}"))?;
     let mut harness = SystemdLab {
         baseline,
+        egress: egress::Scope::default(),
         ports: Vec::new(),
         samples: 0,
         timings: Vec::new(),
@@ -124,6 +126,7 @@ pub fn run(artifacts: &Path, binaries: &Path, case: &str) -> Result<()> {
         .collect::<std::io::Result<Vec<_>>>()?;
     let outcome = (|| {
         harness.preflight()?;
+        harness.egress_inventory()?;
         harness.setup(&binaries)?;
         harness.capture_control()?;
         harness.guard("case-before")?;
@@ -135,8 +138,13 @@ pub fn run(artifacts: &Path, binaries: &Path, case: &str) -> Result<()> {
     harness.lab.runner.phase = harness.lab.runner.whole;
     let guard = harness.guard("case-after");
     let journal = harness.journal("journal.txt");
+    let egress_log = harness.egress_log("final");
     let captures = harness.lab.stop_captures();
-    let diagnostics = if outcome.is_err() || guard.is_err() || journal.is_err() || captures.is_err()
+    let diagnostics = if outcome.is_err()
+        || guard.is_err()
+        || journal.is_err()
+        || egress_log.is_err()
+        || captures.is_err()
     {
         harness.failure_diagnostics()
     } else {
@@ -146,7 +154,10 @@ pub fn run(artifacts: &Path, binaries: &Path, case: &str) -> Result<()> {
         outcome,
         super::mutation::finish(
             guard,
-            super::mutation::finish(diagnostics, super::mutation::finish(journal, captures)),
+            super::mutation::finish(
+                diagnostics,
+                super::mutation::finish(journal, super::mutation::finish(egress_log, captures)),
+            ),
         ),
     );
     fs::write(
