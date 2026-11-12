@@ -939,10 +939,16 @@ impl SystemdLab {
                 .join(format!("{label}-install-check.txt")),
             &out,
         )?;
-        if out.contains("warning: host firewall may block UDP 51820") {
+        if out.contains("warning: ufw status:") || out.contains("warning: nft rules:") {
             return fail(format!(
                 "INCONCLUSIVE: {label} firewall warning negative control unavailable"
             ));
+        }
+        if label == "V-13-allow" {
+            let status = self.cmd("ufw", &["status", "verbose"])?;
+            if !status.lines().any(|line| line.trim() == "Status: active") {
+                return fail("allow negative control requires active ufw");
+            }
         }
         if !out.contains("install: no changes") {
             return fail("negative firewall control has install drift");
@@ -950,6 +956,11 @@ impl SystemdLab {
         Ok(())
     }
     fn firewall_dump(&mut self, label: &str) -> Result<()> {
+        let status = self.cmd("ufw", &["status", "verbose"])?;
+        fs::write(
+            self.lab.artifacts.join(format!("{label}-ufw-status.txt")),
+            status,
+        )?;
         let rules = self.cmd("nft", &["-j", "list", "ruleset"])?;
         fs::write(
             self.lab.artifacts.join(format!("{label}-ruleset.json")),
@@ -965,10 +976,16 @@ impl SystemdLab {
                 .join(format!("{label}-install-check.txt")),
             &out,
         )?;
-        if !out.contains("warning: host firewall may block UDP 51820")
+        let inbound =
+            out.contains("warning: ufw status: ufw is active and does not allow UDP 51820 on up0");
+        let outbound =
+            out.contains("warning: ufw status: ufw is active and does not allow outgoing UDP to");
+        if inbound != (label != "V-13-exit")
+            || outbound != matches!(label, "V-13-exit" | "V-13")
+            || out.contains("warning: nft rules:")
             || !out.contains("install: no changes")
         {
-            return fail("missing UDP firewall availability warning");
+            return fail("missing or unexpected ufw status availability warning");
         }
         self.firewall_dump(label)
     }
@@ -1002,6 +1019,9 @@ impl SystemdLab {
         )?;
         self.firewall_dump("V-13-allow")?;
         self.firewall_negative("V-13-allow")?;
+        // M2 status evaluation warns for outgoing default-deny without an allow.
+        // Explicit denies with a default-allow policy require M6 evaluation.
+        self.cmd("ufw", &["default", "deny", "outgoing"])?;
         // With client ingress allowed, an exit-only block must also warn.
         self.cmd(
             "ufw",

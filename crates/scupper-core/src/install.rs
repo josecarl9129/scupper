@@ -133,8 +133,8 @@ pub struct Facts {
     pub identity_named: bool,
     /// Existing selector.
     pub gateway_id: Option<String>,
-    /// A locally visible firewall may block the listen port.
-    pub firewall_warning: bool,
+    /// Availability warnings naming the deciding host firewall mechanism.
+    pub firewall_warnings: Vec<String>,
 }
 /// Configuration publication requested after all input has been verified.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,8 +262,8 @@ pub enum Change {
 pub struct Plan {
     /// Steps; empty on an unchanged rerun.
     pub steps: Vec<Step>,
-    /// Value-free availability notices.
-    pub warnings: Vec<&'static str>,
+    /// Public availability notices.
+    pub warnings: Vec<String>,
 }
 impl Plan {
     /// Stable, secret-free display for --plan and confirmation.
@@ -273,6 +273,7 @@ impl Plan {
         for warning in &self.warnings {
             let _ = writeln!(out, "warning: {warning}");
         }
+        out.push_str("note: provider/cloud firewalls (e.g. DigitalOcean cloud firewall) are not visible from the host.\n");
         if self.steps.is_empty() {
             out.push_str("install: no changes\n");
         }
@@ -518,12 +519,6 @@ pub fn plan(facts: &Facts, request: &Request) -> Result<Plan, Refusal> {
     }
     Ok(Plan {
         steps,
-        warnings: if facts.firewall_warning {
-            vec![
-                "host firewall may block UDP 51820 or configured exit UDP; inspect locally visible input/output rules",
-            ]
-        } else {
-            vec![]
-        },
+        warnings: facts.firewall_warnings.clone(),
     })
 }

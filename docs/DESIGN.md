@@ -2333,11 +2333,30 @@ firewall or host sysctls (except the optional `90-scupper.conf`).
    in R1) a host with the v1 layout or anything like it: an enabled
    `wg-quick@*` unit, a host link with a configured link name, `table inet
    scupper` in the host ruleset, or a v1 binary at `/usr/local/bin/scupper`
-   (ADR 0014 enforced in code); warn if a locally visible input-hook chain's
-   policy or reachable drop/reject rule can block UDP 51820 on a configured
-   uplink (including rules with no interface match). Follow input-chain jumps;
-   unrelated forward/output drops, names, comments and other UDP ports do not
-   trigger this availability heuristic (V-13).
+   (ADR 0014 enforced in code). For active ufw, use bounded, constant-argv
+   `ufw status` and `ufw status verbose` observations under the System trait
+   (C locale). Parse Status, Default and the To/Action/From table. Warn for
+   incoming client UDP unless the default incoming policy is allow or an
+   ALLOW IN rule admits its port (normally 51820), from any source, on the
+   configured uplink or any interface. Treat IPv6 `(v6)` rows separately.
+   For each configured exit endpoint, warn only when default outgoing is
+   deny/reject without a matching UDP ALLOW OUT rule for its port, destination
+   and uplink. This M2 heuristic does not evaluate explicit denies under a
+   default-allow policy or resolve conflicting rules; exact evaluation is M6.
+   If ufw is inactive or unavailable, inspect nft input/output base chains
+   for new client UDP and configured exit UDP address/port on each uplink.
+   Evaluate rules in order, following `jump` (resume the caller on return or
+   chain end) and `goto` (no local continuation), with cycle detection and a
+   maximum depth of 16 chains. The first applicable accept/drop/reject decides
+   that path; leaving the base chain without a verdict uses its policy. A
+   definite accept in one base chain does not bypass other base chains.
+   Exclude other protocols, ports, interfaces, families and states excluding
+   new. Unknown predicates, including opaque `xt` expressions, may match:
+   they cannot prove an accept or return, and a possible drop/reject warns.
+   Unrelated forward drops, names and comments do not warn (V-13).
+   Each firewall warning names its mechanism (`ufw status` or `nft rules`).
+   Each install output notes once that provider/cloud firewalls, such as
+   DigitalOcean cloud firewall, are not visible from the host.
    Ownership evidence is a matching device/inode in `boot.json` (including a
    failed attempt) or scupperd's Ping. Only an unknown namespace is refused.
    A down, peerless, unaddressed WireGuard host link with a configured name
@@ -2912,17 +2931,24 @@ and canary elapsed times, markers and errors for each phase. Delivery assertions
 and probe timeouts are unchanged; a later timeout remains a failure, with probe,
 sink, command, check/status, unit, boot and journal evidence retained.
 V-13 covers both client-facing and exit WireGuard UDP. It requires no warning
-before ufw, a warning with real default deny-in/allow-out rules and no client
-allow rule (inbound only), no warning after `allow 51820/udp` on `up0`, a warning
-with only exit UDP denied on `up0`, a warning with both directions denied, and
-no warning after disable. A pre-existing warning makes the case inconclusive
-and failing. Every enabled ruleset is saved with `nft -j list ruleset`; CI unit
-tests those real dumps in both directions. The availability heuristic follows
+before ufw, a ufw-status warning with real default deny-in/allow-out rules and
+no client allow rule (inbound only), no warning after `allow 51820/udp` on
+`up0` through the active ufw-status path, a warning with default outgoing deny
+and no exit UDP allow (outbound only), warnings with both directions denied,
+and no warning after disable. A pre-existing warning makes the case
+inconclusive and failing. Each enabled phase saves both `nft -j list ruleset`
+and `ufw status verbose`; the CI replay checks both mechanisms independently.
+The committed status fixtures cover inactive, active defaults, interface and
+any-interface allows, including IPv6 `(v6)` rows. The nft walker still follows
 input/output jumps and gotos for fresh client UDP and each configured exit
-endpoint's port/address. It ignores other protocols, ports, families and ct
-states excluding new; unknown predicates cannot prove an accept. Ufw's invalid
-drop therefore does not warn for a fresh handshake. Local-destination returns
-in ufw-not-local are interpreted in the input-hook routing context.
+endpoint's port/address. Native `ct state invalid` drops do not warn for a fresh
+handshake, and native local-destination returns use the input routing context.
+Opaque `xt` expressions omit state/address-type arguments in Ubuntu's
+iptables-nft dumps. These stay unknown: the raw allow dumps must warn when ufw
+is not consulted. The active ufw-status path supplies the allow negative
+control. M2 is an availability warning heuristic; exact host-firewall
+interpretation, including conflicting rules and explicit denies under a
+default-allow policy, remains M6 (V-13).
 The blocked client2 probe must time out and its exact public-key row on the
 gateway's wg0 must still have handshake timestamp zero; after disable the
 probe must deliver with a provider NAT receipt. Ufw's built-in before rules
@@ -3135,7 +3161,7 @@ hardware) before anything depends on them.
 | V-10 | WireGuard handshake cadence on an **idle** hot standby with keepalive 25 s stays below 180 s | real gateway, 24 h | M3 |
 | V-11 | Whether the provider configs carry a v6 address and the v6 exit works end to end | real account | M4 |
 | V-12 | The forwarder passes the provider's filtered answers unchanged and signed zones resolve through it (no DNSSEC validation in the path) | real gateway | M4 |
-| V-13 | Host firewall tools may block client and exit WireGuard UDP; `install --check` warns on locally visible input/output drops or rejects for client UDP or configured exit endpoints/ports; cloud rules require external observation | systemd lab: ufw default/allow/deny controls in both directions; VM for cloud rules | M2 (warning), M6 |
+| V-13 | Host firewall tools may block client and exit WireGuard UDP; M2 `install --check` uses active ufw status defaults/UDP allows, otherwise the conservative nft jump/goto walker; each warning names its mechanism and install notes cloud rules are not host-visible; exact host-firewall evaluation is M6 | systemd lab: ufw default/allow/default-outgoing-deny controls in both directions, status and raw nft replay; VM for cloud rules | M2 warning, M6 |
 | V-14 | `ip netns del` while edge holds the namespace keeps links and routes alive; the held-fd re-mount restores the name without a second namespace | L17 | M2 |
 | V-15 | `BindsTo=`/`Requires=` keep edge from starting without the namespace and stop it with the namespace unit | VM | M2 |
 | V-16 | Probes inside the namespace work without any host resolver (`/etc/resolv.conf` → 127.0.0.53 unreachable there) | L1 + probe test | M2 |

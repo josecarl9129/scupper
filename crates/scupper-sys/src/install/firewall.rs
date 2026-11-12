@@ -120,19 +120,63 @@ fn matches_value(right: &Value, wanted: &Value, destination: IpAddr) -> Option<b
     Some(equal)
 }
 
-// Outcomes are possible drop and possible fall-through. An accept terminates
-// only this base chain; callers still inspect every other applicable base chain.
-fn chain(
-    rows: &[Value],
+// Outcomes are possible drop and possible return to the caller. An accept
+// terminates only this base chain; every other applicable base chain is checked.
+// A possible return must survive a later accept when its predicate is unknown.
+#[derive(Clone, Copy)]
+struct Outcome {
+    drop: bool,
+    returns: bool,
+}
+
+fn condition(expr: &Value, packet: Packet<'_>) -> Option<bool> {
+    if expr.get("match").is_some() {
+        predicate(expr, packet)
+    } else if [
+        "counter", "log", "accept", "drop", "reject", "return", "jump", "goto",
+    ]
+    .iter()
+    .any(|key| expr.get(key).is_some())
+    {
+        Some(true)
+    } else {
+        // This includes opaque xt matches and unsupported predicates such as
+        // limits. They may apply but cannot establish a definite accept/return.
+        None
+    }
+}
+
+fn chain<'a>(
+    rows: &'a [Value],
+    family: &Value,
+    table: &Value,
+    name: &'a Value,
+    packet: Packet<'_>,
+    path: &mut Vec<&'a Value>,
+) -> Outcome {
+    // Only the active call path is a cycle: separate calls to a shared chain
+    // are legal. Bound acyclic nesting as well, independent of ruleset size.
+    if path.len() >= 16 || path.contains(&name) {
+        return Outcome {
+            drop: true,
+            returns: true,
+        };
+    }
+    path.push(name);
+    let outcome = chain_rules(rows, family, table, name, packet, path);
+    path.pop();
+    outcome
+}
+
+fn chain_rules<'a>(
+    rows: &'a [Value],
     family: &Value,
     table: &Value,
     name: &Value,
     packet: Packet<'_>,
-    depth: usize,
-) -> (bool, bool) {
-    if depth > rows.len() {
-        return (true, true);
-    }
+    path: &mut Vec<&'a Value>,
+) -> Outcome {
+    let mut returns = false;
     for rule in rows
         .iter()
         .filter_map(|r| r.get("rule"))
@@ -141,40 +185,56 @@ fn chain(
         let Some(exprs) = rule["expr"].as_array() else {
             continue;
         };
-        let tests: Vec<_> = exprs
-            .iter()
-            .filter(|e| e.get("match").is_some())
-            .map(|e| predicate(e, packet))
-            .collect();
+        let tests: Vec<_> = exprs.iter().map(|e| condition(e, packet)).collect();
         if tests.contains(&Some(false)) {
             continue;
         }
-        let certain =
-            tests.iter().all(|v| *v == Some(true)) && !exprs.iter().any(|e| e.get("xt").is_some());
+        let certain = tests.iter().all(|v| *v == Some(true));
         for expr in exprs {
             if expr.get("drop").is_some() || expr.get("reject").is_some() {
-                return (true, true);
+                return Outcome {
+                    drop: true,
+                    returns,
+                };
             }
             for verdict in ["jump", "goto"] {
                 if let Some(target) = expr.get(verdict).and_then(|v| v.get("target")) {
-                    let (drop, returns) = chain(rows, family, table, target, packet, depth + 1);
-                    if drop {
-                        return (true, true);
+                    let outcome = chain(rows, family, table, target, packet, path);
+                    if outcome.drop {
+                        return outcome;
                     }
-                    if certain && (!returns || verdict == "goto") {
-                        return (false, verdict == "goto" && returns);
+                    if verdict == "goto" {
+                        returns |= outcome.returns;
+                    }
+                    if certain && (!outcome.returns || verdict == "goto") {
+                        return Outcome {
+                            drop: false,
+                            returns,
+                        };
                     }
                 }
             }
             if certain && expr.get("accept").is_some() {
-                return (false, false);
+                return Outcome {
+                    drop: false,
+                    returns,
+                };
             }
-            if certain && expr.get("return").is_some() {
-                return (false, true);
+            if expr.get("return").is_some() {
+                returns = true;
+                if certain {
+                    return Outcome {
+                        drop: false,
+                        returns,
+                    };
+                }
             }
         }
     }
-    (false, true)
+    Outcome {
+        drop: false,
+        returns: true,
+    }
 }
 
 pub(super) fn may_block(json: &Value, packet: Packet<'_>) -> bool {
@@ -194,8 +254,15 @@ pub(super) fn may_block(json: &Value, packet: Packet<'_>) -> bool {
                         })
         })
         .any(|c| {
-            let (drop, fallthrough) = chain(rows, &c["family"], &c["table"], &c["name"], packet, 0);
-            drop || (fallthrough && c["policy"] == "drop")
+            let outcome = chain(
+                rows,
+                &c["family"],
+                &c["table"],
+                &c["name"],
+                packet,
+                &mut Vec::new(),
+            );
+            outcome.drop || (outcome.returns && c["policy"] == "drop")
         })
 }
 
@@ -439,25 +506,48 @@ mod tests {
         assert!(super::may_block(&r, packet6));
     }
     // V-13 writes these with nft -j list ruleset after actual ufw enable and
-    // successive default, allow, output-only deny and bidirectional deny rules.
+    // successive default, allow, default-outgoing deny and bidirectional deny rules.
+    // Opaque xt predicates still warn on inbound allow dumps without ufw status.
     #[test]
     #[ignore = "requires real V-13 ufw ruleset dumps; run by the systemd CI matrix"]
     fn real_ufw_enable_ruleset_dumps() {
         let root = std::env::var_os("SCUPPER_TEST_UFW_DUMPS").expect("V-13 artifacts directory");
         for (label, inbound, outbound) in [
             ("V-13-default", true, false),
-            ("V-13-allow", false, false),
-            ("V-13-exit", false, true),
+            ("V-13-allow", true, false),
+            ("V-13-exit", true, true),
             ("V-13", true, true),
         ] {
             let path = std::path::Path::new(&root).join(format!("{label}-ruleset.json"));
             let rules: Value =
                 serde_json::from_slice(&std::fs::read(&path).expect("real ufw ruleset dump"))
                     .unwrap();
+            let status_path = std::path::Path::new(&root).join(format!("{label}-ufw-status.txt"));
+            let status = crate::install::ufw::parse(
+                &std::fs::read_to_string(&status_path).expect("real ufw status verbose output"),
+            )
+            .expect("active ufw status");
             for (hook, destination, expected) in [
                 ("input", "198.51.100.2", inbound),
                 ("output", "203.0.113.2", outbound),
             ] {
+                let packet = Packet {
+                    hook,
+                    uplink: "up0",
+                    port: 51820,
+                    destination: destination.parse().unwrap(),
+                };
+                let status_blocked = if hook == "input" {
+                    matches!(label, "V-13-default" | "V-13")
+                } else {
+                    outbound
+                };
+                assert_eq!(
+                    status.may_block(packet),
+                    status_blocked,
+                    "{} {hook}",
+                    status_path.display()
+                );
                 assert_eq!(
                     super::may_block(
                         &rules,
@@ -476,3 +566,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "firewall/flow_tests.rs"]
+mod flow_tests;

@@ -1,0 +1,9 @@
+Status: active
+Logging: on (low)
+Default: deny (incoming), allow (outgoing), allow (routed)
+New profiles: skip
+
+To                         Action      From
+--                         ------      ----
+51820/udp on up0            ALLOW IN    Anywhere
+51820/udp (v6) on up0       ALLOW IN    Anywhere (v6)
