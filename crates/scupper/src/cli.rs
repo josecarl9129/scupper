@@ -16,6 +16,7 @@ mod alerts;
 mod config;
 mod control;
 mod exits;
+mod install;
 use config::ConfigCommand;
 
 #[derive(Parser)]
@@ -107,6 +108,8 @@ enum Command {
         #[command(subcommand)]
         command: alerts::AlertsCommand,
     },
+    /// Provision this gateway from explicit flags or a verified bundle.
+    Install(install::InstallArgs),
     /// Print head's rendered namespace ruleset or compare it with live rules.
     Rules {
         /// Show a canonical diff against the live scupper namespace.
@@ -392,7 +395,10 @@ fn dispatch(
     if json
         && matches!(
             command,
-            Command::Config { .. } | Command::Rules { .. } | Command::Exit { .. }
+            Command::Config { .. }
+                | Command::Rules { .. }
+                | Command::Exit { .. }
+                | Command::Install(..)
         )
     {
         return Err("--json is supported only for check and status".into());
@@ -551,6 +557,7 @@ fn dispatch(
             };
             m2_check(deps, &config, status, json, local, stdout, stderr)
         }
+        Command::Install(args) => install::run(args, deps, stdout, stderr),
         Command::Alerts { command } => alerts::run(command, deps, json, stdout),
         Command::Config { command } => config::run(command, deps, stdout),
         Command::Exit { command } => exits::run(command, deps, stdout),

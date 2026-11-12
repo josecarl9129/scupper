@@ -123,16 +123,44 @@ pub fn exit_config(
 /// Uses the same parser, exit settings and confined key writer as CLI imports.
 /// # Errors
 /// Refuses an existing head, nonempty exit list, invalid provider/site or unsafe
-/// secrets. On a commit error, retains keys because publication may have succeeded;
-/// the caller must inspect head before attempting recovery.
+/// secrets. Removes newly written keys on failure before publication; matching
+/// unreferenced keys from an interrupted attempt are reused.
 #[allow(clippy::too_many_arguments)]
 pub fn import_initial(
     store: &crate::store::VersionStore,
     guard: &crate::lock::WriterGuard,
     config_root: &Path,
-    mut site: scupper_core::config::SiteConfig,
+    site: scupper_core::config::SiteConfig,
     gateway: &scupper_core::config::GatewayId,
     file: &Path,
+    meta: crate::store::MetaInput,
+) -> Result<u64, String> {
+    let provider = read_provider(file)?;
+    let id = provider.suggested_id.clone();
+    import_initial_provider(
+        store,
+        guard,
+        config_root,
+        site,
+        gateway,
+        &provider,
+        id,
+        meta,
+    )
+}
+
+/// Initial import with an already parsed provider and explicit stable exit ID.
+/// # Errors
+/// Applies the same validation, crash recovery and publication rules as `import_initial`.
+#[allow(clippy::too_many_arguments)]
+pub fn import_initial_provider(
+    store: &crate::store::VersionStore,
+    guard: &crate::lock::WriterGuard,
+    config_root: &Path,
+    mut site: scupper_core::config::SiteConfig,
+    gateway: &scupper_core::config::GatewayId,
+    provider: &ProviderConfig,
+    id: scupper_core::config::ExitId,
     meta: crate::store::MetaInput,
 ) -> Result<u64, String> {
     use crate::secrets::SecretFile;
@@ -145,10 +173,9 @@ pub fn import_initial(
     if !gw.exits.is_empty() {
         return Err("initial import requires an empty exit list".into());
     }
-    let provider = read_provider(file)?;
     let exit = exit_config(
-        &provider,
-        provider.suggested_id.clone(),
+        provider,
+        id,
         provider.suggested_name.clone(),
         "ex-0".into(),
         1,
@@ -157,16 +184,39 @@ pub fn import_initial(
     gw.exits.push(exit.clone());
     let validated = validate(site.clone()).map_err(|_| "invalid initial site configuration")?;
     let text = toml::to_string(&site).map_err(|_| "cannot encode initial site configuration")?;
-    SecretFile::write_new(config_root, &exit.private_key_ref, provider.private_key())
-        .map_err(|e| e.to_string())?;
-    if let (Some(reference), Some(psk)) = (&exit.preshared_key_ref, provider.preshared_key()) {
-        SecretFile::write_new(config_root, reference, psk).map_err(|e| e.to_string())?;
-    }
-    SecretFile::preflight(config_root, &site, rustix::process::geteuid().as_raw())
-        .map_err(|e| e.to_string())?;
-    let version = store
-        .commit(guard, None, &text, meta)
-        .map_err(|e| e.to_string())?;
+    let mut written = Vec::new();
+    let result = (|| {
+        for (reference, bytes) in std::iter::once((&exit.private_key_ref, provider.private_key()))
+            .chain(
+                exit.preshared_key_ref
+                    .as_ref()
+                    .zip(provider.preshared_key()),
+            )
+        {
+            if write_or_reuse(config_root, reference, bytes)? {
+                written.push(reference);
+            }
+        }
+        SecretFile::preflight(config_root, &site, rustix::process::geteuid().as_raw())
+            .map_err(|e| e.to_string())?;
+        store
+            .commit(guard, None, &text, meta)
+            .map_err(|e| e.to_string())
+    })();
+    let version = match result {
+        Ok(version) => version,
+        Err(error) => {
+            // A mirror/fsync failure can follow publication. Never remove a
+            // key if the outcome cannot be proved to precede publication.
+            if matches!(store.head(), Ok(None)) {
+                for reference in written {
+                    SecretFile::remove(config_root, reference)
+                        .map_err(|e| format!("{error}; key cleanup: {e}"))?;
+                }
+            }
+            return Err(error);
+        }
+    };
     let rules = scupper_core::render::render_netns(
         &validated,
         gateway,
@@ -180,4 +230,37 @@ pub fn import_initial(
         .write_rendered(guard, version, &rules)
         .map_err(|e| format!("version {version} committed; render write: {e}"))?;
     Ok(version)
+}
+
+/// Writes a new secret or reuses an identical, confined crash leftover.
+/// Returns whether this call created the file.
+/// # Errors
+/// Refuses differing leftovers, unsafe files or failed writes without disclosing bytes.
+pub fn write_or_reuse(
+    root: &Path,
+    name: &scupper_core::config::SecretName,
+    bytes: &[u8],
+) -> Result<bool, String> {
+    match std::fs::symlink_metadata(root.join("secrets/wg").join(name.name())) {
+        Ok(_) => {
+            let existing = crate::secrets::SecretFile::open_with_owner(
+                root,
+                name,
+                rustix::process::geteuid().as_raw(),
+            )
+            .map_err(|e| e.to_string())?;
+            if existing.expose() != bytes {
+                return Err(format!(
+                    "unreferenced secret {} differs from the supplied key; inspect and remove the leftover before retrying install",
+                    name.name()
+                ));
+            }
+            Ok(false)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            crate::secrets::SecretFile::write_new(root, name, bytes).map_err(|e| e.to_string())?;
+            Ok(true)
+        }
+        Err(_) => Err("cannot inspect leftover secret".into()),
+    }
 }

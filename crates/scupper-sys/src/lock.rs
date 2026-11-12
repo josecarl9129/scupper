@@ -4,7 +4,7 @@ use rustix::fs::{FlockOperation, OFlags, flock};
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::Path,
     time::{Duration, Instant},
 };
@@ -80,7 +80,10 @@ impl WriterLock {
     }
 
     fn open(root: &Path, name: &str, operation: FlockOperation) -> io::Result<WriterGuard> {
-        fs::create_dir_all(root)?;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(root)?;
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)

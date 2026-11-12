@@ -4,6 +4,31 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use ipnet::Ipv4Net;
 
+/// Whether a literal address can identify an individual tunnel endpoint.
+/// Private and documentation addresses are allowed; local-only and non-unicast
+/// addresses are not usable endpoints.
+#[must_use]
+pub fn valid_endpoint_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            !ip.is_unspecified()
+                && !ip.is_loopback()
+                && !ip.is_multicast()
+                && !ip.is_broadcast()
+                && !ip.is_link_local()
+        }
+        IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or_else(
+            || {
+                !ip.is_unspecified()
+                    && !ip.is_loopback()
+                    && !ip.is_multicast()
+                    && !ip.is_unicast_link_local()
+            },
+            |ip| valid_endpoint_ip(IpAddr::V4(ip)),
+        ),
+    }
+}
+
 pub(super) fn client_prefix(net: Ipv4Net) -> bool {
     (16..=30).contains(&net.prefix_len())
         && net.network().is_private()

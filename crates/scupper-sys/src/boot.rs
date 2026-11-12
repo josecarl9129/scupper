@@ -199,7 +199,7 @@ pub(crate) enum InputError {
     #[error("{0}")]
     Secret(#[from] crate::secrets::SecretError),
     #[error(
-        "selection names exit {0}, which is absent from the target version; run scupper connect to select Auto before applying"
+        "selection names exit {0}, which is absent from the target version; run scupper connect to select Auto, or scupper disconnect while quarantined, before applying"
     )]
     Selection(scupper_core::config::ExitId),
 }

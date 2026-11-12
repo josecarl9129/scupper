@@ -1,7 +1,6 @@
-//! Read-only v1 markers reserved for the future install preflight.
+//! Read-only v1 markers used by installation preflight.
 use crate::{
     canon::{command, command_result},
-    parse,
     rules::V1Config,
     system::{EXEC_TIMEOUT, Program, SYSTEMCTL_TIMEOUT, System},
     verdict::{Probe, ProbeError},
@@ -11,6 +10,8 @@ use std::collections::BTreeSet;
 /// Evidence of the retired host layout; never removed by detection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum V1Marker {
+    /// An installed binary without the M2 version-store CLI.
+    Binary,
     /// An enabled wg-quick instance, including instances outside the v1 defaults.
     EnabledWgQuick(String),
     /// The host namespace contains `table inet scupper`.
@@ -21,37 +22,73 @@ pub enum V1Marker {
 
 /// Finds enabled wg-quick instances, the host table, and v1 tunnel link names.
 /// Does not inspect binaries, configuration secrets or namespace contents.
-/// Nothing invokes this helper until the install preflight is implemented.
 ///
 /// # Errors
 /// Returns execution or parse failures; a failed observation is never absence.
 pub fn detect_v1_layout(sys: &dyn System) -> Probe<Vec<V1Marker>> {
+    detect_v1_layout_for(sys, &[])
+}
+
+/// Also refuses host links named by the requested configuration.
+/// # Errors
+/// An observation or parse failure is never treated as absence.
+pub fn detect_v1_layout_for(sys: &dyn System, names: &[&str]) -> Probe<Vec<V1Marker>> {
+    detect_layout(sys, names, None)
+}
+
+/// Install detection ignores only host links that boot can safely remove.
+/// Missing optional utilities cannot hide other v1 evidence.
+/// # Errors
+/// Failed observations are never treated as absence.
+pub fn detect_install_layout(
+    sys: &dyn System,
+    names: &[&str],
+    packages: &BTreeSet<String>,
+) -> Probe<Vec<V1Marker>> {
+    detect_layout(sys, names, Some(packages))
+}
+
+fn detect_layout(
+    sys: &dyn System,
+    names: &[&str],
+    packages: Option<&BTreeSet<String>>,
+) -> Probe<Vec<V1Marker>> {
     let mut markers = enabled_units(sys)?;
-    let tables = command(
-        sys,
-        Program::Nft,
-        &["-j".into(), "list".into(), "tables".into()],
-        EXEC_TIMEOUT,
-    )?;
-    let tables = crate::canon::canonicalize(&tables)?;
-    for entry in tables["nftables"]
-        .as_array()
-        .ok_or_else(|| ProbeError::setup("missing nftables table list"))?
-    {
-        let table = entry
-            .get("table")
-            .ok_or_else(|| ProbeError::setup("malformed nftables table listing"))?;
-        let family = table
-            .get("family")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| ProbeError::setup("missing table family"))?;
-        let name = table
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| ProbeError::setup("missing table name"))?;
-        if family == "inet" && name == "scupper" {
-            markers.push(V1Marker::HostTable);
+    if packages.is_some() && !markers.is_empty() {
+        return Ok(markers);
+    }
+    if packages.is_none_or(|p| p.contains("nftables")) {
+        let tables = command(
+            sys,
+            Program::Nft,
+            &["-j".into(), "list".into(), "tables".into()],
+            EXEC_TIMEOUT,
+        )?;
+        let tables = crate::canon::canonicalize(&tables)?;
+        for entry in tables["nftables"]
+            .as_array()
+            .ok_or_else(|| ProbeError::setup("missing nftables table list"))?
+        {
+            let table = entry
+                .get("table")
+                .ok_or_else(|| ProbeError::setup("malformed nftables table listing"))?;
+            let family = table
+                .get("family")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| ProbeError::setup("missing table family"))?;
+            let name = table
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| ProbeError::setup("missing table name"))?;
+            if family == "inet" && name == "scupper" {
+                markers.push(V1Marker::HostTable);
+            }
         }
+    }
+    if packages.is_some_and(|p| !p.contains("iproute2"))
+        || (packages.is_some() && !markers.is_empty())
+    {
+        return Ok(markers);
     }
     let links = command(
         sys,
@@ -60,9 +97,30 @@ pub fn detect_v1_layout(sys: &dyn System) -> Probe<Vec<V1Marker>> {
         EXEC_TIMEOUT,
     )?;
     let config = V1Config::default();
-    for link in parse::links(&links)? {
-        if link.name == config.client_iface.as_str() || link.name == config.exit_iface.as_str() {
-            markers.push(V1Marker::HostLink(link.name));
+    if packages.is_none() {
+        for link in crate::parse::links(&links)? {
+            if link.name == config.client_iface.as_str()
+                || link.name == config.exit_iface.as_str()
+                || names.contains(&link.name.as_str())
+            {
+                markers.push(V1Marker::HostLink(link.name));
+            }
+        }
+        return Ok(markers);
+    }
+    for link in scupper_core::parse::parse_ip_link(&links)? {
+        if link.ifname == config.client_iface.as_str()
+            || link.ifname == config.exit_iface.as_str()
+            || names.contains(&link.ifname.as_str())
+        {
+            if names.contains(&link.ifname.as_str())
+                && packages.is_some_and(|p| p.contains("wireguard-tools"))
+                && crate::boot::links::host_link_removable(sys, &link)
+                    .map_err(|e| ProbeError::setup(&e))?
+            {
+                continue;
+            }
+            markers.push(V1Marker::HostLink(link.ifname));
         }
     }
     Ok(markers)
@@ -133,4 +191,24 @@ fn enabled_units(sys: &dyn System) -> Probe<Vec<V1Marker>> {
         }
     }
     Ok(markers)
+}
+
+/// Identifies retired/unknown binaries by the version-store CLI, not semver:
+/// v1 and M2 development binaries can share the same package version.
+/// The caller first checks that the fixed installed path exists.
+/// # Errors
+/// Failed execution is an observation error, never evidence of absence.
+pub fn detect_installed_binary(sys: &dyn System) -> Probe<Option<V1Marker>> {
+    let output = sys
+        .run(
+            Program::Scupper,
+            &["config".into(), "--help".into()],
+            EXEC_TIMEOUT,
+        )
+        .map_err(|_| ProbeError::setup("cannot inspect installed binary"))?;
+    let words: BTreeSet<_> = output.stdout.split_whitespace().collect();
+    Ok(
+        (output.status != Some(0) || !words.contains("bundle") || !words.contains("validate"))
+            .then_some(V1Marker::Binary),
+    )
 }

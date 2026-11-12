@@ -24,6 +24,18 @@ const OUTPUT_CAP: usize = 1024 * 1024;
 /// A kernel utility selected without a shell or PATH lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub enum Program {
+    /// Installation utility `dpkgquery`.
+    DpkgQuery,
+    /// Installation utility `useradd`.
+    Useradd,
+    /// Installation utility `groupadd`.
+    Groupadd,
+    /// Installation utility `uname`.
+    Uname,
+    /// Installation utility `getent`.
+    Getent,
+    /// Installation utility `scupper`.
+    Scupper,
     /// Read fixed public procfs socket tables inside a namespace.
     Cat,
     /// `WireGuard` inspection.
@@ -51,6 +63,12 @@ impl Program {
     #[must_use]
     pub const fn default_path(self) -> &'static str {
         match self {
+            Self::DpkgQuery => "/usr/bin/dpkg-query",
+            Self::Useradd => "/usr/sbin/useradd",
+            Self::Groupadd => "/usr/sbin/groupadd",
+            Self::Uname => "/usr/bin/uname",
+            Self::Getent => "/usr/bin/getent",
+            Self::Scupper => scupper_core::install::SCUPPER_FILE,
             Self::Cat => "/usr/bin/cat",
             Self::Nsenter => "/usr/bin/nsenter",
             Self::Sysctl => "/usr/sbin/sysctl",
@@ -68,6 +86,12 @@ impl Program {
 /// Validated executable paths; private fields prevent relative-path injection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Programs {
+    dpkgquery: PathBuf,
+    useradd: PathBuf,
+    groupadd: PathBuf,
+    uname: PathBuf,
+    getent: PathBuf,
+    scupper: PathBuf,
     cat: PathBuf,
     wg: PathBuf,
     ip: PathBuf,
@@ -83,6 +107,12 @@ pub struct Programs {
 impl Default for Programs {
     fn default() -> Self {
         Self {
+            dpkgquery: Program::DpkgQuery.default_path().into(),
+            useradd: Program::Useradd.default_path().into(),
+            groupadd: Program::Groupadd.default_path().into(),
+            uname: Program::Uname.default_path().into(),
+            getent: Program::Getent.default_path().into(),
+            scupper: Program::Scupper.default_path().into(),
             cat: Program::Cat.default_path().into(),
             wg: Program::Wg.default_path().into(),
             ip: Program::Ip.default_path().into(),
@@ -115,6 +145,12 @@ impl Programs {
                 return Err(ExecError::spawn("program path must be absolute"));
             }
             let destination = match program {
+                Program::DpkgQuery => &mut paths.dpkgquery,
+                Program::Useradd => &mut paths.useradd,
+                Program::Groupadd => &mut paths.groupadd,
+                Program::Uname => &mut paths.uname,
+                Program::Getent => &mut paths.getent,
+                Program::Scupper => &mut paths.scupper,
                 Program::Cat => &mut paths.cat,
                 Program::Nsenter => &mut paths.nsenter,
                 Program::Sysctl => &mut paths.sysctl,
@@ -135,6 +171,12 @@ impl Programs {
     #[must_use]
     pub fn path(&self, program: Program) -> &Path {
         match program {
+            Program::DpkgQuery => &self.dpkgquery,
+            Program::Useradd => &self.useradd,
+            Program::Groupadd => &self.groupadd,
+            Program::Uname => &self.uname,
+            Program::Getent => &self.getent,
+            Program::Scupper => &self.scupper,
             Program::Cat => &self.cat,
             Program::Nsenter => &self.nsenter,
             Program::Sysctl => &self.sysctl,
@@ -238,6 +280,11 @@ pub enum ExecTarget<'a> {
 /// }
 /// ```
 pub trait System {
+    /// Effective uid observed by installation (injectable for fake hosts).
+    fn install_uid(&self) -> u32 {
+        rustix::process::geteuid().as_raw()
+    }
+
     /// Identity currently published at a namespace path.
     /// # Errors
     /// Returns metadata errors, including a missing namespace name.

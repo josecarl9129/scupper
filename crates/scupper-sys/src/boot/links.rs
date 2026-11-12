@@ -24,33 +24,10 @@ pub(crate) fn cleanup_host(deps: &BootDeps<'_>, name: &str) -> Result<()> {
     )?)
     .map_err(|e| e.to_string())?;
     if let Some(link) = links.iter().find(|link| link.ifname == name) {
-        if link.kind.as_deref() != Some("wireguard")
-            || link.flags.iter().any(|f| f == "UP")
-            || link.xdp
-        {
-            return Err("host link name collision: not positively ours".into());
-        }
-        let peers = execute(
-            deps,
-            ExecTarget::Host,
-            Program::Wg,
-            &strings(&["show", name, "peers"]),
-            None,
-        )?;
-        let addresses = parse_ip_addr(&execute(
-            deps,
-            ExecTarget::Host,
-            Program::Ip,
-            &strings(&["-j", "addr", "show"]),
-            None,
-        )?)
-        .map_err(|e| e.to_string())?;
-        if !peers.trim().is_empty()
-            || !addresses
-                .iter()
-                .any(|a| a.ifname == name && a.ifindex == link.ifindex && a.addresses.is_empty())
-        {
-            return Err("host link name collision: peers or addresses present".into());
+        if !host_link_removable(deps.system, link)? {
+            return Err(
+                "host link name collision: not a down, peerless, unaddressed WireGuard link".into(),
+            );
         }
         execute(
             deps,
@@ -61,6 +38,42 @@ pub(crate) fn cleanup_host(deps: &BootDeps<'_>, name: &str) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// Read-only predicate shared by boot cleanup and installation detection.
+pub(crate) fn host_link_removable(
+    system: &dyn crate::system::System,
+    link: &scupper_core::parse::IpLink,
+) -> Result<bool> {
+    if link.kind.as_deref() != Some("wireguard") || link.flags.iter().any(|f| f == "UP") || link.xdp
+    {
+        return Ok(false);
+    }
+    let run = |program, args: &[&str]| {
+        let args = strings(args);
+        if program == Program::Wg {
+            crate::system::check_wg_args(system, &args)
+                .map_err(|e| format!("cannot inspect host link: {e}"))?;
+        }
+        let output = system
+            .run(program, &args, crate::system::EXEC_TIMEOUT)
+            .map_err(|e| format!("cannot inspect host link: {e}"))?;
+        if output.status != Some(0) {
+            return Err(format!(
+                "{program:?} cannot inspect host link (status {:?}): {}",
+                output.status,
+                super::diagnostic(&output.stderr)
+            ));
+        }
+        Ok(output.stdout)
+    };
+    let peers = run(Program::Wg, &["show", &link.ifname, "peers"])?;
+    let addresses =
+        parse_ip_addr(&run(Program::Ip, &["-j", "addr", "show"])?).map_err(|e| e.to_string())?;
+    Ok(peers.trim().is_empty()
+        && addresses.iter().any(|a| {
+            a.ifname == link.ifname && a.ifindex == link.ifindex && a.addresses.is_empty()
+        }))
 }
 
 pub(crate) fn add_host(deps: &BootDeps<'_>, name: &str) -> Result<()> {

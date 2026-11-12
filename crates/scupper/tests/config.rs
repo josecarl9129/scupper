@@ -1333,7 +1333,13 @@ fn orphan_recovery_retains_staged_identity_and_unrelated_exit_names() {
         .unwrap()
         .set_modified(std::time::UNIX_EPOCH)
         .unwrap();
-    let (code, out, err) = h.run(&["exit", "import", source.path(), "--yes"]);
+    let (code, out, err) = h.run(&[
+        "exit",
+        "import",
+        source.path(),
+        "--yes",
+        "--replace-leftover-key",
+    ]);
     assert_eq!(code, 0, "{out} {err}");
     assert!(!stale.exists());
     assert_eq!(
@@ -1718,7 +1724,7 @@ fn initial_import_library_publishes_first_exit_and_keys_in_an_empty_store() {
 }
 
 #[test]
-fn existing_next_generation_requires_yes_and_reports_unreferenced_before_replacement() {
+fn existing_next_generation_requires_dedicated_flag_before_replacement() {
     let mut h = Harness::new();
     h.tty = true;
     h.load();
@@ -1731,9 +1737,19 @@ fn existing_next_generation_requires_yes_and_reports_unreferenced_before_replace
     let (code, out, err) = h.run_prompt(&["exit", "import", source.path()], &h);
     assert_eq!(code, 1);
     assert!(out.contains("unreferenced"), "{out}");
-    assert!(err.contains("--yes"), "{err}");
+    assert!(err.contains("--replace-leftover-key"), "{err}");
     assert_eq!(h.snapshot(), before);
-    let (code, out, err) = h.run(&["exit", "import", source.path(), "--yes"]);
+    let (code, _, err) = h.run(&["exit", "import", source.path(), "--yes"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("--replace-leftover-key"));
+    assert_eq!(h.snapshot(), before);
+    let (code, out, err) = h.run(&[
+        "exit",
+        "import",
+        source.path(),
+        "--yes",
+        "--replace-leftover-key",
+    ]);
     assert_eq!(code, 0, "{out} {err}");
     assert!(out.contains("unreferenced"));
     assert_eq!(fs::read(key).unwrap(), IMPORT_PRIVATE.as_bytes());

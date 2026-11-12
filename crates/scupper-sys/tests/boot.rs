@@ -2448,3 +2448,29 @@ fn apply_input_io_and_corruption_keep_their_error_kinds_in_both_modes() {
         }
     }
 }
+
+#[test]
+fn host_link_inspection_keeps_status_and_sanitized_bounded_stderr() {
+    for (program, needle) in [
+        (Program::Wg, "show wg0 peers"),
+        (Program::Ip, "-j addr show"),
+    ] {
+        let f = Fixture::new();
+        f.kernel
+            .host
+            .borrow_mut()
+            .insert("wg0".into(), Link::new("wireguard"));
+        *f.kernel.failure.borrow_mut() = Some((
+            program,
+            needle.into(),
+            format!("inspection\nfailed\t{}", "x".repeat(3000)),
+        ));
+        let report = f.run(None);
+        assert!(!report.succeeded(), "{report:?}");
+        let error = report.steps.last().unwrap().error.as_ref().unwrap();
+        assert!(error.contains("status Some(2)"), "{error}");
+        assert!(error.contains("inspection failed "), "{error}");
+        assert!(!error.chars().any(char::is_control));
+        assert!(error.len() < 2200);
+    }
+}

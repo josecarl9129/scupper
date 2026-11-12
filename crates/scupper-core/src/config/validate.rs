@@ -57,7 +57,7 @@ impl Errors {
             !text.contains('%')
                 && text
                     .parse::<SocketAddr>()
-                    .is_ok_and(|a| a.port() > 0 && !a.ip().is_unspecified()),
+                    .is_ok_and(|a| a.port() > 0 && super::valid_endpoint_ip(a.ip())),
             path,
             Rule::InvalidEndpoint,
         );
