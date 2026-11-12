@@ -1,5 +1,5 @@
-#![cfg(target_os = "linux")]
 //! CLI parsing, isolated-canon safety guards, and interaction contracts.
+#![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used)]
 use scupper::{
     cli::{self, Dependencies, NamespaceReader, Privilege, Prompt},

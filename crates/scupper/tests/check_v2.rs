@@ -1,5 +1,5 @@
-#![cfg(target_os = "linux")]
 //! CLI routing, non-TTY output and schema checks through the real M2 driver.
+#![cfg(target_os = "linux")]
 #![cfg(feature = "testing")]
 #![allow(clippy::unwrap_used)]
 #[path = "../../scupper-sys/tests/support/v2.rs"]
