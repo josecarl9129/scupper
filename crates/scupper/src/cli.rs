@@ -17,6 +17,7 @@ mod config;
 mod control;
 mod exits;
 mod install;
+mod secret;
 use config::ConfigCommand;
 
 #[derive(Parser)]
@@ -116,6 +117,11 @@ enum Command {
     Alerts {
         #[command(subcommand)]
         command: alerts::AlertsCommand,
+    },
+    /// Provision or inspect root-only gateway secret files.
+    Secret {
+        #[command(subcommand)]
+        command: secret::SecretCommand,
     },
     /// Provision this gateway from explicit flags or a verified bundle.
     Install(install::InstallArgs),
@@ -344,6 +350,10 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
+    let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    // A mistaken extra argument can itself be a credential. Clap diagnostics
+    // normally quote such arguments; secret commands must keep them value-free.
+    let secret_command = args.iter().any(|arg| arg == "secret");
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
         Err(error) => {
@@ -354,7 +364,14 @@ where
                 let _ = write!(stdout, "{error}");
                 return 0;
             }
-            let _ = writeln!(stderr, "scupper: {error}");
+            if secret_command {
+                let _ = writeln!(
+                    stderr,
+                    "scupper: invalid secret command; run scupper secret --help"
+                );
+            } else {
+                let _ = writeln!(stderr, "scupper: {error}");
+            }
             return 1;
         }
     };
@@ -404,7 +421,8 @@ fn dispatch(
     if json
         && matches!(
             command,
-            Command::Config { .. }
+            Command::Secret { .. }
+                | Command::Config { .. }
                 | Command::Rules { .. }
                 | Command::Exit { .. }
                 | Command::Install(..)
@@ -572,6 +590,7 @@ fn dispatch(
         }
         Command::Install(args) => install::run(args, deps, stdout, stderr),
         Command::Alerts { command } => alerts::run(command, deps, json, stdout),
+        Command::Secret { command } => secret::run(command, deps, stdout),
         Command::Config { command } => config::run(command, deps, stdout),
         Command::Exit { command } => exits::run(command, deps, stdout),
         Command::Rules { diff } => config::rules(deps, diff, stdout),

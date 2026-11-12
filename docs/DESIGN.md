@@ -1506,6 +1506,9 @@ scupper                                 bare: short status summary with next-ste
 │   └── create --provider digitalocean [--region R] [--size S] [--name N] [--token REF]
 ├── secret
 │   ├── check REF                       resolve REF, print ok + value length only (never the value)
+│   ├── set url REF [--replace]          gateway: hidden URL prompt or one stdin line; root only
+│   ├── set telegram REF [--replace]     gateway: hidden bot token + visible chat id, or two stdin lines
+│   ├── list                            gateway: names, kinds, modes, referenced by any committed version; root only
 │   └── backends                        list built-in and command-defined schemes
 ├── version
 ├── completion SHELL
@@ -1906,6 +1909,33 @@ healthy verdict is never exported as current. `GET /v1/health` means only
 | macOS notification | posted locally by the Mac agent (§14), not pushed by the gateway |
 
 No native SMTP sink.
+
+On Linux gateways, `scupper secret set url REF [--replace]` reads a URL
+from a hidden TTY prompt or one stdin line (at most 4 KiB, excluding the
+optional final newline). It uses the same HTTPS, host and no-userinfo
+validation as delivery. `scupper secret set telegram REF [--replace]`
+reads a hidden bot token followed by a visible chat id, or two stdin lines.
+Tokens have a decimal bot id, a colon and at least 35 URL-safe characters;
+chat ids are decimal with an optional leading minus, or `@channelname`
+(ASCII letters, digits and underscores). The assembled URL is also capped
+at 4 KiB. Neither command accepts values in arguments or the environment.
+
+Both commands require root, validate the reference basename, and durably
+write `/etc/scupper/secrets/url/REF` (root 0600; directories 0700) through
+confined directory descriptors and the shared temporary-file, fsync, rename,
+directory-fsync writer. Existing files require `--replace`; replacement
+refuses symlinks, special files and unsafe ownership or modes. Confirmation
+shows only the ref and `https://example.com/…`, or
+`telegram bot 0000… chat @fake_channel`, never the URL path/query or token.
+The current config head determines the next step: `scupper alerts test SINK`
+for each matching sink, or heartbeat use at its next interval. Unreferenced
+and historical-only refs point to `scupper config edit`.
+
+`scupper secret list` shows names, kinds, modes and whether any committed
+config version references each file, without reading contents.
+`scupper secret check REF` uses the daemon's resolver and prints only ok and
+value length, checking both kinds if the same basename exists in both.
+Both gateway inspection commands also require root.
 
 Telegram uses the JSON object `{"text": ...}`. Store the bot token and chat ID
 only in the local secret URL, with path `/bot<token>/sendMessage` and query
