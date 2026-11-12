@@ -65,6 +65,15 @@ enum Command {
         #[arg(long)]
         durations: Option<PathBuf>,
     },
+    /// Run installed units with real systemd on an ephemeral CI runner.
+    SystemdLab {
+        #[arg(long, default_value = "systemd-lab-out")]
+        artifacts: PathBuf,
+        #[arg(long)]
+        binaries: PathBuf,
+        #[arg(long, value_parser = ["L9", "L10", "L14", "L44", "V-13"])]
+        case: String,
+    },
     /// Namespace-local canary sink (used by leaktest).
     #[command(hide = true)]
     Sink {
@@ -100,6 +109,7 @@ enum Command {
         marker: String,
     },
 }
+#[allow(clippy::too_many_lines)] // Keep the platform-gated command dispatch together.
 fn run(command: Command) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     match command {
         Command::RouteCheck { .. } => Err("route-check requires Linux".into()),
@@ -164,6 +174,15 @@ fn run(command: Command) -> Result<bool, Box<dyn std::error::Error + Send + Sync
                 durations.as_deref(),
                 case.as_deref(),
             )?;
+            Ok(true)
+        }
+        #[cfg(target_os = "linux")]
+        Command::SystemdLab {
+            artifacts,
+            binaries,
+            case,
+        } => {
+            xtask::lab::run_systemd(&artifacts, &binaries, &case)?;
             Ok(true)
         }
         #[cfg(target_os = "linux")]

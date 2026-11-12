@@ -42,13 +42,23 @@ impl Lab {
         Ok(())
     }
     fn build_wan(&mut self) -> Result<()> {
+        self.build_wan_mode(false)
+    }
+    pub(super) fn build_wan_mode(&mut self, root_gateway: bool) -> Result<()> {
         for ns in ["wan", "gwhost", "client", "client2", "provA", "internet"] {
-            self.new_namespace(ns, "")?;
+            if !root_gateway || ns != "gwhost" {
+                self.new_namespace(ns, "")?;
+            }
         }
         for segment in [A.gwhost, A.client, A.client2, A.provider, A.internet] {
-            self.veth(segment, "eth0")?;
+            if !root_gateway || segment.ns != "gwhost" {
+                self.veth(segment, "eth0")?;
+            }
         }
         for ns in ["wan", "gwhost", "client", "client2", "provA", "internet"] {
+            if root_gateway && ns == "gwhost" {
+                continue;
+            }
             self.cmd(
                 ns,
                 "sysctl",
@@ -169,7 +179,7 @@ impl Lab {
         self.boot_adopt()?;
         Ok(())
     }
-    fn build_provider(&mut self) -> Result<()> {
+    pub(super) fn build_provider(&mut self) -> Result<()> {
         self.cmd("provA", "ip", &["link", "add", "wgp", "type", "wireguard"])?;
         self.wg(
             "provA",
@@ -211,7 +221,7 @@ impl Lab {
 
         Ok(())
     }
-    fn build_client(&mut self) -> Result<()> {
+    pub(super) fn build_client(&mut self) -> Result<()> {
         self.cmd(
             "client",
             "ip",
@@ -258,6 +268,9 @@ impl Lab {
         Ok(())
     }
     fn build_second_client(&mut self) -> Result<()> {
+        self.build_second_client_mode(true)
+    }
+    pub(super) fn build_second_client_mode(&mut self, verify_fixed_ports: bool) -> Result<()> {
         self.cmd(
             "client2",
             "ip",
@@ -295,10 +308,12 @@ impl Lab {
         self.address_up("client2", "wg0", "10.99.0.3/32", 1420)?;
         self.cmd("client2", "ip", &["route", "add", "default", "dev", "wg0"])?;
         self.client_ports_ready = true;
-        self.assert_transport_ports()?;
+        if verify_fixed_ports {
+            self.assert_transport_ports()?;
+        }
         Ok(())
     }
-    fn start_sinks(&mut self) -> Result<()> {
+    pub(super) fn start_sinks(&mut self) -> Result<()> {
         fs::write(self.artifacts.join("sink.jsonl"), "")?;
         let executable = self.executable.clone();
         let log = self
@@ -421,7 +436,13 @@ impl Lab {
         }
         Ok(())
     }
-    fn address_up(&mut self, ns: &str, iface: &str, address: &str, mtu: u32) -> Result<()> {
+    pub(super) fn address_up(
+        &mut self,
+        ns: &str,
+        iface: &str,
+        address: &str,
+        mtu: u32,
+    ) -> Result<()> {
         self.cmd(ns, "ip", &["addr", "add", address, "dev", iface])?;
         self.cmd(
             ns,

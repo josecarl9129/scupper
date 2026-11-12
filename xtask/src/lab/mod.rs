@@ -18,8 +18,10 @@ pub use route_fixture::route_check;
 mod probe_child;
 mod shard;
 pub use shard::{Shard, list, list_with_durations};
+mod systemd;
 mod topology;
 mod transport;
+pub use systemd::run as run_systemd;
 
 use addresses::A;
 use cleanup::{Registry, Resource};

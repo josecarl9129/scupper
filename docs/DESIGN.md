@@ -2741,6 +2741,16 @@ exact M2 rules and resumes it; M2 configuration still refuses IPv6. L9
 crash prefixes are independent simulated boots: their lab-private `/run`
 boot-attempt budgets are saved and reset between prefixes; production
 retry limits are unchanged.
+The separate installed-unit systemd lab uses the runner's root namespace as
+its gateway host, with only a lab veth `up0` to `wan`. Default routes and
+`eth0` addresses are guarded; networkd must report `up0` unmanaged (a
+lab-only runtime `.network` file is added if needed). It installs release
+binaries and tests L9, L10, L14, L44 and V-13 under real udev, networkd and
+systemd on both Ubuntu CI versions. Unlike the namespace lab's port pinning,
+it records each real boot's exit port for exact uplink tuples. Its reboot
+simulation stops the units, deletes namespace links and the named namespace,
+clears runtime state and only lab conntrack entries, preserves configuration
+and durable state, and starts the installed units in dependency order.
 L19 replays source policy routing in a lab-only table (R1 production has no
 client policy rule), and extends L2/L3/L4/L6 with focused provenance, established-flow,
 local-output and route-stage subtrials. L3/L4 deliberately add a preferred veth
