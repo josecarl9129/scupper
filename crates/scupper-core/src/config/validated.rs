@@ -324,6 +324,11 @@ impl ValidatedExit {
     pub fn private_key_ref(&self) -> &SecretName {
         &self.settings.private_key_ref
     }
+    /// Returns the optional local preshared-key reference.
+    #[must_use]
+    pub fn preshared_key_ref(&self) -> Option<&SecretName> {
+        self.settings.preshared_key_ref.as_ref()
+    }
     /// Returns the tunnel MTU.
     #[must_use]
     pub fn mtu(&self) -> u32 {

@@ -322,9 +322,7 @@ fn exits(gw: &Gateway, health: &HealthSettings, path: &str, errors: &mut Errors)
         );
         let name = exit.name.as_str();
         errors.check(
-            (1..=32).contains(&name.chars().count())
-                && !name.trim().is_empty()
-                && name.chars().all(|c| !c.is_control()),
+            exit.name.is_valid(),
             &child(&path, "name"),
             Rule::InvalidExitName,
         );
@@ -358,6 +356,13 @@ fn exits(gw: &Gateway, health: &HealthSettings, path: &str, errors: &mut Errors)
             &child(&path, "private_key_ref"),
             SecretKind::Wg,
         );
+        if let Some(reference) = &exit.preshared_key_ref {
+            errors.secret(
+                reference,
+                &child(&path, "preshared_key_ref"),
+                SecretKind::Wg,
+            );
+        }
         errors.public_key(&exit.peer_public_key, &child(&path, "peer_public_key"));
         errors.endpoint(&exit.endpoint, &child(&path, "endpoint"));
         if let Some(net) = errors.address(&exit.address4, &child(&path, "address4")) {

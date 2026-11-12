@@ -324,6 +324,22 @@ pub(crate) fn configure_peers(
             },
             None,
         )?;
+        if exit.preshared_key_ref().is_some() {
+            let secret = cfg
+                .secrets
+                .get(&format!("{}:psk", exit.ifname()))
+                .ok_or("resolved preshared key missing")?;
+            wg(
+                deps,
+                handle,
+                WgCmd::SetPresharedKeyFromStdin {
+                    ifname: IfName::new(exit.ifname().as_str()).map_err(|e| e.to_string())?,
+                    public_key: PeerKey::new(exit.peer_public_key_text().as_str())
+                        .map_err(|e| e.to_string())?,
+                },
+                Some(secret.expose()),
+            )?;
+        }
     }
     Ok(())
 }

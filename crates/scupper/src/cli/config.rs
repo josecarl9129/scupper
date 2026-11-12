@@ -29,6 +29,13 @@ pub(super) enum ConfigCommand {
         #[arg(long)]
         yes: bool,
     },
+    /// Export all public configuration history, or verify a bundle without writing.
+    Bundle {
+        #[arg(short = 'o', long, conflicts_with = "verify")]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        verify: Option<PathBuf>,
+    },
     /// List committed versions and their attribution.
     History,
     /// Compare two versions (defaults to head-1 and head).
@@ -88,6 +95,29 @@ pub(super) fn run(
 ) -> Result<u8, String> {
     let store = VersionStore::read_only(deps.state_root, deps.config_root);
     match command {
+        ConfigCommand::Bundle { output, verify } => {
+            if let Some(file) = verify {
+                let bytes = scupper_sys::bundle::read_bundle(&file).map_err(|e| e.to_string())?;
+                scupper_sys::bundle::verify(&bytes).map_err(|e| e.to_string())?;
+                writeln!(stdout, "bundle is valid").map_err(output_error)?;
+            } else {
+                let bytes = scupper_sys::bundle::export(deps.state_root, None)
+                    .map_err(|e| e.to_string())?;
+                if let Some(file) = output {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    let mut output = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o640)
+                        .open(file)
+                        .map_err(|e| e.to_string())?;
+                    output.write_all(&bytes).map_err(output_error)?;
+                    output.sync_all().map_err(output_error)?;
+                } else {
+                    stdout.write_all(&bytes).map_err(output_error)?;
+                }
+            }
+        }
         ConfigCommand::Show { version } => {
             let version = version.map_or_else(|| head(&store), Ok)?;
             let (text, _) = store.read(version).map_err(|error| error.to_string())?;
@@ -208,6 +238,12 @@ fn store_new(
     let store =
         VersionStore::open_with_mirror_root(deps.state_root, deps.config_root, Some(&writer))
             .map_err(|error| error.to_string())?;
+    scupper_sys::secrets::SecretFile::preflight(
+        deps.config_root,
+        &parse_site(text).map_err(|e| e.to_string())?,
+        rustix::process::geteuid().as_raw(),
+    )
+    .map_err(|e| e.to_string())?;
     let version = store
         .commit(
             &writer,

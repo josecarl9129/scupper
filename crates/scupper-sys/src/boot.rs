@@ -185,21 +185,62 @@ pub(crate) fn inputs_for_link(
     report: &mut BootReport,
     only: Option<&str>,
 ) -> Result<Inputs> {
+    inputs_for_version(deps, report, only, None).map_err(|e| e.to_string())
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum InputError {
+    #[error(transparent)]
+    Store(#[from] crate::store::StoreError),
+    #[error("{0}")]
+    Internal(String),
+    #[error("{0}")]
+    Persistence(String),
+    #[error("{0}")]
+    Secret(#[from] crate::secrets::SecretError),
+    #[error(
+        "selection names exit {0}, which is absent from the target version; run scupper connect to select Auto before applying"
+    )]
+    Selection(scupper_core::config::ExitId),
+}
+impl From<String> for InputError {
+    fn from(value: String) -> Self {
+        Self::Internal(value)
+    }
+}
+impl From<&str> for InputError {
+    fn from(value: &str) -> Self {
+        Self::Internal(value.into())
+    }
+}
+
+#[allow(clippy::too_many_lines)] // Keep validation and secret resolution in one pre-mutation input boundary.
+pub(crate) fn inputs_for_version(
+    deps: &BootDeps<'_>,
+    report: &mut BootReport,
+    only: Option<&str>,
+    target: Option<u64>,
+) -> Result<Inputs, InputError> {
     let store = VersionStore::read_only(deps.state_root, deps.config_root);
-    let head = store
-        .head()
-        .map_err(|e| e.to_string())?
-        .ok_or("no configuration")?;
+    let head = match target {
+        Some(version) => version,
+        None => store.head()?.ok_or("no configuration")?,
+    };
     let resolved = StateFile::open(deps.state_root, None)
         .and_then(|file| file.read())
-        .map_err(|e| e.to_string())?
+        .map_err(|e| InputError::Persistence(e.to_string()))?
         .for_boot(true);
+    if target.is_some() && resolved.missing_state_alert {
+        return Err(InputError::Persistence("state.json missing".into()));
+    }
     if resolved.missing_state_alert {
         report.warnings.push("state.json missing with a configuration head: Disconnected; lost quarantine state requires operator attention".into());
     }
     // Missing state deliberately uses head with closed intent, without hiding the
     // loss by writing replacement state. Present state must name an applied version.
-    let version = if resolved.missing_state_alert {
+    let version = if let Some(target) = target {
+        target
+    } else if resolved.missing_state_alert {
         head
     } else {
         resolved
@@ -207,10 +248,13 @@ pub(crate) fn inputs_for_link(
             .applied_version
             .ok_or("state has no applied version")?
     };
-    let (text, _) = store.read(version).map_err(|e| e.to_string())?;
+    let (text, _) = store.read(version)?;
     report.applied_version = Some(version);
-    let site = validate(parse_site(&text).map_err(|_| "invalid configuration")?)
-        .map_err(|_| "invalid configuration")?;
+    let parsed = parse_site(&text).map_err(|_| "invalid configuration")?;
+    if target.is_some() {
+        warn_url_secrets(deps, report, &parsed);
+    }
+    let site = validate(parsed).map_err(|_| "invalid configuration")?;
     let gateway = GatewayId(
         RealFs
             .read(&deps.config_root.join("gateway-id"))
@@ -219,6 +263,12 @@ pub(crate) fn inputs_for_link(
             .into(),
     );
     let gw = site.gateway(&gateway).ok_or("unknown gateway-id")?;
+    if target.is_some()
+        && let Selection::Pin(id) | Selection::Prefer(id) = &resolved.state.selection
+        && !gw.exits().iter().any(|exit| exit.id() == id)
+    {
+        return Err(InputError::Selection(id.clone()));
+    }
     let stamp = VersionStamp {
         version,
         sha256: Sha256::digest(text.as_bytes()).into(),
@@ -226,11 +276,13 @@ pub(crate) fn inputs_for_link(
     let rules = render_netns(&site, &gateway, &stamp).map_err(|e| e.to_string())?;
     match RealFs.read(&deps.state_root.join(format!("rendered/{version:06}.nft"))) {
         Ok(saved) if saved != rules => {
-            return Err("stored render differs from applied configuration".into());
+            return Err(InputError::Internal(
+                "stored render differs from applied configuration".into(),
+            ));
         }
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.to_string()),
+        Err(error) => return Err(InputError::Persistence(error.to_string())),
     }
     let refs = std::iter::once((
         gw.client_tunnel().ifname().as_str(),
@@ -247,7 +299,20 @@ pub(crate) fn inputs_for_link(
         let key = SecretFile::open_with_owner(deps.config_root, reference, deps.secret_owner);
         #[cfg(not(feature = "testing"))]
         let key = SecretFile::open(deps.config_root, reference);
-        secrets.insert(name.into(), key.map_err(|e| e.to_string())?);
+        secrets.insert(name.into(), key?);
+    }
+    for exit in gw
+        .exits()
+        .iter()
+        .filter(|exit| only.is_none_or(|name| name == exit.ifname().as_str()))
+    {
+        if let Some(reference) = exit.preshared_key_ref() {
+            #[cfg(feature = "testing")]
+            let key = SecretFile::open_with_owner(deps.config_root, reference, deps.secret_owner);
+            #[cfg(not(feature = "testing"))]
+            let key = SecretFile::open(deps.config_root, reference);
+            secrets.insert(format!("{}:psk", exit.ifname()), key?);
+        }
     }
     Ok(Inputs {
         site,
@@ -258,6 +323,28 @@ pub(crate) fn inputs_for_link(
         secrets,
         missing_state_alert: resolved.missing_state_alert,
     })
+}
+
+fn warn_url_secrets(
+    deps: &BootDeps<'_>,
+    report: &mut BootReport,
+    site: &scupper_core::config::SiteConfig,
+) {
+    #[cfg(feature = "testing")]
+    let owner = deps.secret_owner;
+    #[cfg(not(feature = "testing"))]
+    let owner = 0;
+    for reference in site
+        .alerts
+        .sinks
+        .values()
+        .map(scupper_core::config::AlertSink::url_ref)
+        .chain(site.heartbeat.as_ref().map(|h| &h.url_ref))
+    {
+        if let Err(error) = SecretFile::open_with_owner(deps.config_root, reference, owner) {
+            report.warnings.push(error.to_string());
+        }
+    }
 }
 
 fn strings(args: &[&str]) -> Vec<String> {
@@ -725,6 +812,13 @@ pub(crate) fn configured_names(cfg: &Inputs) -> Result<Vec<IfName>> {
 /// Internal fixture boundary for release-restricted multi-gateway configurations.
 #[cfg(feature = "testing")]
 pub mod testing {
+    /// Resolves the exact boot/apply inputs without performing kernel mutations.
+    /// # Errors
+    /// Returns the production input loader's validation or secret-resolution error.
+    pub fn inputs(deps: &super::BootDeps<'_>) -> Result<(), String> {
+        super::inputs(deps, &mut super::BootReport::default()).map(|_| ())
+    }
+
     /// Reconfigures the client link using the production peer/session path.
     /// # Errors
     /// Returns missing inputs, namespace or link configuration errors.

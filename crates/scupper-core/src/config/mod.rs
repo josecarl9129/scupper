@@ -7,6 +7,7 @@
 mod model;
 mod network;
 mod parse;
+pub mod provider;
 mod types;
 mod validate;
 mod validated;
@@ -57,7 +58,7 @@ rules! {
     DuplicateExitName => "Exit names must be unique ignoring case.",
     ExitNameMatchesId => "An exit name must not equal another exit's ID.",
     InvalidTag => "Tags must contain lowercase letters, digits or hyphens.",
-    EmptyPolicy => "The ordered exit policy must not be empty.",
+    EmptyPolicy => "The ordered exit policy must be nonempty.",
     UnknownExit => "Every policy exit must exist.",
     DisabledExit => "Policy exits must be enabled.",
     DuplicatePolicyExit => "Policy exits must not repeat.",

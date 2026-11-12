@@ -521,8 +521,8 @@ negative!(
 );
 negative!(
     no_exit,
-    "gateways.gw1.exits",
-    NotSupportedInThisRelease,
+    "policy.exits[0]",
+    UnknownExit,
     |c: &mut SiteConfig| gateway(c).exits.clear()
 );
 negative!(
@@ -614,12 +614,12 @@ fn second_gateway_and_shared_identity_are_rejected() {
 }
 
 #[test]
-fn second_exit_checks_duplicates_even_when_release_rejects_it() {
+fn second_exit_checks_duplicates() {
     let mut cfg = config();
     let mut second = exit(&mut cfg).clone();
     second.name.0 = "zURICH".into();
     gateway(&mut cfg).exits.push(second);
-    let errors = rejects(cfg, "gateways.gw1.exits", Rule::NotSupportedInThisRelease);
+    let errors = rejects(cfg, "gateways.gw1.exits[1].id", Rule::DuplicateExitId);
     for (field, rule) in [
         ("id", Rule::DuplicateExitId),
         ("name", Rule::DuplicateExitName),
@@ -1859,4 +1859,36 @@ fn policy_initial_qualification_defaults_bounds_and_old_key_rejected() {
     );
     let serialized = toml::to_string(&cfg).unwrap();
     assert!(!serialized.contains("fail_closed_grace_seconds"));
+}
+
+#[test]
+fn m2_rejects_empty_and_multiple_exits_and_policy() {
+    let mut empty = config();
+    gateway(&mut empty).exits.clear();
+    empty.policy.exits.clear();
+    let errors = rejects(empty, "gateways.gw1.exits", Rule::NotSupportedInThisRelease);
+    assert!(errors.contains(&ValidationError {
+        path: "policy.exits".into(),
+        rule: Rule::NotSupportedInThisRelease
+    }));
+    assert!(errors.contains(&ValidationError {
+        path: "policy.exits".into(),
+        rule: Rule::EmptyPolicy
+    }));
+    let mut multiple = config();
+    let mut second = exit(&mut multiple).clone();
+    second.id.0 = "second".into();
+    second.name.0 = "Second".into();
+    second.ifname = "ex-second".into();
+    multiple.policy.exits.push(second.id.clone());
+    gateway(&mut multiple).exits.push(second);
+    let errors = rejects(
+        multiple,
+        "gateways.gw1.exits",
+        Rule::NotSupportedInThisRelease,
+    );
+    assert!(errors.contains(&ValidationError {
+        path: "policy.exits".into(),
+        rule: Rule::NotSupportedInThisRelease
+    }));
 }

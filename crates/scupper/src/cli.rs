@@ -15,6 +15,7 @@ use clap::{Parser, Subcommand, error::ErrorKind};
 mod alerts;
 mod config;
 mod control;
+mod exits;
 use config::ConfigCommand;
 
 #[derive(Parser)]
@@ -95,6 +96,11 @@ enum Command {
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
+    },
+    /// Import or remove a provider exit on this gateway.
+    Exit {
+        #[command(subcommand)]
+        command: exits::ExitCommand,
     },
     /// Inspect alert sinks or send a test notification.
     Alerts {
@@ -383,7 +389,12 @@ fn dispatch(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<u8, String> {
-    if json && matches!(command, Command::Config { .. } | Command::Rules { .. }) {
+    if json
+        && matches!(
+            command,
+            Command::Config { .. } | Command::Rules { .. } | Command::Exit { .. }
+        )
+    {
         return Err("--json is supported only for check and status".into());
     }
     match command {
@@ -542,6 +553,7 @@ fn dispatch(
         }
         Command::Alerts { command } => alerts::run(command, deps, json, stdout),
         Command::Config { command } => config::run(command, deps, stdout),
+        Command::Exit { command } => exits::run(command, deps, stdout),
         Command::Rules { diff } => config::rules(deps, diff, stdout),
     }
 }

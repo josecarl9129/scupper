@@ -111,6 +111,7 @@ fn fields(shape: &str) -> &'static [(&'static str, &'static str)] {
             ("provider", ""),
             ("ifname", ""),
             ("private_key_ref", ""),
+            ("preshared_key_ref", ""),
             ("peer_public_key", ""),
             ("endpoint", ""),
             ("address4", ""),

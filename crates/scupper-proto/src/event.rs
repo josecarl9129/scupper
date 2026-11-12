@@ -128,6 +128,7 @@ vocabulary!(
     Command,
     "Administrative action alphabet.",
     Connect,
+    ResetSelection,
     Disconnect,
     Apply,
     RepairClear,

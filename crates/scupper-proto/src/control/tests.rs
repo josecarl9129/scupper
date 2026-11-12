@@ -264,6 +264,7 @@ fn every_variant_roundtrips_and_keys_are_private() {
         "selection",
         "plan",
         "repair_plan",
+        "replaced",
         "observed_at",
         "netns",
         "device",

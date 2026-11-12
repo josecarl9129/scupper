@@ -2968,3 +2968,62 @@ hardware) before anything depends on them.
 | [0030](adr/0030-mac-root-helper.md) | Mac: a minimal root helper with root-owned tools, a user agent for the rest |
 | [0031](adr/0031-quarantine-latch.md) | Persisted quarantine latch after an exhausted repair budget |
 | [0032](adr/0032-post-nat-uplink-filter.md) | Drop exit-sourced uplink packets after NAT |
+
+### M2-2t1 implementation deviations
+
+M2 retains exactly one configured exit and one nonempty policy entry.
+`exit import` adds an exit when none is present or replaces the sole exit in
+one version; confirmation names both the old and new exits. Pin/prefer of a
+replaced ID falls back to Auto through a compare-and-set daemon operation after
+successful publication when the ID changes. Under the writer lock, the reset
+changes only Pin/Prefer of that replaced ID; Disconnected and other selections
+remain untouched. Confirmation announces the reset and its event names the actor
+and ResetSelection action. Unchanged IDs retain their selection. Replacement
+reuses the existing exit interface, reconfiguring its key, peers and addresses
+in place. `exit remove` is refused in M2 and points to import for replacement.
+Duplicate private and peer public keys are checked against other configured
+exits in head, excluding the exit being replaced.
+
+Provider IPv6 Address, DNS and `::/0` settings are accepted and dropped with
+an explicit notice: "IPv6 not used: client IPv6 fails closed". IPv4 settings
+still pass the current schema; unsupported keepalives are refused.
+Provider preshared keys use an optional `preshared_key_ref` in each exit,
+resolved from a separate 0600 `wg/exit-<id>-v<N>-psk` secret file and supplied to
+`wg set` through stdin. Import uses `wg pubkey` through stdin because the
+existing cryptographic dependency has no public API for importing an
+existing X25519 private key. Confirmation shows its base64 public key,
+abbreviated as `k3Vq…9fQ=`; `--verbose` shows the full public key.
+
+Imports use generation-unique `exit-<id>-v<N>` private key references, with N
+the version being committed. IDs are limited to 32 bytes so even a u64 version
+and the optional `-psk` suffix fit the 63-byte reference grammar. Import sweeps
+only names referenced as exit private or preshared keys in stored history,
+plus recognizable crashed-import generations at or below head and older temporary writes.
+Generations above head are retained because a timed-out commit may still publish.
+An existing next-generation file is shown as unreferenced and refused unless the
+operator explicitly confirms recovery with `--yes`; referenced files are always refused.
+Every key referenced by any version in `applied_version..=head` is retained;
+after applied advances, a later import sweep collects obsolete exit keys.
+Missing state conservatively retains all history. Other names, including staged
+client identities, are never collected. Every sweep candidate is checked before
+any deletion; unsafe entries are named with instructions for fixing them.
+Stale temporary key files older than the current import run are swept under
+the writer lock. Config load, rollback and daemon commit resolve every secret
+before publication; apply and apply dry-run resolve the same target boot inputs
+before any state or kernel mutation. Pin/Prefer of an exit absent from the target
+is refused by name with guidance to run `scupper connect`. Missing identity or
+exit keys refuse apply; missing alert or heartbeat URL secrets produce warnings.
+Storage and render failures retain their persistence/internal error kinds.
+Imports are serialized across key installation and socket commit so one
+import cannot collect another's unpublished keys. Install must never adopt
+unreferenced keys. The library's `provider::import_initial` accepts a public site
+skeleton with an empty exit list and an empty store, uses the same provider parser
+and exit construction as replacement, writes keys, and commits the initial version
+and render. It is available for the next install step; no install command is added.
+
+Gateway exit mutations use the local control socket when scupperd is
+available, with the existing local writer path only when the supervisor
+lease proves no daemon owns the gateway. A definite failed commit removes
+new keys; an unknown socket outcome or a failure after head publication
+retains keys to avoid invalidating a committed version. Bundles contain
+only committed history; interrupted versions above head are not exported.

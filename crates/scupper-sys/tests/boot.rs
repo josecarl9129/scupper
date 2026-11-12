@@ -10,486 +10,17 @@ use scupper_core::render::{Scope, desired_sysctls};
 use scupper_sys::{
     boot::{BootDeps, BootNamespace, BootPoint, BootReport, BootStep, boot},
     lock::WriterLock,
-    netns::{NetnsError, NetnsHandle, testing},
+    netns::testing,
     state::{Quarantine, Selection, StateFile},
-    system::{ExecError, ExecOutput, ExecTarget, Program, System},
+    system::Program,
 };
-use std::{
-    cell::{Cell, RefCell},
-    collections::BTreeMap,
-    fs,
-    os::unix::fs::PermissionsExt,
-    time::Duration,
-};
-use support::{Root, Script};
+use std::{cell::Cell, collections::BTreeMap, fs, os::unix::fs::PermissionsExt, time::Duration};
+use support::Root;
 
-fn derived_key(input: &[u8]) -> String {
-    if input.starts_with(b"A") {
-        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into()
-    } else {
-        "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=".into()
-    }
-}
+#[path = "support/boot_kernel.rs"]
+mod boot_kernel;
+use boot_kernel::{Kernel, Link};
 
-#[derive(Clone)]
-struct Link {
-    kind: String,
-    up: bool,
-    addresses: Vec<String>,
-    peers: BTreeMap<String, (String, String)>,
-    mtu: u32,
-    public_key: String,
-    port: u16,
-    keepalive: u16,
-    hooks: bool,
-    xdp: bool,
-}
-impl Link {
-    fn new(kind: &str) -> Self {
-        Self {
-            kind: kind.into(),
-            up: false,
-            addresses: vec![],
-            peers: BTreeMap::new(),
-            mtu: 1420,
-            public_key: "(none)".into(),
-            port: 0,
-            keepalive: 0,
-            hooks: false,
-            xdp: false,
-        }
-    }
-}
-struct Kernel {
-    exists: Cell<bool>,
-    host: RefCell<BTreeMap<String, Link>>,
-    ns: RefCell<BTreeMap<String, Link>>,
-    values: RefCell<BTreeMap<String, String>>,
-    calls: RefCell<Vec<String>>,
-    rules: Cell<bool>,
-    gates_closed: Cell<bool>,
-    began_live: Cell<bool>,
-    failure: RefCell<Option<(Program, String, String)>>,
-    verified_this_run: Cell<bool>,
-    fail_after: Cell<Option<usize>>,
-    script: Script,
-    defaults: RefCell<BTreeMap<bool, String>>,
-    wrong_readback: Cell<bool>,
-    state_failure_on_close: RefCell<Option<std::path::PathBuf>>,
-    bad_canon: Cell<bool>,
-    check_links: Cell<bool>,
-}
-impl Kernel {
-    fn new() -> Self {
-        Self {
-            exists: Cell::new(false),
-            host: RefCell::default(),
-            ns: RefCell::new(BTreeMap::from([("lo".into(), Link::new("loopback"))])),
-            values: RefCell::default(),
-            calls: RefCell::default(),
-            rules: Cell::new(false),
-            gates_closed: Cell::new(false),
-            began_live: Cell::new(false),
-            failure: RefCell::default(),
-            verified_this_run: Cell::new(false),
-            fail_after: Cell::new(None),
-            script: Script::new("ubuntu-24.04"),
-            defaults: RefCell::default(),
-            wrong_readback: Cell::new(false),
-            state_failure_on_close: RefCell::new(None),
-            bad_canon: Cell::new(false),
-            check_links: Cell::new(true),
-        }
-    }
-    fn closed(&self) {
-        if self.check_links.get() {
-            assert!(self.ns.borrow().iter().all(|(name, link)| name == "lo"
-                || ["wg0", "ex-ch1"].contains(&name.as_str()) && link.kind == "wireguard"));
-        }
-        let values = self.values.borrow();
-        if ["net.ipv4.ip_forward", "net.ipv6.conf.all.forwarding"]
-            .iter()
-            .all(|k| values.get(*k).is_some_and(|v| v == "0"))
-        {
-            self.gates_closed.set(true);
-        }
-        // A live namespace remains untouched during read-only adoption checks.
-        // A fresh lo-only namespace may inherit forwarding until its first write.
-        if !self.gates_closed.get() && (self.began_live.get() || self.ns.borrow().len() == 1) {
-            return;
-        }
-        for key in ["net.ipv4.ip_forward", "net.ipv6.conf.all.forwarding"] {
-            assert!(
-                values.get(key).is_none_or(|v| v != "1") || self.verified_this_run.get(),
-                "forwarding before same-run verification"
-            );
-        }
-    }
-    fn json_links(links: &BTreeMap<String, Link>) -> String {
-        serde_json::Value::Array(links.iter().enumerate().map(|(i, (name, link))| {
-            let mut value = serde_json::json!({"ifindex":i+1,"ifname":name,"mtu":link.mtu,"flags":if link.up { vec!["UP"] } else {vec![]},"linkinfo":{"info_kind":link.kind}});
-            if link.xdp { value["xdp"] = serde_json::json!({"attached": "generic"}); }
-            value
-        }).collect()).to_string()
-    }
-    fn json_addresses(links: &BTreeMap<String, Link>) -> String {
-        serde_json::Value::Array(links.iter().enumerate().map(|(i,(name,link))| serde_json::json!({"ifindex":i+1,"ifname":name,"addr_info":link.addresses.iter().map(|a| { let (local,prefix)=a.split_once('/').unwrap(); serde_json::json!({"family":"inet","scope":"global","local":local,"prefixlen":prefix.parse::<u8>().unwrap()}) }).collect::<Vec<_>>() })).collect()).to_string()
-    }
-    #[allow(clippy::too_many_lines)]
-    fn exec(
-        &self,
-        target: ExecTarget<'_>,
-        p: Program,
-        args: &[String],
-        input: Option<&[u8]>,
-    ) -> Result<ExecOutput, ExecError> {
-        let ns = matches!(target, ExecTarget::Netns(_));
-        let a = |i| args.get(i).map_or("", String::as_str);
-        let words = args
-            .iter()
-            .map(|word| {
-                if word.starts_with("/proc/") && word.contains("/fd/") {
-                    "<netns-fd>"
-                } else if word.contains("scupper-canon-") {
-                    "<render>"
-                } else if word.starts_with("net:[") {
-                    "<identity>"
-                } else if word.starts_with('/') && p == Program::Unshare {
-                    "<executable>"
-                } else {
-                    word
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-        self.calls.borrow_mut().push(format!(
-            "{} {p:?} {words}{}",
-            if ns { "netns" } else { "host" },
-            input.map_or(String::new(), |bytes| format!(" stdin={}", bytes.len()))
-        ));
-        let count = self.calls.borrow().len();
-        if self.fail_after.get().is_some_and(|stop| count > stop) {
-            return Err(ExecError::spawn("injected kill"));
-        }
-        if let Some((program, needle, stderr)) = &*self.failure.borrow()
-            && *program == p
-            && args.join(" ").contains(needle)
-        {
-            if stderr == "missing-binary" {
-                return Err(ExecError::spawn("No such file or directory"));
-            }
-            return Ok(ExecOutput {
-                status: Some(2),
-                stdout: String::new(),
-                stderr: stderr.clone(),
-            });
-        }
-        let mut stdout = String::new();
-        let map = if ns { &self.ns } else { &self.host };
-        match p {
-            Program::Ip if a(0) == "netns" => {
-                self.exists.set(true);
-                self.values
-                    .borrow_mut()
-                    .insert("net.ipv4.ip_forward".into(), "1".into());
-            }
-            Program::Ip if args == ["-d", "-j", "link", "show"] => {
-                stdout = Self::json_links(&map.borrow());
-            }
-            Program::Ip if args == ["-j", "addr", "show"] => {
-                let mut addresses: Vec<serde_json::Value> =
-                    serde_json::from_str(&Self::json_addresses(&map.borrow())).unwrap();
-                if !ns {
-                    let uplinks: Vec<serde_json::Value> =
-                        serde_json::from_str(&self.script.text("gwhost--4-addr.json")).unwrap();
-                    addresses.extend(uplinks.into_iter().filter(|link| link["ifname"] == "eth0"));
-                }
-                stdout = serde_json::to_string(&addresses).unwrap();
-            }
-            Program::Ip if a(0) == "link" && a(1) == "add" => {
-                assert!(!ns);
-                map.borrow_mut().insert(a(2).into(), Link::new("wireguard"));
-            }
-            Program::Ip if a(0) == "link" && a(1) == "delete" => {
-                assert!(!ns);
-                map.borrow_mut().remove(a(3));
-            }
-            Program::Ip if a(0) == "link" && a(1) == "set" => {
-                if a(3) == "netns" {
-                    assert!(!ns);
-                    assert!(a(4).starts_with("/proc/") && a(4).contains("/fd/"));
-                    let link = self.host.borrow_mut().remove(a(2)).unwrap();
-                    self.ns.borrow_mut().insert(a(2).into(), link);
-                } else {
-                    assert!(ns);
-                    let mut links = map.borrow_mut();
-                    let name = if a(2) == "dev" { a(3) } else { a(2) };
-                    let link = links.get_mut(name).unwrap();
-                    if let Some(i) = args.iter().position(|a| a == "mtu") {
-                        link.mtu = a(i + 1).parse().unwrap();
-                    }
-                    if a(4) == "xdp" {
-                        link.xdp = false;
-                    } else if args.last().unwrap() == "up" {
-                        link.up = true;
-                    } else if args.last().unwrap() == "down" {
-                        link.up = false;
-                    }
-                }
-            }
-            Program::Ip if a(0) == "addr" => {
-                assert!(ns);
-                let mut links = map.borrow_mut();
-                if a(1) == "flush" {
-                    links.get_mut(a(3)).unwrap().addresses.clear();
-                } else {
-                    links.get_mut(a(4)).unwrap().addresses.push(a(2).into());
-                }
-            }
-            Program::Ip if a(0) == "-j" && a(2) == "route" && a(3) == "show" => {
-                let all = a(5) == "all" || a(5) == "local";
-                let filename = format!(
-                    "scupper-{}-{}.json",
-                    a(1),
-                    if all { "routes-all" } else { "route" }
-                );
-                let mut routes: Vec<serde_json::Value> =
-                    serde_json::from_str(&self.script.text(&filename)).unwrap();
-                if let Some(route) = self.defaults.borrow().get(&(a(1) == "-6")) {
-                    routes.retain(|r| r["dst"] != "default");
-                    routes.push(if route.contains("unreachable") {
-                        serde_json::json!({"dst":"default", "type":"unreachable"})
-                    } else {
-                        serde_json::json!({"dst":"default", "dev":"ex-ch1"})
-                    });
-                }
-                if a(4) == "default" {
-                    routes.retain(|r| r["dst"] == "default");
-                }
-                if a(5) == "local" {
-                    routes.retain(|r| r["table"] == "local");
-                }
-                stdout = serde_json::to_string(&routes).unwrap();
-            }
-            Program::Ip if args.iter().any(|a| a == "replace") => {
-                assert!(ns);
-                if let Some(i) = args.iter().position(|word| word == "dev") {
-                    assert!(
-                        self.ns.borrow().get(a(i + 1)).unwrap().up,
-                        "route via a down link"
-                    );
-                }
-                self.defaults
-                    .borrow_mut()
-                    .insert(a(0) == "-6", args.join(" "));
-            }
-            Program::Sysctl => {
-                assert!(ns);
-                if a(0) == "-w" {
-                    let (k, v) = a(1).split_once('=').unwrap();
-                    if k == "net.ipv4.ip_forward"
-                        && v == "0"
-                        && let Some(path) = self.state_failure_on_close.borrow_mut().take()
-                    {
-                        fs::rename(&path, path.with_extension("saved")).unwrap();
-                        fs::create_dir(&path).unwrap();
-                    }
-                    if v == "1" {
-                        assert!(self.verified_this_run.get());
-                    }
-                    if k == "net.ipv4.ip_forward"
-                        && self.values.borrow().get(k).is_some_and(|old| old != v)
-                    {
-                        let mut values = self.values.borrow_mut();
-                        for scope in ["all", "default", "lo", "wg0", "ex-ch1"] {
-                            values.insert(
-                                format!("net.ipv4.conf.{scope}.accept_redirects"),
-                                "1".into(),
-                            );
-                        }
-                    }
-                    self.values.borrow_mut().insert(k.into(), v.into());
-                } else {
-                    stdout = self
-                        .values
-                        .borrow()
-                        .get(a(1))
-                        .cloned()
-                        .unwrap_or_else(|| "0".into());
-                    if self.wrong_readback.get() {
-                        stdout = "99".into();
-                    }
-                }
-            }
-            Program::Nft if input.is_some() => {
-                assert!(ns);
-                if a(0) == "-f" {
-                    self.rules.set(true);
-                }
-            }
-            Program::Nft => {
-                assert!(ns);
-                stdout = if self.rules.get() {
-                    self.script.text("want.json")
-                } else {
-                    "{\"nftables\":[]}".into()
-                };
-            }
-            Program::Unshare => {
-                assert!(!ns);
-                stdout = self.script.text("want.json");
-                if self.bad_canon.get() {
-                    stdout = "{\"nftables\":[]}".into();
-                } else if self.rules.get() {
-                    self.verified_this_run.set(true);
-                }
-            }
-            Program::Wg if a(0) == "set" => {
-                assert!(ns);
-                let mut links = map.borrow_mut();
-                let link = links.get_mut(a(1)).unwrap();
-                match a(2) {
-                    "private-key" => {
-                        assert_eq!(a(3), "/dev/stdin");
-                        assert!(input.is_some());
-                        link.public_key = derived_key(input.unwrap());
-                    }
-                    "listen-port" => link.port = a(3).parse().unwrap(),
-                    "peer" if a(4) == "remove" => {
-                        link.peers.remove(a(3));
-                    }
-                    "peer" => {
-                        let allowed = args.iter().position(|a| a == "allowed-ips").unwrap();
-                        let endpoint = args.iter().position(|a| a == "endpoint").map_or_else(
-                            || {
-                                link.peers
-                                    .get(a(3))
-                                    .map_or_else(|| "(none)".into(), |peer| peer.1.clone())
-                            },
-                            |i| a(i + 1).to_owned(),
-                        );
-                        link.keepalive = args
-                            .iter()
-                            .position(|a| a == "persistent-keepalive")
-                            .map_or(0, |i| a(i + 1).parse().unwrap());
-                        link.peers
-                            .insert(a(3).into(), (a(allowed + 1).into(), endpoint));
-                    }
-                    _ => panic!("unexpected wg writer"),
-                }
-            }
-            Program::Conntrack => {
-                assert!(ns && self.verified_this_run.get());
-            }
-            Program::Tc if a(0) == "-j" && a(1) == "qdisc" => {
-                if map.borrow().get(a(4)).is_some_and(|l| l.hooks) {
-                    stdout = r#"[{"kind":"clsact","handle":"ffff:","parent":"ffff:fff1"}]"#.into();
-                } else {
-                    return self.script.run_in(target, p, args, Duration::from_secs(3));
-                }
-            }
-            Program::Tc if a(0) == "qdisc" => {
-                map.borrow_mut().get_mut(a(3)).unwrap().hooks = false;
-            }
-            Program::Wg if a(0) == "pubkey" => {
-                stdout = derived_key(input.unwrap());
-            }
-            Program::Wg if a(1) == "interfaces" => {}
-            Program::Wg if a(0) == "show" => {
-                let links = map.borrow();
-                let link = links.get(a(1)).unwrap();
-                stdout = match a(2) {
-                    "public-key" => link.public_key.clone(),
-                    "listen-port" => link.port.to_string(),
-                    _ => link
-                        .peers
-                        .iter()
-                        .map(|(key, (allowed, endpoint))| match a(2) {
-                            "peers" => format!("{key}\n"),
-                            "allowed-ips" => format!("{key}\t{allowed}\n"),
-                            "endpoints" => format!("{key}\t{endpoint}\n"),
-                            "persistent-keepalive" => format!("{key}\t{}\n", link.keepalive),
-                            "latest-handshakes" => format!("{key}\t999\n"),
-                            _ => panic!("unexpected wg read"),
-                        })
-                        .collect(),
-                };
-            }
-            _ => return self.script.run_in(target, p, args, Duration::from_secs(3)),
-        }
-        self.closed();
-        if self.fail_after.get() == Some(count) {
-            return Err(ExecError::spawn("injected kill after command"));
-        }
-        Ok(ExecOutput {
-            status: Some(0),
-            stdout,
-            stderr: String::new(),
-        })
-    }
-}
-impl System for Kernel {
-    fn namespace_identity(&self, _: &std::path::Path) -> std::io::Result<(u64, u64)> {
-        testing::handle()
-            .map(|held| held.identity())
-            .map_err(std::io::Error::other)
-    }
-
-    fn canon_run_root(&self) -> &std::path::Path {
-        std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
-    }
-    fn run(&self, p: Program, a: &[String], _: Duration) -> Result<ExecOutput, ExecError> {
-        self.exec(ExecTarget::Host, p, a, None)
-    }
-    fn run_in(
-        &self,
-        t: ExecTarget<'_>,
-        p: Program,
-        a: &[String],
-        _: Duration,
-    ) -> Result<ExecOutput, ExecError> {
-        self.exec(t, p, a, None)
-    }
-    fn run_with_stdin(
-        &self,
-        t: ExecTarget<'_>,
-        p: Program,
-        a: &[String],
-        b: &[u8],
-        _: Duration,
-    ) -> Result<ExecOutput, ExecError> {
-        self.exec(t, p, a, Some(b))
-    }
-    fn wireguard_socket_dirs(&self) -> Vec<std::path::PathBuf> {
-        vec![]
-    }
-    fn now_unix_secs(&self) -> u64 {
-        1000
-    }
-}
-impl BootNamespace for Kernel {
-    fn path(&self) -> &std::path::Path {
-        static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-        PATH.get_or_init(|| {
-            std::env::var_os("CARGO_TARGET_TMPDIR")
-                .map_or_else(
-                    || {
-                        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                            .join("../../target/tmp")
-                    },
-                    std::path::PathBuf::from,
-                )
-                .join("boot-test-namespace")
-        })
-    }
-    fn open(&self) -> Result<Option<NetnsHandle>, NetnsError> {
-        if self.exists.get() {
-            testing::handle().map(Some)
-        } else {
-            Ok(None)
-        }
-    }
-}
 struct Fixture {
     root: Root,
     kernel: Kernel,
@@ -2678,5 +2209,242 @@ fn boot_never_adds_source_policy_rules_or_nonbaseline_rules() {
             }
         }
         assert_eq!(families, [true, true], "both rule inventories must run");
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep the complete live transaction and its safety assertions together.
+fn missing_secret_commit_and_apply_refuse_before_kernel_or_state_changes() {
+    use scupper_core::config::{GatewayId, SecretKind, SecretName, parse_site};
+    use scupper_proto::{ApiErrorCode, Reason, UnixSeconds};
+    use scupper_sys::{
+        daemon::admin,
+        events::EventLog,
+        store::{MetaInput, VersionStore},
+    };
+    for field in ["private", "psk", "identity", "sink", "heartbeat"] {
+        let f = Fixture::new();
+        assert!(f.run(None).succeeded());
+        let run_root = f.root.path.join("run");
+        let deps = BootDeps {
+            system: &f.kernel,
+            namespace: &f.kernel,
+            state_root: &f.root.path,
+            config_root: &f.root.path,
+            run_root: &run_root,
+            hook: None,
+            secret_owner: rustix::process::geteuid().as_raw(),
+        };
+        let log = EventLog::memory_only(GatewayId("gw1".into()), || UnixSeconds(1000)).unwrap();
+        let mut site = parse_site(&support::site_text("ubuntu-24.04")).unwrap();
+        let reference = SecretName::new(
+            if ["sink", "heartbeat"].contains(&field) {
+                SecretKind::Url
+            } else {
+                SecretKind::Wg
+            },
+            "missing-ref",
+        )
+        .unwrap();
+        match field {
+            "private" => {
+                site.gateways
+                    .get_mut(&GatewayId("gw1".into()))
+                    .unwrap()
+                    .exits[0]
+                    .private_key_ref = reference;
+            }
+            "psk" => {
+                site.gateways
+                    .get_mut(&GatewayId("gw1".into()))
+                    .unwrap()
+                    .exits[0]
+                    .preshared_key_ref = Some(reference);
+            }
+            "identity" => site.identities.values_mut().next().unwrap().private_key_ref = reference,
+            "sink" => {
+                site.alerts.sinks.insert(
+                    "test".into(),
+                    scupper_core::config::AlertSink::Ntfy {
+                        url_ref: reference,
+                        min_severity: scupper_core::config::Severity::Critical,
+                    },
+                );
+            }
+            "heartbeat" => {
+                site.heartbeat = Some(scupper_core::config::HeartbeatSettings {
+                    kind: scupper_core::config::HeartbeatKind::Healthchecks,
+                    url_ref: reference,
+                    interval: scupper_core::config::DurationStr("60s".into()),
+                    report: scupper_core::config::HeartbeatReport::StatusCode,
+                });
+            }
+            _ => unreachable!(),
+        }
+        let text = toml::to_string(&site).unwrap();
+        let error =
+            admin::commit(&deps, &log.handle, Some(1), &text, Reason::Operator, 0).unwrap_err();
+        assert_eq!(error.code, ApiErrorCode::InvalidRequest);
+        assert!(error.to_string().contains("missing-ref"), "{error}");
+        let store = VersionStore::read_only(&f.root.path, &f.root.path);
+        assert_eq!(store.head().unwrap(), Some(1));
+        // A stored version can lose a file after publication, or come from older history.
+        let writer = WriterLock::acquire(&run_root).unwrap();
+        let store =
+            VersionStore::open_with_mirror_root(&f.root.path, &f.root.path, Some(&writer)).unwrap();
+        store
+            .commit(
+                &writer,
+                Some(1),
+                &text,
+                MetaInput {
+                    actor: "test".into(),
+                    at: 1000,
+                    reason: "missing key fixture".into(),
+                },
+            )
+            .unwrap();
+        drop(writer);
+        let before = fs::read(f.root.path.join("state.json")).unwrap();
+        let calls = f.kernel.calls.borrow().clone();
+        for dry_run in [true, false] {
+            if ["sink", "heartbeat"].contains(&field) {
+                let result = admin::apply(&deps, &log.handle, None, dry_run, 0).unwrap();
+                let scupper_proto::OpResult::Apply { warnings, .. } = result else {
+                    panic!("expected apply")
+                };
+                assert!(
+                    warnings
+                        .iter()
+                        .any(|warning| warning.contains("missing-ref"))
+                );
+            } else {
+                let error = admin::apply(&deps, &log.handle, None, dry_run, 0).unwrap_err();
+                assert_eq!(error.code, ApiErrorCode::InvalidRequest);
+                assert!(error.to_string().contains("missing-ref"), "{error}");
+            }
+            if !dry_run && ["sink", "heartbeat"].contains(&field) {
+                continue;
+            }
+            assert_eq!(fs::read(f.root.path.join("state.json")).unwrap(), before);
+            assert_eq!(*f.kernel.calls.borrow(), calls);
+        }
+        if ["sink", "heartbeat"].contains(&field) {
+            continue;
+        }
+        assert_eq!(fs::read(f.root.path.join("state.json")).unwrap(), before);
+        assert_eq!(*f.kernel.calls.borrow(), calls);
+        assert_eq!(f.kernel.values.borrow()["net.ipv4.ip_forward"], "1");
+    }
+}
+
+#[test]
+fn socket_reset_compares_current_intent_and_preserves_concurrent_disconnect() {
+    use scupper_core::config::ExitId;
+    use scupper_sys::daemon::testing::dispatch_reset_selection;
+    for current in [
+        Selection::Disconnected,
+        Selection::Auto,
+        Selection::Pin(ExitId("other".into())),
+        Selection::Prefer(ExitId("other".into())),
+        Selection::Pin(ExitId("ch1".into())),
+        Selection::Prefer(ExitId("ch1".into())),
+    ] {
+        let f = Fixture::new();
+        f.state(|s| s.selection = Selection::Pin(ExitId("ch1".into())));
+        assert!(f.run(None).succeeded());
+        let run = f.root.path.join("run");
+        let expected = match &current {
+            Selection::Pin(id) | Selection::Prefer(id) if id.as_str() == "ch1" => Selection::Auto,
+            _ => current.clone(),
+        };
+        let before = std::cell::RefCell::new(Vec::new());
+        let response = dispatch_reset_selection(
+            BootDeps {
+                system: &f.kernel,
+                namespace: &f.kernel,
+                state_root: &f.root.path,
+                config_root: &f.root.path,
+                run_root: &run,
+                hook: None,
+                secret_owner: rustix::process::geteuid().as_raw(),
+            },
+            (&ExitId("ch1".into())).into(),
+            || {
+                f.state(|s| s.selection = current.clone());
+                *before.borrow_mut() = fs::read(f.root.path.join("state.json")).unwrap();
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            response.result.unwrap(),
+            scupper_proto::OpResult::ResetSelection {}
+        ));
+        let scupper_sys::state::StateRead::Present(saved) =
+            StateFile::open(&f.root.path, None).unwrap().read().unwrap()
+        else {
+            panic!("missing state")
+        };
+        assert_eq!(saved.selection, expected);
+        if expected == current {
+            assert_eq!(
+                fs::read(f.root.path.join("state.json")).unwrap(),
+                *before.borrow()
+            );
+        }
+    }
+}
+
+#[test]
+fn apply_input_io_and_corruption_keep_their_error_kinds_in_both_modes() {
+    use scupper_sys::{daemon::admin, events::EventLog};
+    for failure in ["state", "render", "gateway", "render-mismatch"] {
+        let f = Fixture::new();
+        assert!(f.run(None).succeeded());
+        fs::create_dir_all(f.root.path.join("rendered")).unwrap();
+        match failure {
+            "state" => {
+                fs::remove_file(f.root.path.join("state.json")).unwrap();
+                fs::create_dir(f.root.path.join("state.json")).unwrap();
+            }
+            "render" => {
+                fs::create_dir(f.root.path.join("rendered/000001.nft")).unwrap();
+            }
+            "gateway" => {
+                fs::remove_file(f.root.path.join("gateway-id")).unwrap();
+            }
+            "render-mismatch" => {
+                fs::write(f.root.path.join("rendered/000001.nft"), "invalid render").unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let run = f.root.path.join("run");
+        let deps = BootDeps {
+            system: &f.kernel,
+            namespace: &f.kernel,
+            state_root: &f.root.path,
+            config_root: &f.root.path,
+            run_root: &run,
+            hook: None,
+            secret_owner: rustix::process::geteuid().as_raw(),
+        };
+        let log = EventLog::memory_only(scupper_core::config::GatewayId("gw1".into()), || {
+            scupper_proto::UnixSeconds(1000)
+        })
+        .unwrap();
+        let calls = f.kernel.calls.borrow().clone();
+        for dry_run in [true, false] {
+            let error = admin::apply(&deps, &log.handle, None, dry_run, 0).unwrap_err();
+            assert_eq!(
+                error.code,
+                if ["state", "render"].contains(&failure) {
+                    scupper_proto::ApiErrorCode::PersistenceUnavailable
+                } else {
+                    scupper_proto::ApiErrorCode::Internal
+                }
+            );
+            assert_eq!(*f.kernel.calls.borrow(), calls);
+            assert_eq!(f.kernel.values.borrow()["net.ipv4.ip_forward"], "1");
+        }
     }
 }
