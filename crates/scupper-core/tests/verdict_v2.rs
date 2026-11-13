@@ -121,6 +121,7 @@ fn passing() -> Observations {
         active: RouteTarget::Exit(config().exit_iface),
         handshakes: Some(Ok(BTreeMap::from([(exit_id(), current())]))),
         forwarding: Some(Ok(Forwarding {
+            client_sessions: scupper_core::verdict::v2::ClientSessions::default(),
             client_v4: 1,
             netns_sockets: vec![],
             hardening: vec![],
@@ -175,9 +176,17 @@ fn code(result: &Next) -> Option<u8> {
     }
 }
 fn assert_violation(obs: &Observations, want: Violation) {
-    let result = report(obs);
-    assert_eq!(result.verdict.exit_code(), 2);
-    assert_eq!(result.verdict, Verdict::Unprotected(NonEmpty::new(want)));
+    let want = Verdict::Unprotected(NonEmpty::new(want));
+    for state in 0..3 {
+        let mut obs = obs.clone();
+        if let Some(Ok(f)) = &mut obs.forwarding {
+            f.client_sessions.active_reset = state == 1;
+            f.client_sessions.unknown = state == 2;
+        }
+        let result = report(&obs);
+        assert_eq!(result.verdict.exit_code(), 2);
+        assert_eq!(result.verdict, want);
+    }
 }
 fn assert_degraded(obs: &Observations, want: Degraded) {
     let result = report(obs);
@@ -1746,4 +1755,125 @@ fn client_link_down_or_absent_is_degraded_and_closure_keeps_precedence() {
             .for_each(|l| l.up = false);
         assert_closed(&obs, FailClosed::AdminDisconnected);
     }
+}
+
+#[test]
+fn client_reset_is_degraded_until_transport_with_idle_warning_and_closure_precedence() {
+    let cfg = config();
+    let mut obs = passing();
+    forwarding(&mut obs).client_sessions.active_reset = true;
+    let result = report_with(&obs, &cfg);
+    assert_eq!(
+        result.verdict,
+        Verdict::Degraded(Degraded::ClientSessionsReset)
+    );
+    assert_eq!(result.verdict.exit_code(), 3);
+    let mut down = obs.clone();
+    for link in &mut topology(&mut down).links {
+        if link.name == "wg0" {
+            link.up = false;
+        }
+    }
+    forwarding(&mut down).v4 = 0;
+    assert_eq!(
+        report_with(&down, &cfg).verdict,
+        Verdict::Degraded(Degraded::ClientSideBroken(ClientFault::LinkDown))
+    );
+    forwarding(&mut obs).client_sessions.active_reset = false;
+    forwarding(&mut obs).client_sessions.idle_reset = true;
+    let result = report_with(&obs, &cfg);
+    assert!(matches!(result.verdict, Verdict::Protected { .. }));
+    assert!(result.warnings.contains(&Warning::IdleClientSessionsReset));
+    forwarding(&mut obs).client_sessions.active_reset = true;
+    forwarding(&mut obs).quarantine = Some(RepairKind::SafetyDrift);
+    forwarding(&mut obs).v4 = 0;
+    assert!(matches!(
+        report_with(&obs, &cfg).verdict,
+        Verdict::FailClosed(FailClosed::Quarantined { .. })
+    ));
+    topology(&mut obs).ruleset = RulesetObs::Missing;
+    assert!(matches!(
+        report_with(&obs, &cfg).verdict,
+        Verdict::Unprotected(_)
+    ));
+    let mut obs = passing();
+    forwarding(&mut obs).client_sessions.active_reset = true;
+    obs.selection = Selection::Disconnected;
+    let defaults = defaults(&mut obs);
+    defaults.v4 = DefaultRouteObs::Unreachable;
+    defaults.v6 = DefaultRouteObs::Unreachable;
+    for link in &mut topology(&mut obs).links {
+        if link.name == "ex-ch1" {
+            link.up = false;
+        }
+    }
+    assert!(matches!(
+        report_with(&obs, &cfg).verdict,
+        Verdict::FailClosed(FailClosed::AdminDisconnected)
+    ));
+}
+
+#[test]
+fn pending_sessions_collect_later_safety_stages_before_readiness() {
+    let cfg = config();
+    let mut obs = passing();
+    forwarding(&mut obs).client_sessions.active_reset = true;
+    obs.routes = None;
+    obs.exit_probe = None;
+    obs.supervisor = None;
+    assert_eq!(next(&obs, &cfg, NOW), Next::Routes);
+    obs.routes = passing().routes;
+    assert_eq!(next(&obs, &cfg, NOW), Next::ExitProbe);
+    obs.exit_probe = passing().exit_probe;
+    assert_eq!(next(&obs, &cfg, NOW), Next::Supervisor);
+    obs.supervisor = passing().supervisor;
+    assert_degraded(&obs, Degraded::ClientSessionsReset);
+    obs.supervisor = Some(Supervisor::Dead);
+    assert_degraded(&obs, Degraded::ClientSessionsReset);
+}
+
+#[test]
+fn pending_sessions_never_hide_unknown_safety_evidence() {
+    for stage in 0..6 {
+        let mut obs = passing();
+        forwarding(&mut obs).client_sessions.active_reset = true;
+        let unknown = ProbeError::io("injected unknown safety evidence");
+        match stage {
+            0 => obs.topology = Some(Err(unknown)),
+            1 => obs.defaults = Some(Err(unknown)),
+            2 => obs.handshakes = Some(Err(unknown)),
+            3 => obs.forwarding = Some(Err(unknown)),
+            4 => obs.routes.as_mut().unwrap()[0].1.v4 = Err(unknown),
+            _ => obs.exit_probe = Some(Err(ProbeError::Setup("probe setup unavailable".into()))),
+        }
+        assert_eq!(code(&next(&obs, &config(), NOW)), Some(1), "stage {stage}");
+    }
+}
+
+#[test]
+fn unavailable_history_is_last_and_expiry_is_a_warning_not_recovery() {
+    let mut obs = passing();
+    forwarding(&mut obs).client_sessions.unknown = true;
+    assert_degraded(&obs, Degraded::ClientSessionsUnknown);
+    obs.routes = None;
+    assert_eq!(next(&obs, &config(), NOW), Next::Routes);
+    obs.routes = passing().routes;
+    obs.exit_probe = Some(Err(ProbeError::Setup("unknown exit safety".into())));
+    assert_eq!(code(&next(&obs, &config(), NOW)), Some(1));
+    obs.exit_probe = passing().exit_probe;
+    forwarding(&mut obs).client_sessions.unknown = false;
+    forwarding(&mut obs).client_sessions.history_unavailable = true;
+    forwarding(&mut obs).client_sessions.expired_unconfirmed = true;
+    let result = report(&obs);
+    assert!(matches!(result.verdict, Verdict::Protected { .. }));
+    assert!(
+        result
+            .warnings
+            .contains(&Warning::ClientSessionHistoryUnavailable)
+    );
+    assert!(
+        result
+            .warnings
+            .contains(&Warning::ClientSessionsExpiredUnconfirmed)
+    );
 }

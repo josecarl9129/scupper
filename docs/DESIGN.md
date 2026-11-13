@@ -1810,6 +1810,99 @@ quarantine or administrative disconnect retains its closure verdict. This client
 ingress diagnosis precedes ordinary exit availability failures. Known
 containment violations and required-observation errors still take precedence.
 
+Client readiness is independent of reopening the protected data path. A client-link
+bounce clears WireGuard sessions even when handshake timestamps and counters
+survive; a reboot or recreation also loses the peer endpoints. Recovery is passive:
+client endpoints are never persisted or restored, and the gateway does not contact
+an address learned from disk.
+
+`/var/lib/scupper/client-sessions.json` holds a versioned, bounded record under the
+global writer lock: the gateway's public identity, namespace/session generation,
+configured peer public keys, last authenticated observation times, fixed lease
+expiries, and curated full-resolution handshake/counter baselines. It contains no
+private/session keys, endpoints, receiver indices, or raw WireGuard dumps. Files
+use mode 0600 in the private state directory. Writes use same-directory temporary
+files, file fsync, atomic rename and directory fsync. Authenticated activity is
+checkpointed every 30 seconds at most, with immediate recovery transitions and a
+best-effort snapshot **before** planned daemon shutdown or client teardown.
+Reset intent is saved before LinkDown without waiting for telemetry; its preserved
+counters are captured after the command, including a timeout after kernel effect. Thus unexpected power loss
+has a bounded snapshot loss window; persistence is not shutdown-only.
+
+Each affected peer has one of four states:
+
+| State | Meaning for check |
+|---|---|
+| `RequiredPending` | Authenticated activity lease still live, but no current-generation recovery evidence: exit 3 `ClientSessionsReset` |
+| `Recovered` | Current-generation recovery evidence observed and checkpointed |
+| `ExpiredUnconfirmed` | Original 180 s activity lease expired without confirmation; warning, excluded from the currently required cohort |
+| `Unknown` | No usable authenticated history for this peer; covered by the bounded unavailable-history policy |
+
+A lease expires 180 seconds after its last qualifying authenticated observation.
+The original deadline survives daemon restarts, link retries, recreation and
+reboot. Outbound probes and handshake responses do not renew it. Expiry never
+manufactures recovery. Exit 0 means protected and ready for the **currently
+required cohort**, and status retains expired-unconfirmed and unavailable-history
+warnings. Removed configured peers stop participating.
+
+Missing, corrupt, unsupported-version, mismatched-identity or clock-skewed history
+is unavailable evidence. The writer retains one private diagnostic copy, queues a value-free persistence
+alert event for the daemon, and checkpoints an unknown generation with one fixed 180 s deadline. Boot
+and D2 reopening continue under their independent safety gates. A private runtime
+fallback exposes durable-write failures to check without substituting for reboot
+history; fresh authenticated evidence can still restore readiness. Check returns 3
+`ClientSessionsUnknown` during that lease, unless all configured peers supply
+current-generation evidence; after expiry it retains a history warning. Retries
+and rebuilds preserve the unknown deadline. Backward clocks invalidate history;
+a forward jump may expire a lease, producing an unconfirmed warning, never a
+recovered state. Read-only check does not write history or send probes.
+
+Recovery uses the netlink handshake timespec, including nanoseconds, and receive
+and transmit baselines from the current generation. Round 5's stronger receipt
+rule remains: a newer handshake and receive growth greater than one 92-byte
+response that is not a multiple of 92. A handshake timestamp and merely nonzero
+rx_bytes are insufficient; repeated gateway responses remain unconfirmed.
+Ambiguous multiples of 92 conservatively remain pending. N3 residual ambiguity:
+a gateway response (92 bytes) mixed with a client initiation (148 bytes) totals
+240 bytes and can satisfy this rule even when the confirmation and initiation's
+response are lost. The accepted client-initiated-handshake evidence can therefore
+precede recovery by the client's next retry (up to about 5 seconds); it is not an
+end-to-end canary. Latched recovery is never inferred from elapsed time.
+
+Session readiness is considered only after forwarded routes, the exit-IP probe,
+and required supervisor namespace validation. Established safety violations give
+2; unresolved safety evidence keeps its existing policy; only then can session
+impairment give 3, before Protected or Unsupervised. Codes are never combined with
+a numeric maximum. A down client link retains `ClientSideBroken(LinkDown)`, with a
+session warning, rather than reporting session reset as its primary diagnosis.
+
+Each client LinkUp queues at most one small fixed UDP datagram per configured
+client. Boot defers this optional probe to the daemon's next fresh verified tick,
+removing the duplicate full boot observation and its placeholder uplink address.
+A tick that changed links or had any step failure cannot dispatch the hook. The
+persisted quarantine latch is applied before caching the observation. The planner
+must verify configuration and the output path, including tc/XDP inventory, exact
+peers/AllowedIPs, routes and ruleset, before output; RealKernel independently
+rechecks state and rules. The child runs in the held namespace and binds both the
+client interface and configured gateway tunnel source. Destinations are configured
+device host /32 addresses, port 9 and fixed payload `scupper-session`. There is no
+firewall exception or keepalive override. Unavailable proofs and failed sends are
+logged and left to client retry, without failing boot. On a fresh device there is
+no learned endpoint, so this probe cannot accelerate recovery.
+
+L44 keeps its single canary with no retry. Its reboot regression preserves the
+client's old session, starts a check/receipt observer before the rebuild, and
+briefly blocks only client outer UDP to pin the false-OK window. Check must never
+be 0 before new authenticated client evidence. Recovery has a 90 s budget, followed
+by the existing single canary (2 s per request). First-install readiness separately
+allows the 180 s unknown-history lease plus 30 s for verification. Leak captures,
+positive controls and receipt checks retain their existing requirements.
+
+D2 still lowers the client link immediately on Unknown bypass inventory. It
+keeps that link down across every still-Unknown tick and every plan prefix;
+restoration requires known inventory and the existing reopening gates. A down
+link is containment evidence, never proof authorizing local recovery output.
+
 Ping publishes an active apply or rebuild with its source and target versions
 and elapsed age. Before an apply publishes its convergence target, and during a
 rebuild, Check may report `Degraded::OperationInProgress` (3). Once apply publishes
@@ -1845,6 +1938,7 @@ with an unavailable supervisor treated as Dead.
 | 6 | exit-IP probe through the route over v4 and, when the active exit is v6-capable, over v6; on failure, one bound path probe on a standby to classify `CommonModeProbeFailure` vs `ExitProbeFailed` | 3; exit IP ∈ uplink addresses → 2 |
 | 7 | the DNS self-test (§7: cache-bypassing random label, UDP and TCP, each configured listener family) gets an upstream response, and edge's upstream generation equals scupperd's (M4+) | 3 |
 | 8 | scupperd alive: control-socket `Ping` answered within 2 s with last complete iteration < 30 s ago (only if `require_daemon`, M2+) | 5 |
+| 9 | client session readiness, after all preceding safety evidence: a live required lease returns `ClientSessionsReset`, unavailable history returns `ClientSessionsUnknown` for one bounded lease, and expired-unconfirmed peers warn before a protected or unsupervised result | 3 |
 
 M1 order (v1 layout, v1 plus the exact comparison and a config
 cross-check): whole host ruleset exact, no tc qdisc or filter beyond the

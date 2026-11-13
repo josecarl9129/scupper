@@ -274,6 +274,18 @@ impl Kernel {
                 );
                 let mut routes: Vec<serde_json::Value> =
                     serde_json::from_str(&self.script.text(&filename)).unwrap();
+                // Replacing an exit address also replaces its kernel local route.
+                for route in &mut routes {
+                    if route["type"] != "local" || route["dev"] != "ex-ch1" {
+                        continue;
+                    }
+                    let links = self.ns.borrow();
+                    if let Some(address) = links.get("ex-ch1").and_then(|l| l.addresses.first()) {
+                        let host = address.split('/').next().unwrap();
+                        route["prefsrc"] = serde_json::json!(host);
+                        route["dst"] = serde_json::json!(host);
+                    }
+                }
                 if let Some(route) = self.defaults.borrow().get(&(a(1) == "-6")) {
                     routes.retain(|r| r["dst"] != "default");
                     routes.push(if route.contains("unreachable") {
@@ -448,6 +460,43 @@ impl Kernel {
     }
 }
 impl System for Kernel {
+    fn client_session_io(
+        &self,
+        _: &NetnsHandle,
+        request: &scupper_sys::client_sessions::Request,
+    ) -> std::io::Result<scupper_sys::client_sessions::Response> {
+        use scupper_sys::client_sessions::{Response, Sample};
+        self.calls.borrow_mut().push(format!(
+            "client-session {} {}",
+            request.iface,
+            if request.probe.is_some() {
+                "probe"
+            } else {
+                "checkpoint-samples"
+            }
+        ));
+        if let Some((_, destinations)) = &request.probe {
+            return Ok(Response::Probes(vec![true; destinations.len()]));
+        }
+        let ns = self.ns.borrow();
+        let link = ns
+            .get(&request.iface)
+            .ok_or_else(|| std::io::Error::other("missing client link"))?;
+        let samples = link
+            .peers
+            .keys()
+            .map(|key| Sample {
+                key: scupper_core::config::PublicKey(key.clone())
+                    .bytes()
+                    .unwrap(),
+                handshake: (0, 0),
+                rx: 0,
+                tx: 0,
+            })
+            .collect();
+        Ok(Response::Samples(samples))
+    }
+
     fn module_loaded(&self, module: &str) -> std::io::Result<bool> {
         if *self.script.file_error.borrow() {
             return Err(std::io::ErrorKind::PermissionDenied.into());

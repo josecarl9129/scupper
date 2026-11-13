@@ -12,7 +12,6 @@ mod helpers;
 mod mounts;
 mod mutation;
 mod policy_fixture;
-mod positive;
 mod route_fixture;
 pub use mutation::run_mutation;
 pub use route_fixture::route_check;
@@ -650,52 +649,10 @@ impl Lab {
         ipv6: bool,
         healthy: bool,
     ) -> Result<Vec<String>> {
-        self.canaries_with_tcp_retry(markers, ipv6, healthy, None)
-    }
-    fn canaries_with_tcp_retry(
-        &mut self,
-        markers: &mut Vec<String>,
-        ipv6: bool,
-        healthy: bool,
-        retry_log: Option<&Path>,
-    ) -> Result<Vec<String>> {
         let mut sent = Vec::new();
         for protocol in ["tcp", "udp"] {
             for by_name in [false, true] {
                 self.runner.check()?;
-                if healthy
-                    && protocol == "tcp"
-                    && let Some(log) = retry_log
-                {
-                    let delivered = positive::tcp(markers, log, |marker, deadline| {
-                        self.ensure_services()?;
-                        let target = if by_name {
-                            format!("{marker}.lab.test")
-                        } else {
-                            A.internet.peer.into()
-                        };
-                        // Bound the entire subprocess (including pipes and cleanup),
-                        // rather than allowing a last 15 s launcher at the deadline.
-                        let phase = self.runner.phase;
-                        self.runner.phase = phase.min(deadline);
-                        let result = self.send("client", protocol, &target, marker, ipv6);
-                        self.runner.phase = phase;
-                        let outcome = result?;
-                        // A lost ACK can leave a receipt even on a timeout. Such
-                        // receipts must still be unique and from provider NAT.
-                        let receipts = helpers::receipts(&fs::read_to_string(
-                            self.artifacts.join("sink.jsonl"),
-                        )?)?;
-                        check_positive_receipt(
-                            &receipts,
-                            marker,
-                            outcome == helpers::Outcome::Delivered,
-                        )?;
-                        Ok(outcome)
-                    })?;
-                    sent.push(delivered);
-                    continue;
-                }
                 let marker = Self::marker()?;
                 let target = if by_name {
                     format!("{marker}.lab.test")
@@ -722,16 +679,9 @@ impl Lab {
         Ok(sent)
     }
     fn service_check(&mut self, markers: &mut Vec<String>) -> Result<()> {
-        self.service_check_with_tcp_retry(markers, None)
-    }
-    fn service_check_with_tcp_retry(
-        &mut self,
-        markers: &mut Vec<String>,
-        retry_log: Option<&Path>,
-    ) -> Result<()> {
         self.ensure_services()?;
         let first_marker = markers.len();
-        let sent = self.canaries_with_tcp_retry(markers, false, true, retry_log)?;
+        let sent = self.canaries(markers, false, true)?;
         let receipts = helpers::receipts(&fs::read_to_string(self.artifacts.join("sink.jsonl"))?)?;
         for marker in &markers[first_marker..] {
             check_positive_receipt(&receipts, marker, sent.contains(marker))?;

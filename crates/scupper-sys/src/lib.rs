@@ -9,6 +9,7 @@ pub mod boot;
 pub mod bundle;
 pub mod canon;
 pub mod check_v2;
+pub mod client_sessions;
 pub mod cmd;
 pub mod collect;
 pub mod fs;

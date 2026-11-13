@@ -116,6 +116,7 @@ impl SystemdLab {
         let trial = (|| {
             if case == "L44" {
                 self.writers_canary("before-race", &mut markers)?;
+                self.reboot_sessions(&mut markers)?;
             } else {
                 self.lab.service_check(&mut markers)?;
             }
@@ -636,25 +637,99 @@ impl SystemdLab {
         self.systemctl(&["daemon-reload"])?;
         Ok(())
     }
+    fn reboot_sessions(&mut self, markers: &mut Vec<String>) -> Result<()> {
+        // Preserve the client's old session, including its receiver index.
+        // Only block its outer UDP temporarily; all leak captures/oracles stay on.
+        let rules = format!(
+            "table inet reboot_sessions {{ chain output {{ type filter hook output priority filter; ip daddr {} meta l4proto udp counter drop; }} }}\n",
+            A.gwhost.peer
+        );
+        self.lab.runner.input(
+            &Invocation::new("client", "nft", &["-f", "-"]),
+            Some(rules.as_bytes()),
+        )?;
+        let trial = (|| {
+            self.reboot_stop()?;
+            let log = self.lab.artifacts.join("L44-reboot-sessions-check.jsonl");
+            let started = self.lab.private.join("reboot-observer-started");
+            let mut observer = self.lab.runner.background(
+                &Invocation::new(
+                    "",
+                    "python3",
+                    &[
+                        "-c",
+                        include_str!("reboot_sessions.py"),
+                        CLI,
+                        log.to_str().ok_or("observer log path")?,
+                        started.to_str().ok_or("observer startup path")?,
+                        &self.lab.public_keys[3],
+                    ],
+                ),
+                &self.lab.artifacts.join("L44-reboot-observer.stdout"),
+            )?;
+            let until = Instant::now() + Duration::from_secs(5);
+            while !started.exists() {
+                observer.alive()?;
+                if Instant::now() >= until {
+                    return fail("reboot observer did not start");
+                }
+                self.lab.runner.dwell(Duration::from_millis(50))?;
+            }
+            self.reboot_start()?;
+            // No authenticated client transport is possible during this interval.
+            // Pin the absence of false OK independently of the observer's samples.
+            for _ in 0..6 {
+                let (status, _) = self
+                    .lab
+                    .runner
+                    .output(&Invocation::new("", CLI, &["check"]), None)?;
+                if status.code() == Some(0) {
+                    return fail(
+                        "reboot check falsely reported ready while client UDP was blocked",
+                    );
+                }
+                observer.alive()?;
+                self.lab.runner.dwell(Duration::from_millis(500))?;
+            }
+            self.lab.cmd(
+                "client",
+                "nft",
+                &["delete", "table", "inet", "reboot_sessions"],
+            )?;
+            if !observer.wait_timeout(Duration::from_secs(90))?.success() {
+                return fail(
+                    "reboot session observer rejected readiness; see L44-reboot-sessions-check.jsonl",
+                );
+            }
+            // One ordinary canary, with the existing 2 s per-request budget.
+            // There is no retry and no fresh_session() client reset.
+            self.lab.service_check(markers)
+        })();
+        let cleanup = self
+            .lab
+            .runner
+            .output(
+                &Invocation::new(
+                    "client",
+                    "nft",
+                    &["delete", "table", "inet", "reboot_sessions"],
+                ),
+                None,
+            )
+            .map(|_| ());
+        super::super::mutation::finish(trial, cleanup)
+    }
     fn writers_canary(&mut self, label: &str, markers: &mut Vec<String>) -> Result<()> {
         let started = Instant::now();
         let first_marker = markers.len();
         let mut ready_ms = None;
         let result = (|| {
-            // ready polls check=0 for at most 90 seconds and proves provider
+            // ready allows the initial 180 s unknown lease plus 30 s and proves provider
             // transport. Do this after the final unit start, before any probe.
             self.ready_recorded(Some(&format!("L44-{label}")))?;
             ready_ms = Some(started.elapsed().as_millis());
             self.check_code(0)?;
-            self.lab.service_check_with_tcp_retry(
-                markers,
-                Some(
-                    &self
-                        .lab
-                        .artifacts
-                        .join(format!("L44-{label}-tcp-attempts.jsonl")),
-                ),
-            )
+            self.lab.service_check(markers)
         })();
         fs::write(
             self.lab.artifacts.join(format!("L44-{label}-canary.json")),

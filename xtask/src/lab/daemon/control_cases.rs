@@ -246,7 +246,7 @@ fn compare_sessions(before: &str, after: &str, traffic: bool) -> bool {
         && before.iter().all(|(key, (time, rx, tx))| {
             let (next_time, next_rx, next_tx) = after[key];
             *time > 0
-                && next_time >= *time
+                && (traffic && next_time >= *time || !traffic && next_time == *time)
                 && next_rx >= *rx
                 && next_tx >= *tx
                 && (!traffic || (next_rx > *rx && next_tx > *tx))
@@ -533,10 +533,8 @@ impl DaemonGuard<'_> {
     fn client_session(&mut self) -> Result<String> {
         let handshakes = self
             .lab
-            .cmd("scupper", "wg", &["show", "wg0", "latest-handshakes"])?;
-        let transfers = self
-            .lab
-            .cmd("scupper", "wg", &["show", "wg0", "transfer"])?;
+            .cmd("client", "wg", &["show", "wg0", "latest-handshakes"])?;
+        let transfers = self.lab.cmd("client", "wg", &["show", "wg0", "transfer"])?;
         let times = handshakes
             .lines()
             .filter_map(|line| line.split_once(char::is_whitespace))
@@ -544,7 +542,7 @@ impl DaemonGuard<'_> {
         let mut sample = String::new();
         for line in transfers
             .lines()
-            .filter(|line| line.split_whitespace().next() == Some(self.lab.public_keys[3].as_str()))
+            .filter(|line| line.split_whitespace().next() == Some(self.lab.public_keys[0].as_str()))
         {
             let (peer, counters) = line
                 .split_once(char::is_whitespace)
@@ -668,7 +666,7 @@ impl DaemonGuard<'_> {
         let after = self.client_session()?;
         if !session_continues(before, &after) {
             return fail(format!(
-                "apply reset client transfer counters: {before:?} -> {after:?}"
+                "apply changed client session: {before:?} -> {after:?}"
             ));
         }
         Ok(())
@@ -1629,9 +1627,9 @@ mod tests {
 mod session_tests {
     use super::{session_continues, session_has_traffic};
     #[test]
-    fn counters_allow_idle_sessions_and_rekeys_but_reject_resets() {
+    fn client_handshakes_detect_rekeys_and_resets_even_when_counters_survive() {
         let before = "peer 100 1000 2000\n";
-        assert!(session_continues(before, "peer 220 1100 2100"));
+        assert!(!session_continues(before, "peer 220 1100 2100"));
         assert!(session_continues(before, before));
         assert!(session_continues(before, "peer 100 1100 2000"));
         assert!(session_has_traffic(before, "peer 220 1100 2100"));

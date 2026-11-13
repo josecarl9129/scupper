@@ -625,7 +625,7 @@ pub(crate) fn boot_apply_with_guard(
             .warnings
             .push(format!("repair checkpoint migration: {error}"));
     }
-    let report = boot_locked(deps, initial, open_quarantined);
+    let report = boot_locked(deps, initial, open_quarantined, guard);
     if !report.succeeded() {
         let mut report = report;
         if let Err(error) = save_report(deps, &report) {
@@ -655,7 +655,12 @@ pub(crate) fn save_report_at(run_root: &Path, report: &BootReport) -> Result<()>
 }
 
 #[allow(clippy::too_many_lines)] // Keep the ordered build and its failure boundaries together.
-fn boot_locked(deps: &BootDeps<'_>, mut report: BootReport, open_quarantined: bool) -> BootReport {
+fn boot_locked(
+    deps: &BootDeps<'_>,
+    mut report: BootReport,
+    open_quarantined: bool,
+    guard: &WriterGuard,
+) -> BootReport {
     if !step(&mut report, deps, BootStep::Lock, false, || Ok(())) {
         return report;
     }
@@ -808,7 +813,7 @@ fn boot_locked(deps: &BootDeps<'_>, mut report: BootReport, open_quarantined: bo
         if adopted {
             Ok(())
         } else {
-            links::configure(deps, &handle, &cfg)
+            links::configure(deps, &handle, &cfg, guard)
         }
     }) {
         return report;
@@ -880,6 +885,8 @@ fn boot_locked(deps: &BootDeps<'_>, mut report: BootReport, open_quarantined: bo
             return Ok(());
         }
         containment(deps, &handle, &cfg, &mut owned_links)?;
+        // Recovery probes follow on the daemon's next fresh verified tick.
+        // Their availability must never gate boot or forwarding.
         sysctls(
             deps,
             &handle,

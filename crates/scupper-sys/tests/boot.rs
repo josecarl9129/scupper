@@ -2835,3 +2835,32 @@ fn previous_release_reads_written_boot_report() {
     assert_eq!(old.applied_version, report.applied_version);
     assert_eq!(old.owned_links, report.owned_links);
 }
+
+#[test]
+fn boot_defers_optional_session_probe_to_daemon_verified_tick() {
+    let f = Fixture::new();
+    let inject = |point| {
+        if point == BootPoint::After(BootStep::Routes) {
+            *f.kernel.failure.borrow_mut() = Some((
+                Program::Ip,
+                "route show table all".into(),
+                "injected probe route observation failure".into(),
+            ));
+        }
+        Ok(())
+    };
+    let report = f.run(Some(&inject));
+    assert!(report.succeeded(), "{report:?}");
+    assert!(
+        !f.kernel
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call.contains("route show table all"))
+    );
+    assert_eq!(f.kernel.values.borrow()["net.ipv4.ip_forward"], "1");
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(f.root.path.join("client-sessions.json")).unwrap())
+            .unwrap();
+    assert_eq!(record["probe_pending"], true, "boot defers its probe");
+}

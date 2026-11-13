@@ -55,6 +55,48 @@ pub struct StepError(pub &'static str);
 /// Namespace kernel adapter. Implementations must bound every exec to three seconds
 /// and collect safety first with a six-second shared deadline.
 pub trait Kernel {
+    /// Read-only activity snapshot before a planned stop.
+    /// # Errors
+    /// Returns telemetry failure, never a reason to block shutdown.
+    fn checkpoint_client_activity(&self, _guard: &WriterGuard) -> Result<(), StepError> {
+        Ok(())
+    }
+
+    /// Drain the value-free session history alert queued by boot or recovery.
+    fn take_client_session_alert(&self, _guard: &WriterGuard) -> bool {
+        false
+    }
+
+    /// Save reset intent before containment without waiting for telemetry.
+    /// # Errors
+    /// Failure is logged but never prevents the containment command.
+    fn before_client_link_down(&self, _guard: &WriterGuard) -> Result<(), StepError> {
+        Ok(())
+    }
+    /// Capture client reset state while down, before any reopening.
+    /// # Errors
+    /// Returns durable checkpoint or netlink failure.
+    fn client_link_down(&self, _guard: &WriterGuard) -> Result<(), StepError> {
+        Ok(())
+    }
+    /// Checkpoint reset baseline and a single probe before client `LinkUp`.
+    /// # Errors
+    /// Failure blocks reopening.
+    fn before_client_link_up(&self, _guard: &WriterGuard) -> Result<(), StepError> {
+        Ok(())
+    }
+    /// Consume pending client probes only under the pure planner output gate.
+    /// # Errors
+    /// Returns probe failure; callers log it without changing containment.
+    fn recover_client_sessions(
+        &self,
+        _guard: &WriterGuard,
+        _desired: &Desired,
+        _model: &KernelModel,
+    ) -> Result<(), StepError> {
+        Ok(())
+    }
+
     /// Publish newly recreated owned link identities while holding the writer.
     /// Called after safety work; failed publication is retried on later ticks.
     ///
@@ -412,6 +454,14 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             cached: None,
         })
     }
+    /// Snapshot activity before planned shutdown without probing or kernel mutations.
+    /// # Errors
+    /// Returns lock contention or telemetry failure; shutdown remains best effort.
+    pub fn checkpoint_before_shutdown(&self) -> Result<(), StepError> {
+        let guard = WriterLock::try_acquire(&self.config.run_root)
+            .map_err(|_| StepError("session snapshot writer unavailable"))?;
+        self.kernel.checkpoint_client_activity(&guard)
+    }
     /// Adapter access for lifecycle updates such as edge's new namespace path.
     pub fn kernel(&self) -> &K {
         &self.kernel
@@ -678,12 +728,12 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
     #[allow(clippy::single_match_else)] // Durable success and failure retain different latch views.
     fn observe(&mut self, report: &mut TickReport) -> Observation {
         let mut observation = self.kernel.observe(&self.held);
-        self.cached = Some((Instant::now(), observation.model.clone()));
         observation.model.latch = self.persisted.quarantine.as_ref().map(|q| Latch {
             uncertain: q.uncertain,
             reason: q.reason.clone(),
             object: q.object.clone(),
         });
+        self.cached = Some((Instant::now(), observation.model.clone()));
         self.forwarding = observation.model.forwarding_v4 == planner::Known::Value(1)
             && observation.model.forwarding_v6 == planner::Known::Value(1)
             && observation.model.client_forwarding_v4 == planner::Known::Value(1);
@@ -768,6 +818,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
     fn tick_locked(&mut self, guard: &WriterGuard, report: &mut TickReport) {
         self.store.begin_tick();
         self.kernel.begin_tick();
+        self.session_history_alert(guard, report);
         // Read the applied identity before comparing against this render. A
         // concurrent writer holds the same lock, so it cannot race this check.
         if let Some(mut latest) = self
@@ -1489,6 +1540,36 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         if restore_name {
             self.restore_namespace(guard, report);
         }
+        let client_changed = report.steps.iter().any(|step| {
+            matches!(
+                step,
+                Step::LinkUp { .. }
+                    | Step::LinkDown { .. }
+                    | Step::LinkCreate { .. }
+                    | Step::LinkReconfigure { .. }
+            )
+        });
+        if report.failures.is_empty()
+            && !client_changed
+            && let Some((_, model)) = &self.cached
+            && planner::client_output_verified(model, desired)
+            && self.deadline.is_none_or(|d| self.kernel.within_deadline(d))
+            && let Err(error) = self.kernel.recover_client_sessions(guard, desired, model)
+        {
+            eprintln!("client session recovery probe failed: {error}; awaiting client retry");
+        }
+        self.session_history_alert(guard, report);
+    }
+    fn session_history_alert(&self, guard: &WriterGuard, report: &mut TickReport) {
+        if self.kernel.take_client_session_alert(guard) {
+            self.emit(
+                EventKind::PersistenceFailed {
+                    reason: scupper_proto::Reason::StateWrite,
+                },
+                Actor::Daemon,
+                report,
+            );
+        }
     }
     fn repair_now(&self) -> MonoTime {
         (self.clock)().0.after(Duration::from_secs(600))
@@ -1571,6 +1652,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             );
         }
     }
+    #[allow(clippy::too_many_lines)] // Keep persistence, client reset checkpoint and kernel ordering together.
     fn execute_step(
         &mut self,
         step: &Step,
@@ -1578,6 +1660,31 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         guard: &WriterGuard,
         report: &mut TickReport,
     ) -> Result<(), StepError> {
+        let client = self
+            .config
+            .site
+            .gateway(&self.config.gateway)
+            .map(|gw| gw.client_tunnel().ifname().as_str().to_owned());
+        let raises_client = match step {
+            Step::LinkUp { name, .. } => Some(name.as_str()) == client.as_deref(),
+            Step::LinkCreate {
+                link,
+                phase: planner::LinkPhase::Up,
+            } => link.up && Some(link.name.as_str()) == client.as_deref(),
+            _ => false,
+        };
+        if raises_client {
+            self.kernel.before_client_link_up(guard)?;
+        }
+        let lowers_client = match step {
+            Step::LinkDown { name } => Some(name.as_str()) == client.as_deref(),
+            Step::LinkReconfigure { link } => Some(link.name.as_str()) == client.as_deref(),
+            _ => false,
+        };
+        if lowers_client && let Err(error) = self.kernel.before_client_link_down(guard) {
+            // Checkpoint before the command: a timeout can mean it took effect.
+            eprintln!("client reset checkpoint failed: {error}");
+        }
         let result = match step {
             Step::PersistLatch { reason, object } => {
                 let mut state = self.persisted.clone();
@@ -1641,6 +1748,10 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             }),
             _ => self.kernel.execute(step),
         };
+        if lowers_client && let Err(error) = self.kernel.client_link_down(guard) {
+            // Counters survive LinkDown, even if the command timed out after applying it.
+            eprintln!("client reset baseline checkpoint failed: {error}");
+        }
         if result.is_ok()
             && matches!(
                 step,
@@ -2066,6 +2177,8 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         if dry_run {
             return Ok(planned.steps.iter().map(StepKind::from).collect());
         }
+        // Manual repair uses the same fresh output proof as a periodic tick.
+        self.cached = Some((Instant::now(), observed.model.clone()));
         let mut report = TickReport {
             complete: observed.complete && observed.safety_complete,
             ..TickReport::default()

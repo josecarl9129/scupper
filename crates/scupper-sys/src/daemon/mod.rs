@@ -411,7 +411,7 @@ impl Drop for Audit {
 
 /// Run until SIGTERM/SIGINT sets `stop`, finishing any current tick first.
 /// Notification, probes and audit maintenance occur outside the writer lock.
-/// Shutdown never executes kernel operations, even if flushing fails.
+/// Shutdown only reads client activity for a final snapshot; it never mutates kernel state.
 ///
 /// # Errors
 /// Returns invalid identity/configuration roots or notify socket setup errors.
@@ -990,6 +990,11 @@ impl DaemonDeps for Runtime<'_> {
         self.heartbeat_iteration(true);
     }
     fn shutdown(&mut self) {
+        if let Some((machine, _, _)) = &self.running
+            && let Err(error) = machine.checkpoint_before_shutdown()
+        {
+            eprintln!("scupperd: client activity snapshot: {error}");
+        }
         self.alerts.stop();
         self.running.take();
         if let Err(error) = self.audit.shutdown() {

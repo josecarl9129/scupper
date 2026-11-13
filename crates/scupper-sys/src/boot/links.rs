@@ -126,7 +126,12 @@ pub(crate) fn move_link(deps: &BootDeps<'_>, handle: &NetnsHandle, name: &str) -
     Ok(())
 }
 
-pub(super) fn configure(deps: &BootDeps<'_>, handle: &NetnsHandle, cfg: &Inputs) -> Result<()> {
+pub(super) fn configure(
+    deps: &BootDeps<'_>,
+    handle: &NetnsHandle,
+    cfg: &Inputs,
+    guard: &crate::lock::WriterGuard,
+) -> Result<()> {
     let gw = cfg.site.gateway(&cfg.gateway).ok_or("unknown gateway")?;
     for name in super::configured_names(cfg)?
         .iter()
@@ -148,7 +153,26 @@ pub(super) fn configure(deps: &BootDeps<'_>, handle: &NetnsHandle, cfg: &Inputs)
         }
         let up = name == gw.client_tunnel().ifname().as_str()
             || cfg.state.selection != scupper_core::verdict::v2::Selection::Disconnected;
-        configure_body(deps, handle, cfg, name, up, true)?;
+        if name == gw.client_tunnel().ifname().as_str() {
+            let was_down = !existing
+                .iter()
+                .any(|l| l.ifname == name && l.flags.iter().any(|f| f == "UP"));
+            configure_body(deps, handle, cfg, name, false, true)?;
+            crate::client_sessions::before_up(
+                deps.system,
+                handle,
+                name,
+                deps.state_root,
+                deps.run_root,
+                gw.client_tunnel().identity().public_key.as_str(),
+                was_down,
+                guard,
+            )
+            .map_err(|_| "client session baseline unavailable".to_string())?;
+            set_up(deps, handle, name, true)?;
+        } else {
+            configure_body(deps, handle, cfg, name, up, true)?;
+        }
     }
     Ok(())
 }

@@ -479,6 +479,7 @@ fn build_plan(
     // reopening gates pass, restore the same configured device before forwarding.
     for repair in &admitted {
         if let Repair::LinkUp { name } = repair
+            && !unknown_inventory
             && !closed_by_policy(suppressed, effective_latch)
             && builder.can_raise_client(name)
         {

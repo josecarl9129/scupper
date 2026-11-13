@@ -1111,3 +1111,178 @@ fn full_check_reports_client_link_down_or_missing_without_probing_the_missing_de
         }
     }
 }
+
+#[test]
+#[allow(clippy::too_many_lines)] // Run the public checkpoint and check driver on both captured kernels.
+fn client_reset_checkpoint_gates_the_real_check_driver_on_both_runners() {
+    use scupper_core::verdict::v2::{Degraded, Verdict};
+    use scupper_sys::{
+        client_sessions::{self, Request, Response, Sample},
+        lock::WriterLock,
+        netns::NetnsHandle,
+        system::{ExecError, ExecOutput, ExecTarget, Program, System},
+    };
+    use std::{cell::RefCell, time::Duration};
+    struct Sessions {
+        inner: Script,
+        sample: RefCell<Sample>,
+        fail_read: std::cell::Cell<bool>,
+    }
+    impl System for Sessions {
+        fn run(
+            &self,
+            p: Program,
+            args: &[String],
+            timeout: Duration,
+        ) -> Result<ExecOutput, ExecError> {
+            self.inner.run(p, args, timeout)
+        }
+        fn run_in(
+            &self,
+            t: ExecTarget<'_>,
+            p: Program,
+            args: &[String],
+            timeout: Duration,
+        ) -> Result<ExecOutput, ExecError> {
+            self.inner.run_in(t, p, args, timeout)
+        }
+        fn now_unix_secs(&self) -> u64 {
+            1000
+        }
+        fn wireguard_socket_dirs(&self) -> Vec<std::path::PathBuf> {
+            vec![]
+        }
+        fn read_host_udp(&self, ipv6: bool) -> std::io::Result<String> {
+            self.inner.read_host_udp(ipv6)
+        }
+        fn canon_run_root(&self) -> &Path {
+            self.inner.canon_run_root()
+        }
+        fn client_session_io(&self, _: &NetnsHandle, r: &Request) -> std::io::Result<Response> {
+            assert!(
+                r.probe.is_none(),
+                "check must never initiate recovery probes"
+            );
+            if self.fail_read.get() {
+                return Err(std::io::Error::other("session telemetry unavailable"));
+            }
+            Ok(Response::Samples(vec![self.sample.borrow().clone()]))
+        }
+    }
+    for runner in ["ubuntu-22.04", "ubuntu-24.04"] {
+        let handle = testing::handle().unwrap();
+        let root = Root::new(runner, &handle);
+        let site = site(runner);
+        let gateway = GatewayId("gw1".into());
+        let cfg = cfg(&site, &gateway, root.stamp);
+        let key = site.devices().values().next().unwrap().public_key();
+        let sys = Sessions {
+            inner: Script::new(runner),
+            fail_read: std::cell::Cell::new(false),
+            sample: RefCell::new(Sample {
+                key,
+                handshake: (1000, 0),
+                rx: 1000,
+                tx: 2000,
+            }),
+        };
+        fresh(&sys.inner);
+        let writer = WriterLock::acquire(root.path.join("lock")).unwrap();
+        fs::remove_file(root.path.join("client-sessions.json")).unwrap();
+        client_sessions::link_down(
+            &sys,
+            &handle,
+            "wg0",
+            &root.path,
+            &root.path,
+            site.gateway(&gateway)
+                .unwrap()
+                .client_tunnel()
+                .identity()
+                .public_key
+                .as_str(),
+            &writer,
+        )
+        .unwrap();
+        client_sessions::before_up(
+            &sys,
+            &handle,
+            "wg0",
+            &root.path,
+            &root.path,
+            site.gateway(&gateway)
+                .unwrap()
+                .client_tunnel()
+                .identity()
+                .public_key
+                .as_str(),
+            true,
+            &writer,
+        )
+        .unwrap();
+        let deps = Dependencies {
+            system: &sys,
+            probe_exec: &sys.inner,
+            handle: Some(&handle),
+            run_root: &root.path,
+            state_root: &root.path,
+        };
+        let (report, obs) = check_v2::run_with_observations(&deps, &cfg);
+        assert_eq!(
+            report.unwrap().verdict,
+            Verdict::Degraded(Degraded::ClientSessionsUnknown)
+        );
+        assert!(
+            obs.routes.is_some(),
+            "pending sessions must not skip route evidence"
+        );
+        assert!(
+            obs.exit_probe.is_some(),
+            "pending sessions must not skip exit-IP evidence"
+        );
+        assert!(
+            obs.supervisor.is_some(),
+            "pending sessions must not skip supervisor evidence"
+        );
+        let saved_probe = sys.inner.probe.borrow().clone();
+        let mut probe: serde_json::Value = serde_json::from_str(&saved_probe).unwrap();
+        probe["result"]["ip"] = serde_json::json!("198.51.100.2");
+        *sys.inner.probe.borrow_mut() = probe.to_string();
+        assert_eq!(
+            check_v2::run_check_v2(&deps, &cfg)
+                .unwrap()
+                .verdict
+                .exit_code(),
+            2
+        );
+        *sys.inner.probe.borrow_mut() = saved_probe;
+        sys.sample.borrow_mut().handshake = (1000, 1);
+        sys.sample.borrow_mut().rx += 92;
+        assert_eq!(
+            check_v2::run_check_v2(&deps, &cfg).unwrap().verdict,
+            Verdict::Degraded(Degraded::ClientSessionsUnknown)
+        );
+        sys.sample.borrow_mut().rx += 32;
+        assert_eq!(
+            check_v2::run_check_v2(&deps, &cfg)
+                .unwrap()
+                .verdict
+                .exit_code(),
+            0
+        );
+        sys.fail_read.set(true);
+        assert_eq!(
+            check_v2::run_check_v2(&deps, &cfg).unwrap().verdict,
+            Verdict::Degraded(Degraded::ClientSessionsUnknown)
+        );
+        *sys.inner.probe.borrow_mut() = probe.to_string();
+        let (report, obs) = check_v2::run_with_observations(&deps, &cfg);
+        assert_eq!(
+            report.unwrap().verdict.exit_code(),
+            2,
+            "session telemetry failure cannot hide an exit-IP safety violation"
+        );
+        assert!(obs.routes.is_some());
+        assert!(obs.exit_probe.is_some());
+    }
+}

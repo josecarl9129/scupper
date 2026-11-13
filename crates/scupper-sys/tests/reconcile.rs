@@ -4156,3 +4156,72 @@ fn failed_d2_link_up_keeps_forwarding_closed_and_names_the_failed_link() {
         kind: StepKind::LinkUp, object: Some(name), result: scupper_proto::Outcome::Failed, ..
     } if name == "wg0")));
 }
+
+#[test]
+fn manual_client_repair_dispatches_recovery_and_unknown_inventory_cannot_use_old_cache() {
+    let mut rig = Rig::new();
+    rig.kernel
+        .mutate(|m| m.links.get_mut("wg0").unwrap().up = Known::Value(false));
+    let before = rig.kernel.session_recoveries();
+    let steps = rig
+        .machine()
+        .apply_plan(false, Actor::Local { uid: 0 })
+        .unwrap();
+    assert!(steps.contains(&StepKind::LinkUp));
+    assert_eq!(
+        rig.kernel.session_recoveries(),
+        before,
+        "LinkUp requires a fresh next tick"
+    );
+    rig.tick();
+    assert!(rig.kernel.session_recoveries() > before);
+    assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(true));
+    // The last cached state was healthy. Manual repair must replace it with
+    // its fresh Unknown observation before deciding whether to send output.
+    rig.kernel
+        .timeouts(BTreeSet::from([ObservationItem::Tc("wg0".into())]));
+    let before = rig.kernel.session_recoveries();
+    rig.machine()
+        .apply_plan(false, Actor::Local { uid: 0 })
+        .unwrap();
+    assert_eq!(rig.kernel.session_recoveries(), before);
+    assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(false));
+}
+
+#[test]
+fn link_down_timeout_after_effect_has_a_prior_session_checkpoint() {
+    let mut rig = Rig::new();
+    rig.kernel.mutate(|m| {
+        foreign(m);
+        m.links.get_mut("foreign0").unwrap().tc_hooks = Known::Unknown;
+    });
+    rig.kernel.inject(Fault {
+        step: StepKind::LinkDown,
+        remaining: None,
+        partial: true,
+    });
+    let recoveries = rig.kernel.session_recoveries();
+    let report = rig.tick();
+    assert!(
+        report
+            .failures
+            .iter()
+            .any(|(s, _)| matches!(s, Step::LinkDown { name } if name == "wg0"))
+    );
+    assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(false));
+    let history = rig.kernel.history();
+    let checkpoint = rig.kernel.session_checkpoints();
+    let down = history
+        .iter()
+        .position(|(s, _)| matches!(s, Step::LinkDown { name } if name == "wg0"))
+        .unwrap();
+    assert!(
+        checkpoint.contains(&down),
+        "checkpoint must precede the failed command"
+    );
+    assert_eq!(
+        rig.kernel.session_recoveries(),
+        recoveries,
+        "failed plan cannot run recovery hook"
+    );
+}

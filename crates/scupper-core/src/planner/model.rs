@@ -788,3 +788,22 @@ pub fn safe(m: &KernelModel, desired: &Desired) -> bool {
                     })
         })
 }
+
+/// Whether a locally generated client recovery packet has a verified configuration
+/// and output path. Down ingress alone is never proof for this output operation.
+#[must_use]
+pub fn client_output_verified(m: &KernelModel, desired: &Desired) -> bool {
+    !desired.disconnected
+        && m.latch.is_none()
+        && safe(m, desired)
+        && m.extra_routes == Known::Value(vec![])
+        && m.ruleset == Known::Value(Ruleset::Verified(desired.fingerprint))
+        && desired.links.iter().all(|(name, want)| {
+            m.links
+                .get(name)
+                .is_some_and(|link| link.matches_config(want))
+        })
+        && m.links
+            .get(&m.client_link)
+            .is_some_and(|link| link.up == Known::Value(true))
+}

@@ -594,7 +594,9 @@ impl SystemdLab {
     }
     fn ready_recorded(&mut self, label: Option<&str>) -> Result<()> {
         let started = Instant::now();
-        let until = started + Duration::from_secs(90);
+        // First installation or unavailable history includes one honest 180 s
+        // unknown lease. This is readiness waiting, never a canary retry.
+        let until = started + Duration::from_secs(210);
         loop {
             self.lab.runner.check()?;
             let (status, output) = self

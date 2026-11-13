@@ -30,6 +30,8 @@ pub struct RealKernel<'a> {
     deps: BootDeps<'a>,
     held: Arc<NetnsHandle>,
     desired: Desired,
+    site: scupper_core::config::ValidatedSite,
+    gateway: scupper_core::config::GatewayId,
     exit_keys:
         std::collections::BTreeMap<scupper_core::config::ExitId, scupper_core::config::SecretName>,
     health: HealthConfigV2,
@@ -37,6 +39,8 @@ pub struct RealKernel<'a> {
     edge_path: RefCell<Option<PathBuf>>,
     owned_links: RefCell<std::collections::BTreeMap<String, u32>>,
     memory_latch: Cell<bool>,
+    #[cfg(feature = "testing")]
+    unknown_inventory_tick: Cell<bool>,
     owned_dirty: Cell<bool>,
     flushed: Cell<bool>,
     state: crate::state::StateFile,
@@ -93,12 +97,16 @@ impl<'a> RealKernel<'a> {
             deps,
             held,
             desired,
+            site: config.site.clone(),
+            gateway: config.gateway.clone(),
             exit_keys,
             health,
             namespace_path,
             edge_path: RefCell::new(edge_path),
             owned_links: RefCell::new(std::collections::BTreeMap::new()),
             memory_latch: Cell::new(false),
+            #[cfg(feature = "testing")]
+            unknown_inventory_tick: Cell::new(false),
             owned_dirty: Cell::new(false),
             flushed: Cell::new(false),
             state,
@@ -299,6 +307,140 @@ impl<'a> RealKernel<'a> {
     }
 }
 impl Kernel for RealKernel<'_> {
+    fn checkpoint_client_activity(&self, guard: &WriterGuard) -> Result<(), StepError> {
+        crate::client_sessions::before_shutdown(
+            self.deps.system,
+            &self.held,
+            &self.health.client_iface,
+            self.deps.state_root,
+            self.deps.run_root,
+            self.site
+                .gateway(&self.gateway)
+                .ok_or(StepError("unknown gateway"))?
+                .client_tunnel()
+                .identity()
+                .public_key
+                .as_str(),
+            guard,
+        )
+        .map_err(|_| StepError("client activity snapshot failed"))
+    }
+
+    fn take_client_session_alert(&self, guard: &WriterGuard) -> bool {
+        crate::client_sessions::take_history_alert(self.deps.run_root, guard)
+    }
+    fn before_client_link_down(&self, guard: &WriterGuard) -> Result<(), StepError> {
+        crate::client_sessions::before_down(
+            self.deps.system,
+            self.deps.state_root,
+            self.deps.run_root,
+            self.site
+                .gateway(&self.gateway)
+                .ok_or(StepError("unknown gateway"))?
+                .client_tunnel()
+                .identity()
+                .public_key
+                .as_str(),
+            guard,
+        )
+        .map_err(|_| StepError("client reset intent checkpoint failed"))
+    }
+    fn client_link_down(&self, guard: &WriterGuard) -> Result<(), StepError> {
+        crate::client_sessions::link_down(
+            self.deps.system,
+            &self.held,
+            &self.health.client_iface,
+            self.deps.state_root,
+            self.deps.run_root,
+            self.site
+                .gateway(&self.gateway)
+                .ok_or(StepError("unknown gateway"))?
+                .client_tunnel()
+                .identity()
+                .public_key
+                .as_str(),
+            guard,
+        )
+        .map_err(|_| StepError("client reset checkpoint failed"))
+    }
+    fn before_client_link_up(&self, guard: &WriterGuard) -> Result<(), StepError> {
+        let inventory = boot::inventory(&self.deps, &self.held)
+            .map_err(|_| StepError("client link inventory failed"))?;
+        let link = inventory
+            .iter()
+            .find(|l| l.ifname == self.health.client_iface)
+            .ok_or(StepError("client link missing"))?;
+        crate::client_sessions::before_up(
+            self.deps.system,
+            &self.held,
+            &self.health.client_iface,
+            self.deps.state_root,
+            self.deps.run_root,
+            self.site
+                .gateway(&self.gateway)
+                .ok_or(StepError("unknown gateway"))?
+                .client_tunnel()
+                .identity()
+                .public_key
+                .as_str(),
+            !link.flags.iter().any(|f| f == "UP"),
+            guard,
+        )
+        .map_err(|_| StepError("client reset baseline unavailable"))
+    }
+    fn recover_client_sessions(
+        &self,
+        guard: &WriterGuard,
+        desired: &Desired,
+        model: &scupper_core::planner::KernelModel,
+    ) -> Result<(), StepError> {
+        if !scupper_core::planner::client_output_verified(model, desired) {
+            return Ok(());
+        }
+        if self.memory_latch.get() {
+            return Ok(());
+        }
+        let state = self
+            .state
+            .read_until(Instant::now() + EXEC_TIMEOUT)
+            .map_err(|_| StepError("client session state unavailable"))?;
+        let crate::state::StateRead::Present(state) = state else {
+            return Err(StepError("client session state unavailable"));
+        };
+        if state.quarantine.is_some()
+            || state.selection == scupper_core::verdict::v2::Selection::Disconnected
+            || state.applied_version != Some(desired.applied_version())
+        {
+            return Ok(());
+        }
+        crate::client_sessions::checkpoint_recovered(
+            self.deps.system,
+            &self.held,
+            &self.health.client_iface,
+            self.deps.state_root,
+            self.deps.run_root,
+            self.site
+                .gateway(&self.gateway)
+                .ok_or(StepError("unknown gateway"))?
+                .client_tunnel()
+                .identity()
+                .public_key
+                .as_str(),
+            guard,
+        )
+        .map_err(|_| StepError("client session readiness checkpoint failed"))?;
+        self.verify(desired.fingerprint())?;
+        crate::client_sessions::probe_pending(
+            self.deps.system,
+            &self.held,
+            &self.site,
+            &self.gateway,
+            self.deps.state_root,
+            guard,
+        )
+        .map_err(|_| StepError("client session probe failed"))
+    }
+
     fn checkpoint_owned(&self, guard: &WriterGuard) -> Result<(), StepError> {
         if !self.owned_dirty.get() {
             return Ok(());
@@ -313,12 +455,18 @@ impl Kernel for RealKernel<'_> {
         Ok(())
     }
 
+    fn begin_tick(&self) {
+        self.invalidate_state();
+        #[cfg(feature = "testing")]
+        self.unknown_inventory_tick
+            .set(std::fs::remove_file(self.deps.run_root.join("unknown-inventory-once")).is_ok());
+    }
     fn invalidate_state(&self) {
         self.state.invalidate_reads();
     }
     fn observe(&self, held: &NetnsHandle) -> Observation {
         self.flushed.set(false);
-        collect::reconcile::observe(
+        let observation = collect::reconcile::observe(
             self.deps.system,
             held,
             &self.desired,
@@ -326,7 +474,18 @@ impl Kernel for RealKernel<'_> {
             &self.namespace_path,
             self.edge_path.borrow().as_deref(),
             &self.owned_links.borrow(),
-        )
+        );
+        #[cfg(feature = "testing")]
+        let observation = if self.unknown_inventory_tick.get() {
+            let mut observation = observation;
+            observation.model.links_complete = false;
+            observation.safety_complete = false;
+            observation.complete = false;
+            observation
+        } else {
+            observation
+        };
+        observation
     }
     fn observe_rest(
         &self,

@@ -169,6 +169,7 @@ pub(crate) fn forwarding_with_client(
             .collect()
     };
     Ok(Forwarding {
+        client_sessions: scupper_core::verdict::v2::ClientSessions::default(),
         client_v4,
         netns_sockets,
         v4: values[0],

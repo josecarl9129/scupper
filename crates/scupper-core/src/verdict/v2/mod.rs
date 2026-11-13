@@ -2,8 +2,8 @@
 //!
 //! Stages follow DESIGN §12: containment → administrative closure → observed
 //! defaults/handshakes → forwarding/client listener → forwarded routes → exit
-//! probe → required supervisor. Standby probing is reserved for multi-exit M2k;
-//! DNS self-tests begin with the M4 forwarder. Neither is requested in M2.
+//! probe → required supervisor/netns → client sessions. Standby probing is
+//! reserved for multi-exit M2k; DNS self-tests begin with the M4 forwarder. Neither is requested in M2.
 //!
 //! Known violations in any supplied observation win over observation errors.
 //! Supplied required-observation errors win over availability results, even if
@@ -531,6 +531,18 @@ pub fn next(obs: &Observations, cfg: &HealthConfigV2, now: u64) -> Next {
                 now,
             );
         }
+        if obs
+            .forwarding
+            .as_ref()
+            .and_then(|f| f.as_ref().ok())
+            .is_some_and(|f| {
+                f.client_sessions.active_reset
+                    || f.client_sessions.idle_reset
+                    || f.client_sessions.unknown
+            })
+        {
+            warnings.push(Warning::IdleClientSessionsReset);
+        }
         return report(
             Verdict::Degraded(Degraded::ClientSideBroken(ClientFault::LinkDown)),
             warnings,
@@ -656,6 +668,7 @@ pub fn next(obs: &Observations, cfg: &HealthConfigV2, now: u64) -> Next {
         );
     }
     let exit = cfg.exit.clone();
+    let mut supervisor_fault = None;
     if cfg.require_daemon {
         let why = match obs.supervisor {
             None => return Next::Supervisor,
@@ -668,18 +681,7 @@ pub fn next(obs: &Observations, cfg: &HealthConfigV2, now: u64) -> Next {
             Some(Supervisor::Dead) => Some(SupervisorFault::Dead),
             Some(Supervisor::NotRequired) => Some(SupervisorFault::NotRequired),
         };
-        if let Some(why) = why {
-            return report(
-                Verdict::Unsupervised {
-                    exit,
-                    exit_ip: ip,
-                    why,
-                },
-                warnings,
-                cfg,
-                now,
-            );
-        }
+        supervisor_fault = why;
     } else {
         match obs.supervisor {
             Some(Supervisor::Dead) => warnings.push(Warning::DaemonDead),
@@ -690,6 +692,43 @@ pub fn next(obs: &Observations, cfg: &HealthConfigV2, now: u64) -> Next {
             }
             _ => {}
         }
+    }
+    if forwarding.client_sessions.history_unavailable {
+        warnings.push(Warning::ClientSessionHistoryUnavailable);
+    }
+    if forwarding.client_sessions.expired_unconfirmed {
+        warnings.push(Warning::ClientSessionsExpiredUnconfirmed);
+    }
+    if forwarding.client_sessions.unknown {
+        return report(
+            Verdict::Degraded(Degraded::ClientSessionsUnknown),
+            warnings,
+            cfg,
+            now,
+        );
+    }
+    if forwarding.client_sessions.idle_reset {
+        warnings.push(Warning::IdleClientSessionsReset);
+    }
+    if forwarding.client_sessions.active_reset {
+        return report(
+            Verdict::Degraded(Degraded::ClientSessionsReset),
+            warnings,
+            cfg,
+            now,
+        );
+    }
+    if let Some(why) = supervisor_fault {
+        return report(
+            Verdict::Unsupervised {
+                exit,
+                exit_ip: ip,
+                why,
+            },
+            warnings,
+            cfg,
+            now,
+        );
     }
     report(Verdict::Protected { exit, exit_ip: ip }, warnings, cfg, now)
 }

@@ -71,7 +71,8 @@ mod types;
 
 pub use desired::Desired;
 pub use model::{
-    ForwardingGates, KernelLink, KernelModel, ObservationDetails, ObservationItem, safe,
+    ForwardingGates, KernelLink, KernelModel, ObservationDetails, ObservationItem,
+    client_output_verified, safe,
 };
 pub use plan::{clear_latch, plan, replan_after_failure};
 pub use types::*;

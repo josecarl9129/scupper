@@ -187,6 +187,22 @@ pub enum RepairKind {
     SafetyDrift,
 }
 
+/// Client service evidence after a client link reset, independent of containment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // Independent cohorts can coexist; per-peer storage uses explicit states.
+pub struct ClientSessions {
+    /// A peer active in the 180 seconds preceding reset has not recovered.
+    pub active_reset: bool,
+    /// An idle or never-connected peer has not recovered.
+    pub idle_reset: bool,
+    /// Historical cohort is unavailable within its one bounded lease.
+    pub unknown: bool,
+    /// Unavailable history lease expired; this is not confirmed recovery.
+    pub history_unavailable: bool,
+    /// An authenticated activity lease expired without confirmation.
+    pub expired_unconfirmed: bool,
+}
+
 /// Forwarding and the listening side of the client tunnel, observed together.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Forwarding {
@@ -210,6 +226,8 @@ pub struct Forwarding {
     pub host_sockets: Vec<UdpSocket>,
     /// Every configured client peer's handshake, including explicit Never.
     pub client_handshakes: BTreeMap<[u8; 32], Handshake>,
+    /// Persistent reset generation evaluated against fresh client transport.
+    pub client_sessions: ClientSessions,
 }
 
 /// One client's forwarded lookup results for both address families.
@@ -415,6 +433,10 @@ pub enum Degraded {
     DisconnectNotEffective,
     /// The gateway's client listener is broken.
     ClientSideBroken(ClientFault),
+    /// Recently active clients still lack authenticated post-reset transport.
+    ClientSessionsReset,
+    /// Session history is unavailable during its bounded uncertainty lease.
+    ClientSessionsUnknown,
     /// Probe ran but the exit path failed.
     ExitProbeFailed(ProbeError),
     /// Probe returned an implausible public IPv4 exit address.
@@ -479,6 +501,12 @@ pub enum Warning {
     DaemonStale,
     /// At least one configured client has a stale or never handshake.
     ClientHandshakesStale,
+    /// Idle clients have unconfirmed sessions after a client link reset.
+    IdleClientSessionsReset,
+    /// Session activity lease expired without confirmation.
+    ClientSessionsExpiredUnconfirmed,
+    /// Durable history was unavailable; the bounded unknown lease has expired.
+    ClientSessionHistoryUnavailable,
 }
 
 /// Observation stage, in execution order.

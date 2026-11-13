@@ -31,7 +31,7 @@ pub(super) fn short_boot_root(case: &str) -> std::path::PathBuf {
     Path::new("/run/scupper-lab").join(format!("{}-{case}", std::process::id()))
 }
 
-pub(super) const CASES: [&str; 32] = [
+pub(super) const CASES: [&str; 33] = [
     "L1",
     "L2",
     "L5",
@@ -40,6 +40,7 @@ pub(super) const CASES: [&str; 32] = [
     "L9b",
     "L11",
     "L12",
+    "L54",
     "L15",
     "L18",
     "L20",
@@ -2199,6 +2200,7 @@ pub(super) fn daemon_wanted(case: &str) -> &'static str {
         }
         "L11" => "second client isolation; gateway/provider scans denied; allowed client echo",
         "L12" => "WireGuard source rejection; widened peer check 2; traced antispoof drop",
+        "L54" => "single Unknown tick resets active client; no false OK; first TCP within 5 s",
         "L15" => "real fake HTTPS exit-IP target: 0, uplink address 2, restored 0",
         "L18" => "host sysctl inheritance overridden; forwarding toggle reapplies hardening",
         "L20" => "supervised IPv4 PMTU; IPv6 renderer chain property, unsupervised",

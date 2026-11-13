@@ -300,6 +300,17 @@ pub enum ExecTarget<'a> {
 /// }
 /// ```
 pub trait System {
+    /// Bounded public netlink telemetry or a fixed client session probe.
+    /// # Errors
+    /// Returns unsupported or child/namespace errors.
+    fn client_session_io(
+        &self,
+        _held: &NetnsHandle,
+        _request: &crate::client_sessions::Request,
+    ) -> std::io::Result<crate::client_sessions::Response> {
+        Err(std::io::Error::other("client session helper unsupported"))
+    }
+
     /// Enabled wg-quick instances from public filesystem inventory.
     /// # Errors
     /// Returns an error when the inventory cannot be read.
@@ -801,6 +812,14 @@ fn namespace_result(
 }
 
 impl System for RealSystem {
+    fn client_session_io(
+        &self,
+        held: &NetnsHandle,
+        request: &crate::client_sessions::Request,
+    ) -> std::io::Result<crate::client_sessions::Response> {
+        crate::client_sessions::execute(self, held, request)
+    }
+
     fn wg_quick_units(&self) -> std::io::Result<Vec<String>> {
         crate::v1_detect::wg_quick_units_at(Path::new("/"))
     }

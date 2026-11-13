@@ -280,6 +280,7 @@ mod tests {
             "daemon-L52b",
             "daemon-L53",
             "daemon-L53b",
+            "daemon-L54",
             "daemon-heartbeat",
             "daemon-alerts",
             "daemon-V03",

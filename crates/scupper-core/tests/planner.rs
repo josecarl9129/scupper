@@ -934,6 +934,7 @@ fn observations(
         tc_hooks: vec![],
     };
     let forwarding = Forwarding {
+        client_sessions: scupper_core::verdict::v2::ClientSessions::default(),
         client_v4: 1,
         netns_sockets: vec![],
         v4: 1,
@@ -2724,5 +2725,51 @@ fn d2_foreign_tc_failure_then_positive_absence_restores_client_before_forwarding
                 .iter()
                 .any(|s| matches!(s, Step::ForwardingOn { .. } | Step::LinkUp { .. }))
         );
+    }
+}
+
+#[test]
+fn unknown_never_raises_client_in_any_tick_prefix_and_probes_require_known_output() {
+    let d = desired();
+    for name in ["wg0", "ex-ch1"] {
+        let mut model = KernelModel::desired(&d);
+        model.links.get_mut(name).unwrap().tc_hooks = Known::Unknown;
+        let mut budgets = Budgets::default();
+        let mut debounce = Debounce::default();
+        for t in 0..8 {
+            let p = plan(&d, &model, &budgets, None, &debounce, at(t));
+            for step in &p.steps {
+                assert!(!matches!(
+                    step,
+                    Step::LinkUp { .. }
+                        | Step::LinkCreate {
+                            phase: LinkPhase::Up,
+                            ..
+                        }
+                ));
+                model = model.apply(step);
+                assert!(!client_output_verified(&model, &d));
+            }
+            assert_eq!(model.links["wg0"].up, Known::Value(false));
+            budgets = p.budgets;
+            debounce = p.debounce;
+        }
+        model.links.get_mut(name).unwrap().tc_hooks = Known::Value(vec![]);
+        let p = plan(&d, &model, &budgets, None, &debounce, at(10));
+        model = run(&model, &p.steps);
+        assert!(client_output_verified(&model, &d));
+    }
+    let clean = KernelModel::desired(&d);
+    assert!(client_output_verified(&clean, &d));
+    for item in 0..5 {
+        let mut m = clean.clone();
+        match item {
+            0 => m.links_complete = false,
+            1 => m.host_links_complete = false,
+            2 => m.links.get_mut("wg0").unwrap().peers = Known::Unknown,
+            3 => m.ruleset = Known::Unknown,
+            _ => m.links.get_mut("ex-ch1").unwrap().tc_hooks = Known::Unknown,
+        }
+        assert!(!client_output_verified(&m, &d));
     }
 }

@@ -24,7 +24,7 @@ pub struct Fault {
     pub step: StepKind,
     /// Remaining failures; None means always.
     pub remaining: Option<usize>,
-    /// `ForwardingOn` writes IPv4 before returning an error.
+    /// `ForwardingOn` writes IPv4; `LinkDown` takes effect before returning an error.
     pub partial: bool,
 }
 /// Shared fake state survives destruction and recreation of a reconciler.
@@ -41,6 +41,8 @@ struct Inner {
     crash_after: Option<usize>,
     boundaries: usize,
     remounts: usize,
+    session_recoveries: usize,
+    session_checkpoints: Vec<usize>,
     edge_elsewhere: bool,
     memory_latch: Option<Latch>,
     flushed: bool,
@@ -69,6 +71,8 @@ impl FakeKernel {
                 crash_after: None,
                 boundaries: 0,
                 remounts: 0,
+                session_recoveries: 0,
+                session_checkpoints: vec![],
                 edge_elsewhere: false,
                 memory_latch: None,
                 flushed: false,
@@ -123,6 +127,16 @@ impl FakeKernel {
     #[must_use]
     pub fn remounts(&self) -> usize {
         self.inner.borrow().remounts
+    }
+    /// Successful dispatches of the verified client session recovery hook.
+    #[must_use]
+    pub fn session_recoveries(&self) -> usize {
+        self.inner.borrow().session_recoveries
+    }
+    /// Number of executed steps at each pre-teardown session checkpoint.
+    #[must_use]
+    pub fn session_checkpoints(&self) -> Vec<usize> {
+        self.inner.borrow().session_checkpoints.clone()
     }
     /// Clear history without changing kernel state.
     pub fn clear_history(&self) {
@@ -271,6 +285,25 @@ impl FakeKernel {
     }
 }
 impl Kernel for FakeKernel {
+    fn before_client_link_down(&self, _guard: &WriterGuard) -> Result<(), StepError> {
+        let mut inner = self.inner.borrow_mut();
+        let before = inner.history.len();
+        inner.session_checkpoints.push(before);
+        Ok(())
+    }
+    fn recover_client_sessions(
+        &self,
+        _guard: &WriterGuard,
+        desired: &Desired,
+        model: &KernelModel,
+    ) -> Result<(), StepError> {
+        assert!(scupper_core::planner::client_output_verified(
+            model, desired
+        ));
+        self.inner.borrow_mut().session_recoveries += 1;
+        Ok(())
+    }
+
     fn within_deadline(&self, deadline: Instant) -> bool {
         Instant::now() < deadline && self.inner.borrow().elapsed < Duration::from_secs(20)
     }
@@ -357,6 +390,9 @@ impl Kernel for FakeKernel {
         let result = if let Some(partial) = fail {
             if partial && matches!(step, Step::ForwardingOn { .. }) {
                 inner.model.forwarding_v4 = Known::Value(1);
+            }
+            if partial && matches!(step, Step::LinkDown { .. }) {
+                inner.model = inner.model.apply(step);
             }
             Err(StepError("injected step failure"))
         } else {

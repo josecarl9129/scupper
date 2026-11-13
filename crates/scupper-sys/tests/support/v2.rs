@@ -408,6 +408,14 @@ impl Root {
                 .to_string(),
         )
         .unwrap();
+        // These safety fixtures model an old, available history with an empty
+        // required cohort. Session lifecycle/unknown-history tests replace it.
+        let site = validate(parse_site(text).unwrap()).unwrap();
+        fs::write(path.join("client-sessions.json"), serde_json::json!({
+            "version": 1, "gateway": site.gateway(&GatewayId("gw1".into())).unwrap().client_tunnel().identity().public_key.as_str(),
+            "written_at": 0, "namespace": handle.identity(), "down": false,
+            "down_since": null, "unknown_until": null, "probe_pending": false, "peers": []
+        }).to_string()).unwrap();
         Self {
             path,
             stamp: VersionStamp {

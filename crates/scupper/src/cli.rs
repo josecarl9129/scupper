@@ -75,6 +75,9 @@ enum Command {
         /// One JSON `ProbeRequest` (stdin is not a byte stream).
         request: String,
     },
+    /// Internal public netlink observation and fixed client recovery probe.
+    #[command(hide = true)]
+    ClientSessions { request: String },
     /// Internal unprivileged delivery using a secret stdin protocol.
     #[command(hide = true)]
     Deliver {
@@ -539,6 +542,13 @@ fn dispatch(
             command: DeliverCommand::Alert,
         } => Ok(scupper_sys::heartbeat::alert_child(std::io::stdin().lock())
             .map_or_else(scupper_sys::heartbeat::Failure::exit_code, |()| 0)),
+        Command::ClientSessions { request } => {
+            let result = scupper_sys::client_sessions::child(&request)
+                .map_err(|_| "client session helper failed".to_string())?;
+            serde_json::to_writer(&mut *stdout, &result).map_err(|e| e.to_string())?;
+            writeln!(stdout).map_err(output_error)?;
+            Ok(0)
+        }
         Command::Probe { request } => {
             let outcome = scupper_sys::probe_child::child_main(&request)?;
             serde_json::to_writer(&mut *stdout, &outcome).map_err(|error| error.to_string())?;

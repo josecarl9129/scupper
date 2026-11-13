@@ -777,7 +777,7 @@ fn capture_loss_or_missing_statistics_cannot_establish_silence() {
 }
 
 #[test]
-fn positive_retry_receipts_still_require_provider_nat_and_uniqueness() {
+fn positive_receipts_require_provider_nat_and_uniqueness() {
     let marker = "scupper-canary-receipt";
     assert!(super::check_positive_receipt(&[], marker, true).is_err());
     assert!(super::check_positive_receipt(&[], marker, false).is_ok());
@@ -855,21 +855,8 @@ fn healthy_outer_packets() -> Vec<Vec<u8>> {
 }
 
 #[test]
-fn recovered_positive_canary_cannot_hide_a_timed_out_attempts_leak() {
-    let dir = test_dir("retry-leak");
-    let mut markers = Vec::new();
-    let mut attempts = 0;
-    let delivered = super::positive::tcp(&mut markers, &dir.join("attempts.jsonl"), |_, _| {
-        attempts += 1;
-        Ok(if attempts == 1 {
-            super::helpers::Outcome::TimedOut
-        } else {
-            super::helpers::Outcome::Delivered
-        })
-    })
-    .unwrap();
-    assert_eq!(markers.len(), 2);
-    assert_eq!(delivered, markers[1]);
+fn a_later_positive_canary_cannot_hide_an_earlier_markers_leak() {
+    let markers = vec![super::Lab::marker().unwrap(), super::Lab::marker().unwrap()];
     let policy = Policy::from_toml(&evidence::policy(&markers, false).unwrap()).unwrap();
     let mut packets = healthy_outer_packets();
     assert!(evidence::contained(
@@ -891,7 +878,6 @@ fn recovered_positive_canary_cannot_hide_a_timed_out_attempts_leak() {
     assert_eq!(report.violation_count, 1);
     assert_eq!(report.counts["Violation(CanaryMarker)"], 1);
     assert!(!evidence::contained(&report));
-    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]

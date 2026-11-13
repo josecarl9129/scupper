@@ -291,13 +291,46 @@ fn run_driver(
             Next::Forwarding => {
                 let client_present = !matches!(&obs.topology, Some(Ok(t))
                     if t.links_complete && !t.links.iter().any(|link| link.name == health.client_iface));
-                obs.forwarding = Some(collect::forwarding::forwarding_with_client(
-                    deps.system,
-                    handle,
-                    &health,
-                    &state,
-                    client_present,
-                ));
+                obs.forwarding = Some(
+                    collect::forwarding::forwarding_with_client(
+                        deps.system,
+                        handle,
+                        &health,
+                        &state,
+                        client_present,
+                    )
+                    .and_then(|mut forwarding| {
+                        if client_present
+                            && state.quarantine.is_none()
+                            && state.selection != Selection::Disconnected
+                        {
+                            let keys = health
+                                .peers
+                                .get(&health.client_iface)
+                                .into_iter()
+                                .flatten()
+                                .map(|p| p.public_key)
+                                .collect::<Vec<_>>();
+                            forwarding.client_sessions = crate::client_sessions::status(
+                                deps.system,
+                                handle,
+                                &health.client_iface,
+                                deps.state_root,
+                                deps.run_root,
+                                cfg.site
+                                    .gateway(cfg.gateway)
+                                    .ok_or_else(|| ProbeError::setup("unknown gateway"))?
+                                    .client_tunnel()
+                                    .identity()
+                                    .public_key
+                                    .as_str(),
+                                &keys,
+                            )
+                            .map_err(|_| ProbeError::io("client session observation failed"))?;
+                        }
+                        Ok(forwarding)
+                    }),
+                );
             }
             Next::Routes => match collect::routes(deps.system, handle, &health) {
                 Ok(routes) => obs.routes = Some(routes),

@@ -1507,7 +1507,8 @@ fn import_replacement_applies_over_existing_namespace_in_place() {
         hook: None,
         secret_owner: rustix::process::geteuid().as_raw(),
     };
-    assert!(boot::boot(&deps).succeeded());
+    let report = boot::boot(&deps);
+    assert!(report.succeeded(), "{report:?}");
     let before = parse_site(&h.store().read(1).unwrap().0).unwrap();
     let old = &before.gateways[&GatewayId("gw1".into())].exits[0];
     let source = ProviderFile::new();
