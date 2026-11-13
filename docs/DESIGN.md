@@ -2498,12 +2498,18 @@ the normal startup path.
 ### `scupper boot` (stops at the first failure; every prefix is closed)
 
 0. Take the writer lock (ADR 0028).
-8. Load the shared install module list with bounded host `modprobe <module>`
-   commands before Inputs or any sysctl. Missing modules stop boot with the
-   module named in `boot.json`. This also supports older installs and manual
-   starts without the modules-load file. Checkpoint IDs 0–7 remain stable;
+8. Check `/sys/module/<name>` read-only for each module in the shared install
+   module list before Inputs or any sysctl. Present modules need no command.
+   Only when the namespace is absent, load missing modules with bounded host
+   `modprobe <module>` commands. An existing namespace is verify-only: a missing
+   module stops boot with a closed failure naming it in `boot.json`, without
+   `modprobe`, for the existing closed-boot/rebuild logic to handle. Inventory
+   read errors and load failures also stop boot with the module named. This
+   supports older installs and manual starts without the modules-load file.
+   Checkpoint IDs 0–7 remain stable;
    execution order is Lock, Modules (8), Inputs (1), Close (2), then 3–7.
-   The two commands each have a 3 s deadline (at most 6 s under the writer lock).
+   The step is recorded even when every module is already present. At most two
+   load commands each have a 3 s deadline (at most 6 s under the writer lock).
 1. If `/run/netns/scupper` exists and holds our links: adopt (verify only).
    Else `ip netns add scupper`; `lo` up.
 2. In the namespace: forwarding 0 (v4, v6); all hardening sysctls (§5.4);

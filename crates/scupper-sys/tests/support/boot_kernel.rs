@@ -53,6 +53,7 @@ impl Link {
 }
 pub struct Kernel {
     pub conntrack_loaded: Cell<bool>,
+    pub wireguard_loaded: Cell<bool>,
     pub exists: Cell<bool>,
     pub host: RefCell<BTreeMap<String, Link>>,
     pub ns: RefCell<BTreeMap<String, Link>>,
@@ -75,6 +76,7 @@ impl Kernel {
     pub fn new() -> Self {
         Self {
             conntrack_loaded: Cell::new(false),
+            wireguard_loaded: Cell::new(false),
             exists: Cell::new(false),
             host: RefCell::default(),
             ns: RefCell::new(BTreeMap::from([("lo".into(), Link::new("loopback"))])),
@@ -192,6 +194,8 @@ impl Kernel {
                 assert!(!ns);
                 if a(0) == "nf_conntrack" {
                     self.conntrack_loaded.set(true);
+                } else if a(0) == "wireguard" {
+                    self.wireguard_loaded.set(true);
                 }
             }
 
@@ -437,6 +441,17 @@ impl Kernel {
     }
 }
 impl System for Kernel {
+    fn module_loaded(&self, module: &str) -> std::io::Result<bool> {
+        if *self.script.file_error.borrow() {
+            return Err(std::io::ErrorKind::PermissionDenied.into());
+        }
+        Ok(match module {
+            "nf_conntrack" => self.conntrack_loaded.get(),
+            "wireguard" => self.wireguard_loaded.get(),
+            _ => panic!("unexpected module {module}"),
+        })
+    }
+
     fn namespace_identity(&self, _: &std::path::Path) -> std::io::Result<(u64, u64)> {
         testing::handle()
             .map(|held| held.identity())

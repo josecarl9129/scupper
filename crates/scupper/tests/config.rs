@@ -511,19 +511,7 @@ fn boot_is_hidden_root_only_and_reports_input_failure_after_modules() {
     assert_eq!(report["steps"][1]["step"], "Modules");
     assert_eq!(report["steps"][2]["step"], "Inputs");
     assert_eq!(report["steps"][2]["error"], "no configuration");
-    assert_eq!(
-        h.system
-            .calls
-            .borrow()
-            .iter()
-            .map(|(ns, p, args)| {
-                assert!(!ns);
-                assert_eq!(*p, scupper_sys::system::Program::Modprobe);
-                args[0].clone()
-            })
-            .collect::<Vec<_>>(),
-        scupper_core::install::BOOT_MODULES
-    );
+    assert!(h.system.calls.borrow().is_empty());
 }
 
 #[test]
@@ -677,6 +665,10 @@ fn alerts_list_marks_corrupt_row_and_keeps_other_sinks_visible() {
 // key derivation substituted. Command recording deliberately excludes stdin.
 struct ProviderSystem<'a>(&'a support::Script);
 impl scupper_sys::system::System for ProviderSystem<'_> {
+    fn module_loaded(&self, module: &str) -> io::Result<bool> {
+        scupper_sys::system::System::module_loaded(self.0, module)
+    }
+
     fn canon_run_root(&self) -> &Path {
         self.0.canon_run_root()
     }

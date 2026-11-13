@@ -1,5 +1,3 @@
-host Modprobe nf_conntrack
-host Modprobe wireguard
 netns Ip -d -j link show
 netns Wg pubkey stdin=45
 netns Wg show wg0 public-key

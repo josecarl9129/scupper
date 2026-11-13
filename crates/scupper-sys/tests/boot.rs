@@ -178,7 +178,20 @@ fn fresh_and_adopt_call_goldens() {
             .count(),
         2
     );
-    assert!(!adopt.contains("Sysctl -w") && !adopt.contains("Nft -f") && !adopt.contains("Wg set"));
+    // Match the lab's adoption oracle: only reads and two default replacements.
+    for call in adopt.lines() {
+        assert!(
+            call.starts_with("netns Ip ") && (call.contains("show") || call.contains("replace"))
+                || call.starts_with("netns Wg show ")
+                || call.starts_with("netns Wg pubkey ")
+                || call.starts_with("netns Sysctl -n ")
+                || call == "netns Nft -j list ruleset"
+                || call.starts_with("netns Tc ") && call.contains("show")
+                || call.starts_with("host Wg show ")
+                || call.starts_with("host Unshare "),
+            "adoption unexpectedly mutated the gateway: {call}"
+        );
+    }
 }
 #[test]
 fn fs9_every_command_and_checkpoint_prefix_is_closed_and_retry_completes() {
@@ -556,6 +569,8 @@ fn every_foreign_link_is_disabled_before_hooks_or_per_link_sysctls() {
     ] {
         let f = Fixture::new();
         f.kernel.exists.set(true);
+        f.kernel.conntrack_loaded.set(true);
+        f.kernel.wireguard_loaded.set(true);
         f.kernel.check_links.set(false);
         for name in &names {
             let mut link = Link::new("veth");
@@ -596,6 +611,8 @@ fn unsafe_raw_names_fail_closed_but_other_foreign_links_are_still_disabled() {
     for name in ["bad/name", "bad name", "bad\0name", "sixteencharacters"] {
         let f = Fixture::new();
         f.kernel.exists.set(true);
+        f.kernel.conntrack_loaded.set(true);
+        f.kernel.wireguard_loaded.set(true);
         f.kernel.check_links.set(false);
         for name in [name, "uplink"] {
             let mut link = Link::new("veth");
@@ -2528,6 +2545,85 @@ fn modules_precede_sysctls_on_a_cold_host_and_failures_name_the_module() {
                     .unwrap();
             assert_eq!(saved.steps, report.steps);
         }
+    }
+}
+
+#[test]
+fn fresh_boot_loads_only_missing_modules() {
+    for missing in [None, Some("nf_conntrack"), Some("wireguard")] {
+        let f = Fixture::new();
+        f.kernel
+            .conntrack_loaded
+            .set(missing != Some("nf_conntrack"));
+        f.kernel.wireguard_loaded.set(missing != Some("wireguard"));
+        let report = f.run(None);
+        assert!(report.succeeded() && !report.adopted, "{report:?}");
+        assert_eq!(report.steps[1].step, BootStep::Modules);
+        assert_eq!(report.steps.len(), 9);
+        let calls = f.kernel.calls.borrow();
+        let loads = calls
+            .iter()
+            .filter(|call| call.contains("Modprobe"))
+            .collect::<Vec<_>>();
+        let expected = missing
+            .map(|module| format!("host Modprobe {module}"))
+            .into_iter()
+            .collect::<Vec<_>>();
+        assert_eq!(loads, expected.iter().collect::<Vec<_>>());
+        if let Some(load) = loads.first() {
+            let load_index = calls.iter().position(|call| call == *load).unwrap();
+            let sysctl_index = calls
+                .iter()
+                .position(|call| call.contains("Sysctl"))
+                .unwrap();
+            assert!(load_index < sysctl_index);
+        }
+    }
+}
+
+#[test]
+fn adoption_with_a_missing_module_fails_without_any_commands() {
+    for module in scupper_core::install::BOOT_MODULES {
+        let f = Fixture::new();
+        assert!(f.run(None).succeeded());
+        if *module == "nf_conntrack" {
+            f.kernel.conntrack_loaded.set(false);
+        } else {
+            f.kernel.wireguard_loaded.set(false);
+        }
+        f.kernel.calls.borrow_mut().clear();
+        let report = f.run(None);
+        assert!(!report.succeeded() && !report.adopted, "{report:?}");
+        assert_eq!(report.steps.len(), 2);
+        let last = report.steps.last().unwrap();
+        assert_eq!(last.step, BootStep::Modules);
+        let error = last.error.as_ref().unwrap();
+        assert!(
+            error.contains(module) && error.contains("existing namespace"),
+            "{error}"
+        );
+        assert!(f.kernel.calls.borrow().is_empty());
+        let saved: BootReport =
+            serde_json::from_slice(&fs::read(f.root.path.join("run/boot.json")).unwrap()).unwrap();
+        assert_eq!(saved.steps, report.steps);
+    }
+}
+
+#[test]
+fn unreadable_module_inventory_fails_without_commands() {
+    for existing in [false, true] {
+        let f = Fixture::new();
+        if existing {
+            assert!(f.run(None).succeeded());
+            f.kernel.calls.borrow_mut().clear();
+        }
+        *f.kernel.script.file_error.borrow_mut() = true;
+        let report = f.run(None);
+        assert!(!report.succeeded(), "{report:?}");
+        let last = report.steps.last().unwrap();
+        assert_eq!(last.step, BootStep::Modules);
+        assert!(last.error.as_ref().unwrap().contains("nf_conntrack"));
+        assert!(f.kernel.calls.borrow().is_empty());
     }
 }
 

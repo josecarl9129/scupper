@@ -265,6 +265,11 @@ impl Script {
     }
 }
 impl System for Script {
+    fn module_loaded(&self, _: &str) -> std::io::Result<bool> {
+        // These captures describe a running gateway with its modules loaded.
+        Ok(true)
+    }
+
     fn canon_run_root(&self) -> &Path {
         Path::new(env!("CARGO_MANIFEST_DIR"))
     }

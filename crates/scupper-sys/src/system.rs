@@ -294,6 +294,14 @@ pub enum ExecTarget<'a> {
 /// }
 /// ```
 pub trait System {
+    /// Checks the host's read-only sysfs inventory for a loaded kernel module.
+    ///
+    /// # Errors
+    /// Returns filesystem errors rather than treating an unreadable path as absent.
+    fn module_loaded(&self, module: &str) -> std::io::Result<bool> {
+        Path::new("/sys/module").join(module).try_exists()
+    }
+
     /// Effective uid observed by installation (injectable for fake hosts).
     fn install_uid(&self) -> u32 {
         rustix::process::geteuid().as_raw()
@@ -984,6 +992,10 @@ pub mod testing {
         }
     }
     impl System for RecordingSystem<'_> {
+        fn module_loaded(&self, module: &str) -> std::io::Result<bool> {
+            self.inner.module_loaded(module)
+        }
+
         fn canon_executable(&self) -> &Path {
             self.inner.canon_executable()
         }

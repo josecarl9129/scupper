@@ -33,7 +33,7 @@ use std::{collections::BTreeMap, path::Path};
 pub enum BootStep {
     /// 0: acquire the global writer lock, with a bounded wait.
     Lock = 0,
-    /// 8: load modules before Inputs; existing checkpoint IDs stay stable.
+    /// 8: verify modules, loading missing ones only for a fresh namespace.
     Modules = 8,
     /// 1: resolve all inputs and open or create the foreign namespace.
     Inputs = 1,
@@ -610,8 +610,22 @@ fn boot_locked(deps: &BootDeps<'_>, mut report: BootReport, open_quarantined: bo
     if !step(&mut report, deps, BootStep::Lock, false, || Ok(())) {
         return report;
     }
+    let mut existing = None;
     if !step(&mut report, deps, BootStep::Modules, false, || {
+        existing = deps.namespace.open().map_err(|e| e.to_string())?;
         for module in scupper_core::install::BOOT_MODULES {
+            if deps
+                .system
+                .module_loaded(module)
+                .map_err(|error| format!("required kernel module {module}: {error}"))?
+            {
+                continue;
+            }
+            if existing.is_some() {
+                return Err(format!(
+                    "required kernel module {module} is missing while adopting an existing namespace"
+                ));
+            }
             execute(
                 deps,
                 ExecTarget::Host,
@@ -628,7 +642,6 @@ fn boot_locked(deps: &BootDeps<'_>, mut report: BootReport, open_quarantined: bo
     let mut owned_links = BTreeMap::new();
     let prepared = (|| {
         let cfg = inputs(deps, &mut report)?;
-        let existing = deps.namespace.open().map_err(|e| e.to_string())?;
         let existed = existing.is_some();
         let handle = if let Some(handle) = existing {
             handle
