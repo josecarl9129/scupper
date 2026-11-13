@@ -2742,3 +2742,96 @@ fn legacy_boot_migrates_once_without_changing_forwarding_or_quarantine() {
         )).count(), 1);
     }
 }
+
+#[test]
+fn migration_audit_failure_does_not_abort_daemon_initialization() {
+    use scupper_sys::events::EventLog;
+    let f = Fixture::new();
+    assert!(f.run(None).succeeded());
+    fs::remove_file(f.root.path.join("repair-state.json")).unwrap();
+    let log = EventLog::memory_only(scupper_core::config::GatewayId("gw1".into()), || {
+        scupper_proto::UnixSeconds(1000)
+    })
+    .unwrap();
+    drop(log.log);
+    assert!(
+        log.handle
+            .emit(
+                scupper_proto::EventKind::RepairCheckpointCreated {},
+                scupper_proto::Actor::Daemon,
+                None
+            )
+            .is_err()
+    );
+    let tick = scupper_sys::daemon::testing::restart_tick_with_log(
+        BootDeps {
+            system: &f.kernel,
+            namespace: &f.kernel,
+            state_root: &f.root.path,
+            config_root: &f.root.path,
+            run_root: &f.root.path.join("run"),
+            hook: None,
+            secret_owner: rustix::process::geteuid().as_raw(),
+        },
+        log.handle,
+    )
+    .unwrap();
+    assert!(tick.complete, "{tick:?}");
+    assert!(f.root.path.join("repair-state.json").is_file());
+}
+
+#[test]
+fn daemon_rebuild_migration_reuses_its_locked_audit_writer() {
+    for running in [false, true] {
+        let f = Fixture::new();
+        assert!(f.run(None).succeeded());
+        let start = std::time::Instant::now();
+        scupper_sys::daemon::testing::rebuild_legacy(
+            BootDeps {
+                system: &f.kernel,
+                namespace: &f.kernel,
+                state_root: &f.root.path,
+                config_root: &f.root.path,
+                run_root: &f.root.path.join("run"),
+                hook: None,
+                secret_owner: rustix::process::geteuid().as_raw(),
+            },
+            running,
+        )
+        .unwrap();
+        // A second EventLog::open waits five seconds for this process's writer.
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "{running}: {:?}",
+            start.elapsed()
+        );
+        let events = scupper_sys::events::read_since(&f.root.path, 0, None)
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    scupper_proto::EventKind::RepairCheckpointCreated {}
+                ) && event.actor == scupper_proto::Actor::Daemon)
+                .count(),
+            1
+        );
+    }
+}
+
+#[path = "fixtures/previous_state.rs"]
+mod previous_state;
+
+#[test]
+fn previous_release_reads_written_boot_report() {
+    let f = Fixture::new();
+    let report = f.run(None);
+    assert!(report.succeeded());
+    let bytes = fs::read(f.root.path.join("run/boot.json")).unwrap();
+    let old: previous_state::BootReport = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(old.steps.len(), report.steps.len());
+    assert_eq!(old.applied_version, report.applied_version);
+    assert_eq!(old.owned_links, report.owned_links);
+}

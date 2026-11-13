@@ -34,8 +34,9 @@ pub struct Quarantine {
 /// Write-ahead repair history, independent of the main state replacement.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RepairState {
-    /// Attempt counts retained conservatively for ten minutes after restart.
-    pub attempts: std::collections::BTreeMap<String, usize>,
+    /// Unix seconds per attempt; legacy count-only checkpoints carry no live history.
+    #[serde(default)]
+    pub attempts_unix: std::collections::BTreeMap<String, Vec<u64>>,
     /// A restore is in flight; this never constitutes a quarantine latch.
     pub armed: bool,
     /// A quarantine whose main state replacement may have failed.
@@ -88,8 +89,33 @@ pub struct State {
     /// Durable operator selection, including deliberate disconnection.
     pub selection: Selection,
     /// Persistent quarantine latch, cleared only by explicit administrative action.
-    #[serde(deserialize_with = "required_option")]
+    #[serde(
+        deserialize_with = "required_option",
+        serialize_with = "legacy_quarantine"
+    )]
     pub quarantine: Option<Quarantine>,
+}
+// Keep state.json readable by the previous release, whose latch rejects unknown
+// fields. Typed uncertainty lives only in repair-state.json.
+#[allow(clippy::ref_option)] // Serde serialize_with borrows the complete field.
+fn legacy_quarantine<S: serde::Serializer>(
+    quarantine: &Option<Quarantine>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    #[derive(Serialize)]
+    struct LegacyQuarantine<'a> {
+        reason: &'a str,
+        object: &'a str,
+        since_unix: u64,
+    }
+    quarantine
+        .as_ref()
+        .map(|q| LegacyQuarantine {
+            reason: &q.reason,
+            object: &q.object,
+            since_unix: q.since_unix,
+        })
+        .serialize(serializer)
 }
 fn required_option<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
     d: D,
@@ -261,9 +287,20 @@ impl StateFile {
     pub fn read(&self) -> io::Result<StateRead> {
         match RealFs.read(&self.path) {
             Ok(text) => {
-                let state: State = serde_json::from_str(&text)
+                let mut state: State = serde_json::from_str(&text)
                     .map_err(|_| io::Error::other("invalid state.json"))?;
                 check_schema(&state)?;
+                // Reattach only typed metadata to an existing latch; raw reads
+                // never synthesize a quarantine from missing or unreadable state.
+                if let Some(main) = &mut state.quarantine
+                    && let Some(checkpoint) = self.repair_state().quarantine
+                    && checkpoint.uncertain
+                    && main.reason == checkpoint.reason
+                    && main.object == checkpoint.object
+                    && main.since_unix == checkpoint.since_unix
+                {
+                    main.uncertain = true;
+                }
                 Ok(StateRead::Present(state))
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(StateRead::Missing),
@@ -286,8 +323,9 @@ impl StateFile {
         if let StateRead::Present(state) = &mut saved {
             let marker = std::fs::symlink_metadata(run_root.join("latch-uncertain"));
             if state.applied_version.is_some() {
+                let repair = self.repair_state();
                 state.quarantine = state.quarantine.take().or_else(|| {
-                    self.repair_state().latch().map(|mut q| {
+                    repair.latch().map(|mut q| {
                         q.reason = format!(
                             "latch persistence or clearance uncertain: {}; run scupper connect",
                             q.reason

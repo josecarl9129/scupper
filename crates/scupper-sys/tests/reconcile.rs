@@ -3491,7 +3491,10 @@ fn failed_latch_persist_restart_and_reboot_keep_closed_with_durable_budgets() {
             raw.quarantine.is_none(),
             "main state write must have failed"
         );
-        assert_eq!(file.repair_state().attempts["safety:ruleset"], 3);
+        assert_eq!(
+            file.repair_state().attempts_unix["safety:ruleset"],
+            vec![1100; 3]
+        );
         if reboot {
             fs::remove_dir_all(&run_root).unwrap();
         }
@@ -3557,10 +3560,9 @@ fn failed_latch_persist_restart_and_reboot_keep_closed_with_durable_budgets() {
         let file = StateFile::open(&state_root, None).unwrap();
         assert!(
             file.repair_state()
-                .attempts
+                .attempts_unix
                 .get("safety:ruleset")
-                .copied()
-                .unwrap_or(0)
+                .map_or(0, Vec::len)
                 <= 1,
             "explicit connect resets the exhausted budget before repairing"
         );
@@ -3580,7 +3582,7 @@ fn exhausted_durable_budget_without_latch_record_does_not_latch_after_reboot() {
     file.write_repair_state(
         &guard,
         &scupper_sys::state::RepairState {
-            attempts: BTreeMap::from([("safety:ruleset".into(), 3)]),
+            attempts_unix: BTreeMap::from([("safety:ruleset".into(), vec![1100; 3])]),
             ..Default::default()
         },
     )
@@ -3591,12 +3593,18 @@ fn exhausted_durable_budget_without_latch_record_does_not_latch_after_reboot() {
         panic!("missing state")
     };
     assert!(saved.quarantine.is_none());
-    assert_eq!(file.repair_state().attempts["safety:ruleset"], 3);
+    assert_eq!(
+        file.repair_state().attempts_unix["safety:ruleset"],
+        vec![1100; 3]
+    );
 }
 
 #[test]
 fn three_successful_repairs_survive_restart_and_reboot_without_latch() {
-    for reboot in [false, true] {
+    for (reboot, gap) in [false, true]
+        .into_iter()
+        .flat_map(|reboot| [120, 600, 660].map(|gap| (reboot, gap)))
+    {
         let rig = Rig::new();
         let state_root = rig.root.join("durable");
         let run_root = rig.root.join("runtime");
@@ -3635,7 +3643,10 @@ fn three_successful_repairs_survive_restart_and_reboot_without_latch() {
         }
         let file = StateFile::open(&state_root, None).unwrap();
         assert!(!file.repair_state().armed);
-        assert_eq!(file.repair_state().attempts["safety:ruleset"], 3);
+        assert_eq!(
+            file.repair_state().attempts_unix["safety:ruleset"],
+            vec![1100; 3]
+        );
         let scupper_sys::state::StateRead::Present(saved) = file.startup_read(&run_root).unwrap()
         else {
             unreachable!()
@@ -3647,7 +3658,7 @@ fn three_successful_repairs_survive_restart_and_reboot_without_latch() {
             rig.log.handle.clone(),
             config(),
             rig.held.clone(),
-            || (MonoTime(Duration::ZERO), 1200),
+            || (MonoTime(Duration::ZERO), 1100 + gap),
         )
         .unwrap();
         assert!(restarted.latch().is_none());
@@ -3655,8 +3666,27 @@ fn three_successful_repairs_survive_restart_and_reboot_without_latch() {
         assert!(restarted.latch().is_none());
         rig.flush_rules();
         let tick = restarted.tick();
-        assert!(restarted.latch().is_some(), "{tick:?}");
-        assert!(!raises(&tick));
+        assert_eq!(
+            restarted.latch().is_some(),
+            gap < 600,
+            "gap={gap}, reboot={reboot}: {tick:?}"
+        );
+        if gap < 600 {
+            assert!(!raises(&tick));
+        } else {
+            assert!(tick.failures.is_empty(), "{tick:?}");
+            assert!(
+                tick.steps
+                    .iter()
+                    .any(|step| matches!(step, Step::LoadRuleset { .. })),
+                "{tick:?}"
+            );
+            assert_eq!(
+                rig.kernel.model().forwarding_v4,
+                Known::Value(1),
+                "{tick:?}"
+            );
+        }
     }
 }
 
@@ -3822,5 +3852,117 @@ fn connect_clearance_uses_typed_uncertainty_instead_of_reason_words() {
             );
             assert!(rig.machine().latch().is_some());
         }
+    }
+}
+
+#[test]
+fn restored_attempts_keep_their_original_expiry_and_future_times_clamp_to_now() {
+    // Each attempt ages independently; count-only history is expired. Future
+    // timestamps count now, but do not extend the window beyond ten minutes.
+    for (history, elapsed, latched) in [
+        (
+            r#"{"attempts":{"safety:ruleset":3},"armed":false,"quarantine":null}"#,
+            0,
+            false,
+        ),
+        (
+            r#"{"attempts_unix":{"safety:ruleset":[1100,1100,1100]},"armed":false,"quarantine":null}"#,
+            479,
+            true,
+        ),
+        (
+            r#"{"attempts_unix":{"safety:ruleset":[1100,1100,1100]},"armed":false,"quarantine":null}"#,
+            480,
+            false,
+        ),
+        (
+            r#"{"attempts_unix":{"safety:ruleset":[1000,1100,1200]},"armed":false,"quarantine":null}"#,
+            380,
+            false,
+        ),
+        (
+            r#"{"attempts_unix":{"safety:ruleset":[9999,9999,9999]},"armed":false,"quarantine":null}"#,
+            599,
+            true,
+        ),
+        (
+            r#"{"attempts_unix":{"safety:ruleset":[9999,9999,9999]},"armed":false,"quarantine":null}"#,
+            600,
+            false,
+        ),
+    ] {
+        let rig = Rig::new();
+        let state_root = rig.root.join("durable");
+        let guard = WriterLock::acquire(&rig.root).unwrap();
+        let file = StateFile::open(&state_root, Some(&guard)).unwrap();
+        file.write(&guard, &rig.store.state()).unwrap();
+        fs::write(state_root.join("repair-state.json"), history).unwrap();
+        drop(guard);
+        let time = Cell::new(0);
+        let mut machine = Reconciler::new(
+            rig.kernel.clone(),
+            file,
+            rig.log.handle.clone(),
+            rig.config(),
+            rig.held.clone(),
+            || (MonoTime(Duration::from_secs(time.get())), 1220 + time.get()),
+        )
+        .unwrap();
+        time.set(elapsed);
+        rig.flush_rules();
+        let tick = machine.tick();
+        assert_eq!(
+            machine.latch().is_some(),
+            latched,
+            "elapsed={elapsed}, history={history}: {tick:?}"
+        );
+        if !latched {
+            assert!(
+                tick.steps
+                    .iter()
+                    .any(|step| matches!(step, Step::LoadRuleset { .. })),
+                "{tick:?}"
+            );
+            assert!(tick.failures.is_empty(), "{tick:?}");
+        }
+    }
+}
+
+#[test]
+fn repair_checkpoints_preserve_each_attempts_wall_timestamp_across_clock_steps() {
+    let rig = Rig::new();
+    let state_root = rig.root.join("durable");
+    let guard = WriterLock::acquire(&rig.root).unwrap();
+    let file = StateFile::open(&state_root, Some(&guard)).unwrap();
+    file.write(&guard, &rig.store.state()).unwrap();
+    drop(guard);
+    let time = Cell::new((100, 1100));
+    let mut machine = Reconciler::new(
+        rig.kernel.clone(),
+        file,
+        rig.log.handle.clone(),
+        rig.config(),
+        rig.held.clone(),
+        || {
+            let (mono, unix) = time.get();
+            (MonoTime(Duration::from_secs(mono)), unix)
+        },
+    )
+    .unwrap();
+    let mut expected = Vec::new();
+    for (mono, unix) in [(100, 1100), (200, 1105), (300, 2000)] {
+        time.set((mono, unix));
+        rig.flush_rules();
+        let tick = machine.tick();
+        assert!(tick.failures.is_empty(), "{tick:?}");
+        assert!(machine.latch().is_none());
+        expected.push(unix);
+        assert_eq!(
+            StateFile::open(&state_root, None)
+                .unwrap()
+                .repair_state()
+                .attempts_unix["safety:ruleset"],
+            expected
+        );
     }
 }

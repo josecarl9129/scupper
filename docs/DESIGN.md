@@ -968,9 +968,9 @@ version (stay on the applied version, alert).
   persistence sets the typed `uncertain` flag in memory; `scupper connect` may
   also clear this uncertainty, including a safety latch whose persistence failed.
   Reason text never selects which latches connect may clear.
-  Before a safety-budget Restore, `repair-state.json` durably reserves its attempt
-  count. Other restores checkpoint best effort. The armed flag covers only one
-  restore's execution and verification and is cleared when it ends, even on failure;
+  Before a safety-budget Restore, `repair-state.json` durably reserves the attempt
+  with its Unix timestamp. Other restores checkpoint best effort. The armed flag
+  covers only one restore's execution and verification and is cleared when it ends, even on failure;
   armed status and successful attempt counts never synthesize a quarantine in
   startup or `check`. The latch itself is checkpointed before replacing
   `state.json`. Only failed latch persistence writes the best-effort
@@ -978,10 +978,20 @@ version (stay on the applied version, alert).
   quarantine, or the marker keeps the gateway latched; a missing checkpoint is no
   record. Under the writer lock at daemon start or boot, readable legacy state
   with an applied version and no marker receives an empty checkpoint and one
-  `RepairCheckpointCreated` audit event. Existing state quarantine is preserved.
-  Attempt counts survive restart with a conservative new ten-minute expiry;
-  exhausting three successful repairs does not latch until a subsequent restore
-  is refused for budget. Suppression of a safety restore ends closed.
+  best-effort `RepairCheckpointCreated` audit event. An audit failure logs and
+  raises a persistence alert without aborting initialization. Daemon rebuild,
+  apply and rollback reuse the existing audit handle. Existing state quarantine
+  is preserved. New uncertainty metadata lives only in `repair-state.json`;
+  `state.json` keeps the strict previous-release schema for deploy rollback.
+  Rollback caveat: a latch that exists when a deploy rolls back to the
+  previous release and is cleared there is not recorded in
+  `repair-state.json`, so the next upgrade reports it as an uncertain latch
+  (closed, Critical); one `scupper connect` clears it. Fails closed, never open.
+  Attempt timestamps survive restart with only their remaining ten-minute
+  window; entries at least 600 seconds old and legacy count-only entries expire.
+  Future wall timestamps clamp to startup time. Runtime expiry uses monotonic
+  time. Exhausting three successful repairs does not latch until a subsequent
+  restore is refused for budget. Suppression of a safety restore ends closed.
 - Debounce: drift must be seen on 2 consecutive ticks before a repair, except
   ruleset drift (forwarding 0 at once), foreign links and tc hooks (acted on
   at once).
@@ -3497,6 +3507,18 @@ independent bounded attempts save status/check JSON, boot.json, the last 200 eve
 records, unit status and the
 scupperd journal in short-monotonic format. Daemon stderr reports start, ready,
 boot retry and apply outcomes without request contents or destinations.
+L44's positive TCP checks allow at most three attempts per destination within
+15 seconds, with a fresh marker and source port each time. Only delivery timeouts
+are retried. Per-attempt JSON-lines artifacts retain timings and outcomes; every
+attempt's marker remains in the unfiltered uplink oracle policy. Delivered
+markers still require exactly one provider-NAT receipt; any receipt from a
+timed-out attempt must also be unique and from provider NAT. Negative probes,
+packet allow-lists, capture liveness/loss checks and zero-leak assertions are
+unchanged. Background GNU timeout escalation uses 35 seconds so it cannot
+preempt the reconciler's 30-second requested shutdown grace. The lab still
+enforces each job's own bounded grace and rejects forced shutdown, including
+SIGKILL of a capture. Per-job shutdown artifacts identify the log, PID, requested
+signal, grace, elapsed time and outcome.
 The reboot simulation stops units, deletes namespace links and the named namespace,
 asserts and removes only scupper-named root leftovers (unexpected leftovers fail),
 clears runtime state and only lab conntrack entries, and preserves durable state.

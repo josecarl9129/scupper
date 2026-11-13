@@ -3,7 +3,7 @@ use std::{
     fs::File,
     io::{Read, Write},
     os::unix::process::{CommandExt, ExitStatusExt},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
         Arc,
@@ -47,10 +47,10 @@ impl Invocation {
         }
     }
     // GNU timeout also bounds descendants if the supervising process disappears.
-    pub fn timed(&self, seconds: u64) -> Vec<String> {
+    pub fn timed(&self, seconds: u64, kill_after: u64) -> Vec<String> {
         let mut args = vec![
             "--signal=TERM".into(),
-            "--kill-after=2".into(),
+            format!("--kill-after={kill_after}"),
             seconds.to_string(),
             self.program.clone(),
         ];
@@ -106,7 +106,12 @@ impl Runner {
         }
         Ok(())
     }
-    fn command(&mut self, invocation: &Invocation, seconds: u64) -> Result<Command> {
+    fn command(
+        &mut self,
+        invocation: &Invocation,
+        seconds: u64,
+        kill_after: u64,
+    ) -> Result<Command> {
         self.check()?;
         let wrapped;
         let invocation = if let Some(fixture) = &self.wg_fixture
@@ -132,11 +137,12 @@ impl Runner {
         writeln!(
             self.trace,
             "{}",
-            serde_json::json!({"argv": invocation.timed(seconds)})
+            serde_json::json!({"argv": invocation.timed(seconds, kill_after)})
         )?;
         self.trace.flush()?;
         let mut cmd = Command::new("timeout");
-        cmd.args(invocation.timed(seconds)).process_group(0);
+        cmd.args(invocation.timed(seconds, kill_after))
+            .process_group(0);
         cmd.env("LC_ALL", "C");
         cmd.env_remove("SCUPPER_TEST_BOOT_MARKER");
         if let Some(marker) = &self.boot_marker {
@@ -165,7 +171,7 @@ impl Runner {
         input: Option<&[u8]>,
         seconds: u64,
     ) -> Result<(ExitStatus, String)> {
-        let mut cmd = self.command(invocation, seconds)?;
+        let mut cmd = self.command(invocation, seconds, 2)?;
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         cmd.stdin(if input.is_some() {
             Stdio::piped()
@@ -176,6 +182,7 @@ impl Runner {
             child: cmd.spawn()?,
             done: false,
             drains: Vec::new(),
+            log: None,
         };
         // Drain concurrently: an ip/nft JSON response can exceed pipe capacity.
         let stdout = group.child.stdout.take().ok_or("missing stdout")?;
@@ -267,7 +274,11 @@ impl Runner {
             .saturating_duration_since(Instant::now())
             .as_secs()
             + 2;
-        let mut cmd = self.command(invocation, seconds)?;
+        // GNU timeout also arms kill-after when forwarding our explicit stop
+        // signal. Its former 2 s escalation preempted the reconciler's 30 s
+        // stop_timeout. Let Group enforce that grace, with a bounded fallback
+        // if the runner disappears. Foreground commands retain 2 s escalation.
+        let mut cmd = self.command(invocation, seconds, 35)?;
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -279,6 +290,7 @@ impl Runner {
             child,
             done: false,
             drains: Vec::new(),
+            log: Some(log.into()),
         };
         for (stream, file) in [
             (Box::new(stdout) as Box<dyn Read + Send>, File::create(log)?),
@@ -384,6 +396,7 @@ pub(super) struct Group {
     child: Child,
     done: bool,
     drains: Vec<mpsc::Receiver<std::io::Result<()>>>,
+    log: Option<PathBuf>,
 }
 impl Group {
     fn finish_logs(&mut self) -> Result<()> {
@@ -473,6 +486,20 @@ impl Group {
         if self.done {
             return Ok(());
         }
+        let started = Instant::now();
+        let result = self.stop_inner(signal, timeout);
+        if let Some(log) = &self.log {
+            let saved = std::fs::write(log.with_extension("shutdown.json"), serde_json::to_vec_pretty(
+                &serde_json::json!({"log":log,"pid":self.child.id(),"signal":signal.as_raw(),"grace_ms":timeout.as_millis(),"elapsed_ms":started.elapsed().as_millis(),"passed":result.is_ok(),"error":result.as_ref().err().map(ToString::to_string)}),
+            )?).map_err(Into::into);
+            return super::mutation::finish(
+                result.map_err(|error| format!("{}: {error}", log.display()).into()),
+                saved,
+            );
+        }
+        result
+    }
+    fn stop_inner(&mut self, signal: Signal, timeout: Duration) -> Result<()> {
         self.alive()?;
         self.signal(signal);
         let until = Instant::now() + timeout;

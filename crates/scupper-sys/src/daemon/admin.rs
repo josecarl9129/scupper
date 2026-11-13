@@ -478,7 +478,7 @@ fn apply_inner(
             Actor::Local { uid },
             Some(target),
         );
-        let report = crate::boot::boot_apply_with_guard(deps, guard, true);
+        let report = crate::boot::boot_apply_with_guard(deps, guard, true, Some(log));
         if !report.succeeded() {
             step = match report.steps.last().map(|step| step.step) {
                 Some(crate::boot::BootStep::Ruleset) => scupper_proto::StepKind::LoadRuleset,
@@ -526,7 +526,7 @@ fn apply_inner(
         state = original;
         let restored = file.write(guard, &state);
         let rollback = if restored.is_ok() && reclosed && previous.is_some() {
-            Some(crate::boot::boot_with_guard(deps, guard))
+            Some(crate::boot::boot_with_guard(deps, guard, Some(log)))
         } else {
             None
         };

@@ -1300,3 +1300,27 @@ fn replay_uses_disk_sequence_space_even_when_local_ids_are_far_ahead() {
     assert!(emit(&reopened.handle) > high);
     flush(&reopened.handle);
 }
+
+#[test]
+fn failed_checkpoint_audit_is_best_effort_and_raises_persistence_alert() {
+    let opened = EventLog::memory_buffer(GatewayId("gw1".into()), || UnixSeconds(1000)).unwrap();
+    let handle = opened.handle;
+    drop(opened.log);
+    assert!(!handle.shared.lock().failure);
+    handle.repair_checkpoint_created(Actor::Daemon, Some(1));
+    let queue = handle.shared.lock();
+    assert!(queue.failure);
+    let event = queue
+        .events
+        .iter()
+        .find(|event| {
+            matches!(
+                event.kind,
+                EventKind::PersistenceFailed {
+                    reason: Reason::EventWrite
+                }
+            )
+        })
+        .unwrap();
+    assert_eq!(event.alert().unwrap().key, AlertKey::Persistence);
+}

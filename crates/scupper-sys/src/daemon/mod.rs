@@ -214,14 +214,11 @@ fn initialize<'a>(
         .map(|(writer, _)| writer)
         .or(owned_guard.as_ref())
         .ok_or_else(|| io::Error::other("missing startup writer"))?;
+    // Keep migration and attachment in one writer transaction. A slow read or
+    // canon preparation can make concurrent CLI intent time out and retry.
     let loaded = inputs.load(&deps, canon_deadline)?;
     if loaded.state.migrate_repair_state(writer, deps.run_root)? {
-        log.emit(
-            EventKind::RepairCheckpointCreated {},
-            Actor::Daemon,
-            loaded.saved.applied_version,
-        )
-        .map_err(io::Error::other)?;
+        log.repair_checkpoint_created(Actor::Daemon, loaded.saved.applied_version);
     }
     let site = validate(parse_site(&loaded.text).map_err(io::Error::other)?)
         .map_err(|_| io::Error::other("invalid applied configuration"))?;
@@ -1042,7 +1039,7 @@ impl DaemonDeps for Runtime<'_> {
         let report = if let Some((machine, _, _)) = &mut self.running {
             machine.rebuild(&deps).ok()
         } else {
-            Some(boot::boot(&deps))
+            Some(boot::boot_with_log(&deps, Some(&self.audit.handle())))
         };
         if report.as_ref().is_some_and(BootReport::succeeded) {
             eprintln!("scupperd: boot retry: success");
@@ -2008,6 +2005,57 @@ pub mod testing {
         runtime.shutdown();
         Ok(report)
     }
+    /// Exercise initialization with an unavailable audit sender.
+    /// # Errors
+    /// Returns startup failures, which must not include a failed migration event.
+    pub fn restart_tick_with_log(
+        deps: BootDeps<'_>,
+        log: crate::events::LogHandle,
+    ) -> io::Result<crate::reconcile::TickReport> {
+        let origin = Instant::now();
+        let (mut machine, _, _) = super::initialize(
+            deps,
+            GatewayId("gw1".into()),
+            log,
+            origin,
+            origin + Duration::from_secs(5),
+            &mut StartupRead::default(),
+            None,
+        )?;
+        Ok(machine.tick())
+    }
+
+    /// Exercise both runtime rebuild paths with the audit writer already held.
+    /// # Errors
+    /// Returns fixture, rebuild or audit persistence failures.
+    pub fn rebuild_legacy(deps: BootDeps<'_>, running: bool) -> io::Result<()> {
+        use super::scheduler::DaemonDeps as _;
+        let options = Options {
+            state_root: deps.state_root.into(),
+            config_root: deps.config_root.into(),
+            run_root: deps.run_root.into(),
+            probe_binary: deps.run_root.join("unused-probe"),
+        };
+        let mut runtime = runtime(deps, &options)?;
+        runtime.audit.opened = EventLog::open(deps.state_root, GatewayId("gw1".into()), || {
+            UnixSeconds(unix())
+        })
+        .map_err(io::Error::other)?;
+        if let Some((machine, _, _)) = &mut runtime.running {
+            machine.set_log(runtime.audit.handle());
+        }
+        if !running {
+            runtime.running = None;
+        }
+        std::fs::remove_file(deps.state_root.join("repair-state.json"))?;
+        runtime.rebuild();
+        if runtime.running.is_none() {
+            return Err(io::Error::other("rebuild did not reattach"));
+        }
+        runtime.shutdown();
+        Ok(())
+    }
+
     /// Run the daemon's fresh full check and its production alert projection.
     /// # Errors
     /// Returns fixture or observation failures.

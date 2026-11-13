@@ -288,6 +288,8 @@ pub struct Reconciler<K, S, C> {
     failover: Failover,
     failover_config: FailoverConfig,
     budgets: Budgets,
+    // Preserve the wall timestamp assigned to each reservation across later checkpoints.
+    repair_times: BTreeMap<MonoTime, u64>,
     debounce: Debounce,
     latch: Option<Latch>,
     persisted: State,
@@ -339,6 +341,10 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         let (failover, actions) =
             Failover::new(clock().0, persisted.selection.clone(), &failover_config);
         let repair = store.repair_state().unwrap_or_default();
+        let (mono, unix) = clock();
+        // Planner time has a ten-minute headroom so even an origin of zero can
+        // represent attempts from before this process started.
+        let repair_now = mono.after(Duration::from_secs(600));
         let startup_quarantine = persisted.quarantine.clone().or_else(|| {
             repair.startup_latch().map(|mut q| {
                 q.reason = format!(
@@ -356,6 +362,26 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         config.desired(&persisted.selection, failover.desired_route())?;
         kernel.hold_latch(latch.as_ref());
         kernel.persisted_latch(latch.as_ref());
+        let mut repair_times = BTreeMap::new();
+        let attempts = repair
+            .attempts_unix
+            .into_iter()
+            .filter_map(|(key, times)| {
+                let times: Vec<_> = times
+                    .into_iter()
+                    .map(|at| at.min(unix)) // Future attempts clamp to now.
+                    .filter(|at| unix - at < 600)
+                    .take(3)
+                    .map(|at| {
+                        let mono =
+                            MonoTime(repair_now.0.saturating_sub(Duration::from_secs(unix - at)));
+                        repair_times.insert(mono, at);
+                        mono
+                    })
+                    .collect();
+                (!times.is_empty()).then_some((key, times))
+            })
+            .collect();
         Ok(Self {
             kernel,
             store,
@@ -364,13 +390,10 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             failover,
             failover_config,
             budgets: Budgets {
-                attempts: repair
-                    .attempts
-                    .into_iter()
-                    .map(|(key, count)| (key, vec![clock().0; count.min(3)]))
-                    .collect(),
+                attempts,
                 ..Budgets::default()
             },
+            repair_times,
             debounce: Debounce::default(),
             latch,
             persisted,
@@ -695,6 +718,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                     // this process was unavailable. Memory-only latches still hold.
                     self.latch = None;
                     self.budgets = Budgets::default();
+                    self.repair_times.clear();
                     self.kernel.hold_latch(None);
                 }
                 if self.latch.is_none() {
@@ -778,6 +802,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 self.kernel.persisted_latch(None);
                 self.kernel.hold_latch(None);
                 self.budgets = Budgets::default();
+                self.repair_times.clear();
             }
             if let Some(latch) = &self.latch {
                 latest.quarantine = Some(Quarantine {
@@ -830,7 +855,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 &self.budgets,
                 self.latch.as_ref(),
                 &self.debounce,
-                (self.clock)().0,
+                self.repair_now(),
             );
             if self.latch.is_none() {
                 self.latch = prefix.latch;
@@ -904,7 +929,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             &planning_budgets,
             self.latch.as_ref(),
             &self.debounce,
-            now,
+            now.after(Duration::from_secs(600)),
         );
         if observed.model.forwarding_off()
             && report.steps.contains(&Step::ForwardingOff)
@@ -1111,7 +1136,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                         &self.budgets,
                         self.latch.as_ref(),
                         &self.debounce,
-                        (self.clock)().0,
+                        self.repair_now(),
                     );
                     self.adopt_safety(&recovery);
                     if !retried {
@@ -1176,7 +1201,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         // ruleset load or foreign-link/tc reopening. Failed Tighten spends nothing.
         let mut plan = plan;
         let mut safety_reservations = Vec::new();
-        let now = (self.clock)().0;
+        let now = self.repair_now();
         for class in [
             planner::SafetyClass::Ruleset,
             planner::SafetyClass::ForeignLink,
@@ -1285,12 +1310,13 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 .into_iter()
                 .partition(|(trigger, _)| *trigger == StepKind::from(&step));
             safety_reservations = pending;
+            let repair_now = self.repair_now();
             for (_, key) in &charged {
                 self.budgets
                     .attempts
                     .entry(key.clone())
                     .or_default()
-                    .push((self.clock)().0);
+                    .push(repair_now);
             }
             let checkpoint = if repair_class(&step) == scupper_proto::RepairClass::Restore {
                 let checkpoint = self.checkpoint_repairs(guard, true);
@@ -1360,7 +1386,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                         &self.budgets,
                         self.latch.as_ref(),
                         &self.debounce,
-                        (self.clock)().0,
+                        self.repair_now(),
                     );
                     self.adopt_safety(&containment);
                     self.run_emergency(
@@ -1388,7 +1414,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                     &self.budgets,
                     self.latch.as_ref(),
                     &self.debounce,
-                    (self.clock)().0,
+                    self.repair_now(),
                 );
                 if !observed.complete {
                     // Full observations include routes/rules: preserve their alert
@@ -1451,22 +1477,49 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             self.restore_namespace(guard, report);
         }
     }
-    fn checkpoint_repairs(&self, guard: &WriterGuard, armed: bool) -> Result<(), StepError> {
+    fn repair_now(&self) -> MonoTime {
+        (self.clock)().0.after(Duration::from_secs(600))
+    }
+    fn checkpoint_repairs(&mut self, guard: &WriterGuard, armed: bool) -> Result<(), StepError> {
+        let (mono, unix) = (self.clock)();
+        let now = mono.after(Duration::from_secs(600));
+        let mut repair_times = BTreeMap::new();
         let repair = RepairState {
-            attempts: self
+            attempts_unix: self
                 .budgets
                 .attempts
                 .iter()
-                .map(|(key, times)| (key.clone(), times.len()))
+                .map(|(key, times)| {
+                    (
+                        key.clone(),
+                        times
+                            .iter()
+                            .map(|at| {
+                                let unix =
+                                    self.repair_times.get(at).copied().unwrap_or_else(|| {
+                                        unix.saturating_sub(now.elapsed_since(*at).as_secs())
+                                    });
+                                repair_times.insert(*at, unix);
+                                unix
+                            })
+                            .collect(),
+                    )
+                })
                 .collect(),
             armed,
             quarantine: self.latch.as_ref().map(|latch| Quarantine {
                 reason: latch.reason.clone(),
                 object: latch.object.clone(),
-                since_unix: (self.clock)().1,
+                since_unix: self
+                    .persisted
+                    .quarantine
+                    .as_ref()
+                    .filter(|q| q.reason == latch.reason && q.object == latch.object)
+                    .map_or(unix, |q| q.since_unix),
                 uncertain: latch.uncertain,
             }),
         };
+        self.repair_times = repair_times;
         self.store
             .write_repair_state(guard, &repair)
             .map_err(|_| StepError("repair checkpoint failed"))
@@ -1628,6 +1681,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         {
             self.latch = None;
             self.budgets = Budgets::default();
+            self.repair_times.clear();
         }
         if self.latch.is_none() {
             self.latch = state.quarantine.as_ref().map(|q| Latch {
@@ -1886,7 +1940,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 self.persisted = state;
             }
         }
-        Ok(crate::boot::boot_with_guard(deps, &guard))
+        Ok(crate::boot::boot_with_guard(deps, &guard, Some(&self.log)))
     }
     /// Cached observed kernel facts and their earliest collection time.
     #[must_use]
@@ -1935,7 +1989,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             &self.budgets,
             self.latch.as_ref(),
             &self.debounce,
-            (self.clock)().0,
+            self.repair_now(),
         )
         .steps
         .iter()
@@ -1983,7 +2037,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             &budgets,
             self.latch.as_ref(),
             &self.debounce,
-            (self.clock)().0,
+            self.repair_now(),
         );
         let planned = planner::plan(
             &desired,
@@ -1991,7 +2045,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             &budgets,
             self.latch.as_ref(),
             &first.debounce,
-            (self.clock)().0,
+            self.repair_now(),
         );
         if dry_run {
             return Ok(planned.steps.iter().map(StepKind::from).collect());
@@ -2060,6 +2114,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 .clear_repair_state(guard, &self.config.run_root)?;
             self.persisted = state;
             self.budgets = Budgets::default();
+            self.repair_times.clear();
             let _ = self.log.emit(
                 EventKind::AdminAction {
                     reason,

@@ -1093,7 +1093,10 @@ fn legacy_checkpoint_migration_preserves_state_and_distinguishes_failed_reads() 
             &guard,
             &RepairState {
                 armed: true,
-                attempts: std::collections::BTreeMap::from([("safety:ruleset".into(), 3)]),
+                attempts_unix: std::collections::BTreeMap::from([(
+                    "safety:ruleset".into(),
+                    vec![1100; 3],
+                )]),
                 ..RepairState::default()
             },
         )
@@ -1158,4 +1161,63 @@ fn runtime_uncertainty_marks_a_visible_latch_without_rewriting_it() {
         original.quarantine.as_ref().unwrap().since_unix
     );
     assert_eq!(file.read().unwrap(), StateRead::Present(original));
+}
+
+#[path = "fixtures/previous_state.rs"]
+mod previous_state;
+
+#[test]
+fn previous_release_reads_written_state_including_typed_uncertainty_and_all_selections() {
+    for selection in [
+        Selection::Auto,
+        Selection::Disconnected,
+        Selection::Pin(ExitId("ch1".into())),
+        Selection::Prefer(ExitId("ch1".into())),
+    ] {
+        for uncertain in [None, Some(false), Some(true)] {
+            let dir = TempDir::new();
+            let guard = writer(&dir.0);
+            let file = StateFile::open(&dir.0, None).unwrap();
+            let state = State {
+                schema: 1,
+                applied_version: Some(43),
+                selection: selection.clone(),
+                quarantine: uncertain.map(|uncertain| Quarantine {
+                    reason: "repair budget exhausted".into(),
+                    object: "safety:ruleset".into(),
+                    since_unix: 1_700_000_001,
+                    uncertain,
+                }),
+            };
+            file.write(&guard, &state).unwrap();
+            let bytes = fs::read(dir.0.join("state.json")).unwrap();
+            let old: previous_state::State = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(old.schema, state.schema);
+            assert_eq!(old.applied_version, state.applied_version);
+            assert_eq!(
+                serde_json::to_value(old.selection).unwrap(),
+                serde_json::to_value(&selection).unwrap()
+            );
+            assert_eq!(old.quarantine.is_some(), uncertain.is_some());
+            if let Some(q) = old.quarantine {
+                assert_eq!(q.reason, "repair budget exhausted");
+                assert_eq!(q.object, "safety:ruleset");
+                assert_eq!(q.since_unix, 1_700_000_001);
+            }
+            assert_eq!(file.read().unwrap(), StateRead::Present(state.clone()));
+            assert_eq!(
+                file.startup_read(&dir.0.join("run")).unwrap(),
+                StateRead::Present(state)
+            );
+            if uncertain == Some(true) {
+                assert!(file.repair_state().quarantine.unwrap().uncertain);
+                let checkpoint = fs::read(dir.0.join("repair-state.json")).unwrap();
+                assert!(
+                    String::from_utf8(checkpoint)
+                        .unwrap()
+                        .contains("\"uncertain\":true")
+                );
+            }
+        }
+    }
 }

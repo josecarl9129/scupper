@@ -551,6 +551,13 @@ fn step(
 #[must_use]
 #[allow(clippy::too_many_lines)] // The numbered sequence is intentionally visible in one function.
 pub fn boot(deps: &BootDeps<'_>) -> BootReport {
+    boot_with_log(deps, None)
+}
+
+pub(crate) fn boot_with_log(
+    deps: &BootDeps<'_>,
+    log: Option<&crate::events::LogHandle>,
+) -> BootReport {
     let mut report = BootReport::default();
     let guard = match WriterLock::acquire(deps.run_root) {
         Ok(guard) => guard,
@@ -563,11 +570,15 @@ pub fn boot(deps: &BootDeps<'_>) -> BootReport {
             return report;
         }
     };
-    boot_with_guard(deps, &guard)
+    boot_with_guard(deps, &guard, log)
 }
 
-pub(crate) fn boot_with_guard(deps: &BootDeps<'_>, guard: &WriterGuard) -> BootReport {
-    boot_apply_with_guard(deps, guard, false)
+pub(crate) fn boot_with_guard(
+    deps: &BootDeps<'_>,
+    guard: &WriterGuard,
+    log: Option<&crate::events::LogHandle>,
+) -> BootReport {
+    boot_apply_with_guard(deps, guard, false, log)
 }
 
 /// Explicit apply may open the gate while durable quarantine remains until verification.
@@ -575,11 +586,16 @@ pub(crate) fn boot_apply_with_guard(
     deps: &BootDeps<'_>,
     guard: &WriterGuard,
     open_quarantined: bool,
+    log: Option<&crate::events::LogHandle>,
 ) -> BootReport {
     let mut initial = BootReport::default();
     let migration = (|| -> std::io::Result<()> {
         let file = StateFile::open(deps.state_root, None)?;
         if file.migrate_repair_state(guard, deps.run_root)? {
+            if let Some(log) = log {
+                log.repair_checkpoint_created(scupper_proto::Actor::Daemon, None);
+                return Ok(());
+            }
             let gateway = GatewayId(
                 RealFs
                     .read(&deps.config_root.join("gateway-id"))?
@@ -597,12 +613,7 @@ pub(crate) fn boot_apply_with_guard(
             .map_err(std::io::Error::other)?;
             opened
                 .handle
-                .emit(
-                    scupper_proto::EventKind::RepairCheckpointCreated {},
-                    scupper_proto::Actor::Boot,
-                    None,
-                )
-                .map_err(std::io::Error::other)?;
+                .repair_checkpoint_created(scupper_proto::Actor::Boot, None);
             opened
                 .handle
                 .flush_blocking(std::time::Duration::from_secs(5))?;

@@ -28,14 +28,24 @@ records the latch before main-state replacement and reserves safety repair count
 before mutation. The in-flight flag covers one restore's execution and verified
 completion; it is cleared when that restore ends, including a failed restore.
 Neither an in-flight flag nor three successful repairs constitutes a latch at
-startup or in `check`. Restored counts retain their conservative ten-minute
-window; the next refused safety restore latches, without a fresh repair budget.
+startup or in `check`. Each attempt retains its Unix timestamp. At restart,
+attempts at least ten minutes old expire; future timestamps clamp to now, and legacy count-only
+entries expire. Live attempts retain only their remaining window, so the next
+refused safety restore latches without granting a fresh repair budget.
 Other restores checkpoint best effort and never depend on state-disk fsync.
 
-A missing checkpoint means no record, including on upgrade from 4442253. Under
-the writer lock, daemon initialization and boot create an empty legacy checkpoint
+A missing checkpoint means no record, including on upgrade from the previous
+release. Under the writer lock, daemon initialization and boot create an empty legacy checkpoint
 only beside readable state with an applied version and no runtime uncertainty
 marker, and emit `RepairCheckpointCreated` once. Existing `state.quarantine` is
 preserved byte for byte. Unreadable or corrupt checkpoints, recorded quarantine,
 and runtime uncertainty still fail closed across restart. `connect` clears only
 typed uncertainty; ordinary durable safety latches require `repair clear` or apply.
+
+The migration audit is best effort: a failed event logs a warning and raises a
+persistence alert without aborting startup. Daemon rebuild, apply and rollback
+reuse the daemon's audit sender; only standalone boot opens an audit writer.
+For binary rollback compatibility, `state.json` retains the previous release's
+strict latch schema. Typed uncertainty and attempt timestamps are written only
+to `repair-state.json`, which that release never reads. An older binary still
+honors a main-state latch and its existing administrative clearance paths.

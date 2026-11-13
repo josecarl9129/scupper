@@ -1044,7 +1044,10 @@ fn check_accepts_legacy_layout_and_in_flight_restore_without_false_quarantine() 
             &guard,
             &RepairState {
                 armed: true,
-                attempts: std::collections::BTreeMap::from([("safety:ruleset".into(), 3)]),
+                attempts_unix: std::collections::BTreeMap::from([(
+                    "safety:ruleset".into(),
+                    vec![1100; 3],
+                )]),
                 ..RepairState::default()
             },
         )

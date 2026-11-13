@@ -646,7 +646,15 @@ impl SystemdLab {
             self.ready_recorded(Some(&format!("L44-{label}")))?;
             ready_ms = Some(started.elapsed().as_millis());
             self.check_code(0)?;
-            self.lab.service_check(markers)
+            self.lab.service_check_with_tcp_retry(
+                markers,
+                Some(
+                    &self
+                        .lab
+                        .artifacts
+                        .join(format!("L44-{label}-tcp-attempts.jsonl")),
+                ),
+            )
         })();
         fs::write(
             self.lab.artifacts.join(format!("L44-{label}-canary.json")),
