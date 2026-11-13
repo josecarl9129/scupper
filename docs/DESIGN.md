@@ -1518,8 +1518,8 @@ scupper                                 bare: short status summary with next-ste
 ├── completion SHELL
 ├── mac                                 (macOS builds only)
 │   ├── app status [APP]                transmission | qbittorrent; bind/profile match/tunnel up or down
-│   ├── app bind APP [--address A]       pin to tunnel IPv4; --profile FILE (default ~/.scupper/scupper0.conf)
-│   ├── app unbind APP                  clear binding; bind/unbind require the app to be quit
+│   ├── app bind APP [--address A]       pin to tunnel IPv4 (Transmission IPv6 ::1); --profile FILE (default ~/.scupper/scupper0.conf)
+│   ├── app unbind APP                  restore saved app preferences; app must be quit
 │   ├── join | leave | status
 │   ├── trust add [--current] | trust rm NAME | trust list
 │   ├── enroll --gateway HOST           generate device key + API token locally, register over SSH
@@ -2327,6 +2327,75 @@ While joined, the helper checks `scutil --dns` and re-asserts the tunnel
 resolver if the system resolver is not `10.99.0.1`. There is no R1
 captive-portal bypass.
 
+### App binding
+
+`scupper mac app bind transmission|qbittorrent` runs as the logged-in user;
+root is refused, including `sudo`. Quit the app before bind or unbind;
+`--yes` does not bypass this check. The default profile is
+`~/.scupper/scupper0.conf`; profile reads require a regular file, are limited
+to 16 KiB, and use a fully preallocated zeroized buffer. Bind errors suggest
+`--address` for an explicit tunnel IPv4. An address currently held
+by any interface other than `utun*` is refused, even when supplied explicitly.
+An unassigned address can be pinned while the tunnel is down. Status names
+all interfaces holding the pinned address; tunnel up requires only `utun*`
+holders, and is an address-presence observation rather than a handshake check.
+A non-`utun` holder is reported as `tunnel NOT USED: <if> holds the bound
+address` with a `warning:` line; no holder is reported as `tunnel down`.
+Status continues after profile and per-app errors, showing `profile unknown
+(<reason>)` with a `--profile` hint and app error lines. Status exits 1 if any
+warning is printed (including profile, app, or interface inspection errors),
+and 0 otherwise. A profile mismatch or absent tunnel alone does not warn.
+
+Transmission uses `defaults` in `org.m0k.transmission` to set
+`BindAddressIPv4` to the tunnel address and `BindAddressIPv6` to `::1`.
+There is no IPv6 exit, and the gateway drops client IPv6. Both values are
+read back after changes; a mismatch fails the command. Status shows IPv6
+as well as IPv4, and warns `IPv6 unpinned` when IPv4 is bound but IPv6 is
+not `::1` (including a missing IPv6 preference). A failed IPv6 write after
+IPv4 succeeds reports a partial binding and asks the user to rerun bind;
+the restore state is retained. Before the first bind, the prior values
+(including missing keys) are printed and saved in the user-only file
+`~/.config/scupper/transmission-bind.state`. Rebinding retains that original
+restore point. Unbind restores both prior values, deleting originally missing
+keys. Without a backup, unbind refuses to change existing preferences.
+The backup is removed only after verified restore; state writes use a
+temporary file and atomic rename.
+
+On macOS qBittorrent's preferences are at
+`~/.config/qBittorrent/qBittorrent.ini`. The editor changes only the three
+`[BitTorrent]` binding keys, selecting the numeric IPv4 in
+`Session\InterfaceAddress` and clearing `Session\Interface` and
+`Session\InterfaceName`. This is an IPv4-only binding: qBittorrent's
+`getListeningIPs()` produces only that IPv4, which
+`applyNetworkInterfacesSettings()` supplies to libtorrent's listening and
+outgoing settings. There is no separate IPv6 address key; no wildcard IPv6
+listener is selected. A binding by interface name would instead include both
+address families on that interface. See the
+[qBittorrent implementation](https://github.com/qbittorrent/qBittorrent/blob/master/src/base/bittorrent/sessionimpl.cpp)
+and [libtorrent settings](https://www.libtorrent.org/reference-Settings.html).
+Before the first bind, the three original raw values are hex-encoded in
+`~/.config/scupper/qbittorrent-bind.state` (mode 0600). Later binds retain
+this restore point. Unbind restores the three values, verifies the written
+config, then removes the state. Missing original keys restore as empty values.
+Without state, an existing scupper-style binding is refused rather than
+saved as the original; inspect `qBittorrent.ini.scupper-backup` to recover
+older bindings. This full ini backup is retained on unbind and is not
+refreshed when the config already holds a scupper binding. Replacements
+preserve the ini's owner, group, mode, line endings and unrelated bytes,
+using a temporary file and atomic rename. Status shows wildcard addresses
+`0.0.0.0` and `::` as unbound, and interface-only settings as interface
+bindings covering both families, with tunnel availability unknown.
+
+`defaults`, `pgrep`, and `ifconfig` each have a five-second deadline, including
+output EOF, and bounded output. Run the one-time join/start-transfer/leave
+check on a network with IPv6 before relying on either app binding. The
+binding covers the torrent engine only; URL/magnet fetches, RSS, search
+plugins, and tracker DNS lookups can use the currently available route.
+App/version compatibility, proxy behavior, race-free concurrent writers,
+and a two-key Transmission rollback
+on partial failure remain follow-ups; these settings alone do not establish
+the Mac-wide firewall guarantees described above.
+
 ### Auto-join (ADR 0021)
 
 The per-user LaunchAgent `net.scupper.agent` (`scupper mac agent run`)
@@ -2445,7 +2514,13 @@ firewall or host sysctls (except the optional `90-scupper.conf`).
    if the store already names one, a missing key file is an error, so a
    re-run never silently changes the client-facing identity or use a file the operator placed; `exit import` per provider
    file; tell the operator to delete downloaded provider files.
-7. Units, `systemctl enable --now scupper-net scupperd scupper-edge`.
+7. Atomically install root-owned mode 0644 `/etc/modules-load.d/scupper.conf`
+   from the shared boot module list: exactly `nf_conntrack` and `wireguard`.
+   Conntrack must precede its sysctls; WireGuard is defensive because link creation
+   can autoload it. nft autoloads its own dependencies; expression modules must not
+   be listed (for example, counter is part of `nf_tables` on Linux 6.x).
+   Install checks content, ownership and mode; unchanged reruns
+   do no writes. Then units, `systemctl enable --now scupper-net scupperd scupper-edge`.
    Release the writer lock after durable mutations and before daemon-reload
    or enabling services: `scupper boot` needs that same lock. Install waits up
    to 120 seconds for `systemctl enable --now`, beyond the 90-second unit start bound.
@@ -2495,6 +2570,18 @@ the normal startup path.
 ### `scupper boot` (stops at the first failure; every prefix is closed)
 
 0. Take the writer lock (ADR 0028).
+8. Check `/sys/module/<name>` read-only for each module in the shared install
+   module list before Inputs or any sysctl. Present modules need no command.
+   Only when the namespace is absent, load missing modules with bounded host
+   `modprobe <module>` commands. An existing namespace is verify-only: a missing
+   module stops boot with a closed failure naming it in `boot.json`, without
+   `modprobe`, for the existing closed-boot/rebuild logic to handle. Inventory
+   read errors and load failures also stop boot with the module named. This
+   supports older installs and manual starts without the modules-load file.
+   Checkpoint IDs 0–7 remain stable;
+   execution order is Lock, Modules (8), Inputs (1), Close (2), then 3–7.
+   The step is recorded even when every module is already present. At most two
+   load commands each have a 3 s deadline (at most 6 s under the writer lock).
 1. If `/run/netns/scupper` exists and holds our links: adopt (verify only).
    Else `ip netns add scupper`; `lo` up.
 2. In the namespace: forwarding 0 (v4, v6); all hardening sysctls (§5.4);
@@ -2511,6 +2598,15 @@ the normal startup path.
    inside WireGuard until the first handshake) or `unreachable`.
 6. Forwarding 1 unless latched or Disconnected; re-apply hardening; read back.
 7. Write `/run/scupper/boot.json` (step results); scupperd logs `Boot`.
+
+Successful handoffs accept both the pre-module eight-step report (Lock, Inputs,
+Close, Ruleset, Links, Routes, Forwarding, Record) and the new report with a
+successful Modules step immediately after Lock. Both require every step exactly
+once in order, without errors. Thus a binary swap can adopt a healthy namespace
+using the previous release's report without closing forwarding or rebuilding.
+Namespace, applied-version and owned-link identity checks still apply. An older
+binary cannot read the new Modules variant; rolling back after a new boot report
+has been written can require a closed rebuild.
 
 Requirement "ruleset before forwarding" is met inside the namespace by
 steps 2-6. The host `ip_forward` is irrelevant to the client path. The v1
@@ -2964,6 +3060,29 @@ boot retry and apply outcomes without request contents or destinations.
 The reboot simulation stops units, deletes namespace links and the named namespace,
 asserts and removes only scupper-named root leftovers (unexpected leftovers fail),
 clears runtime state and only lab conntrack entries, and preserves durable state.
+Before starting units it records whether `nf_conntrack` is loaded and attempts
+`modprobe -r nf_conntrack`. It never pre-creates a namespace: `scupper-net` must
+exercise the real fresh-namespace path whether unloading succeeds or conntrack
+remains pinned. Both modes require boot.json to show Modules succeeded immediately
+after Lock, before Inputs, and that boot did not adopt a namespace; they then
+verify the sysctl is 0 before starting scupperd. Artifacts retain the kernel
+release, unload exit/output, module state, namespace absence and first boot report.
+The deterministic cold-module reproduction is in the fake-kernel unit test.
+
+Lab boot success checks deserialize the product's `BootReport` and use its
+`succeeded()` definition, including its exact legacy upgrade compatibility.
+Both labs derive L9 checkpoint IDs and prefix expectations from the product's
+ordered `BootStep::ALL`, including Modules (ID 8, immediately after Lock).
+Prefix recovery retains any namespace and host leftovers for boot to adopt or
+repair; only the subsequent full reboot requires namespace absence and attempts
+module unloading. Each L9 recovery requires successful Modules evidence before
+Inputs, and a full reboot additionally forbids adoption. Per-prefix boot reports
+retain this evidence alongside the checkpoint markers.
+
+Runners may pin conntrack (for example through Docker NAT); in that case the lab
+proves module commands succeeded on the real kernel and fresh namespace creation,
+not reproduction of the missing-module sysctl failure. Runner unload behaviour
+must be measured in CI, not inferred from the passing sysctl check.
 It holds `up0` down until `scupper-net` completes, restores lab routes, then starts
 scupperd, retaining the same capture ifindex. L9 proves udev initialization and
 networkd observation, records per-point timings and asserts recovery removed host

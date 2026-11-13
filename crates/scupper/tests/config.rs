@@ -492,7 +492,7 @@ fn machine_output_never_prompts_for_config_writes() {
 }
 
 #[test]
-fn boot_is_hidden_root_only_and_reports_input_failure_without_kernel_writes() {
+fn boot_is_hidden_root_only_and_reports_input_failure_after_modules() {
     let mut h = Harness::new();
     let (code, help, _) = h.run(&["--help"]);
     assert_eq!(code, 0);
@@ -507,9 +507,10 @@ fn boot_is_hidden_root_only_and_reports_input_failure_without_kernel_writes() {
     let (code, out, err) = h.run(&["boot"]);
     assert_eq!(code, 1, "{out} {err}");
     let report: serde_json::Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(report["steps"].as_array().unwrap().len(), 2);
-    assert_eq!(report["steps"][1]["step"], "Inputs");
-    assert_eq!(report["steps"][1]["error"], "no configuration");
+    assert_eq!(report["steps"].as_array().unwrap().len(), 3);
+    assert_eq!(report["steps"][1]["step"], "Modules");
+    assert_eq!(report["steps"][2]["step"], "Inputs");
+    assert_eq!(report["steps"][2]["error"], "no configuration");
     assert!(h.system.calls.borrow().is_empty());
 }
 
@@ -664,6 +665,10 @@ fn alerts_list_marks_corrupt_row_and_keeps_other_sinks_visible() {
 // key derivation substituted. Command recording deliberately excludes stdin.
 struct ProviderSystem<'a>(&'a support::Script);
 impl scupper_sys::system::System for ProviderSystem<'_> {
+    fn module_loaded(&self, module: &str) -> io::Result<bool> {
+        scupper_sys::system::System::module_loaded(self.0, module)
+    }
+
     fn canon_run_root(&self) -> &Path {
         self.0.canon_run_root()
     }

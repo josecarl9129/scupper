@@ -188,6 +188,7 @@ fn observe_files(system: &dyn System, paths: &Paths, facts: &mut Facts) -> Resul
     for path in [
         model::WG0_FILE,
         model::GATEWAY_FILE,
+        model::MODULES_FILE,
         model::MIRROR_FILE,
         model::STATE_FILE,
     ] {

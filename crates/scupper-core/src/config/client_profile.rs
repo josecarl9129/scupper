@@ -2,6 +2,8 @@
 use std::{io::Read, net::Ipv4Addr};
 use zeroize::Zeroizing;
 
+const MAX_PROFILE_BYTES: usize = 16 * 1024;
+
 const INVALID: &str = "profile must contain one tunnel IPv4 Address in [Interface]";
 
 /// Validate an IPv4 literal in RFC 1918 or the shared address range.
@@ -78,11 +80,17 @@ pub fn parse_address(profile: &[u8]) -> Result<Ipv4Addr, &'static str> {
 ///
 /// # Errors
 /// Returns content-free read/parse errors; the buffer is wiped on all exits.
-pub fn read_address(mut reader: impl Read) -> Result<Ipv4Addr, &'static str> {
-    let mut bytes = Zeroizing::new(Vec::new());
+pub fn read_address(reader: impl Read) -> Result<Ipv4Addr, &'static str> {
+    // Reserve the full capped read up front: avoid reallocations and the stack
+    // probe in read_to_end, which would leave unzeroized copies of private keys.
+    let mut bytes = Zeroizing::new(Vec::with_capacity(MAX_PROFILE_BYTES + 1));
     reader
+        .take((MAX_PROFILE_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|_| "could not read client profile")?;
+    if bytes.len() > MAX_PROFILE_BYTES {
+        return Err("client profile exceeds 16 KiB");
+    }
     parse_address(&bytes)
 }
 
@@ -148,6 +156,19 @@ mod tests {
             .to_string(),
             "10.99.0.2"
         );
+    }
+    #[test]
+    fn profile_reads_stop_at_size_limit() {
+        let prefix = b"[Interface]\nAddress=10.99.0.2\n#";
+        let mut bytes = prefix.to_vec();
+        bytes.resize(MAX_PROFILE_BYTES, b'x');
+        assert!(read_address(bytes.as_slice()).is_ok());
+        bytes.push(b'x');
+        assert_eq!(
+            read_address(bytes.as_slice()).unwrap_err(),
+            "client profile exceeds 16 KiB"
+        );
+        assert!(read_address(std::io::repeat(b'x')).is_err());
     }
     #[test]
     fn address_ranges() {

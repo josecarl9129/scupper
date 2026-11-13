@@ -99,6 +99,13 @@ impl Script {
             });
         }
         let name = match program {
+            Program::Modprobe => {
+                assert!(!netns);
+                assert_eq!(args.len(), 1);
+                assert!(scupper_core::install::BOOT_MODULES.contains(&arg(0)));
+                return Ok(out);
+            }
+
             Program::Cat => {
                 assert!(netns);
                 assert!(args.len() == 1 && matches!(arg(0), "/proc/net/udp" | "/proc/net/udp6"));
@@ -258,6 +265,11 @@ impl Script {
     }
 }
 impl System for Script {
+    fn module_loaded(&self, _: &str) -> std::io::Result<bool> {
+        // These captures describe a running gateway with its modules loaded.
+        Ok(true)
+    }
+
     fn canon_run_root(&self) -> &Path {
         Path::new(env!("CARGO_MANIFEST_DIR"))
     }

@@ -33,6 +33,8 @@ use std::{collections::BTreeMap, path::Path};
 pub enum BootStep {
     /// 0: acquire the global writer lock, with a bounded wait.
     Lock = 0,
+    /// 8: verify modules, loading missing ones only for a fresh namespace.
+    Modules = 8,
     /// 1: resolve all inputs and open or create the foreign namespace.
     Inputs = 1,
     /// 2: close forwarding and verify hardening.
@@ -47,6 +49,21 @@ pub enum BootStep {
     Forwarding = 6,
     /// 7: durably publish the per-boot namespace identity and report.
     Record = 7,
+}
+
+impl BootStep {
+    /// Current checkpoints in execution order; numeric IDs remain stable for test hooks.
+    pub const ALL: &[Self] = &[
+        Self::Lock,
+        Self::Modules,
+        Self::Inputs,
+        Self::Close,
+        Self::Ruleset,
+        Self::Links,
+        Self::Routes,
+        Self::Forwarding,
+        Self::Record,
+    ];
 }
 
 /// A single step's outcome. Unrun steps do not appear in the report.
@@ -87,10 +104,24 @@ pub struct BootReport {
     pub owned_links: BTreeMap<String, u32>,
 }
 impl BootReport {
-    /// True only after every checkpoint, including durable publication, succeeded.
+    /// True only after all checkpoints succeeded in order, including publication.
+    /// Accept the pre-module eight-step writer for seamless upgrade handoffs;
+    /// new reports must have Modules immediately after Lock and before Inputs.
     #[must_use]
     pub fn succeeded(&self) -> bool {
-        self.steps.len() == 8 && self.steps.iter().all(|step| step.error.is_none())
+        let legacy = [
+            BootStep::Lock,
+            BootStep::Inputs,
+            BootStep::Close,
+            BootStep::Ruleset,
+            BootStep::Links,
+            BootStep::Routes,
+            BootStep::Forwarding,
+            BootStep::Record,
+        ];
+        let steps = || self.steps.iter().map(|step| step.step);
+        self.steps.iter().all(|step| step.error.is_none())
+            && (steps().eq(legacy) || steps().eq(BootStep::ALL.iter().copied()))
     }
 }
 
@@ -579,10 +610,38 @@ fn boot_locked(deps: &BootDeps<'_>, mut report: BootReport, open_quarantined: bo
     if !step(&mut report, deps, BootStep::Lock, false, || Ok(())) {
         return report;
     }
+    let mut existing = None;
+    if !step(&mut report, deps, BootStep::Modules, false, || {
+        existing = deps.namespace.open().map_err(|e| e.to_string())?;
+        for module in scupper_core::install::BOOT_MODULES {
+            if deps
+                .system
+                .module_loaded(module)
+                .map_err(|error| format!("required kernel module {module}: {error}"))?
+            {
+                continue;
+            }
+            if existing.is_some() {
+                return Err(format!(
+                    "required kernel module {module} is missing while adopting an existing namespace"
+                ));
+            }
+            execute(
+                deps,
+                ExecTarget::Host,
+                Program::Modprobe,
+                &strings(&[module]),
+                None,
+            )
+            .map_err(|error| format!("required kernel module {module}: {error}"))?;
+        }
+        Ok(())
+    }) {
+        return report;
+    }
     let mut owned_links = BTreeMap::new();
     let prepared = (|| {
         let cfg = inputs(deps, &mut report)?;
-        let existing = deps.namespace.open().map_err(|e| e.to_string())?;
         let existed = existing.is_some();
         let handle = if let Some(handle) = existing {
             handle

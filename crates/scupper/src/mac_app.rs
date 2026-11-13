@@ -46,7 +46,7 @@ enum AppCommand {
         #[arg(long, value_parser = scupper_core::config::client_profile::tunnel_address)]
         address: Option<Ipv4Addr>,
     },
-    /// Clear the app's tunnel binding while it is quit.
+    /// Restore saved app binding preferences while quit.
     Unbind { app: App },
 }
 
@@ -58,11 +58,11 @@ mod system;
 pub(crate) fn run(args: &MacArgs, out: &mut dyn Write) -> Result<u8, String> {
     #[cfg(target_os = "macos")]
     {
+        system::require_user(rustix::process::getuid().as_raw())?;
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .ok_or("HOME is not set")?;
-        system::execute(args, &home, &system::Native, out)?;
-        Ok(0)
+        system::execute(args, &home, &system::Native, out)
     }
     #[cfg(not(target_os = "macos"))]
     {

@@ -961,12 +961,9 @@ impl DaemonGuard<'_> {
                     "disconnected",
                 )?;
                 self.control_stop(Signal::TERM)?;
-                self.lab.boot_gateway(&[], &format!("{case}-reboot"))?;
+                let boot = self.lab.boot_gateway(&[], &format!("{case}-reboot"))?;
                 self.assert_disconnected_boot(&format!("{case}-reboot"))?;
-                let boot: serde_json::Value = serde_json::from_slice(&fs::read(
-                    self.lab.artifacts.join(format!("{case}-reboot.json")),
-                )?)?;
-                if boot["adopted"] != true {
+                if !boot.adopted {
                     return fail("L14 disconnected reboot did not adopt");
                 }
                 self.expect_check(
