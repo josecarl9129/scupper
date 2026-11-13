@@ -200,16 +200,37 @@ impl DaemonGuard<'_> {
             .daemon_wait("alert HTTPS listener", Duration::from_secs(5), |lab| {
                 Ok(lab.cmd("internet", "ss", &["-ltnH"])?.contains(":443"))
             })?;
-        // Mark only locally generated delivery-identity traffic. Forwarded client
-        // SYNs cannot receive this mark, even after source translation.
+        // Mark the alert connection from its first locally generated packet,
+        // then restore DSCP from conntrack even for late socketless kernel RSTs.
+        // Forwarded client SYNs cannot receive cs7, even after source translation.
         let identity = scupper_sys::heartbeat::account(
             &fs::read_to_string(root.join("etc/passwd"))?,
             &fs::read_to_string(root.join("etc/group"))?,
         )
         .map_err(|_| "alert identity missing")?;
         let mark = format!(
-            "table inet alert_identity {{\n  chain output {{\n    type filter hook output priority -150;\n    ip daddr {endpoint} tcp dport 443 ip dscp set cs0;\n    meta skuid {} ip daddr {endpoint} tcp dport 443 ip dscp set cs7;\n  }}\n  chain forward {{\n    type filter hook forward priority -150;\n    ip daddr {endpoint} tcp dport 443 ip dscp set cs0;\n  }}\n}}\n",
-            identity.uid,
+            r"table inet alert_identity {{
+  counter tracked_reset {{ }}
+  counter invalid_reset {{ }}
+  counter unmarked_tracked {{ }}
+  counter unmarked_invalid {{ }}
+  chain output {{
+    type filter hook output priority -150;
+    ip daddr {endpoint} tcp dport 443 ip dscp set cs0;
+    meta skuid {uid} ip daddr {endpoint} tcp dport 443 ct mark set 0x5c;
+    ct mark 0x5c ip daddr {endpoint} tcp dport 443 ip dscp set cs7;
+    ip daddr {endpoint} tcp dport 443 tcp flags == rst ct state != invalid counter name tracked_reset;
+    ip daddr {endpoint} tcp dport 443 tcp flags == rst ct state invalid counter name invalid_reset;
+    ip daddr {endpoint} tcp dport 443 ip dscp cs0 ct state != invalid counter name unmarked_tracked;
+    ip daddr {endpoint} tcp dport 443 ip dscp cs0 ct state invalid counter name unmarked_invalid;
+  }}
+  chain forward {{
+    type filter hook forward priority -150;
+    ip daddr {endpoint} tcp dport 443 ip dscp set cs0;
+  }}
+}}
+",
+            uid = identity.uid,
             endpoint = super::heartbeat::ENDPOINT
         );
         self.lab.runner.input(
@@ -424,6 +445,25 @@ impl DaemonGuard<'_> {
         }
         server.stop(Signal::TERM)?;
         self.lab.stop_captures()?;
+        // Keep kernel conntrack evidence alongside the pcap: a tracked flow must
+        // never lose its identity mark. INVALID socketless resets cannot read a
+        // ct mark; the oracle requires capture-local proof of that closing reply.
+        let counters: serde_json::Value = serde_json::from_str(&self.lab.cmd(
+            "gwhost",
+            "nft",
+            &["-j", "list", "table", "inet", "alert_identity"],
+        )?)?;
+        fs::write(
+            self.lab.artifacts.join("alerts-conntrack.json"),
+            serde_json::to_vec_pretty(&counters)?,
+        )?;
+        if identity_counter(&counters, "unmarked_tracked")? != 0 {
+            return fail("alerts: a conntrack-associated delivery packet lost DSCP cs7");
+        }
+        // Require all counters to exist, even when the race does not fire.
+        for name in ["tracked_reset", "invalid_reset", "unmarked_invalid"] {
+            identity_counter(&counters, name)?;
+        }
         let bytes = fs::read(self.lab.artifacts.join("alerts.pcap"))?;
         if crate::pcap::heartbeat_hellos(
             &bytes,
@@ -438,6 +478,27 @@ impl DaemonGuard<'_> {
             .daemon_oracle("alerts", &markers, self.lab.exit_port, self.lab.exit_port)?;
         Ok("Critical host-uplink alert, exact per-sink sequences and preset shapes, client canaries, durable CLI receipt, live shortened coalescing hold".into())
     }
+}
+
+fn identity_counter(value: &serde_json::Value, name: &str) -> Result<u64> {
+    let counters = value["nftables"]
+        .as_array()
+        .ok_or("missing nftables counters")?;
+    let mut found = counters.iter().filter_map(|row| {
+        let counter = &row["counter"];
+        (counter["family"] == "inet"
+            && counter["table"] == "alert_identity"
+            && counter["name"] == name)
+            .then_some(counter)
+    });
+    let packets = found
+        .next()
+        .and_then(|c| c["packets"].as_u64())
+        .ok_or("missing alert identity counter")?;
+    if found.next().is_some() {
+        return fail("duplicate alert identity counter");
+    }
+    Ok(packets)
 }
 
 fn assert_sequence(rows: &[serde_json::Value], expected: &[(&str, &str)]) -> Result<()> {
@@ -478,6 +539,26 @@ fn assert_preset_sequence(rows: &[serde_json::Value]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn identity_counter_requires_exact_scope_and_numeric_evidence() {
+        let row = serde_json::json!({"counter":{
+            "family":"inet", "table":"alert_identity", "name":"unmarked_tracked", "packets":0
+        }});
+        let good = serde_json::json!({"nftables":[row.clone()]});
+        assert_eq!(identity_counter(&good, "unmarked_tracked").unwrap(), 0);
+        assert!(identity_counter(&good, "invalid_reset").is_err());
+        let mut nonzero = good.clone();
+        nonzero["nftables"][0]["counter"]["packets"] = 1.into();
+        assert_eq!(identity_counter(&nonzero, "unmarked_tracked").unwrap(), 1);
+        for field in ["family", "table", "packets"] {
+            let mut invalid = good.clone();
+            invalid["nftables"][0]["counter"][field] = "wrong".into();
+            assert!(identity_counter(&invalid, "unmarked_tracked").is_err());
+        }
+        let duplicate = serde_json::json!({"nftables":[row.clone(), row]});
+        assert!(identity_counter(&duplicate, "unmarked_tracked").is_err());
+    }
+
     #[test]
     fn exact_sequence_rejects_extras_missing_reordering_and_nonadjacent_duplicates() {
         let row =

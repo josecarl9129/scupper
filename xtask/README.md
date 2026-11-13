@@ -68,6 +68,22 @@ markers match those names ASCII case-insensitively, while byte-array markers
 remain exact. Markers supplement the allow-list, which also rejects unmarked
 unexpected traffic.
 
+With `heartbeat` and `heartbeat_dscp` configured, outbound delivery requires the
+identity DSCP mark. The alert lab sets a conntrack mark from the alert UID and
+copies it to CS7 in OUTPUT; FORWARD always clears that DSCP. Its
+`alerts-conntrack.json` counters distinguish tracked and INVALID bare resets and
+require zero unmarked tracked endpoint packets.
+
+The `heartbeat_late_reset` class handles one socketless IPv4 closing reply when
+conntrack cannot supply the mark. In capture order, the exact host/endpoint TCP
+tuple must have a marked SYN, an empty endpoint FIN/ACK, and an empty marked
+abortive RST/ACK. Only a subsequent DSCP-0, empty, optionless RST with ACK field
+zero and sequence equal to both the FIN's ACK and the endpoint's latest ACK is
+allowed. The proof is consumed once and a new SYN revokes it. Fragmented packets
+cannot establish or use this proof; all address, marker, framing and positive
+capture checks still apply. This closing class does not supply positive
+`heartbeat` evidence.
+
 WireGuard rules require an uplink gateway IP and equal endpoint address
 families. UDP endpoints must match exactly. The four-byte type/reserved field
 must be `[1..4, 0, 0, 0]`; initiation, response and cookie messages require

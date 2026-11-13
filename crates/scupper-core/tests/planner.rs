@@ -1778,6 +1778,49 @@ fn blocked_restores_reserve_nothing_and_unknown_rulesets_only_close() {
 }
 
 #[test]
+fn known_foreign_link_drift_and_deletion_preserve_client_identity() {
+    let d = desired();
+    let mut m = KernelModel::desired(&d);
+    m.links.insert("foreign0".into(), foreign(&d));
+    let first = tick(&d, &m, &Debounce::default());
+    assert!(first.steps.contains(&Step::LinkDown {
+        name: "foreign0".into()
+    }));
+    let client = m.links["wg0"].clone();
+    let mut budgets = first.budgets.clone();
+    let mut debounce = first.debounce.clone();
+    m = run(&m, &first.steps);
+    m.links.remove("foreign0"); // A successful inventory positively establishes absence.
+    let mut plans = vec![first];
+    for second in [2, 4] {
+        let next = plan(&d, &m, &budgets, None, &debounce, at(second));
+        budgets = next.budgets.clone();
+        debounce = next.debounce.clone();
+        m = run(&m, &next.steps);
+        plans.push(next);
+    }
+    for p in plans {
+        assert!(!p.debounce.ingress_quarantined);
+        assert!(
+            !p.steps
+                .contains(&Step::Emit(PlannerEvent::IngressQuarantined))
+        );
+        assert!(
+            !p.steps
+                .contains(&Step::Emit(PlannerEvent::ObservationUnknown))
+        );
+        assert!(!p.steps.iter().any(|s| match s {
+            Step::LinkDown { name } => name == "wg0",
+            Step::LinkCreate { link, .. } | Step::LinkReconfigure { link } => link.name == "wg0",
+            _ => false,
+        }));
+    }
+    assert_eq!(m.links["wg0"], client);
+    assert_eq!(m.forwarding_v4, Known::Value(1));
+    assert_eq!(m.forwarding_v6, Known::Value(1));
+}
+
+#[test]
 fn unknown_inventory_closes_ingress_immediately_then_recovers() {
     let d = desired();
     for missing_links in [false, true] {

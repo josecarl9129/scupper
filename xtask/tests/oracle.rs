@@ -1687,3 +1687,225 @@ fn alert_identity_mark_rejects_client_syn_even_after_uplink_source_translation()
     assert_eq!(report.packets[0].class, violation(Reason::NotAllowListed));
     assert_eq!(report.packets[1].class, allowed("heartbeat"));
 }
+
+// Reconstruct the shape and closing fields of diagnosis packets 697–716.
+// TLS bytes and handshake sequence numbers were not supplied in the diagnosis;
+// they are synthetic. The FIN acknowledgement / closing RST seq is exact.
+const ALERT_SEQ: u32 = 2_333_173_460;
+
+fn alert_segment(outbound: bool, dscp: u8, flags: u8, seq: u32, ack: u32, data: &[u8]) -> Vec<u8> {
+    let host = [198, 51, 100, 2];
+    let endpoint = [198, 51, 100, 10];
+    let (src, dst, sport, dport) = if outbound {
+        (host, endpoint, 51584, 443)
+    } else {
+        (endpoint, host, 443, 51584)
+    };
+    let mut segment = tcp(sport, dport, data);
+    segment[4..8].copy_from_slice(&seq.to_be_bytes());
+    segment[8..12].copy_from_slice(&ack.to_be_bytes());
+    segment[13] = flags;
+    let mut ip = ip4(src, dst, 6, &segment);
+    ip[1] = dscp << 2;
+    ip[6] = 0x40; // DF, IP ID 0, as in packet 716.
+    ip
+}
+
+fn alert_close_sequence() -> Vec<Vec<u8>> {
+    let mut packets = vec![
+        alert_segment(true, 56, 2, ALERT_SEQ - 43, 0, b""),
+        alert_segment(false, 0, 0x12, 100, ALERT_SEQ - 42, b""),
+        alert_segment(true, 56, 0x10, ALERT_SEQ - 42, 101, b""),
+    ];
+    for i in 0..7 {
+        packets.push(alert_segment(
+            true,
+            56,
+            0x18,
+            ALERT_SEQ - 42 + i * 6,
+            101 + i * 6,
+            b"\x17\x03\x03\x00\x01x",
+        ));
+        packets.push(alert_segment(
+            false,
+            0,
+            0x18,
+            101 + i * 6,
+            ALERT_SEQ - 36 + i * 6,
+            b"\x17\x03\x03\x00\x01y",
+        ));
+    }
+    packets.extend([
+        alert_segment(false, 0, 0x11, 143, ALERT_SEQ, b""), // 714: endpoint FIN/ACK
+        alert_segment(true, 56, 0x14, ALERT_SEQ, 144, b""), // 715: marked abortive close
+        alert_segment(true, 0, 4, ALERT_SEQ, 0, b""),       // 716: socketless bare RST
+    ]);
+    packets
+}
+
+fn alert_report(packets: &[Vec<u8>]) -> Report {
+    let policy = Policy::from_toml(
+        r#"
+uplink_addrs = ["198.51.100.2"]
+heartbeat = "198.51.100.10:443"
+heartbeat_dscp = 56
+forbidden_addrs = ["10.99.0.0/24", "10.2.0.0/24"]
+canary_markers = ["leak.example"]
+"#,
+    )
+    .unwrap();
+    classify(&capture(101, packets), &policy, 30).unwrap()
+}
+
+#[test]
+fn alert_late_bare_reset_requires_the_marked_syn_fin_and_abort_sequence() {
+    let packets = alert_close_sequence();
+    assert_eq!(packets.len(), 20);
+    let report = alert_report(&packets);
+    assert_eq!(report.violation_count, 0);
+    assert_eq!(report.packets[19].class, allowed("heartbeat_late_reset"));
+    for omitted in [0, 17, 18] {
+        // No marked SYN, endpoint FIN, or marked abort.
+        let mut incomplete = packets.clone();
+        incomplete.remove(omitted);
+        assert_eq!(
+            alert_report(&incomplete).packets.last().unwrap().class,
+            violation(Reason::NotAllowListed)
+        );
+    }
+    let report = alert_report(&packets[19..]); // Unseen flow, even with the exact RST seq.
+    assert_eq!(report.packets[0].class, violation(Reason::NotAllowListed));
+    let mut unmarked = packets.clone();
+    unmarked[0][1] = 0;
+    assert_eq!(
+        alert_report(&unmarked).packets[19].class,
+        violation(Reason::NotAllowListed)
+    );
+    let mut reordered = packets.clone();
+    reordered.swap(17, 19); // RST before the endpoint FIN does not qualify.
+    assert_eq!(
+        alert_report(&reordered).packets[17].class,
+        violation(Reason::NotAllowListed)
+    );
+    // Established sockets normally negotiate timestamps; FIN and socket-owned
+    // RST/ACK may have options, while the socketless RST has none.
+    let mut timestamped = packets.clone();
+    for i in [17, 18] {
+        timestamped[i].extend_from_slice(&[1, 1, 8, 10, 0, 0, 0, 1, 0, 0, 0, 2]);
+        timestamped[i][2..4].copy_from_slice(&52_u16.to_be_bytes());
+        timestamped[i][32] = 0x80;
+    }
+    assert_eq!(alert_report(&timestamped).violation_count, 0);
+}
+
+#[test]
+fn alert_late_reset_rejects_payload_ack_wrong_tuple_and_sequence() {
+    let packets = alert_close_sequence();
+    let mut wrong_tuple = packets[19].clone();
+    wrong_tuple[20..22].copy_from_slice(&51585_u16.to_be_bytes());
+    for reset in [
+        alert_segment(true, 0, 4, ALERT_SEQ, 0, b"x"),
+        alert_segment(true, 0, 0x14, ALERT_SEQ, 0, b""),
+        alert_segment(true, 0, 4, ALERT_SEQ + 1, 0, b""),
+        alert_segment(true, 0, 4, ALERT_SEQ, 144, b""),
+        alert_segment(true, 1, 4, ALERT_SEQ, 0, b""),
+        wrong_tuple,
+    ] {
+        let mut trial = packets[..19].to_vec();
+        trial.push(reset);
+        assert_eq!(
+            alert_report(&trial).packets[19].class,
+            violation(Reason::NotAllowListed)
+        );
+    }
+    let mut options = packets[19].clone();
+    options.extend_from_slice(&[1, 1, 1, 1]);
+    options[2..4].copy_from_slice(&44_u16.to_be_bytes());
+    options[32] = 0x60;
+    let mut trial = packets[..19].to_vec();
+    trial.push(options);
+    assert_eq!(
+        alert_report(&trial).packets[19].class,
+        violation(Reason::NotAllowListed)
+    );
+}
+
+#[test]
+fn alert_late_reset_proof_is_single_use_and_cannot_follow_a_reused_tuple() {
+    let mut packets = alert_close_sequence();
+    packets.push(packets[19].clone());
+    assert_eq!(
+        alert_report(&packets).packets[20].class,
+        violation(Reason::NotAllowListed)
+    );
+    for dscp in [0, 56] {
+        let mut reused = packets[..19].to_vec();
+        reused.push(alert_segment(true, dscp, 2, 1, 0, b""));
+        reused.push(packets[19].clone());
+        assert_eq!(
+            alert_report(&reused).packets[20].class,
+            violation(Reason::NotAllowListed)
+        );
+    }
+    let mut newer_ack = packets[..19].to_vec();
+    newer_ack.push(alert_segment(false, 0, 0x10, 144, ALERT_SEQ + 1, b""));
+    newer_ack.push(packets[19].clone());
+    assert_eq!(
+        alert_report(&newer_ack).packets[20].class,
+        violation(Reason::NotAllowListed)
+    );
+}
+
+#[test]
+fn alert_late_reset_does_not_override_leak_or_decode_failures() {
+    let packets = alert_close_sequence();
+    let mut forbidden_packet = packets[19].clone();
+    forbidden_packet[12..16].copy_from_slice(&CLIENT);
+    let mut truncated = packets[19].clone();
+    truncated.pop();
+    let mut trailing = packets[19].clone();
+    trailing.push(0);
+    let mut marked_trailer = packets[19].clone();
+    marked_trailer.extend_from_slice(b"leak.example");
+    for (reset, expected) in [
+        (forbidden_packet, forbidden(CLIENT, Location::Outer)),
+        (truncated, violation(Reason::Truncated)),
+        (trailing, violation(Reason::NotAllowListed)),
+        (marked_trailer, violation(Reason::NotAllowListed)),
+        (
+            alert_segment(true, 0, 4, ALERT_SEQ, 0, b"leak.example"),
+            violation(Reason::CanaryMarker),
+        ),
+    ] {
+        let mut trial = packets[..19].to_vec();
+        trial.push(reset);
+        assert_eq!(alert_report(&trial).packets[19].class, expected);
+    }
+}
+
+#[test]
+fn alert_late_reset_cannot_use_fragment_reassembly() {
+    let mut packets = alert_close_sequence();
+    let reset = packets.pop().unwrap();
+    let mut first = reset[..36].to_vec(); // First sixteen TCP bytes.
+    first[2..4].copy_from_slice(&36_u16.to_be_bytes());
+    first[6..8].copy_from_slice(&0x2000_u16.to_be_bytes());
+    let mut last = reset[..20].to_vec();
+    last.extend_from_slice(&reset[36..]);
+    last[2..4].copy_from_slice(&24_u16.to_be_bytes());
+    last[6..8].copy_from_slice(&2_u16.to_be_bytes());
+    packets.extend([first, last]);
+    let report = alert_report(&packets);
+    for packet in &report.packets[19..] {
+        assert_eq!(packet.class, violation(Reason::NotAllowListed));
+    }
+}
+
+proptest! {
+    #[test]
+    fn alert_late_reset_never_authorizes_any_payload(data in prop::collection::vec(any::<u8>(), 1..128)) {
+        let mut packets = alert_close_sequence();
+        packets[19] = alert_segment(true, 0, 4, ALERT_SEQ, 0, &data);
+        prop_assert!(matches!(alert_report(&packets).packets[19].class, Class::Violation(_)));
+    }
+}
