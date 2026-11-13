@@ -117,3 +117,6 @@ pub(super) fn child(path: &str, name: &str) -> String {
         format!("{path}.{safe}")
     }
 }
+
+/// Minimal client WireGuard profile Address reader.
+pub mod client_profile;

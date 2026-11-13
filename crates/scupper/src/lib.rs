@@ -18,3 +18,5 @@ pub mod remote;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "portable_cli.rs"]
 mod portable_cli_test;
+
+mod mac_app;

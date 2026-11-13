@@ -82,7 +82,8 @@ pub(crate) fn execute(
                 let code = status
                     .code()
                     .and_then(|c| u8::try_from(c).ok())
-                    .unwrap_or(1);
+                    // Keep signal termination distinct from exit 1 (pgrep: no matches).
+                    .unwrap_or(255);
                 return Ok(crate::deploy::TransportOutput {
                     code,
                     stdout: std::mem::take(stdout),
@@ -133,6 +134,13 @@ mod tests {
 #[allow(clippy::unwrap_used)]
 mod status_tests {
     use super::*;
+    #[test]
+    fn signal_termination_is_not_reported_as_exit_one() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "kill -TERM $$"]);
+        let result = execute(command, b"", Duration::from_secs(2)).unwrap();
+        assert_eq!(result.code, 255);
+    }
     #[test]
     fn nonzero_exit_preserves_status_and_both_streams() {
         let mut command = Command::new("sh");

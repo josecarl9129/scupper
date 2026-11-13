@@ -1517,6 +1517,9 @@ scupper                                 bare: short status summary with next-ste
 ├── version
 ├── completion SHELL
 ├── mac                                 (macOS builds only)
+│   ├── app status [APP]                transmission | qbittorrent; bind/profile match/tunnel up or down
+│   ├── app bind APP [--address A]       pin to tunnel IPv4 (Transmission IPv6 ::1); --profile FILE (default ~/.scupper/scupper0.conf)
+│   ├── app unbind APP                  restore saved app preferences; app must be quit
 │   ├── join | leave | status
 │   ├── trust add [--current] | trust rm NAME | trust list
 │   ├── enroll --gateway HOST           generate device key + API token locally, register over SSH
@@ -2323,6 +2326,75 @@ before the LAN pass, so a hostile network cannot receive DNS through it.
 While joined, the helper checks `scutil --dns` and re-asserts the tunnel
 resolver if the system resolver is not `10.99.0.1`. There is no R1
 captive-portal bypass.
+
+### App binding
+
+`scupper mac app bind transmission|qbittorrent` runs as the logged-in user;
+root is refused, including `sudo`. Quit the app before bind or unbind;
+`--yes` does not bypass this check. The default profile is
+`~/.scupper/scupper0.conf`; profile reads require a regular file, are limited
+to 16 KiB, and use a fully preallocated zeroized buffer. Bind errors suggest
+`--address` for an explicit tunnel IPv4. An address currently held
+by any interface other than `utun*` is refused, even when supplied explicitly.
+An unassigned address can be pinned while the tunnel is down. Status names
+all interfaces holding the pinned address; tunnel up requires only `utun*`
+holders, and is an address-presence observation rather than a handshake check.
+A non-`utun` holder is reported as `tunnel NOT USED: <if> holds the bound
+address` with a `warning:` line; no holder is reported as `tunnel down`.
+Status continues after profile and per-app errors, showing `profile unknown
+(<reason>)` with a `--profile` hint and app error lines. Status exits 1 if any
+warning is printed (including profile, app, or interface inspection errors),
+and 0 otherwise. A profile mismatch or absent tunnel alone does not warn.
+
+Transmission uses `defaults` in `org.m0k.transmission` to set
+`BindAddressIPv4` to the tunnel address and `BindAddressIPv6` to `::1`.
+There is no IPv6 exit, and the gateway drops client IPv6. Both values are
+read back after changes; a mismatch fails the command. Status shows IPv6
+as well as IPv4, and warns `IPv6 unpinned` when IPv4 is bound but IPv6 is
+not `::1` (including a missing IPv6 preference). A failed IPv6 write after
+IPv4 succeeds reports a partial binding and asks the user to rerun bind;
+the restore state is retained. Before the first bind, the prior values
+(including missing keys) are printed and saved in the user-only file
+`~/.config/scupper/transmission-bind.state`. Rebinding retains that original
+restore point. Unbind restores both prior values, deleting originally missing
+keys. Without a backup, unbind refuses to change existing preferences.
+The backup is removed only after verified restore; state writes use a
+temporary file and atomic rename.
+
+On macOS qBittorrent's preferences are at
+`~/.config/qBittorrent/qBittorrent.ini`. The editor changes only the three
+`[BitTorrent]` binding keys, selecting the numeric IPv4 in
+`Session\InterfaceAddress` and clearing `Session\Interface` and
+`Session\InterfaceName`. This is an IPv4-only binding: qBittorrent's
+`getListeningIPs()` produces only that IPv4, which
+`applyNetworkInterfacesSettings()` supplies to libtorrent's listening and
+outgoing settings. There is no separate IPv6 address key; no wildcard IPv6
+listener is selected. A binding by interface name would instead include both
+address families on that interface. See the
+[qBittorrent implementation](https://github.com/qbittorrent/qBittorrent/blob/master/src/base/bittorrent/sessionimpl.cpp)
+and [libtorrent settings](https://www.libtorrent.org/reference-Settings.html).
+Before the first bind, the three original raw values are hex-encoded in
+`~/.config/scupper/qbittorrent-bind.state` (mode 0600). Later binds retain
+this restore point. Unbind restores the three values, verifies the written
+config, then removes the state. Missing original keys restore as empty values.
+Without state, an existing scupper-style binding is refused rather than
+saved as the original; inspect `qBittorrent.ini.scupper-backup` to recover
+older bindings. This full ini backup is retained on unbind and is not
+refreshed when the config already holds a scupper binding. Replacements
+preserve the ini's owner, group, mode, line endings and unrelated bytes,
+using a temporary file and atomic rename. Status shows wildcard addresses
+`0.0.0.0` and `::` as unbound, and interface-only settings as interface
+bindings covering both families, with tunnel availability unknown.
+
+`defaults`, `pgrep`, and `ifconfig` each have a five-second deadline, including
+output EOF, and bounded output. Run the one-time join/start-transfer/leave
+check on a network with IPv6 before relying on either app binding. The
+binding covers the torrent engine only; URL/magnet fetches, RSS, search
+plugins, and tracker DNS lookups can use the currently available route.
+App/version compatibility, proxy behavior, race-free concurrent writers,
+and a two-key Transmission rollback
+on partial failure remain follow-ups; these settings alone do not establish
+the Mac-wide firewall guarantees described above.
 
 ### Auto-join (ADR 0021)
 
