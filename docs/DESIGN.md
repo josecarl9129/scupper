@@ -3464,6 +3464,18 @@ independent bounded attempts save status/check JSON, boot.json, the last 200 eve
 records, unit status and the
 scupperd journal in short-monotonic format. Daemon stderr reports start, ready,
 boot retry and apply outcomes without request contents or destinations.
+L44's positive TCP checks allow at most three attempts per destination within
+15 seconds, with a fresh marker and source port each time. Only delivery timeouts
+are retried. Per-attempt JSON-lines artifacts retain timings and outcomes; every
+attempt's marker remains in the unfiltered uplink oracle policy. Delivered
+markers still require exactly one provider-NAT receipt; any receipt from a
+timed-out attempt must also be unique and from provider NAT. Negative probes,
+packet allow-lists, capture liveness/loss checks and zero-leak assertions are
+unchanged. Background GNU timeout escalation uses 35 seconds so it cannot
+preempt the reconciler's 30-second requested shutdown grace. The lab still
+enforces each job's own bounded grace and rejects forced shutdown, including
+SIGKILL of a capture. Per-job shutdown artifacts identify the log, PID, requested
+signal, grace, elapsed time and outcome.
 The reboot simulation stops units, deletes namespace links and the named namespace,
 asserts and removes only scupper-named root leftovers (unexpected leftovers fail),
 clears runtime state and only lab conntrack entries, and preserves durable state.

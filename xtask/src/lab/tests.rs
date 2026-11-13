@@ -432,7 +432,7 @@ fn every_external_program_uses_argv_namespace_entry_and_a_timeout() {
                 }
             );
             for seconds in [15, 1050] {
-                let timed = invocation.timed(seconds);
+                let timed = invocation.timed(seconds, 2);
                 assert_eq!(
                     timed[0..3],
                     ["--signal=TERM", "--kill-after=2", &seconds.to_string()]
@@ -443,7 +443,7 @@ fn every_external_program_uses_argv_namespace_entry_and_a_timeout() {
         }
     }
 }
-fn test_dir(name: &str) -> PathBuf {
+pub(super) fn test_dir(name: &str) -> PathBuf {
     let path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("lab-test-{name}-{}", std::process::id()));
     fs::create_dir_all(&path).unwrap();
@@ -613,6 +613,134 @@ fn background_processes_shutdown_cleanly_and_early_exit_fails() {
 }
 
 #[test]
+#[ignore = "subprocess fixture"]
+fn slow_shutdown_fixture() {
+    let dir = test_dir("slow-shutdown");
+    let stop = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&stop)).unwrap();
+    fs::write(dir.join("ready"), "ready").unwrap();
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Longer than GNU timeout's former two-second escalation, but inside
+    // the caller's grace. Model a reconciler finishing work before exit.
+    std::thread::sleep(Duration::from_millis(2500));
+    fs::write(dir.join("end"), "complete\n").unwrap();
+}
+
+#[test]
+fn background_supervisor_respects_the_requested_shutdown_grace() {
+    let dir = test_dir("slow-shutdown");
+    let mut runner = Runner::new(
+        fs::File::create(dir.join("trace")).unwrap(),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let executable = std::env::current_exe().unwrap();
+    let mut group = runner
+        .background(
+            &Invocation::new(
+                "",
+                executable.to_str().unwrap(),
+                &["--ignored", "--exact", "lab::tests::slow_shutdown_fixture"],
+            ),
+            &dir.join("slow.stdout"),
+        )
+        .unwrap();
+    // The subprocess has a different PID; its ready/end files use that PID.
+    let until = Instant::now() + Duration::from_secs(5);
+    let pid = loop {
+        if let Ok(Some(pid)) = group.supervised_pid() {
+            break pid;
+        }
+        group.alive().unwrap();
+        assert!(Instant::now() < until, "supervisor did not start fixture");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let child_dir = dir
+        .parent()
+        .unwrap()
+        .join(format!("lab-test-slow-shutdown-{pid}"));
+    while !child_dir.join("ready").exists() {
+        group.alive().unwrap();
+        assert!(Instant::now() < until, "fixture did not become ready");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    group
+        .stop_timeout(rustix::process::Signal::TERM, Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(child_dir.join("end")).unwrap(),
+        "complete\n"
+    );
+    runner.assert_background_released(0).unwrap();
+    fs::remove_dir_all(child_dir).unwrap();
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[ignore = "subprocess fixture"]
+fn ignored_term_fixture() {
+    let stop = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, stop).unwrap();
+    let dir = test_dir("ignored-term");
+    fs::write(dir.join("ready"), "handler installed").unwrap();
+    // A bounded fixture that deliberately ignores the flag. The parent must
+    // escalate; neither scheduling nor timeout's SIGCONT can make TERM exit it.
+    std::thread::sleep(Duration::from_secs(30));
+}
+
+#[test]
+fn background_escalation_still_fails_and_records_the_job() {
+    let dir = test_dir("shutdown-escalation");
+    let mut runner = Runner::new(
+        fs::File::create(dir.join("trace")).unwrap(),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let log = dir.join("capture.stdout");
+    let executable = std::env::current_exe().unwrap();
+    let mut group = runner
+        .background(
+            &Invocation::new(
+                "",
+                executable.to_str().unwrap(),
+                &["--ignored", "--exact", "lab::tests::ignored_term_fixture"],
+            ),
+            &log,
+        )
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(5);
+    let pid = loop {
+        if let Ok(Some(pid)) = group.supervised_pid() {
+            break pid;
+        }
+        group.alive().unwrap();
+        assert!(Instant::now() < until, "supervisor did not start fixture");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let child_dir = dir
+        .parent()
+        .unwrap()
+        .join(format!("lab-test-ignored-term-{pid}"));
+    while !child_dir.join("ready").exists() {
+        group.alive().unwrap();
+        assert!(Instant::now() < until, "fixture did not become ready");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let error = group
+        .stop_timeout(rustix::process::Signal::TERM, Duration::from_millis(100))
+        .unwrap_err();
+    assert!(error.to_string().contains("capture.stdout"));
+    assert!(error.to_string().contains("SIGKILL"));
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(log.with_extension("shutdown.json")).unwrap()).unwrap();
+    assert_eq!(record["passed"], false);
+    assert_eq!(record["grace_ms"], 100);
+    runner.assert_background_released(0).unwrap();
+    fs::remove_dir_all(child_dir).unwrap();
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn capture_loss_or_missing_statistics_cannot_establish_silence() {
     assert!(
         evidence::check_capture_stats(
@@ -646,6 +774,34 @@ fn capture_loss_or_missing_statistics_cannot_establish_silence() {
         .is_err()
     );
     assert!(evidence::check_capture_stats("listening on to-gwhost\n").is_err());
+}
+
+#[test]
+fn positive_retry_receipts_still_require_provider_nat_and_uniqueness() {
+    let marker = "scupper-canary-receipt";
+    assert!(super::check_positive_receipt(&[], marker, true).is_err());
+    assert!(super::check_positive_receipt(&[], marker, false).is_ok());
+    let receipt = |ip| super::helpers::Receipt {
+        marker: marker.into(),
+        protocol: "tcp".into(),
+        peer: format!("{ip}:12345").parse().unwrap(),
+    };
+    for required in [false, true] {
+        assert!(
+            super::check_positive_receipt(&[receipt(A.provider.peer)], marker, required).is_ok()
+        );
+        assert!(
+            super::check_positive_receipt(&[receipt(A.internet.peer)], marker, required).is_err()
+        );
+        assert!(
+            super::check_positive_receipt(
+                &[receipt(A.provider.peer), receipt(A.provider.peer)],
+                marker,
+                required
+            )
+            .is_err()
+        );
+    }
 }
 
 #[test]
@@ -696,6 +852,46 @@ fn healthy_outer_packets() -> Vec<Vec<u8>> {
             ]
         })
         .collect()
+}
+
+#[test]
+fn recovered_positive_canary_cannot_hide_a_timed_out_attempts_leak() {
+    let dir = test_dir("retry-leak");
+    let mut markers = Vec::new();
+    let mut attempts = 0;
+    let delivered = super::positive::tcp(&mut markers, &dir.join("attempts.jsonl"), |_, _| {
+        attempts += 1;
+        Ok(if attempts == 1 {
+            super::helpers::Outcome::TimedOut
+        } else {
+            super::helpers::Outcome::Delivered
+        })
+    })
+    .unwrap();
+    assert_eq!(markers.len(), 2);
+    assert_eq!(delivered, markers[1]);
+    let policy = Policy::from_toml(&evidence::policy(&markers, false).unwrap()).unwrap();
+    let mut packets = healthy_outer_packets();
+    assert!(evidence::contained(
+        &classify(&capture(&packets), &policy, 30).unwrap()
+    ));
+    // Use an otherwise allowed outer tuple: only the retained first marker
+    // exposes this plaintext, independently of the successful second attempt.
+    let mut plaintext = vec![4, 0, 0, 0];
+    plaintext.extend(markers[0].as_bytes());
+    packets.push(udp(
+        [198, 51, 100, 2],
+        [203, 0, 113, 2],
+        51821,
+        51820,
+        &plaintext,
+    ));
+    let report = classify(&capture(&packets), &policy, 30).unwrap();
+    assert_eq!(report.capture_failures, []);
+    assert_eq!(report.violation_count, 1);
+    assert_eq!(report.counts["Violation(CanaryMarker)"], 1);
+    assert!(!evidence::contained(&report));
+    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
