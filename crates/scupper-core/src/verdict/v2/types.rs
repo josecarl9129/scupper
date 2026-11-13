@@ -224,7 +224,7 @@ pub struct RouteObs {
 /// Client listener disagreement; client reachability beyond the host is unproven.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum ClientFault {
-    /// Client-facing link is administratively down.
+    /// Client-facing link is administratively down or positively absent.
     LinkDown,
     /// Client-facing public identity differs or is unset.
     PublicKey,
@@ -619,6 +619,9 @@ impl std::fmt::Display for Verdict {
         match self {
             Self::Protected { exit, exit_ip } => write!(f, "protected: {exit} ({exit_ip})"),
             Self::Unprotected(violations) => write!(f, "UNPROTECTED: {:?}", violations.as_slice()),
+            Self::Degraded(Degraded::ClientSideBroken(ClientFault::LinkDown)) => {
+                f.write_str("degraded: client link down")
+            }
             Self::Degraded(reason) => write!(f, "degraded: {reason:?}"),
             Self::FailClosed(reason) => write!(f, "fail closed: {reason:?}"),
             Self::Unsupervised { exit, exit_ip, why } => {

@@ -1,4 +1,4 @@
-//! Audit records deliberately exclude arbitrary strings and network observations.
+//! Audit records exclude packet observations; link repairs retain the interface name.
 use crate::{Identifier, UnixSeconds, sampled_enum, vocabulary};
 use scupper_core::{
     failover::{FailClosedReason, FailoverEvent},
@@ -147,6 +147,7 @@ vocabulary!(
     RouteReplace,
     RouteDelete,
     LinkDown,
+    LinkUp,
     LinkForwardingOff,
     LinkCreate,
     LinkReconfigure,
@@ -173,11 +174,11 @@ pub struct Release {
 // Every declaration requires a sample. Both enumeration and exhaustive sample
 // matching are generated here, so a new kind cannot silently escape privacy tests.
 macro_rules! event_kinds {
-    ($( $name:ident { $( $field:ident : $ty:ty = $sample:expr ),* $(,)? } ),+ $(,)?) => {
+    ($( $name:ident { $( $(#[$field_meta:meta])* $field:ident : $ty:ty = $sample:expr ),* $(,)? } ),+ $(,)?) => {
         /// Closed audit alphabet. `kind` names the variant and `data` holds its fields.
         #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
         #[serde(tag = "kind", content = "data", deny_unknown_fields)]
-        pub enum EventKind { $(#[doc = stringify!($name)] $name { $(#[doc = stringify!($field)] $field: $ty),* }),+ }
+        pub enum EventKind { $(#[doc = stringify!($name)] $name { $( $(#[$field_meta])* #[doc = stringify!($field)] $field: $ty),* }),+ }
         #[cfg(test)]
         impl EventKind {
             pub(crate) const NAMES: &'static [&'static str] = &[$(stringify!($name)),+];
@@ -204,7 +205,7 @@ event_kinds! {
     FailClosedEnded { duration: Duration = Duration::from_secs(4) },
     ExitHealthChanged { exit: Identifier = Identifier("ch1".into()), from: Health = Health::Healthy, to: Health = Health::Down },
     DriftDetected { object: ObjectKind = ObjectKind::Ruleset, reason: Reason = Reason::SafetyDrift },
-    Repair { kind: StepKind = StepKind::LoadRuleset, class: RepairClass = RepairClass::Restore, result: Outcome = Outcome::Succeeded },
+    Repair { #[serde(default, skip_serializing_if = "Option::is_none")] object: Option<String> = Some("wg0".into()), kind: StepKind = StepKind::LinkDown, class: RepairClass = RepairClass::Tighten, result: Outcome = Outcome::Succeeded },
     RepairSuppressed { object: ObjectKind = ObjectKind::Ruleset },
     CheckVerdictChanged { from: VerdictCode = VerdictCode::Protected, to: VerdictCode = VerdictCode::Unprotected, reason: ObjectKind = ObjectKind::Ruleset },
     VerdictChanged { from: VerdictCode = VerdictCode::Protected, to: VerdictCode = VerdictCode::FailClosed },
@@ -343,6 +344,7 @@ impl From<&Step> for StepKind {
             Step::RouteReplace { .. } => Self::RouteReplace,
             Step::RouteDelete { .. } => Self::RouteDelete,
             Step::LinkDown { .. } => Self::LinkDown,
+            Step::LinkUp { .. } => Self::LinkUp,
             Step::LinkForwardingOff { .. } => Self::LinkForwardingOff,
             Step::LinkCreate { .. } => Self::LinkCreate,
             Step::LinkReconfigure { .. } => Self::LinkReconfigure,
@@ -352,5 +354,25 @@ impl From<&Step> for StepKind {
             Step::PersistLatch { .. } => Self::PersistLatch,
             Step::Emit(_) => Self::Emit,
         }
+    }
+}
+
+#[cfg(test)]
+mod repair_tests {
+    use super::*;
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn repair_link_object_round_trips_and_old_records_still_decode() {
+        let old = serde_json::json!({"kind":"Repair", "data":{
+            "kind":"LinkDown", "class":"Tighten", "result":"Succeeded"
+        }});
+        let mut event: EventKind = serde_json::from_value(old.clone()).unwrap();
+        assert!(matches!(event, EventKind::Repair { object: None, .. }));
+        if let EventKind::Repair { object, .. } = &mut event {
+            *object = Some("wg0".into());
+        }
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["data"]["object"], "wg0");
+        assert_eq!(serde_json::from_value::<EventKind>(json).unwrap(), event);
     }
 }

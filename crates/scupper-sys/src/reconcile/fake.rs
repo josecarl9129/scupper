@@ -321,7 +321,7 @@ impl Kernel for FakeKernel {
     #[allow(clippy::too_many_lines)] // Keep guards, injected failures and partial effects in order.
     fn execute(&self, step: &Step) -> Result<(), StepError> {
         let mut inner = self.inner.borrow_mut();
-        if let Step::ForwardingOn { requires } = step {
+        if let Step::ForwardingOn { requires } | Step::LinkUp { requires, .. } = step {
             if inner.memory_latch.is_some()
                 || inner.model.latch.is_some()
                 || !matches!(inner.model.ruleset, Known::Value(Ruleset::Verified(f) | Ruleset::Unverified(f)) if f == *requires)

@@ -888,6 +888,7 @@ fn maintain_retention(shared: &Shared, disk: &mut Disk) {
         if let Ok(event) = shared.event(
             &mut queue,
             EventKind::Repair {
+                object: None,
                 kind: StepKind::EventLog,
                 class: scupper_proto::RepairClass::Tighten,
                 result: Outcome::Failed,

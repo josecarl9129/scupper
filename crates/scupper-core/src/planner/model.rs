@@ -533,6 +533,11 @@ impl KernelModel {
                     link.up = Known::Value(false);
                 }
             }
+            Step::LinkUp { name, .. } => {
+                if let Some(link) = m.links.get_mut(name) {
+                    link.up = Known::Value(true);
+                }
+            }
             Step::LinkForwardingOff { name } => {
                 if let Some(link) = m.links.get_mut(name) {
                     link.forwarding_v4 = Known::Value(0);

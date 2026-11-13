@@ -418,31 +418,42 @@ pub(crate) fn observe(
         Scope::Default,
         "forwarding",
     );
+    let mut failed_links = Vec::new();
     for link in &raw {
+        // Per-link failures can mean deletion after the dump. Keep their failure
+        // accounting separate until one bounded re-dump can prove absence.
+        let per_link = SafetySystem {
+            system: sys,
+            deadline: safety.deadline,
+            failed: Cell::new(false),
+        };
         let name = &link.ifname;
         let ifname = IfName::new(name);
         let (gates, tc) = match ifname {
             Ok(dev) => (
                 [
                     gate(
-                        &safety,
+                        &per_link,
                         held,
                         SysctlFamily::Ipv4,
                         Scope::Link(dev.clone()),
                         "forwarding",
                     ),
                     gate(
-                        &safety,
+                        &per_link,
                         held,
                         SysctlFamily::Ipv6,
                         Scope::Link(dev),
                         "forwarding",
                     ),
                 ],
-                known(hooks(&safety, held, name, link.xdp)),
+                known(hooks(&per_link, held, name, link.xdp)),
             ),
             Err(_) => ([Known::Unknown, Known::Unknown], Known::Unknown),
         };
+        if gates.contains(&Known::Unknown) || tc == Known::Unknown {
+            failed_links.push((name.clone(), link.ifindex));
+        }
         model.links.insert(
             name.clone(),
             KernelLink {
@@ -469,11 +480,40 @@ pub(crate) fn observe(
             },
         );
     }
+    if !failed_links.is_empty() {
+        // A complete second dump proves only absence of the same identity, never
+        // safety of a replacement with the same name or a newly introduced link.
+        // One re-dump for the entire failed batch uses the original safety deadline.
+        let again = read(&safety, held, &KernelCmd::Ip(IpCmd::LinkShowJson))
+            .and_then(|s| Ok(parse_ip_link(&s)?));
+        match again {
+            Ok(again) => {
+                if again.iter().any(|link| {
+                    !raw.iter()
+                        .any(|old| old.ifname == link.ifname && old.ifindex == link.ifindex)
+                }) {
+                    model.links_complete = false;
+                }
+                for (name, ifindex) in failed_links {
+                    if again
+                        .iter()
+                        .all(|link| link.ifname != name && link.ifindex != ifindex)
+                    {
+                        model.links.remove(&name);
+                    } else {
+                        safety.failed.set(true);
+                    }
+                }
+            }
+            Err(_) => safety.failed.set(true),
+        }
+    }
     model.client_forwarding_v4 = model
         .links
         .get(&model.client_link)
         .map_or(Known::Value(0), |l| l.forwarding_v4.clone());
-    let safety_complete = !safety.failed.get()
+    let safety_complete = model.links_complete
+        && !safety.failed.get()
         && start.elapsed() <= Duration::from_secs(6)
         && model.ruleset != Known::Unknown
         && [

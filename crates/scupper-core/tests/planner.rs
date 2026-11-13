@@ -666,7 +666,15 @@ fn assert_plan(d: &Desired, m: &KernelModel, p: &Plan, latch: Option<&Latch>) {
     let mut verified = m.ruleset == Known::Value(Ruleset::Verified(d.fingerprint()));
     let mut invariant_seen = forwarding_invariant(d, &current);
     for (i, s) in p.steps.iter().enumerate() {
-        if let Step::ForwardingOn { requires } = s {
+        if matches!(s, Step::ForwardingOn { .. }) {
+            assert!(
+                current
+                    .links
+                    .get("wg0")
+                    .is_some_and(|l| l.ready(&d.links()["wg0"]))
+            );
+        }
+        if let Step::ForwardingOn { requires } | Step::LinkUp { requires, .. } = s {
             assert!(i > 0 && p.steps[i - 1] == Step::FlushConntrack);
             assert!(!latching && latch.is_none() && m.latch.is_none());
             assert!(verified);
@@ -1155,6 +1163,7 @@ fn repair_slot(repair: &Repair) -> usize {
         Repair::ForwardingOff => 12,
         Repair::ExitDown { .. } => 13,
         Repair::HostLinkCleanup { .. } => 14,
+        Repair::LinkUp { .. } => 16,
     }
 }
 fn escalation_slot(escalation: &Escalation) -> usize {
@@ -1241,6 +1250,7 @@ fn drift(d: &Desired, mode: u8) -> KernelModel {
         37 => m.default_forwarding_v6 = Known::Unknown,
         38 => m.links.get_mut("wg0").unwrap().forwarding_v4 = Known::Unknown,
         39 => m.links.get_mut(&exit).unwrap().forwarding_v6 = Known::Unknown,
+        43 => m.links.get_mut("wg0").unwrap().up = Known::Value(false),
         41 | 42 => {
             let (mut topology, forwarding, gates, routes, mut details) = observations(d);
             if mode == 41 {
@@ -1263,7 +1273,7 @@ fn drift(d: &Desired, mode: u8) -> KernelModel {
 }
 #[derive(Default, Debug)]
 struct Coverage {
-    repairs: [usize; 16],
+    repairs: [usize; 17],
     escalations: [usize; 5],
     latch: usize,
     suppression: usize,
@@ -1407,8 +1417,9 @@ fn random_models_prefixes_failures_determinism_and_coverage() {
     let coverage = RefCell::new(Coverage::default());
     let strategy = (
         prop_oneof![
-            prop::collection::vec(0_u8..43, 2..12),
-            prop::collection::vec(0_u8..14, 1..2)
+            prop::collection::vec(0_u8..44, 2..12),
+            prop::collection::vec(0_u8..14, 1..2),
+            Just(vec![43])
         ],
         any::<bool>(),
         any::<bool>(),
@@ -1862,8 +1873,17 @@ fn unknown_inventory_closes_ingress_immediately_then_recovers() {
         m.links.get_mut("wg0").unwrap().tc_hooks = Known::Value(vec![]);
         let third = plan(&d, &m, &second.budgets, None, &second.debounce, at(4));
         m = run(&m, &third.steps);
-        let fourth = plan(&d, &m, &third.budgets, None, &third.debounce, at(6));
-        m = run(&m, &fourth.steps);
+        assert_eq!(m.links["wg0"].up, Known::Value(true));
+        assert!(
+            third
+                .steps
+                .iter()
+                .position(|s| matches!(s, Step::LinkUp { name, .. } if name == "wg0"))
+                < third
+                    .steps
+                    .iter()
+                    .position(|s| matches!(s, Step::ForwardingOn { .. }))
+        );
         assert_eq!(m.links["wg0"].up, Known::Value(true));
         assert!(safe(&m, &d));
     }
@@ -2173,7 +2193,7 @@ proptest! {
     #![proptest_config(ProptestConfig {cases:128,failure_persistence:None,..ProptestConfig::default()})]
     #[test]
     fn plans_never_restore_routes_through_links_left_down(
-        modes in prop::collection::vec(0_u8..43, 0..12),
+        modes in prop::collection::vec(0_u8..44, 0..12),
         disconnected in any::<bool>(),
     ) {
         let connected = desired();
@@ -2644,4 +2664,65 @@ fn unknown_host_inventory_closes_forwarding_without_flapping_client_link() {
             .iter()
             .any(|r| matches!(r, Repair::LinkRecreate { .. }))
     );
+}
+
+#[test]
+fn d2_foreign_tc_failure_then_positive_absence_restores_client_before_forwarding() {
+    let d = desired();
+    let mut m = KernelModel::desired(&d);
+    let client = m.links["wg0"].clone();
+    let mut link = foreign(&d);
+    link.tc_hooks = Known::Unknown;
+    m.links.insert("foreign0".into(), link);
+    let first = tick(&d, &m, &Debounce::default());
+    assert!(first.steps.contains(&Step::LinkDown { name: "wg0".into() }));
+    m = run(&m, &first.steps);
+    assert_eq!(m.links["wg0"].up, Known::Value(false));
+    m.links.remove("foreign0");
+    let second = plan(&d, &m, &first.budgets, None, &first.debounce, at(2));
+    let up = second
+        .steps
+        .iter()
+        .position(|s| matches!(s, Step::LinkUp { name, .. } if name == "wg0"))
+        .unwrap();
+    let open = second
+        .steps
+        .iter()
+        .position(|s| matches!(s, Step::ForwardingOn { .. }))
+        .unwrap();
+    assert!(up < open);
+    assert_eq!(second.steps[up - 1], Step::FlushConntrack);
+    for p in [&first, &second] {
+        assert!(!p.steps.iter().any(|s| matches!(s, Step::LinkCreate { link, .. } | Step::LinkReconfigure { link } if link.name == "wg0")));
+    }
+    m = run(&m, &second.steps);
+    assert_eq!(m.links["wg0"], client);
+    assert_eq!(m.forwarding_v4, Known::Value(1));
+    assert!(!second.budgets.attempts.contains_key("link:wg0"));
+    // The same gates must prevent LinkUp and forwarding while policy is closed
+    // or the inventory is still unknown, even after debounce has elapsed.
+    for cause in 0..4 {
+        let mut blocked = m
+            .apply(&Step::ForwardingOff)
+            .apply(&Step::LinkDown { name: "wg0".into() });
+        let mut intent = d.clone();
+        match cause {
+            0 => blocked.links_complete = false,
+            1 => blocked.ruleset = Known::Unknown,
+            2 => {
+                blocked.latch = Some(Latch {
+                    uncertain: false,
+                    reason: "test".into(),
+                    object: "ruleset".into(),
+                });
+            }
+            _ => intent = desired_with("ch1", [7; 32], &Selection::Disconnected),
+        }
+        let p = settled(&intent, &blocked);
+        assert!(
+            !p.steps
+                .iter()
+                .any(|s| matches!(s, Step::ForwardingOn { .. } | Step::LinkUp { .. }))
+        );
+    }
 }

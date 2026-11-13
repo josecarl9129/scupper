@@ -997,7 +997,14 @@ version (stay on the applied version, alert).
   at once).
 - Unknown link or tc inventory inside the gateway namespace closes forwarding and
   takes the client link down immediately, in the same tick; it never waits for the
-  restore debounce. Host-side inventory failures retain the existing restore
+  restore debounce. A failed per-link read triggers one link re-dump within the
+  same safety deadline: absence of both the name and ifindex drops the vanished
+  record; a present or replacement link, new identity, or failed re-dump retains
+  Unknown. Once inventory is known and safe, an otherwise configured, owned client
+  link is raised with `LinkUp` before forwarding reopens. LinkUp uses the same
+  applied-version, ruleset, conntrack-flush, disconnect and quarantine gates as
+  forwarding restoration, preserving its ifindex, addresses and peers.
+  Host-side inventory failures retain the existing restore
   debounce and block speculative host link creation without flapping the client.
 - **One writer** (ADR 0028): every code path that mutates kernel or
   persistent state (the boot procedure, the scupperd tick, a local `apply`
@@ -1797,6 +1804,12 @@ A full-screen TUI stays R2+.
 
 Scripts that page on any non-zero code page on 5; that is intended.
 
+A down or positively absent client link cannot return 0 or 5. It returns 3
+`ClientSideBroken(LinkDown)` (“degraded: client link down”), while effective
+quarantine or administrative disconnect retains its closure verdict. This client
+ingress diagnosis precedes ordinary exit availability failures. Known
+containment violations and required-observation errors still take precedence.
+
 Ping publishes an active apply or rebuild with its source and target versions
 and elapsed age. Before an apply publishes its convergence target, and during a
 rebuild, Check may report `Degraded::OperationInProgress` (3). Once apply publishes
@@ -1822,8 +1835,9 @@ with an unavailable supervisor treated as Dead.
 
 | Stage | Observation | Fails with |
 |---|---|---|
-| 1 | netns present with expected inode; links = configured set, all WireGuard; peers and AllowedIPs as configured; ruleset canonical-exact; RPDB = kernel defaults; tc = baseline only (§3) | 2 (`Violation`) |
+| 1 | netns present with expected inode; links = configured set (missing client ingress is availability drift at stage 2), all WireGuard; peers and AllowedIPs as configured; ruleset canonical-exact; RPDB = kernel defaults; tc = baseline only (§3) | 2 (`Violation`) |
 | 2 | selection `Disconnected`: 4 `AdminDisconnected` only when the kernel shows the closure (both defaults `unreachable`, exit links down or without peers); otherwise 3 `DisconnectNotEffective` (the repair loop then tightens) | 4 / 3 |
+| 2 | client link administratively down or positively absent: 3 `ClientSideBroken(LinkDown)`; effective quarantine or administrative disconnect takes precedence | 3 / 4 |
 | 3 | the **observed** default routes (not the failover machine's intent) are `unreachable` in both families; main table = default + kernel routes only | 4 `NoHealthyExit` / `PinnedExitDown`; intent unreachable but a kernel route via an exit, or an extra route → 3 `RouteWrong` |
 | 3 | active exit handshake never/stale: if another enabled exit is fresh and the active has been stale for less than `failover_grace` (default 30 s, about 2× probe detection time), 4 `FailoverPending`; after that 3 `FailoverStuck`; if no exit is fresh, 4 `NoHealthyExit` | 4 / 3 |
 | 4 | forwarding = 1 for v4 (and v6 if any client has v6); with the quarantine latch set, forwarding 0 is 4 `Quarantined`. Client side: `wg0` public key = its identity's `public_key`, listen port as configured, a host UDP socket bound to it (else 3 `ClientSideBroken`); stale client handshakes are a warning only (a Mac may be offline) | 3 / 4 |
@@ -1929,7 +1943,7 @@ pub enum Degraded {
     RouteWrong { client: ClientAddr, got: RouteAnswer, want: RouteTarget },
     DisconnectNotEffective,
     OperationInProgress { from: u64, to: u64 }, // snapshot transition; no kernel comparison
-    ClientSideBroken(ClientFault),             // wg0 key, listen port or host socket
+    ClientSideBroken(ClientFault),             // wg0 absent/down, key, listen port or host socket
     ExitProbeFailed(ProbeError),               // the probe ran and the path failed (not a local setup error)
     ExitProbeImplausible { ip: IpAddr },       // exit IP cannot be a public exit address
     CommonModeProbeFailure,
@@ -1965,6 +1979,11 @@ bound probe succeeded) stays a named test.
 ---
 
 ## 13. Events, metrics, alerts, heartbeat
+
+Local `Repair` events include an optional `object` containing the interface name
+for link create, reconfigure, up, down, per-link forwarding and tc operations.
+Non-link repairs omit it; older records without this field remain readable.
+Interface names are operational identities and are not projected into alert payloads.
 
 ### Event log (ADR 0019)
 

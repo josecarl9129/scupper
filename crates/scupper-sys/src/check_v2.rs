@@ -289,7 +289,15 @@ fn run_driver(
                 obs.handshakes = Some(collect::handshakes(deps.system, handle, &health));
             }
             Next::Forwarding => {
-                obs.forwarding = Some(collect::forwarding(deps.system, handle, &health, &state));
+                let client_present = !matches!(&obs.topology, Some(Ok(t))
+                    if t.links_complete && !t.links.iter().any(|link| link.name == health.client_iface));
+                obs.forwarding = Some(collect::forwarding::forwarding_with_client(
+                    deps.system,
+                    handle,
+                    &health,
+                    &state,
+                    client_present,
+                ));
             }
             Next::Routes => match collect::routes(deps.system, handle, &health) {
                 Ok(routes) => obs.routes = Some(routes),

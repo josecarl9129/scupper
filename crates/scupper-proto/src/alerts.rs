@@ -221,6 +221,7 @@ mod tests {
             ),
             (
                 EventKind::Repair {
+                    object: None,
                     kind: crate::StepKind::LoadRuleset,
                     class: crate::RepairClass::Restore,
                     result: Outcome::Succeeded,

@@ -63,8 +63,27 @@ pub fn forwarding(
     cfg: &HealthConfigV2,
     state: &State,
 ) -> Probe<Forwarding> {
+    forwarding_with_client(sys, handle, cfg, state, true)
+}
+
+// A complete topology dump can positively prove that the client is absent.
+// Read the remaining gates for quarantine precedence without probing a missing
+// device. Its key/listener/gate/handshake state is known absent, not an I/O error.
+#[allow(clippy::too_many_lines)] // Keep gate, listener and known-absence observations together.
+pub(crate) fn forwarding_with_client(
+    sys: &dyn System,
+    handle: &NetnsHandle,
+    cfg: &HealthConfigV2,
+    state: &State,
+    client_present: bool,
+) -> Probe<Forwarding> {
     let names = std::iter::once("lo")
-        .chain(cfg.links.keys().map(String::as_str))
+        .chain(
+            cfg.links
+                .keys()
+                .map(String::as_str)
+                .filter(|name| client_present || *name != cfg.client_iface),
+        )
         .map(IfName::new)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| ProbeError::io("invalid sysctl interface"))?;
@@ -91,32 +110,45 @@ pub fn forwarding(
             hardening.push(key.into());
         }
     }
-    let client_v4 = parse_sysctl(&observe(
-        sys,
-        handle,
-        KernelCmd::Sysctl(SysctlCmd::Read(SysctlKey {
-            family: SysctlFamily::Ipv4,
-            scope: Scope::Link(
-                IfName::new(&cfg.client_iface)
-                    .map_err(|_| ProbeError::io("invalid client interface"))?,
-            ),
-            name: "forwarding",
-        })),
-    )?)?;
+    let client_v4 = if client_present {
+        parse_sysctl(&observe(
+            sys,
+            handle,
+            KernelCmd::Sysctl(SysctlCmd::Read(SysctlKey {
+                family: SysctlFamily::Ipv4,
+                scope: Scope::Link(
+                    IfName::new(&cfg.client_iface)
+                        .map_err(|_| ProbeError::io("invalid client interface"))?,
+                ),
+                name: "forwarding",
+            })),
+        )?)?
+    } else {
+        0
+    };
     let mut netns_sockets = parse_proc_net_udp(&observe(sys, handle, KernelCmd::ReadUdp(false))?)?;
     netns_sockets.extend(parse_proc_net_udp6(&observe(
         sys,
         handle,
         KernelCmd::ReadUdp(true),
     )?)?);
-    let client_public_key = match wg(sys, handle, &cfg.client_iface, WgField::PublicKey)? {
-        WgOutput::PublicKey(key) => key.as_ref().map(key_bytes).transpose()?,
-        _ => return Err(ProbeError::io("unexpected public-key response")),
+    let client_public_key = if client_present {
+        match wg(sys, handle, &cfg.client_iface, WgField::PublicKey)? {
+            WgOutput::PublicKey(key) => key.as_ref().map(key_bytes).transpose()?,
+            _ => return Err(ProbeError::io("unexpected public-key response")),
+        }
+    } else {
+        None
     };
-    let WgOutput::ListenPort(listen_port) =
-        wg(sys, handle, &cfg.client_iface, WgField::ListenPort)?
-    else {
-        return Err(ProbeError::io("unexpected listen-port response"));
+    let listen_port = if client_present {
+        let WgOutput::ListenPort(listen_port) =
+            wg(sys, handle, &cfg.client_iface, WgField::ListenPort)?
+        else {
+            return Err(ProbeError::io("unexpected listen-port response"));
+        };
+        listen_port
+    } else {
+        0
     };
     let mut host_sockets = parse_proc_net_udp(
         &sys.read_host_udp(false)
@@ -126,7 +158,16 @@ pub fn forwarding(
         &sys.read_host_udp(true)
             .map_err(|error| ProbeError::io(&error.to_string()))?,
     )?);
-    let client_handshakes = handshake_map(sys, handle, &cfg.client_iface)?;
+    let client_handshakes = if client_present {
+        handshake_map(sys, handle, &cfg.client_iface)?
+    } else {
+        cfg.peers
+            .get(&cfg.client_iface)
+            .into_iter()
+            .flatten()
+            .map(|peer| (peer.public_key, scupper_core::parse::Handshake::Never))
+            .collect()
+    };
     Ok(Forwarding {
         client_v4,
         netns_sockets,

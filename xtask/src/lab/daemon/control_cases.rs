@@ -1065,6 +1065,7 @@ impl DaemonGuard<'_> {
                 self.expect_check(&root, 0, None, "real-reboot-connected")?;
             }
             "L43" => {
+                let client_ifindex = self.lab.assert_client_link()?;
                 for attempt in 0..5 {
                     self.lab.cmd(
                         "scupper",
@@ -1117,6 +1118,10 @@ impl DaemonGuard<'_> {
                     if outcome == Some(RepairOutcome::Latched) {
                         break;
                     }
+                    if self.lab.assert_client_link()? != client_ifindex {
+                        return fail("L43 containment changed wg0 ifindex");
+                    }
+                    self.assert_client_traffic(&mut markers)?;
                     self.lab.daemon_route_healthy(Duration::from_secs(30))?;
                     if attempt == 4 {
                         return fail("L43 recurring foreign links did not latch");

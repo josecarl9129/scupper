@@ -236,7 +236,11 @@ impl Lab {
             None,
             15,
         )?;
-        parse_check_output(&self.artifacts, status, &stdout)
+        let result = parse_check_output(&self.artifacts, status, &stdout)?;
+        if result.0 == 0 {
+            self.assert_client_link()?;
+        }
+        Ok(result)
     }
 
     fn check_row(

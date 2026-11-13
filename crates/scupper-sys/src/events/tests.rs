@@ -1153,6 +1153,7 @@ fn retention_errors_warn_once_continue_appending_and_retry_while_idle() {
             .filter(|e| matches!(
                 e.kind,
                 EventKind::Repair {
+                    object: None,
                     kind: StepKind::EventLog,
                     result: Outcome::Failed,
                     ..

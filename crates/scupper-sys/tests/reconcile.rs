@@ -904,6 +904,8 @@ struct CollectorSystem {
     fail_host_links: Cell<bool>,
     fail_netns_links: Cell<bool>,
     stall: Cell<bool>,
+    per_link_race: Cell<u8>,
+    link_dumps: Cell<usize>,
 }
 impl scupper_sys::system::System for CollectorSystem {
     fn run(
@@ -948,6 +950,41 @@ impl scupper_sys::system::System for CollectorSystem {
             })
         {
             return Err(ExecError::Timeout { after: timeout });
+        }
+        let race = self.per_link_race.get();
+        if ns && race != 0 {
+            if program == Program::Ip && args.iter().any(|a| a == "link") {
+                let dump = self.link_dumps.get() + 1;
+                self.link_dumps.set(dump);
+                if race == 4 && dump > 1 {
+                    return Err(ExecError::Timeout { after: timeout });
+                }
+                let script = support::Script::new("ubuntu-24.04");
+                let output = script.run_in(target, program, args, timeout)?;
+                let mut links: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                if dump == 1 || matches!(race, 2 | 3) {
+                    links.as_array_mut().unwrap().push(serde_json::json!({
+                        "ifindex": if race == 3 && dump > 1 { 11 } else { 10 },
+                        "ifname":"foreign0", "flags":["BROADCAST"], "mtu":1500,
+                        "linkinfo":{"info_kind":"dummy"}
+                    }));
+                }
+                return Ok(ExecOutput {
+                    stdout: links.to_string(),
+                    ..output
+                });
+            }
+            let failed = program == Program::Tc && args.iter().any(|a| a == "foreign0")
+                || race == 5
+                    && program == Program::Sysctl
+                    && args.iter().any(|a| a.contains(".foreign0."));
+            if failed {
+                return Ok(ExecOutput {
+                    status: Some(1),
+                    stdout: String::new(),
+                    stderr: "Cannot find device foreign0".into(),
+                });
+            }
         }
         let text = if !ns && program == Program::Ip {
             "[]".into()
@@ -3965,4 +4002,157 @@ fn repair_checkpoints_preserve_each_attempts_wall_timestamp_across_clock_steps()
             expected
         );
     }
+}
+
+#[test]
+fn per_link_failure_redumps_once_and_positive_absence_avoids_d2() {
+    for race in [1, 2, 3, 4, 5] {
+        let rig = Rig::new();
+        let sys = CollectorSystem::default();
+        sys.per_link_race.set(race);
+        let observed = observe_real(&rig, &sys);
+        // One initial safety dump, exactly one safety re-dump, then phase B.
+        assert_eq!(sys.link_dumps.get(), 3);
+        let vanished = matches!(race, 1 | 5);
+        assert_eq!(observed.safety_complete, vanished, "race {race}");
+        assert_eq!(observed.model.links.contains_key("foreign0"), !vanished);
+        if vanished {
+            assert!(observed.model.links_complete);
+            assert!(
+                observed
+                    .model
+                    .links
+                    .values()
+                    .all(|l| l.tc_hooks != Known::Unknown)
+            );
+        } else {
+            assert_eq!(observed.model.links["foreign0"].tc_hooks, Known::Unknown);
+        }
+        let d = desired();
+        let p = scupper_core::planner::plan(
+            &d,
+            &observed.model,
+            &scupper_core::planner::Budgets::default(),
+            None,
+            &scupper_core::planner::Debounce::default(),
+            MonoTime(Duration::ZERO),
+        );
+        assert_eq!(
+            p.steps.contains(&Step::LinkDown { name: "wg0".into() }),
+            !vanished
+        );
+        assert_eq!(p.debounce.ingress_quarantined, !vanished);
+        assert_eq!(
+            p.steps.contains(&Step::Emit(
+                scupper_core::planner::PlannerEvent::ObservationUnknown
+            )),
+            !vanished
+        );
+    }
+}
+
+#[test]
+fn d2_recovery_raises_client_in_the_same_tick_and_events_identify_links() {
+    let mut rig = Rig::new();
+    rig.kernel.mutate(|m| {
+        foreign(m);
+        m.links.get_mut("foreign0").unwrap().tc_hooks = Known::Unknown;
+    });
+    let closed = rig.tick();
+    assert!(
+        closed
+            .steps
+            .contains(&Step::LinkDown { name: "wg0".into() })
+    );
+    assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(false));
+    assert_ne!(
+        rig.machine().verdict(),
+        Some(scupper_proto::VerdictCode::Protected)
+    );
+    rig.kernel.mutate(|m| {
+        m.links.remove("foreign0");
+    });
+    let recovered = rig.tick();
+    assert!(
+        recovered
+            .steps
+            .iter()
+            .any(|s| matches!(s, Step::LinkUp { name, .. } if name == "wg0"))
+    );
+    assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(true));
+    assert_eq!(
+        rig.machine().verdict(),
+        Some(scupper_proto::VerdictCode::Protected)
+    );
+    for report in [&closed, &recovered] {
+        for step in &report.steps {
+            if let Some(name) = step.link_name() {
+                assert!(report.events.iter().any(|e| matches!(e, EventKind::Repair { kind, object: Some(object), .. } if *kind == StepKind::from(step) && object == name)));
+            }
+        }
+    }
+}
+
+#[test]
+fn complete_tick_cannot_report_protected_while_client_link_is_down_or_missing() {
+    for missing in [false, true] {
+        let mut rig = Rig::new();
+        rig.kernel.mutate(|m| {
+            if missing {
+                m.links.remove("wg0");
+            } else {
+                m.links.get_mut("wg0").unwrap().up = Known::Value(false);
+            }
+        });
+        let report = rig.tick(); // Availability repair is still debouncing.
+        assert!(report.complete);
+        assert_ne!(
+            rig.machine().verdict(),
+            Some(scupper_proto::VerdictCode::Protected)
+        );
+        assert_eq!(
+            rig.machine().verdict(),
+            Some(scupper_proto::VerdictCode::Degraded)
+        );
+    }
+}
+
+#[test]
+fn failed_d2_link_up_keeps_forwarding_closed_and_names_the_failed_link() {
+    let mut rig = Rig::new();
+    rig.kernel.mutate(|m| {
+        foreign(m);
+        m.links.get_mut("foreign0").unwrap().tc_hooks = Known::Unknown;
+    });
+    rig.tick();
+    rig.kernel.mutate(|m| {
+        m.links.remove("foreign0");
+    });
+    rig.kernel.inject(Fault {
+        step: StepKind::LinkUp,
+        remaining: None,
+        partial: false,
+    });
+    let report = rig.tick();
+    assert!(
+        report
+            .failures
+            .iter()
+            .any(|(s, _)| matches!(s, Step::LinkUp { .. }))
+    );
+    assert!(
+        !report
+            .steps
+            .iter()
+            .any(|s| matches!(s, Step::ForwardingOn { .. }))
+    );
+    assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(false));
+    assert!(rig.kernel.model().forwarding_off());
+    assert_ne!(
+        rig.machine().verdict(),
+        Some(scupper_proto::VerdictCode::Protected)
+    );
+    assert!(report.events.iter().any(|e| matches!(e, EventKind::Repair {
+        kind: StepKind::LinkUp, object: Some(name), result: scupper_proto::Outcome::Failed, ..
+    } if name == "wg0")));
 }

@@ -7,7 +7,7 @@ use super::{Class, Policy, decode::Ip};
 struct Flow {
     fin_ack: Option<u32>,
     last_ack: Option<u32>,
-    abort_seen: bool,
+    abort_seq: Option<u32>,
 }
 
 #[derive(Default)]
@@ -61,26 +61,19 @@ impl LateResets {
         let empty = tcp.len() == usize::from(tcp[12] >> 4) * 4;
         if inbound && trusted && flags & 0x10 != 0 {
             flow.last_ack = Some(ack);
-            if flags == 0x11 && empty {
+            if matches!(flags & 0x3f, 0x11 | 0x19) && empty {
                 flow.fin_ack = Some(ack);
-                flow.abort_seen = false;
             }
         }
-        if outbound
-            && trusted
-            && ip.dscp == mark
-            && flags == 0x14
-            && empty
-            && flow.fin_ack == Some(seq)
-        {
-            flow.abort_seen = true;
+        if outbound && trusted && ip.dscp == mark && flags == 0x14 && empty {
+            flow.abort_seq = Some(seq);
         }
         let allowed = outbound
             && ip.dscp == 0
             && flags == 4
             && bare
             && ack == 0
-            && flow.abort_seen
+            && flow.abort_seq == Some(seq)
             && flow.fin_ack == Some(seq)
             && flow.last_ack == Some(seq);
         if allowed {

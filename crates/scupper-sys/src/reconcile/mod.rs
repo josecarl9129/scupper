@@ -546,6 +546,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 let result = self.kernel.execute(&Step::FlushConntrack);
                 let _ = self.log.emit(
                     EventKind::Repair {
+                        object: None,
                         kind: StepKind::FlushConntrack,
                         class: repair_class(&Step::FlushConntrack),
                         result: if result.is_ok() {
@@ -778,6 +779,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             let closed = self.execute_step(&Step::ForwardingOff, false, guard, report);
             self.emit(
                 EventKind::Repair {
+                    object: None,
                     kind: StepKind::ForwardingOff,
                     class: scupper_proto::RepairClass::Tighten,
                     result: if closed.is_ok() {
@@ -1060,11 +1062,19 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             }
             self.reported_fail_closed = Some(closed);
         }
+        let client_up = self.cached.as_ref().is_some_and(|(_, model)| {
+            model
+                .links
+                .get(&model.client_link)
+                .is_some_and(|link| link.up == planner::Known::Value(true))
+        });
         let verdict = if !report.complete {
             VerdictCode::ObservationError
-        } else if self.latch.is_some()
-            || !self.forwarding
-            || self.persisted.selection == Selection::Disconnected
+        } else if self.latch.is_some() || self.persisted.selection == Selection::Disconnected {
+            VerdictCode::FailClosed
+        } else if !client_up {
+            VerdictCode::Degraded
+        } else if !self.forwarding
             || *self.failover.desired_route() == scupper_core::render::RouteTarget::Unreachable
         {
             VerdictCode::FailClosed
@@ -1114,6 +1124,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             if !matches!(step, Step::Emit(_)) {
                 self.emit(
                     EventKind::Repair {
+                        object: step.link_name().map(str::to_owned),
                         kind: StepKind::from(&step),
                         class: repair_class(&step),
                         result: if result.is_ok() {
@@ -1440,6 +1451,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 report.failures.push((step.clone(), error));
                 self.emit(
                     EventKind::Repair {
+                        object: step.link_name().map(str::to_owned),
                         kind: StepKind::from(&step),
                         class: repair_class(&step),
                         result: Outcome::Failed,
@@ -1464,6 +1476,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             } else if !matches!(step, Step::Emit(_)) {
                 self.emit(
                     EventKind::Repair {
+                        object: step.link_name().map(str::to_owned),
                         kind: StepKind::from(&step),
                         class: repair_class(&step),
                         result: Outcome::Succeeded,
@@ -1604,7 +1617,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                         StepError("event emission failed")
                     })
             }
-            Step::ForwardingOn { .. } if self.latch.is_some() => {
+            Step::ForwardingOn { .. } | Step::LinkUp { .. } if self.latch.is_some() => {
                 Err(StepError("quarantine blocks forwarding"))
             }
             // A route restore from fail-closed intentionally preserves conntrack.
@@ -1641,6 +1654,9 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             self.boot_write_failure(report);
         }
         if result.is_ok() {
+            if let Some((_, model)) = &mut self.cached {
+                *model = model.apply(step);
+            }
             match step {
                 Step::ForwardingOn { .. } => {
                     self.forwarding = true;
@@ -2192,6 +2208,7 @@ const fn repair_class(step: &Step) -> scupper_proto::RepairClass {
             ..
         } => scupper_proto::RepairClass::Tighten,
         Step::ForwardingOn { .. }
+        | Step::LinkUp { .. }
         | Step::LoadRuleset { .. }
         | Step::VerifyRuleset { .. }
         | Step::WriteSysctl { .. }

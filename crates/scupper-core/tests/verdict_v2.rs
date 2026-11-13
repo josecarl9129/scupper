@@ -1712,3 +1712,38 @@ fn default_build_route_child() {
     );
     std::fs::write(sentinel, "completed").unwrap();
 }
+
+#[test]
+fn client_link_down_or_absent_is_degraded_and_closure_keeps_precedence() {
+    for missing in [false, true] {
+        let mut obs = passing();
+        if missing {
+            topology(&mut obs).links.retain(|l| l.name != "wg0");
+            topology(&mut obs).peers.remove("wg0");
+        } else {
+            topology(&mut obs).links[1].up = false;
+        }
+        assert_degraded(&obs, Degraded::ClientSideBroken(ClientFault::LinkDown));
+        let verdict = Verdict::Degraded(Degraded::ClientSideBroken(ClientFault::LinkDown));
+        assert_eq!(verdict.exit_code(), 3);
+        assert_eq!(verdict.to_string(), "degraded: client link down");
+        defaults(&mut obs).v4 = DefaultRouteObs::Unreachable;
+        assert_degraded(&obs, Degraded::ClientSideBroken(ClientFault::LinkDown));
+        forwarding(&mut obs).quarantine = Some(RepairKind::SafetyDrift);
+        forwarding(&mut obs).v4 = 0;
+        assert_closed(
+            &obs,
+            FailClosed::Quarantined {
+                reason: RepairKind::SafetyDrift,
+            },
+        );
+        obs.selection = Selection::Disconnected;
+        defaults(&mut obs).v4 = DefaultRouteObs::Unreachable;
+        topology(&mut obs)
+            .links
+            .iter_mut()
+            .filter(|l| l.name == "ex-ch1")
+            .for_each(|l| l.up = false);
+        assert_closed(&obs, FailClosed::AdminDisconnected);
+    }
+}

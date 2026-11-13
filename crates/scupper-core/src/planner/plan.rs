@@ -120,6 +120,7 @@ pub fn plan(
         .steps
         .iter()
         .filter_map(|step| match step {
+            Step::LinkUp { name, .. } => Some(name.clone()),
             Step::LinkCreate {
                 link,
                 phase: LinkPhase::Up,
@@ -145,7 +146,7 @@ fn reservation_keys(
         .iter()
         .filter(|r| {
             r.class() == RepairClass::Restore
-                && !matches!(r, Repair::LinkReconfigure { name }
+                && !matches!(r, Repair::LinkReconfigure { name } | Repair::LinkUp { name }
                 if p.budgets.downed_by_planner.contains(name)
                     && observed.links.get(name).is_some_and(|link| {
                         desired.links.get(name).is_some_and(|want| link.matches_config(want))
@@ -237,10 +238,10 @@ fn build_plan(
             }) {
                 continue;
             }
-            if repair != Repair::RulesetReload
-                && !(repair == Repair::ForwardingRestore && safety_reopen)
-                && !debounce.previous.contains(&object)
-            {
+            let immediate = repair == Repair::RulesetReload
+                || repair == Repair::ForwardingRestore && safety_reopen
+                || matches!(&repair, Repair::LinkUp { name } if budgets.downed_by_planner.contains(name));
+            if !immediate && !debounce.previous.contains(&object) {
                 continue;
             }
         }
@@ -437,6 +438,7 @@ fn build_plan(
             | Repair::RouteReplace { .. }
             | Repair::RulesetReload
             | Repair::ForwardingRestore
+            | Repair::LinkUp { .. }
             | Repair::ExtraRouteDelete { .. }
             | Repair::ForeignLinkDown { .. }
             | Repair::PeerContainment { .. }
@@ -472,6 +474,21 @@ fn build_plan(
     }
     if switched {
         builder.push(Step::FlushConntrack);
+    }
+    // D2 changes only administrative state. Once inventory is known and all
+    // reopening gates pass, restore the same configured device before forwarding.
+    for repair in &admitted {
+        if let Repair::LinkUp { name } = repair
+            && !closed_by_policy(suppressed, effective_latch)
+            && builder.can_raise_client(name)
+        {
+            builder.result.repairs.push(repair.clone());
+            builder.push(Step::FlushConntrack);
+            builder.push(Step::LinkUp {
+                name: name.clone(),
+                requires: desired.fingerprint,
+            });
+        }
     }
     let link_work = builder
         .result
@@ -657,6 +674,15 @@ fn detect(d: &Desired, m: &KernelModel) -> Vec<Repair> {
                 out.push(Repair::LinkRecreate { name: name.clone() });
             }
             Some(link)
+                if name == &m.client_link
+                    && link.owned()
+                    && link.matches_config(want)
+                    && want.up
+                    && link.up != Known::Value(true) =>
+            {
+                out.push(Repair::LinkUp { name: name.clone() });
+            }
+            Some(link)
                 if link.owned()
                     && (!link.matches_config(want) || want.up && link.up != Known::Value(true)) =>
             {
@@ -773,7 +799,27 @@ impl Builder<'_> {
         }
         self.push(Step::ReadBackSysctls);
     }
+    fn can_raise_client(&self, name: &str) -> bool {
+        let raised = self.model.apply(&Step::LinkUp {
+            name: name.to_owned(),
+            requires: self.desired.fingerprint,
+        });
+        self.can_reopen() && safe(&raised, self.desired)
+    }
     fn can_forward(&self) -> bool {
+        self.can_reopen()
+            && self
+                .model
+                .links
+                .get(&self.model.client_link)
+                .is_some_and(|link| {
+                    self.desired
+                        .links
+                        .get(&self.model.client_link)
+                        .is_some_and(|want| link.ready(want))
+                })
+    }
+    fn can_reopen(&self) -> bool {
         let mut closed = self.model.clone();
         closed.forwarding_v4 = Known::Value(0);
         closed.forwarding_v6 = Known::Value(0);
@@ -866,6 +912,7 @@ impl Builder<'_> {
             }
             | Repair::LinkRecreate { .. }
             | Repair::LinkReconfigure { .. }
+            | Repair::LinkUp { .. }
             | Repair::ExitRehandshake { .. }
             | Repair::PersistLatch { .. }
             | Repair::ForwardingOff

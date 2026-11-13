@@ -1060,3 +1060,54 @@ fn check_accepts_legacy_layout_and_in_flight_restore_without_false_quarantine() 
         0
     );
 }
+
+#[test]
+fn full_check_reports_client_link_down_or_missing_without_probing_the_missing_device() {
+    use scupper_core::verdict::v2::{ClientFault, Degraded, Verdict};
+    for missing in [false, true] {
+        let runner = "ubuntu-24.04";
+        let handle = testing::handle().unwrap();
+        let root = Root::new(runner, &handle);
+        let site = site(runner);
+        let gateway = GatewayId("gw1".into());
+        let cfg = cfg(&site, &gateway, root.stamp);
+        let sys = Script::new(runner);
+        fresh(&sys);
+        for file in ["scupper--4-link.json", "scupper--4-addr.json"] {
+            let mut rows: serde_json::Value = serde_json::from_str(&sys.text(file)).unwrap();
+            if missing {
+                rows.as_array_mut()
+                    .unwrap()
+                    .retain(|l| l["ifname"] != "wg0");
+            } else {
+                for link in rows.as_array_mut().unwrap() {
+                    if link["ifname"] == "wg0" {
+                        link["flags"] = serde_json::json!(["POINTOPOINT", "NOARP"]);
+                    }
+                }
+            }
+            sys.replace(file, &rows.to_string());
+        }
+        let deps = Dependencies {
+            system: &sys,
+            probe_exec: &sys,
+            handle: Some(&handle),
+            run_root: &root.path,
+            state_root: &root.path,
+        };
+        let report = check_v2::run_check_v2(&deps, &cfg).unwrap();
+        assert_eq!(
+            report.verdict,
+            Verdict::Degraded(Degraded::ClientSideBroken(ClientFault::LinkDown))
+        );
+        assert_eq!(report.verdict.exit_code(), 3);
+        if missing {
+            assert!(
+                !sys.calls
+                    .borrow()
+                    .iter()
+                    .any(|(_, _, args)| args.iter().any(|s| s == "wg0" || s.contains(".wg0.")))
+            );
+        }
+    }
+}

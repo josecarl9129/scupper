@@ -19,7 +19,7 @@
 //! both families to prove M2's IPv6 rejection without requesting a stage twice.
 //! Interface names in inventories are raw strings so foreign kernel
 //! names outside config syntax remain representable. Missing/duplicate links
-//! use `ForeignLink`. Disconnected exits may have no peers (the documented
+//! use `ForeignLink`, except absent client ingress (degraded link down). Disconnected exits may have no peers (the documented
 //! administrative closure), but any peers still present must match policy.
 //! FailoverPending/Stuck and other future variants are retained as vocabulary,
 //! without multi-exit logic. The constructor requires exactly one exit. Assigned
@@ -174,11 +174,9 @@ fn topology_violations(
             )));
         }
     }
-    for name in cfg
-        .links
-        .keys()
-        .filter(|name| t.links_complete && !seen.contains(name.as_str()))
-    {
+    for name in cfg.links.keys().filter(|name| {
+        t.links_complete && *name != &cfg.client_iface && !seen.contains(name.as_str())
+    }) {
         found.push(Violation::ForeignLink(name.clone()));
     }
     let names: BTreeSet<_> = cfg.peers.keys().chain(t.peers.keys()).collect();
@@ -510,6 +508,36 @@ pub fn next(obs: &Observations, cfg: &HealthConfigV2, now: u64) -> Next {
     let Some(Ok(defaults)) = &obs.defaults else {
         return Next::Defaults;
     };
+    // Client ingress being cut off is an availability failure even if the exit
+    // is also down. Administrative closure and effective quarantine outrank it.
+    if obs.selection != Selection::Disconnected
+        && !topology
+            .links
+            .iter()
+            .any(|link| link.name == cfg.client_iface && link.up)
+    {
+        let Some(Ok(forwarding)) = &obs.forwarding else {
+            return Next::Forwarding;
+        };
+        if forwarding.v4 == 0
+            && let Some(reason) = &forwarding.quarantine
+        {
+            return report(
+                Verdict::FailClosed(FailClosed::Quarantined {
+                    reason: reason.clone(),
+                }),
+                warnings,
+                cfg,
+                now,
+            );
+        }
+        return report(
+            Verdict::Degraded(Degraded::ClientSideBroken(ClientFault::LinkDown)),
+            warnings,
+            cfg,
+            now,
+        );
+    }
     if let Some(verdict) = defaults_failure(topology, defaults, obs, cfg) {
         return report(verdict, warnings, cfg, now);
     }
@@ -553,18 +581,6 @@ pub fn next(obs: &Observations, cfg: &HealthConfigV2, now: u64) -> Next {
     if forwarding.v4 != 1 || forwarding.client_v4 != 1 {
         return report(
             Verdict::Degraded(Degraded::ForwardingDisabled),
-            warnings,
-            cfg,
-            now,
-        );
-    }
-    if !topology
-        .links
-        .iter()
-        .any(|link| link.name == cfg.client_iface && link.up)
-    {
-        return report(
-            Verdict::Degraded(Degraded::ClientSideBroken(ClientFault::LinkDown)),
             warnings,
             cfg,
             now,

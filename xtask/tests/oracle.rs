@@ -1799,6 +1799,29 @@ fn alert_late_bare_reset_requires_the_marked_syn_fin_and_abort_sequence() {
 }
 
 #[test]
+fn alert_fin_and_abort_order_and_empty_psh_fin_do_not_change_the_proof() {
+    for swapped in [false, true] {
+        for flags in [0x11, 0x19] {
+            let mut packets = alert_close_sequence();
+            packets[17][33] = flags;
+            if swapped {
+                packets.swap(17, 18);
+            }
+            let report = alert_report(&packets);
+            assert_eq!(report.violation_count, 0);
+            assert_eq!(report.packets[19].class, allowed("heartbeat_late_reset"));
+            // Even after a marked abort, the reply must follow the FIN.
+            let fin = if swapped { 18 } else { 17 };
+            packets.swap(fin, 19);
+            assert_eq!(
+                alert_report(&packets).packets[fin].class,
+                violation(Reason::NotAllowListed)
+            );
+        }
+    }
+}
+
+#[test]
 fn alert_late_reset_rejects_payload_ack_wrong_tuple_and_sequence() {
     let packets = alert_close_sequence();
     let mut wrong_tuple = packets[19].clone();

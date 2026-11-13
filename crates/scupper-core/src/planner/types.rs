@@ -154,6 +154,11 @@ pub enum Repair {
         /// Configured name.
         name: String,
     },
+    /// Raise an already configured owned client link without changing identity.
+    LinkUp {
+        /// Configured name.
+        name: String,
+    },
     /// Disable, but never delete, a foreign link.
     ForeignLinkDown {
         /// Raw interface name.
@@ -211,6 +216,7 @@ impl Repair {
             | Self::HardeningSysctl { .. }
             | Self::LinkRecreate { .. }
             | Self::LinkReconfigure { .. }
+            | Self::LinkUp { .. }
             | Self::ExitRehandshake { .. }
             | Self::HostLinkCleanup { .. } => RepairClass::Restore,
             Self::RouteReplace { target, .. } => match target {
@@ -242,7 +248,9 @@ impl Repair {
                 route.entry.metric,
                 route.entry.dev
             ),
-            Self::LinkRecreate { name } | Self::LinkReconfigure { name } => format!("link:{name}"),
+            Self::LinkRecreate { name }
+            | Self::LinkReconfigure { name }
+            | Self::LinkUp { name } => format!("link:{name}"),
             Self::ExitDown { name } => format!("exit-down:{name}"),
             Self::HostLinkCleanup { name } => format!("host-link:{name}"),
             Self::PeerContainment { name } => format!("peer-containment:{name}"),
@@ -440,6 +448,13 @@ pub enum Step {
         /// Raw interface name.
         name: String,
     },
+    /// Raise a configured owned client link under the forwarding restore gates.
+    LinkUp {
+        /// Namespace interface name.
+        name: String,
+        /// Required whole-namespace fingerprint.
+        requires: Fingerprint,
+    },
     /// Close forwarding on a newly moved or reconfigured device before `LinkUp`.
     LinkForwardingOff {
         /// Namespace interface name.
@@ -498,6 +513,18 @@ pub enum StepFailure {
     NonFatal,
 }
 impl Step {
+    /// Interface acted on by this step, for local operational audit records.
+    #[must_use]
+    pub fn link_name(&self) -> Option<&str> {
+        match self {
+            Self::LinkDown { name }
+            | Self::LinkUp { name, .. }
+            | Self::LinkForwardingOff { name }
+            | Self::TcDelete { name, .. } => Some(name),
+            Self::LinkCreate { link, .. } | Self::LinkReconfigure { link } => Some(&link.name),
+            _ => None,
+        }
+    }
     /// Failure policy carried by this step. Failed containment blocks every
     /// later `Stop` (Restore) step, while later `Contain`/`NonFatal` steps still run.
     /// `NonFatal` failures neither block Restore nor clear containment failure.
@@ -516,6 +543,7 @@ impl Step {
             } => StepFailure::Contain,
             Self::PersistLatch { .. } | Self::Emit(_) => StepFailure::NonFatal,
             Self::ForwardingOn { .. }
+            | Self::LinkUp { .. }
             | Self::LoadRuleset { .. }
             | Self::VerifyRuleset { .. }
             | Self::FlushConntrack

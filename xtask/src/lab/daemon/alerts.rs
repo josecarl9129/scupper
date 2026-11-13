@@ -476,8 +476,27 @@ impl DaemonGuard<'_> {
         }
         self.lab
             .daemon_oracle("alerts", &markers, self.lab.exit_port, self.lab.exit_port)?;
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(self.lab.artifacts.join("alerts.report.json"))?)?;
+        assert_invalid_reset_evidence(&report, &counters)?;
         Ok("Critical host-uplink alert, exact per-sink sequences and preset shapes, client canaries, durable CLI receipt, live shortened coalescing hold".into())
     }
+}
+
+fn assert_invalid_reset_evidence(
+    report: &serde_json::Value,
+    counters: &serde_json::Value,
+) -> Result<()> {
+    let counts = report["counts"]
+        .as_object()
+        .ok_or("missing oracle counts")?;
+    let exempted = counts
+        .get("Allowed(heartbeat_late_reset)")
+        .map_or(Ok(0), |v| v.as_u64().ok_or("invalid late reset count"))?;
+    if exempted > identity_counter(counters, "unmarked_invalid")? {
+        return fail("alerts: late-reset exemptions exceed kernel unmarked INVALID packets");
+    }
+    Ok(())
 }
 
 fn identity_counter(value: &serde_json::Value, name: &str) -> Result<u64> {
@@ -539,6 +558,22 @@ fn assert_preset_sequence(rows: &[serde_json::Value]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn late_reset_exemptions_require_kernel_invalid_evidence() {
+        for exempted in [0, 1, 2] {
+            for invalid in [0, 1, 2] {
+                let report =
+                    serde_json::json!({"counts":{"Allowed(heartbeat_late_reset)":exempted}});
+                let counters = serde_json::json!({"nftables":[{"counter":{
+                    "family":"inet", "table":"alert_identity", "name":"unmarked_invalid", "packets":invalid
+                }}]});
+                assert_eq!(
+                    assert_invalid_reset_evidence(&report, &counters).is_ok(),
+                    exempted <= invalid
+                );
+            }
+        }
+    }
     #[test]
     fn identity_counter_requires_exact_scope_and_numeric_evidence() {
         let row = serde_json::json!({"counter":{

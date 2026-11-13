@@ -53,7 +53,7 @@
 //! | Known ruleset mismatch | Forwarding off | Budgeted load and verify |
 //! | Unknown ruleset | Forwarding off | Wait for a positive observation |
 //! | Known tc/foreign link | Delete hook / link down | Class-budgeted reopening |
-//! | Unknown tc/link inventory | Forwarding off and client down immediately | Normal link Restore after inventory recovers |
+//! | Unknown tc/link inventory | Forwarding off and client down immediately | Gated `LinkUp` before forwarding after inventory recovers |
 //! | Known peer `AllowedIPs` mismatch | Owned link down before debounce/budget | Normal configuration Restore |
 //! | Active exit MTU/keepalive mismatch | Default becomes unreachable on first sighting | Debounced configuration repair, then route promotion |
 //!

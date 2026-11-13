@@ -210,6 +210,29 @@ impl<'a> RealKernel<'a> {
             Err(StepError("ruleset verification failed"))
         }
     }
+    // Both reopening operations recheck applied version, durable/memory closure,
+    // conntrack flushing and the live canonical ruleset at execution time.
+    fn restore_gate(&self, requires: scupper_core::planner::Fingerprint) -> Result<(), StepError> {
+        // Re-read durable quarantine as well as the executor's memory gate.
+        self.state.invalidate_reads();
+        let state = self
+            .state
+            .read_until(Instant::now() + EXEC_TIMEOUT)
+            .map_err(|_| StepError("state unavailable"))?;
+        let crate::state::StateRead::Present(state) = state else {
+            return Err(StepError("state unavailable"));
+        };
+        if state.applied_version != Some(self.desired.applied_version())
+            || self.memory_latch.get()
+            || state.quarantine.is_some()
+            || state.selection == scupper_core::verdict::v2::Selection::Disconnected
+            || !self.flushed.get()
+        {
+            return Err(StepError("forwarding gate refused"));
+        }
+        self.verify(requires)?;
+        Ok(())
+    }
     fn forwarding(&self, on: bool, only: Option<&str>) -> Result<(), StepError> {
         forwarding(&self.deps, &self.held, on, only)
     }
@@ -370,24 +393,7 @@ impl Kernel for RealKernel<'_> {
         match step {
             Step::ForwardingOff => self.forwarding(false, None),
             Step::ForwardingOn { requires } => {
-                // Re-read durable quarantine as well as the executor's memory gate.
-                self.state.invalidate_reads();
-                let state = self
-                    .state
-                    .read_until(Instant::now() + EXEC_TIMEOUT)
-                    .map_err(|_| StepError("state unavailable"))?;
-                let crate::state::StateRead::Present(state) = state else {
-                    return Err(StepError("state unavailable"));
-                };
-                if state.applied_version != Some(self.desired.applied_version())
-                    || self.memory_latch.get()
-                    || state.quarantine.is_some()
-                    || state.selection == scupper_core::verdict::v2::Selection::Disconnected
-                    || !self.flushed.get()
-                {
-                    return Err(StepError("forwarding gate refused"));
-                }
-                self.verify(*requires)?;
+                self.restore_gate(*requires)?;
                 self.forwarding(true, None)
             }
             Step::LoadRuleset {
@@ -472,6 +478,23 @@ impl Kernel for RealKernel<'_> {
             }
             Step::LinkDown { name } => boot::links::set_up(&self.deps, &self.held, name, false)
                 .map_err(|_| StepError("link down failed")),
+            Step::LinkUp { name, requires } => {
+                self.restore_gate(*requires)?;
+                if name != &self.health.client_iface
+                    || !boot::inventory(&self.deps, &self.held)
+                        .map_err(|_| StepError("link inventory failed"))?
+                        .iter()
+                        .any(|link| {
+                            link.ifname == *name
+                                && link.kind.as_deref() == Some("wireguard")
+                                && self.owned_links.borrow().get(name) == Some(&link.ifindex)
+                        })
+                {
+                    return Err(StepError("client link ownership changed"));
+                }
+                boot::links::set_up(&self.deps, &self.held, name, true)
+                    .map_err(|_| StepError("link up failed"))
+            }
             Step::LinkForwardingOff { name } => self.forwarding(false, Some(name)),
             Step::LinkCreate { .. }
             | Step::LinkReconfigure { .. }

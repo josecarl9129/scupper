@@ -718,7 +718,10 @@ impl Lab {
             baseline_version: None,
             deliberately_killed: false,
         };
-        let result = guard.run(case);
+        let result = guard.run(case).and_then(|detail| {
+            guard.lab.assert_client_link()?;
+            Ok(detail)
+        });
         let cleanup = guard.finish();
         match (result, cleanup) {
             (Ok(observed), Ok(())) => Ok(observed),
@@ -745,6 +748,46 @@ impl Lab {
         let (mut child, notify) = spawned?;
         let result = child.wait_timeout(Duration::from_secs(30));
         super::mutation::finish(result, notify.finish())
+    }
+    // Every successful check gets independent link/address evidence. Return the
+    // identity so L43 can also prove containment never recreates client ingress.
+    pub(super) fn assert_client_link(&mut self) -> Result<u64> {
+        let address = self
+            .site
+            .gateways()
+            .values()
+            .next()
+            .ok_or("missing gateway")?
+            .client_tunnel()
+            .address4();
+        let expected_addr = address.addr().to_string();
+        let links: serde_json::Value = serde_json::from_str(&self.cmd(
+            "scupper",
+            "ip",
+            &["-j", "address", "show", "dev", "wg0"],
+        )?)?;
+        let link = &links[0];
+        if link["ifname"] != "wg0"
+            || !link["flags"]
+                .as_array()
+                .is_some_and(|flags| flags.iter().any(|f| f == "UP"))
+            || !link["addr_info"].as_array().is_some_and(|addrs| {
+                addrs
+                    .iter()
+                    .any(|a| a["local"] == expected_addr && a["prefixlen"] == address.prefix_len())
+            })
+        {
+            return fail(format!(
+                "client link down, missing or missing configured address: {links}"
+            ));
+        }
+        fs::write(
+            self.artifacts.join("client-link-final.json"),
+            serde_json::to_vec_pretty(&links)?,
+        )?;
+        link["ifindex"]
+            .as_u64()
+            .ok_or_else(|| "missing client ifindex".into())
     }
     pub(super) fn daemon_boot_recover(&mut self, stem: &str) -> Result<String> {
         let root = self.boot_root.clone();
