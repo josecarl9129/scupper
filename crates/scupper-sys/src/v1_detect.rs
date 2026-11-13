@@ -2,7 +2,7 @@
 use crate::{
     canon::{command, command_result},
     rules::V1Config,
-    system::{EXEC_TIMEOUT, Program, SYSTEMCTL_TIMEOUT, System},
+    system::{EXEC_TIMEOUT, ExecError, Program, SYSTEMCTL_TIMEOUT, System},
     verdict::{Probe, ProbeError},
 };
 use std::collections::BTreeSet;
@@ -39,7 +39,7 @@ pub fn detect_v1_layout_for(sys: &dyn System, names: &[&str]) -> Probe<Vec<V1Mar
 /// Install detection ignores only host links that boot can safely remove.
 /// Missing optional utilities cannot hide other v1 evidence.
 /// # Errors
-/// Failed observations are never treated as absence.
+/// Missing installed tools remain observation errors; uninspectable links are evidence.
 pub fn detect_install_layout(
     sys: &dyn System,
     names: &[&str],
@@ -115,10 +115,15 @@ fn detect_layout(
         {
             if names.contains(&link.ifname.as_str())
                 && packages.is_some_and(|p| p.contains("wireguard-tools"))
-                && crate::boot::links::host_link_removable(sys, &link)
-                    .map_err(|e| ProbeError::setup(&e))?
             {
-                continue;
+                match crate::boot::links::host_link_removable(sys, &link) {
+                    Ok(true) => continue,
+                    Ok(false)
+                    | Err(crate::boot::links::HostLinkError::Exec(ExecError::NotFound {
+                        program: Program::Wg,
+                    })) => {}
+                    Err(error) => return Err(ProbeError::setup(&error.to_string())),
+                }
             }
             markers.push(V1Marker::HostLink(link.ifname));
         }
@@ -128,8 +133,7 @@ fn detect_layout(
 
 fn enabled_units(sys: &dyn System) -> Probe<Vec<V1Marker>> {
     let mut markers = Vec::new();
-    let units = command(
-        sys,
+    let output = sys.run(
         Program::Systemctl,
         &[
             "list-unit-files".into(),
@@ -139,7 +143,19 @@ fn enabled_units(sys: &dyn System) -> Probe<Vec<V1Marker>> {
             "wg-quick@*.service".into(),
         ],
         SYSTEMCTL_TIMEOUT,
-    )?;
+    );
+    // systemctl returns a nonzero status when this glob matches no unit files.
+    // Keep failures with diagnostics or any listed units as observation errors.
+    let units = match output {
+        Ok(output)
+            if output.status.is_some_and(|status| status != 0)
+                && matches!(output.stdout.trim(), "" | "0 unit files listed.")
+                && output.stderr.lines().all(no_units_diagnostic) =>
+        {
+            String::new()
+        }
+        other => command_result(other)?,
+    };
     let mut instances = BTreeSet::new();
     for line in units.lines().filter(|line| !line.trim().is_empty()) {
         let name = line.split_whitespace().next().unwrap_or_default();
@@ -191,6 +207,19 @@ fn enabled_units(sys: &dyn System) -> Probe<Vec<V1Marker>> {
         }
     }
     Ok(markers)
+}
+
+fn no_units_diagnostic(line: &str) -> bool {
+    matches!(
+        line.trim()
+            .trim_end_matches('.')
+            .to_ascii_lowercase()
+            .as_str(),
+        "" | "no units found"
+            | "no unit files found"
+            | "no matching unit files found"
+            | "0 unit files listed"
+    )
 }
 
 /// Identifies retired/unknown binaries by the version-store CLI, not semver:

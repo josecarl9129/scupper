@@ -269,3 +269,39 @@ fn assert_restored_device_setup_is_suppressed(host: &Host, interaction: &Interac
     assert!(!output.contains("device"), "{output}");
     assert!(!output.contains("scupper config load"));
 }
+
+#[test]
+fn fresh_ubuntu_missing_tools_prints_package_installation_advice() {
+    let host = Host::new();
+    fs::write(
+        host.root.join("etc/os-release"),
+        "ID=ubuntu\nVERSION_ID=24.04\n",
+    )
+    .unwrap();
+    let fake = Fake {
+        missing_packages: true,
+        missing_tools: true,
+        ..Fake::default()
+    };
+    let interaction = Interaction {
+        tty: false,
+        answer: false,
+        prompts: Cell::new(0),
+    };
+    let before = host.snapshot();
+    let (code, out, err) = run(&host, &fake, &interaction, &["--plan"]);
+    assert_eq!(code, 1);
+    assert!(
+        out.contains("apt-get install -y wireguard-tools nftables iproute2 conntrack"),
+        "{out} {err}"
+    );
+    assert!(!err.contains("cannot inspect v1 layout"));
+    // With no wireguard-tools package, the fake models systemctl's status 1
+    // and empty output for an unmatched wg-quick pattern.
+    assert!(fake.calls.borrow().iter().any(|(program, args)| {
+        *program == scupper_sys::system::Program::Systemctl
+            && args.first().is_some_and(|arg| arg == "list-unit-files")
+    }));
+    assert_eq!(host.snapshot(), before);
+    assert_eq!(interaction.prompts.get(), 0);
+}

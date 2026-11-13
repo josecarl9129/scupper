@@ -196,6 +196,13 @@ jobs:
         run: env -u CARGO_TARGET_TMPDIR cargo test -p scupper -p scupper-core -p scupper-proto -p xtask --locked
       - name: Build CLI archive
         run: env -u CARGO_TARGET_TMPDIR cargo xtask dist --target aarch64-apple-darwin
+      - name: Verify version commands
+        run: |
+          for argument in version --version; do
+            output=$(target/aarch64-apple-darwin/release/scupper "$argument")
+            printf '%s\n' "$output"
+            [[ "$output" =~ ^scupper\ [0-9] ]]
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: scupper-aarch64-apple-darwin

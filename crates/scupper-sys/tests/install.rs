@@ -962,3 +962,80 @@ fn modules_file_is_managed_and_drift_is_repaired() {
     host.apply(&fake);
     assert_eq!(host.prepare(&fake).unwrap().plan.steps, []);
 }
+
+#[test]
+fn v1_detection_installed_tools_must_be_observable() {
+    for tool in [Program::Nft, Program::Wg] {
+        let host = Host::new();
+        let fake = Fake {
+            broken_tool: Some(tool),
+            host_link: Some("ex-0"),
+            leftover: true,
+            ..Fake::default()
+        };
+        assert_eq!(
+            host.prepare(&fake).unwrap_err(),
+            model::Refusal::Input("cannot inspect v1 layout")
+        );
+    }
+    let packages = model::PACKAGES.map(String::from).into();
+    let fake = Fake {
+        missing_tool: Some(Program::Nft),
+        ..Fake::default()
+    };
+    assert!(scupper_sys::v1_detect::detect_install_layout(&fake, &[], &packages).is_err());
+
+    let fake = Fake {
+        missing_tool: Some(Program::Wg),
+        host_link: Some("ex-0"),
+        host_address: Some("192.0.2.1"),
+        leftover: true,
+        ..Fake::default()
+    };
+    // Kernel links remain evidence when missing wg prevents proving them removable.
+    assert_eq!(
+        scupper_sys::v1_detect::detect_install_layout(&fake, &["ex-0"], &packages).unwrap(),
+        [scupper_sys::v1_detect::V1Marker::HostLink("ex-0".into())]
+    );
+    assert_eq!(Host::new().prepare(&fake).unwrap_err(), model::Refusal::V1);
+}
+
+#[test]
+fn empty_unit_listing_is_accepted_by_both_install_detection_calls() {
+    let fake = Fake {
+        no_unit_files: true,
+        ..Fake::default()
+    };
+    Host::new().prepare(&fake).unwrap();
+    assert_eq!(
+        fake.calls
+            .borrow()
+            .iter()
+            .filter(|(program, args)| {
+                *program == Program::Systemctl && args[0] == "list-unit-files"
+            })
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn absent_ufw_uses_nft_walker_without_error() {
+    let fake = Fake {
+        firewall: true,
+        ..Fake::default()
+    };
+    let prepared = Host::new().prepare(&fake).unwrap();
+    assert!(
+        prepared
+            .plan
+            .warnings
+            .iter()
+            .any(|warning| warning.starts_with("nft rules:"))
+    );
+    assert!(
+        fake.calls.borrow().iter().any(|(program, args)| {
+            *program == Program::Nft && args == &["-j", "list", "ruleset"]
+        })
+    );
+}

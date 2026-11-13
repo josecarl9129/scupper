@@ -58,20 +58,7 @@ pub(super) fn run(
         }
         AlertsCommand::Test { sink } => {
             require_root(deps, "alerts test")?;
-            let name = if let Some(name) = sink {
-                name
-            } else {
-                if !deps.prompt.is_terminal() {
-                    return Err("alerts test requires SINK without a TTY".into());
-                }
-                let names: Vec<_> = sinks.keys().map(String::as_str).collect();
-                deps.prompt
-                    .choose(&names)
-                    .map_err(|_| "sink picker failed")?
-            };
-            if !sinks.contains_key(&name) {
-                return Err("unknown alert sink".into());
-            }
+            let name = select_sink(sink, &sinks.keys().map(String::as_str).collect::<Vec<_>>())?;
             let ping = scupper_sys::daemon::control::call(
                 deps.writer_root,
                 &scupper_sys::daemon::control::request(scupper_proto::Op::Ping {}),
@@ -113,4 +100,57 @@ pub(super) fn run(
         }
     }
     Ok(0)
+}
+
+// Selection never consults stdin, even on a terminal.
+fn select_sink(sink: Option<String>, names: &[&str]) -> Result<String, String> {
+    if let Some(name) = sink {
+        return if names.contains(&name.as_str()) {
+            Ok(name)
+        } else {
+            Err(format!("unknown alert sink: {name}"))
+        };
+    }
+    match names {
+        [name] => Ok((*name).to_owned()),
+        [] => Err(
+            "no alert sinks configured; add [alerts.sinks.<name>] to a config file, then run scupper config load <file>"
+                .into(),
+        ),
+        _ => Err(format!(
+            "several alert sinks configured: {}; run scupper alerts test <sink>",
+            names.join(", ")
+        )),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::select_sink;
+
+    #[test]
+    fn one_sink_is_selected_without_interaction() {
+        assert_eq!(select_sink(None, &["chat"]), Ok("chat".into()));
+    }
+
+    #[test]
+    fn no_sinks_explains_how_to_add_one() {
+        let empty = select_sink(None, &[]).unwrap_err();
+        assert!(empty.contains("no alert sinks configured"));
+        assert!(empty.contains("[alerts.sinks.<name>]"));
+        assert!(empty.contains("scupper config load <file>"));
+    }
+
+    #[test]
+    fn several_sinks_require_an_explicit_choice() {
+        let several = select_sink(None, &["chat", "phone"]).unwrap_err();
+        assert!(several.contains("chat, phone"));
+        assert!(several.contains("scupper alerts test <sink>"));
+        assert_eq!(
+            select_sink(Some("phone".into()), &["chat", "phone"]),
+            Ok("phone".into())
+        );
+        assert!(select_sink(Some("missing".into()), &["chat"]).is_err());
+    }
 }

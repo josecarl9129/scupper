@@ -171,7 +171,14 @@ impl Kernel {
             && args.join(" ").contains(needle)
         {
             if stderr == "missing-binary" {
-                return Err(ExecError::spawn("No such file or directory"));
+                if !ns {
+                    return Err(ExecError::NotFound { program: p });
+                }
+                return Ok(ExecOutput {
+                    status: Some(127),
+                    stdout: String::new(),
+                    stderr: "No such file or directory".into(),
+                });
             }
             return Ok(ExecOutput {
                 status: Some(2),

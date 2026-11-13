@@ -18,6 +18,9 @@ mod control;
 mod exits;
 mod install;
 mod secret;
+mod view;
+#[cfg(test)]
+mod view_tests;
 use config::ConfigCommand;
 
 #[derive(Parser)]
@@ -36,7 +39,10 @@ struct Cli {
 
 #[derive(Clone, Subcommand)]
 enum Command {
+    /// Print the installed CLI version.
+    Version,
     /// Manage macOS client settings.
+    #[cfg(target_os = "macos")]
     Mac(crate::mac_app::MacArgs),
     /// Stage and deploy a gateway release over SSH.
     Deploy(crate::deploy::DeployArgs),
@@ -220,34 +226,6 @@ impl Privilege for EffectiveUid {
 pub trait Prompt {
     /// Whether input, preview output and prompt output are terminals.
     fn is_terminal(&self) -> bool;
-
-    /// Select an exact or uniquely matching configured sink on a terminal.
-    /// # Errors
-    /// Returns cancellation, ambiguity or input/output failures.
-    fn choose(&self, candidates: &[&str]) -> io::Result<String> {
-        if !self.is_terminal() || candidates.is_empty() {
-            return Err(io::Error::other("no interactive choices"));
-        }
-        let mut output = io::stderr();
-        writeln!(output, "Sinks: {}", candidates.join(", "))?;
-        write!(output, "Filter or exact sink: ")?;
-        output.flush()?;
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        let input = input.trim();
-        let exact = candidates.iter().find(|s| **s == input);
-        if let Some(name) = exact {
-            return Ok((*name).to_owned());
-        }
-        let matches: Vec<_> = candidates
-            .iter()
-            .filter(|s| !input.is_empty() && s.contains(input))
-            .collect();
-        match matches.as_slice() {
-            [name] => Ok((***name).to_owned()),
-            _ => Err(io::Error::other("sink filter must match one choice")),
-        }
-    }
 
     /// Shows the optional preview, then asks the question; the default is no.
     ///
@@ -460,6 +438,11 @@ fn dispatch(
         return Err("--json is supported only for check and status".into());
     }
     match command {
+        Command::Version => {
+            writeln!(stdout, "scupper {}", env!("CARGO_PKG_VERSION")).map_err(output_error)?;
+            Ok(0)
+        }
+        #[cfg(target_os = "macos")]
         Command::Mac(args) => crate::mac_app::run(&args, stdout),
         Command::Deploy(args) => {
             crate::deploy::run(&args, &crate::deploy::Ssh, &crate::deploy::Terminal, stdout)
@@ -687,14 +670,6 @@ fn json_error(stage: Option<scupper_core::verdict::v2::Stage>, message: &str) ->
     serde_json::json!({"stage": stage, "message": message})
 }
 
-fn redact_endpoints(obs: &mut scupper_core::verdict::v2::Observations) {
-    if let Some(Ok(topology)) = &mut obs.topology {
-        for peer in topology.peers.values_mut().flatten() {
-            peer.endpoint = None;
-        }
-    }
-}
-
 fn status_error(stdout: &mut dyn Write, json: bool, error: &str) -> Result<u8, String> {
     if json {
         serde_json::to_writer(
@@ -707,31 +682,6 @@ fn status_error(stdout: &mut dyn Write, json: bool, error: &str) -> Result<u8, S
         writeln!(stdout, "M2 observations failed: {error}").map_err(output_error)?;
     }
     Ok(0)
-}
-
-fn status_json(
-    stdout: &mut dyn Write,
-    result: &Result<scupper_core::verdict::v2::Report, scupper_core::verdict::v2::CheckError>,
-    obs: &scupper_core::verdict::v2::Observations,
-) -> Result<(), String> {
-    // Status retains a diagnostic representation of every stage, including
-    // explicitly unrequested stages. Check's machine interface is the Report.
-    let value = serde_json::json!({"schema": 1, "report": result.as_ref().ok(),
-    "error": result.as_ref().err().map(|error| json_error(Some(error.stage), &error.source.to_string())), "observations": {
-        "topology": format!("{:?}", obs.topology),
-        "selection": format!("{:?}", obs.selection),
-        "active": format!("{:?}", obs.active),
-        "defaults": format!("{:?}", obs.defaults),
-        "handshakes": format!("{:?}", obs.handshakes),
-        "forwarding": format!("{:?}", obs.forwarding),
-        "routes": format!("{:?}", obs.routes),
-        "exit_probe": format!("{:?}", obs.exit_probe),
-        "standby_probe": format!("{:?}", obs.standby_probe),
-        "dns": format!("{:?}", obs.dns),
-        "supervisor": format!("{:?}", obs.supervisor),
-    }});
-    serde_json::to_writer(&mut *stdout, &value).map_err(|error| error.to_string())?;
-    writeln!(stdout).map_err(output_error)
 }
 
 #[allow(clippy::too_many_lines)] // Keep the single bounded retry beside the final verdict.
@@ -767,25 +717,21 @@ fn m2_check(
             gateway: &config.gateway,
             stamp: config.stamp,
         };
-        let (result, mut observations) = if status {
+        let (result, observations) = if status {
             scupper_sys::check_v2::run_with_observations(&check_deps, &check_config)
         } else {
             scupper_sys::check_v2::run_with_supervisor(&check_deps, &check_config, supervisor)
         };
         if status {
-            redact_endpoints(&mut observations);
+            let now = result
+                .as_ref()
+                .map_or_else(|_| deps.system.now_unix_secs(), |r| r.at);
+            let value = view::status_value(config, &result, &observations, now)?;
             if json {
-                status_json(stdout, &result, &observations)?;
-                return Ok(0);
-            }
-            writeln!(
-                stdout,
-                "M2 observations (None = not requested):\n{observations:#?}"
-            )
-            .map_err(output_error)?;
-            match result {
-                Ok(report) => writeln!(stdout, "{}", report.verdict).map_err(output_error)?,
-                Err(error) => writeln!(stdout, "{error}").map_err(output_error)?,
+                serde_json::to_writer(&mut *stdout, &value).map_err(|e| e.to_string())?;
+                writeln!(stdout).map_err(output_error)?;
+            } else {
+                view::status(stdout, &value)?;
             }
             return Ok(0);
         }
@@ -823,10 +769,10 @@ fn m2_check(
                         .map_err(|error| error.to_string())?;
                     writeln!(stdout).map_err(output_error)?;
                 } else {
-                    writeln!(stdout, "{}", report.verdict).map_err(output_error)?;
-                    for warning in &report.warnings {
-                        writeln!(stderr, "warning: {warning:?}").map_err(output_error)?;
-                    }
+                    view::check(
+                        stdout,
+                        &serde_json::to_value(&report).map_err(|e| e.to_string())?,
+                    )?;
                 }
                 Ok(report.verdict.exit_code())
             }
@@ -904,5 +850,45 @@ impl scupper_sys::boot::BootNamespace for BootNamespaces<'_> {
         self.0
             .open_gateway()
             .map_err(|error| scupper_sys::netns::NetnsError::Proc(io::Error::other(error)))
+    }
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+
+    #[test]
+    fn implemented_gateway_and_portable_commands_parse_on_linux() {
+        for command in [
+            "version",
+            "deploy",
+            "status",
+            "check",
+            "connect",
+            "disconnect",
+            "apply",
+            "repair",
+            "config",
+            "exit",
+            "alerts",
+            "secret",
+            "install",
+            "rules",
+            "remote",
+            "boot",
+            "probe",
+            "deliver",
+            "canon",
+        ] {
+            let error = Cli::try_parse_from(["scupper", command, "--help"]).err();
+            assert!(
+                error.is_some_and(|e| e.kind() == ErrorKind::DisplayHelp),
+                "{command}"
+            );
+        }
+        assert!(
+            Cli::try_parse_from(["scupper", "mac", "--help"])
+                .is_err_and(|e| e.kind() != ErrorKind::DisplayHelp)
+        );
     }
 }

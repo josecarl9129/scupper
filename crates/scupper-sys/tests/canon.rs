@@ -160,7 +160,9 @@ fn isolated_canon_loads_then_lists_and_reports_failures() -> Result<(), Box<dyn 
         Err(ExecError::Timeout {
             after: EXEC_TIMEOUT,
         }),
-        Err(ExecError::spawn("nft unavailable")),
+        Err(ExecError::NotFound {
+            program: Program::Nft,
+        }),
     ] {
         let sys = FakeSystem::new();
         sys.live_results

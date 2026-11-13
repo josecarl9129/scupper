@@ -2497,6 +2497,7 @@ fn host_link_inspection_keeps_status_and_sanitized_bounded_stderr() {
         let report = f.run(None);
         assert!(!report.succeeded(), "{report:?}");
         let error = report.steps.last().unwrap().error.as_ref().unwrap();
+        assert!(error.starts_with("cannot inspect host link:"), "{error}");
         assert!(error.contains("status Some(2)"), "{error}");
         assert!(error.contains("inspection failed "), "{error}");
         assert!(!error.chars().any(char::is_control));

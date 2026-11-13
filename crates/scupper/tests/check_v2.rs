@@ -72,7 +72,7 @@ fn m2_check_codes_and_json_work_without_a_tty() {
     let root = Root::new(&sys.runner, &testing::handle().unwrap());
     let (code, out, err) = run(&sys, &root, &["check"]);
     assert_eq!(code, 0, "{out} {err}");
-    assert!(out.starts_with("protected:"));
+    assert!(out.starts_with("protected via"));
     assert!(!out.contains('\u{1b}'));
     let (code, out, _) = run(&sys, &root, &["--json", "check"]);
     assert_eq!(code, 0);
@@ -84,15 +84,14 @@ fn m2_check_codes_and_json_work_without_a_tty() {
     assert_eq!(code, 0);
     let status: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(status["schema"], 1);
-    assert!(
-        !status["observations"]["topology"]
-            .as_str()
-            .unwrap()
-            .contains("endpoint: Some")
-    );
+    assert!(status["observations"]["topology"]["ok"]["peers"]["wg0"][0]["endpoint"].is_null());
     let (_, text_status, _) = run(&sys, &root, &["status"]);
-    assert!(!text_status.contains("endpoint: Some"));
-    assert_eq!(status["observations"]["supervisor"], "Some(NotRequired)");
+    assert!(text_status.contains("Exits"));
+    assert!(!text_status.contains("Observations {"));
+    assert_eq!(
+        status["observations"]["supervisor"]["state"],
+        "not_required"
+    );
     for (filename, value, code) in [
         (
             "scupper-nft-ruleset.json",
