@@ -87,7 +87,7 @@ client plaintext, and no host service may proxy for clients.
 |---|---|
 | Boot protection ("fail closed at boot before any process starts") | **No client-capable path exists until protection is verified.** A process has to install the rules; before `scupper boot` runs there is no namespace, so no client path at all. Every prefix of the boot procedure is closed (§15). |
 | DNS forcing (§3 of the requirements) | **Plain DNS is forced, DoT is blocked, DoH is not controllable.** All client UDP/TCP port 53 to any destination is redirected to the gateway forwarder; TCP and UDP 853 are rejected so clients fall back to port 53 at once; DNS over HTTPS on 443 is indistinguishable from HTTPS and still leaves only through the VPN (I1). |
-| Mac protection | pf protection applies while pf is enabled and evaluates the scupper anchor, from the moment `join` has installed and verified it. Events that remove the anchor or its evaluation path (macOS reloading pf, another tool disabling pf) are detected within one 5 s check and repaired; the length of any such gap and the macOS operations that cause one are measured (V-05), not assumed to be zero. Between boot and the helper restoring a persisted join, and between a network change and an auto-join, the Mac is not protected. R1 accepts this guarantee; R2 re-evaluates a Network Extension backend from the V-05 measurements (§19, D-2). |
+| Mac protection | On qualified configurations, the effective pf policy blocks traffic outside the documented exceptions (§14). Checks target 1 s/5 s while the helper runs; detection and recovery have no guaranteed maximum duration, and transient changes or admitted states may escape detection. Boot before helper enforcement is unprotected. Stale observations yield `Unknown`; status shows the last full verification time. V-05 measures gap distributions, never a bound. R2 re-evaluates a Network Extension backend (§19, D-2). |
 | Multi-gateway in R1 | Data model and config only: several gateways and a shared client-facing identity are expressible; R1 validation accepts exactly one active gateway (§16). |
 
 ---
@@ -331,15 +331,18 @@ with the namespace layout, which does not depend on `nftables.service`.
 | `scupper deliver …` children | started by scupperd in host netns | `scupper-alert` from exec (`Command::uid`) | one alert/heartbeat HTTPS request | no |
 | `scupper-edge` | **whole process in the netns** (`NetworkNamespacePath=`) | user `scupper-edge`, `CAP_NET_BIND_SERVICE` only | DNS forwarder, tunnel API, `/metrics` | DNS only |
 | `scupper` | anywhere | caller | CLI | no |
-| `scupper mac helper` (LaunchDaemon `net.scupper.helper`) | Mac | root; root-owned binaries only (ADR 0030) | pf, wg-quick, persisted join intent; typed commands over a local socket; parses no HTTP | Mac side |
-| `scupper mac agent` (LaunchAgent `net.scupper.agent`) | Mac | logged-in user | network fingerprint, join requests, gateway events, notifications, bundle copies, API token | no |
+| `scupper mac helper` (LaunchDaemon `net.scupper.helper`, M5a) | Mac | root; root-owned helper and pinned child (ADR 0030, 0033) | pf, supervised `wireguard-go -f`, UAPI, addresses/routes/DNS/MTU, persisted join intent; owner-uid socket authorization (§14); no gateway HTTP parsing | Mac side |
+| `scupper mac agent` (LaunchAgent `net.scupper.agent`, M5b) | Mac | logged-in user | network fingerprint, join requests, gateway events, notifications, bundle copies, API token | no |
 
 Rules:
-- **No TLS or HTTP parsing as root.** Probe children create their sockets
+- **No TLS or HTTP parsing as root, except the M6a Mac release downloader
+  specified in §14.** Probe children create their sockets
   (setns into the netns via the held namespace fd, `SO_BINDTODEVICE` where
   needed) while single-threaded, then drop supplementary groups, gid and
   uid, verify with `getresuid`/`getresgid` and abort if any id is 0. Delivery
-  children are started unprivileged. The Mac helper follows the same rule.
+  children are started unprivileged. The M5a Mac helper parses no HTTP. M6a
+  permits only its fixed-origin release download into root-owned staging, not
+  gateway HTTP/API parsing or caller-controlled download locations (§14).
 - **Edge sees a minimal filesystem.** Its unit replaces `/run` with an empty
   tmpfs and binds in only its own socket (§15), so the host resolver's
   Varlink and D-Bus endpoints (`/run/systemd/resolve/`, `/run/dbus/`) and any
@@ -373,7 +376,7 @@ crates/
                     (nft, pf, units), verdict + staging, failover machine, planner, parsers
   scupper-proto/    serde types for API, control socket and --json (schema = 1)
   scupper-sys/      Linux adapters: Exec with timeouts and allow-list, System impl, netns, probes
-  scupper-mac/      pf, wg-quick, launchd, network fingerprint (exec only)
+  scupper-mac/      pf, supervised wireguard-go/UAPI, launchd, network fingerprint (§14)
   scupperd/         bin: reconciler, events, alert/heartbeat scheduling, control socket
   scupper-edge/     bin: DNS forwarder, HTTP API, metrics
   scupper/          bin: CLI (clap), transports, human rendering; hidden boot/probe/deliver
@@ -619,7 +622,7 @@ a golden):
 | sets, antispoof, input (without 53/7380), forward (client→exit, return), postrouting, output | M2 |
 | `dns_redirect`, input port 53, forward port-53 drop, 853 rejects, `nonglobal4/6` | M4 (with the forwarder; before M4 clients use the provider resolver `10.2.0.1` directly, which `nonglobal4` would block) |
 | `exit_ifaces_v6` non-empty | M4, only for exits whose v6 support is verified (V-11) |
-| input port 7380 | M5 |
+| input port 7380 | M5b |
 
 Why each part exists:
 - `antispoof`: WireGuard already enforces AllowedIPs; this covers a peer
@@ -1037,7 +1040,7 @@ address4 = "10.99.0.1/24"
 address6 = "fd00:99::1/64"
 mtu = 1420
 
-[gateways.gw1.api]                   # M5
+[gateways.gw1.api]                   # M5b
 port = 7380
 
 [gateways.gw1.dns]                   # M4
@@ -1354,7 +1357,7 @@ cache.
 |---|---|---|
 | Local | Unix socket `/run/scupper/control.sock`, 0660 `root:scupper-admin`, newline-delimited JSON | `SO_PEERCRED`: uid 0, or a uid whose group list contains `scupper-admin` (looked up with `getgrouplist`, since `SO_PEERCRED` carries only the primary gid) = admin |
 | Edge | Unix socket `/run/scupper/edge.sock`, 0660 `root:scupper-edge` | `SO_PEERCRED` uid = `scupper-edge`; only the edge operation set: forward an authenticated tunnel request with its device principal, the `DnsUpstream` subscription, the verdict/metrics snapshot |
-| Tunnel API (M5) | HTTP/1.1 + JSON, edge, `10.99.0.1:7380` and `[fd00:99::1]:7380`, inside the namespace | WireGuard source address + device token |
+| Tunnel API (M5b) | HTTP/1.1 + JSON, edge, `10.99.0.1:7380` and `[fd00:99::1]:7380`, inside the namespace | WireGuard source address + device token |
 | SSH (break-glass) | `ssh root@<public address> scupper remote`, request as JSON on stdin | sshd on the host, untouched by scupper |
 
 There is **no SSH inside the tunnel** (ADR 0008): sshd stays in the host
@@ -1520,11 +1523,10 @@ scupper                                 bare: short status summary with next-ste
 │   ├── app status [APP]                transmission | qbittorrent; bind/profile match/tunnel up or down
 │   ├── app bind APP [--address A]       pin to tunnel IPv4 (Transmission IPv6 ::1); --profile FILE (default ~/.scupper/scupper0.conf)
 │   ├── app unbind APP                  restore saved app preferences; app must be quit
-│   ├── join | leave | status
-│   ├── trust add [--current] | trust rm NAME | trust list
-│   ├── enroll --gateway HOST           generate device key + API token locally, register over SSH
-│   ├── helper install | uninstall      root LaunchDaemon with root-owned tool copies (ADR 0030)
-│   └── agent install | uninstall | run  per-user LaunchAgent
+│   ├── setup | join | leave | status | uninstall | selftest   M5a; helper contract in §14
+│   ├── trust add [--current] | trust rm NAME | trust list     M5b
+│   ├── enroll --gateway HOST           M5b: generate device key + API token locally, register over SSH
+│   └── agent install | uninstall | run  M5b: per-user LaunchAgent
 └── (hidden) boot | probe … --json | deliver …      used by units and scupperd
 ```
 
@@ -1708,7 +1710,7 @@ M1 implements exactly v1's six commands (`status check connect disconnect
 rules apply`) and exit codes 0-4; `connect`/`disconnect` start and stop
 `wg-quick@proton0` as v1 does.
 
-### Interactive use: helpful, never required (M5 for the full set)
+### Interactive use: helpful, never required (M5b for the full set)
 
 Rules:
 
@@ -1948,7 +1950,7 @@ bound probe succeeded) stays a named test.
 - **Privacy by type:** no variant has a destination, domain or traffic field;
   a test serializes every variant and checks the field set.
 
-### Metrics (edge `/metrics`, tunnel only, token required, M5)
+### Metrics (edge `/metrics`, tunnel only, token required, M5b)
 
 `scupper_verdict{kind}`, `scupper_exit_up{exit}`, `scupper_exit_active{exit}`,
 `scupper_exit_handshake_age_seconds{exit}`,
@@ -1976,7 +1978,7 @@ healthy verdict is never exported as current. `GET /v1/health` means only
 | `ntfy` | HTTPS POST; ntfy's email forwarding covers email |
 | `webhook` | HTTPS POST JSON, presets `telegram`, `pushover`, `generic` (template per preset) |
 | Prometheus | scraped from `/metrics` |
-| macOS notification | posted locally by the Mac agent (§14), not pushed by the gateway |
+| macOS notification | M5a: minimal helper failure notification into the user session; M5b: full Mac agent notifications (§14), not pushed by the gateway |
 
 No native SMTP sink.
 
@@ -2286,109 +2288,410 @@ the four CI shards allow 30 min (formerly 25 min) including setup slack.
 
 ---
 
-## 14. Mac client (ADR 0021)
+## 14. Mac client (ADR 0021, 0030, 0033)
 
-All Mac logic is exec-based (`wg-quick`, `pfctl`, `route`, `arp`,
-`launchctl`, `osascript`) in `scupper-mac`; rendering is pure in
-`scupper-core`. No FFI, no unsafe code.
+On qualified configurations, the effective pf policy blocks traffic outside the
+documented exceptions. Checks target 1 s and 5 s intervals while the helper runs.
+Detected failures trigger repair attempts or a NotProtected status. Detection and
+recovery have no guaranteed maximum duration; transient changes and states
+admitted during them may escape detection. Boot before helper enforcement is
+unprotected. pf filters IP traffic through the network stack; BPF or raw-frame
+injection is outside this claim. Bridged VM, vmnet and Internet Sharing paths
+require separate qualification before their traffic is covered.
 
-### Tunnel
+`scupper mac status` states this claim, shows the last full verification time,
+and becomes `Unknown` when observations are stale. Gap distributions are measured
+and reported, never presented as a bound. A replaced root helper is outside this
+claim. IPv6-only underlay networks are unsupported in M5a. IPv6 is routed into
+the tunnel (split `/1` routes); it exits only where the gateway has a qualified
+v6 exit (M4, V-11) and otherwise fails closed at the gateway. The legacy
+app-binding statement below that there is no IPv6 exit predates M4 and must
+be read with this qualification; the binding settings remain as documented.
+The exceptions below are destination/address/port exceptions, not authentication
+of the sending process or remote peer. The UDP endpoint and TCP 22 exceptions
+are bounded bypasses: any local app can send bytes to those IP:port pairs
+outside WireGuard.
 
-**Privileged pieces are root-owned (ADR 0030).** The root helper never
-executes anything from the Homebrew prefix, which the installing account
-can write. `scupper mac helper install` copies the helper binary and the
-tools it runs (`wg`, `wireguard-go`, `wg-quick` and the `bash` it needs)
-into `/Library/Application Support/net.scupper/bin/` (root:wheel, 0755,
-every parent root-owned and not group- or world-writable) and records their
-sha256. The helper runs them by absolute path with `PATH` set to that
-directory plus `/usr/bin:/bin:/usr/sbin:/sbin` and an otherwise empty
-environment, and refuses to start if a recorded hash or an ownership check
-fails. Re-running `helper install` after a Homebrew upgrade refreshes the
-copies. The helper takes typed commands (join, leave, status) from the user
-agent over a root-owned local socket and never parses HTTP or JSON from the
-gateway.
+### Components and ownership
 
-`wg-quick` with `/Library/Application Support/net.scupper/etc/scupper0.conf`
-(root, directory 0700):
-`Address = 10.99.0.2/32, fd00:99::2/128`, `DNS = 10.99.0.1`,
-`AllowedIPs = 0.0.0.0/0, ::/0`, `Endpoint = <gateway public address>:51820`.
-wg-quick installs an endpoint host route via the physical interface, which is
-what keeps break-glass SSH to the public address working while joined.
+`scupper-mac` owns the Mac integration; anchor rendering, observation parsers,
+and the verifier are pure in `scupper-core`. scupper's own code has no unsafe
+code; the pinned `wireguard-go` dependency uses unsafe internally. The helper
+uses absolute paths to macOS system tools (`pfctl`, `ifconfig`, `ipconfig`,
+`route`, `scutil`, `launchctl`, `sudo`, `osascript`), typed validated inputs
+(including rejection of newline injection), bounded output and deadlines.
+No shell script runs as root.
 
-### Join / leave
+The root LaunchDaemon `net.scupper.helper` owns pf, the persisted join intent,
+the supervised tunnel child, UAPI, addresses, routes, DNS and MTU. Its launchd
+job uses `RunAtLoad` and `KeepAlive`. It parses no gateway HTTP/JSON (M6a
+adds only the fixed-origin release download below), reads no user configuration
+and resolves no user secret backends. Its configuration and state live under
+`/Library/Application Support/net.scupper/` in root-owned 0700 directories;
+private-key files are 0600. The helper and pinned `wireguard-go` are installed
+in `bin/` under that directory (root:wheel, 0755, all parents root-owned and
+not group- or world-writable), with recorded sha256 hashes. They run by absolute
+path with a fixed minimal environment.
 
-`join`:
-1. Persist the join intent (`/Library/Application Support/net.scupper/state/joined`,
-   root). Load the anchor in **pre-tunnel** form (block all except UDP to
-   the endpoint, TCP 22 to the endpoint address, DHCP/DHCPv6, NDP).
-2. Flush pre-existing pf states (`pfctl -F states`, documented as "existing
-   connections are reset when you join").
-3. Verify the whole evaluation path: pf enabled (`pfctl -s info`); the main
-   ruleset still contains `anchor "com.apple/*"` and no earlier `quick`
-   rule that could match first; no `skip` flag on `en*` or `utun*`
-   (`pfctl -s Interfaces -v`); `pfctl -a com.apple/scupper -sr` matches the
-   rendered anchor.
-4. `wg-quick up scupper0`; read the utun name from
-   `/var/run/wireguard/scupper0.name`.
-5. Load the joined anchor (adds the utun pass rules); verify again.
-6. Report joined only after step 5 and a fresh handshake.
+The macOS release includes `wireguard-go` built in CI from a pinned upstream tag
+with a pinned Go toolchain; its sha256 is in the release checksums. The helper
+starts `wireguard-go -f utun` with a kernel-assigned interface number as its
+foreground, supervised child. The mechanism for proving current-generation
+utun identity, startup readiness and rejection of stale name-files/UAPI sockets
+is **to be fixed in 5a2**; an interface name alone is not sufficient. It replaces
+`wg` and `wg-quick` by configuring the WireGuard UAPI socket (`set=1` key/value
+protocol), with bounded framing, deadlines, read-back and no key logging. It
+configures `10.99.0.2/32`, `fd00:99::2/128`, the peer's allowed IPs
+`0.0.0.0/0, ::/0`, and the numeric IPv4 endpoint fixed at setup, for example
+`198.51.100.7:51820`. No LAN DNS bootstrap is allowed.
 
-`leave` (explicit user action only): `wg-quick down`, flush the anchor,
-release the pf enable reference (`pfctl -X <token>`, never `pfctl -d`),
-remove the join intent. A crash, a lost gateway or a dead provider is
-**never** treated as a leave.
+The root-owned local socket accepts typed requests authenticated with
+`LOCAL_PEERCRED` against the enrolled owner's uid only, not whichever user is
+currently on the console. In M5a, "enrolled owner" means the uid that ran
+`scupper mac setup`, recorded by setup before elevation; setup requires a
+non-root invoking user. It does not imply M5b enrolment. Any process running
+as this user can request leave;
+the CLI asks for confirmation to prevent accidents. A TTY prompt is not an
+authorization boundary against another process of that uid. Socket and input
+validation must not turn same-user access into arbitrary privileged execution.
 
-While joined the helper re-verifies the whole evaluation path every 5 s and
-compares the anchor's utun with `/var/run/wireguard/scupper0.name` and the
-running `wireguard-go`. On any difference it loads the pre-tunnel anchor at
-once, flushes all states (connections admitted while protection was missing
-must not survive its restoration) and joins again. **At boot**, if the join
-intent is persisted, the helper (`RunAtLoad`) loads the pre-tunnel anchor
-before anything else and then joins; traffic before launchd starts the
-helper is not protected (V-05 measures this window).
+The M5a user CLI is `scupper mac setup|join|leave|status|uninstall|selftest`:
 
-### pf anchor (`com.apple/scupper`, reached by the stock `anchor "com.apple/*"`; `/etc/pf.conf` is never edited)
+| Command | Contract |
+|---|---|
+| `setup` | User-run installer with one admin prompt, from the release archive verified by the user's own `scupper`; imports the existing `~/.scupper/scupper0.conf` as specified below, records the invoking uid as owner, and installs the helper, pinned child and launchd job. |
+| `join` | Persist intent and establish verified enforcement before starting the tunnel; existing connections are reset when you join. |
+| `leave` | Confirm the intentional removal of protection; clear intent only through the serialized leave operation. |
+| `status` | Show join intent, observed enforcement, tunnel health, last full verification time and durable errors separately; non-zero on failure or stale/unknown enforcement while join is intended. A fresh handshake cannot upgrade enforcement to `Protected`. |
+| `uninstall` | Explicitly leave before removing owned files and launchd job; interrupted removal must remain recoverable and must not silently clear join intent. |
+| `selftest` | Non-destructive probes with positive controls, reporting exactly what was observed; never remove protection. |
+
+M5a failure reporting is a durable error state, non-zero `status`, and a minimal
+desktop notification sent by the helper into the enrolled user's session using
+`launchctl asuser <uid> sudo -u <user> /usr/bin/osascript …`, with absolute
+paths for launchctl and sudo too. The recorded owner uid determines `<user>`;
+`asuser` selects only the bootstrap namespace, and `sudo -u` drops privileges
+before the interpreter starts. Use a fixed script with the bounded, validated
+message passed as an argument, never interpolated into script source. The
+notification child has a deadline; failure or an absent user session never
+affects enforcement or clears the durable error. The full user agent, auto-join,
+gateway-aware notifications, enrolment and bundle copies belong to M5b.
+Unattended provisioning/upgrades belong to M6a (see below).
+
+### pf policy and DHCP/ND lifecycle
+
+The helper owns only `com.apple/scupper`, reached through the stock
+`anchor "com.apple/*"`. It never edits `/etc/pf.conf` or rebuilds the main
+ruleset. It enables pf with `pfctl -E` and records its reference token in
+`/var/run/scupper/pf.token`; leave releases only its own reference with
+`pfctl -X <token>`, never `pfctl -d`.
+
+These rendered examples select physical interface `en0`, endpoint
+`198.51.100.7:51820`, lease server `192.0.2.1`, and current-generation tunnel
+`utun6`. Interface names and addresses come from validated observations.
+Endpoint UDP and TCP 22 passes and the ND matrix apply only to the selected
+physical interface. DHCP is tracked separately on **every physical interface**, where "physical
+interface" means an interface that backs an enabled network service with DHCP
+configuration in the SystemConfiguration store (typically Wi-Fi and Ethernet
+`en*`); `awdl*`, `llw*`, `ap*`, `bridge*`, `anpi*` and any interface type not
+qualified in V-21 get no DHCP pass. The set is recorded in V-21 per OS build. Tracking
+includes an interface with no lease or gateway yet: all physical interfaces
+get the acquiring/rebinding rules initially, then each switches to bound rules
+when it has a validated lease. Newly discovered physical interfaces get acquiring
+rules before path selection; an inactive link's rules permit acquisition when it
+comes up. Non-selected physical interfaces receive only their DHCP passes.
+Each pass states either `keep state (if-bound)` or `no state`; the final rule
+blocks everything else. Multi-uplink path-selection details remain **to be fixed
+in 5a2**; multiple leases alone are not an ambiguity or a verification failure.
+
+Pre-tunnel, **bound DHCP phase**:
 
 ```pf
-# scupper kill switch, rendered for utun6, physical interfaces { en0 },
-# gateway 198.51.100.7, DHCP server 192.0.2.1 (from the current lease)
-pass quick on lo0 all
-pass out quick on utun6 all keep state (if-bound)
-pass in  quick on utun6 all keep state (if-bound)
-pass out quick on { en0 } proto udp from any to 198.51.100.7 port 51820 keep state (if-bound)
-pass out quick on { en0 } proto tcp from any to 198.51.100.7 port 22 keep state (if-bound)   # break-glass SSH only
-pass out quick on { en0 } inet proto udp from any port 68 to { 255.255.255.255, 192.0.2.1 } port 67 keep state (if-bound)
-pass in  quick on { en0 } inet proto udp from any port 67 to any port 68
-pass out quick on { en0 } inet6 proto udp from fe80::/10 port 546 to ff02::1:2 port 547 keep state (if-bound)
-pass in  quick on { en0 } inet6 proto udp from fe80::/10 port 547 to fe80::/10 port 546
-pass out quick on { en0 } inet6 proto ipv6-icmp icmp6-type { routersol, neighbrsol, neighbradv } keep state (if-bound)
-pass in  quick on { en0 } inet6 proto ipv6-icmp icmp6-type { routeradv, neighbrsol, neighbradv }
+pass quick on lo0 all no state
+pass out quick on en0 inet proto udp from any to 198.51.100.7 port 51820 keep state (if-bound)
+pass out quick on en0 inet proto tcp from any to 198.51.100.7 port 22 keep state (if-bound)
+# Bound: renew only to/from the current lease server.
+pass out quick on en0 inet proto udp from any port 68 to 192.0.2.1 port 67 no state
+pass in quick on en0 inet proto udp from 192.0.2.1 port 67 to any port 68 no state
+# ND: RS out, RA in, NS/NA both ways; DAD only to solicited-node multicast.
+pass out quick on en0 inet6 proto ipv6-icmp from fe80::/10 to ff02::2 icmp6-type 133 no state
+pass in quick on en0 inet6 proto ipv6-icmp from fe80::/10 to { fe80::/10, ff02::1 } icmp6-type 134 no state
+pass out quick on en0 inet6 proto ipv6-icmp from fe80::/10 to { fe80::/10, ff02::1:ff00:0/104 } icmp6-type 135 no state
+pass in quick on en0 inet6 proto ipv6-icmp from fe80::/10 to { fe80::/10, ff02::1:ff00:0/104 } icmp6-type 135 no state
+pass out quick on en0 inet6 proto ipv6-icmp from fe80::/10 to { fe80::/10, ff02::1 } icmp6-type 136 no state
+pass in quick on en0 inet6 proto ipv6-icmp from fe80::/10 to { fe80::/10, ff02::1 } icmp6-type 136 no state
+pass out quick on en0 inet6 proto ipv6-icmp from :: to ff02::1:ff00:0/104 icmp6-type 135 no state
+pass in quick on en0 inet6 proto ipv6-icmp from :: to ff02::1:ff00:0/104 icmp6-type 135 no state
 block drop quick all
 ```
 
-- States are **interface-bound** (`if-bound`, V-20): a connection admitted
-  through the tunnel cannot continue on a physical interface after a route
-  change, an anchor loss or a utun-number reuse.
-- DHCP and DHCPv6 passes are limited to the physical interfaces and to the
-  broadcast address, the lease's server and the DHCPv6 multicast group, so
-  they cannot carry traffic to arbitrary hosts (V-21). The anchor is
-  re-rendered when the set of physical interfaces or the lease server
-  changes.
-- **No DNS to the local network while joined:** nothing on a physical
-  interface passes except the lines above, so ports 53, 853 and 5353 to LAN
-  addresses (a DHCP-supplied resolver, mDNS) are blocked. With `lan_access`
-  this stays true (below).
+Joined, **bound DHCP phase** (the only additional passes are for the owned utun):
 
-pf is enabled with `pfctl -E`, the reference token stored in
-`/var/run/scupper/pf.token`. LAN access (printers, AirDrop) is blocked while
-joined. `lan_access = true` (off by default) adds a pass for the directly
-connected IPv4 subnet only if it lies inside RFC 1918 or link-local space
-and is no larger than /16, plus IPv6 link-local; explicit `block drop quick`
-rules for TCP and UDP ports 53, 853 and 5353 to those addresses are rendered
-before the LAN pass, so a hostile network cannot receive DNS through it.
-While joined, the helper checks `scutil --dns` and re-asserts the tunnel
-resolver if the system resolver is not `10.99.0.1`. There is no R1
-captive-portal bypass.
+```pf
+pass quick on lo0 all no state
+pass out quick on utun6 all keep state (if-bound)
+pass in quick on utun6 all keep state (if-bound)
+pass out quick on en0 inet proto udp from any to 198.51.100.7 port 51820 keep state (if-bound)
+pass out quick on en0 inet proto tcp from any to 198.51.100.7 port 22 keep state (if-bound)
+pass out quick on en0 inet proto udp from any port 68 to 192.0.2.1 port 67 no state
+pass in quick on en0 inet proto udp from 192.0.2.1 port 67 to any port 68 no state
+pass out quick on en0 inet6 proto ipv6-icmp from fe80::/10 to ff02::2 icmp6-type 133 no state
+pass in quick on en0 inet6 proto ipv6-icmp from fe80::/10 to { fe80::/10, ff02::1 } icmp6-type 134 no state
+pass out quick on en0 inet6 proto ipv6-icmp from fe80::/10 to { fe80::/10, ff02::1:ff00:0/104 } icmp6-type 135 no state
+pass in quick on en0 inet6 proto ipv6-icmp from fe80::/10 to { fe80::/10, ff02::1:ff00:0/104 } icmp6-type 135 no state
+pass out quick on en0 inet6 proto ipv6-icmp from fe80::/10 to { fe80::/10, ff02::1 } icmp6-type 136 no state
+pass in quick on en0 inet6 proto ipv6-icmp from fe80::/10 to { fe80::/10, ff02::1 } icmp6-type 136 no state
+pass out quick on en0 inet6 proto ipv6-icmp from :: to ff02::1:ff00:0/104 icmp6-type 135 no state
+pass in quick on en0 inet6 proto ipv6-icmp from :: to ff02::1:ff00:0/104 icmp6-type 135 no state
+block drop quick all
+```
+
+In **acquiring/rebinding**, replace the two bound DHCP lines for each physical
+interface in either form with exactly these lines (substitute its name for
+`en0`, and render a pair for every physical interface still acquiring):
+
+```pf
+pass out quick on en0 inet proto udp from any port 68 to 255.255.255.255 port 67 no state
+pass in quick on en0 inet proto udp from any port 67 to any port 68 no state
+```
+
+Initial acquisition and network change enter acquiring on each affected
+physical interface, independently of which uplink carries the endpoint. The
+helper observes the lease server and lease/T1/T2 information through bounded
+`ipconfig getpacket <if>` reads; an expected no-lease response or an expired
+lease remains acquiring. Malformed/unparseable output is a verification failure,
+not a validated lease. The exact parsing and timer derivation are to be fixed
+in 5a2. A validated lease
+selects bound mode for that interface; renewal before T2 goes only to that lease
+server. At T2, re-enable its acquiring/rebinding rules until a lease is bound
+again. Re-render, load and capture a normalized read-back baseline as specified
+below when an interface, phase or lease server changes.
+DHCP has no pf states to outlive a phase transition. The broad inbound source
+in acquiring/rebinding is intentional: this is an address/port exception, not
+a claim that DHCP packets or processes are authenticated (V-21).
+
+The ND matrix applies in both DHCP phases and both anchor forms:
+
+| Message | Direction on selected physical interface | Source | Destination |
+|---|---|---|---|
+| RS (133) | out | `fe80::/10` | `ff02::2` |
+| RA (134) | in | `fe80::/10` | link-local unicast or `ff02::1` |
+| NS (135) | in/out | `fe80::/10` | link-local unicast or solicited-node multicast `ff02::1:ff00:0/104` |
+| NA (136) | in/out | `fe80::/10` | link-local unicast or `ff02::1` |
+| DAD NS (135) | in/out | `::` | solicited-node multicast only |
+
+Hop-limit handling (255) is **decided per OS in qualification**; the qualified
+OS record must specify the enforcement mechanism or limitation. The examples
+above do not assume a portable pf hop-limit syntax. No DHCPv6 or other IPv6
+traffic passes on the underlay. Next to the numeric UDP endpoint exception,
+there is exactly one SSH destination exception: outbound TCP 22 from the Mac
+to the gateway endpoint IP only, on the selected physical interface with
+`keep state (if-bound)`. The CLI pins the SSH host key. Both are bounded bypasses:
+any local app can send bytes to that IP:port outside WireGuard; UDP is not proof
+of WireGuard, and the TCP exception does not authenticate an application.
+
+ADR 0008 stands unchanged: SSH reaches the public, host-only listener, never
+the tunnel. In M5a the exception keeps all gateway CLI operations available
+through §10's SSH transport without leave, including deploy/rollback (ADR 0026)
+and high-risk local-socket mutations via SSH (ADR 0029). M5b moves routine admin
+to the tunnel API and turns public SSH into an explicit, expiring break-glass
+switch. High-risk mutations, deploy/rollback and API-unavailable fallback still
+use SSH and require that switch to be open; API authentication failures never
+trigger fallback. Closing or expiry removes the TCP 22 pass **and its admitted
+states**, with checked state removal and read-back through the serialized state
+machine. Switch authorization, expiry persistence and restart handling must be
+specified and qualified in M5b; an uncertain expiry must not reopen SSH. A
+closed-by-default switch conflicts with ADR 0008 (break-glass independent of
+every scupper component) and §10's SSH fallback, so M5b must amend ADR 0008 and
+§10 first, including recovery when the helper is hung and can neither open the
+switch nor leave.
+LAN access and captive-portal bypass are unavailable in M5a. LAN DNS, DoT and
+mDNS are blocked by the final block; DNS configuration is functionality, not
+the kill switch.
+
+### Verifier contract and status
+
+The verifier accepts only a small qualified surrounding configuration: the
+stock macOS main ruleset and stock `com.apple/*` siblings observed on the
+qualified OS matrix. Stock siblings are accepted only if they contain no rule
+that can match our traffic (traffic governed by `com.apple/scupper`, including
+traffic it would block). Stock names alone confer no trust. Record each accepted
+sibling's expanded contents and this assessment per OS build. Any earlier or
+sibling quick pass that could match our traffic produces `NotProtected`, even
+in a stock sibling; qualification cannot silently add an exception. It walks
+the expanded evaluation path, including all anchors before ours and siblings.
+It enumerates all interfaces with `ifconfig -l`, not just `en*`/`utun*`, and
+checks skip flags on
+every non-loopback interface. Tables, translation, `route-to`, unknown anchors
+before ours, or any other unqualified construct produce
+`NotProtected("unsupported pf configuration: …")`; it must not attempt to
+interpret arbitrary pf configurations as safe.
+
+Observations include bounded parses of `pfctl -s info`,
+`pfctl -a <anchor> -sr`, the main ruleset and expanded anchors,
+`pfctl -s Interfaces -v`, `ifconfig -l`, `scutil --dns`, `route -n get`,
+bounded `ipconfig getpacket <if>` lease/server/T1/T2 observations on every
+physical interface, and the supervised child generation and UAPI read-back.
+An unparseable observation is a verification failure, never evidence of
+protection. Successful non-atomic
+reads do not exclude transient changes between reads.
+
+"Exact anchor" means equality with **normalized pfctl output**, not the renderer's
+source text. For each intended policy generation: render, load, read back once
+with `pfctl -a com.apple/scupper -sr`, semantically verify the read-back against
+the intended policy and qualified OS normalization, then store that normalized
+text and its hash as the expected baseline. Later reads compare against that
+stored text/hash; never refresh the baseline from an unexplained live change.
+Lists may expand, ICMPv6 types may print as names and implicit TCP flags may
+appear. Qualification records these transformations and reviewed goldens per
+OS build; load/read-back or semantic mismatch is a verification failure. A
+planned policy change repeats the sequence under the serialized state machine.
+Non-atomic capture/read-back cannot exclude a transient foreign mutation.
+
+| Observed state | Result and action |
+|---|---|
+| Fresh, complete qualified observations; pf enabled, required hook and exact anchor present, no bypass, expected tunnel generation (if joined) | `Protected` for the verified pre-tunnel or joined policy; report tunnel health separately. |
+| Anchor missing/different | `Repair(load+verify pre-tunnel, kill all states, full verify, rejoin)`; every step must succeed before advancing. |
+| pf disabled | `Repair(pfctl -E, load+verify pre-tunnel, kill all states, full verify, rejoin)`; record the new reference token. |
+| Required main-ruleset hook missing | `NotProtected("Required pf hook missing; responsible process unknown")`; nothing of ours is evaluated: scupper's policy is not evaluated, and only routing still prefers the tunnel. Treat this as unprotected; persist error and notify. Never rebuild another owner's main ruleset. |
+| Earlier quick pass or sibling quick pass that could match our traffic, or skip flag on any non-loopback interface | `NotProtected(reason)`; for bypassed traffic, nothing of ours is evaluated; only routing still prefers the tunnel. Treat this as unprotected; report and notify; do not edit someone else's rules. |
+| Unqualified OS/surrounding configuration or unsupported construct | `NotProtected("unsupported pf configuration: …")`; no automatic rejoin through an unverified path. |
+| Parse failure, failed/hung privileged step or failed read-back | `NotProtected(reason)`; retain intent, record failure and notify. Credit blocking only where independently verified; if a hook/pass/skip bypasses us, nothing of ours is evaluated for that traffic. |
+| Child death, helper restart, wrong/reused utun, or previous-generation name-file/socket | `Repair(load+verify pre-tunnel, kill all states, full verify, recreate child)`; never adopt a surviving interface. |
+| Endpoint route recursion, missing physical gateway, or no unambiguous selected path among simultaneous uplinks (multiple leases alone are allowed) | `NotProtected(reason)` until a supported physical path is selected; retain pre-tunnel policy. |
+| Tool hash/owner mismatch with persisted join intent | Load and verify pre-tunnel policy and kill states before tool checks; then refuse join with `NotProtected(reason)`; a failed policy load is also reported. |
+| Observations stale, including helper unavailable/suspended | `Unknown`; show last full verification time, request fresh observations, never reuse a persisted `Protected` result. |
+
+Cheap checks target 1 s (normalized read-back hash against the stored baseline,
+pf enabled, hook present); a full walk targets 5 s. `route -n monitor` events
+and wake notifications also trigger
+checks. The stale-observation threshold and timeout-to-status mapping are to be
+fixed in 5a2; neither target interval is a maximum detection or recovery time.
+Known failures remain errors; staleness cannot turn them into success. Status
+keeps three independent facts: persisted join intent, observed enforcement,
+and tunnel health. A handshake is never an enforcement check.
+
+### Serialized join, leave and repair
+
+One state machine serializes join, leave, repair, network-change handling and,
+in M6a, update activation. No socket request, monitor event or child callback
+may run a competing mutation. Its durable phases distinguish intent,
+pre-tunnel enforcement, child generation, joined enforcement, leaving, and
+failure; restart reconciles observed state rather than trusting a phase label.
+A durable `leaving` phase takes precedence over persisted join intent: restart
+completes the authorized leave, with checked cleanup, rather than rejoining.
+All-state flushing uses `pfctl -F states` with a checked outcome, including
+states admitted during a detected gap.
+
+1. **Join:** persist intent; acquire a pf reference if necessary; load and read
+   back pre-tunnel policy; kill all states; verify enforcement. Check installed
+   tool ownership/hashes only after pre-tunnel enforcement. If verification or
+   integrity fails, retain intent and available blocking, report the error and
+   stop before starting a child.
+2. Start a new foreground child and configure UAPI, addresses, MTU, endpoint
+   host route, split routes and DNS; check the outcome after each step. Read
+   back the current-generation utun identity before rendering its passes.
+3. Load the joined anchor and fully verify it. Report `Protected` only from
+   successful enforcement observations; report joined/healthy only after the
+   tunnel also has a fresh handshake. A tunnel failure does not imply leave.
+4. **Repair/planned teardown:** load and verify pre-tunnel policy, kill all
+   states, then release the old interface and clean up owned routes/DNS. Rejoin
+   only after verified enforcement, using a new child generation. If pf was
+   disabled, first take a new enable reference. Each failed step stops the
+   transition and records `NotProtected`; unsupported surrounding rules or
+   hook loss require operator action, not a main-ruleset reload.
+5. **Leave:** after the authorized request, durably enter leaving; load and
+   verify pre-tunnel policy, kill states, stop the child and clean up owned
+   routes/DNS. Only then remove the anchor, release the helper's pf reference
+   and clear join intent. Interrupted leave resumes this sequence on restart,
+   without recreating the tunnel; a crash outside a durable leaving phase,
+   unreachable gateway or dead provider never constitutes leave.
+
+On startup, a durable leaving phase completes leave first. Otherwise, with
+persisted join intent, the helper loads and verifies pre-tunnel enforcement
+and kills states before installed-tool checks or tunnel recovery. Without join
+intent it installs no enforcement. While join is intended and leave is not
+pending, child death or helper restart requires pre-tunnel policy and a state
+flush first, then recreation;
+never adopt a surviving utun, name-file or socket from a previous generation.
+The death-to-utun-reuse race remains a limitation: a name alone is not identity,
+and reuse or traffic before detection may escape observation. Interface-bound
+states and state flushing must be qualified (V-20), not assumed to eliminate
+that race.
+
+### Addresses, routes, DNS and MTU
+
+The helper covers the darwin tunnel lifecycle itself. It installs IPv4 and
+IPv6 /1 split routes through the owned utun, and an IPv4 endpoint host route
+through the selected physical gateway. It discovers that gateway independently
+of its own split/endpoint routes, checks that endpoint resolution cannot
+recurse into the utun, and reads the installed route back. A missing gateway
+must not fall back to a tunnel route. With simultaneous uplinks it selects one
+unambiguous physical interface/gateway for the endpoint and its UDP/TCP 22/ND
+passes; DHCP rules remain on every physical interface. Multiple valid leases
+are normal, for example on a docked laptop, and alone do not fail verification.
+Only inability to select a supported endpoint path fails explicitly; exact
+selection/tie-breaking rules are to be fixed in 5a2. Endpoint-route refresh
+after network changes goes through pre-tunnel enforcement, state flushing,
+validated path selection, route
+replacement and verification before joined passes return. Cleanup removes
+only owned routes, including stale endpoint routes. DHCP option 121 and hostile
+RA routes may defeat tunnel routing; they must not create new pf exceptions.
+
+MTU defaults to **1280**, with an explicit validated override. The helper sets
+and reads back the MTU. Override validation details and exact multi-uplink
+selection rules are to be fixed in 5a2 and qualified before support is claimed.
+
+The helper owns exactly one Dynamic Store DNS key:
+`State:/Network/Service/net.scupper/DNS`. Its dictionary contract is:
+
+| Field/behavior | Specification |
+|---|---|
+| `ServerAddresses` | Array containing the tunnel resolver: `["10.99.0.1"]`. |
+| `SearchOrder` | Lower values win; the numeric value and interaction with stock/supplemental resolvers are to be fixed in 5a2. |
+| Default-domain matching, search-domain and interface-scoping fields | Exact field inclusion, types and values are to be fixed in 5a2, with `scutil --dns` read-back proving default resolution through the tunnel. |
+
+5a2 must finalize and qualify the dictionary before implementation is accepted.
+The helper reconciles only its own key on restart and removes only that key on
+leave or crash recovery before recreating it for persisted join intent
+(unless a durable leave is pending); it never overwrites another service's
+resolver.
+Whether removal restores the underlying system resolver configuration is a
+5a2 qualification item, including configd and supplemental-resolver behavior;
+it is not assumed. Effective resolver read-back and network-change
+reconciliation test functionality; pf continues to block LAN DNS even if
+resolver selection fails.
+
+### Installation and later unattended updates
+
+In M5a, `scupper mac setup` is the only installer, including refresh of the
+installed privileged binaries. The user-run CLI imports the existing
+`~/.scupper/scupper0.conf`: device private key, peer public key, tunnel addresses
+and numeric IPv4 endpoint/port. It accepts only validated WireGuard data fields,
+not hook commands or arbitrary executable configuration, and passes typed data
+to the installer for validation and storage in the root-owned helper config
+(0700 directory, private-key files 0600). The helper never reads the user file
+at runtime. Setup records the invoking uid as the owner before elevation.
+The existing user copy is retained for app binding/legacy use in M5a, so its
+private key remains readable by that user; importing it does not make that key
+root-exclusive. Setup reports this retained-copy limitation. Missing or invalid
+input fails setup; M5a does not generate or register a new device. Enrolment and
+new-key registration stay M5b. The user's own `scupper` fetches the release
+archive and checksums from the fixed GitHub release source over TLS and verifies
+sha256 before the user-run setup and its one admin prompt. R1 binaries are not
+notarized; the trust anchor is GitHub TLS plus release checksums, which do not
+authenticate a compromised release host. Authenticated release metadata is an
+R2 extension (§16); signing/notarization accompanies the later Network
+Extension milestone, which needs an Apple Developer account.
+
+M6a adds unattended provisioning and upgrades. The privileged helper must take
+**only a release identifier**, download from the fixed GitHub URL over TLS into
+root-owned staging, verify the release itself, and activate atomically with a
+durable rollback record. It must never accept caller-supplied executable paths,
+archives or checksums as privileged update authority. Activation is serialized
+with join/leave/repair, maintains verified pre-tunnel enforcement throughout
+when join is intended, checks each step, and rolls back on failure. No user
+agent staging directory is trusted for privileged activation.
 
 ### App binding
 
@@ -2457,57 +2760,95 @@ plugins, and tracker DNS lookups can use the currently available route.
 App/version compatibility, proxy behavior, race-free concurrent writers,
 and a two-key Transmission rollback
 on partial failure remain follow-ups; these settings alone do not establish
-the Mac-wide firewall guarantees described above.
+the bounded Mac-wide firewall claim described above.
 
-### Auto-join (ADR 0021)
+### M5b agent, auto-join, notifications and enrolment
 
-The per-user LaunchAgent `net.scupper.agent` (`scupper mac agent run`)
-watches `route -n monitor`,
-debounces 2 s and fingerprints the network as (interface, default gateway
-IP, gateway MAC from `arp`); SSIDs are not used (recent macOS hides them
-without location permission). Policy: **untrusted → join; trusted → nothing.**
-The trusted list is **empty by default**; unknown or unreadable networks are
-untrusted. There is **no auto-leave** in R1: the fingerprint is a
-convenience hint, not an authenticated network identity, and a spoofed
-router (same gateway IP and MAC) must never be able to remove protection.
-The same spoofing can make an untrusted network look trusted and so prevent
-an auto-join; that is why the trusted list is empty by default and staying
-joined everywhere is the recommended mode. The agent can ask the helper to
-join; it asks it to leave only on an explicit user command.
-Auto-join is not zero-gap: traffic between a network change and the join is
-not protected unless the Mac stays joined.
+The per-user LaunchAgent `net.scupper.agent` (`scupper mac agent run`) is M5b.
+It watches `route -n monitor`, debounces 2 s, and fingerprints the network as
+(interface, default gateway IP, gateway MAC from `arp`), without SSIDs. Policy
+is untrusted → join, trusted → nothing; the trusted list is empty by default,
+and unknown/unreadable networks are untrusted. There is no auto-leave. The
+fingerprint is a convenience hint, not authenticated identity; spoofing can
+prevent auto-join if a trusted entry exists. Staying joined is recommended.
+Traffic before an auto-join is not protected unless enforcement already holds.
 
-### Notifications
+The agent requests join and requests leave only on an explicit user command;
+this convention does not strengthen the same-user socket trust boundary. Full
+notifications cover joined/left, stale client handshake (> 3 min), gateway
+context from the API/SSH when available, warning-or-higher gateway events from
+`GET /v1/events?wait=30s`, and failover. M5a's minimal helper failure notification
+does not depend on this agent.
 
-The user agent posts notifications (`osascript -e 'display notification …'`) for:
-joined/left; **gateway unreachable** (client handshake stale > 3 min while
-joined: "gateway unreachable, traffic blocked"; when the API or SSH still
-answers, the notification adds the gateway's own view, e.g. "gateway
-healthy, no client handshake: check the cloud firewall for UDP 51820"); gateway events of severity ≥
-warning (from `GET /v1/events?wait=30s`); failover.
+`scupper mac enroll --gateway HOST` (M5b) generates a WireGuard device key and
+32-byte API token on the Mac, then registers the public key and token sha256
+with `scupper device add …` over SSH. Token:
+`~/.config/scupper/token` (0600, user; same-user readability is bounded by
+ADR 0029); the helper's private key is in its root-only configuration. After
+each `ConfigCommitted` event the agent saves `GET /v1/config/bundle` to
+`~/.config/scupper/bundles/` (keeps 10).
 
-### Enrolment and local files
+### Testing and macOS release gates
 
-`scupper mac enroll --gateway HOST` generates the device WireGuard key
-(`wg genkey`) and a 32-byte API token **on the Mac**, then over SSH runs
-`scupper device add …` with the public key and the token's sha256 (a new
-config version). Token: `~/.config/scupper/token` (0600, user; any process
-of that user can read it, which ADR 0029 bounds); key: inside
-`scupper0.conf` (0600 root, root-owned directory). After each `ConfigCommitted` event the agent
-saves `GET /v1/config/bundle` to `~/.config/scupper/bundles/` (keeps 10).
+`scupper mac selftest` is safe on the user's Mac: no anchor/hook removal, pf
+disable, permissive reload, teardown, helper suspension or other deliberate
+loss of protection. It reports the exact probes, conditions and observations,
+with positive controls that distinguish a blocked probe from a dead destination.
+It never claims that successful probes prove all traffic cannot leak.
 
-### Mac test matrix (reduced, external capture)
+Lab qualification uses a disposable local Apple Virtualization macOS VM on the
+user's Mac, with capture on the guest NIC **before NAT** through a file-handle
+network attachment. Start capture **before guest boot** for reboot cases.
+Run production rules unchanged, with individual faults and compound failures
+(especially policy loss while the helper is dead, suspended or hung), and record
+pass conditions before the run. Send continuous numbered canaries with positive
+controls across every transition, covering IPv4 and IPv6 flows on all enabled
+links. Capture permits only the documented UDP endpoint, TCP 22 (while enabled),
+DHCP-phase and ND exceptions on the physical link; any other stack-origin
+traffic on a qualified path is evidence against protection, with its timing and
+observed status recorded. Record excluded BPF/raw-frame and unqualified bridged
+traffic separately; successful probes do not extend the claim to those paths.
+Measure boot, detection and recovery gap distributions, including missed
+transients; never infer a maximum bound from samples.
 
-join/leave; sleep/wake; Wi-Fi change; Ethernet plug-in; `wg-quick` process
-death; agent death; helper death; reboot with a persisted join; pf reload by
-macOS (firewall toggle, Internet Sharing); OS update; DHCP option 121
-routes more specific than wg-quick's /1 routes (TunnelVision); DHCP DNS
-change after a network change; a hostile RA with a Route Information
-Option; established TCP and UDP flows across route deletion, sleep/wake,
-anchor loss and utun-number reuse. Each case is checked with a capture on a
-machine outside the Mac against pass conditions written down beforehand:
-what may appear (UDP to the gateway endpoint, TCP 22 to it, DHCP and ND on
-the local link) and that nothing else does.
+The fault matrix includes join/leave; wireguard-go death; helper death,
+restart and suspension; route deletion; anchor removal; hook removal; pf
+disable; persistent and transient permissive reloads; sleep/wake; utun reuse
+and stale name-files/sockets; reboot with persisted join; firewall toggle,
+Internet Sharing, OS update and another VPN/pf tool; iCloud Private Relay,
+other Network Extensions and Apple-service coexistence; earlier/sibling quick
+passes and non-loopback skip flags; unparseable and unsupported rules;
+DHCP acquisition, renewal, T2 rebinding, option 121 and DNS changes; Wi-Fi
+change, Ethernet plug-in and simultaneous uplinks; missing gateway/endpoint
+route recursion; hostile RA with Route Information Option; established TCP
+and UDP flows across route changes, policy loss and reuse. Inject faults after
+each privileged step, including failed and hung commands, setup/uninstall
+interruptions and integrity mismatch. Include bridged VMs, vmnet and Internet
+Sharing traffic, recording bridge pfil settings and whether frames reach pf;
+unsupported bridge paths cannot be claimed protected. Exercise BPF injection,
+including user-group access to `/dev/bpf*` such as ChmodBPF enables, and raw-frame
+injection as exclusions: packets bypassing the stack are outside the pf claim,
+not evidence of enforcement. Determine whether IPConfiguration DHCP uses BPF
+(V-21); a lease alone does not prove the DHCP rules were exercised. Scripted
+real-hardware Wi-Fi and sleep/wake cases run on the user's Mac in addition to
+VM qualification; the M5b matrix adds agent death.
+
+Slices and required evidence:
+
+| Slice | Scope | Evidence |
+|---|---|---|
+| 5a0 | This specification and ADR amendments, reviewed before 5a1. | Consistency review. |
+| 5a1 | Pure anchor renderer, parsers, qualified evaluation-path walker and verifier. | Semantic rule/verifier table tests, properties and mutation tests; render → load → read back once → store normalized text/hash → compare later reads, with semantically reviewed per-OS normalization goldens and stock-sibling assessments. |
+| 5a2 | launchd helper, supervision/UAPI, address/route/DNS/MTU lifecycle, repairs, crash-safe state and socket authorization; fix the open details above. | Fake-System fault injection after every privileged step. |
+| 5a3 | `setup`, `join`, `leave`, `status`, `uninstall`. | Interrupted setup/refresh/uninstall tests; unattended updates remain M6a. |
+| 5a4 | Safe `selftest` and separate lab qualification. | Continuous numbered canaries and positive controls on every enabled link/family; pre-NAT capture before boot, individual/compound faults, exclusions and gap distributions. |
+
+GitHub macOS CI runs 5a1–5a3 tests and a non-blocking smoke test only; it cannot
+substitute for lab qualification. **V-05, V-20 and V-21 are macOS-helper release
+gates**, tied to the exact OS build and helper/wireguard-go artifact hashes.
+Unsupported or unqualified combinations cannot report `Protected`. Record the
+ND hop-limit decision per OS, DHCP exceptions, state behavior, real-hardware
+results and measured gaps with each qualification record.
 
 ---
 
@@ -2742,8 +3083,10 @@ reflects the verdict. A first deploy to a fresh host (nothing to roll back
 to) skips steps 4 and 7 and says so.
 
 `scupper upgrade [<gateway>] [--version V]`: download the release artefact
-and `SHA256SUMS` over HTTPS, verify, then the same deploy flow. On the Mac
-itself, upgrades go through Homebrew.
+and `SHA256SUMS` over HTTPS, verify, then the same gateway deploy flow. Mac
+privileged installation/refresh uses user-run `scupper mac setup` in M5a;
+unattended provision/upgrade is M6a with helper-owned download, verification
+and atomic activation/rollback (§14, ADR 0033).
 
 In M2, `deploy --host ADDR` exists without the rollback timer (steps 1-3
 and 5): enough for the migration to a fresh host, where the old host is the
@@ -2859,7 +3202,7 @@ Terraform example stays R2+.
 |---|---|
 | `scupper-<version>-x86_64-unknown-linux-musl.tar.gz` | gateway: `scupper`, `scupperd`, `scupper-edge`, unit files, `MANIFEST` |
 | `scupper-<version>-aarch64-unknown-linux-musl.tar.gz` | gateway, same contents |
-| `scupper-<version>-aarch64-apple-darwin.tar.gz` | Mac (built on a macOS runner) |
+| `scupper-<version>-aarch64-apple-darwin.tar.gz` | Mac: CLI/helper and pinned `wireguard-go` (built on a macOS runner; §14) |
 | `SHA256SUMS` | all of the above |
 
 - **Linux install script** (`install.sh` in the repository and release):
@@ -2867,8 +3210,9 @@ Terraform example stays R2+.
   HTTPS, verifies the sum, installs the binaries to `/usr/local/bin/`, prints
   `scupper install` as the next step. It changes nothing else.
 - **Homebrew tap** for the Mac: `brew tap <org>/scupper && brew install scupper`,
-  then `scupper mac enroll --gateway <address>`. The formula pins the
-  artefact's sha256.
+  for the user CLI; `scupper mac setup` installs the privileged helper and
+  release-bundled tunnel driver (§14). Enrolment arrives in M5b. The formula
+  pins the artefact's sha256; it is not the privileged update path.
 - Checksums detect corruption, not a compromised release host; signing is
   R2.
 
@@ -2930,8 +3274,8 @@ VM rehearsal in CI.
 ### High availability (deferred; ADR 0024)
 
 Both options remain open; R1 implements neither. Either way the client stays
-fail-closed during a switch (pf holds on the Mac; no gateway ever forwards
-outside a VPN exit).
+fail-closed during a switch (qualified, verified Mac pf policy holds within
+§14's claim; no gateway ever forwards outside a VPN exit).
 
 | | (a) Server-side active/standby | (b) Client-side gateway switching |
 |---|---|---|
@@ -3272,7 +3616,7 @@ R1's policy-rule and route inventories catch steady-state drift first.
 | L32 | v6 via v6 exit (when V-11 passes) | works; uplink clean | M4 |
 | L33 | RA and redirect injection from the client tunnel and from an exit | no route or address change in netns | M4 |
 | L34 | non-global destinations: client to 10.2.0.1:80, 192.168.1.1, fe80::1, multicast | dropped | M4 |
-| L35 | API: scan from uplink and from provider side (v4, v6); wrong source, missing token, wrong Host, preflight | no response from uplink/provider; 401/403 otherwise | M5 |
+| L35 | API: scan from uplink and from provider side (v4, v6); wrong source, missing token, wrong Host, preflight | no response from uplink/provider; 401/403 otherwise | M5b |
 | L36 | rebuild rehearsal: fresh VM from a bundle | check 0 within the time budget | M6 |
 | L37 | VM reboot of a provisioned image | check 0; uplink capture clean from the first packet | M6 |
 | L38 | deploy a deliberately broken build (tunnel down, check ≠ 0); kill scupperd during the window; reboot during the window | no confirmation; rollback at deadline by the previous binary; uplink capture clean throughout; previous revision applied; event recorded | M6 |
@@ -3330,7 +3674,7 @@ still execute after a client hangs up because they only tighten policy.
 | Host `nftables.service` stop or reload, ufw | netns layout: no effect on containment; ufw may block client UDP (availability). **M1 layout: the stock unit flushes the host ruleset on stop; with the exit down, rule 1000 missing or the gateway disconnected, client traffic follows the main table to the uplink** | netns: stage 4 client side, handshake ages; M1: `check` 2 when run | netns: none needed; M1: lab only, never deployed (§19, D-1) |
 | Host or cloud firewall blocks WireGuard UDP | exits: handshakes fail, closed; clients: cannot connect while the gateway side is healthy | exit handshake ages; client handshake ages (warning); stage 4 for local causes; Mac agent notification with the gateway's view | `install --check` warns |
 | Host uplink down | handshakes stop; closed | handshake ages | FailClosed; alerts queued until uplink returns |
-| **Gateway host lost** (VM deleted, hypervisor failure, region outage) | clients fail closed (Mac pf holds) | Mac agent: "gateway unreachable"; external heartbeat service alerts when pings stop | rebuild from bundle (§15, ~10 min) |
+| **Gateway host lost** (VM deleted, hypervisor failure, region outage) | qualified, verified Mac pf policy blocks outside documented exceptions (§14) | M5a: helper handshake checks and `mac status`; M5b agent: "gateway unreachable"; external heartbeat service alerts when pings stop | rebuild from bundle (§15, ~10 min) |
 | Reboot | closed until boot finishes | `Boot` event | `scupper boot` |
 | `scupper boot` fails mid-way | closed (prefix rule); edge not started | unit failed; scupperd alert | scupperd retries under budget; operator via SSH |
 | Invalid config committed | rejected | validation | stays on head |
@@ -3343,10 +3687,10 @@ still execute after a client hangs up because they only tighten policy.
 | Heartbeat service down | no dead-man coverage | delivery errors | `HeartbeatFailed` warning |
 | Device token leaked (any process of the Mac user can read it) | from the device's tunnel address: the operational API (status, connect/disconnect, exit selection, low-risk config); no device, exit or alert changes (ADR 0029) | events carry the `Device` actor | rotate over SSH |
 | Edge compromised (for example through a DNS parsing bug) | can assert device principals for the operational set, observe and stop client DNS; cannot make high-risk changes, reach the uplink or host proxy sockets | – | unprivileged, no keys, minimal filesystem view; splitting DNS and API into two processes is an R2 option |
-| Mac tunnel down while joined | Mac traffic blocked by pf | agent handshake check | notification; stays blocked |
-| Mac agent or helper crash | agent: no auto-join or notifications; helper: no re-verification; pf rules and states persist | launchd KeepAlive | restart; the helper re-verifies and flushes states after any repaired gap |
-| macOS reloads pf.conf or disables pf | protection gap until detection (≤ 5 s, measured in V-05) | 5 s re-verify of the whole evaluation path | pre-tunnel anchor, flush states, rejoin, notify |
-| Mac reboot while joined | unprotected until the helper starts | persisted join intent | helper loads the pre-tunnel anchor at load, then joins |
+| Mac tunnel down while joined | qualified, verified pf policy blocks outside documented exceptions (§14) | helper child/UAPI/handshake checks; full agent context in M5b | retain intent and available blocking; recreate child only after verified pre-tunnel enforcement |
+| Mac agent or helper crash/suspension | agent (M5b): no auto-join/full notifications; helper: no new verification; existing pf state persists but may change independently | launchd KeepAlive for death; stale observations → `Unknown` | helper restart loads/verifies pre-tunnel policy and kills states before tool checks or child recreation; never adopt an old utun (§14) |
+| macOS reloads pf.conf or disables pf | protection may be lost; no maximum detection/recovery duration (§14) | cheap/full checks target 1 s/5 s; missed transients possible; V-05 gap distributions | checked repair for anchor loss/pf disable; missing hook or unsupported surrounding rules → `NotProtected`, durable error and notification; never rebuild the main ruleset |
+| Mac reboot while joined | boot before helper enforcement is unprotected | persisted join intent; V-05 measurements | helper loads/verifies pre-tunnel policy and kills states before tool checks, then recreates the tunnel (§14) |
 | Deployed binary or config breaks the tunnel, API or check | no confirmation arrives | rollback timer | gateway restores previous binary and revision itself, fail-closed; `DeployRolledBack` alert |
 | Crash or reboot during a pending deploy | timer owned by systemd; guard unit at boot | `pending.json` | rollback at deadline, before the boot procedure if needed |
 | Rollback itself fails | gateway stays closed | `DeployRolledBack{result: failed}`, heartbeat verdict | operator via break-glass SSH |
@@ -3364,8 +3708,11 @@ Each milestone ends tested and deployable.
 | **M2 Netns + daemon** | Workspace split; netns layout (§3, §5.2 M2 parts, §5.4); `scupper boot`; scupperd reconcile loop, repairs, budgets, planner; single-exit failover machine; event log; alert sinks (ntfy, webhook); external heartbeat; exit code 5; basic `scupper install`, basic `scupper deploy --host` (no rollback timer) and config version store + bundle; leak harness in CI with L1-L20; migration to a fresh host. | L1-L20, L41, L43, L44, L46, L50, L52, L53, L55 green in CI; fake-system scenarios green, including the latch property; new gateway serving the Mac with `check` = 0 and rebooted twice with `check` = 0 afterwards and a clean uplink capture from the first packet; host `ip rule flush` → still 0; `ip -n scupper route del default` → 3 then repaired; heartbeat observed at the external service and stopping when scupperd is stopped; old gateway kept as rollback. |
 | **M3 Exits** | Two exits; full failover machine (sticky, pin, prefer, optional auto failback); hot standby (after V-09) or cold; `exit list/show/use/auto/test/import`. | L21-L27, L47, L48 green; V-09, V-10, V-25 recorded; cold-standby outage measured against its 30-60 s target; real failover on the gateway by blocking one exit's endpoint: switch ≤ 20 s, event and alert delivered. |
 | **M4 DNS + IPv6** | Edge with forwarder; `dns_redirect`, 853 rejects, `nonglobal` sets; dual-stack model, v6 fail-closed path; v6 exit only after V-11. | L28-L34, L42, L45, L49, L54 green; Mac resolves via 10.99.0.1; an opportunistic DoT client falls back to 53 and a strict DoT client fails without sending plaintext DNS; v6 on v4-only exit gets ICMPv6 unreachable; V-11, V-12, V-26 recorded. |
-| **M5 API + Mac** | Tunnel API and auth; CLI transports; `/metrics`; `scupper mac` join/leave, pf anchor, auto-join, notifications, enrolment, bundle copies. | L35 green; auth unit tests; Mac matrix (§14) passed with external capture against the written pass conditions; V-05, V-06, V-20, V-21 recorded; CLI works identically via local, API and SSH. |
-| **M6 Installer + release** | `install` hardening (`--check`, preflight incl. host firewall, idempotence tests); confirm-or-rollback `deploy`, `upgrade`, guard unit; `gateway create --provider digitalocean` with operator-side secret references; distribution (Linux install script, Homebrew tap, artefacts for x86_64/aarch64 Linux musl and aarch64 macOS with `SHA256SUMS`); timed rebuild rehearsal; VM reboot test; reproducible-build check. | L36-L39, L51 green; V-18, V-27 recorded; second `install` run is a no-op; a broken deploy rolls back by itself, including one that changes a unit file and one whose own check falsely reports 0; `gateway create` + `deploy` + `mac enroll` reach `check` = 0 on a fresh VM (DigitalOcean client also green against the fake API in CI); rebuild ≤ ~10 min in rehearsal; two builds bit-identical. |
+| **M5 API + Mac** | Delivered in M5a (qualified pf enforcement) and M5b (Tunnel API and user agent). | Both submilestones pass; V-06 recorded; CLI works identically via local, API and SSH. |
+| **M5a Mac pf** | §14 slices 5a0–5a4: specification first, renderer/verifier, launchd helper and pinned supervised tunnel driver, UAPI/address/route/DNS/MTU lifecycle, `setup/join/leave/status/uninstall/selftest`, durable failure reporting and minimal notification. | Semantic/property/mutation tests, Fake-System faults after each privileged step, interrupted setup/refresh/uninstall tests; safe selftest with positive controls; V-05/V-20/V-21 release gates passed per OS build and artifact with pre-NAT VM capture, scripted hardware Wi-Fi/sleep results and measured gap distributions. No recovery bound claimed. |
+| **M5b API + Mac agent** | Routine admin via tunnel API/auth, CLI transports and `/metrics`; public SSH becomes an explicit, expiring break-glass switch with state removal on close/expiry (§14); user agent, auto-join, full notifications, enrolment and bundle copies. | L35 and auth tests green; agent failure and network-change matrix (§14); enrolment/bundle recovery verified; transport parity with the switch open for SSH, including high-risk changes/deploy; expiry/close removes admitted SSH states. |
+| **M6 Installer + release** | `install` hardening (`--check`, preflight incl. host firewall, idempotence tests); confirm-or-rollback `deploy`, `upgrade`, guard unit; `gateway create --provider digitalocean` with operator-side secret references; distribution (Linux install script, user-CLI Homebrew tap, artefacts for x86_64/aarch64 Linux musl and aarch64 macOS with `SHA256SUMS`; privileged Mac path in §14); timed rebuild rehearsal; VM reboot test; reproducible-build check. | L36-L39, L51 green; V-18, V-27 recorded; second `install` run is a no-op; a broken deploy rolls back by itself, including one that changes a unit file and one whose own check falsely reports 0; `gateway create` + `deploy` + `mac enroll` reach `check` = 0 on a fresh VM (DigitalOcean client also green against the fake API in CI); rebuild ≤ ~10 min in rehearsal; two builds bit-identical. |
+| **M6a Unattended provision + upgrade** | Unattended Mac operations after setup. Helper accepts only a release identifier; downloads from fixed GitHub URL over TLS into root staging, verifies itself, activates atomically with durable rollback record; serialized with join/leave/repair (§14). | No caller-staged privileged executables/archives/checksums accepted; interrupted download/activation/reboot and rollback fault tests; verified pre-tunnel enforcement maintained throughout activation when joined; qualification gates remain tied to OS build and artifact. |
 
 ### Decisions on scope and guarantees
 
@@ -3374,10 +3721,11 @@ Each milestone ends tested and deployable.
   carries traffic. The existing v1 gateway is left unchanged; the first
   deployment is M2 on a freshly built host (§16).
 - **D-2 Mac enforcement: pf in R1, re-evaluated for R2.** R1 states the
-  narrowed guarantee of §1 (enforced while pf evaluates the anchor; removal
-  detected and repaired within 5 s; the boot window measured, V-05). R2
-  re-evaluates a Network Extension packet tunnel using the V-05 and V-20
-  measurements.
+  qualified-configuration claim of §14: 1 s/5 s check targets, no guaranteed
+  maximum detection/recovery duration, stale observations → `Unknown`, and
+  unprotected boot before enforcement. V-05 reports gap distributions. R2
+  re-evaluates a Network Extension packet tunnel using V-05 and V-20; it
+  requires an Apple Developer account.
 - **D-3 Command-defined secret backends: in R1**, under the rules of §8
   (never as root, user-owned config only, argv without shell, minimal
   environment).
@@ -3399,7 +3747,7 @@ hardware) before anything depends on them.
 | V-02 | With `rp_filter=0`, standby probes bound with `SO_BINDTODEVICE` succeed while the netns default route is `unreachable` or points at another exit (IPv4; for IPv6 see V-22), so the gateway leaves FailClosed by itself | L16, L22 | M2 |
 | V-03 | Writing `ip_forward` rewrites per-device `forwarding` and `accept_redirects` and nothing else relevant (in particular not `rp_filter`), and re-applying restores every hardening value | L18 + fake-system test | M2 |
 | V-04 | Kernel canonicalization through a throwaway namespace yields identical JSON for live and rendered rulesets on Ubuntu 22.04, 24.04 and Debian 12 (`ifname` sets and `iifname`/`oifname` load without the links); stays `Exact` across an nft userspace upgrade without reboot (L41); `canon` aborts when the namespace switch failed | golden + CI matrix | M1 (host table), M2 (netns) |
-| V-05 | The pf sub-anchor `com.apple/scupper` is evaluated via the stock `anchor "com.apple/*"`. For each macOS operation that reloads or changes pf (firewall toggle, Internet Sharing, OS update, sleep/wake, another VPN or pf tool): whether the anchor or its evaluation path is removed, and the measured gap until the helper's repair. Also the unprotected window from boot to the helper's load with a persisted join | Mac matrix with external capture | M5 |
+| V-05 | Effective evaluation of `com.apple/scupper` on each qualified stock configuration and the full §14 fault matrix, including individual/compound failures (policy loss with helper unavailable), failed/hung privileged commands, Private Relay/Network Extensions/Apple services and bridged VM/vmnet/Internet Sharing paths. Check truthful `NotProtected`/stale `Unknown`, repair outcomes and BPF/raw-frame exclusions; measure gaps and missed transients without a maximum bound. | Continuous numbered IPv4/IPv6 canaries and positive controls on all enabled links across every transition; local Apple Virtualization VM guest-NIC capture before NAT via file-handle attachment, already running before guest boot; unchanged production rules; scripted hardware Wi-Fi/sleep; record OS build/artifact hashes and bridge pfil behavior | M5a macOS-helper release gate |
 | V-06 | macOS source-address selection with a ULA-only v6 address: how much traffic uses the v6 exit | Mac capture | M4/M5 |
 | V-07 | The renderer never emits `iif`/`oif` except for `lo` | property test R-07 | M1 |
 | V-08 | The provider drops un-NATed packets from an absent ruleset (informational; I1 does not depend on it) | gateway test with the ruleset removed in a lab namespace | M3 |
@@ -3414,8 +3762,8 @@ hardware) before anything depends on them.
 | V-17 | `redirect to :53` in the `inet` family works for IPv6 queries on the target kernels | L28 | M4 |
 | V-18 | A `systemd-run --on-active` transient timer fires after scupperd and edge are killed, and the guard unit performs or re-arms the rollback after a reboot | L38 in a VM | M6 |
 | V-19 | Exact `pass-cli` command, output format and minimum version for reading one field of `pass://vault/item/field`; `PROTON_PASS_AGENT_REASON` accepted; not-logged-in exit status and message detectable | `pass-cli --help` and a test vault; parser unit tests on captured output | M6 |
-| V-20 | macOS pf accepts `keep state (if-bound)` and binds states to the utun: established TCP and UDP flows do not pass on a physical interface after a route change, anchor loss or utun-number reuse | Mac capture | M5 |
-| V-21 | Whether a non-root macOS process can bind UDP 68/546 while the system DHCP client runs; the restricted DHCP rules still allow lease acquisition and renewal | Mac test | M5 |
+| V-20 | Qualify explicit `keep state (if-bound)` and `no state` semantics; established TCP/UDP across route deletion, policy loss, sleep/wake, child death and utun reuse. Verify pre-tunnel load/read-back → kill states → release/recreate ordering and rejection of previous-generation sockets/name-files; record the remaining death-to-reuse race and any escapes. | Same pre-NAT VM and scripted hardware matrix as V-05, production rules unchanged, OS build and artifact hashes | M5a macOS-helper release gate |
+| V-21 | Qualify DHCPv4 acquisition before a lease/gateway on every physical interface, including simultaneous Wi-Fi/Ethernet, renewal and T2 rebinding/network change; bound rules restrict to each lease server, acquiring/rebinding permits inbound UDP 67→68 from any source and outbound broadcast 68→67 on each acquiring interface. Verify `ipconfig getpacket` lease/T1/T2 observations. Establish whether IPConfiguration sends/receives DHCP through BPF: packets pf never sees cannot validate DHCP rules, and successful leasing alone proves nothing about them. Test non-root UDP 68 binding while the system client runs. Verify ND/hop-limit decision, no DHCPv6/global-v6 bypass, LAN-DNS blocking, and endpoint-only UDP/TCP 22 on the selected physical interface with interface-bound states and CLI host-key pinning; demonstrate that any local app can use those destination exceptions. M5b adds SSH switch expiry/close and admitted-state removal. | Same pre-NAT VM and scripted hardware matrix as V-05, production rules unchanged, OS build and artifact hashes; record all destination/address/port and BPF exclusions | M5a macOS-helper release gate; M5b switch qualification |
 | V-22 | An IPv6 socket bound with `SO_BINDTODEVICE` to a standby gets no route while the netns v6 default is `unreachable` or via another exit (expected; standby probes are IPv4 only) | L16 variant | M2 |
 | V-23 | `nftables.service` on the target distributions runs `nft flush ruleset` on stop; whether package upgrades restart it; whether a drop-in clearing `ExecStop=` prevents the flush | VM; read-only `systemctl cat nftables` on a v1 gateway | M1 |
 | V-24 | Whether systemd-networkd with `ManageForeignRoutes=yes` deletes routes in table 51820 on an unmanaged link | VM | M1 |
@@ -3450,7 +3798,7 @@ hardware) before anything depends on them.
 | [0018](adr/0018-alerts-via-uplink.md) | Alerts and heartbeat leave via the host uplink |
 | [0019](adr/0019-jsonl-event-log.md) | JSON Lines event log |
 | [0020](adr/0020-probes-resolve-through-exit.md) | Probes resolve names through the exit they test |
-| [0021](adr/0021-mac-wg-quick-pf.md) | Mac: wg-quick, pf sub-anchor, fingerprint-based auto-join |
+| [0021](adr/0021-mac-wg-quick-pf.md) | Mac: wg-quick, pf sub-anchor, fingerprint-based auto-join (amended by 0033) |
 | [0022](adr/0022-polling-reconcile.md) | Level-triggered polling reconcile loop |
 | [0023](adr/0023-secret-refs.md) | Secret references: gateway files by name, operator secrets resolved just in time |
 | [0024](adr/0024-ha-options-deferred.md) | High availability options, deferred |
@@ -3462,6 +3810,7 @@ hardware) before anything depends on them.
 | [0030](adr/0030-mac-root-helper.md) | Mac: a minimal root helper with root-owned tools, a user agent for the rest |
 | [0031](adr/0031-quarantine-latch.md) | Persisted quarantine latch after an exhausted repair budget |
 | [0032](adr/0032-post-nat-uplink-filter.md) | Drop exit-sourced uplink packets after NAT |
+| [0033](adr/0033-mac-own-tunnel-driver.md) | Mac: scupper drives its own pinned wireguard-go, without wg-quick or Homebrew |
 
 ### M2-2t1 implementation deviations
 

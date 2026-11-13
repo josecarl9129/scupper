@@ -8,7 +8,7 @@ wg-quick cannot create an interface in one namespace and place it in another, ru
 
 ## Decision
 
-From M2 scupper creates and configures all gateway WireGuard links itself: `ip link add … type wireguard` (host, down), `ip link set … netns scupper`, `wg set <if> private-key <file> peer …`, addresses, up. `exit import` reads a wg-quick file and keeps only interface/peer fields; `PostUp`, `PreDown`, `Table`, `DNS` and script lines are rejected. M1 still drives `wg-quick@proton0` for parity. The Mac keeps wg-quick (ADR 0021).
+From M2 scupper creates and configures all gateway WireGuard links itself: `ip link add … type wireguard` (host, down), `ip link set … netns scupper`, `wg set <if> private-key <file> peer …`, addresses, up. `exit import` reads a wg-quick file and keeps only interface/peer fields; `PostUp`, `PreDown`, `Table`, `DNS` and script lines are rejected. M1 still drives `wg-quick@proton0` for parity. The Mac does not use wg-quick either: its helper drives a pinned wireguard-go itself (ADR 0033).
 
 ## Alternatives considered
 
