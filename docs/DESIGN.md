@@ -1528,6 +1528,23 @@ scupper                                 bare: short status summary with next-ste
 └── (hidden) boot | probe … --json | deliver …      used by units and scupperd
 ```
 
+**Current platform boundary (M2).** `version` and `--version` print the same
+CLI package version and succeed on every platform. `deploy` is an operator-side
+command, available on Linux and macOS. The implemented `mac app status`,
+`mac app bind` and `mac app unbind` commands are exposed only by macOS builds.
+Gateway adapters are Linux-only: `status`, `check`, `connect`, `disconnect`,
+`rules`, `apply`, `exit`, `config`, `alerts`, `secret`, `repair`, `install`, and
+the hidden `remote`, `boot`, `probe`, `canon` and `deliver` helpers. On other
+platforms gateway commands fail with a platform-unavailability error. Remote
+API/SSH transports for the general gateway commands, completion, and commands
+in the tree without an M2 implementation remain later milestones.
+
+`alerts test` never reads stdin to select a sink. Without SINK, one configured
+sink is selected automatically; zero sinks reports how to add
+`[alerts.sinks.<name>]` to a configuration file and load it with
+`scupper config load <file>`; multiple sinks are listed
+with the instruction `scupper alerts test <sink>`.
+
 **Exit names.** Commands that take `EXIT` accept the `id` or the `name`,
 case-insensitively (`zurich`, `Zurich`, `ch1`); on a TTY a unique prefix
 also matches and an ambiguous one lists the candidates; without a TTY only
@@ -1624,9 +1641,55 @@ Mutation commands return 0 when the operation completed, 1 on error.
 `check` is the only health verdict. Human output is for reading; `--json`
 is versioned (`schema`) and covered by golden tests.
 
+M2 human `check` output is one verdict line including the applied config
+version and warning count, followed by one `warning:` line per warning on
+stdout. Local observation and daemon socket responses use the same renderer.
+`status` renders sections for the verdict, every configured exit (id,
+interface, latest handshake age, observed endpoint and public key), clients
+(name, handshake age and public key), client routes, forwarding, and
+supervisor/daemon state. Missing observations are explicitly marked; future
+handshakes say `in future`, and an absent handshake says `never`. Public keys
+are base64. Client roaming endpoints are redacted; exit endpoints are visible.
+`status` returns 0 when it renders a report, including an observation error;
+`check` preserves the verdict codes in §12 and returns 1 for observation errors.
+
+**M2 health JSON (schema 1).** `check --json` emits the existing full Report
+object, identically for socket and local checks: `schema`, `verdict`,
+`warnings`, `at` (Unix seconds), and `config_version`. Verdicts and warnings
+retain the core externally tagged enum representation (for example
+`{"Protected":{"exit":"ch1","exit_ip":"203.0.113.77"}}`); no human text is
+used as a machine discriminator. Errors use
+`{"schema":1,"error":{"stage":null,"message":"..."}}`, with the stage enum
+name in place of null when known.
+
+`status --json` emits `schema`, `report` (Report or null), `error` (null or
+`{stage,message}`), `observations`, `exits`, and `clients`. When configuration
+cannot be loaded, it emits the same schema/error envelope as `check`.
+Observation fields are `topology`, `selection`, `active`, `defaults`,
+`handshakes`, `forwarding`, `routes`, `exit_probe`, `standby_probe`, `dns`, and
+`supervisor`. Probe stages use null for unrequested, `{"ok":VALUE}` for an
+observation (including negative facts), and `{"error":"..."}` for an error.
+`selection` and `active` retain their core enum encoding. Routes are null or
+an ordered array of `{client,v4,v6}`, whose family values retain the core
+`{"Ok":ANSWER}` / `{"Err":ERROR}` encoding. Topology retains namespace
+identity, link/address inventory, public peers, ruleset comparison and
+violations; its namespace is `{"present":{"device":N,"inode":N}}`,
+`"missing"` or `"wrong_inode"`, and ruleset is `"exact"`, `"missing"`, or
+`{"differs":{"live":[...],"want":[...]}}` (SHA-256 byte arrays).
+Forwarding retains numeric sysctls, hardening findings, quarantine, listener,
+sockets and client handshakes. All public keys, including handshake map keys,
+are base64 strings. Handshakes are `"never"` or `{"at":UNIX_SECONDS}`.
+Supervisor is null or an object with `state` equal to `alive`, `dead`, or
+`not_required`; alive also has `iteration_age_seconds` and `netns` identity.
+Exit rows have `id`, `interface`, `public_key`, `handshake_age` and `endpoint`
+(null when unobserved); client rows have `name`, `public_key`, `handshake_age`.
+The age strings are informational; scripts use the observation timestamps.
+Object field order is not significant. Golden fixtures cover both human views
+and JSON field shapes. Debug representations are not part of either interface.
+
 ```
 $ scupper check; echo $?
-protected: via ch1 (exit 203.0.113.77), kill switch in place
+protected via ch1 (exit IP 203.0.113.77), config v43, 0 warnings
 0
 
 $ scupper status

@@ -1,0 +1,121 @@
+{
+  "clients": [
+    {
+      "handshake_age": "never",
+      "name": "mac",
+      "public_key": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI="
+    }
+  ],
+  "error": null,
+  "exits": [
+    {
+      "endpoint": "203.0.113.10:51820",
+      "handshake_age": "41s ago",
+      "id": "ch1",
+      "interface": "ex-ch1",
+      "public_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+    }
+  ],
+  "observations": {
+    "active": "Unreachable",
+    "defaults": null,
+    "dns": null,
+    "exit_probe": null,
+    "forwarding": {
+      "ok": {
+        "client_handshakes": {
+          "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=": "never"
+        },
+        "client_public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        "client_v4": 1,
+        "hardening": [],
+        "host_sockets": [],
+        "listen_port": 51820,
+        "netns_sockets": [],
+        "quarantine": null,
+        "v4": 1,
+        "v6": 0
+      }
+    },
+    "handshakes": {
+      "ok": {
+        "ch1": {
+          "at": 959
+        }
+      }
+    },
+    "routes": [
+      {
+        "client": "10.99.0.2",
+        "v4": {
+          "Ok": {
+            "Dev": "ex-ch1"
+          }
+        },
+        "v6": {
+          "Ok": "Unreachable"
+        }
+      }
+    ],
+    "selection": "Auto",
+    "standby_probe": null,
+    "supervisor": {
+      "iteration_age_seconds": 3,
+      "netns": {
+        "device": 1,
+        "inode": 2
+      },
+      "state": "alive"
+    },
+    "topology": {
+      "ok": {
+        "addresses_complete": true,
+        "errors": [],
+        "extra_rules": [],
+        "host_wireguard_on_client_port": [],
+        "links": [],
+        "links_complete": true,
+        "netns": {
+          "present": {
+            "device": 1,
+            "inode": 2
+          }
+        },
+        "peers": {
+          "ex-ch1": [
+            {
+              "allowed_ips": [],
+              "endpoint": "203.0.113.10:51820",
+              "public_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+            }
+          ],
+          "wg0": [
+            {
+              "allowed_ips": [],
+              "endpoint": null,
+              "public_key": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI="
+            }
+          ]
+        },
+        "ruleset": "exact",
+        "tc_hooks": []
+      }
+    }
+  },
+  "report": {
+    "at": 1000,
+    "config_version": 2,
+    "schema": 1,
+    "verdict": {
+      "Protected": {
+        "exit": "ch1",
+        "exit_ip": "37.120.137.232"
+      }
+    },
+    "warnings": [
+      "ClientHandshakesStale",
+      "ClockSkew"
+    ]
+  },
+  "schema": 1
+}

@@ -527,7 +527,7 @@ fn boot_refuses_unresponsive_lease_holder_before_kernel_calls() {
 }
 
 #[test]
-fn alerts_list_redacts_reference_and_test_requires_sink_without_tty() {
+fn alerts_list_redacts_reference_and_single_sink_needs_no_tty() {
     let h = Harness::new();
     let original = fs::read_to_string(h.input()).unwrap();
     h.text(&format!(
@@ -557,13 +557,46 @@ url_ref = "private-reference"
     }
     let (code, _, err) = h.run(&["alerts", "test"]);
     assert_eq!(code, 1);
-    assert!(err.contains("requires SINK"));
+    assert!(err.contains("running scupperd"));
+    assert_eq!(h.prompts.get(), 0);
     let (code, _, err) = h.run(&["alerts", "test", "missing"]);
     assert_eq!(code, 1);
     assert!(err.contains("unknown alert sink"));
     let (code, _, err) = h.run(&["alerts", "test", "primary"]);
     assert_eq!(code, 1);
     assert!(err.contains("running scupperd"));
+}
+
+#[test]
+fn alerts_test_without_sink_refuses_empty_or_ambiguous_config_without_prompting() {
+    for tty in [false, true] {
+        let mut h = Harness::new();
+        h.tty = tty;
+        h.load();
+        let (code, _, err) = h.run(&["alerts", "test"]);
+        assert_eq!(code, 1);
+        assert!(err.contains("no alert sinks configured"));
+        assert!(err.contains("scupper config load <file>"));
+        let original = fs::read_to_string(h.input()).unwrap();
+        h.text(&format!(
+            r#"{original}
+[alerts.sinks.chat]
+kind = "ntfy"
+url_ref = "private-reference"
+min_severity = "warning"
+[alerts.sinks.phone]
+kind = "ntfy"
+url_ref = "private-reference"
+min_severity = "warning"
+"#
+        ));
+        h.load();
+        let (code, _, err) = h.run(&["alerts", "test"]);
+        assert_eq!(code, 1);
+        assert!(err.contains("chat, phone"));
+        assert!(err.contains("scupper alerts test <sink>"));
+        assert_eq!(h.prompts.get(), 0);
+    }
 }
 
 #[test]
@@ -635,7 +668,8 @@ fn alerts_test_waits_for_individual_receipt_and_returns_the_real_failure() {
                 std::thread::sleep(Duration::from_millis(10));
             }
         });
-        let (code, out, err) = h.run(&["alerts", "test", "primary", "--json"]);
+        // The only configured sink is selected without consulting stdin.
+        let (code, out, err) = h.run(&["alerts", "test", "--json"]);
         worker.join().unwrap();
         assert_eq!(code, expected, "{out} {err}");
         assert_eq!(

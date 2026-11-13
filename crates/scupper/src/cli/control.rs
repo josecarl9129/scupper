@@ -182,7 +182,7 @@ pub(super) fn mutation(
             ));
         }
     };
-    render(response, json, out)
+    render(response, json, out, err)
 }
 
 pub(super) enum ReadOutcome {
@@ -326,7 +326,7 @@ fn read_with(
         match response {
             Ok(response) if response.result.is_ok() => {
                 writeln!(err, "transport: local socket").map_err(output_error)?;
-                return render(response, json, out).map(ReadOutcome::Rendered);
+                return render(response, json, out, err).map(ReadOutcome::Rendered);
             }
             Err(ClientError::OutcomeUnknown(error))
                 if matches!(
@@ -455,22 +455,25 @@ fn operation_report(
         operation.age
     );
     writeln!(err, "{message}").map_err(output_error)?;
+    let report = scupper_core::verdict::v2::Report {
+        verdict: scupper_core::verdict::v2::Verdict::Degraded(
+            scupper_core::verdict::v2::Degraded::OperationInProgress {
+                from: operation.from,
+                to: operation.to,
+            },
+        ),
+        warnings: Vec::new(),
+        at: unix_seconds(),
+        config_version: operation.from,
+    };
     if json {
-        let report = scupper_core::verdict::v2::Report {
-            verdict: scupper_core::verdict::v2::Verdict::Degraded(
-                scupper_core::verdict::v2::Degraded::OperationInProgress {
-                    from: operation.from,
-                    to: operation.to,
-                },
-            ),
-            warnings: Vec::new(),
-            at: unix_seconds(),
-            config_version: operation.from,
-        };
         serde_json::to_writer(&mut *out, &report).map_err(|error| error.to_string())?;
         writeln!(out).map_err(output_error)?;
     } else {
-        writeln!(out, "{message}").map_err(output_error)?;
+        super::view::check(
+            out,
+            &serde_json::to_value(&report).map_err(|e| e.to_string())?,
+        )?;
     }
     Ok(ReadOutcome::Rendered(3))
 }
@@ -481,7 +484,12 @@ fn unix_seconds() -> u64 {
         .as_secs()
 }
 
-fn render(response: Response, json: bool, out: &mut dyn Write) -> Result<u8, String> {
+fn render(
+    response: Response,
+    json: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<u8, String> {
     let code = match &response.result {
         Ok(OpResult::Check { health, .. }) => verdict_code(health.verdict),
         Err(error)
@@ -493,7 +501,14 @@ fn render(response: Response, json: bool, out: &mut dyn Write) -> Result<u8, Str
         Err(_) => 1,
         _ => 0,
     };
-    if response.replayed && !json {
+    if response.replayed
+        && !json
+        && let Ok(OpResult::Check { health, .. }) = &response.result
+    {
+        let at = response.observed_at.unwrap_or(health.at).0;
+        writeln!(err, "(replayed result observed at {at})").map_err(output_error)?;
+    }
+    if response.replayed && !json && !matches!(response.result, Ok(OpResult::Check { .. })) {
         writeln!(
             out,
             "replayed outcome observed at {:?}: {:?}",
@@ -513,6 +528,7 @@ fn render(response: Response, json: bool, out: &mut dyn Write) -> Result<u8, Str
         writeln!(out).map_err(output_error)?;
     } else {
         match response.result {
+            Ok(OpResult::Check { report, .. }) => return super::view::check(out, &report).map(|()| code),
             Ok(OpResult::Disconnect {}) => writeln!(out, "traffic is now blocked"),
             Ok(OpResult::Connect { exit }) => writeln!(out, "connected via {}", String::from(exit)),
             Ok(OpResult::Apply { version, dry_run, repair_plan, plan, warnings }) => {
@@ -548,6 +564,78 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
 
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn socket_check_uses_human_report_and_preserves_verdict_codes() {
+        use scupper_core::{
+            config::ExitId,
+            verdict::v2::{FailClosed, NonEmpty, Report, Verdict, Violation, Warning},
+        };
+        for verdict in [
+            Verdict::Protected {
+                exit: ExitId("ch1".into()),
+                exit_ip: "37.120.137.232".parse().unwrap(),
+            },
+            Verdict::Unprotected(NonEmpty::new(Violation::ForeignLink("eth0".into()))),
+            Verdict::FailClosed(FailClosed::AdminDisconnected),
+        ] {
+            let report = Report {
+                verdict,
+                warnings: vec![Warning::ClockSkew],
+                at: 1000,
+                config_version: 2,
+            };
+            for replayed in [false, true] {
+                let response = Response {
+                    request_id: scupper_proto::Identifier::try_from("test-check".to_owned())
+                        .unwrap(),
+                    schema: Schema,
+                    replayed,
+                    observed_at: Some(scupper_proto::UnixSeconds(1001)),
+                    result: Ok(OpResult::Check {
+                        health: (&report).into(),
+                        report: serde_json::to_value(&report).unwrap(),
+                    }),
+                };
+                let mut out = Vec::new();
+                let mut err = Vec::new();
+                assert_eq!(
+                    render(response.clone(), false, &mut out, &mut err).unwrap(),
+                    report.verdict.exit_code()
+                );
+                assert_eq!(
+                    String::from_utf8(err).unwrap(),
+                    if replayed {
+                        "(replayed result observed at 1001)\n"
+                    } else {
+                        ""
+                    }
+                );
+                let text = String::from_utf8(out).unwrap();
+                assert!(text.contains("config v2, 1 warning\nwarning: clock skew\n"));
+                for debug in [
+                    "Check {",
+                    "HealthSummary {",
+                    "Report {",
+                    "ClockSkew",
+                    "ForeignLink(",
+                ] {
+                    assert!(!text.contains(debug), "{text}");
+                }
+                let mut out = Vec::new();
+                let mut err = Vec::new();
+                assert_eq!(
+                    render(response, true, &mut out, &mut err).unwrap(),
+                    report.verdict.exit_code()
+                );
+                assert_eq!(err, Vec::<u8>::new());
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&out).unwrap(),
+                    serde_json::to_value(&report).unwrap()
+                );
+            }
+        }
+    }
     type Reply = Result<Result<OpResult, scupper_proto::ApiError>, std::io::ErrorKind>;
     struct RecordedClient {
         now: Cell<Instant>,

@@ -65,7 +65,7 @@ pub(super) fn observe(system: &dyn System) -> Result<Option<Status>, Refusal> {
         )
     };
     let status = match run(&["status"]) {
-        Err(ExecError::Spawn(_)) => return Ok(None), // Optional executable absent.
+        Err(ExecError::NotFound { .. }) => return Ok(None), // Optional executable absent.
         result => result.map_err(|_| Refusal::CommandFailed("ufw status failed".into()))?,
     };
     if status.status != Some(0) {

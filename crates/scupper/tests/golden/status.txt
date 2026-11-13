@@ -1,0 +1,21 @@
+Verdict
+protected via ch1 (exit IP 37.120.137.232), config v2, 2 warnings
+warning: client handshakes stale
+warning: clock skew
+
+Exits
+  ch1 (ex-ch1): handshake 41s ago, endpoint 203.0.113.10:51820
+    public key AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=
+
+Clients
+  mac: handshake never
+    public key AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=
+
+Client route
+  10.99.0.2: IPv4 via ex-ch1; IPv6 unreachable
+
+Forwarding
+  IPv4 1; IPv6 0; client ingress IPv4 1
+
+Supervisor / daemon
+  scupperd alive, last complete iteration 3s ago

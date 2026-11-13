@@ -4,7 +4,11 @@ use scupper_sys::{
     system::{EXEC_TIMEOUT, ExecError, ExecOutput, Program, SYSTEMCTL_TIMEOUT, System},
     v1_detect::{V1Marker, detect_v1_layout},
 };
-use std::{cell::RefCell, collections::VecDeque, time::Duration};
+use std::{
+    cell::RefCell,
+    collections::{BTreeSet, VecDeque},
+    time::Duration,
+};
 struct Reply {
     program: Program,
     args: Vec<String>,
@@ -36,7 +40,7 @@ impl Fake {
                 "--no-pager",
                 "wg-quick@*.service",
             ],
-            0,
+            i32::from(text.is_empty()),
             text,
         );
     }
@@ -165,4 +169,48 @@ fn errors_and_malformed_observations_are_never_absence() {
         after: SYSTEMCTL_TIMEOUT,
     });
     assert!(detect_v1_layout(&sys).is_err());
+}
+
+#[test]
+fn no_matching_unit_files_accepts_only_empty_results_and_no_units_diagnostics() {
+    for (status, stdout, stderr, accepted) in [
+        (Some(1), "", "", true),
+        (Some(4), "", "", true),
+        (Some(2), "", "No unit files found.\n", true),
+        (Some(3), "0 unit files listed.\n", "", true),
+        (
+            Some(1),
+            "",
+            "Failed to connect to bus: Permission denied",
+            false,
+        ),
+        (
+            Some(2),
+            "",
+            "No unit files found.\nFailed to connect to bus",
+            false,
+        ),
+        (Some(1), "wg-quick@wg0.service enabled", "", false),
+        (Some(4), "unexpected output", "No unit files found.", false),
+        (None, "", "", false),
+    ] {
+        let sys = Fake::new();
+        sys.units("");
+        sys.0.borrow_mut().front_mut().unwrap().output = Ok(ExecOutput {
+            status,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        });
+        // An empty package inventory avoids probing uninstalled tools.
+        let result = scupper_sys::v1_detect::detect_install_layout(&sys, &[], &BTreeSet::new());
+        assert_eq!(
+            result.is_ok(),
+            accepted,
+            "{status:?} {stdout:?} {stderr:?}: {result:?}"
+        );
+        if let Ok(markers) = result {
+            assert_eq!(markers, []);
+        }
+        assert!(sys.0.borrow().is_empty());
+    }
 }

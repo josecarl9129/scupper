@@ -228,6 +228,12 @@ pub enum Stream {
 /// Execution failed before a trustworthy complete output was available.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ExecError {
+    /// The executable was absent when spawning it.
+    #[error("{program:?} executable not found")]
+    NotFound {
+        /// Executable whose spawn failed with ENOENT.
+        program: Program,
+    },
     /// Spawn, pipe or wait failure; stored by [`Self::spawn`] with bounded text.
     #[error("exec I/O error: {}", bounded(.0))]
     Spawn(String),
@@ -670,9 +676,18 @@ impl RealSystem {
         if input.is_some() {
             command.stdin(Stdio::piped());
         }
-        let mut child = command
-            .spawn()
-            .map_err(|error| ExecError::spawn(&error.to_string()))?;
+        let mut child = command.spawn().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ExecError::NotFound {
+                    program: match target {
+                        ExecTarget::Host => program,
+                        ExecTarget::Netns(_) => Program::Nsenter,
+                    },
+                }
+            } else {
+                ExecError::spawn(&error.to_string())
+            }
+        })?;
         let deadline = started + timeout + Duration::from_millis(900);
         let mut readers = Vec::with_capacity(2);
         let result = collect(&mut child, started, timeout, &mut readers, input);

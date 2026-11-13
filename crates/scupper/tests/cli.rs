@@ -296,7 +296,12 @@ fn exit_codes_contract() {
         assert_eq!(out, "");
         assert!(err.starts_with("scupper:"));
     }
-    for args in [vec!["--help"], vec!["--version"], vec!["config", "--help"]] {
+    for args in [
+        vec!["--help"],
+        vec!["--version"],
+        vec!["version"],
+        vec!["config", "--help"],
+    ] {
         let (code, out, err) = h.run(&args);
         assert_eq!(code, 0);
         assert!(out.contains("scupper"));

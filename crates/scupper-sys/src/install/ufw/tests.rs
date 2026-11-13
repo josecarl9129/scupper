@@ -156,13 +156,19 @@ fn queries_use_only_constant_argv_and_bounded_system_calls() {
         *script.1.borrow(),
         [vec!["status"], vec!["status", "verbose"]]
     );
-    for response in [output(INACTIVE), Err(ExecError::spawn("not installed"))] {
+    for response in [
+        output(INACTIVE),
+        Err(ExecError::NotFound {
+            program: Program::Ufw,
+        }),
+    ] {
         let script = Script::new(VecDeque::from([response]));
         assert!(observe(&script).unwrap().is_none());
         assert!(script.0.borrow().is_empty());
         assert_eq!(*script.1.borrow(), [vec!["status"]]);
     }
     for failure in [
+        Err(ExecError::spawn("permission denied while spawning ufw")),
         Err(ExecError::Timeout {
             after: EXEC_TIMEOUT,
         }),

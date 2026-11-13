@@ -24,6 +24,7 @@ pub struct Fake {
     pub pubkey_inputs: RefCell<Vec<[u8; 32]>>,
     pub addresses: Vec<&'static str>,
     pub host_link: Option<&'static str>,
+    pub host_address: Option<&'static str>,
     pub leftover: bool,
     pub enable_failure: bool,
     pub calls: RefCell<Vec<(Program, Vec<String>)>>,
@@ -34,6 +35,10 @@ pub struct Fake {
     pub arch: String,
     pub uid: u32,
     pub missing_packages: bool,
+    pub no_unit_files: bool,
+    pub missing_tools: bool,
+    pub missing_tool: Option<Program>,
+    pub broken_tool: Option<Program>,
     pub marker: Option<&'static str>,
     pub firewall: bool,
     pub ufw_status: Option<&'static str>,
@@ -46,6 +51,7 @@ impl Default for Fake {
             pubkey_inputs: RefCell::default(),
             addresses: vec!["198.51.100.7"],
             host_link: None,
+            host_address: None,
             leftover: false,
             enable_failure: false,
             calls: RefCell::default(),
@@ -56,6 +62,10 @@ impl Default for Fake {
             arch: "x86_64".into(),
             uid: 0,
             missing_packages: false,
+            no_unit_files: false,
+            missing_tools: false,
+            missing_tool: None,
+            broken_tool: None,
             marker: None,
             firewall: false,
             ufw_status: None,
@@ -64,6 +74,9 @@ impl Default for Fake {
     }
 }
 impl System for Fake {
+    fn wireguard_socket_dirs(&self) -> Vec<PathBuf> {
+        Vec::new()
+    }
     fn install_uid(&self) -> u32 {
         self.uid
     }
@@ -75,6 +88,18 @@ impl System for Fake {
         timeout: Duration,
     ) -> Result<ExecOutput, ExecError> {
         self.calls.borrow_mut().push((program, args.to_vec()));
+        if self.missing_tool == Some(program)
+            || (self.missing_tools && matches!(program, Program::Nft | Program::Wg))
+        {
+            return Err(ExecError::NotFound { program });
+        }
+        if self.broken_tool == Some(program) {
+            return Ok(ExecOutput {
+                status: Some(1),
+                stdout: String::new(),
+                stderr: "tool failed".into(),
+            });
+        }
         let mut status = 0;
         let text = match (program, args.first().map(String::as_str)) {
             (Program::Uname, Some("-r")) => self.os_kernel.clone(),
@@ -114,8 +139,11 @@ impl System for Fake {
             (Program::Systemctl, Some("list-unit-files")) => {
                 if self.marker == Some("unit") {
                     "wg-quick@foreign.service enabled".into()
-                } else {
+                } else if self.missing_packages || self.no_unit_files {
+                    status = 1;
                     String::new()
+                } else {
+                    "wg-quick@.service disabled enabled".into()
                 }
             }
             (Program::Systemctl, Some("is-enabled")) => {
@@ -159,7 +187,7 @@ impl System for Fake {
                 assert_eq!(timeout, scupper_sys::system::EXEC_TIMEOUT);
                 assert!(args == ["status"] || args == ["status", "verbose"]);
                 self.ufw_status
-                    .ok_or_else(|| ExecError::spawn("optional executable absent"))?
+                    .ok_or(ExecError::NotFound { program })?
                     .into()
             }
             (Program::Nft, _) => {
@@ -175,7 +203,12 @@ impl System for Fake {
                 if args.iter().any(|a| a == "address") {
                     serde_json::json!([{"addr_info": self.addresses.iter().map(|ip| serde_json::json!({"scope":"global", "local":ip})).collect::<Vec<_>>()}]).to_string()
                 } else if args.iter().any(|a| a == "addr") {
-                    serde_json::json!([{"ifindex":3,"ifname":self.host_link.unwrap_or("wg0"),"addr_info":[]}]).to_string()
+                    let addresses: Vec<_> = self
+                        .host_address
+                        .iter()
+                        .map(|ip| serde_json::json!({"family":"inet", "local":ip, "prefixlen":24}))
+                        .collect();
+                    serde_json::json!([{"ifindex":3,"ifname":self.host_link.unwrap_or("wg0"),"addr_info":addresses}]).to_string()
                 } else if self.marker == Some("link") || self.host_link.is_some() {
                     serde_json::json!([{"ifindex":3,"ifname":self.host_link.unwrap_or("wg0"),"flags": if self.leftover { vec![] } else { vec!["UP"] },"mtu":1420,"linkinfo":{"info_kind":"wireguard"}}]).to_string()
                 } else {

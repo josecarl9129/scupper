@@ -10,7 +10,10 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Print the installed CLI version.
+    Version,
     /// Manage macOS client settings.
+    #[cfg(target_os = "macos")]
     Mac(crate::mac_app::MacArgs),
     /// Stage and deploy a gateway release over SSH.
     Deploy(crate::deploy::DeployArgs),
@@ -37,6 +40,11 @@ where
         }
     };
     match cli.command {
+        Command::Version => {
+            println!("scupper {}", env!("CARGO_PKG_VERSION"));
+            0
+        }
+        #[cfg(target_os = "macos")]
         Command::Mac(args) => match crate::mac_app::run(&args, &mut std::io::stdout()) {
             Ok(code) => code,
             Err(error) => {
@@ -68,11 +76,46 @@ where
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
+
     #[test]
     fn operator_parser_and_platform_refusals() {
         assert_eq!(super::run(["scupper", "--version"]), 0);
+        assert_eq!(super::run(["scupper", "version"]), 0);
         assert_eq!(super::run(["scupper", "install", "--plan"]), 1);
-        assert_eq!(super::run(["scupper", "check"]), 1);
+        for command in [
+            "status",
+            "check",
+            "connect",
+            "disconnect",
+            "apply",
+            "repair",
+            "config",
+            "exit",
+            "alerts",
+            "secret",
+            "rules",
+            "remote",
+            "boot",
+            "probe",
+            "deliver",
+            "canon",
+        ] {
+            assert!(
+                matches!(
+                    super::Cli::try_parse_from(["scupper", command]),
+                    Ok(super::Cli {
+                        command: super::Command::Gateway(_)
+                    })
+                ),
+                "{command} must parse into the platform refusal path"
+            );
+            assert_eq!(super::run(["scupper", command]), 1, "{command}");
+        }
+        #[cfg(target_os = "macos")]
+        assert_eq!(super::run(["scupper", "mac", "--help"]), 0);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(super::run(["scupper", "mac", "--help"]), 1);
         assert_eq!(super::run(["scupper", "deploy", "--help"]), 0);
         assert_eq!(super::run(["scupper", "deploy"]), 1);
     }

@@ -1,0 +1,15 @@
+{
+  "at": 1000,
+  "config_version": 2,
+  "schema": 1,
+  "verdict": {
+    "Protected": {
+      "exit": "ch1",
+      "exit_ip": "37.120.137.232"
+    }
+  },
+  "warnings": [
+    "ClientHandshakesStale",
+    "ClockSkew"
+  ]
+}
