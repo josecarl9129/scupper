@@ -606,6 +606,10 @@ pub fn prepare(system: &dyn System, paths: &Paths, options: &Options) -> Result<
     };
     let mut files = BTreeMap::from([
         (
+            model::MODULES_FILE.into(),
+            model::modules_config().into_bytes(),
+        ),
+        (
             model::GATEWAY_FILE.into(),
             format!("{gateway}\n").into_bytes(),
         ),

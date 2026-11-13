@@ -1,9 +1,11 @@
 //! Real unit faults, using the namespace lab's traffic and capture oracle.
+use super::super::boot::{at_or_after, kill_points};
 use super::super::command::Group;
 use super::{
     A, CLI, Duration, Instant, Invocation, Lab, Path, Result, SystemdLab, fail, fs, helpers,
 };
 use rustix::process::Signal;
+use scupper_sys::boot::BootStep;
 use std::{
     io::Write,
     os::unix::{fs::MetadataExt, process::ExitStatusExt},
@@ -14,6 +16,13 @@ use std::{
 // cannot solicit a reply that follows the root namespace's default route.
 fn oracle_control_drop() -> &'static str {
     "table inet lab_inject { chain input { type filter hook input priority filter; ip saddr 198.51.100.2 ip daddr 198.51.100.1 udp sport { 40002, 40003 } udp dport { 53, 8080 } counter drop;\n }\n chain forward { type filter hook forward priority filter; ip saddr 10.99.0.2 ip daddr 192.0.2.6 udp sport 40001 udp dport 8080 counter drop;\n }\n}\n"
+}
+
+pub(super) fn systemd_kill_points() -> Vec<String> {
+    kill_points()
+        .into_iter()
+        .chain(["link-add-wg0".into(), "link-add-ex-0".into()])
+        .collect()
 }
 
 impl SystemdLab {
@@ -91,21 +100,10 @@ impl SystemdLab {
 
     pub(super) fn case(&mut self, case: &str) -> Result<()> {
         if case == "L9" {
-            for point in [
-                "0",
-                "1",
-                "2",
-                "3",
-                "4",
-                "5",
-                "6",
-                "7",
-                "link-add-wg0",
-                "link-add-ex-0",
-            ] {
+            for point in systemd_kill_points() {
                 self.guard(&format!("L9-{point}-before"))?;
                 let started = Instant::now();
-                let result = self.boot_prefix(point);
+                let result = self.boot_prefix(&point);
                 self.timings.push(serde_json::json!({"point":point,"elapsed_ms":started.elapsed().as_millis(),"passed":result.is_ok()}));
                 result?;
                 self.guard(&format!("L9-{point}-after"))?;
@@ -329,7 +327,7 @@ impl SystemdLab {
                 }
             }
             self.safety()?;
-            if matches!(point, "4" | "5" | "6" | "7") {
+            if at_or_after(point, BootStep::Links) {
                 let port = self
                     .lab
                     .cmd("scupper", "wg", &["show", "ex-0", "listen-port"])?
@@ -338,7 +336,7 @@ impl SystemdLab {
                 self.record_port(port);
             }
             self.fresh_session()?;
-            let has_client = matches!(point, "4" | "5" | "6" | "7" | "link-add-ex-0");
+            let has_client = at_or_after(point, BootStep::Links) || point == "link-add-ex-0";
             let rx = if has_client {
                 let until = Instant::now() + Duration::from_secs(15);
                 loop {
@@ -372,7 +370,7 @@ impl SystemdLab {
             };
             let marker = Lab::marker()?;
             markers.push(marker.clone());
-            if matches!(point, "6" | "7") {
+            if at_or_after(point, BootStep::Forwarding) {
                 if self
                     .lab
                     .send("client", "udp", A.internet.peer, &marker, false)?
@@ -394,7 +392,13 @@ impl SystemdLab {
             }
             // First recover without deleting the host leftover: adoption/removal
             // must be proved before the second reboot destroys runtime state.
-            self.reboot_start()?;
+            self.start_boot_units(false)?;
+            fs::copy(
+                "/run/scupper/boot.json",
+                self.lab
+                    .artifacts
+                    .join(format!("{stem}-recovery-boot.json")),
+            )?;
             self.assert_no_host_wireguard(&format!("{stem}-recovered-host"))?;
             self.ready()?;
             self.safety()?;
@@ -413,7 +417,7 @@ impl SystemdLab {
         fs::write(
             self.lab.artifacts.join(format!("{stem}.json")),
             serde_json::to_vec_pretty(
-                &serde_json::json!({"point":point,"elapsed_ms":started.elapsed().as_millis(),"closed_canary_has_ingress_proof":matches!(point,"4"|"5"|"6"|"7"|"link-add-ex-0"),"early_prefix_assertions":"Without gateway wg0, closed probes prove no delivery; safety and recovery are the meaningful controls.","passed":result.is_ok(),"error":result.as_ref().err().map(ToString::to_string)}),
+                &serde_json::json!({"point":point,"elapsed_ms":started.elapsed().as_millis(),"closed_canary_has_ingress_proof":(at_or_after(point, BootStep::Links) || point == "link-add-ex-0"),"early_prefix_assertions":"Without gateway wg0, closed probes prove no delivery; safety and recovery are the meaningful controls.","passed":result.is_ok(),"error":result.as_ref().err().map(ToString::to_string)}),
             )?,
         )?;
         result
@@ -657,9 +661,12 @@ impl SystemdLab {
         self.reboot_stop()?;
         self.fault_dropin(
             "scupper-net",
-            "ExecStart=\nExecStart=/usr/local/bin/scupper boot --stop-after=3",
+            &format!(
+                "ExecStart=\nExecStart=/usr/local/bin/scupper boot --stop-after={}",
+                BootStep::Ruleset as u8
+            ),
         )?;
-        self.fault_dropin("scupperd", "RestartSec=3s\nEnvironment=SCUPPER_TEST_BOOT_POINT=3\nEnvironment=SCUPPER_TEST_BOOT_MARKER=/run/scupper/daemon-reached")?;
+        self.fault_dropin("scupperd", &format!("RestartSec=3s\nEnvironment=SCUPPER_TEST_BOOT_POINT={}\nEnvironment=SCUPPER_TEST_BOOT_MARKER=/run/scupper/daemon-reached", BootStep::Ruleset as u8))?;
         let trial = (|| {
             let mut start = self.lab.runner.background(
                 &Invocation::new("", "systemctl", &["start", "scupperd"]),

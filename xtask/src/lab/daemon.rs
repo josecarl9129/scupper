@@ -760,6 +760,13 @@ impl Lab {
             .trim()
             .parse()?;
         self.service_check(&mut Vec::new())?;
+        let boot: scupper_sys::boot::BootReport =
+            serde_json::from_slice(&fs::read(root.join("run/scupper/boot.json"))?)?;
+        fs::write(
+            self.artifacts.join(format!("{stem}-recovery-boot.json")),
+            serde_json::to_vec_pretty(&boot)?,
+        )?;
+        super::boot::verify_modules(&boot)?;
         let (code, report) = self.check_result(&Self::boot_binary()?, &root)?;
         fs::write(
             self.artifacts.join(format!("{stem}-supervised-check.json")),
@@ -1968,8 +1975,9 @@ impl Lab {
                 "ip",
                 &["-j", "link", "show", "ex-ch1"],
             )?)?;
-            if report.owned_links.get("ex-ch1").copied().map(u64::from)
-                != after[0]["ifindex"].as_u64()
+            if !report.succeeded()
+                || report.owned_links.get("ex-ch1").copied().map(u64::from)
+                    != after[0]["ifindex"].as_u64()
             {
                 return fail("L4 boot.json retained stale owned identity");
             }

@@ -3,6 +3,13 @@
 use scupper_core::install::*;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+
+#[test]
+fn boot_modules_and_modules_load_file_are_exactly_the_safe_list() {
+    assert_eq!(BOOT_MODULES, ["nf_conntrack", "wireguard"]);
+    assert_eq!(modules_config(), "nf_conntrack\nwireguard\n");
+}
+
 fn facts() -> Facts {
     Facts {
         os: "ubuntu".into(),
@@ -14,6 +21,7 @@ fn facts() -> Facts {
     }
 }
 fn request(bundle: bool) -> Request {
+    let modules = modules_config();
     Request {
         gateway_id: "gw1".into(),
         configuration: if bundle {
@@ -31,6 +39,7 @@ fn request(bundle: bool) -> Request {
             ("scupperd".into(), "22".repeat(32)),
         ]),
         files: [
+            (MODULES_FILE, modules.as_str()),
             (GATEWAY_FILE, "gw1\n"),
             (
                 "/etc/systemd/system/scupper-net.service",
@@ -149,6 +158,18 @@ fn simulate_result_is_empty_and_drift_has_exact_preconditions() {
         }
     }
     wanted.configuration = Configuration::Existing;
+    // The production hand fix is already root-owned mode 0644. Keep it as-is.
+    host.nodes.insert(
+        MODULES_FILE.into(),
+        Node {
+            uid: 0,
+            mode: 0o644,
+            sha256: Some(format!(
+                "{:x}",
+                Sha256::digest(b"nf_conntrack\nwireguard\n")
+            )),
+        },
+    );
     assert_eq!(plan(&host, &wanted).unwrap().steps, []);
     host.nodes.get_mut(CONFIG_ROOT).unwrap().mode = 0o755;
     let drift = plan(&host, &wanted).unwrap();

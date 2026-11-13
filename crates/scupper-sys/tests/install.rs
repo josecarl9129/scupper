@@ -528,6 +528,7 @@ fn write_boot_report(host: &Host, matching: bool, succeeded: bool) {
     let m = fs::metadata(host.paths.at(model::NETNS_FILE)).unwrap();
     let steps = [
         BootStep::Lock,
+        BootStep::Modules,
         BootStep::Inputs,
         BootStep::Close,
         BootStep::Ruleset,
@@ -907,4 +908,57 @@ fn fresh_install_checks_exit_port_and_rerun_preserves_both_direction_warnings() 
     assert_eq!(host.prepare(&fake).unwrap().plan.warnings, plan.warnings);
     fake.ufw_status = Some(EXIT_ALLOW);
     assert_eq!(host.prepare(&fake).unwrap().plan.warnings.len(), 1);
+}
+
+#[test]
+fn modules_file_is_managed_and_drift_is_repaired() {
+    let host = Host::new();
+    let fake = Fake::default();
+    assert!(
+        host.prepare(&fake)
+            .unwrap()
+            .plan
+            .text()
+            .contains(model::MODULES_FILE)
+    );
+    host.apply(&fake);
+    let path = host.paths.at(model::MODULES_FILE);
+    assert_eq!(fs::read_to_string(&path).unwrap(), model::modules_config());
+    assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o644);
+    assert_eq!(
+        fs::metadata(&path).unwrap().uid(),
+        rustix::process::geteuid().as_raw()
+    );
+    // A production hand-file containing exactly these bytes needs no migration.
+    fs::write(&path, "nf_conntrack\nwireguard\n").unwrap();
+    let before = host.snapshot();
+    assert_eq!(host.prepare(&fake).unwrap().plan.steps, []);
+    host.apply(&fake);
+    assert_eq!(host.snapshot(), before);
+    for contents in [Some("wireguard\n"), None] {
+        if let Some(contents) = contents {
+            fs::write(&path, contents).unwrap();
+        } else {
+            fs::remove_file(&path).unwrap();
+        }
+        assert!(
+            host.prepare(&fake)
+                .unwrap()
+                .plan
+                .text()
+                .contains(model::MODULES_FILE)
+        );
+        host.apply(&fake);
+        assert_eq!(fs::read_to_string(&path).unwrap(), model::modules_config());
+    }
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(
+        host.prepare(&fake)
+            .unwrap()
+            .plan
+            .text()
+            .contains(model::MODULES_FILE)
+    );
+    host.apply(&fake);
+    assert_eq!(host.prepare(&fake).unwrap().plan.steps, []);
 }

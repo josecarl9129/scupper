@@ -10,13 +10,15 @@ note: provider/cloud firewalls (e.g. DigitalOcean cloud firewall) are not visibl
 9. directory /var/lib/scupper/config uid=0 mode=0700
 10. directory /var/lib/scupper/config/versions uid=0 mode=0700
 11. directory /var/lib/scupper/rendered uid=0 mode=0700
-12. binary /usr/local/bin/scupper sha256=d85bc442a17d2a445c11b9f47f50395765f72c9283016bf984452373c1bac62c mode=0755 (atomic; keep .prev)
-13. binary /usr/local/bin/scupperd sha256=3aa6c3123072fe102791d99b9c166e261af179ec3523a99cc9963d7872e00fb3 mode=0755 (atomic; keep .prev)
-14. generate wg0 identity mode=0600 (wg pubkey via stdin)
-15. initialize state applied_version=1 selection=Auto mode=0600
-16. publish Initial { sha256: "ec702186f35b7191f8836aee1c2e30cc2a8e5f62dcebfca8acc0897add227ead" } configuration
-17. file /etc/scupper/gateway-id uid=0 mode=0644 sha256=17e439def43637c3dee712c48a6a8e26ef22fd1e06b20c8cc86d54aa00b6b927 (atomic)
-18. file /etc/systemd/system/scupper-net.service uid=0 mode=0644 sha256=27f3cf0c2128d9ae9f8e85f637b18e4a06c4ab5597bdaf9c7f83525456e1053a (atomic)
-19. file /etc/systemd/system/scupperd.service uid=0 mode=0644 sha256=92706c5b107a10d2f13a39d6c05b7a852c22d5b081dab4eb62f7762035d78290 (atomic)
-20. systemctl daemon-reload
-21. systemctl enable --now scupper-net scupperd
+12. directory /etc/modules-load.d uid=0 mode=0755
+13. binary /usr/local/bin/scupper sha256=d85bc442a17d2a445c11b9f47f50395765f72c9283016bf984452373c1bac62c mode=0755 (atomic; keep .prev)
+14. binary /usr/local/bin/scupperd sha256=3aa6c3123072fe102791d99b9c166e261af179ec3523a99cc9963d7872e00fb3 mode=0755 (atomic; keep .prev)
+15. generate wg0 identity mode=0600 (wg pubkey via stdin)
+16. initialize state applied_version=1 selection=Auto mode=0600
+17. publish Initial { sha256: "ec702186f35b7191f8836aee1c2e30cc2a8e5f62dcebfca8acc0897add227ead" } configuration
+18. file /etc/modules-load.d/scupper.conf uid=0 mode=0644 sha256=59c4be334ea4f8d2f6b0e5809640b0977c89ece270be3305eb2691e74b227954 (atomic)
+19. file /etc/scupper/gateway-id uid=0 mode=0644 sha256=17e439def43637c3dee712c48a6a8e26ef22fd1e06b20c8cc86d54aa00b6b927 (atomic)
+20. file /etc/systemd/system/scupper-net.service uid=0 mode=0644 sha256=27f3cf0c2128d9ae9f8e85f637b18e4a06c4ab5597bdaf9c7f83525456e1053a (atomic)
+21. file /etc/systemd/system/scupperd.service uid=0 mode=0644 sha256=92706c5b107a10d2f13a39d6c05b7a852c22d5b081dab4eb62f7762035d78290 (atomic)
+22. systemctl daemon-reload
+23. systemctl enable --now scupper-net scupperd
