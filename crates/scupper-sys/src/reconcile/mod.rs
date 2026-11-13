@@ -10,7 +10,7 @@ use crate::{
     events::LogHandle,
     lock::{WriterGuard, WriterLock},
     netns::NetnsHandle,
-    state::{Quarantine, State, StateFile, StateRead},
+    state::{Quarantine, RepairState, State, StateFile, StateRead},
 };
 use scupper_core::{
     config::{ExitId, GatewayId, ValidatedSite},
@@ -116,6 +116,32 @@ pub trait Kernel {
 
 /// Durable state boundary. Implementations must not acknowledge a write before fsync.
 pub trait StateStore {
+    /// Optional durable repair checkpoint (memory-only adapters may omit it).
+    fn repair_state(&self) -> Option<RepairState> {
+        None
+    }
+    /// Persist write-ahead repair history under the writer guard.
+    /// # Errors
+    /// Returns persistence failures before a restore can begin.
+    fn write_repair_state(&self, _guard: &WriterGuard, _repair: &RepairState) -> io::Result<()> {
+        Ok(())
+    }
+    /// Explicitly clear repair uncertainty and its runtime marker.
+    /// # Errors
+    /// Returns durable clearance failures.
+    fn clear_repair_state(
+        &self,
+        _guard: &WriterGuard,
+        _run_root: &std::path::Path,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+    /// Whether an external latch clear has durable proof.
+    fn clearance_proven(&self) -> bool {
+        self.repair_state()
+            .is_none_or(|s| s.startup_latch().is_none())
+    }
+
     /// Read the complete durable state, refusing absence or corruption.
     ///
     /// # Errors
@@ -141,6 +167,20 @@ pub trait StateStore {
     fn write(&self, guard: &WriterGuard, state: &State) -> io::Result<()>;
 }
 impl StateStore for StateFile {
+    fn repair_state(&self) -> Option<RepairState> {
+        Some(Self::repair_state(self))
+    }
+    fn write_repair_state(&self, guard: &WriterGuard, repair: &RepairState) -> io::Result<()> {
+        Self::write_repair_state(self, guard, repair)
+    }
+    fn clear_repair_state(
+        &self,
+        guard: &WriterGuard,
+        run_root: &std::path::Path,
+    ) -> io::Result<()> {
+        Self::clear_repair_state(self, guard, run_root)
+    }
+
     fn begin_tick(&self) {
         self.invalidate_reads();
     }
@@ -298,7 +338,18 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             FailoverConfig::from_site(&config.site, &config.gateway).map_err(io::Error::other)?;
         let (failover, actions) =
             Failover::new(clock().0, persisted.selection.clone(), &failover_config);
-        let latch = persisted.quarantine.as_ref().map(|q| Latch {
+        let repair = store.repair_state().unwrap_or_default();
+        let startup_quarantine = persisted.quarantine.clone().or_else(|| {
+            repair.startup_latch().map(|mut q| {
+                q.reason = format!(
+                    "latch persistence or clearance uncertain: {}; run scupper connect",
+                    q.reason
+                );
+                q
+            })
+        });
+        let latch = startup_quarantine.as_ref().map(|q| Latch {
+            uncertain: q.uncertain,
             reason: q.reason.clone(),
             object: q.object.clone(),
         });
@@ -312,7 +363,14 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             config,
             failover,
             failover_config,
-            budgets: Budgets::default(),
+            budgets: Budgets {
+                attempts: repair
+                    .attempts
+                    .into_iter()
+                    .map(|(key, count)| (key, vec![clock().0; count.min(3)]))
+                    .collect(),
+                ..Budgets::default()
+            },
             debounce: Debounce::default(),
             latch,
             persisted,
@@ -503,6 +561,14 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         scupper_core::verdict::v2::NetnsIdentity { device, inode }
     }
 
+    /// Whether the quarantine lacks durable main-state persistence.
+    pub fn connect_clearable_latch(&self) -> bool {
+        self.budgets.persistence_failed || self.latch.as_ref().is_some_and(|latch| latch.uncertain)
+    }
+    /// Whether a latch write failed during this process.
+    pub fn latch_persistence_failed(&self) -> bool {
+        self.budgets.persistence_failed
+    }
     /// Current memory quarantine, including a latch whose durable write failed.
     pub fn latch(&self) -> Option<&Latch> {
         self.latch.as_ref()
@@ -590,6 +656,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         let mut observation = self.kernel.observe(&self.held);
         self.cached = Some((Instant::now(), observation.model.clone()));
         observation.model.latch = self.persisted.quarantine.as_ref().map(|q| Latch {
+            uncertain: q.uncertain,
             reason: q.reason.clone(),
             object: q.object.clone(),
         });
@@ -614,12 +681,16 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         match self.store.read_until(deadline) {
             Ok(state) => {
                 observation.model.latch = state.quarantine.as_ref().map(|q| Latch {
+                    uncertain: q.uncertain,
                     reason: q.reason.clone(),
                     object: q.object.clone(),
                 });
                 self.kernel
                     .persisted_latch(observation.model.latch.as_ref());
-                if self.persisted.quarantine.is_some() && state.quarantine.is_none() {
+                if self.persisted.quarantine.is_some()
+                    && state.quarantine.is_none()
+                    && self.store.clearance_proven()
+                {
                     // Another authorized writer durably cleared the latch while
                     // this process was unavailable. Memory-only latches still hold.
                     self.latch = None;
@@ -653,6 +724,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 // Do not turn unreadable persisted quarantine into an implicit clear.
                 observation.model.ruleset = planner::Known::Unknown;
                 observation.model.latch = self.persisted.quarantine.as_ref().map(|q| Latch {
+                    uncertain: q.uncertain,
                     reason: q.reason.clone(),
                     object: q.object.clone(),
                 });
@@ -712,6 +784,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                     reason: latch.reason.clone(),
                     object: latch.object.clone(),
                     since_unix: (self.clock)().1,
+                    uncertain: latch.uncertain,
                 });
                 if self.store.write(guard, &latest).is_err() {
                     self.persistence_failure(report);
@@ -1212,21 +1285,50 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 .into_iter()
                 .partition(|(trigger, _)| *trigger == StepKind::from(&step));
             safety_reservations = pending;
-            for (_, key) in charged {
+            for (_, key) in &charged {
                 self.budgets
                     .attempts
-                    .entry(key)
+                    .entry(key.clone())
                     .or_default()
                     .push((self.clock)().0);
             }
+            let checkpoint = if repair_class(&step) == scupper_proto::RepairClass::Restore {
+                let checkpoint = self.checkpoint_repairs(guard, true);
+                if charged.is_empty() {
+                    Ok(())
+                } else {
+                    checkpoint
+                }
+            } else {
+                Ok(())
+            };
+            if checkpoint.is_err() {
+                // No Restore was attempted. Never manufacture an exhausted
+                // memory budget without its durable write-ahead reservation.
+                for (_, key) in charged {
+                    if let Some(times) = self.budgets.attempts.get_mut(&key) {
+                        times.pop();
+                    }
+                    if self.budgets.attempts.get(&key).is_some_and(Vec::is_empty) {
+                        self.budgets.attempts.remove(&key);
+                    }
+                }
+            }
             report.steps.push(step.clone());
-            let result = self.execute_step(
-                &step,
-                last_flush.is_some_and(|flush| index < flush),
-                guard,
-                report,
-            );
+            let result = checkpoint.and_then(|()| {
+                self.execute_step(
+                    &step,
+                    last_flush.is_some_and(|flush| index < flush),
+                    guard,
+                    report,
+                )
+            });
             self.kernel.step_boundary(&step);
+            if repair_class(&step) == scupper_proto::RepairClass::Restore {
+                // This restore's execution/readback has ended, including Stop failures.
+                // Keep charged counts even if completion checkpointing fails.
+                let _ = self.checkpoint_repairs(guard, false);
+            }
             if let Err(error) = result {
                 if step.failure() == StepFailure::NonFatal {
                     if !matches!(step, Step::Emit(_)) {
@@ -1234,6 +1336,9 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                     }
                     if matches!(step, Step::PersistLatch { .. }) {
                         self.budgets.persistence_failed = true;
+                        if let Some(latch) = &mut self.latch {
+                            latch.uncertain = true;
+                        }
                         self.emit(
                             EventKind::PersistenceFailed {
                                 reason: Reason::StateWrite,
@@ -1346,6 +1451,36 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             self.restore_namespace(guard, report);
         }
     }
+    fn checkpoint_repairs(&self, guard: &WriterGuard, armed: bool) -> Result<(), StepError> {
+        let repair = RepairState {
+            attempts: self
+                .budgets
+                .attempts
+                .iter()
+                .map(|(key, times)| (key.clone(), times.len()))
+                .collect(),
+            armed,
+            quarantine: self.latch.as_ref().map(|latch| Quarantine {
+                reason: latch.reason.clone(),
+                object: latch.object.clone(),
+                since_unix: (self.clock)().1,
+                uncertain: latch.uncertain,
+            }),
+        };
+        self.store
+            .write_repair_state(guard, &repair)
+            .map_err(|_| StepError("repair checkpoint failed"))
+    }
+    fn mark_uncertain(&self) {
+        let _ = crate::fs::durable_replace(
+            &crate::fs::RealFs,
+            &self.config.run_root.join("latch-uncertain"),
+            b"latch persistence uncertain; explicit scupper connect required\n",
+            0o600,
+            &|_| Ok(()),
+            &|_| Ok(()),
+        );
+    }
     fn restore_namespace(&self, guard: &WriterGuard, report: &mut TickReport) {
         if !report.escalations.contains(&Escalation::RebindNamespace) {
             report.escalations.push(Escalation::RebindNamespace);
@@ -1384,18 +1519,26 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                     reason: reason.clone(),
                     object: object.clone(),
                     since_unix: (self.clock)().1,
+                    uncertain: self.connect_clearable_latch(),
                 });
                 self.kernel.invalidate_state();
+                self.checkpoint_repairs(guard, false).inspect_err(|_| {
+                    self.mark_uncertain();
+                })?;
                 self.store
                     .write(guard, &state)
                     .map(|()| {
                         self.kernel.persisted_latch(Some(&Latch {
+                            uncertain: self.connect_clearable_latch(),
                             reason: reason.clone(),
                             object: object.clone(),
                         }));
                         self.persisted = state;
                     })
-                    .map_err(|_| StepError("latch persistence failed"))
+                    .map_err(|_| {
+                        self.mark_uncertain();
+                        StepError("latch persistence failed")
+                    })
             }
             Step::Emit(event) => {
                 let event = EventKind::from(event.clone());
@@ -1479,12 +1622,16 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 "applied version changed; reconciler must reload",
             ));
         }
-        if self.persisted.quarantine.is_some() && state.quarantine.is_none() {
+        if self.persisted.quarantine.is_some()
+            && state.quarantine.is_none()
+            && self.store.clearance_proven()
+        {
             self.latch = None;
             self.budgets = Budgets::default();
         }
         if self.latch.is_none() {
             self.latch = state.quarantine.as_ref().map(|q| Latch {
+                uncertain: q.uncertain,
                 reason: q.reason.clone(),
                 object: q.object.clone(),
             });
@@ -1654,6 +1801,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 reason: latch.reason.clone(),
                 object: latch.object.clone(),
                 since_unix: (self.clock)().1,
+                uncertain: latch.uncertain,
             });
         }
         state.selection = selection.clone();
@@ -1693,6 +1841,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 reason: latch.reason.clone(),
                 object: latch.object.clone(),
                 since_unix: (self.clock)().1,
+                uncertain: latch.uncertain,
             });
             self.store.write(guard, &state)?;
         }
@@ -1721,6 +1870,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                     reason: latch.reason.clone(),
                     object: latch.object.clone(),
                     since_unix: (self.clock)().1,
+                    uncertain: latch.uncertain,
                 });
                 self.kernel.invalidate_state();
                 if let Err(error) = self.store.write(&guard, &state) {
@@ -1906,6 +2056,8 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         let mut state = self.refresh_admin_state()?;
         let Some(latch) = &self.latch else {
             self.store.write(guard, &state)?;
+            self.store
+                .clear_repair_state(guard, &self.config.run_root)?;
             self.persisted = state;
             self.budgets = Budgets::default();
             let _ = self.log.emit(
@@ -1926,6 +2078,8 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         state.quarantine = None;
         self.kernel.invalidate_state();
         self.store.write(guard, &state)?;
+        self.store
+            .clear_repair_state(guard, &self.config.run_root)?;
         self.persisted = state;
         self.latch = transition.latch;
         let _ = self.log.emit(

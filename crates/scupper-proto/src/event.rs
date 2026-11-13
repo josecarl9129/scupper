@@ -194,6 +194,7 @@ macro_rules! event_kinds {
 event_kinds! {
     ConfigCommitted { version: u64 = 2, parent: Option<u64> = Some(1), sha: [u8; 32] = [0; 32], reason: Reason = Reason::Operator },
     ConfigApplied { version: u64 = 2 },
+    RepairCheckpointCreated {},
     ApplyFailed { version: Option<u64> = Some(2), step: StepKind = StepKind::LoadRuleset, reason: Reason = Reason::ExecutionFailed },
     Failover { from: Identifier = Identifier("ch1".into()), to: Identifier = Identifier("ch2".into()), cause: Reason = Reason::HealthFailure },
     Failback { from: Identifier = Identifier("ch2".into()), to: Identifier = Identifier("ch1".into()) },

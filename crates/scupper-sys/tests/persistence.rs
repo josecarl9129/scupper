@@ -111,6 +111,7 @@ fn closed_state() -> State {
             reason: "repair budget exhausted".into(),
             object: "ex-ch1".into(),
             since_unix: 1_700_000_001,
+            uncertain: false,
         }),
         ..State::default()
     }
@@ -529,7 +530,7 @@ fn returned_write_failures_leave_state_atomic_and_clean_temporary_files() {
                 closed_state()
             })
         );
-        assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 2);
+        assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 3);
     }
 }
 
@@ -1052,4 +1053,109 @@ fn mirror_observation_waits_for_an_in_progress_commit() {
         MirrorStatus::InSync
     );
     observer.join().unwrap();
+}
+
+#[test]
+fn legacy_checkpoint_migration_preserves_state_and_distinguishes_failed_reads() {
+    use scupper_sys::state::{RepairState, RepairStateRead};
+    for quarantined in [false, true] {
+        let dir = TempDir::new();
+        let guard = writer(&dir.0);
+        let file = StateFile::open(&dir.0, None).unwrap();
+        // Exact schema emitted by 4442253: no checkpoint and no uncertainty field.
+        let legacy = if quarantined {
+            r#"{"schema":1,"applied_version":43,"selection":"Auto","quarantine":{"reason":"repair budget exhausted","object":"ex-ch1","since_unix":1700000001}}"#
+        } else {
+            r#"{"schema":1,"applied_version":43,"selection":"Auto","quarantine":null}"#
+        };
+        fs::write(dir.0.join("state.json"), legacy).unwrap();
+        assert!(matches!(file.repair_state_read(), RepairStateRead::Missing));
+        let StateRead::Present(before) = file.safety_read(&dir.0.join("run")).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(before.quarantine.is_some(), quarantined);
+        assert!(
+            file.migrate_repair_state(&guard, &dir.0.join("run"))
+                .unwrap()
+        );
+        assert!(
+            !file
+                .migrate_repair_state(&guard, &dir.0.join("run"))
+                .unwrap()
+        );
+        assert_eq!(
+            fs::read_to_string(dir.0.join("state.json")).unwrap(),
+            legacy
+        );
+        assert!(file.repair_state().startup_latch().is_none());
+        // In-flight status and successful restore counts are never latch evidence.
+        file.write_repair_state(
+            &guard,
+            &RepairState {
+                armed: true,
+                attempts: std::collections::BTreeMap::from([("safety:ruleset".into(), 3)]),
+                ..RepairState::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            file.safety_read(&dir.0.join("run")).unwrap(),
+            StateRead::Present(before)
+        );
+        fs::write(dir.0.join("repair-state.json"), "invalid").unwrap();
+        assert!(matches!(
+            file.repair_state_read(),
+            RepairStateRead::Unreadable
+        ));
+        assert!(file.repair_state().latch().unwrap().uncertain);
+        fs::remove_file(dir.0.join("repair-state.json")).unwrap();
+        fs::create_dir(dir.0.join("repair-state.json")).unwrap();
+        assert!(matches!(
+            file.repair_state_read(),
+            RepairStateRead::Unreadable
+        ));
+    }
+}
+
+#[test]
+fn uncertainty_marker_prevents_legacy_checkpoint_migration() {
+    let dir = TempDir::new();
+    let guard = writer(&dir.0);
+    fs::write(
+        dir.0.join("state.json"),
+        r#"{"schema":1,"applied_version":43,"selection":"Auto","quarantine":null}"#,
+    )
+    .unwrap();
+    fs::write(dir.0.join("run/latch-uncertain"), "uncertain").unwrap();
+    let file = StateFile::open(&dir.0, None).unwrap();
+    assert!(
+        !file
+            .migrate_repair_state(&guard, &dir.0.join("run"))
+            .unwrap()
+    );
+    let StateRead::Present(saved) = file.startup_read(&dir.0.join("run")).unwrap() else {
+        unreachable!()
+    };
+    assert!(saved.quarantine.unwrap().uncertain);
+}
+
+#[test]
+fn runtime_uncertainty_marks_a_visible_latch_without_rewriting_it() {
+    let dir = TempDir::new();
+    let guard = writer(&dir.0);
+    let file = StateFile::open(&dir.0, None).unwrap();
+    let original = closed_state();
+    file.write(&guard, &original).unwrap();
+    // A post-rename durability failure can leave the main latch visible.
+    fs::write(dir.0.join("run/latch-uncertain"), "failed latch write").unwrap();
+    let StateRead::Present(effective) = file.startup_read(&dir.0.join("run")).unwrap() else {
+        unreachable!()
+    };
+    let quarantine = effective.quarantine.unwrap();
+    assert!(quarantine.uncertain);
+    assert_eq!(
+        quarantine.since_unix,
+        original.quarantine.as_ref().unwrap().since_unix
+    );
+    assert_eq!(file.read().unwrap(), StateRead::Present(original));
 }

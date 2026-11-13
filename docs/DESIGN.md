@@ -963,14 +963,32 @@ version (stay on the applied version, alert).
   first step, forwarding goes to 0, the drift is tightened away, then
   `state.json` records `quarantine {reason, object, since}` (fsynced); boot step 6 and every
   planner and repair step refuse to raise forwarding while it is set; only
-  `scupper repair clear` or a verified full `scupper apply` removes it, with
-  an `AdminAction` event. If the latch cannot be persisted, it holds in
-  memory and `PersistenceFailed` is raised; after a restart without the
-  record the drift is seen again and re-latches. Suppression always ends
-  closed.
+  `scupper repair clear` or a verified full `scupper apply` removes an ordinary
+  durable safety-budget latch, with an `AdminAction` event. Failed latch
+  persistence sets the typed `uncertain` flag in memory; `scupper connect` may
+  also clear this uncertainty, including a safety latch whose persistence failed.
+  Reason text never selects which latches connect may clear.
+  Before a safety-budget Restore, `repair-state.json` durably reserves its attempt
+  count. Other restores checkpoint best effort. The armed flag covers only one
+  restore's execution and verification and is cleared when it ends, even on failure;
+  armed status and successful attempt counts never synthesize a quarantine in
+  startup or `check`. The latch itself is checkpointed before replacing
+  `state.json`. Only failed latch persistence writes the best-effort
+  `/run/scupper/latch-uncertain` marker. An unreadable/corrupt checkpoint, a recorded
+  quarantine, or the marker keeps the gateway latched; a missing checkpoint is no
+  record. Under the writer lock at daemon start or boot, readable legacy state
+  with an applied version and no marker receives an empty checkpoint and one
+  `RepairCheckpointCreated` audit event. Existing state quarantine is preserved.
+  Attempt counts survive restart with a conservative new ten-minute expiry;
+  exhausting three successful repairs does not latch until a subsequent restore
+  is refused for budget. Suppression of a safety restore ends closed.
 - Debounce: drift must be seen on 2 consecutive ticks before a repair, except
   ruleset drift (forwarding 0 at once), foreign links and tc hooks (acted on
   at once).
+- Unknown link or tc inventory inside the gateway namespace closes forwarding and
+  takes the client link down immediately, in the same tick; it never waits for the
+  restore debounce. Host-side inventory failures retain the existing restore
+  debounce and block speculative host link creation without flapping the client.
 - **One writer** (ADR 0028): every code path that mutates kernel or
   persistent state (the boot procedure, the scupperd tick, a local `apply`
   while scupperd is down, the deploy rollback executor) holds the exclusive
@@ -979,7 +997,8 @@ version (stay on the applied version, alert).
   that the only case.
 - In the netns layout the only possible "other writer" is a human with root;
   stopping and alerting is the right response to fighting.
-- Disk errors never block a safety repair; the event is kept in memory and
+- Disk errors never block a tightening safety repair; automatic Restore requires
+  a durable checkpoint; the event is kept in memory and
   `PersistenceFailed` is raised.
 
 ### Planner
@@ -991,7 +1010,8 @@ creating links. Each step is idempotent. Property: **every prefix of every
 plan satisfies `safe(state)`** (no forward path to a non-exit; forwarding on
 implies a verified ruleset). On a failed step, scupperd re-plans from the
 observed state toward the **previous** applied version and alerts;
-`applied_version` is published under closed gates before the target boot. A failed
+`applied_version` is the convergence target, published under closed gates before
+  target boot; it does not claim successful verification. A failed
 live apply restores the previous version and reports its rollback result (§18).
 
 ---
@@ -1768,10 +1788,12 @@ A full-screen TUI stays R2+.
 Scripts that page on any non-zero code page on 5; that is intended.
 
 Ping publishes an active apply or rebuild with its source and target versions
-and elapsed age. Check reports `Degraded::OperationInProgress` (3) during this
-transition, including rollback, without comparing the kernel to the version
-being published in state.json. This is an availability indication; no topology
-verdict is asserted until the transition publishes its attached snapshot.
+and elapsed age. Before an apply publishes its convergence target, and during a
+rebuild, Check may report `Degraded::OperationInProgress` (3). Once apply publishes
+N+1 under closed gates, Check collects live kernel observations against N+1,
+including the open-forwarding reattachment tail; a violation returns 2. It never
+presents the old N snapshot as current. Publication is a convergence target,
+not a claim that verification has completed.
 The initial Ping and Check (including one retry after SupervisorUnavailable)
 share one absolute 5 s deadline established before the initial Ping. The Ping
 itself is capped at 2 s; its elapsed time reduces the remaining Check budget.
@@ -1807,9 +1829,12 @@ uplink is the device of the host default route, `exit_addr` is assigned to
 `exit_iface`, `client_addr` lies inside `wg0`'s peer AllowedIPs; validation
 refuses an interface name that does not exist) (2) → handshake fresh (4) → `ip route get 1.1.1.1 from 10.99.0.2 iif wg0` =
 `dev proton0` (3) → exit probe bound to `proton0` (3).
-In M1, tcx BPF links (kernel 6.6+) and other eBPF attachments without a
-qdisc are not detected; `tc filter show` covers only root filters, and the
-qdisc check is the guard for ingress/clsact.
+Fault-model exclusion (M1 and M2, A2): tcx BPF links (kernel 6.6+) and other
+BPF attachments without a qdisc are not inventoried. The tc/XDP inventory does
+not establish their absence; tunnel confinement alone does not prove quarantine,
+filtering or selected-exit policy against such hooks. Backlog: add an error-aware
+BPF program/link query, distinguishing enumeration failure from an empty inventory.
+No tcx detection is implemented in M2.
 
 Rules: an observation error is 1, never a safe code; a known violation wins
 over an observation error. `Never` is not fresh; `Age(d)` is fresh iff
@@ -2212,7 +2237,9 @@ Covers "the gateway (or scupperd) is dead", which no on-host alert can.
   a dead or hung scupperd sends nothing because the watchdog-gated
   iteration never completes. Each delivery child gets a deadline (verdict
   start + min(30 s, interval), monotonic) and exits without sending once it
-  has passed. Sockets use SO_LINGER(0) and TCP_USER_TIMEOUT equal to the
+  has passed. This is best-effort bounded sender staleness, not a network
+  delivery guarantee: packets already in the network cannot be recalled and
+  receiver expiry is required for strict freshness. Sockets use SO_LINGER(0) and TCP_USER_TIMEOUT equal to the
   remaining deadline, refreshed before each socket operation. TCP_USER_TIMEOUT
   does not shorten the first retransmission or tail-loss probe. Before every
   socket write the child reads the current TCP_INFO.tcpi_rto (via the safe
@@ -2268,7 +2295,8 @@ client data. The lab's dedicated endpoint tuple is not targeted by client flows;
 its tuple-only oracle allowance is cross-checked with an established socket
 owned by the locally allocated `scupper-alert` uid in L53/L53b.
 
-The absolute CLOCK_MONOTONIC deadline assumes parent and child share a time
+The absolute CLOCK_MONOTONIC sender deadline bounds staleness best effort,
+not network delivery; it assumes parent and child share a time
 namespace. It does not advance during system suspend; wall-clock freshness over
 suspend remains a documented M2 limitation. Linux kernel transmission deadlines
 bound locally queued work; they cannot recall packets already in the network.
@@ -3094,12 +3122,17 @@ rollback. Confirm-or-rollback, `upgrade` and the guard unit arrive in M6.
 M2 recovery remains manual. Before replacing either binary, Switch durably
 writes both existing binaries to their `.prev` paths, then replaces the pair
 back to back. Switch failures carry typed outcomes through reserved exit statuses:
-`RefusedNoChange` (20), `FailedAfterRename` (21), and `Unknown` (22).
+`RefusedNoChange` (20), `FailedAfterRename` (21), `Unknown` (22),
+`FailedAfterChange` (23), and `PossiblyChanged` (24).
 Only a failure after an actual binary rename, or an unknown outcome after the
 child or SSH connection is lost, prints these commands on the gateway and
 again on the client with the deploy identifier. Precondition/digest refusals,
-backup failures before a live rename, and failed restarts for empty or unit-only
-plans report "refused, nothing changed" with the reason and omit recovery commands:
+and other failures with established non-mutation report "unchanged" and omit
+recovery commands. Completed writes or commands report "changed"; failed writes,
+permission changes or commands report "possibly changed" because partial effects
+are possible. Both categories list affected files and service commands, including
+unit-only plans and `.prev` backups before any live binary rename. Failed restarts
+never claim nothing changed. Binary recovery commands are:
 
 ```sh
 install -m 0755 /usr/local/bin/scupperd.prev /usr/local/bin/scupperd
@@ -3870,3 +3903,27 @@ lease proves no daemon owns the gateway. A definite failed commit removes
 new keys; an unknown socket outcome or a failure after head publication
 retains keys to avoid invalidating a committed version. Bundles contain
 only committed history; interrupted versions above head are not exported.
+
+Notification policy clarification (D21): Unprotected and quarantine are exposure-class
+Critical incidents. A never-delivered incident that resolves produces a durable
+“resolved while undelivered” summary carrying its first audit sequence as incident
+id, duration and occurrence count, including resolution during the restart hold.
+Its delivery obligation remains queued until acknowledgment, across further
+restarts and subsequent incidents. Keep at most one owed summary per exposure
+key: retain the first incident ID, add incident and occurrence counts, retain the
+maximum duration and latest resolution timestamp, and keep the fixed 64-entry /
+128 KiB journal limits. A new active incident retains its own pending firing slot
+beside the owed summary. Availability (FailClosed) keeps the existing
+policy: an unattempted historical firing resolved during the observation hold may
+be dropped, avoiding unmatched availability recoveries.
+
+Boot attachment contract (D9): successful `scupper boot` while the matching
+supervisor is attached means **supervisor attached**, not health. Use `scupper
+check` for current protection. A deploy restart of that boot unit may be idempotent;
+new boot-only logic runs on the next rebuild or reboot.
+
+Historical key policy (D5): retired exit keys continue to be deleted outside
+`applied_version..=head`. Configuration history labels versions whose exit keys
+are gone `not restorable (key destroyed)`; apply refuses before mutation with the
+same explanation. Public history is retained; rollback cannot recreate destroyed
+private keys.

@@ -113,9 +113,7 @@ pub fn execute_locked<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)>(
             let selection = exit.map_or(Selection::Auto, |id| {
                 Selection::Prefer(scupper_core::config::ExitId(String::from(id)))
             });
-            if machine.latch().is_some() {
-                return Err(api(ApiErrorCode::Quarantined));
-            }
+            prepare_connect(machine, guard, &selection, actor.clone())?;
             machine
                 .set_selection_locked(guard, selection, actor)
                 .map_err(|e| {
@@ -160,6 +158,32 @@ pub fn execute_locked<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)>(
             Err(api(ApiErrorCode::InvalidRequest))
         }
     }
+}
+
+// Shared by synchronous local control and the daemon's pending-connect path.
+pub(super) fn prepare_connect<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)>(
+    machine: &mut Reconciler<K, S, C>,
+    guard: &WriterGuard,
+    selection: &Selection,
+    actor: Actor,
+) -> Result<(), ApiError> {
+    if let Selection::Pin(id) | Selection::Prefer(id) = selection
+        && !machine
+            .desired()
+            .map_err(internal)?
+            .exits()
+            .contains_key(id)
+    {
+        return Err(api(ApiErrorCode::InvalidRequest));
+    }
+    if machine.connect_clearable_latch() {
+        machine
+            .clear_latch_for_locked(guard, actor, scupper_core::planner::ClearLatch::RepairClear)
+            .map_err(internal)?;
+    } else if machine.latch().is_some() {
+        return Err(api(ApiErrorCode::Quarantined));
+    }
+    Ok(())
 }
 
 struct DeadlineProbe<'a> {
@@ -313,6 +337,9 @@ pub(crate) fn apply_preflight(
     let mut preflight = crate::boot::BootReport::default();
     crate::boot::inputs_for_version(deps, &mut preflight, None, Some(target)).map_err(|error| {
         match error {
+            crate::boot::InputError::Secret(ref secret) if secret.is_not_found() => input_error(
+                format!("version {target} is not restorable (key destroyed or missing): {secret}"),
+            ),
             crate::boot::InputError::Secret(_) | crate::boot::InputError::Selection(_) => {
                 input_error(error.to_string())
             }
@@ -416,6 +443,10 @@ fn apply_inner(
     let StateRead::Present(mut state) = file.read().map_err(internal)? else {
         return Err(api(ApiErrorCode::PersistenceUnavailable));
     };
+    let StateRead::Present(effective) = file.safety_read(deps.run_root).map_err(internal)? else {
+        return Err(api(ApiErrorCode::PersistenceUnavailable));
+    };
+    let effective_quarantine = effective.quarantine;
     let original = state.clone();
     let previous = state.applied_version;
     let mut step = scupper_proto::StepKind::ForwardingOff;
@@ -459,8 +490,9 @@ fn apply_inner(
 
             return Err(api(ApiErrorCode::Internal));
         }
-        if let Some(quarantine) = state.quarantine.take() {
+        if let Some(quarantine) = state.quarantine.take().or(effective_quarantine) {
             let latch = scupper_core::planner::Latch {
+                uncertain: quarantine.uncertain,
                 reason: quarantine.reason,
                 object: quarantine.object,
             };
@@ -478,6 +510,8 @@ fn apply_inner(
             );
             let _ = log.emit(cleared.event.into(), Actor::Local { uid }, Some(target));
         }
+        file.clear_repair_state(guard, deps.run_root)
+            .map_err(internal)?;
         Ok(())
     })();
     if let Err(failure) = attempt {
@@ -665,6 +699,7 @@ pub fn preview_locked(
         Instant::now() + Duration::from_secs(6),
     );
     let latch = state.quarantine.map(|q| Latch {
+        uncertain: q.uncertain,
         reason: q.reason,
         object: q.object,
     });
@@ -730,7 +765,14 @@ pub fn durable_intent(deps: &BootDeps<'_>, op: &Op, uid: u32) -> Result<(), ApiE
             }
         }
         Op::Connect { exit } => {
-            if state.quarantine.is_some() {
+            let StateRead::Present(effective) =
+                file.safety_read(deps.run_root).map_err(internal)?
+            else {
+                return Err(api(ApiErrorCode::PersistenceUnavailable));
+            };
+            if effective.quarantine.as_ref().is_some_and(|q| q.uncertain) {
+                state.quarantine = None;
+            } else if effective.quarantine.is_some() {
                 return Err(api(ApiErrorCode::Quarantined));
             }
             if let Some(id) = exit {
@@ -766,6 +808,10 @@ pub fn durable_intent(deps: &BootDeps<'_>, op: &Op, uid: u32) -> Result<(), ApiE
     }
     file.write(&guard, &state)
         .map_err(|_| api(ApiErrorCode::PersistenceUnavailable))?;
+    if matches!(op, Op::Connect { .. } | Op::RepairClear { .. }) {
+        file.clear_repair_state(&guard, deps.run_root)
+            .map_err(internal)?;
+    }
     Ok(())
 }
 

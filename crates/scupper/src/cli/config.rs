@@ -131,27 +131,7 @@ pub(super) fn run(
             require_root(deps, "config load")?;
             store_new(deps, &store, &read_input(&file)?, reason, yes, stdout)?;
         }
-        ConfigCommand::History => {
-            writeln!(stdout, "version\tparent\tat\tactor\treason\tsha256").map_err(output_error)?;
-            for (index, meta) in store
-                .history()
-                .map_err(|error| error.to_string())?
-                .iter()
-                .enumerate()
-            {
-                writeln!(
-                    stdout,
-                    "{}\t{}\t{}\t{:?}\t{:?}\t{}",
-                    index + 1,
-                    meta.parent.map_or_else(|| "-".into(), |n| n.to_string()),
-                    meta.at,
-                    meta.actor,
-                    meta.reason,
-                    &meta.sha256[..12]
-                )
-                .map_err(output_error)?;
-            }
-        }
+        ConfigCommand::History => history(deps, &store, stdout)?,
         ConfigCommand::Diff { a, b } => {
             let current = head(&store)?;
             let a = a.unwrap_or(current.saturating_sub(1));
@@ -187,6 +167,62 @@ pub(super) fn run(
         }
     }
     Ok(0)
+}
+
+fn history(
+    deps: &Dependencies<'_>,
+    store: &VersionStore,
+    stdout: &mut dyn Write,
+) -> Result<(), String> {
+    writeln!(
+        stdout,
+        "version\tparent\tat\tactor\treason\tsha256\trestorability"
+    )
+    .map_err(output_error)?;
+    for (index, meta) in store
+        .history()
+        .map_err(|error| error.to_string())?
+        .iter()
+        .enumerate()
+    {
+        writeln!(
+            stdout,
+            "{}\t{}\t{}\t{:?}\t{:?}\t{}\t{}",
+            index + 1,
+            meta.parent.map_or_else(|| "-".into(), |n| n.to_string()),
+            meta.at,
+            meta.actor,
+            meta.reason,
+            &meta.sha256[..12],
+            restorability(
+                deps,
+                &store.read((index + 1) as u64).map_err(|e| e.to_string())?.0
+            )?
+        )
+        .map_err(output_error)?;
+    }
+    Ok(())
+}
+
+fn restorability(deps: &Dependencies<'_>, text: &str) -> Result<&'static str, String> {
+    let site = parse_site(text).map_err(|e| e.to_string())?;
+    for reference in site
+        .gateways
+        .values()
+        .flat_map(|g| &g.exits)
+        .flat_map(|e| std::iter::once(&e.private_key_ref).chain(e.preshared_key_ref.as_ref()))
+    {
+        if !scupper_sys::secrets::SecretFile::exists(
+            deps.config_root,
+            reference,
+            rustix::process::geteuid().as_raw(),
+        )
+        .map_err(|e| e.to_string())?
+        {
+            return Ok("not restorable (key destroyed)");
+        }
+    }
+    Ok("keys retained")
 }
 
 fn head(store: &VersionStore) -> Result<u64, String> {

@@ -340,6 +340,7 @@ fn dispatch(
         }
         DeployOp::Switch { plan_sha256, .. } => {
             let mut replaced = false;
+            let mut mutations = install::Mutations::default();
             let result: Result<u8, String> = (|| {
                 verified(&stage)?;
                 let prepared = prepare_install(system, paths, &stage)?;
@@ -358,16 +359,23 @@ fn dispatch(
                     .steps
                     .iter()
                     .any(|s| matches!(s.change, Change::Binary(..)));
-                install::apply_with_fs(system, paths, prepared, filesystem).map_err(|error| {
+                let (_, changes) = install::apply_with_fs_tracked(
+                    system, paths, prepared, filesystem,
+                )
+                .map_err(|error| {
                     replaced = error.replaced;
+                    mutations = error.mutations;
                     error.reason
                 })?;
+                mutations = changes;
                 replaced = binary_changed;
-                service(system, &["daemon-reload"])?;
+                tracked_service(system, &["daemon-reload"], &mut mutations)?;
                 if net_changed {
-                    service(system, &["restart", "scupper-net"])?;
+                    tracked_service(system, &["restart", "scupper-net"], &mut mutations)?;
+                    writeln!(out, "scupper-net: an attached supervisor makes boot idempotent; newly installed boot logic runs on the next rebuild or reboot.").map_err(|e| e.to_string())?;
                 }
-                service(system, &["restart", "scupperd"])?;
+                tracked_service(system, &["restart", "scupperd"], &mut mutations)?;
+                write!(out, "{}", mutations.text()).map_err(|e| e.to_string())?;
                 Ok(0)
             })();
             match result {
@@ -375,10 +383,14 @@ fn dispatch(
                 Err(reason) => Ok(report_switch(
                     if replaced {
                         SwitchOutcome::FailedAfterRename
+                    } else if !mutations.possibly_changed.is_empty() {
+                        SwitchOutcome::PossiblyChanged
+                    } else if !mutations.changed.is_empty() {
+                        SwitchOutcome::FailedAfterChange
                     } else {
                         SwitchOutcome::RefusedNoChange
                     },
-                    &reason,
+                    &format!("{reason}\n{}", mutations.text()),
                     out,
                 )),
             }
@@ -403,6 +415,17 @@ fn dispatch(
         DeployOp::Prepare { .. } => Err("invalid deploy state".into()),
     }
 }
+fn tracked_service(
+    system: &dyn System,
+    args: &[&str],
+    mutations: &mut install::Mutations,
+) -> Result<(), String> {
+    let label = format!("systemctl {}", args.join(" "));
+    mutations.begin(&label);
+    service(system, args)?;
+    mutations.complete(&label);
+    Ok(())
+}
 use std::os::unix::fs::DirBuilderExt;
 
 #[cfg(test)]
@@ -415,6 +438,8 @@ mod tests {
             SwitchOutcome::RefusedNoChange,
             SwitchOutcome::FailedAfterRename,
             SwitchOutcome::Unknown,
+            SwitchOutcome::FailedAfterChange,
+            SwitchOutcome::PossiblyChanged,
         ] {
             let message = crate::deploy::switch_message(outcome, "injected failure");
             let mut command = Command::new("sh");
@@ -433,7 +458,10 @@ mod tests {
             assert_eq!(text, format!("{message}\n"));
             assert_eq!(
                 text.matches(model::RESTORE_COMMANDS).count(),
-                usize::from(outcome != SwitchOutcome::RefusedNoChange)
+                usize::from(matches!(
+                    outcome,
+                    SwitchOutcome::FailedAfterRename | SwitchOutcome::Unknown
+                ))
             );
         }
     }
@@ -489,6 +517,8 @@ mod empty_diagnostic_tests {
             SwitchOutcome::RefusedNoChange,
             SwitchOutcome::FailedAfterRename,
             SwitchOutcome::Unknown,
+            SwitchOutcome::FailedAfterChange,
+            SwitchOutcome::PossiblyChanged,
         ] {
             let result = crate::deploy::TransportOutput {
                 code: outcome.exit_code(),
@@ -503,7 +533,10 @@ mod empty_diagnostic_tests {
             let text = String::from_utf8(out).unwrap();
             assert_eq!(
                 text.matches(model::RESTORE_COMMANDS).count(),
-                usize::from(outcome != SwitchOutcome::RefusedNoChange)
+                usize::from(matches!(
+                    outcome,
+                    SwitchOutcome::FailedAfterRename | SwitchOutcome::Unknown
+                ))
             );
             if outcome == SwitchOutcome::RefusedNoChange {
                 assert!(text.contains("refused, nothing changed"));

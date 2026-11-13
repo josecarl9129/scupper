@@ -276,6 +276,7 @@ pub(super) fn read(
     read_with(deps, status, json, out, err, &SocketClient)
 }
 
+#[allow(clippy::too_many_lines)] // Keep the shared deadline and target-context fallback in one sequence.
 fn read_with(
     deps: &Dependencies<'_>,
     status: bool,
@@ -286,11 +287,15 @@ fn read_with(
 ) -> Result<ReadOutcome, String> {
     use scupper_core::verdict::v2::Supervisor;
     let deadline = client.now() + control::CHECK_TIMEOUT;
-    let mut local = |err: &mut dyn Write, supervisor, version: Option<u64>| {
+    let mut local = |err: &mut dyn Write, supervisor, mut version: Option<u64>| {
         if let Some(operation) =
             version.and_then(|from| version_transition(from, applied_version(deps)))
         {
-            return operation_report(&operation, json, out, err);
+            if target_context_exists(deps, operation.to) {
+                version = Some(operation.to);
+            } else {
+                return operation_report(&operation, json, out, err);
+            }
         }
         writeln!(err, "transport: local observations").map_err(output_error)?;
         Ok(ReadOutcome::Local(LocalRead {
@@ -314,6 +319,10 @@ fn read_with(
     };
     let mut version = Some(version);
     if let Some(operation) = operation {
+        if let Some(current) = operation_context(deps, &operation) {
+            // The target is safe to compare only after its verified boot completed.
+            return local(err, supervisor, Some(current));
+        }
         return operation_report(&operation, json, out, err);
     }
     if busy_age.is_some_and(|age| age >= 5)
@@ -345,6 +354,15 @@ fn read_with(
                     ..
                 }) = fresh.as_ref()
                 {
+                    if let Some(current) = operation_context(deps, operation) {
+                        return local(
+                            err,
+                            fresh
+                                .as_ref()
+                                .map_or(Supervisor::Dead, |ping| ping.supervisor),
+                            Some(current),
+                        );
+                    }
                     return operation_report(operation, json, out, err);
                 }
                 version = fresh.as_ref().map(|ping| ping.version);
@@ -397,24 +415,77 @@ pub(super) fn transition_after_observation(
     let state_version = applied_version(deps);
     if let Some(ping) = ping.as_ref() {
         if let Some(operation) = &ping.operation {
+            if let Some(current) = operation_context(deps, operation) {
+                return Ok(
+                    (version != current).then_some(ReadOutcome::Local(LocalRead {
+                        supervisor: ping.supervisor,
+                        version: Some(current),
+                        transition_deadline: Some(deadline),
+                    })),
+                );
+            }
             return operation_report(operation, json, out, err).map(Some);
         }
         let identity = |supervisor| match supervisor {
             scupper_core::verdict::v2::Supervisor::Alive { netns, .. } => Some(netns),
             _ => None,
         };
-        if ping.version != version || identity(ping.supervisor) != identity(local.supervisor) {
+        let current = state_version
+            .filter(|version| target_context_exists(deps, *version))
+            .unwrap_or(ping.version);
+        if current != version || identity(ping.supervisor) != identity(local.supervisor) {
             return Ok(Some(ReadOutcome::Local(LocalRead {
                 supervisor: ping.supervisor,
-                version: Some(ping.version),
+                version: Some(current),
                 transition_deadline: Some(deadline),
             })));
         }
     }
     if let Some(operation) = version_transition(version, state_version) {
+        if target_context_exists(deps, operation.to) {
+            return Ok(Some(ReadOutcome::Local(LocalRead {
+                supervisor: ping
+                    .as_ref()
+                    .map_or(local.supervisor, |ping| ping.supervisor),
+                version: Some(operation.to),
+                transition_deadline: Some(deadline),
+            })));
+        }
         return operation_report(&operation, json, out, err).map(Some);
     }
     Ok(None)
+}
+
+fn operation_context(
+    deps: &Dependencies<'_>,
+    operation: &scupper_proto::OperationProgress,
+) -> Option<u64> {
+    (operation.kind == scupper_proto::OperationKind::Apply)
+        .then(|| applied_version(deps))
+        .flatten()
+        .filter(|version| *version == operation.to && target_context_exists(deps, *version))
+}
+
+fn target_context_exists(deps: &Dependencies<'_>, version: u64) -> bool {
+    let succeeded = (|| -> Option<bool> {
+        let report: scupper_sys::boot::BootReport = serde_json::from_str(
+            &std::fs::read_to_string(deps.writer_root.join("boot.json")).ok()?,
+        )
+        .ok()?;
+        let namespace = deps.namespaces.open_gateway().ok()??;
+        Some(
+            report.succeeded()
+                && report.applied_version == Some(version)
+                && report
+                    .netns
+                    .is_some_and(|id| namespace.identity() == (id.dev, id.ino)),
+        )
+    })()
+    .unwrap_or(false);
+    succeeded
+        && scupper_sys::store::VersionStore::read_only(deps.state_root, deps.config_root)
+            .read(version)
+            .is_ok()
 }
 
 fn applied_version(deps: &Dependencies<'_>) -> Option<u64> {
@@ -861,6 +932,132 @@ mod tests {
         assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out));
         assert!(String::from_utf8_lossy(&out).contains("Protected"));
         assert!(client.replies.borrow().is_empty());
+    }
+
+    #[cfg(feature = "testing")]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    #[allow(clippy::too_many_lines)] // Both operation snapshots and a Ping racing publication must reach the real driver.
+    fn apply_tail_uses_target_context_and_detects_kernel_violation() {
+        use super::test_support::{Root, Script, fresh};
+        struct Namespaces;
+        impl super::super::NamespaceReader for Namespaces {
+            fn read_namespace(&self, _: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+                unreachable!("not used by the local check")
+            }
+            fn open_gateway(&self) -> Result<Option<scupper_sys::netns::NetnsHandle>, String> {
+                Ok(Some(scupper_sys::netns::testing::handle().unwrap()))
+            }
+        }
+        for (with_operation, boot_state) in [true, false].into_iter().flat_map(|operation| {
+            ["previous", "in_progress", "succeeded", "wrong_inode"].map(|state| (operation, state))
+        }) {
+            let sys = Script::new("ubuntu-24.04");
+            fresh(&sys);
+            sys.replace("scupper-nft-ruleset.json", r#"{"nftables":[]}"#);
+            let held = scupper_sys::netns::testing::handle().unwrap();
+            let text = test_support::site_text(&sys.runner)
+                .replace("require_daemon = false", "require_daemon = true");
+            let root = Root::with_text(&text, &held);
+            let path = root.path.join("boot.json");
+            let (dev, ino) = held.identity();
+            let mut boot = scupper_sys::boot::BootReport {
+                steps: scupper_sys::boot::BootStep::ALL
+                    .iter()
+                    .map(|step| scupper_sys::boot::StepResult {
+                        step: *step,
+                        error: None,
+                        adopted: true,
+                    })
+                    .collect(),
+                applied_version: Some(1),
+                netns: Some(scupper_sys::boot::NamespaceIdentity { dev, ino }),
+                ..Default::default()
+            };
+            match boot_state {
+                "previous" => boot.applied_version = Some(0),
+                "in_progress" => {
+                    boot.steps.pop();
+                }
+                "wrong_inode" => {
+                    boot.netns.as_mut().unwrap().ino += 1;
+                }
+                _ => {}
+            }
+            std::fs::write(path, serde_json::to_vec(&boot).unwrap()).unwrap();
+            let guard = scupper_sys::lock::WriterLock::acquire(&root.path).unwrap();
+            scupper_sys::state::StateFile::open(&root.path, Some(&guard))
+                .unwrap()
+                .write(
+                    &guard,
+                    &scupper_sys::state::State {
+                        applied_version: Some(1),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let deps = Dependencies {
+                state_root: &root.path,
+                config_root: &root.path,
+                writer_root: &root.path,
+                system: &sys,
+                probe_exec: &sys,
+                namespaces: &Namespaces,
+                privilege: &super::super::EffectiveUid,
+                prompt: &super::super::TerminalPrompt,
+            };
+            let (device, inode) = held.identity();
+            let ping = || {
+                Ok(Ok(OpResult::Ping {
+                    last_complete_iteration_age: Some(0),
+                    current_iteration_age: None,
+                    operation: with_operation.then_some(scupper_proto::OperationProgress {
+                        kind: scupper_proto::OperationKind::Apply,
+                        from: 0,
+                        to: 1,
+                        age: 8,
+                    }),
+                    netns: NetnsIdentity { device, inode },
+                    version: 0,
+                    quarantined: false,
+                    selection: Selection::Auto,
+                }))
+            };
+            let mut replies = VecDeque::from([(Duration::ZERO, ping())]);
+            if !with_operation {
+                replies.push_back((control::CHECK_TIMEOUT, Err(std::io::ErrorKind::TimedOut)));
+            }
+            let client = RecordedClient {
+                now: Cell::new(Instant::now()),
+                replies: RefCell::new(replies),
+                calls: RefCell::default(),
+            };
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let outcome = read_with(&deps, false, true, &mut out, &mut err, &client).unwrap();
+            if boot_state != "succeeded" {
+                assert!(
+                    matches!(outcome, ReadOutcome::Rendered(3)),
+                    "{}",
+                    String::from_utf8_lossy(&out)
+                );
+                assert!(String::from_utf8_lossy(&out).contains("OperationInProgress"));
+                continue;
+            }
+            let ReadOutcome::Local(local) = outcome else {
+                unreachable!("expected local fallback")
+            };
+            assert_eq!(local.version, Some(1));
+            let config = super::super::m2_config_at(&deps, local.version)
+                .unwrap()
+                .unwrap();
+            let code =
+                super::super::m2_check(&deps, &config, false, true, local, &mut out, &mut err)
+                    .unwrap();
+            assert_eq!(code, 2, "{}", String::from_utf8_lossy(&out));
+            assert!(String::from_utf8_lossy(&out).contains("Unprotected"));
+            assert!(client.replies.borrow().is_empty());
+        }
     }
 
     #[test]

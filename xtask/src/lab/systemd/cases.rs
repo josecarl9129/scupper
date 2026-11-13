@@ -840,7 +840,7 @@ impl SystemdLab {
                             "boot refused; stop scupperd, then rerun",
                             "supervisor lease unavailable:",
                             "writer lock timeout:",
-                            "boot skipped successfully; use scupper apply for a verified update",
+                            "boot skipped successfully; use scupper check for health and scupper apply for a verified update",
                         ]
                         .iter()
                         .any(|refusal| journal.contains(refusal))

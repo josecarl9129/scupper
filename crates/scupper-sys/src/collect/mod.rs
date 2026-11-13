@@ -102,8 +102,15 @@ pub fn boot_identity(root: &Path) -> Probe<NetnsIdentity> {
 /// # Errors
 /// Returns absent, invalid, unsafe or unreadable state as an observation error.
 pub fn selection(root: &Path) -> Probe<State> {
+    selection_with_run(root, root)
+}
+
+/// Read state while honoring per-boot uncertainty at the supplied runtime root.
+/// # Errors
+/// Returns state observation failures.
+pub fn selection_with_run(root: &Path, run_root: &Path) -> Probe<State> {
     match StateFile::open(root, None)
-        .and_then(|file| file.read())
+        .and_then(|file| file.safety_read(run_root))
         .map_err(|error| ProbeError::io(&format!("read state.json: {error}")))?
     {
         StateRead::Present(state) => Ok(state),

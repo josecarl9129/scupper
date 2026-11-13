@@ -103,6 +103,8 @@ pub enum LinkPhase {
 /// Persisted quarantine identity. Persistence supplies the wall-clock timestamp.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Latch {
+    /// Failed persistence or unreadable safety evidence, clearable by connect.
+    pub uncertain: bool,
     /// Why recurring safety drift closed the gateway.
     pub reason: String,
     /// Stable budget object key.

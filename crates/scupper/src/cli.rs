@@ -474,7 +474,7 @@ fn dispatch(
                             "{error}; holder is not an initialized, responsive scupperd attached to the named namespace; boot refused; stop scupperd, then rerun"
                         ));
                     }
-                    writeln!(stderr, "scupperd owns the namespace; boot skipped successfully; use scupper apply for a verified update").map_err(output_error)?;
+                    writeln!(stderr, "supervisor attached; scupperd owns the namespace; boot skipped successfully; use scupper check for health and scupper apply for a verified update").map_err(output_error)?;
                     return Ok(0);
                 }
                 Err(error) => return Err(format!("supervisor lease unavailable: {error}")),

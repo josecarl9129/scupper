@@ -311,12 +311,17 @@ impl Runtime<'_> {
         let Some((machine, _, _)) = &mut self.running else {
             return super::admin::durable_intent(&self.deps(), op, uid);
         };
-        if matches!(op, Op::Connect { .. }) && machine.latch().is_some() {
-            return Err(control::api(ApiErrorCode::Quarantined));
-        }
         let guard = machine
             .writer_guard()
             .map_err(|_| control::api(ApiErrorCode::Conflict))?;
+        if matches!(op, Op::Connect { .. }) {
+            super::admin::prepare_connect(
+                machine,
+                &guard,
+                &selection,
+                scupper_proto::Actor::Local { uid },
+            )?;
+        }
         machine.set_intent_locked(&guard, selection).map_err(|e| {
             control::api(if e.to_string() == "unconfigured exit" {
                 ApiErrorCode::InvalidRequest

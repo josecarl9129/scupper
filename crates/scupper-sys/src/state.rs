@@ -26,6 +26,54 @@ pub struct Quarantine {
     pub object: String,
     /// Unix seconds when the latch was set.
     pub since_unix: u64,
+    /// Failed persistence or unreadable latch evidence; connect may clear this.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub uncertain: bool,
+}
+
+/// Write-ahead repair history, independent of the main state replacement.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RepairState {
+    /// Attempt counts retained conservatively for ten minutes after restart.
+    pub attempts: std::collections::BTreeMap<String, usize>,
+    /// A restore is in flight; this never constitutes a quarantine latch.
+    pub armed: bool,
+    /// A quarantine whose main state replacement may have failed.
+    pub quarantine: Option<Quarantine>,
+}
+impl RepairState {
+    /// Only a recorded latch survives startup; counts and in-flight restores do not latch.
+    #[must_use]
+    pub fn startup_latch(&self) -> Option<Quarantine> {
+        self.latch()
+    }
+    /// A checkpointed latch may precede a failed main-state replacement.
+    #[must_use]
+    pub fn latch(&self) -> Option<Quarantine> {
+        self.quarantine.clone().map(|mut q| {
+            q.uncertain = true;
+            q
+        })
+    }
+}
+
+/// Missing legacy checkpoints carry no latch evidence; unreadable ones fail closed.
+#[derive(Debug, Clone)]
+pub enum RepairStateRead {
+    /// No repair record exists.
+    Missing,
+    /// A readable checkpoint.
+    Present(RepairState),
+    /// I/O or decoding failed.
+    Unreadable,
+}
+fn uncertain_quarantine() -> Quarantine {
+    Quarantine {
+        reason: "latch persistence or clearance uncertain; run scupper connect".into(),
+        object: "repair-history".into(),
+        since_unix: 0,
+        uncertain: true,
+    }
 }
 
 /// On-disk state schema. Missing optional fields are refused, as are unknown fields.
@@ -34,7 +82,7 @@ pub struct Quarantine {
 pub struct State {
     /// The supported state schema, currently 1.
     pub schema: u32,
-    /// Last successfully applied immutable configuration version.
+    /// Convergence target published under closed gates before target boot.
     #[serde(deserialize_with = "required_option")]
     pub applied_version: Option<u64>,
     /// Durable operator selection, including deliberate disconnection.
@@ -220,6 +268,117 @@ impl StateFile {
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(StateRead::Missing),
             Err(error) => Err(error),
+        }
+    }
+
+    /// Read safety state at a process/boot boundary, honoring uncertainty records.
+    /// # Errors
+    /// Returns main-state read failures. Corrupt or unreadable repair history is latched.
+    pub fn startup_read(&self, run_root: &Path) -> io::Result<StateRead> {
+        self.safety_read(run_root)
+    }
+
+    /// Read current latch uncertainty without interpreting completed budgets as a restart.
+    /// # Errors
+    /// Returns main-state read errors.
+    pub fn safety_read(&self, run_root: &Path) -> io::Result<StateRead> {
+        let mut saved = self.read()?;
+        if let StateRead::Present(state) = &mut saved {
+            let marker = std::fs::symlink_metadata(run_root.join("latch-uncertain"));
+            if state.applied_version.is_some() {
+                state.quarantine = state.quarantine.take().or_else(|| {
+                    self.repair_state().latch().map(|mut q| {
+                        q.reason = format!(
+                            "latch persistence or clearance uncertain: {}; run scupper connect",
+                            q.reason
+                        );
+                        q
+                    })
+                });
+                if !matches!(marker, Err(ref e) if e.kind() == io::ErrorKind::NotFound) {
+                    state
+                        .quarantine
+                        .get_or_insert_with(uncertain_quarantine)
+                        .uncertain = true;
+                }
+            }
+        }
+        Ok(saved)
+    }
+
+    /// Read the checkpoint without conflating absence and failed observation.
+    #[must_use]
+    pub fn repair_state_read(&self) -> RepairStateRead {
+        match RealFs.read(&self.path.with_file_name("repair-state.json")) {
+            Ok(text) => serde_json::from_str(&text)
+                .map_or(RepairStateRead::Unreadable, RepairStateRead::Present),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => RepairStateRead::Missing,
+            Err(_) => RepairStateRead::Unreadable,
+        }
+    }
+
+    /// Effective repair history: no record is empty, unreadable evidence latches.
+    #[must_use]
+    pub fn repair_state(&self) -> RepairState {
+        match self.repair_state_read() {
+            RepairStateRead::Missing => RepairState::default(),
+            RepairStateRead::Present(repair) => repair,
+            RepairStateRead::Unreadable => RepairState {
+                quarantine: Some(uncertain_quarantine()),
+                ..RepairState::default()
+            },
+        }
+    }
+
+    /// Establish a legacy checkpoint under the writer lock without changing state.
+    /// Returns true exactly when a checkpoint was created, for the migration audit.
+    /// # Errors
+    /// Returns main-state or durable checkpoint write errors.
+    pub fn migrate_repair_state(&self, writer: &WriterGuard, run_root: &Path) -> io::Result<bool> {
+        if !matches!(self.repair_state_read(), RepairStateRead::Missing)
+            || !matches!(
+                self.read()?,
+                StateRead::Present(State {
+                    applied_version: Some(_),
+                    ..
+                })
+            )
+            || !matches!(std::fs::symlink_metadata(run_root.join("latch-uncertain")), Err(e) if e.kind() == io::ErrorKind::NotFound)
+        {
+            return Ok(false);
+        }
+        self.write_repair_state(writer, &RepairState::default())?;
+        Ok(true)
+    }
+
+    /// Persist a repair checkpoint before allowing an automatic restore.
+    /// # Errors
+    /// Returns serialization, write or durability failures.
+    pub fn write_repair_state(
+        &self,
+        _writer: &WriterGuard,
+        repair: &RepairState,
+    ) -> io::Result<()> {
+        let bytes = serde_json::to_vec(repair).map_err(io::Error::other)?;
+        durable_replace(
+            &RealFs,
+            &self.path.with_file_name("repair-state.json"),
+            &bytes,
+            0o600,
+            &|_| Ok(()),
+            &|_| Ok(()),
+        )
+    }
+
+    /// Record explicit administrative clearance after the main state is durable.
+    /// # Errors
+    /// Returns checkpoint or runtime-marker removal/durability failures.
+    pub fn clear_repair_state(&self, writer: &WriterGuard, run_root: &Path) -> io::Result<()> {
+        self.write_repair_state(writer, &RepairState::default())?;
+        match std::fs::remove_file(run_root.join("latch-uncertain")) {
+            Ok(()) => RealFs.sync_dir(run_root),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
         }
     }
 
@@ -428,7 +587,7 @@ impl StateFile {
     /// remains; after rename the new file remains.
     pub fn write_with_hook(
         &self,
-        _writer: &WriterGuard,
+        writer: &WriterGuard,
         state: &State,
         hook: &dyn Fn(DurableStep) -> io::Result<()>,
     ) -> io::Result<()> {
@@ -443,6 +602,14 @@ impl StateFile {
             .parent()
             .ok_or_else(|| io::Error::other("missing state directory"))?;
         durable_directory(parent)?;
+        if state.quarantine.is_some() {
+            let mut repair = self.repair_state();
+            repair.quarantine.clone_from(&state.quarantine);
+            self.write_repair_state(writer, &repair)?;
+        } else if !self.path.try_exists()? {
+            // Only first creation establishes a clean history automatically.
+            self.write_repair_state(writer, &RepairState::default())?;
+        }
         durable_replace(&RealFs, &self.path, &bytes, 0o600, &|_| Ok(()), hook)
     }
 }

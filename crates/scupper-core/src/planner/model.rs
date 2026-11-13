@@ -174,6 +174,7 @@ pub struct ObservationDetails {
 /// Abstract kernel and persisted latch state. All fields are public so collectors
 /// and property generators can represent partial, inconsistent observations.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // Independent kernel facts, not mutually exclusive lifecycle states.
 pub struct KernelModel {
     /// Configured client ingress name.
     pub client_link: String,
@@ -195,6 +196,8 @@ pub struct KernelModel {
     pub links: BTreeMap<String, KernelLink>,
     /// Whether absence from `links` is authoritative.
     pub links_complete: bool,
+    /// Whether absence from the host inventory permits link creation.
+    pub host_links_complete: bool,
     /// IPv4 default, retaining foreign/missing route observations.
     pub default_v4: Known<DefaultRouteObs>,
     /// IPv6 default.
@@ -260,6 +263,7 @@ impl KernelModel {
                 .collect(),
             links,
             links_complete: true,
+            host_links_complete: true,
             default_v4: Known::Value(route_obs(&desired.routes[0].1)),
             default_v6: Known::Value(route_obs(&desired.routes[1].1)),
             extra_routes: Known::Value(vec![]),
@@ -451,6 +455,7 @@ impl KernelModel {
         m.latch = forwarding
             .and_then(|f| f.quarantine.as_ref())
             .map(|_| Latch {
+                uncertain: false,
                 reason: "persisted safety drift".into(),
                 object: "persisted".into(),
             });
@@ -566,6 +571,7 @@ impl KernelModel {
             }
             Step::PersistLatch { reason, object } => {
                 m.latch = Some(Latch {
+                    uncertain: false,
                     reason: reason.clone(),
                     object: object.clone(),
                 });
@@ -757,6 +763,7 @@ pub fn safe(m: &KernelModel, desired: &Desired) -> bool {
             NamespaceState::InodeGone | NamespaceState::Unknown
         )
         && m.links_complete
+        && m.host_links_complete
         && exit_prefix_routes_safe(m, desired)
         && m.extra_rules == Known::Value(vec![])
         && m.links.iter().all(|(name, link)| {

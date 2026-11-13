@@ -125,7 +125,7 @@ impl StartupRead {
                     .spawn(move || {
                         let result = (|| {
                             let state = StateFile::open(&state_root, None)?;
-                            let StateRead::Present(saved) = state.read()? else {
+                            let StateRead::Present(saved) = state.startup_read(&run_root)? else {
                                 return Err(io::Error::other("missing safety state"));
                             };
                             let version = saved
@@ -192,6 +192,7 @@ impl StartupRead {
             .ok_or_else(|| io::Error::other("missing startup inputs"))
     }
 }
+#[allow(clippy::too_many_lines)] // Keep locked checkpoint migration and startup attachment in one boundary.
 fn initialize<'a>(
     deps: BootDeps<'a>,
     gateway: GatewayId,
@@ -201,7 +202,27 @@ fn initialize<'a>(
     inputs: &mut StartupRead,
     guard: Option<(&crate::lock::WriterGuard, bool)>,
 ) -> io::Result<(Machine<'a>, Arc<NetnsHandle>, Config)> {
+    let owned_guard = if guard.is_none() {
+        Some(crate::lock::WriterLock::acquire_timeout(
+            deps.run_root,
+            canon_deadline.saturating_duration_since(Instant::now()),
+        )?)
+    } else {
+        None
+    };
+    let writer = guard
+        .map(|(writer, _)| writer)
+        .or(owned_guard.as_ref())
+        .ok_or_else(|| io::Error::other("missing startup writer"))?;
     let loaded = inputs.load(&deps, canon_deadline)?;
+    if loaded.state.migrate_repair_state(writer, deps.run_root)? {
+        log.emit(
+            EventKind::RepairCheckpointCreated {},
+            Actor::Daemon,
+            loaded.saved.applied_version,
+        )
+        .map_err(io::Error::other)?;
+    }
     let site = validate(parse_site(&loaded.text).map_err(io::Error::other)?)
         .map_err(|_| io::Error::other("invalid applied configuration"))?;
     let version = loaded
@@ -282,8 +303,8 @@ fn initialize<'a>(
         }
         machine.resume_existing_locked(guard);
     } else {
-        machine.recover_route_switch()?;
-        machine.resume_existing();
+        machine.recover_route_switch_locked(writer)?;
+        machine.resume_existing_locked(writer);
     }
     Ok((machine, held, config))
 }
@@ -801,9 +822,9 @@ impl Runtime<'_> {
                     )
                     .ok()
                 };
-                if self.running.is_none() {
-                    close_only(&deps, self.options);
-                }
+                finish_apply_reattach(&mut result, &guard, self.running.is_some(), |guard| {
+                    close_only_locked(&deps, guard)
+                });
                 self.cached = None;
                 self.last_complete = None;
                 self.publish_snapshot();
@@ -1233,18 +1254,61 @@ impl DaemonDeps for Runtime<'_> {
         }
     }
 }
+// Reattachment failure is contained synchronously under the apply's writer.
+fn finish_apply_reattach(
+    result: &mut Result<scupper_proto::OpResult, scupper_proto::ApiError>,
+    guard: &crate::lock::WriterGuard,
+    attached: bool,
+    close: impl FnOnce(&crate::lock::WriterGuard) -> Result<(), crate::reconcile::StepError>,
+) {
+    if attached {
+        return;
+    }
+    let closed = close(guard);
+    if closed.is_ok()
+        && let Ok(scupper_proto::OpResult::Apply { warnings, .. }) = result
+    {
+        warnings.push("Apply succeeded but supervisor reattachment failed; forwarding is closed while the supervisor retries".into());
+    }
+    if let Err(error) = closed {
+        let mut failure = result
+            .as_ref()
+            .err()
+            .cloned()
+            .unwrap_or_else(|| control::api(scupper_proto::ApiErrorCode::Internal));
+        let observation = failure
+            .observation
+            .get_or_insert_with(|| serde_json::json!({}));
+        if let Some(fields) = observation.as_object_mut() {
+            fields.insert("closure_error".into(), serde_json::json!(error.to_string()));
+        } else {
+            *observation =
+                serde_json::json!({"closure_error": error.to_string(), "previous": observation});
+        }
+        *result = Err(failure);
+    }
+}
+
+fn close_only_locked(
+    deps: &BootDeps<'_>,
+    _guard: &crate::lock::WriterGuard,
+) -> Result<(), crate::reconcile::StepError> {
+    let held = NetnsHandle::open("/run/netns/scupper")
+        .map_err(|_| crate::reconcile::StepError("closure namespace unavailable"))?;
+    crate::reconcile::forwarding_gates(deps, &held, false, None)
+}
+
 // An invalid handoff cannot authorize restoration. Close gates only, using the
 // same bounded kernel executor and writer lock as reconciliation.
 fn close_only(deps: &BootDeps<'_>, options: &Options) {
-    let Ok(_guard) =
+    let Ok(guard) =
         crate::lock::WriterLock::acquire_timeout(&options.run_root, Duration::from_millis(100))
     else {
         return;
     };
-    let Ok(held) = NetnsHandle::open("/run/netns/scupper") else {
-        return;
-    };
-    let _ = crate::reconcile::forwarding_gates(deps, &held, false, None);
+    if let Err(error) = close_only_locked(deps, &guard) {
+        eprintln!("scupperd: emergency closure failed: {error}");
+    }
 }
 
 // Fault injection is confined to testing builds and still executes real boot.
@@ -1270,6 +1334,57 @@ fn testing_boot_hook(point: boot::BootPoint) -> Result<(), String> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apply_reattach_closes_under_real_writer_before_return_and_propagates_failure() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/tmp/apply-close")
+            .join(std::process::id().to_string());
+        let guard = crate::lock::WriterLock::acquire(&root).unwrap();
+        for fail in [false, true] {
+            let mut forwarding = true;
+            let mut result = Ok(scupper_proto::OpResult::Apply {
+                version: 1,
+                dry_run: false,
+                warnings: vec![],
+                repair_plan: vec![],
+                plan: vec![],
+            });
+            finish_apply_reattach(&mut result, &guard, false, |held| {
+                assert!(std::ptr::eq(held, &raw const guard));
+                assert!(crate::lock::WriterLock::try_acquire(&root).is_err());
+                forwarding = false;
+                if fail {
+                    Err(crate::reconcile::StepError("injected closure failure"))
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(!forwarding, "closure must complete before returning");
+            assert_eq!(result.is_err(), fail);
+            if let Ok(scupper_proto::OpResult::Apply { warnings, .. }) = &result {
+                assert!(
+                    warnings
+                        .iter()
+                        .any(|warning| warning.contains("reattachment failed")
+                            && warning.contains("forwarding is closed"))
+                );
+            }
+            if fail {
+                let error = result.unwrap_err();
+                assert!(error.to_string().contains("closure failed"));
+                assert!(
+                    error
+                        .observation
+                        .unwrap()
+                        .to_string()
+                        .contains("closure failure")
+                );
+            }
+        }
+        drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[cfg(feature = "testing")]
     #[test]
@@ -1696,6 +1811,13 @@ mod tests {
             .join("production-initialize")
             .join(std::process::id().to_string());
         std::fs::create_dir_all(&root).unwrap();
+        let guard = crate::lock::WriterLock::acquire(&root).unwrap();
+        StateFile::open(&root, None)
+            .unwrap()
+            .write_repair_state(&guard, &crate::state::RepairState::default())
+            .unwrap();
+        drop(guard);
+
         let text = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../scupper-core/tests/fixtures/site-m2.toml"

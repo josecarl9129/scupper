@@ -1,3 +1,4 @@
+//! Sender deadlines provide best-effort bounded staleness, not a network delivery guarantee.
 //! Host-namespace heartbeat delivery. The URL and absolute `CLOCK_MONOTONIC`
 //! deadline travel only over stdin. GET uses the existing rustls/webpki client,
 //! with no redirects, proxies, custom trust roots or response body logging.
@@ -127,7 +128,7 @@ impl fmt::Debug for Request {
     }
 }
 impl Request {
-    /// Construct with an absolute Linux monotonic deadline.
+    /// Construct with an absolute Linux monotonic sender deadline (best effort; no network arrival guarantee).
     /// # Errors
     /// Rejects invalid HTTPS URLs and deadlines more than 30 seconds away.
     pub fn new(url: &str, deadline_ns: u64) -> Result<Self, Failure> {
@@ -629,7 +630,7 @@ pub fn retry(request: &Request, send: impl FnMut() -> Result<(), Failure>) -> Re
     retry_deadline(request.deadline_ns, send)
 }
 
-/// Retry one complete resolution/delivery job, preserving its absolute deadline.
+/// Retry a resolution/delivery job within its absolute sender deadline; network arrival is not guaranteed.
 /// # Errors
 /// Returns the final reason; no attempt begins after the verdict deadline.
 pub fn retry_deadline(

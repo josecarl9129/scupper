@@ -161,6 +161,15 @@ pub struct Alert {
     /// Closed protection-check reason, when applicable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<ProtectionReason>,
+    /// First audit sequence of an exposure incident summarized after resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incident_id: Option<u64>,
+    /// Exposure resolved before its firing notification reached the sink.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resolved_undelivered: bool,
+    /// Number of exposure incidents represented by an owed summary.
+    #[serde(default)]
+    pub incidents: u64,
     /// Suppressed notifications since the previous delivery.
     pub suppressed: u64,
 }
@@ -176,10 +185,33 @@ impl From<AlertEvent> for Alert {
             count: 1,
             suppressed: 0,
             reason: None,
+            incident_id: None,
+            resolved_undelivered: false,
+            incidents: 0,
         }
     }
 }
 impl Alert {
+    /// Merge an owed exposure summary, retaining the first incident and latest resolution.
+    pub fn merge_summary(&mut self, other: &Self) {
+        if other.seq > self.seq {
+            self.count = self.count.saturating_add(other.count);
+            self.incidents = self.incidents.max(1).saturating_add(other.incidents.max(1));
+            self.seq = other.seq;
+        } else if other.seq == self.seq {
+            self.count = self.count.max(other.count);
+            self.incidents = self.incidents.max(other.incidents).max(1);
+        }
+        self.duration = self.duration.max(other.duration);
+        self.at = self.at.max(other.at);
+        self.incident_id = self.incident_id.or(other.incident_id);
+    }
+    /// Exposure-class incidents retain a delivery obligation even without a firing delivery.
+    #[must_use]
+    pub fn exposure(&self) -> bool {
+        self.severity == Severity::Critical
+            && matches!(self.key, AlertKey::Unprotected | AlertKey::Quarantine)
+    }
     /// Fixed title, derived exclusively from an enum.
     #[must_use]
     pub fn title(&self) -> &'static str {
@@ -207,6 +239,18 @@ impl Alert {
             self.count,
             self.suppressed
         );
+        if self.resolved_undelivered {
+            use std::fmt::Write as _;
+            let _ = write!(
+                body,
+                "; resolved while undelivered; incidents={}",
+                self.incidents.max(1)
+            );
+        }
+        if let Some(id) = self.incident_id {
+            use std::fmt::Write as _;
+            let _ = write!(body, "; incident_id={id}");
+        }
         if let Some(reason) = self.reason {
             body.push_str("; reason=");
             body.push_str(reason.as_str());

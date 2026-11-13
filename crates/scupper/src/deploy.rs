@@ -78,6 +78,22 @@ impl TransportOutput {
 pub(crate) fn switch_message(outcome: SwitchOutcome, reason: &str) -> String {
     let reason = reason.trim_end();
     match outcome {
+        SwitchOutcome::FailedAfterChange | SwitchOutcome::PossiblyChanged => {
+            if reason.starts_with("Switch changed:")
+                || reason.starts_with("Switch possibly changed:")
+            {
+                reason.into()
+            } else {
+                format!(
+                    "Switch {}: {reason}",
+                    if outcome == SwitchOutcome::PossiblyChanged {
+                        "possibly changed"
+                    } else {
+                        "changed"
+                    }
+                )
+            }
+        }
         SwitchOutcome::RefusedNoChange
             if reason.starts_with("Switch refused, nothing changed: ") =>
         {
@@ -94,7 +110,7 @@ pub(crate) fn switch_message(outcome: SwitchOutcome, reason: &str) -> String {
         SwitchOutcome::FailedAfterRename | SwitchOutcome::Unknown => format!(
             "Switch {}: {reason}. Gateway binaries may be mixed or services stopped. Restore manually:\n{}",
             if outcome == SwitchOutcome::Unknown {
-                "outcome unknown"
+                "outcome unknown (possibly changed; files in the confirmed plan)"
             } else {
                 "failed after binary rename"
             },

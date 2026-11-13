@@ -47,7 +47,12 @@ enum AppCommand {
         address: Option<Ipv4Addr>,
     },
     /// Restore saved app binding preferences while quit.
-    Unbind { app: App },
+    Unbind {
+        app: App,
+        /// Restore saved preferences even if current values changed after bind.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[cfg(any(target_os = "macos", test))]

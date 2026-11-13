@@ -89,7 +89,7 @@ fn prepare(
     let health_result = identity
         .clone()
         .and_then(|identity| health(deps, cfg, identity));
-    let state_result = collect::selection(deps.state_root);
+    let state_result = collect::selection_with_run(deps.state_root, deps.run_root);
     let pending = health_result
         .as_ref()
         .err()

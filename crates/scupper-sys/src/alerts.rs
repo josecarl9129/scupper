@@ -174,10 +174,10 @@ impl Journal {
     }
     fn owes_recovery(&self, key: alerts::AlertKey) -> bool {
         self.delivered.get(&key) == Some(&alerts::AlertState::Firing)
-            || self
-                .queue
-                .iter()
-                .any(|p| p.alert.key == key && (p.first.is_some() || p.observe_until.is_none()))
+            || self.queue.iter().any(|p| {
+                p.alert.key == key
+                    && (p.alert.exposure() || p.first.is_some() || p.observe_until.is_none())
+            })
     }
     fn observe(&mut self, alert: Alert, at: u64) {
         if alert.severity == alerts::Severity::Critical
@@ -198,15 +198,33 @@ impl Journal {
     fn enqueue(&mut self, alerts: Vec<Alert>) {
         for mut alert in alerts {
             if alert.severity == alerts::Severity::Critical {
-                if let Some(index) = self.queue.iter().position(|p| p.alert.key == alert.key) {
+                if let Some(index) = self.queue.iter().position(|p| {
+                    p.alert.key == alert.key
+                        && (!p.alert.resolved_undelivered || p.alert.seq == alert.seq)
+                }) {
                     let pending = self.queue.remove(index);
                     if pending.alert.seq != alert.seq || pending.alert.state != alert.state {
                         self.suppressed = self.suppressed.saturating_add(1);
                     } else {
                         alert.count = alert.count.max(pending.alert.count);
                         alert.duration = alert.duration.max(pending.alert.duration);
+                        alert.incidents = alert.incidents.max(pending.alert.incidents);
                     }
-                    if pending.first.is_some()
+                    if alert.exposure()
+                        && alert.state == alerts::AlertState::Resolved
+                        && self.delivered.get(&alert.key) != Some(&alerts::AlertState::Firing)
+                    {
+                        alert.resolved_undelivered = true;
+                        alert.incidents = alert.incidents.max(1);
+                        alert.incident_id = pending.alert.incident_id.or(Some(pending.alert.seq));
+                        alert.count = alert.count.max(pending.alert.count);
+                        alert.duration = alert
+                            .duration
+                            .max(pending.alert.duration)
+                            .max(alert.at.saturating_sub(pending.alert.at));
+                    }
+                    if alert.resolved_undelivered
+                        || pending.first.is_some()
                         || ((pending.observe_until.is_none()
                             || alert.state == alerts::AlertState::Firing
                             || self.delivered.get(&alert.key) == Some(&alerts::AlertState::Firing))
@@ -215,8 +233,11 @@ impl Journal {
                         // Collapsing changes state, not the sink's retry schedule
                         // or the admission already paid for this owed key.
                         let mut replacement = pending;
+                        if alert.resolved_undelivered {
+                            replacement.observe_until = None;
+                        }
                         replacement.alert = alert;
-                        self.queue.push(replacement);
+                        self.push_pending(replacement);
                     }
                     continue;
                 }
@@ -226,11 +247,12 @@ impl Journal {
                     .copied()
                     .unwrap_or(alerts::AlertState::Resolved)
                     == alert.state
+                    && !alert.resolved_undelivered
                 {
                     continue;
                 }
             }
-            if self.queue.len() == 64 {
+            if self.queue.len() >= 64 {
                 if let Some(index) = self
                     .queue
                     .iter()
@@ -248,8 +270,25 @@ impl Journal {
                 }
                 self.suppressed = self.suppressed.saturating_add(1);
             }
-            self.queue.push(Pending::new(alert));
+            if alert.exposure() && alert.state == alerts::AlertState::Firing {
+                alert.incident_id.get_or_insert(alert.seq);
+            }
+            self.push_pending(Pending::new(alert));
         }
+    }
+    fn push_pending(&mut self, mut pending: Pending) {
+        if pending.alert.resolved_undelivered {
+            pending.alert.incidents = pending.alert.incidents.max(1);
+            if let Some(existing) = self
+                .queue
+                .iter_mut()
+                .find(|p| p.alert.resolved_undelivered && p.alert.key == pending.alert.key)
+            {
+                existing.alert.merge_summary(&pending.alert);
+                return;
+            }
+        }
+        self.queue.push(pending);
     }
     fn advance_clock(&mut self, at: u64) {
         if at < self.clock {
@@ -298,15 +337,10 @@ impl Journal {
     fn load(path: &Path, at: u64) -> io::Result<Self> {
         match RealFs.read(path) {
             Ok(text) => {
-                if text.len() > 131_072 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "oversized alert journal",
-                    ));
-                }
                 let mut journal: Self = serde_json::from_str(&text)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                if journal.version != 1
+                if text.len() > 131_072
+                    || journal.version != 1
                     || journal.queue.len() > 64
                     || journal
                         .queue
@@ -338,9 +372,13 @@ impl Journal {
                 journal.queue.reverse();
                 journal.queue.retain(|pending| {
                     pending.alert.severity != alerts::Severity::Critical
+                        || pending.alert.resolved_undelivered
                         || keys.insert(pending.alert.key)
                 });
                 journal.queue.reverse();
+                for pending in std::mem::take(&mut journal.queue) {
+                    journal.push_pending(pending);
+                }
                 if !journal.queue.iter().any(|p| p.test.is_none()) {
                     journal.failing_since = None;
                 }
@@ -1079,6 +1117,8 @@ fn open_journal(root: &Path, path: &Path, log: &LogHandle) -> io::Result<Journal
     let upper = log.committed_seq();
     let mut latest = BTreeMap::new();
     let mut current = Coalescer::default();
+    let mut incident_ids = BTreeMap::new();
+    let mut owed_summaries = BTreeMap::<alerts::AlertKey, Alert>::new();
     let mut tail = events::Tail::default();
     for record in tail.read(root, 0, upper)? {
         if let events::TailRecord::Event(event) = record
@@ -1090,7 +1130,27 @@ fn open_journal(root: &Path, path: &Path, log: &LogHandle) -> io::Result<Journal
             if alert.state == alerts::AlertState::Resolved && journal.owes_recovery(alert.key) {
                 latest.insert(alert.key, alert.clone());
             }
-            for ready in current.push_at(alert, monotonic()) {
+            if alert.exposure() && alert.state == alerts::AlertState::Firing {
+                incident_ids.entry(alert.key).or_insert(alert.seq);
+            }
+            for mut ready in current.push_at(alert, monotonic()) {
+                if ready.exposure() {
+                    ready.incident_id = incident_ids.get(&ready.key).copied();
+                    if ready.state == alerts::AlertState::Resolved {
+                        ready.resolved_undelivered = existing
+                            && ready.seq > journal.critical_scanned
+                            && journal.delivered.get(&ready.key)
+                                != Some(&alerts::AlertState::Firing);
+                        if ready.resolved_undelivered {
+                            ready.incidents = 1;
+                            owed_summaries
+                                .entry(ready.key)
+                                .and_modify(|summary| summary.merge_summary(&ready))
+                                .or_insert_with(|| ready.clone());
+                        }
+                        incident_ids.remove(&ready.key);
+                    }
+                }
                 latest.insert(ready.key, ready);
             }
         }
@@ -1108,11 +1168,15 @@ fn open_journal(root: &Path, path: &Path, log: &LogHandle) -> io::Result<Journal
     if !existing {
         journal.scanned = upper;
     }
+    journal.enqueue(owed_summaries.into_values().collect());
     for alert in latest.into_values() {
         if existing || alert.state == alerts::AlertState::Firing {
             let key = alert.key;
             let snapshot = alert.state == alerts::AlertState::Firing
-                && !journal.queue.iter().any(|p| p.alert.key == key);
+                && !journal
+                    .queue
+                    .iter()
+                    .any(|p| p.alert.key == key && !p.alert.resolved_undelivered);
             journal.enqueue(vec![alert]);
             if snapshot && let Some(pending) = journal.queue.iter_mut().find(|p| p.alert.key == key)
             {
@@ -1815,6 +1879,160 @@ mod tests {
         j.live_keys = Some(log.handle.current_critical_keys(j.scanned));
         step(&mut j, &t.path(), &sink, &log.handle, monotonic()).unwrap();
         assert_eq!(*sink.sent.lock().unwrap(), vec![started]);
+    }
+    #[test]
+    fn exposure_resolved_undelivered_summary_survives_hold_and_two_restarts() {
+        for (start, end) in [
+            (
+                OperationalEvent::Unprotected,
+                OperationalEvent::ProtectionRestored,
+            ),
+            (
+                OperationalEvent::QuarantineSet,
+                OperationalEvent::QuarantineCleared,
+            ),
+        ] {
+            let t = Temp::new();
+            let log = t.log();
+            let sink = Fake::new(Ok(()));
+            let mut j = Journal::new(100);
+            let mut pending = Pending::new(map(start, 41, 1000));
+            pending.observe_until = Some(220);
+            j.coalescer.push_at(pending.alert.clone(), 100);
+            j.coalescer.push_at(map(start, 40, 1001), 101);
+            j.queue.push(pending);
+            j.save(&t.path()).unwrap();
+            let mut j = Journal::load(&t.path(), 101).unwrap();
+            j.observe(map(end, 42, 1017), 117);
+            assert_eq!(j.queue.len(), 1);
+            let summary = &j.queue[0].alert;
+            assert!(summary.resolved_undelivered);
+            assert_eq!(summary.incident_id, Some(41));
+            assert_eq!(summary.duration, 17);
+            assert_eq!(summary.count, 2);
+            assert!(summary.body().contains("resolved while undelivered"));
+            j.save(&t.path()).unwrap();
+            let mut j = Journal::load(&t.path(), 118).unwrap();
+            j.observe(map(start, 43, 1018), 118);
+            assert_eq!(j.queue.len(), 2, "new incident must not erase owed summary");
+            j.save(&t.path()).unwrap();
+            let mut j = Journal::load(&t.path(), 119).unwrap();
+            assert!(j.queue.iter().any(|p| p.alert.incident_id == Some(41)));
+            step(&mut j, &t.path(), &sink, &log.handle, 120).unwrap();
+            assert_eq!(*sink.sent.lock().unwrap(), [42]);
+            assert!(
+                !Journal::load(&t.path(), 121)
+                    .unwrap()
+                    .queue
+                    .iter()
+                    .any(|p| p.alert.incident_id == Some(41))
+            );
+        }
+    }
+    #[test]
+    fn exposure_summary_reconstructed_from_log_survives_retry_and_restart_hold() {
+        let t = Temp::new();
+        let log = t.log();
+        let id = log
+            .handle
+            .emit(
+                EventKind::QuarantineChanged { active: true },
+                Actor::Daemon,
+                None,
+            )
+            .unwrap();
+        log.handle.flush_blocking(Duration::from_secs(5)).unwrap();
+        let j = open_journal(&t.0, &t.path(), &log.handle).unwrap();
+        assert!(j.queue[0].observe_until.is_some());
+        let resolved = log
+            .handle
+            .emit(
+                EventKind::QuarantineChanged { active: false },
+                Actor::Daemon,
+                None,
+            )
+            .unwrap();
+        log.handle.flush_blocking(Duration::from_secs(5)).unwrap();
+        let mut j = open_journal(&t.0, &t.path(), &log.handle).unwrap();
+        assert_eq!(j.queue.len(), 1);
+        assert_eq!(j.queue[0].alert.incident_id, Some(id));
+        assert!(j.queue[0].alert.resolved_undelivered);
+        let sink = Fake::new(Err(SinkError::Transient));
+        step(&mut j, &t.path(), &sink, &log.handle, monotonic()).unwrap();
+        // Multiple incidents can begin and end while the worker is absent.
+        let mut other_resolutions = Vec::new();
+        for _ in 0..2 {
+            log.handle
+                .emit(
+                    EventKind::QuarantineChanged { active: true },
+                    Actor::Daemon,
+                    None,
+                )
+                .unwrap();
+            other_resolutions.push(
+                log.handle
+                    .emit(
+                        EventKind::QuarantineChanged { active: false },
+                        Actor::Daemon,
+                        None,
+                    )
+                    .unwrap(),
+            );
+        }
+        log.handle.flush_blocking(Duration::from_secs(5)).unwrap();
+        let mut j = open_journal(&t.0, &t.path(), &log.handle).unwrap();
+        assert_eq!(
+            j.queue.len(),
+            1,
+            "replay merges every unseen resolved exposure per key"
+        );
+        assert!(j.queue[0].alert.resolved_undelivered);
+        assert_eq!(j.queue[0].alert.incident_id, Some(id));
+        assert_eq!(j.queue[0].alert.incidents, 3);
+        assert_eq!(j.queue[0].alert.count, 3);
+        *sink.result.lock().unwrap() = Ok(());
+        step(&mut j, &t.path(), &sink, &log.handle, monotonic() + 1000).unwrap();
+        assert_eq!(j.queue.len(), 0);
+        assert_eq!(*sink.sent.lock().unwrap(), [resolved, other_resolutions[1]]);
+        assert!(
+            open_journal(&t.0, &t.path(), &log.handle)
+                .unwrap()
+                .queue
+                .is_empty()
+        );
+    }
+    #[test]
+    fn five_hundred_undelivered_incidents_keep_one_summary_per_exposure_key() {
+        let t = Temp::new();
+        let mut journal = Journal::new(0);
+        for incident in 0..500 {
+            for (start, end) in [
+                (
+                    OperationalEvent::Unprotected,
+                    OperationalEvent::ProtectionRestored,
+                ),
+                (
+                    OperationalEvent::QuarantineSet,
+                    OperationalEvent::QuarantineCleared,
+                ),
+            ] {
+                let seq = incident * 2 + 1;
+                journal.observe(map(start, seq, seq), seq);
+                journal.observe(map(end, seq + 1, seq + 1), seq + 1);
+            }
+            journal.save(&t.path()).unwrap();
+            journal = Journal::load(&t.path(), incident * 2 + 2).unwrap();
+            assert_eq!(journal.queue.len(), 2);
+        }
+        for pending in &journal.queue {
+            assert!(pending.alert.resolved_undelivered);
+            assert_eq!(pending.alert.incidents, 500);
+            assert_eq!(pending.alert.count, 500);
+            assert_eq!(pending.alert.incident_id, Some(1));
+            assert_eq!(pending.alert.at, 1000);
+            assert_eq!(pending.alert.duration, 1);
+        }
+        assert!(std::fs::metadata(t.path()).unwrap().len() < 131_072);
     }
     #[test]
     fn critical_retry_and_incident_stats_survive_worker_reconstruction() {

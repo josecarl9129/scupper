@@ -12,7 +12,7 @@ use crate::{
 };
 use std::collections::BTreeSet;
 
-/// Plans only toward the last verified applied configuration. Reservations count
+/// Plans only toward the published convergence target. Reservations count
 /// attempts, even if execution later fails. No caller state is mutated.
 #[must_use]
 #[allow(clippy::too_many_lines)] // Keep the safety-critical execution order visible together.
@@ -266,6 +266,7 @@ fn build_plan(
             .iter()
             .find(|(_, safety)| *safety)
             .map(|(object, _)| Latch {
+                uncertain: false,
                 reason: "safety repair budget exhausted".into(),
                 object: object.clone(),
             })
@@ -310,8 +311,7 @@ fn build_plan(
     for repair in tighten {
         builder.tighten(repair);
     }
-    builder.result.debounce.ingress_quarantined = unknown_inventory
-        && (debounce.ingress_quarantined || debounce.previous.contains("unknown-inventory"));
+    builder.result.debounce.ingress_quarantined = unknown_inventory;
     if builder.result.debounce.ingress_quarantined {
         // Only a positively down or positively absent device is contained.
         // Omission from incomplete inventory must still trigger a down attempt.
@@ -650,7 +650,10 @@ fn detect(d: &Desired, m: &KernelModel) -> Vec<Repair> {
     for name in &d.link_order {
         let want = &d.links[name];
         match m.links.get(name) {
-            None if m.links_complete && m.host_links.get(name).is_none_or(host_leftover) => {
+            None if m.links_complete
+                && m.host_links_complete
+                && m.host_links.get(name).is_none_or(host_leftover) =>
+            {
                 out.push(Repair::LinkRecreate { name: name.clone() });
             }
             Some(link)
@@ -718,6 +721,7 @@ fn detect(d: &Desired, m: &KernelModel) -> Vec<Repair> {
 fn has_unknown_safety(m: &KernelModel) -> bool {
     m.namespace == NamespaceState::Unknown
         || !m.links_complete
+        || !m.host_links_complete
         || matches!(m.ruleset, Known::Unknown)
         || matches!(m.forwarding_v4, Known::Unknown)
         || matches!(m.forwarding_v6, Known::Unknown)

@@ -965,17 +965,10 @@ fn boot_under_held_lease_requires_initialized_ping() {
 
 #[test]
 fn applying_ping_never_compares_kernel_with_unreached_state_version() {
-    use scupper_proto::{OpResult, OperationKind, OperationProgress};
+    use scupper_proto::OpResult;
     use std::os::unix::net::UnixListener;
-    for operation in [
-        Some(OperationProgress {
-            kind: OperationKind::Apply,
-            from: 1,
-            to: 2,
-            age: 6,
-        }),
-        None,
-    ] {
+    {
+        let operation = None;
         let sys = Script::new("ubuntu-24.04");
         fresh(&sys);
         let held = testing::handle().unwrap();

@@ -132,6 +132,14 @@ impl std::fmt::Display for ApiError {
         {
             write!(f, ": {error}")?;
         }
+        if let Some(error) = self
+            .observation
+            .as_ref()
+            .and_then(|o| o.get("closure_error"))
+            .and_then(serde_json::Value::as_str)
+        {
+            write!(f, ": closure failed: {error}")?;
+        }
         Ok(())
     }
 }

@@ -760,6 +760,7 @@ fn failure_state(d: &Desired, m: &KernelModel, p: &Plan, failed: usize) -> Kerne
 fn latch_survives_ticks_restore_repairs_and_failure_replanning() {
     let d = desired();
     let latch = Latch {
+        uncertain: false,
         reason: "fighting".into(),
         object: "link:foreign0".into(),
     };
@@ -1435,6 +1436,7 @@ fn random_models_prefixes_failures_determinism_and_coverage() {
                 let mut m = random_model(&d, &modes);
                 if seed_latch {
                     m.latch = Some(Latch {
+                        uncertain: false,
                         reason: "generated quarantine".into(),
                         object: SafetyClass::TcHook.key().into(),
                     });
@@ -1694,6 +1696,7 @@ fn unrelated_link_restore_cannot_bypass_route_debounce_and_external_latch_cannot
         }
     )));
     let latch = Latch {
+        uncertain: false,
         reason: "external persisted quarantine".into(),
         object: "ruleset".into(),
     };
@@ -1723,6 +1726,7 @@ fn ingress_forwarding_drift_is_not_hidden_by_the_global_values() {
     assert_eq!(tick(&d, &m, &Debounce::default()).steps, []);
     assert_eq!(settled(&d, &m).steps, on(&d));
     let latch = Latch {
+        uncertain: false,
         reason: "quarantine".into(),
         object: "ruleset".into(),
     };
@@ -1774,7 +1778,7 @@ fn blocked_restores_reserve_nothing_and_unknown_rulesets_only_close() {
 }
 
 #[test]
-fn unknown_inventory_closes_ingress_on_second_tick_then_recovers() {
+fn unknown_inventory_closes_ingress_immediately_then_recovers() {
     let d = desired();
     for missing_links in [false, true] {
         let mut m = KernelModel::desired(&d);
@@ -1785,16 +1789,16 @@ fn unknown_inventory_closes_ingress_on_second_tick_then_recovers() {
         }
         let first = tick(&d, &m, &Debounce::default());
         assert_eq!(first.steps.first(), Some(&Step::ForwardingOff));
-        assert!(!first.steps.contains(&Step::LinkDown { name: "wg0".into() }));
+        assert!(first.steps.contains(&Step::LinkDown { name: "wg0".into() }));
         m = run(&m, &first.steps);
         let second = plan(&d, &m, &first.budgets, None, &first.debounce, at(2));
         assert!(
-            second
+            !second
                 .steps
                 .contains(&Step::LinkDown { name: "wg0".into() })
         );
         assert!(
-            second
+            first
                 .steps
                 .contains(&Step::Emit(PlannerEvent::IngressQuarantined))
         );
@@ -2100,6 +2104,7 @@ fn inheritance_and_model_effects_expose_wrongly_emitted_steps() {
     assert_eq!(m.client_forwarding_v4, Known::Value(1));
     m = m.apply(&Step::ForwardingOff);
     m.latch = Some(Latch {
+        uncertain: false,
         reason: "test".into(),
         object: SafetyClass::TcHook.key().into(),
     });
@@ -2325,6 +2330,7 @@ fn admin_actions_reset_only_safety_and_pending_classes_cannot_create_a_latch() {
             .any(|s| matches!(s, Step::ForwardingOn { .. }))
     );
     let latch = Latch {
+        uncertain: false,
         reason: "test".into(),
         object: SafetyClass::TcHook.key().into(),
     };
@@ -2442,6 +2448,7 @@ fn memory_latch_persistence_survives_namespace_loss() {
     let mut m = KernelModel::desired(&d);
     m.namespace = NamespaceState::InodeGone;
     let latch = Latch {
+        uncertain: false,
         reason: "fighting".into(),
         object: SafetyClass::TcHook.key().into(),
     };
@@ -2575,4 +2582,23 @@ fn disconnected_safety_requires_every_forwarding_gate_closed() {
         assert_eq!(plan.steps.first(), Some(&Step::ForwardingOff));
         assert_plan(&d, &open, &plan, None);
     }
+}
+
+#[test]
+fn unknown_host_inventory_closes_forwarding_without_flapping_client_link() {
+    let d = desired();
+    let mut m = KernelModel::desired(&d);
+    m.host_links_complete = false;
+    let first = tick(&d, &m, &Debounce::default());
+    assert_eq!(first.steps.first(), Some(&Step::ForwardingOff));
+    assert!(!first.steps.contains(&Step::LinkDown { name: "wg0".into() }));
+    assert!(!first.debounce.ingress_quarantined);
+    m.links.remove("ex-ch1");
+    let next = settled(&d, &m);
+    assert!(
+        !next
+            .repairs
+            .iter()
+            .any(|r| matches!(r, Repair::LinkRecreate { .. }))
+    );
 }

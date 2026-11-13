@@ -15,7 +15,7 @@ use scupper_sys::{
 };
 use serde_json::json;
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     fs, io,
     path::{Path, PathBuf},
     time::Duration,
@@ -30,6 +30,9 @@ struct Gateway {
     change_on_observe: RefCell<Option<(PathBuf, usize)>>,
 }
 impl System for Gateway {
+    fn wg_quick_units(&self) -> io::Result<Vec<String>> {
+        self.fake.wg_quick_units()
+    }
     fn install_uid(&self) -> u32 {
         0
     }
@@ -470,8 +473,11 @@ fn empty_and_unit_only_plan_restart_failure_omit_recovery() {
         }
         *gateway.fail.borrow_mut() = Some("restart");
         let (result, output) = switch(&host, &gateway, &RealFs, plan.plan_sha256.as_str());
-        assert_eq!(result.unwrap(), SwitchOutcome::RefusedNoChange.exit_code());
-        assert!(output.contains("refused, nothing changed"));
+        assert_eq!(result.unwrap(), SwitchOutcome::PossiblyChanged.exit_code());
+        assert!(output.contains("possibly changed"));
+        if unit_only {
+            assert!(output.contains("changed: /etc/systemd/system/scupperd.service"));
+        }
         assert!(output.contains("restart scupperd"));
         assert!(!output.contains(model::RESTORE_COMMANDS));
         for binary in model::BINARIES {
@@ -568,4 +574,86 @@ fn apply_precondition_refusal_reaches_gateway_without_recovery() {
     assert!(!output.contains(model::RESTORE_COMMANDS));
     assert_eq!(host.snapshot(), expected);
     assert!(gateway.services.borrow().is_empty());
+}
+
+struct FailUnitWrite {
+    after_rename: bool,
+    renamed: Cell<bool>,
+}
+impl Fs for FailUnitWrite {
+    fn check_target(&self, p: &Path) -> io::Result<()> {
+        RealFs.check_target(p)
+    }
+    fn cleanup_stale(&self, p: &Path) -> io::Result<()> {
+        RealFs.cleanup_stale(p)
+    }
+    fn read(&self, p: &Path) -> io::Result<String> {
+        RealFs.read(p)
+    }
+    fn create_temp(&self, p: &Path) -> io::Result<(PathBuf, Box<dyn TempFile>)> {
+        RealFs.create_temp(p)
+    }
+    fn rename(&self, a: &Path, b: &Path) -> io::Result<()> {
+        if b.file_name().is_some_and(|s| s == "scupperd.service") {
+            if !self.after_rename {
+                return Err(io::Error::other("injected failed unit write"));
+            }
+            RealFs.rename(a, b)?;
+            self.renamed.set(true);
+            Ok(())
+        } else {
+            RealFs.rename(a, b)
+        }
+    }
+    fn sync_dir(&self, p: &Path) -> io::Result<()> {
+        if self.renamed.get() {
+            Err(io::Error::other("injected unit sync failure"))
+        } else {
+            RealFs.sync_dir(p)
+        }
+    }
+    fn remove(&self, p: &Path) -> io::Result<()> {
+        RealFs.remove(p)
+    }
+}
+#[test]
+fn unit_write_failure_reports_confirmed_and_possible_changes() {
+    for after_rename in [false, true] {
+        let (host, gateway) = installed();
+        let stage = stage(&host, &gateway);
+        for binary in model::BINARIES {
+            fs::copy(
+                stage.join(binary),
+                host.paths.at(&format!("/usr/local/bin/{binary}")),
+            )
+            .unwrap();
+        }
+        let unit = host.paths.at("/etc/systemd/system/scupperd.service");
+        fs::write(&unit, "old unit").unwrap();
+        let digest = plan(&host, &gateway).plan_sha256;
+        let filesystem = FailUnitWrite {
+            after_rename,
+            renamed: Cell::new(false),
+        };
+        let (result, output) = switch(&host, &gateway, &filesystem, digest.as_str());
+        let outcome = if after_rename {
+            SwitchOutcome::FailedAfterChange
+        } else {
+            SwitchOutcome::PossiblyChanged
+        };
+        assert_eq!(result.unwrap(), outcome.exit_code(), "{output}");
+        assert!(
+            output.contains(if after_rename {
+                "changed: /etc/systemd/system/scupperd.service"
+            } else {
+                "possibly changed: /etc/systemd/system/scupperd.service"
+            }),
+            "{output}"
+        );
+        assert!(!output.contains("nothing changed"));
+        assert_eq!(
+            fs::read_to_string(unit).unwrap() == "old unit",
+            !after_rename
+        );
+    }
 }

@@ -574,6 +574,8 @@ fn typed_status_without_diagnostics_still_controls_client_recovery() {
         wire::SwitchOutcome::RefusedNoChange,
         wire::SwitchOutcome::FailedAfterRename,
         wire::SwitchOutcome::Unknown,
+        wire::SwitchOutcome::FailedAfterChange,
+        wire::SwitchOutcome::PossiblyChanged,
     ] {
         let (_fixture, args, fake) = Fixture::new(&format!("empty-{outcome:?}"), false);
         fake.responses.borrow_mut()[5] = Ok(output(outcome.exit_code(), ""));
@@ -583,7 +585,10 @@ fn typed_status_without_diagnostics_still_controls_client_recovery() {
             assert_eq!(
                 text.matches(scupper_core::install::RESTORE_COMMANDS)
                     .count(),
-                usize::from(outcome != wire::SwitchOutcome::RefusedNoChange)
+                usize::from(matches!(
+                    outcome,
+                    wire::SwitchOutcome::FailedAfterRename | wire::SwitchOutcome::Unknown
+                ))
             );
             if outcome == wire::SwitchOutcome::RefusedNoChange {
                 assert!(text.contains("refused, nothing changed"));

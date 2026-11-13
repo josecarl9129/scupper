@@ -464,6 +464,7 @@ pub struct Crash;
 pub struct MemoryStore {
     state: Rc<RefCell<State>>,
     fail: Rc<RefCell<bool>>,
+    repair: Rc<RefCell<crate::state::RepairState>>,
 }
 impl MemoryStore {
     /// Create a durable reference snapshot.
@@ -472,6 +473,7 @@ impl MemoryStore {
         Self {
             state: Rc::new(RefCell::new(state)),
             fail: Rc::new(RefCell::new(false)),
+            repair: Rc::new(RefCell::new(crate::state::RepairState::default())),
         }
     }
     /// Fail every write until reset, leaving the previous durable state intact.
@@ -485,6 +487,21 @@ impl MemoryStore {
     }
 }
 impl StateStore for MemoryStore {
+    fn repair_state(&self) -> Option<crate::state::RepairState> {
+        Some(self.repair.borrow().clone())
+    }
+    fn write_repair_state(
+        &self,
+        _guard: &WriterGuard,
+        repair: &crate::state::RepairState,
+    ) -> io::Result<()> {
+        *self.repair.borrow_mut() = repair.clone();
+        Ok(())
+    }
+    fn clear_repair_state(&self, _guard: &WriterGuard, _root: &std::path::Path) -> io::Result<()> {
+        *self.repair.borrow_mut() = crate::state::RepairState::default();
+        Ok(())
+    }
     fn applied_snapshot_until(&self, _deadline: Instant) -> Option<State> {
         Some(self.state())
     }

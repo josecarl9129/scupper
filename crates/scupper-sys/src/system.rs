@@ -300,6 +300,13 @@ pub enum ExecTarget<'a> {
 /// }
 /// ```
 pub trait System {
+    /// Enabled wg-quick instances from public filesystem inventory.
+    /// # Errors
+    /// Returns an error when the inventory cannot be read.
+    fn wg_quick_units(&self) -> std::io::Result<Vec<String>> {
+        Err(std::io::Error::other("unit inventory unsupported"))
+    }
+
     /// Checks the host's read-only sysfs inventory for a loaded kernel module.
     ///
     /// # Errors
@@ -794,6 +801,9 @@ fn namespace_result(
 }
 
 impl System for RealSystem {
+    fn wg_quick_units(&self) -> std::io::Result<Vec<String>> {
+        crate::v1_detect::wg_quick_units_at(Path::new("/"))
+    }
     fn canon_worker(&self) -> Option<Box<dyn System + Send>> {
         Some(Box::new(Self {
             canon_cache: std::cell::RefCell::default(),
@@ -1007,6 +1017,9 @@ pub mod testing {
         }
     }
     impl System for RecordingSystem<'_> {
+        fn wg_quick_units(&self) -> std::io::Result<Vec<String>> {
+            self.inner.wg_quick_units()
+        }
         fn module_loaded(&self, module: &str) -> std::io::Result<bool> {
             self.inner.module_loaded(module)
         }
@@ -1066,6 +1079,9 @@ pub mod testing {
     }
 
     impl System for FakeSystem {
+        fn wg_quick_units(&self) -> std::io::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
         fn run(
             &self,
             program: Program,

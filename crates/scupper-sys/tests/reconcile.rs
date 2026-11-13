@@ -24,7 +24,7 @@ use scupper_sys::{
 use std::{
     cell::Cell,
     collections::{BTreeMap, BTreeSet},
-    fs,
+    fs, io,
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
     rc::Rc,
@@ -388,17 +388,7 @@ fn fs7_persisted_and_memory_latches_hold_across_ticks() {
         }
         assert!(!raises(&rig.tick()));
         rig.restart();
-        if persist {
-            assert!(rig.machine().latch().is_some());
-        } else {
-            assert!(rig.machine().latch().is_none());
-            // Budgets are process-local. Persistent fighting is detected afresh.
-            for _ in 0..4 {
-                rig.flush_rules();
-                rig.tick();
-            }
-            assert!(rig.machine().latch().is_some());
-        }
+        assert!(rig.machine().latch().is_some());
         assert!(!raises(&rig.tick()));
     }
 }
@@ -907,9 +897,12 @@ fn fs13_other_process_holds_writer_lock() {
 
 type CollectorCall = (bool, scupper_sys::system::Program, Vec<String>, Duration);
 #[derive(Default)]
+#[allow(clippy::struct_excessive_bools)] // Independent injected collector faults.
 struct CollectorSystem {
     calls: std::cell::RefCell<Vec<CollectorCall>>,
     fail_ruleset: Cell<bool>,
+    fail_host_links: Cell<bool>,
+    fail_netns_links: Cell<bool>,
     stall: Cell<bool>,
 }
 impl scupper_sys::system::System for CollectorSystem {
@@ -944,6 +937,16 @@ impl scupper_sys::system::System for CollectorSystem {
             return Err(ExecError::Timeout { after: timeout });
         }
         if self.fail_ruleset.get() && program == Program::Nft {
+            return Err(ExecError::Timeout { after: timeout });
+        }
+        if program == Program::Ip
+            && args.iter().any(|a| a == "link")
+            && (if ns {
+                self.fail_netns_links.get()
+            } else {
+                self.fail_host_links.get()
+            })
+        {
             return Err(ExecError::Timeout { after: timeout });
         }
         let text = if !ns && program == Program::Ip {
@@ -1237,6 +1240,7 @@ fn fake_forwarding_faults_obey_guards_and_flush_is_per_tick() {
     assert_eq!(rig.kernel.model().forwarding_v4, Known::Value(0));
     rig.kernel.execute(&Step::FlushConntrack).unwrap();
     let latch = Latch {
+        uncertain: false,
         reason: "memory".into(),
         object: "test".into(),
     };
@@ -1718,14 +1722,9 @@ fn full_observation_of_unknown_inventory_advances_ingress_quarantine() {
     rig.kernel
         .timeouts(BTreeSet::from([ObservationItem::Tc("wg0".into())]));
     assert!(!rig.tick().complete);
-    assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(true));
+    assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(false));
     let report = rig.tick();
     assert!(!report.complete);
-    assert!(
-        report
-            .steps
-            .contains(&Step::LinkDown { name: "wg0".into() })
-    );
     assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(false));
 }
 
@@ -2582,6 +2581,7 @@ fn control_repair_clear_preserves_another_writers_selection() {
         reason: "repair-budget".into(),
         object: "safety:ruleset".into(),
         since_unix: 1000,
+        uncertain: false,
     });
     let guard = WriterLock::acquire(&rig.root).unwrap();
     rig.store.write(&guard, &state).unwrap();
@@ -2606,6 +2606,7 @@ fn verified_apply_clear_is_not_undone_by_a_stale_daemon_version_handoff() {
         reason: "repair-budget".into(),
         object: "safety:ruleset".into(),
         since_unix: 1000,
+        uncertain: false,
     });
     rig.store.write(&guard, &state).unwrap();
     drop(guard);
@@ -2819,6 +2820,7 @@ fn connect_rejects_unconfigured_exit_and_quarantine() {
         reason: "state write failed".into(),
         object: "state".into(),
         since_unix: 1000,
+        uncertain: false,
     });
     let guard = WriterLock::acquire(&rig.root).unwrap();
     rig.store.write(&guard, &state).unwrap();
@@ -2848,6 +2850,7 @@ fn repair_clear_retains_operator_context_and_actual_latch_reason() {
         reason: "state write failed".into(),
         object: "state".into(),
         since_unix: 1000,
+        uncertain: false,
     });
     let guard = WriterLock::acquire(&rig.root).unwrap();
     rig.store.write(&guard, &state).unwrap();
@@ -2965,6 +2968,7 @@ fn repair_clear_reopens_forwarding_after_quarantined_restart() {
         reason: "repair budget".into(),
         object: "safety:ruleset".into(),
         since_unix: 1000,
+        uncertain: false,
     });
     let guard = WriterLock::acquire(&rig.root).unwrap();
     scupper_sys::reconcile::StateStore::write(&rig.store, &guard, &state).unwrap();
@@ -3025,6 +3029,7 @@ fn outage_latch_recovery_clear_and_second_outage_emit_two_firings() {
         reason: "repair budget".into(),
         object: "safety:ruleset".into(),
         since_unix: 1000,
+        uncertain: false,
     });
     let guard = WriterLock::acquire(&rig.root).unwrap();
     rig.store.write(&guard, &state).unwrap();
@@ -3409,5 +3414,413 @@ fn cold_start_without_resume_qualifies_at_real_cadence_without_incident() {
             EventKind::FailClosedStarted { .. } | EventKind::FailClosedEnded { .. }
         )));
         rig.safe_history();
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep injected persistence failure, restart/reboot and explicit clearance in one lifecycle.
+fn failed_latch_persist_restart_and_reboot_keep_closed_with_durable_budgets() {
+    use scupper_sys::{
+        reconcile::StateStore,
+        state::{RepairState, StateRead},
+    };
+    use std::time::Instant;
+    struct FailingLatch(StateFile);
+    impl StateStore for FailingLatch {
+        fn read(&self) -> io::Result<State> {
+            StateStore::read(&self.0)
+        }
+        fn read_until(&self, deadline: Instant) -> io::Result<State> {
+            StateStore::read_until(&self.0, deadline)
+        }
+        fn write(&self, guard: &scupper_sys::lock::WriterGuard, state: &State) -> io::Result<()> {
+            self.0.write_with_hook(guard, state, &|step| {
+                if state.quarantine.is_some() && step == scupper_sys::fs::DurableStep::ContentSynced
+                {
+                    Err(io::Error::other("injected main latch persistence failure"))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+        fn repair_state(&self) -> Option<RepairState> {
+            Some(self.0.repair_state())
+        }
+        fn write_repair_state(
+            &self,
+            guard: &scupper_sys::lock::WriterGuard,
+            repair: &RepairState,
+        ) -> io::Result<()> {
+            self.0.write_repair_state(guard, repair)
+        }
+    }
+    for reboot in [false, true] {
+        let rig = Rig::new();
+        let state_root = rig.root.join("durable");
+        let run_root = rig.root.join("runtime");
+        let guard = WriterLock::acquire(&run_root).unwrap();
+        let file = StateFile::open(&state_root, Some(&guard)).unwrap();
+        file.write(&guard, &rig.store.state()).unwrap();
+        drop(guard);
+        let config = || {
+            let mut c = rig.config();
+            c.run_root = run_root.clone();
+            c
+        };
+        let mut machine = Reconciler::new(
+            rig.kernel.clone(),
+            FailingLatch(file),
+            rig.log.handle.clone(),
+            config(),
+            rig.held.clone(),
+            || (MonoTime(Duration::from_secs(100)), 1100),
+        )
+        .unwrap();
+        for _ in 0..4 {
+            rig.flush_rules();
+            machine.tick();
+        }
+        assert!(machine.latch().is_some());
+        assert!(run_root.join("latch-uncertain").is_file());
+        drop(machine);
+        let file = StateFile::open(&state_root, None).unwrap();
+        let StateRead::Present(raw) = file.read().unwrap() else {
+            panic!("missing state")
+        };
+        assert!(
+            raw.quarantine.is_none(),
+            "main state write must have failed"
+        );
+        assert_eq!(file.repair_state().attempts["safety:ruleset"], 3);
+        if reboot {
+            fs::remove_dir_all(&run_root).unwrap();
+        }
+        let StateRead::Present(startup) = file.startup_read(&run_root).unwrap() else {
+            panic!("missing state")
+        };
+        assert!(startup.quarantine.is_some());
+        let mut restarted = Reconciler::new(
+            rig.kernel.clone(),
+            file,
+            rig.log.handle.clone(),
+            config(),
+            rig.held.clone(),
+            || (MonoTime(Duration::ZERO), 1200),
+        )
+        .unwrap();
+        assert!(restarted.latch().is_some());
+        let report = restarted.tick();
+        assert!(!raises(&report));
+        assert!(rig.kernel.model().forwarding_off());
+        let kind = report
+            .events
+            .iter()
+            .find(|event| {
+                matches!(
+                    event,
+                    EventKind::QuarantineChanged { active: true }
+                        | EventKind::QuarantineState { active: true }
+                )
+            })
+            .unwrap()
+            .clone();
+        let alert = scupper_proto::Event {
+            seq: 1,
+            at: UnixSeconds(1200),
+            kind,
+            actor: Actor::Daemon,
+            gateway: scupper_proto::Identifier::try_from("gw1".to_owned()).unwrap(),
+            config_version: Some(1),
+        }
+        .alert()
+        .unwrap();
+        assert_eq!(alert.severity, scupper_core::alerts::Severity::Critical);
+        scupper_sys::daemon::admin::execute(
+            &mut restarted,
+            scupper_proto::Op::Connect { exit: None },
+            0,
+            None,
+            |_| {
+                Ok(scupper_core::verdict::v2::Report {
+                    verdict: scupper_core::verdict::v2::Verdict::Protected {
+                        exit: scupper_core::config::ExitId("ch1".into()),
+                        exit_ip: "192.0.2.1".parse().unwrap(),
+                    },
+                    warnings: vec![],
+                    at: 1200,
+                    config_version: 1,
+                })
+            },
+        )
+        .unwrap();
+        assert!(restarted.latch().is_none());
+        let file = StateFile::open(&state_root, None).unwrap();
+        assert!(
+            file.repair_state()
+                .attempts
+                .get("safety:ruleset")
+                .copied()
+                .unwrap_or(0)
+                <= 1,
+            "explicit connect resets the exhausted budget before repairing"
+        );
+        assert!(file.repair_state().latch().is_none());
+        assert!(!run_root.join("latch-uncertain").exists());
+    }
+}
+
+#[test]
+fn exhausted_durable_budget_without_latch_record_does_not_latch_after_reboot() {
+    let rig = Rig::new();
+    let run = rig.root.join("runtime");
+    let state_root = rig.root.join("durable");
+    let guard = WriterLock::acquire(&run).unwrap();
+    let file = StateFile::open(&state_root, Some(&guard)).unwrap();
+    file.write(&guard, &rig.store.state()).unwrap();
+    file.write_repair_state(
+        &guard,
+        &scupper_sys::state::RepairState {
+            attempts: BTreeMap::from([("safety:ruleset".into(), 3)]),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    drop(guard);
+    fs::remove_dir_all(&run).unwrap();
+    let scupper_sys::state::StateRead::Present(saved) = file.startup_read(&run).unwrap() else {
+        panic!("missing state")
+    };
+    assert!(saved.quarantine.is_none());
+    assert_eq!(file.repair_state().attempts["safety:ruleset"], 3);
+}
+
+#[test]
+fn three_successful_repairs_survive_restart_and_reboot_without_latch() {
+    for reboot in [false, true] {
+        let rig = Rig::new();
+        let state_root = rig.root.join("durable");
+        let run_root = rig.root.join("runtime");
+        let guard = WriterLock::acquire(&run_root).unwrap();
+        let file = StateFile::open(&state_root, Some(&guard)).unwrap();
+        file.write(&guard, &rig.store.state()).unwrap();
+        drop(guard);
+        let config = || {
+            let mut c = rig.config();
+            c.run_root = run_root.clone();
+            c
+        };
+        let mut machine = Reconciler::new(
+            rig.kernel.clone(),
+            file,
+            rig.log.handle.clone(),
+            config(),
+            rig.held.clone(),
+            || (MonoTime(Duration::from_secs(100)), 1100),
+        )
+        .unwrap();
+        for _ in 0..3 {
+            rig.flush_rules();
+            let tick = machine.tick();
+            assert!(tick.failures.is_empty(), "{tick:?}");
+            assert!(
+                tick.steps
+                    .iter()
+                    .any(|step| matches!(step, Step::LoadRuleset { .. }))
+            );
+            assert!(machine.latch().is_none());
+        }
+        drop(machine);
+        if reboot {
+            fs::remove_dir_all(&run_root).unwrap();
+        }
+        let file = StateFile::open(&state_root, None).unwrap();
+        assert!(!file.repair_state().armed);
+        assert_eq!(file.repair_state().attempts["safety:ruleset"], 3);
+        let scupper_sys::state::StateRead::Present(saved) = file.startup_read(&run_root).unwrap()
+        else {
+            unreachable!()
+        };
+        assert!(saved.quarantine.is_none());
+        let mut restarted = Reconciler::new(
+            rig.kernel.clone(),
+            file,
+            rig.log.handle.clone(),
+            config(),
+            rig.held.clone(),
+            || (MonoTime(Duration::ZERO), 1200),
+        )
+        .unwrap();
+        assert!(restarted.latch().is_none());
+        restarted.tick();
+        assert!(restarted.latch().is_none());
+        rig.flush_rules();
+        let tick = restarted.tick();
+        assert!(restarted.latch().is_some(), "{tick:?}");
+        assert!(!raises(&tick));
+    }
+}
+
+#[test]
+fn failed_restore_disarms_its_own_checkpoint_and_does_not_latch_on_restart() {
+    let rig = Rig::new();
+    let state_root = rig.root.join("durable");
+    let guard = WriterLock::acquire(&rig.root).unwrap();
+    let file = StateFile::open(&state_root, Some(&guard)).unwrap();
+    file.write(&guard, &rig.store.state()).unwrap();
+    drop(guard);
+    let mut machine = Reconciler::new(
+        rig.kernel.clone(),
+        file,
+        rig.log.handle.clone(),
+        rig.config(),
+        rig.held.clone(),
+        || (MonoTime(Duration::from_secs(100)), 1100),
+    )
+    .unwrap();
+    rig.kernel.inject(Fault {
+        step: StepKind::LoadRuleset,
+        remaining: Some(1),
+        partial: false,
+    });
+    rig.flush_rules();
+    assert!(!machine.tick().complete);
+    let file = StateFile::open(&state_root, None).unwrap();
+    assert!(!file.repair_state().armed);
+    assert!(file.repair_state().latch().is_none());
+    assert!(!rig.root.join("latch-uncertain").exists());
+    machine.tick();
+    drop(machine);
+    let restarted = Reconciler::new(
+        rig.kernel.clone(),
+        file,
+        rig.log.handle.clone(),
+        rig.config(),
+        rig.held.clone(),
+        || (MonoTime(Duration::ZERO), 1200),
+    )
+    .unwrap();
+    assert!(restarted.latch().is_none());
+}
+
+#[test]
+fn real_collector_separates_host_and_gateway_inventory_failures() {
+    let rig = Rig::new();
+    for host in [true, false] {
+        let sys = CollectorSystem::default();
+        sys.fail_host_links.set(host);
+        sys.fail_netns_links.set(!host);
+        let observation = observe_real(&rig, &sys);
+        assert_eq!(observation.model.host_links_complete, !host);
+        assert_eq!(observation.model.links_complete, host);
+        let plan = scupper_core::planner::plan(
+            &rig.machine.as_ref().unwrap().desired().unwrap(),
+            &observation.model,
+            &scupper_core::planner::Budgets::default(),
+            None,
+            &scupper_core::planner::Debounce::default(),
+            MonoTime(Duration::ZERO),
+        );
+        assert_eq!(
+            plan.steps.contains(&Step::LinkDown { name: "wg0".into() }),
+            !host,
+            "{plan:?}"
+        );
+    }
+}
+
+#[test]
+fn failed_non_safety_checkpoint_does_not_block_forwarding_or_write_uncertainty() {
+    use scupper_sys::{reconcile::StateStore, state::RepairState};
+    use std::time::Instant;
+    struct FailedCheckpoint(StateFile);
+    impl StateStore for FailedCheckpoint {
+        fn read(&self) -> io::Result<State> {
+            StateStore::read(&self.0)
+        }
+        fn read_until(&self, deadline: Instant) -> io::Result<State> {
+            StateStore::read_until(&self.0, deadline)
+        }
+        fn write(&self, guard: &scupper_sys::lock::WriterGuard, state: &State) -> io::Result<()> {
+            self.0.write(guard, state)
+        }
+        fn repair_state(&self) -> Option<RepairState> {
+            Some(self.0.repair_state())
+        }
+        fn write_repair_state(
+            &self,
+            _: &scupper_sys::lock::WriterGuard,
+            _: &RepairState,
+        ) -> io::Result<()> {
+            Err(io::Error::other("full checkpoint disk"))
+        }
+    }
+    let rig = Rig::new();
+    let state_root = rig.root.join("durable");
+    let guard = WriterLock::acquire(&rig.root).unwrap();
+    let file = StateFile::open(&state_root, Some(&guard)).unwrap();
+    file.write(&guard, &rig.store.state()).unwrap();
+    drop(guard);
+    let mut machine = Reconciler::new(
+        rig.kernel.clone(),
+        FailedCheckpoint(file),
+        rig.log.handle.clone(),
+        rig.config(),
+        rig.held.clone(),
+        || (MonoTime(Duration::from_secs(100)), 1100),
+    )
+    .unwrap();
+    machine.resume_existing();
+    rig.kernel
+        .mutate(|model| model.forwarding_v4 = Known::Value(0));
+    let first = machine.tick();
+    let second = machine.tick();
+    assert!(raises(&first) || raises(&second), "{first:?} {second:?}");
+    assert!(first.failures.is_empty() && second.failures.is_empty());
+    assert!(machine.latch().is_none());
+    assert!(!rig.root.join("latch-uncertain").exists());
+}
+
+#[test]
+fn connect_clearance_uses_typed_uncertainty_instead_of_reason_words() {
+    for uncertain in [false, true] {
+        let mut rig = Rig::new();
+        let mut state = rig.store.state();
+        state.quarantine = Some(scupper_sys::state::Quarantine {
+            reason: "persistence appears in an ordinary fighter reason".into(),
+            object: "repair-history".into(),
+            since_unix: 1000,
+            uncertain,
+        });
+        let guard = WriterLock::acquire(&rig.root).unwrap();
+        scupper_sys::reconcile::StateStore::write(&rig.store, &guard, &state).unwrap();
+        drop(guard);
+        rig.restart();
+        let result = scupper_sys::daemon::admin::execute(
+            rig.machine(),
+            scupper_proto::Op::Connect { exit: None },
+            0,
+            None,
+            |_| {
+                Ok(scupper_core::verdict::v2::Report {
+                    verdict: scupper_core::verdict::v2::Verdict::Protected {
+                        exit: scupper_core::config::ExitId("ch1".into()),
+                        exit_ip: "192.0.2.1".parse().unwrap(),
+                    },
+                    warnings: vec![],
+                    at: 1100,
+                    config_version: 1,
+                })
+            },
+        );
+        if uncertain {
+            assert!(result.is_ok(), "{result:?}");
+            assert!(rig.machine().latch().is_none());
+        } else {
+            assert_eq!(
+                result.unwrap_err().code,
+                scupper_proto::ApiErrorCode::Quarantined
+            );
+            assert!(rig.machine().latch().is_some());
+        }
     }
 }

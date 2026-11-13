@@ -1,216 +1,129 @@
-//! Retired-layout preflight observations through a scripted system.
+//! Filesystem discovery never infers absence from a failed systemctl command.
 #![allow(clippy::unwrap_used)]
 use scupper_sys::{
-    system::{EXEC_TIMEOUT, ExecError, ExecOutput, Program, SYSTEMCTL_TIMEOUT, System},
-    v1_detect::{V1Marker, detect_v1_layout},
+    system::{ExecError, ExecOutput, Program, System},
+    v1_detect::{self, V1Marker},
 };
-use std::{
-    cell::RefCell,
-    collections::{BTreeSet, VecDeque},
-    time::Duration,
-};
-struct Reply {
-    program: Program,
-    args: Vec<String>,
-    output: Result<ExecOutput, ExecError>,
-}
-struct Fake(RefCell<VecDeque<Reply>>);
-impl Fake {
-    fn new() -> Self {
-        Self(RefCell::default())
-    }
-    fn push(&self, program: Program, args: &[&str], status: i32, stdout: &str) {
-        self.0.borrow_mut().push_back(Reply {
-            program,
-            args: args.iter().map(|s| (*s).into()).collect(),
-            output: Ok(ExecOutput {
-                status: Some(status),
-                stdout: stdout.into(),
-                stderr: String::new(),
-            }),
-        });
-    }
-    fn units(&self, text: &str) {
-        self.push(
-            Program::Systemctl,
-            &[
-                "list-unit-files",
-                "--type=service",
-                "--no-legend",
-                "--no-pager",
-                "wg-quick@*.service",
-            ],
-            i32::from(text.is_empty()),
-            text,
-        );
-    }
-    fn host(&self, tables: &str, links: &str) {
-        self.push(Program::Nft, &["-j", "list", "tables"], 0, tables);
-        self.push(Program::Ip, &["-d", "-j", "link", "show"], 0, links);
-    }
+use std::{cell::Cell, collections::BTreeSet, io, path::Path, time::Duration};
+struct Fake {
+    unreadable: bool,
+    units: Vec<String>,
+    calls: Cell<usize>,
 }
 impl System for Fake {
-    fn run(
-        &self,
-        program: Program,
-        args: &[String],
-        timeout: Duration,
-    ) -> Result<ExecOutput, ExecError> {
-        let reply = self.0.borrow_mut().pop_front().unwrap();
-        assert_eq!(program, reply.program);
-        assert_eq!(args, reply.args);
-        assert_eq!(
-            timeout,
-            if program == Program::Systemctl {
-                SYSTEMCTL_TIMEOUT
-            } else {
-                EXEC_TIMEOUT
-            }
-        );
-        reply.output
+    fn wg_quick_units(&self) -> io::Result<Vec<String>> {
+        if self.unreadable {
+            Err(io::ErrorKind::PermissionDenied.into())
+        } else {
+            Ok(self.units.clone())
+        }
+    }
+    fn run(&self, _: Program, _: &[String], _: Duration) -> Result<ExecOutput, ExecError> {
+        self.calls.set(self.calls.get() + 1);
+        Ok(ExecOutput {
+            status: Some(1),
+            stdout: String::new(),
+            stderr: String::new(),
+        })
     }
     fn now_unix_secs(&self) -> u64 {
         0
     }
 }
 #[test]
-fn detects_enabled_instances_table_and_v1_tunnel_names_only() {
-    let sys = Fake::new();
-    sys.units("wg-quick@custom.service disabled enabled\nwg-quick@wg0.service enabled enabled\nwg-quick@proton0.service enabled enabled\n");
-    sys.push(
-        Program::Systemctl,
-        &["is-enabled", "wg-quick@custom.service"],
-        0,
-        "enabled-runtime\n",
-    );
-    // The listing is just discovery: is-enabled is authoritative, even if it changed.
-    sys.push(
-        Program::Systemctl,
-        &["is-enabled", "wg-quick@proton0.service"],
-        1,
-        "disabled\n",
-    );
-    sys.push(
-        Program::Systemctl,
-        &["is-enabled", "wg-quick@wg0.service"],
-        0,
-        "enabled\n",
-    );
-    sys.host(r#"{"nftables":[{"metainfo":{}},{"table":{"family":"inet","name":"scupper"}},{"table":{"family":"ip","name":"scupper"}}]}"#,
-        r#"[{"ifname":"lo","flags":["UP"]},{"ifname":"eth0","flags":["UP"]},{"ifname":"wg0","flags":[]},{"ifname":"proton0","flags":[]},{"ifname":"ex-ch1","flags":[]}]"#);
+fn filesystem_inventory_is_authoritative_even_when_systemctl_would_fail_empty() {
+    for unreadable in [false, true] {
+        for units in [vec![], vec!["wg-quick@custom.service".into()]] {
+            let fake = Fake {
+                unreadable,
+                units: units.clone(),
+                calls: Cell::new(0),
+            };
+            let result = v1_detect::detect_install_layout(&fake, &[], &BTreeSet::new());
+            if unreadable {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(
+                    result.unwrap(),
+                    units
+                        .into_iter()
+                        .map(V1Marker::EnabledWgQuick)
+                        .collect::<Vec<_>>()
+                );
+            }
+            assert_eq!(fake.calls.get(), 0);
+        }
+    }
+}
+#[test]
+fn templates_enablement_dangling_symlinks_and_unreadable_inventory() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/tmp/v1-files")
+        .join(std::process::id().to_string());
+    std::fs::create_dir_all(&root).unwrap();
     assert_eq!(
-        detect_v1_layout(&sys).unwrap(),
-        vec![
-            V1Marker::EnabledWgQuick("wg-quick@custom.service".into()),
-            V1Marker::EnabledWgQuick("wg-quick@wg0.service".into()),
-            V1Marker::HostTable,
-            V1Marker::HostLink("wg0".into()),
-            V1Marker::HostLink("proton0".into())
-        ]
+        v1_detect::wg_quick_units_at(&root).unwrap(),
+        Vec::<String>::new()
     );
-    assert!(sys.0.borrow().is_empty());
-}
-#[test]
-fn absence_disabled_and_masked_units_are_clean() {
-    for (state, status) in [
-        ("disabled", 1),
-        ("masked", 1),
-        ("static", 0),
-        ("not-found", 4),
-        ("linked", 1),
+    for directory in [
+        "lib/systemd/system",
+        "usr/lib/systemd/system",
+        "etc/systemd/system",
     ] {
-        let sys = Fake::new();
-        sys.units("wg-quick@wg0.service disabled\n");
-        sys.push(
-            Program::Systemctl,
-            &["is-enabled", "wg-quick@wg0.service"],
-            status,
-            state,
-        );
-        sys.host(r#"{"nftables":[{"table":{"family":"ip","name":"scupper"}},{"table":{"family":"inet","name":"other"}}]}"#, r#"[{"ifname":"eth0","flags":[]}]"#);
-        assert_eq!(detect_v1_layout(&sys).unwrap(), []);
+        std::fs::create_dir_all(root.join(directory)).unwrap();
+        std::fs::write(root.join(directory).join("wg-quick@.service"), "[Unit]\n").unwrap();
     }
-    let sys = Fake::new();
-    sys.units("wg-quick@.service disabled enabled\n");
-    sys.host(r#"{"nftables":[]}"#, "[]");
-    assert_eq!(detect_v1_layout(&sys).unwrap(), []);
-}
-#[test]
-fn errors_and_malformed_observations_are_never_absence() {
-    let sys = Fake::new();
-    sys.units("unexpected output");
-    assert!(detect_v1_layout(&sys).is_err());
-    let sys = Fake::new();
-    sys.units("wg-quick@wg0.service enabled\n");
-    sys.push(
-        Program::Systemctl,
-        &["is-enabled", "wg-quick@wg0.service"],
-        1,
-        "",
+    assert_eq!(
+        v1_detect::wg_quick_units_at(&root).unwrap(),
+        Vec::<String>::new()
     );
-    assert!(detect_v1_layout(&sys).is_err());
-    for tables in [
-        "invalid",
-        r#"{"nftables":[{}]}"#,
-        r#"{"nftables":[{"table":{"name":"scupper"}}]}"#,
-    ] {
-        let sys = Fake::new();
-        sys.units("");
-        sys.host(tables, "[]");
-        assert!(detect_v1_layout(&sys).is_err());
-    }
-    let sys = Fake::new();
-    sys.units("");
-    sys.host(r#"{"nftables":[]}"#, "malformed");
-    assert!(detect_v1_layout(&sys).is_err());
-    let sys = Fake::new();
-    sys.units("");
-    sys.0.borrow_mut().front_mut().unwrap().output = Err(ExecError::Timeout {
-        after: SYSTEMCTL_TIMEOUT,
-    });
-    assert!(detect_v1_layout(&sys).is_err());
+    let wants = root.join("etc/systemd/system/multi-user.target.wants");
+    std::fs::create_dir(&wants).unwrap();
+    std::os::unix::fs::symlink("/missing/template", wants.join("wg-quick@custom.service")).unwrap();
+    assert_eq!(
+        v1_detect::wg_quick_units_at(&root).unwrap(),
+        ["wg-quick@custom.service"]
+    );
+    std::fs::remove_dir_all(&wants).unwrap();
+    std::fs::write(&wants, "not an enumerable directory").unwrap();
+    assert!(v1_detect::wg_quick_units_at(&root).is_err());
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
-fn no_matching_unit_files_accepts_only_empty_results_and_no_units_diagnostics() {
-    for (status, stdout, stderr, accepted) in [
-        (Some(1), "", "", true),
-        (Some(4), "", "", true),
-        (Some(2), "", "No unit files found.\n", true),
-        (Some(3), "0 unit files listed.\n", "", true),
-        (
-            Some(1),
-            "",
-            "Failed to connect to bus: Permission denied",
-            false,
-        ),
-        (
-            Some(2),
-            "",
-            "No unit files found.\nFailed to connect to bus",
-            false,
-        ),
-        (Some(1), "wg-quick@wg0.service enabled", "", false),
-        (Some(4), "unexpected output", "No unit files found.", false),
-        (None, "", "", false),
+fn runtime_wants_requires_and_masked_templates_are_readable() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/tmp/v1-runtime")
+        .join(std::process::id().to_string());
+    std::fs::create_dir_all(root.join("etc/systemd/system")).unwrap();
+    std::os::unix::fs::symlink(
+        "/dev/null",
+        root.join("etc/systemd/system/wg-quick@.service"),
+    )
+    .unwrap();
+    assert_eq!(
+        v1_detect::wg_quick_units_at(&root).unwrap(),
+        Vec::<String>::new()
+    );
+    for (dir, name) in [
+        ("run/systemd/system/multi-user.target.wants", "runtime"),
+        ("run/systemd/system/network.target.requires", "required"),
+        ("etc/systemd/system/network.target.requires", "persistent"),
     ] {
-        let sys = Fake::new();
-        sys.units("");
-        sys.0.borrow_mut().front_mut().unwrap().output = Ok(ExecOutput {
-            status,
-            stdout: stdout.into(),
-            stderr: stderr.into(),
-        });
-        // An empty package inventory avoids probing uninstalled tools.
-        let result = scupper_sys::v1_detect::detect_install_layout(&sys, &[], &BTreeSet::new());
-        assert_eq!(
-            result.is_ok(),
-            accepted,
-            "{status:?} {stdout:?} {stderr:?}: {result:?}"
-        );
-        if let Ok(markers) = result {
-            assert_eq!(markers, []);
-        }
-        assert!(sys.0.borrow().is_empty());
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+        std::os::unix::fs::symlink(
+            "/lib/systemd/system/wg-quick@.service",
+            root.join(dir).join(format!("wg-quick@{name}.service")),
+        )
+        .unwrap();
     }
+    assert_eq!(
+        v1_detect::wg_quick_units_at(&root).unwrap(),
+        [
+            "wg-quick@persistent.service",
+            "wg-quick@required.service",
+            "wg-quick@runtime.service"
+        ]
+    );
+    std::fs::remove_dir_all(root).unwrap();
 }

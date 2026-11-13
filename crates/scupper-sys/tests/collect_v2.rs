@@ -1002,3 +1002,58 @@ fn probe_runtime_child() {
     }
     fs::write(sentinel, "completed").unwrap();
 }
+
+#[test]
+fn check_accepts_legacy_layout_and_in_flight_restore_without_false_quarantine() {
+    use scupper_sys::{
+        lock::WriterLock,
+        state::{RepairState, StateFile},
+    };
+    let runner = "ubuntu-24.04";
+    let held = testing::handle().unwrap();
+    let root = Root::new(runner, &held);
+    let sys = Script::new(runner);
+    fresh(&sys);
+    let site = site(runner);
+    let gateway = GatewayId("gw1".into());
+    let config = cfg(&site, &gateway, root.stamp);
+    fs::write(
+        root.path.join("state.json"),
+        r#"{"schema":1,"applied_version":1,"selection":"Auto","quarantine":null}"#,
+    )
+    .unwrap();
+    fs::remove_file(root.path.join("repair-state.json")).unwrap();
+    let deps = Dependencies {
+        system: &sys,
+        probe_exec: &sys,
+        handle: Some(&held),
+        state_root: &root.path,
+        run_root: &root.path,
+    };
+    assert_eq!(
+        check_v2::run_check_v2(&deps, &config)
+            .unwrap()
+            .verdict
+            .exit_code(),
+        0
+    );
+    let guard = WriterLock::acquire(&root.path).unwrap();
+    StateFile::open(&root.path, None)
+        .unwrap()
+        .write_repair_state(
+            &guard,
+            &RepairState {
+                armed: true,
+                attempts: std::collections::BTreeMap::from([("safety:ruleset".into(), 3)]),
+                ..RepairState::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        check_v2::run_check_v2(&deps, &config)
+            .unwrap()
+            .verdict
+            .exit_code(),
+        0
+    );
+}

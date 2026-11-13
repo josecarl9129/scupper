@@ -258,7 +258,7 @@ pub(crate) fn inputs_for_version(
         None => store.head()?.ok_or("no configuration")?,
     };
     let resolved = StateFile::open(deps.state_root, None)
-        .and_then(|file| file.read())
+        .and_then(|file| file.startup_read(deps.run_root))
         .map_err(|e| InputError::Persistence(e.to_string()))?
         .for_boot(true);
     if target.is_some() && resolved.missing_state_alert {
@@ -573,10 +573,48 @@ pub(crate) fn boot_with_guard(deps: &BootDeps<'_>, guard: &WriterGuard) -> BootR
 /// Explicit apply may open the gate while durable quarantine remains until verification.
 pub(crate) fn boot_apply_with_guard(
     deps: &BootDeps<'_>,
-    _guard: &WriterGuard,
+    guard: &WriterGuard,
     open_quarantined: bool,
 ) -> BootReport {
-    let report = boot_locked(deps, BootReport::default(), open_quarantined);
+    let mut initial = BootReport::default();
+    let migration = (|| -> std::io::Result<()> {
+        let file = StateFile::open(deps.state_root, None)?;
+        if file.migrate_repair_state(guard, deps.run_root)? {
+            let gateway = GatewayId(
+                RealFs
+                    .read(&deps.config_root.join("gateway-id"))?
+                    .trim()
+                    .into(),
+            );
+            let opened = crate::events::EventLog::open(deps.state_root, gateway, || {
+                scupper_proto::UnixSeconds(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                )
+            })
+            .map_err(std::io::Error::other)?;
+            opened
+                .handle
+                .emit(
+                    scupper_proto::EventKind::RepairCheckpointCreated {},
+                    scupper_proto::Actor::Boot,
+                    None,
+                )
+                .map_err(std::io::Error::other)?;
+            opened
+                .handle
+                .flush_blocking(std::time::Duration::from_secs(5))?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = migration {
+        initial
+            .warnings
+            .push(format!("repair checkpoint migration: {error}"));
+    }
+    let report = boot_locked(deps, initial, open_quarantined);
     if !report.succeeded() {
         let mut report = report;
         if let Err(error) = save_report(deps, &report) {

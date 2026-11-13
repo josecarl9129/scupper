@@ -312,6 +312,7 @@ fn leftovers_secrets_latch_and_absent_state_fail_closed() {
             reason: "budget".into(),
             object: "rules".into(),
             since_unix: 1,
+            uncertain: false,
         });
     });
     let report = f.run(None);
@@ -1365,6 +1366,7 @@ fn control_apply_keeps_quarantine_on_failure_and_clears_only_after_full_verifica
             reason: "repair-budget".into(),
             object: "safety:ruleset".into(),
             since_unix: 1000,
+            uncertain: false,
         });
     });
     assert!(fixture.run(None).succeeded());
@@ -2636,6 +2638,13 @@ fn upgraded_daemon_restarts_adopt_legacy_boot_file_without_closing_or_rebuilding
     let fixture = Fixture::new();
     let running = fixture.run(None);
     assert!(running.succeeded());
+    // Exact pre-checkpoint schema used by 4442253, beside its real legacy boot report.
+    fs::write(
+        fixture.root.path.join("state.json"),
+        r#"{"schema":1,"applied_version":1,"selection":"Auto","quarantine":null}"#,
+    )
+    .unwrap();
+    fs::remove_file(fixture.root.path.join("repair-state.json")).unwrap();
     // Model the real kernel's propagation of all.forwarding=1 to per-link gates;
     // this fake stores each sysctl independently. Handshakes are already fresh.
     for name in fixture.kernel.ns.borrow().keys() {
@@ -2685,5 +2694,51 @@ fn upgraded_daemon_restarts_adopt_legacy_boot_file_without_closing_or_rebuilding
             assert_eq!(fixture.kernel.values.borrow()[key], "1");
         }
         assert_eq!(fs::read(run_root.join("boot.json")).unwrap(), bytes);
+        assert!(fixture.root.path.join("repair-state.json").is_file());
+        assert!(
+            StateFile::open(&fixture.root.path, None)
+                .unwrap()
+                .repair_state()
+                .latch()
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn legacy_boot_migrates_once_without_changing_forwarding_or_quarantine() {
+    for quarantined in [false, true] {
+        let f = Fixture::new();
+        assert!(f.run(None).succeeded());
+        if quarantined {
+            f.state(|s| {
+                s.quarantine = Some(scupper_sys::state::Quarantine {
+                    reason: "legacy safety budget".into(),
+                    object: "safety:ruleset".into(),
+                    since_unix: 1000,
+                    uncertain: false,
+                });
+            });
+        }
+        let state = fs::read(f.root.path.join("state.json")).unwrap();
+        fs::remove_file(f.root.path.join("repair-state.json")).unwrap();
+        for _ in 0..2 {
+            let report = f.run(None);
+            assert!(report.succeeded(), "{report:?}");
+            assert_eq!(
+                f.kernel.values.borrow()["net.ipv4.ip_forward"],
+                if quarantined { "0" } else { "1" }
+            );
+            assert_eq!(fs::read(f.root.path.join("state.json")).unwrap(), state);
+            if quarantined {
+                assert_eq!(f.check().verdict.exit_code(), 4);
+            }
+        }
+        let events = scupper_sys::events::Tail::default()
+            .read(&f.root.path, 0, u64::MAX)
+            .unwrap();
+        assert_eq!(events.iter().filter(|record| matches!(record,
+            scupper_sys::events::TailRecord::Event(event) if matches!(event.kind, scupper_proto::EventKind::RepairCheckpointCreated {})
+        )).count(), 1);
     }
 }

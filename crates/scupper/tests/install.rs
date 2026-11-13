@@ -296,9 +296,7 @@ fn fresh_ubuntu_missing_tools_prints_package_installation_advice() {
         "{out} {err}"
     );
     assert!(!err.contains("cannot inspect v1 layout"));
-    // With no wireguard-tools package, the fake models systemctl's status 1
-    // and empty output for an unmatched wg-quick pattern.
-    assert!(fake.calls.borrow().iter().any(|(program, args)| {
+    assert!(!fake.calls.borrow().iter().any(|(program, args)| {
         *program == scupper_sys::system::Program::Systemctl
             && args.first().is_some_and(|arg| arg == "list-unit-files")
     }));

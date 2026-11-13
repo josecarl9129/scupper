@@ -1,4 +1,4 @@
-//! Pure, single-writer repair planning for the last verified applied version.
+//! Pure, single-writer repair planning for the published convergence target.
 //!
 //! Callers supply monotonic time and fresh observations on every tick. Execution
 //! follows each step's [`StepFailure`] policy and re-observes before calling
@@ -53,7 +53,7 @@
 //! | Known ruleset mismatch | Forwarding off | Budgeted load and verify |
 //! | Unknown ruleset | Forwarding off | Wait for a positive observation |
 //! | Known tc/foreign link | Delete hook / link down | Class-budgeted reopening |
-//! | Unknown tc/link inventory | Forwarding off; client down on second tick | Normal link Restore after inventory recovers |
+//! | Unknown tc/link inventory | Forwarding off and client down immediately | Normal link Restore after inventory recovers |
 //! | Known peer `AllowedIPs` mismatch | Owned link down before debounce/budget | Normal configuration Restore |
 //! | Active exit MTU/keepalive mismatch | Default becomes unreachable on first sighting | Debounced configuration repair, then route promotion |
 //!
@@ -61,8 +61,8 @@
 //! same plan, including recovery after interruption. Only a gone namespace
 //! inode prevents namespace steps; other escalations accompany normal planning.
 //! A failed observation is never a placeholder success. On the first incomplete
-//! tc/link inventory tick, an unidentifiable bypass may remain until the second
-//! tick closes client ingress; [`safe`] does not certify that Unknown state.
+//! tc/link inventory tick, forwarding and client ingress close immediately;
+//! [`safe`] does not certify the Unknown inventory itself.
 
 mod desired;
 mod model;

@@ -1,8 +1,8 @@
 //! Read-only v1 markers used by installation preflight.
 use crate::{
-    canon::{command, command_result},
+    canon::command,
     rules::V1Config,
-    system::{EXEC_TIMEOUT, ExecError, Program, SYSTEMCTL_TIMEOUT, System},
+    system::{EXEC_TIMEOUT, ExecError, Program, System},
     verdict::{Probe, ProbeError},
 };
 use std::collections::BTreeSet;
@@ -132,94 +132,68 @@ fn detect_layout(
 }
 
 fn enabled_units(sys: &dyn System) -> Probe<Vec<V1Marker>> {
-    let mut markers = Vec::new();
-    let output = sys.run(
-        Program::Systemctl,
-        &[
-            "list-unit-files".into(),
-            "--type=service".into(),
-            "--no-legend".into(),
-            "--no-pager".into(),
-            "wg-quick@*.service".into(),
-        ],
-        SYSTEMCTL_TIMEOUT,
-    );
-    // systemctl returns a nonzero status when this glob matches no unit files.
-    // Keep failures with diagnostics or any listed units as observation errors.
-    let units = match output {
-        Ok(output)
-            if output.status.is_some_and(|status| status != 0)
-                && matches!(output.stdout.trim(), "" | "0 unit files listed.")
-                && output.stderr.lines().all(no_units_diagnostic) =>
-        {
-            String::new()
-        }
-        other => command_result(other)?,
-    };
-    let mut instances = BTreeSet::new();
-    for line in units.lines().filter(|line| !line.trim().is_empty()) {
-        let name = line.split_whitespace().next().unwrap_or_default();
-        // The installed template is present even on a clean M2 host.
-        if name == "wg-quick@.service" {
-            continue;
-        }
-        if !name.starts_with("wg-quick@")
-            || !name.ends_with(".service")
-            || name.len() <= "wg-quick@.service".len()
-        {
-            return Err(ProbeError::setup("malformed wg-quick unit listing"));
-        }
-        instances.insert(name.to_owned());
-    }
-    for unit in instances {
-        let output = sys.run(
-            Program::Systemctl,
-            &["is-enabled".into(), unit.clone()],
-            SYSTEMCTL_TIMEOUT,
-        );
-        match output {
-            Ok(output)
-                if output.status == Some(0)
-                    && matches!(output.stdout.trim(), "enabled" | "enabled-runtime") =>
-            {
-                markers.push(V1Marker::EnabledWgQuick(unit));
-            }
-            Ok(output)
-                if matches!(output.status, Some(0 | 1 | 3 | 4))
-                    && matches!(
-                        output.stdout.trim(),
-                        "disabled"
-                            | "masked"
-                            | "masked-runtime"
-                            | "static"
-                            | "indirect"
-                            | "not-found"
-                            | "linked"
-                            | "linked-runtime"
-                            | "alias"
-                            | "generated"
-                            | "transient"
-                    ) => {}
-            other => {
-                command_result(other)?;
-                return Err(ProbeError::setup("unexpected is-enabled response"));
-            }
-        }
-    }
-    Ok(markers)
+    sys.wg_quick_units()
+        .map(|units| units.into_iter().map(V1Marker::EnabledWgQuick).collect())
+        .map_err(|_| ProbeError::setup("cannot inspect wg-quick unit files"))
 }
 
-fn no_units_diagnostic(line: &str) -> bool {
-    matches!(
-        line.trim()
-            .trim_end_matches('.')
-            .to_ascii_lowercase()
-            .as_str(),
-        "" | "no units found"
-            | "no unit files found"
-            | "no matching unit files found"
-            | "0 unit files listed"
-    )
+/// Inspect public systemd unit templates and enablement symlinks under a host root.
+/// Missing files establish absence; unreadable inventories are errors.
+/// # Errors
+/// Returns metadata, open, directory enumeration or symlink-read failures.
+pub fn wg_quick_units_at(root: &std::path::Path) -> std::io::Result<Vec<String>> {
+    use std::{fs, io, os::unix::fs::FileTypeExt};
+    for directory in [
+        "lib/systemd/system",
+        "usr/lib/systemd/system",
+        "etc/systemd/system",
+        "run/systemd/system",
+    ] {
+        let template = root.join(directory).join("wg-quick@.service");
+        if fs::symlink_metadata(&template).is_ok_and(|m| m.file_type().is_symlink())
+            && fs::read_link(&template)? == std::path::Path::new("/dev/null")
+        {
+            continue; // A masked template is present, but cannot start a service.
+        }
+        match fs::File::open(&template) {
+            Ok(file) if file.metadata()?.is_file() => {}
+            Ok(file) if file.metadata()?.file_type().is_char_device() => {}
+            Ok(_) => return Err(io::Error::other("wg-quick template is not a regular file")),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let mut units = BTreeSet::new();
+    for directory in ["etc/systemd/system", "run/systemd/system"] {
+        let entries = match fs::read_dir(root.join(directory)) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.ends_with(".wants") && !name.ends_with(".requires") {
+                continue;
+            }
+            for unit in fs::read_dir(entry.path())? {
+                let unit = unit?;
+                let name = unit.file_name().to_string_lossy().into_owned();
+                if name.starts_with("wg-quick@")
+                    && name.ends_with(".service")
+                    && name != "wg-quick@.service"
+                {
+                    if !unit.file_type()?.is_symlink() {
+                        return Err(io::Error::other("wg-quick enablement is not a symlink"));
+                    }
+                    fs::read_link(unit.path())?;
+                    units.insert(name);
+                }
+            }
+        }
+    }
+    Ok(units.into_iter().collect())
 }
 
 /// Identifies retired/unknown binaries by the version-store CLI, not semver:

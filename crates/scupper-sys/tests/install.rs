@@ -1015,7 +1015,7 @@ fn empty_unit_listing_is_accepted_by_both_install_detection_calls() {
                 *program == Program::Systemctl && args[0] == "list-unit-files"
             })
             .count(),
-        2
+        0
     );
 }
 

@@ -12,9 +12,6 @@ fn permissions(path: &Path, mode: u32) -> io::Result<()> {
     stdfs::set_permissions(path, stdfs::Permissions::from_mode(mode))?;
     stdfs::File::open(path)?.sync_all()
 }
-fn write(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
-    fs::durable_replace(&RealFs, path, bytes, mode, &|_| Ok(()), &|_| Ok(()))
-}
 fn new_identity() -> Result<Zeroizing<Vec<u8>>, String> {
     let mut bytes = Zeroizing::new([0u8; 32]);
     let mut at = 0;
@@ -71,6 +68,42 @@ pub fn apply(system: &dyn System, paths: &Paths, prepared: Prepared) -> Result<S
         }
     })
 }
+/// Confirmed and uncertain mutations, including failed operations with partial effects.
+#[derive(Debug, Clone, Default)]
+pub struct Mutations {
+    /// Paths or service commands known to have completed a mutation.
+    pub changed: std::collections::BTreeSet<String>,
+    /// Paths or commands whose failed attempt may have mutated state.
+    pub possibly_changed: std::collections::BTreeSet<String>,
+}
+impl Mutations {
+    /// Mark a mutation before starting a write or command.
+    pub fn begin(&mut self, path: &str) {
+        self.possibly_changed.insert(path.into());
+    }
+    /// Record a completed mutation, even when a later durability step fails.
+    pub fn complete(&mut self, path: &str) {
+        self.possibly_changed.remove(path);
+        self.changed.insert(path.into());
+    }
+    /// Human-readable mutation evidence.
+    #[must_use]
+    pub fn text(&self) -> String {
+        use std::fmt::Write as _;
+        let mut text = String::new();
+        for path in &self.changed {
+            let _ = writeln!(text, "changed: {path}");
+        }
+        for path in &self.possibly_changed {
+            let _ = writeln!(text, "possibly changed: {path}");
+        }
+        if text.is_empty() {
+            text.push_str("unchanged: no mutations attempted\n");
+        }
+        text
+    }
+}
+
 /// Installation failure with the actual binary rename state.
 #[derive(Debug)]
 pub struct ApplyError {
@@ -78,6 +111,8 @@ pub struct ApplyError {
     pub reason: String,
     /// At least one live binary was renamed, even if directory sync then failed.
     pub replaced: bool,
+    /// All completed and potentially partial changes.
+    pub mutations: Mutations,
 }
 /// Applies installation using an injected binary-replacement filesystem boundary.
 /// # Errors
@@ -88,11 +123,29 @@ pub fn apply_with_fs(
     prepared: Prepared,
     filesystem: &dyn Fs,
 ) -> Result<String, ApplyError> {
+    apply_with_fs_tracked(system, paths, prepared, filesystem).map(|(text, _)| text)
+}
+/// Apply with mutation evidence on both success and failure.
+/// # Errors
+/// Returns confirmed and possibly changed paths with the failure.
+pub fn apply_with_fs_tracked(
+    system: &dyn System,
+    paths: &Paths,
+    prepared: Prepared,
+    filesystem: &dyn Fs,
+) -> Result<(String, Mutations), ApplyError> {
     let replaced = std::cell::Cell::new(false);
-    apply_inner(system, paths, prepared, filesystem, &replaced).map_err(|reason| ApplyError {
-        reason,
-        replaced: replaced.get(),
-    })
+    let mutations = std::cell::RefCell::new(Mutations::default());
+    let result = apply_inner(system, paths, prepared, filesystem, &replaced, &mutations);
+    let mutations = mutations.into_inner();
+    match result {
+        Ok(text) => Ok((text, mutations)),
+        Err(reason) => Err(ApplyError {
+            reason,
+            replaced: replaced.get(),
+            mutations,
+        }),
+    }
 }
 #[allow(clippy::too_many_lines)]
 fn apply_inner(
@@ -101,6 +154,7 @@ fn apply_inner(
     mut prepared: Prepared,
     filesystem: &dyn Fs,
     replaced: &std::cell::Cell<bool>,
+    mutations: &std::cell::RefCell<Mutations>,
 ) -> Result<String, String> {
     // No directory or lock is created until the full plan and refusals exist.
     let mut current = observe(system, paths).map_err(|e| e.to_string())?;
@@ -146,7 +200,7 @@ fn apply_inner(
             return Err("secret changed since planning; rerun install".into());
         }
     }
-    let (mutations, services) = prepared.plan.steps.split_at(
+    let (mutation_steps, services) = prepared.plan.steps.split_at(
         prepared
             .plan
             .steps
@@ -154,7 +208,13 @@ fn apply_inner(
             .position(|s| matches!(s.change, Change::DaemonReload | Change::Enable))
             .unwrap_or(prepared.plan.steps.len()),
     );
-    for step in mutations {
+    for step in mutation_steps {
+        let affected = affected_paths(&step.change);
+        if !matches!(step.change, Change::Binary(..)) {
+            for path in &affected {
+                mutations.borrow_mut().begin(path);
+            }
+        }
         let result: Result<(), String> = (|| {
             match &step.change {
                 Change::Group => {
@@ -183,19 +243,40 @@ fn apply_inner(
                         for binary in model::BINARIES {
                             let destination = paths.at(&format!("{}/{binary}", model::BIN_ROOT));
                             if destination.exists() {
+                                let previous = format!("{}/{binary}.prev", model::BIN_ROOT);
+                                let previous_path =
+                                    destination.with_file_name(format!("{binary}.prev"));
+                                filesystem
+                                    .check_target(&previous_path)
+                                    .map_err(|e| e.to_string())?;
+                                match stdfs::symlink_metadata(&previous_path) {
+                                    Ok(metadata) if !metadata.is_file() => {
+                                        return Err("backup target is not a regular file".into());
+                                    }
+                                    Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                                        return Err(e.to_string());
+                                    }
+                                    _ => {}
+                                }
+                                let previous_bytes = read_regular(&destination, 128 * 1024 * 1024)
+                                    .map_err(|e| e.to_string())?;
+                                mutations.borrow_mut().begin(&previous);
                                 fs::durable_replace(
                                     filesystem,
                                     &destination.with_file_name(format!("{binary}.prev")),
-                                    &read_regular(&destination, 128 * 1024 * 1024)
-                                        .map_err(|e| e.to_string())?,
+                                    &previous_bytes,
                                     model::BINARY_MODE,
                                     &|_| Ok(()),
                                     &|_| Ok(()),
                                 )
                                 .map_err(|e| e.to_string())?;
+                                mutations.borrow_mut().complete(&previous);
                             }
                         }
                     }
+                    mutations
+                        .borrow_mut()
+                        .begin(&format!("{}/{name}", model::BIN_ROOT));
                     fs::durable_replace(
                         filesystem,
                         &paths.at(&format!("{}/{name}", model::BIN_ROOT)),
@@ -205,6 +286,9 @@ fn apply_inner(
                         &|step| {
                             if step == fs::DurableStep::Renamed {
                                 replaced.set(true);
+                                mutations
+                                    .borrow_mut()
+                                    .complete(&format!("{}/{name}", model::BIN_ROOT));
                             }
                             Ok(())
                         },
@@ -314,8 +398,20 @@ fn apply_inner(
                 }
                 Change::Configuration(Configuration::Existing) => {}
                 Change::File(path, node) => {
-                    write(&paths.at(path), &prepared.files[path], node.mode)
-                        .map_err(|e| e.to_string())?;
+                    fs::durable_replace(
+                        filesystem,
+                        &paths.at(path),
+                        &prepared.files[path],
+                        node.mode,
+                        &|_| Ok(()),
+                        &|step| {
+                            if step == fs::DurableStep::Renamed {
+                                mutations.borrow_mut().complete(path);
+                            }
+                            Ok(())
+                        },
+                    )
+                    .map_err(|e| e.to_string())?;
                 }
                 Change::Permissions(path, mode) => {
                     permissions(&paths.at(path), *mode).map_err(|e| e.to_string())?;
@@ -326,6 +422,11 @@ fn apply_inner(
             }
             Ok(())
         })();
+        if result.is_ok() {
+            for path in &affected {
+                mutations.borrow_mut().complete(path);
+            }
+        }
         result?;
     }
     drop(guard);
@@ -335,9 +436,35 @@ fn apply_inner(
             Change::Enable => vec!["enable", "--now", model::UNITS[0], model::UNITS[1]],
             _ => return Err("invalid install plan: mutation after service operation".into()),
         };
+        let label = format!("systemctl {}", args.join(" "));
+        mutations.borrow_mut().begin(&label);
         command(system, Program::Systemctl, &args).map_err(|e| e.to_string())?;
+        mutations.borrow_mut().complete(&label);
     }
     peer_section(paths, &prepared.request.gateway_id)
+}
+fn affected_paths(change: &Change) -> Vec<String> {
+    match change {
+        Change::Group => vec!["/etc/group".into(), "/etc/gshadow".into()],
+        Change::User(_) => vec![
+            "/etc/passwd".into(),
+            "/etc/shadow".into(),
+            "/etc/group".into(),
+        ],
+        Change::Directory(path, _) | Change::File(path, _) | Change::Permissions(path, _) => {
+            vec![path.clone()]
+        }
+        Change::Binary(name, _) => vec![format!("{}/{name}", model::BIN_ROOT)],
+        Change::InitializeState => vec![
+            format!("{}/state.json", model::STATE_ROOT),
+            format!("{}/repair-state.json", model::STATE_ROOT),
+        ],
+        Change::GenerateIdentity => vec![format!("{}/wg/wg0", model::SECRETS_ROOT)],
+        Change::Configuration(Configuration::Existing) | Change::DaemonReload | Change::Enable => {
+            vec![]
+        }
+        Change::Configuration(_) => vec![model::STATE_ROOT.into(), model::CONFIG_ROOT.into()],
+    }
 }
 fn peer_section(paths: &Paths, gateway_id: &str) -> Result<String, String> {
     let store =

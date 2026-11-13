@@ -26,7 +26,7 @@ mod execute;
 mod firewall;
 mod observe;
 mod ufw;
-pub use execute::{ApplyError, apply, apply_with_fs};
+pub use execute::{ApplyError, Mutations, apply, apply_with_fs, apply_with_fs_tracked};
 use observe::observe;
 
 /// Flag inputs. No field holds key material.

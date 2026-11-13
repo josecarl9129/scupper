@@ -478,6 +478,10 @@ fn interrupted_route_switch_flushes_once_before_handoff_and_normal_restart_does_
     kernel.clear_history();
     let (_, config) = healthy(&root);
     let mut restarted = make(config);
+    assert!(
+        restarted.latch().is_none(),
+        "an interrupted routine restore must recover without explicit clearance"
+    );
     restarted.recover_route_switch().unwrap();
     assert!(!root.join("route-switch").exists());
     restarted.resume_existing();

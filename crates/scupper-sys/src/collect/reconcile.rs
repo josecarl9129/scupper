@@ -593,6 +593,7 @@ pub(crate) fn observe_rest(
     ))
     .and_then(|s| Ok(parse_ip_addr(&s)?))
     .ok();
+    model.host_links_complete = host.is_ok();
     if let Ok(host) = host {
         for link in host
             .into_iter()
@@ -649,9 +650,6 @@ pub(crate) fn observe_rest(
             }
             model.host_links.insert(link.ifname, record);
         }
-    } else {
-        // Prevent speculative host creation; the executor also rechecks on every add.
-        model.links_complete = false;
     }
     let mut handshakes = BTreeMap::new();
     let mut exit_links = BTreeMap::new();

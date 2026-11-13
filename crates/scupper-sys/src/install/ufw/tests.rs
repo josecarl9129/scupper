@@ -130,9 +130,9 @@ fn outgoing_default_block_requires_matching_udp_allow() {
     ] {
         assert!(!allows(row, packet("output")), "{row}");
     }
-    // M2's default-allow shortcut deliberately does not evaluate DENY rows.
+    // A matching deny also overrides the default allow policy.
     let text = format!("{ANY}\n51820/udp DENY OUT Anywhere\n");
-    assert!(!parse(&text).unwrap().may_block(packet("output")));
+    assert!(parse(&text).unwrap().may_block(packet("output")));
 }
 
 #[test]
@@ -218,4 +218,19 @@ fn verbose_exit_rules_use_from_column_for_interface_in_both_families() {
         "51820/udp ALLOW IN Anywhere # public UDP (v6) text is only a comment",
         packet("input")
     ));
+}
+
+#[test]
+fn deny_before_allow_remains_uncertain() {
+    for action in ["DENY", "REJECT", "LIMIT"] {
+        for hook in ["input", "output"] {
+            let direction = if hook == "input" { "IN" } else { "OUT" };
+            let deny = format!("51820/udp {action} {direction} Anywhere");
+            let allow = format!("51820/udp ALLOW {direction} Anywhere");
+            let text = format!("{DEFAULT}\nTo Action From\n{deny}\n{allow}\n");
+            assert!(parse(&text).unwrap().may_block(packet(hook)));
+            let text = format!("{DEFAULT}\nTo Action From\n{allow}\n{deny}\n");
+            assert!(!parse(&text).unwrap().may_block(packet(hook)));
+        }
+    }
 }

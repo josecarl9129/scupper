@@ -57,7 +57,7 @@ proptest! {
         }
         if drift_bits & (1<<18) != 0 {m.links.get_mut("wg0").unwrap().tc_hooks=Known::Unknown;}
         if drift_bits & (1<<19) != 0 {m.ruleset=Known::Value(Ruleset::Absent);}
-        if latched {m.latch=Some(Latch {reason:"test".into(),object:"ruleset".into()});}
+        if latched {m.latch=Some(Latch { uncertain: false,reason:"test".into(),object:"ruleset".into()});}
         let now=MonoTime(Duration::from_secs(seconds));
         let mut budgets=Budgets::default();
         for class in [SafetyClass::Ruleset,SafetyClass::TcHook,SafetyClass::ForeignLink] {
