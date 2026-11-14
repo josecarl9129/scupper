@@ -200,7 +200,7 @@ pub(super) fn status_value(
                 .map(|s| json!({"local": s.local, "inode": s.inode}))
                 .collect::<Vec<_>>()
         };
-        json!({"v4": f.v4, "v6": f.v6, "client_v4": f.client_v4, "hardening": f.hardening, "quarantine": f.quarantine, "client_public_key": f.client_public_key.as_ref().map(public_key), "listen_port": f.listen_port, "client_handshakes": clients, "host_sockets": sockets(&f.host_sockets), "netns_sockets": sockets(&f.netns_sockets)})
+        json!({"v4": f.v4, "v6": f.v6, "client_v4": f.client_v4, "hardening": f.hardening, "quarantine": f.quarantine, "client_public_key": f.client_public_key.as_ref().map(public_key), "listen_port": f.listen_port, "client_handshakes": clients, "session_reason": if f.client_sessions.telemetry_unavailable { Some("ClientSessionTelemetryUnknown") } else if f.client_sessions.unknown { Some("ClientSessionsUnknown") } else if f.client_sessions.active_reset { Some("ClientSessionsReset") } else { None }, "host_sockets": sockets(&f.host_sockets), "netns_sockets": sockets(&f.netns_sockets)})
     });
     let routes = obs.routes.as_ref().map(|routes| {
         routes
@@ -229,6 +229,14 @@ pub(super) fn status(out: &mut dyn Write, value: &Value) -> Result<(), String> {
         .map_err(output_error)?;
     } else {
         check(out, &value["report"])?;
+    }
+    if let Some(reason) = value["observations"]["forwarding"]["ok"]["session_reason"].as_str() {
+        let reason = match reason {
+            "ClientSessionsReset" => "recovery pending after device reset",
+            "ClientSessionTelemetryUnknown" => "telemetry unavailable",
+            _ => "readiness unknown",
+        };
+        writeln!(out, "Client sessions: {reason}").map_err(output_error)?;
     }
     for (section, field, name) in [("Exits", "exits", "id"), ("Clients", "clients", "name")] {
         writeln!(out, "\n{section}").map_err(output_error)?;

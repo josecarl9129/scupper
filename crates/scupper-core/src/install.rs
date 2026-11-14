@@ -259,6 +259,8 @@ pub enum Change {
     GenerateIdentity,
     /// Initialize a new store with Auto intent and applied version one.
     InitializeState,
+    /// Commit incarnation-bound EMPTY history before a new gateway serves.
+    ProvisionSessions,
     /// Publish config from verified input.
     Configuration(Configuration),
     /// Write exact public content by temp/fsync/rename.
@@ -313,6 +315,10 @@ impl fmt::Display for DisplayChange<'_> {
             Change::InitializeState => write!(
                 f,
                 "initialize state applied_version=1 selection=Auto mode=0600"
+            ),
+            Change::ProvisionSessions => write!(
+                f,
+                "provision new gateway incarnation and EMPTY never-served session history"
             ),
             Change::Configuration(config) => write!(f, "publish {config:?} configuration"),
             Change::File(path, node) => write!(
@@ -498,6 +504,12 @@ pub fn plan(facts: &Facts, request: &Request) -> Result<Plan, Refusal> {
                 change: Change::Directory(path.into(), mode),
             });
         }
+    }
+    if request.configuration != Configuration::Existing {
+        steps.push(Step {
+            before: Condition::PreviousSteps,
+            change: Change::ProvisionSessions,
+        });
     }
     let mut units_changed = false;
     for (path, node) in &request.files {

@@ -231,6 +231,30 @@ fn apply_inner(
                     fs::durable_directory(&paths.at(path)).map_err(|e| e.to_string())?;
                     permissions(&paths.at(path), *mode).map_err(|e| e.to_string())?;
                 }
+                Change::ProvisionSessions => {
+                    let store = VersionStore::read_only(
+                        &paths.at(model::STATE_ROOT),
+                        &paths.at(model::CONFIG_ROOT),
+                    );
+                    let version = store
+                        .head()
+                        .map_err(|e| e.to_string())?
+                        .ok_or("cannot provision sessions without an installed version")?;
+                    let (text, _) = store.read(version).map_err(|e| e.to_string())?;
+                    let site =
+                        config::validate(config::parse_site(&text).map_err(|e| e.to_string())?)
+                            .map_err(|_| "invalid provisioned configuration")?;
+                    let gateway = site
+                        .gateway(&GatewayId(prepared.request.gateway_id.clone()))
+                        .ok_or("unknown gateway")?;
+                    crate::client_sessions::provision(
+                        &paths.at(model::STATE_ROOT),
+                        gateway.client_tunnel().identity().public_key.as_str(),
+                        system.now_unix_secs(),
+                        &guard,
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
                 Change::InitializeState => {
                     crate::state::StateFile::open(paths.at(model::STATE_ROOT), Some(&guard))
                         .and_then(|f| f.write(&guard, &initial_state()))
@@ -455,6 +479,10 @@ fn affected_paths(change: &Change) -> Vec<String> {
             vec![path.clone()]
         }
         Change::Binary(name, _) => vec![format!("{}/{name}", model::BIN_ROOT)],
+        Change::ProvisionSessions => vec![
+            format!("{}/gateway-incarnation", model::STATE_ROOT),
+            format!("{}/client-sessions.json", model::STATE_ROOT),
+        ],
         Change::InitializeState => vec![
             format!("{}/state.json", model::STATE_ROOT),
             format!("{}/repair-state.json", model::STATE_ROOT),

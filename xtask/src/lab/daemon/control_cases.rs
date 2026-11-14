@@ -462,7 +462,11 @@ impl DaemonGuard<'_> {
         expected: Option<(&str, &str)>,
         stem: &str,
     ) -> Result<()> {
-        let (got, report) = self.lab.check_result(&Lab::boot_binary()?, root)?;
+        let (got, report) = if code == 0 {
+            self.lab.wait_session_recovery(&Lab::boot_binary()?, root)?
+        } else {
+            self.lab.check_result(&Lab::boot_binary()?, root)?
+        };
         fs::write(
             self.lab
                 .artifacts

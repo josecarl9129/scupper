@@ -48,7 +48,17 @@ fn error(stage: Stage, source: &ProbeError) -> Next {
     }))
 }
 
-fn report(verdict: Verdict, warnings: Vec<Warning>, cfg: &HealthConfigV2, now: u64) -> Next {
+fn report(verdict: Verdict, mut warnings: Vec<Warning>, cfg: &HealthConfigV2, now: u64) -> Next {
+    if matches!(
+        verdict,
+        Verdict::Degraded(
+            Degraded::ClientSessionsReset
+                | Degraded::ClientSessionsUnknown
+                | Degraded::ClientSessionTelemetryUnknown
+        )
+    ) {
+        warnings.retain(|warning| *warning != Warning::ClientSessionsPending);
+    }
     Next::Done(Ok(Report {
         verdict,
         warnings,
@@ -479,6 +489,25 @@ pub fn next(obs: &Observations, cfg: &HealthConfigV2, now: u64) -> Next {
     let mut warnings = Vec::new();
     if let Some(Ok(f)) = &obs.forwarding {
         warnings.extend(f.hardening.iter().cloned().map(Warning::HardeningSysctl));
+        let sessions = f.client_sessions;
+        if sessions.active_reset || sessions.unknown {
+            warnings.push(Warning::ClientSessionsPending);
+        }
+        if sessions.idle_reset {
+            warnings.push(Warning::IdleClientSessionsReset);
+        }
+        if sessions.history_unavailable {
+            warnings.push(Warning::ClientSessionHistoryUnavailable);
+        }
+        if sessions.expired_unconfirmed {
+            warnings.push(Warning::ClientSessionsExpiredUnconfirmed);
+        }
+        if sessions.peer_missing {
+            warnings.push(Warning::ClientSessionPeerMissing);
+        }
+        if sessions.telemetry_unavailable {
+            warnings.push(Warning::ClientSessionTelemetryUnavailable);
+        }
     }
     if let Some(Ok(f)) = &obs.forwarding
         && let Some(reason) = &f.quarantine
@@ -530,18 +559,6 @@ pub fn next(obs: &Observations, cfg: &HealthConfigV2, now: u64) -> Next {
                 cfg,
                 now,
             );
-        }
-        if obs
-            .forwarding
-            .as_ref()
-            .and_then(|f| f.as_ref().ok())
-            .is_some_and(|f| {
-                f.client_sessions.active_reset
-                    || f.client_sessions.idle_reset
-                    || f.client_sessions.unknown
-            })
-        {
-            warnings.push(Warning::IdleClientSessionsReset);
         }
         return report(
             Verdict::Degraded(Degraded::ClientSideBroken(ClientFault::LinkDown)),
@@ -693,11 +710,25 @@ pub fn next(obs: &Observations, cfg: &HealthConfigV2, now: u64) -> Next {
             _ => {}
         }
     }
-    if forwarding.client_sessions.history_unavailable {
-        warnings.push(Warning::ClientSessionHistoryUnavailable);
+    if let Some(why) = supervisor_fault {
+        return report(
+            Verdict::Unsupervised {
+                exit,
+                exit_ip: ip,
+                why,
+            },
+            warnings,
+            cfg,
+            now,
+        );
     }
-    if forwarding.client_sessions.expired_unconfirmed {
-        warnings.push(Warning::ClientSessionsExpiredUnconfirmed);
+    if forwarding.client_sessions.telemetry_unavailable {
+        return report(
+            Verdict::Degraded(Degraded::ClientSessionTelemetryUnknown),
+            warnings,
+            cfg,
+            now,
+        );
     }
     if forwarding.client_sessions.unknown {
         return report(
@@ -707,24 +738,9 @@ pub fn next(obs: &Observations, cfg: &HealthConfigV2, now: u64) -> Next {
             now,
         );
     }
-    if forwarding.client_sessions.idle_reset {
-        warnings.push(Warning::IdleClientSessionsReset);
-    }
     if forwarding.client_sessions.active_reset {
         return report(
             Verdict::Degraded(Degraded::ClientSessionsReset),
-            warnings,
-            cfg,
-            now,
-        );
-    }
-    if let Some(why) = supervisor_fault {
-        return report(
-            Verdict::Unsupervised {
-                exit,
-                exit_ip: ip,
-                why,
-            },
             warnings,
             cfg,
             now,

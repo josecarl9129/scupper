@@ -34,6 +34,20 @@ pub(crate) struct SafetySystem<'a> {
     pub(crate) failed: Cell<bool>,
 }
 impl System for SafetySystem<'_> {
+    fn client_session_io(
+        &self,
+        held: &NetnsHandle,
+        request: &crate::client_sessions::Request,
+    ) -> std::io::Result<crate::client_sessions::Response> {
+        if Instant::now() >= self.deadline {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        let result = self.system.client_session_io(held, request)?;
+        if Instant::now() >= self.deadline {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        Ok(result)
+    }
     fn canon_safety_deadline(&self) -> Option<Instant> {
         Some(self.deadline)
     }

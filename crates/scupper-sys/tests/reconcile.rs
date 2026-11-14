@@ -4094,6 +4094,94 @@ fn d2_recovery_raises_client_in_the_same_tick_and_events_identify_links() {
 }
 
 #[test]
+fn planner_reopens_client_through_baseline_hook_while_sessions_are_unknown() {
+    use scupper_sys::{
+        client_sessions::{self, Request, Response, Sample},
+        system::{ExecError, ExecOutput, Program, System},
+    };
+    struct SessionSystem;
+    impl System for SessionSystem {
+        fn run(&self, _: Program, _: &[String], _: Duration) -> Result<ExecOutput, ExecError> {
+            panic!("session hook must not run link commands")
+        }
+        fn now_unix_secs(&self) -> u64 {
+            1000
+        }
+        fn client_session_io(&self, _: &NetnsHandle, _: &Request) -> io::Result<Response> {
+            Ok(Response::Samples(vec![Sample {
+                key: [3; 32],
+                handshake: (0, 0),
+                rx: 0,
+                tx: 0,
+            }]))
+        }
+    }
+    let mut rig = Rig::new();
+    let root = rig.root.join("sessions");
+    fs::create_dir(&root).unwrap();
+    let guard = WriterLock::acquire(root.join("provision")).unwrap();
+    client_sessions::provision(&root, "gateway", 1000, &guard).unwrap();
+    client_sessions::activate(&root, &root, "gateway", 1000, &guard).unwrap();
+    client_sessions::before_down(&SessionSystem, &root, &root, "gateway", &guard).unwrap();
+    let before_reads = rig.kernel.rest_reads();
+    let held = rig.held.clone();
+    let called = Rc::new(Cell::new(false));
+    let hook_called = called.clone();
+    let kernel = rig.kernel.clone();
+    let hook_root = root.clone();
+    rig.kernel.on_client_link_up(move |writer| {
+        assert!(
+            kernel.rest_reads() > before_reads,
+            "LinkUp preceded safety observation"
+        );
+        assert_eq!(kernel.model().links["wg0"].up, Known::Value(false));
+        let sessions = client_sessions::status(
+            &SessionSystem,
+            &held,
+            "wg0",
+            &hook_root,
+            &hook_root,
+            "gateway",
+            &[[3; 32]],
+        )
+        .unwrap();
+        assert!(
+            sessions.unknown,
+            "regression requires non-ready sessions at LinkUp"
+        );
+        client_sessions::before_up(
+            &SessionSystem,
+            &held,
+            "wg0",
+            &hook_root,
+            &hook_root,
+            "gateway",
+            true,
+            writer,
+        )
+        .unwrap();
+        hook_called.set(true);
+        Ok(())
+    });
+    rig.kernel
+        .mutate(|model| model.links.get_mut("wg0").unwrap().up = Known::Value(false));
+    for _ in 0..4 {
+        rig.round(true);
+        rig.tick();
+    }
+    assert!(
+        called.get(),
+        "session readiness 3 blocked the baseline/LinkUp repair"
+    );
+    assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(true));
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("client-sessions.json")).unwrap()).unwrap();
+    assert_eq!(record["down"], false);
+    assert_eq!(record["probe_pending"], true);
+    rig.kernel.on_client_link_up(|_| Ok(()));
+}
+
+#[test]
 fn complete_tick_cannot_report_protected_while_client_link_is_down_or_missing() {
     for missing in [false, true] {
         let mut rig = Rig::new();
@@ -4224,4 +4312,97 @@ fn link_down_timeout_after_effect_has_a_prior_session_checkpoint() {
         recoveries,
         "failed plan cannot run recovery hook"
     );
+}
+
+#[test]
+fn independent_sampler_renews_while_reconciler_has_persistent_nonfatal_failure() {
+    use scupper_sys::{
+        client_sessions::{self, Request, Response, Sample},
+        system::{ExecError, ExecOutput, Program, System},
+    };
+    struct ActivitySystem {
+        now: Cell<u64>,
+    }
+    impl System for ActivitySystem {
+        fn run(&self, _: Program, _: &[String], _: Duration) -> Result<ExecOutput, ExecError> {
+            panic!("activity sampling must not run repair commands")
+        }
+        fn now_unix_secs(&self) -> u64 {
+            self.now.get()
+        }
+        fn client_session_io(&self, _: &NetnsHandle, request: &Request) -> io::Result<Response> {
+            assert!(request.probe.is_none());
+            Ok(Response::Samples(vec![Sample {
+                key: [3; 32],
+                handshake: (self.now.get(), 1),
+                rx: self.now.get() * 128,
+                tx: 0,
+            }]))
+        }
+    }
+    let mut rig = Rig::new();
+    let root = rig.root.join("sessions");
+    fs::create_dir_all(&root).unwrap();
+    let activity = Rc::new(ActivitySystem {
+        now: Cell::new(1000),
+    });
+    let sampler_guard = WriterLock::acquire(root.join("sampler-owner")).unwrap();
+    let held = rig.held.clone();
+    let sample = || {
+        client_sessions::checkpoint_recovered(
+            &*activity,
+            &held,
+            "wg0",
+            &root,
+            &root,
+            "public-gateway",
+            &sampler_guard,
+            &[[3; 32]],
+        )
+        .unwrap();
+    };
+    sample();
+    // Establish a baseline, then authenticated activity.
+    rig.tick();
+    activity.now.set(1002);
+    sample();
+    rig.tick();
+    rig.store.fail_writes(true);
+    let mut saw_failure = false;
+    for now in (1004..1040).step_by(2) {
+        activity.now.set(now);
+        sample();
+        rig.flush_rules(); // Exhaust the drift budget; latch persistence then fails every tick.
+        let before = rig.kernel.session_recoveries();
+        let report = rig.tick();
+        if !report.failures.is_empty() {
+            assert_eq!(
+                rig.kernel.session_recoveries(),
+                before,
+                "failed repairs must still suppress outbound probes"
+            );
+        }
+        saw_failure |= report
+            .failures
+            .iter()
+            .any(|(step, _)| step.failure() == scupper_core::planner::StepFailure::NonFatal);
+        let record: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("client-sessions.json")).unwrap()).unwrap();
+        assert_eq!(record["renewed_at"], now);
+        assert_eq!(record["peers"][0]["lease_until"], now + 180);
+    }
+    assert!(
+        saw_failure,
+        "fixture must exercise a real NonFatal step failure"
+    );
+}
+
+#[test]
+fn repairs_never_call_a_blocking_tick_checkpoint() {
+    let mut rig = Rig::new();
+    rig.kernel
+        .on_activity_checkpoint(|_| panic!("repair path called session persistence"));
+    rig.flush_rules();
+    let report = rig.tick();
+    assert!(report.steps.contains(&Step::ForwardingOff));
 }

@@ -195,12 +195,16 @@ pub struct ClientSessions {
     pub active_reset: bool,
     /// An idle or never-connected peer has not recovered.
     pub idle_reset: bool,
-    /// Historical cohort is unavailable within its one bounded lease.
+    /// History is unavailable during its initial lease or a tracking gap recovery.
     pub unknown: bool,
-    /// Unavailable history lease expired; this is not confirmed recovery.
+    /// Historical evidence is unavailable; this is not confirmed recovery.
     pub history_unavailable: bool,
     /// An authenticated activity lease expired without confirmation.
     pub expired_unconfirmed: bool,
+    /// Check could not read current client activity; uncertainty is unbounded.
+    pub telemetry_unavailable: bool,
+    /// A configured peer is absent from the current device sample.
+    pub peer_missing: bool,
 }
 
 /// Forwarding and the listening side of the client tunnel, observed together.
@@ -435,8 +439,10 @@ pub enum Degraded {
     ClientSideBroken(ClientFault),
     /// Recently active clients still lack authenticated post-reset transport.
     ClientSessionsReset,
-    /// Session history is unavailable during its bounded uncertainty lease.
+    /// Session history is unavailable, including stalled activity tracking.
     ClientSessionsUnknown,
+    /// Check's own client telemetry read failed.
+    ClientSessionTelemetryUnknown,
     /// Probe ran but the exit path failed.
     ExitProbeFailed(ProbeError),
     /// Probe returned an implausible public IPv4 exit address.
@@ -503,9 +509,15 @@ pub enum Warning {
     ClientHandshakesStale,
     /// Idle clients have unconfirmed sessions after a client link reset.
     IdleClientSessionsReset,
+    /// Session readiness is pending while an earlier stage has precedence.
+    ClientSessionsPending,
+    /// A configured peer was missing from the device sample.
+    ClientSessionPeerMissing,
+    /// Check could not read client activity telemetry.
+    ClientSessionTelemetryUnavailable,
     /// Session activity lease expired without confirmation.
     ClientSessionsExpiredUnconfirmed,
-    /// Durable history was unavailable; the bounded unknown lease has expired.
+    /// Durable activity history is unavailable or has an observation gap.
     ClientSessionHistoryUnavailable,
 }
 
@@ -602,6 +614,32 @@ pub struct Report {
     pub at: u64,
     /// Applied configuration version supplied to the health config constructor.
     pub config_version: u64,
+}
+
+impl Report {
+    /// True only when every diagnosis concerns client session readiness.
+    #[must_use]
+    pub fn session_only(&self) -> bool {
+        matches!(
+            self.verdict,
+            Verdict::Degraded(
+                Degraded::ClientSessionsReset
+                    | Degraded::ClientSessionsUnknown
+                    | Degraded::ClientSessionTelemetryUnknown
+            )
+        ) && self.warnings.iter().all(|warning| {
+            matches!(
+                warning,
+                Warning::ClientHandshakesStale
+                    | Warning::IdleClientSessionsReset
+                    | Warning::ClientSessionsPending
+                    | Warning::ClientSessionPeerMissing
+                    | Warning::ClientSessionTelemetryUnavailable
+                    | Warning::ClientSessionsExpiredUnconfirmed
+                    | Warning::ClientSessionHistoryUnavailable
+            )
+        })
+    }
 }
 
 /// Next required stage, or a decisive report/error.

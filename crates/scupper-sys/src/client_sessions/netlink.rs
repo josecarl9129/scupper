@@ -170,7 +170,30 @@ fn peers(bytes: &[u8], peers: &mut BTreeMap<[u8; 32], PartialSample>) -> io::Res
         Ok(())
     })
 }
-pub(super) fn read(iface: &str) -> io::Result<Vec<Sample>> {
+pub(super) fn link_up(ifindex: u32) -> io::Result<bool> {
+    let socket = Socket::new(Domain::from(16), Type::DGRAM, Some(Protocol::from(0)))?;
+    socket.set_read_timeout(Some(Duration::from_secs(1)))?;
+    socket.set_write_timeout(Some(Duration::from_secs(1)))?;
+    let mut request = Vec::new();
+    request.extend(32_u32.to_ne_bytes());
+    request.extend(18_u16.to_ne_bytes()); // RTM_GETLINK
+    request.extend(1_u16.to_ne_bytes());
+    request.extend(3_u32.to_ne_bytes());
+    request.extend(0_u32.to_ne_bytes());
+    request.extend([0_u8; 4]); // ifinfomsg family, pad, type
+    request.extend(ifindex.to_ne_bytes());
+    request.extend([0_u8; 8]);
+    let mut up = None;
+    exchange(&socket, &request, 3, |kind, payload| {
+        if kind != 16 || u32_at(payload, 4)? != ifindex {
+            return Err(invalid());
+        }
+        up = Some(u32_at(payload, 8)? & 1 != 0);
+        Ok(())
+    })?;
+    up.ok_or_else(invalid)
+}
+pub(super) fn read(iface: &str) -> io::Result<(u32, Vec<Sample>)> {
     // AF_NETLINK=16, NETLINK_GENERIC=16. socket2 safely owns the descriptor;
     // std::io::Read avoids uninitialized buffers and raw sockaddr construction.
     let socket = Socket::new(Domain::from(16), Type::DGRAM, Some(Protocol::from(16)))?;
@@ -197,6 +220,7 @@ pub(super) fn read(iface: &str) -> io::Result<Vec<Sample>> {
     let mut name = iface.as_bytes().to_vec();
     name.push(0);
     let mut samples = BTreeMap::new();
+    let mut ifindex = None;
     exchange(
         &socket,
         &request(family, 0, 0x301, 2, &attr(2, &name)?)?,
@@ -206,6 +230,9 @@ pub(super) fn read(iface: &str) -> io::Result<Vec<Sample>> {
                 return Err(invalid());
             }
             attributes(payload.get(4..).ok_or_else(invalid)?, |kind, value| {
+                if kind == 1 {
+                    ifindex = Some(u32_at(value, 0)?);
+                }
                 if kind == 8 {
                     peers(value, &mut samples)?;
                 }
@@ -213,7 +240,7 @@ pub(super) fn read(iface: &str) -> io::Result<Vec<Sample>> {
             })
         },
     )?;
-    samples
+    let peers = samples
         .into_iter()
         .map(|(key, s)| {
             Ok(Sample {
@@ -223,7 +250,8 @@ pub(super) fn read(iface: &str) -> io::Result<Vec<Sample>> {
                 tx: s.tx.ok_or_else(invalid)?,
             })
         })
-        .collect()
+        .collect::<io::Result<Vec<_>>>()?;
+    Ok((ifindex.ok_or_else(invalid)?, peers))
 }
 
 #[cfg(test)]

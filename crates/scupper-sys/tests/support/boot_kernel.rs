@@ -52,9 +52,12 @@ impl Link {
     }
 }
 pub struct Kernel {
+    pub now: Cell<u64>,
+    pub during_client_sample: RefCell<Option<Box<dyn FnOnce()>>>,
     pub conntrack_loaded: Cell<bool>,
     pub wireguard_loaded: Cell<bool>,
     pub exists: Cell<bool>,
+    pub system_state: RefCell<(Option<i32>, String)>,
     pub host: RefCell<BTreeMap<String, Link>>,
     pub ns: RefCell<BTreeMap<String, Link>>,
     pub values: RefCell<BTreeMap<String, String>>,
@@ -75,9 +78,12 @@ pub struct Kernel {
 impl Kernel {
     pub fn new() -> Self {
         Self {
+            now: Cell::new(1000),
+            during_client_sample: RefCell::new(None),
             conntrack_loaded: Cell::new(false),
             wireguard_loaded: Cell::new(false),
             exists: Cell::new(false),
+            system_state: RefCell::new((Some(1), "stopping\n".into())),
             host: RefCell::default(),
             ns: RefCell::new(BTreeMap::from([("lo".into(), Link::new("loopback"))])),
             values: RefCell::default(),
@@ -197,6 +203,14 @@ impl Kernel {
             });
         }
         match p {
+            Program::Systemctl if a(0) == "is-system-running" => {
+                let (status, stdout) = self.system_state.borrow().clone();
+                return Ok(ExecOutput {
+                    status,
+                    stdout,
+                    stderr: String::new(),
+                });
+            }
             Program::Modprobe => {
                 assert!(!ns);
                 if a(0) == "nf_conntrack" {
@@ -230,7 +244,11 @@ impl Kernel {
                 map.borrow_mut().insert(a(2).into(), Link::new("wireguard"));
             }
             Program::Ip if a(0) == "link" && a(1) == "delete" => {
-                assert!(!ns);
+                // Clean stop destroys the quiesced client in its held namespace.
+                if ns {
+                    assert_eq!(a(3), "wg0");
+                    assert!(!map.borrow()[a(3)].up);
+                }
                 map.borrow_mut().remove(a(3));
             }
             Program::Ip if a(0) == "link" && a(1) == "set" => {
@@ -332,6 +350,12 @@ impl Kernel {
                         && self.values.borrow().get(k).is_some_and(|old| old != v)
                     {
                         let mut values = self.values.borrow_mut();
+                        // Linux propagates a global IPv4 forwarding change to
+                        // existing devices. Model this so full check reaches the
+                        // session verdict instead of a spurious forwarding fault.
+                        for name in self.ns.borrow().keys() {
+                            values.insert(format!("net.ipv4.conf.{name}.forwarding"), v.into());
+                        }
                         for scope in ["all", "default", "lo", "wg0", "ex-ch1"] {
                             values.insert(
                                 format!("net.ipv4.conf.{scope}.accept_redirects"),
@@ -440,7 +464,9 @@ impl Kernel {
                             "allowed-ips" => format!("{key}\t{allowed}\n"),
                             "endpoints" => format!("{key}\t{endpoint}\n"),
                             "persistent-keepalive" => format!("{key}\t{}\n", link.keepalive),
-                            "latest-handshakes" => format!("{key}\t999\n"),
+                            "latest-handshakes" => {
+                                format!("{key}\t{}\n", self.now.get().saturating_sub(1))
+                            }
                             _ => panic!("unexpected wg read"),
                         })
                         .collect(),
@@ -477,6 +503,9 @@ impl System for Kernel {
         ));
         if let Some((_, destinations)) = &request.probe {
             return Ok(Response::Probes(vec![true; destinations.len()]));
+        }
+        if let Some(action) = self.during_client_sample.borrow_mut().take() {
+            action();
         }
         let ns = self.ns.borrow();
         let link = ns
@@ -543,11 +572,14 @@ impl System for Kernel {
     ) -> Result<ExecOutput, ExecError> {
         self.exec(t, p, a, Some(b))
     }
+    fn read_host_udp(&self, ipv6: bool) -> std::io::Result<String> {
+        self.script.read_host_udp(ipv6)
+    }
     fn wireguard_socket_dirs(&self) -> Vec<std::path::PathBuf> {
         vec![]
     }
     fn now_unix_secs(&self) -> u64 {
-        1000
+        self.now.get()
     }
 }
 impl BootNamespace for Kernel {

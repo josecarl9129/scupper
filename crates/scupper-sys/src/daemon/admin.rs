@@ -126,12 +126,10 @@ pub fn execute_locked<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)>(
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
                 if let Ok(report) = check(Some(deadline))
-                    && let Verdict::Protected { exit, .. } | Verdict::Unsupervised { exit, .. } =
-                        report.verdict
+                    && let Ok(result) =
+                        super::pending::verified(&Op::Connect { exit: None }, report)
                 {
-                    return Ok(OpResult::Connect {
-                        exit: (&exit).into(),
-                    });
+                    return Ok(result);
                 }
                 if Instant::now() >= deadline {
                     return Err(api(ApiErrorCode::NotReady));
@@ -910,6 +908,8 @@ pub fn local(
         Instant::now() + Duration::from_secs(30),
         &mut StartupRead::default(),
         Some((&guard, true)),
+        false,
+        |_, _| {},
     )
     .map_err(|e| e.to_string())?;
     let result = execute_locked(&mut machine, &guard, op, uid, None, |deadline| {

@@ -459,3 +459,29 @@ fn operational_ids_are_validated_at_every_wire_boundary() {
         );
     }
 }
+
+#[test]
+fn connect_reads_legacy_reply_but_old_strict_clients_require_a_paired_upgrade() {
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "kind", content = "data", deny_unknown_fields)]
+    enum OldResult {
+        Connect { exit: Identifier },
+    }
+    let old = json!({"kind":"Connect", "data":{"exit":"ch1"}});
+    let current: OpResult = serde_json::from_value(old).unwrap();
+    assert!(matches!(
+        current,
+        OpResult::Connect {
+            exit: Some(_),
+            report: Value::Null
+        }
+    ));
+    let new = json!({"kind":"Connect", "data":{"exit":"ch1", "report":{"verdict":"Protected"}}});
+    assert!(serde_json::from_value::<OldResult>(new).is_err());
+    let null_exit = json!({"kind":"Connect", "data":{"exit":null, "report":null}});
+    assert!(serde_json::from_value::<OldResult>(null_exit).is_err());
+    let legacy: OldResult =
+        serde_json::from_value(json!({"kind":"Connect","data":{"exit":"ch1"}})).unwrap();
+    let OldResult::Connect { exit } = legacy;
+    assert_eq!(String::from(exit), "ch1");
+}

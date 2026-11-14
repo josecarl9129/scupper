@@ -27,7 +27,14 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let root = Root::new("ubuntu-24.04", &testing::handle().unwrap());
+        Self::with_daemon(false)
+    }
+    fn with_daemon(required: bool) -> Self {
+        let text = support::site_text("ubuntu-24.04").replace(
+            "require_daemon = false",
+            &format!("require_daemon = {required}"),
+        );
+        let root = Root::with_text(&text, &testing::handle().unwrap());
         let writer = WriterLock::acquire(root.path.join("lock")).unwrap();
         StateFile::open(&root.path, Some(&writer))
             .unwrap()
@@ -2863,4 +2870,554 @@ fn boot_defers_optional_session_probe_to_daemon_verified_tick() {
         serde_json::from_slice(&fs::read(f.root.path.join("client-sessions.json")).unwrap())
             .unwrap();
     assert_eq!(record["probe_pending"], true, "boot defers its probe");
+}
+
+#[test]
+fn provisioned_boot_leaves_client_down_until_sampler_consumes_empty() {
+    use scupper_sys::client_sessions;
+    let f = Fixture::with_daemon(true);
+    let site = support::site("ubuntu-24.04");
+    let gateway = site.gateways().values().next().unwrap();
+    let identity = gateway.client_tunnel().identity().public_key.as_str();
+    fs::remove_file(f.root.path.join("client-sessions.json")).unwrap();
+    fs::remove_file(f.root.path.join("gateway-incarnation")).unwrap();
+    let guard = WriterLock::acquire(f.root.path.join("lock")).unwrap();
+    client_sessions::provision(&f.root.path, identity, 1000, &guard).unwrap();
+    let empty = fs::read(f.root.path.join("client-sessions.json")).unwrap();
+    let report = f.run(None);
+    assert!(report.succeeded(), "{report:?}");
+    assert!(!f.kernel.ns.borrow()["wg0"].up);
+    assert_eq!(
+        fs::read(f.root.path.join("client-sessions.json")).unwrap(),
+        empty
+    );
+    client_sessions::activate(
+        &f.root.path,
+        &f.root.path.join("run"),
+        identity,
+        1000,
+        &guard,
+    )
+    .unwrap();
+    assert!(f.run(None).succeeded());
+    assert!(f.kernel.ns.borrow()["wg0"].up);
+}
+
+#[test]
+fn clean_stop_samples_after_quiescing_and_seals_only_after_confirmed_delete() {
+    let f = Fixture::new();
+    assert!(f.run(None).succeeded());
+    let run = f.root.path.join("run");
+    f.kernel.calls.borrow_mut().clear();
+    scupper_sys::boot::clean_stop(&BootDeps {
+        system: &f.kernel,
+        namespace: &f.kernel,
+        state_root: &f.root.path,
+        config_root: &f.root.path,
+        run_root: &run,
+        hook: None,
+        secret_owner: rustix::process::geteuid().as_raw(),
+    })
+    .unwrap();
+    assert!(!f.kernel.ns.borrow().contains_key("wg0"));
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(f.root.path.join("client-sessions.json")).unwrap())
+            .unwrap();
+    assert_eq!(record["clean_stop"]["sequence"], record["sequence"]);
+    assert_eq!(record["clean_stop"]["at"], record["renewed_at"]);
+    let calls = f.kernel.calls.borrow();
+    let down = calls
+        .iter()
+        .position(|call| call.contains("wg0 down"))
+        .unwrap();
+    let sample = calls
+        .iter()
+        .position(|call| call.contains("checkpoint-samples"))
+        .unwrap();
+    let delete = calls
+        .iter()
+        .position(|call| call.contains("delete dev wg0"))
+        .unwrap();
+    assert!(down < sample && sample < delete, "{calls:?}");
+    drop(calls);
+    assert!(f.run(None).succeeded());
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(f.root.path.join("client-sessions.json")).unwrap())
+            .unwrap();
+    assert!(record["clean_stop"].is_null());
+}
+
+fn daemonless_damaged_history_boot(damage: &str, stall_hook: bool) {
+    let f = Fixture::with_daemon(false);
+    assert!(f.run(None).succeeded());
+    scupper_sys::boot::clean_stop(&BootDeps {
+        system: &f.kernel,
+        namespace: &f.kernel,
+        state_root: &f.root.path,
+        config_root: &f.root.path,
+        run_root: &f.root.path.join("run"),
+        hook: None,
+        secret_owner: rustix::process::geteuid().as_raw(),
+    })
+    .unwrap();
+    let file = f.root.path.join("client-sessions.json");
+    match damage {
+        "clock" => f.kernel.now.set(990),
+        "key" => {
+            // Simulate an offline client-key change across a real clean stop:
+            // the live configuration no longer matches the sealed gateway.
+            let mut record: serde_json::Value =
+                serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+            record["gateway"] = serde_json::json!("previous-client-tunnel-key");
+            fs::write(&file, serde_json::to_vec(&record).unwrap()).unwrap();
+        }
+        "corrupt" => fs::write(&file, b"broken history").unwrap(),
+        _ => panic!("unknown damage"),
+    }
+    let damaged = fs::read(&file).unwrap();
+    let lock = std::rc::Rc::new(std::cell::RefCell::new(None));
+    if stall_hook {
+        let slot = lock.clone();
+        let run = f.root.path.join("run");
+        // Telemetry runs after daemonless retirement but before the opening
+        // worker. Hold its lock through the timeout to exercise boot's fallback.
+        *f.kernel.during_client_sample.borrow_mut() = Some(Box::new(move || {
+            *slot.borrow_mut() =
+                Some(WriterLock::try_acquire(run.join("client-session-writer")).unwrap());
+        }));
+    }
+    let report = f.run(None);
+    assert!(
+        report.succeeded(),
+        "{damage}, stall={stall_hook}: {report:?}"
+    );
+    assert!(f.kernel.ns.borrow()["wg0"].up);
+    assert_eq!(
+        fs::read(f.root.path.join("client-sessions.unavailable.json")).unwrap(),
+        damaged
+    );
+    assert_eq!(
+        f.check().verdict,
+        scupper_core::verdict::v2::Verdict::Degraded(
+            scupper_core::verdict::v2::Degraded::ClientSessionsUnknown
+        )
+    );
+    drop(lock.borrow_mut().take());
+    // There is no sampler in this mode. Repeated boot and a clock correction
+    // must still serve clients and never reinterpret damaged history as Ready.
+    f.kernel.now.set(1200);
+    assert!(f.run(None).succeeded());
+    assert!(f.kernel.ns.borrow()["wg0"].up);
+    assert_eq!(f.check().verdict.exit_code(), 3);
+}
+#[test]
+fn daemonless_boot_after_clean_stop_and_client_key_change() {
+    daemonless_damaged_history_boot("key", false);
+}
+#[test]
+fn daemonless_boot_with_clock_behind_clean_stop_seal() {
+    daemonless_damaged_history_boot("clock", false);
+}
+#[test]
+fn daemonless_boot_with_corrupt_history() {
+    daemonless_damaged_history_boot("corrupt", false);
+}
+#[test]
+fn daemonless_boot_with_damaged_history_and_opening_hook_timeout() {
+    daemonless_damaged_history_boot("clock", true);
+}
+
+#[test]
+fn failed_clean_stop_never_seals_a_teardown_marker() {
+    for command in ["wg0 down", "delete dev wg0"] {
+        let f = Fixture::new();
+        assert!(f.run(None).succeeded());
+        *f.kernel.failure.borrow_mut() = Some((
+            Program::Ip,
+            command.into(),
+            "injected teardown failure".into(),
+        ));
+        assert!(
+            scupper_sys::boot::clean_stop(&BootDeps {
+                system: &f.kernel,
+                namespace: &f.kernel,
+                state_root: &f.root.path,
+                config_root: &f.root.path,
+                run_root: &f.root.path.join("run"),
+                hook: None,
+                secret_owner: rustix::process::geteuid().as_raw(),
+            })
+            .is_err()
+        );
+        assert!(f.kernel.ns.borrow().contains_key("wg0"));
+        let record: serde_json::Value =
+            serde_json::from_slice(&fs::read(f.root.path.join("client-sessions.json")).unwrap())
+                .unwrap();
+        assert!(record["clean_stop"].is_null());
+    }
+}
+
+#[test]
+fn manual_net_stop_and_failed_shutdown_queries_preserve_the_client_device() {
+    for (status, state) in [
+        (Some(0), "running\n"),
+        (Some(1), "degraded\n"),
+        (None, "stopping\n"),
+        (Some(2), "stopping\n"),
+        (Some(1), " stopping\n"),
+        (Some(1), "stopping\nextra\n"),
+    ] {
+        let f = Fixture::new();
+        assert!(f.run(None).succeeded());
+        *f.kernel.system_state.borrow_mut() = (status, state.into());
+        let before = fs::read(f.root.path.join("client-sessions.json")).unwrap();
+        f.kernel.calls.borrow_mut().clear();
+        scupper_sys::boot::clean_stop(&BootDeps {
+            system: &f.kernel,
+            namespace: &f.kernel,
+            state_root: &f.root.path,
+            config_root: &f.root.path,
+            run_root: &f.root.path.join("run"),
+            hook: None,
+            secret_owner: rustix::process::geteuid().as_raw(),
+        })
+        .unwrap();
+        assert!(f.kernel.ns.borrow()["wg0"].up);
+        assert_eq!(
+            fs::read(f.root.path.join("client-sessions.json")).unwrap(),
+            before
+        );
+        assert_eq!(f.kernel.calls.borrow().len(), 1);
+    }
+}
+#[test]
+fn shutdown_refuses_teardown_while_a_reconciler_or_sampler_is_alive() {
+    for sampler in [false, true] {
+        let f = Fixture::new();
+        assert!(f.run(None).succeeded());
+        let run = f.root.path.join("run");
+        let supervisor =
+            (!sampler).then(|| scupper_sys::lock::SupervisorLease::try_acquire(&run).unwrap());
+        let owner =
+            sampler.then(|| WriterLock::try_acquire(run.join("client-sampler-owner")).unwrap());
+        assert!(
+            scupper_sys::boot::clean_stop(&BootDeps {
+                system: &f.kernel,
+                namespace: &f.kernel,
+                state_root: &f.root.path,
+                config_root: &f.root.path,
+                run_root: &run,
+                hook: None,
+                secret_owner: rustix::process::geteuid().as_raw()
+            })
+            .is_err()
+        );
+        assert!(f.kernel.ns.borrow()["wg0"].up);
+        drop((supervisor, owner));
+    }
+}
+#[test]
+fn daemonless_fresh_boot_retires_empty_and_serves_without_claiming_ready() {
+    let f = Fixture::new();
+    let site = support::site("ubuntu-24.04");
+    let identity = site
+        .gateways()
+        .values()
+        .next()
+        .unwrap()
+        .client_tunnel()
+        .identity()
+        .public_key
+        .as_str();
+    fs::remove_file(f.root.path.join("client-sessions.json")).unwrap();
+    fs::remove_file(f.root.path.join("gateway-incarnation")).unwrap();
+    let guard = WriterLock::acquire(f.root.path.join("lock")).unwrap();
+    scupper_sys::client_sessions::provision(&f.root.path, identity, 1000, &guard).unwrap();
+    assert!(f.run(None).succeeded());
+    assert!(f.kernel.ns.borrow()["wg0"].up);
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(f.root.path.join("client-sessions.json")).unwrap())
+            .unwrap();
+    assert_eq!(record["never_served"], false);
+    assert_eq!(record["history"], "Unavailable");
+    assert_eq!(f.check().verdict.exit_code(), 3);
+    // A later daemon activation cannot reinterpret the durable state as EMPTY.
+    let before = fs::read(f.root.path.join("client-sessions.json")).unwrap();
+    scupper_sys::client_sessions::activate(
+        &f.root.path,
+        &f.root.path.join("run"),
+        identity,
+        1000,
+        &guard,
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read(f.root.path.join("client-sessions.json")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn real_before_client_link_up_finishes_during_a_twenty_second_session_lock_hold() {
+    use scupper_core::{config::GatewayId, planner::Step};
+    use scupper_sys::reconcile::{Config, Kernel as _, RealKernel};
+    let f = Fixture::new();
+    let boot_report = f.run(None);
+    assert!(boot_report.succeeded());
+    f.kernel.ns.borrow_mut().get_mut("wg0").unwrap().up = false;
+    let held = std::sync::Arc::new(testing::handle().unwrap());
+    let site = support::site("ubuntu-24.04");
+    let config = Config {
+        site: site.clone(),
+        gateway: GatewayId("gw1".into()),
+        stamp: f.root.stamp,
+        fingerprint: scupper_sys::canon::fingerprint(
+            &scupper_sys::canon::canonicalize(&f.kernel.script.text("want.json")).unwrap(),
+        )
+        .unwrap(),
+        run_root: f.root.path.join("run"),
+        lock_wait: Duration::ZERO,
+    };
+    let adapter = RealKernel::new(
+        BootDeps::new(
+            &f.kernel,
+            &f.kernel,
+            &f.root.path,
+            &f.root.path,
+            &config.run_root,
+        ),
+        held.clone(),
+        &config,
+        support::health(&site, &held),
+        held.fd_path(),
+        None,
+    )
+    .unwrap();
+    adapter.set_owned_links(boot_report.owned_links);
+    let lock = WriterLock::try_acquire(config.run_root.join("client-session-writer")).unwrap();
+    let holder = std::thread::spawn(move || {
+        let _lock = lock;
+        std::thread::sleep(Duration::from_secs(20));
+    });
+    let guard = WriterLock::acquire(&config.run_root).unwrap();
+    adapter.execute(&Step::FlushConntrack).unwrap();
+    let start = std::time::Instant::now();
+    adapter.before_client_link_up(&guard).unwrap();
+    adapter
+        .execute(&Step::LinkUp {
+            name: "wg0".into(),
+            requires: config.fingerprint,
+        })
+        .unwrap();
+    assert!(start.elapsed() < Duration::from_millis(5500));
+    assert!(f.kernel.ns.borrow()["wg0"].up);
+    assert_ne!(f.check().verdict.exit_code(), 0);
+    holder.join().unwrap();
+}
+
+#[test]
+fn local_planner_cannot_open_or_consume_provisioned_empty() {
+    use scupper_core::config::GatewayId;
+    use scupper_sys::reconcile::{Config, Kernel as _, RealKernel};
+    let f = Fixture::with_daemon(true);
+    let site = support::site("ubuntu-24.04");
+    let identity = site
+        .gateways()
+        .values()
+        .next()
+        .unwrap()
+        .client_tunnel()
+        .identity()
+        .public_key
+        .as_str();
+    fs::remove_file(f.root.path.join("client-sessions.json")).unwrap();
+    fs::remove_file(f.root.path.join("gateway-incarnation")).unwrap();
+    let guard = WriterLock::acquire(f.root.path.join("lock")).unwrap();
+    scupper_sys::client_sessions::provision(&f.root.path, identity, 1000, &guard).unwrap();
+    assert!(f.run(None).succeeded());
+    let empty = fs::read(f.root.path.join("client-sessions.json")).unwrap();
+    let held = std::sync::Arc::new(testing::handle().unwrap());
+    let config = Config {
+        site: site.clone(),
+        gateway: GatewayId("gw1".into()),
+        stamp: f.root.stamp,
+        fingerprint: [7; 32],
+        run_root: f.root.path.join("run"),
+        lock_wait: Duration::ZERO,
+    };
+    let adapter = RealKernel::new(
+        BootDeps::new(
+            &f.kernel,
+            &f.kernel,
+            &f.root.path,
+            &f.root.path,
+            &config.run_root,
+        ),
+        held.clone(),
+        &config,
+        support::health(&site, &held),
+        held.fd_path(),
+        None,
+    )
+    .unwrap();
+    assert!(adapter.before_client_link_up(&guard).is_err());
+    assert_eq!(
+        fs::read(f.root.path.join("client-sessions.json")).unwrap(),
+        empty
+    );
+    assert!(!f.kernel.ns.borrow()["wg0"].up);
+}
+
+#[test]
+fn cli_local_apply_does_not_retire_empty_even_with_daemonless_configuration() {
+    let f = Fixture::new();
+    assert!(f.run(None).succeeded());
+    let site = support::site("ubuntu-24.04");
+    let identity = site
+        .gateways()
+        .values()
+        .next()
+        .unwrap()
+        .client_tunnel()
+        .identity()
+        .public_key
+        .as_str();
+    fs::remove_file(f.root.path.join("client-sessions.json")).unwrap();
+    fs::remove_file(f.root.path.join("gateway-incarnation")).unwrap();
+    let guard = WriterLock::acquire(f.root.path.join("lock")).unwrap();
+    scupper_sys::client_sessions::provision(&f.root.path, identity, 1000, &guard).unwrap();
+    drop(guard);
+    f.kernel.ns.borrow_mut().get_mut("wg0").unwrap().up = false;
+    let empty = fs::read(f.root.path.join("client-sessions.json")).unwrap();
+    let run = f.root.path.join("run");
+    scupper_sys::daemon::admin::local(
+        BootDeps {
+            system: &f.kernel,
+            namespace: &f.kernel,
+            state_root: &f.root.path,
+            config_root: &f.root.path,
+            run_root: &run,
+            hook: None,
+            secret_owner: rustix::process::geteuid().as_raw(),
+        },
+        &f.kernel.script,
+        scupper_proto::Op::Apply {
+            version: None,
+            dry_run: false,
+        },
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read(f.root.path.join("client-sessions.json")).unwrap(),
+        empty
+    );
+    assert!(!f.kernel.ns.borrow()["wg0"].up);
+}
+
+#[test]
+fn boot_never_raises_client_while_planner_latch_is_set() {
+    for daemon in [false, true] {
+        for checkpoint_only in [false, true] {
+            let f = Fixture::with_daemon(daemon);
+            assert!(f.run(None).succeeded());
+            f.kernel.ns.borrow_mut().get_mut("wg0").unwrap().up = false;
+            let quarantine = Quarantine {
+                reason: "repair budget".into(),
+                object: "client".into(),
+                since_unix: 1000,
+                uncertain: false,
+            };
+            if checkpoint_only {
+                let checkpoint = scupper_sys::state::RepairState {
+                    quarantine: Some(quarantine),
+                    ..Default::default()
+                };
+                fs::write(
+                    f.root.path.join("repair-state.json"),
+                    serde_json::to_vec(&checkpoint).unwrap(),
+                )
+                .unwrap();
+            } else {
+                f.state(|state| state.quarantine = Some(quarantine));
+            }
+            f.kernel.calls.borrow_mut().clear();
+            let report = f.run(None);
+            assert!(report.succeeded(), "{report:?}");
+            assert!(!f.kernel.ns.borrow()["wg0"].up);
+            assert!(
+                !f.kernel
+                    .calls
+                    .borrow()
+                    .iter()
+                    .any(|call| call.contains("wg0 up"))
+            );
+            assert_eq!(f.kernel.values.borrow()["net.ipv4.ip_forward"], "0");
+        }
+    }
+}
+
+#[test]
+fn real_before_client_link_down_does_not_wait_for_a_held_session_lock() {
+    use scupper_core::{config::GatewayId, planner::Step};
+    use scupper_sys::reconcile::{Config, Kernel as _, RealKernel};
+    let f = Fixture::new();
+    let boot_report = f.run(None);
+    assert!(boot_report.succeeded());
+    assert!(f.kernel.ns.borrow()["wg0"].up);
+    let held = std::sync::Arc::new(testing::handle().unwrap());
+    let site = support::site("ubuntu-24.04");
+    let config = Config {
+        site: site.clone(),
+        gateway: GatewayId("gw1".into()),
+        stamp: f.root.stamp,
+        fingerprint: scupper_sys::canon::fingerprint(
+            &scupper_sys::canon::canonicalize(&f.kernel.script.text("want.json")).unwrap(),
+        )
+        .unwrap(),
+        run_root: f.root.path.join("run"),
+        lock_wait: Duration::ZERO,
+    };
+    let adapter = RealKernel::new(
+        BootDeps::new(
+            &f.kernel,
+            &f.kernel,
+            &f.root.path,
+            &f.root.path,
+            &config.run_root,
+        ),
+        held.clone(),
+        &config,
+        support::health(&site, &held),
+        held.fd_path(),
+        None,
+    )
+    .unwrap();
+    adapter.set_owned_links(boot_report.owned_links);
+    let lock = WriterLock::try_acquire(config.run_root.join("client-session-writer")).unwrap();
+    let _lock = lock;
+    let guard = WriterLock::acquire(&config.run_root).unwrap();
+    adapter.execute(&Step::FlushConntrack).unwrap();
+    let start = std::time::Instant::now();
+    let token = fs::read(config.run_root.join("client-session-invalidation")).ok();
+    assert!(adapter.before_client_link_down(&guard).is_err());
+    // Pin the pre-LinkDown window: a failed command must not leave Ready.
+    assert_ne!(
+        fs::read(config.run_root.join("client-session-invalidation")).ok(),
+        token
+    );
+    assert_eq!(f.check().verdict.exit_code(), 3);
+    adapter
+        .execute(&Step::LinkDown { name: "wg0".into() })
+        .unwrap();
+    assert!(start.elapsed() < Duration::from_millis(200));
+    assert!(!f.kernel.ns.borrow()["wg0"].up);
+    assert_eq!(
+        f.check().verdict,
+        scupper_core::verdict::v2::Verdict::Degraded(
+            scupper_core::verdict::v2::Degraded::ClientSideBroken(
+                scupper_core::verdict::v2::ClientFault::LinkDown
+            )
+        )
+    );
 }

@@ -1127,6 +1127,7 @@ fn client_reset_checkpoint_gates_the_real_check_driver_on_both_runners() {
         inner: Script,
         sample: RefCell<Sample>,
         fail_read: std::cell::Cell<bool>,
+        now: std::cell::Cell<u64>,
     }
     impl System for Sessions {
         fn run(
@@ -1147,7 +1148,7 @@ fn client_reset_checkpoint_gates_the_real_check_driver_on_both_runners() {
             self.inner.run_in(t, p, args, timeout)
         }
         fn now_unix_secs(&self) -> u64 {
-            1000
+            self.now.get()
         }
         fn wireguard_socket_dirs(&self) -> Vec<std::path::PathBuf> {
             vec![]
@@ -1179,6 +1180,7 @@ fn client_reset_checkpoint_gates_the_real_check_driver_on_both_runners() {
         let sys = Sessions {
             inner: Script::new(runner),
             fail_read: std::cell::Cell::new(false),
+            now: std::cell::Cell::new(1000),
             sample: RefCell::new(Sample {
                 key,
                 handshake: (1000, 0),
@@ -1202,6 +1204,7 @@ fn client_reset_checkpoint_gates_the_real_check_driver_on_both_runners() {
                 .public_key
                 .as_str(),
             &writer,
+            true,
         )
         .unwrap();
         client_sessions::before_up(
@@ -1218,6 +1221,24 @@ fn client_reset_checkpoint_gates_the_real_check_driver_on_both_runners() {
                 .as_str(),
             true,
             &writer,
+        )
+        .unwrap();
+        let identity = site
+            .gateway(&gateway)
+            .unwrap()
+            .client_tunnel()
+            .identity()
+            .public_key
+            .as_str();
+        client_sessions::checkpoint_recovered(
+            &sys,
+            &handle,
+            "wg0",
+            &root.path,
+            &root.path,
+            identity,
+            &writer,
+            &[key],
         )
         .unwrap();
         let deps = Dependencies {
@@ -1264,6 +1285,24 @@ fn client_reset_checkpoint_gates_the_real_check_driver_on_both_runners() {
         );
         sys.sample.borrow_mut().rx += 32;
         assert_eq!(
+            check_v2::run_check_v2(&deps, &cfg).unwrap().verdict,
+            Verdict::Degraded(Degraded::ClientSessionsUnknown)
+        );
+        for now in (1000..=1180).step_by(5) {
+            sys.now.set(now);
+            client_sessions::checkpoint_recovered(
+                &sys,
+                &handle,
+                "wg0",
+                &root.path,
+                &root.path,
+                identity,
+                &writer,
+                &[key],
+            )
+            .unwrap();
+        }
+        assert_eq!(
             check_v2::run_check_v2(&deps, &cfg)
                 .unwrap()
                 .verdict
@@ -1273,7 +1312,7 @@ fn client_reset_checkpoint_gates_the_real_check_driver_on_both_runners() {
         sys.fail_read.set(true);
         assert_eq!(
             check_v2::run_check_v2(&deps, &cfg).unwrap().verdict,
-            Verdict::Degraded(Degraded::ClientSessionsUnknown)
+            Verdict::Degraded(Degraded::ClientSessionTelemetryUnknown)
         );
         *sys.inner.probe.borrow_mut() = probe.to_string();
         let (report, obs) = check_v2::run_with_observations(&deps, &cfg);

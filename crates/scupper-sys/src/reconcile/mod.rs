@@ -55,7 +55,8 @@ pub struct StepError(pub &'static str);
 /// Namespace kernel adapter. Implementations must bound every exec to three seconds
 /// and collect safety first with a six-second shared deadline.
 pub trait Kernel {
-    /// Read-only activity snapshot before a planned stop.
+    /// Optional diagnostic hook for embedders/tests; no production caller.
+    /// Periodic activity runs on an independent sampler.
     /// # Errors
     /// Returns telemetry failure, never a reason to block shutdown.
     fn checkpoint_client_activity(&self, _guard: &WriterGuard) -> Result<(), StepError> {
@@ -454,7 +455,8 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             cached: None,
         })
     }
-    /// Snapshot activity before planned shutdown without probing or kernel mutations.
+    /// Optional diagnostic snapshot for embedders/tests; no production caller.
+    /// System shutdown uses `boot::clean_stop` after daemon exit.
     /// # Errors
     /// Returns lock contention or telemetry failure; shutdown remains best effort.
     pub fn checkpoint_before_shutdown(&self) -> Result<(), StepError> {

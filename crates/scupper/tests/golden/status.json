@@ -33,6 +33,7 @@
         "listen_port": 51820,
         "netns_sockets": [],
         "quarantine": null,
+        "session_reason": null,
         "v4": 1,
         "v6": 0
       }

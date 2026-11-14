@@ -145,6 +145,18 @@ impl std::fmt::Display for ApiError {
 }
 impl std::error::Error for ApiError {}
 
+/// Cached client-session readiness diagnosis, independent of the primary verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::enum_variant_names)] // Match the existing staged-verdict wire names.
+pub enum SessionReason {
+    /// Complete observations are unavailable or stale.
+    ClientSessionsUnknown,
+    /// A currently leased client has not recovered after device reset.
+    ClientSessionsReset,
+    /// The sampler could not obtain complete telemetry.
+    ClientSessionTelemetryUnknown,
+}
+
 /// A bounded health summary. Full standalone check JSON remains [`crate::Report`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -270,6 +282,9 @@ pub enum OpResult, result_samples {
     },
     /// Cached health and its age.
     Status {
+        /// Latest sampler diagnosis; its freshness is evaluated independently of ticks.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_reason: Option<SessionReason> = None,
         /// Seconds since a successful external heartbeat, absent until delivered.
         #[serde(default)]
         heartbeat_last_success_age: Option<u64> = None,
@@ -290,7 +305,10 @@ pub enum OpResult, result_samples {
     /// Selected exit after connection was verified.
     Connect {
         /// Observed active exit.
-        exit: Identifier = Identifier("ch1".into()),
+        exit: Option<Identifier> = Some(Identifier("ch1".into())),
+        /// Actual fresh verdict, including client session readiness.
+        #[serde(default)]
+        report: serde_json::Value = serde_json::Value::Null,
     },
     /// Selection reset completed, including a no-op if the selection changed.
     ResetSelection {},

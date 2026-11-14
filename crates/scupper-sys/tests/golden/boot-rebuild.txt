@@ -242,6 +242,7 @@ netns Sysctl -n net.ipv6.conf.all.proxy_ndp
 netns Sysctl -n net.ipv4.conf.all.route_localnet
 netns Sysctl -n net.netfilter.nf_conntrack_tcp_loose
 netns Ip link set wg0 mtu 1420
+client-session wg0 checkpoint-samples
 netns Ip link set dev wg0 up
 netns Ip -d -j link show
 netns Ip link set dev ex-ch1 down

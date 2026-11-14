@@ -601,7 +601,11 @@ fn render(
         match response.result {
             Ok(OpResult::Check { report, .. }) => return super::view::check(out, &report).map(|()| code),
             Ok(OpResult::Disconnect {}) => writeln!(out, "traffic is now blocked"),
-            Ok(OpResult::Connect { exit }) => writeln!(out, "connected via {}", String::from(exit)),
+            Ok(OpResult::Connect { exit, report }) => {
+                if let Some(exit) = exit { writeln!(out, "exit connected via {}; verdict: {}", String::from(exit), report["verdict"]) }
+                else { writeln!(out, "exit connected; client session readiness {}; verdict: {}",
+                    if report["verdict"]["Degraded"] == "ClientSessionsReset" { "pending" } else { "unknown" }, report["verdict"]) }
+            },
             Ok(OpResult::Apply { version, dry_run, repair_plan, plan, warnings }) => {
                 for warning in warnings { writeln!(out, "Warning: {warning}").map_err(output_error)?; }
                 writeln!(out, "version {version}; dry run: {dry_run}\nPreflight: passed\nRepair preview: {repair_plan:?}\nTarget boot: {plan:?}")

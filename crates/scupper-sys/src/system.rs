@@ -465,6 +465,8 @@ pub struct RealSystem {
     programs: Programs,
     canon_paths: Option<(PathBuf, PathBuf)>,
     wireguard_dirs: Option<Vec<PathBuf>>,
+    #[cfg(feature = "testing")]
+    shutdown_state_for_test: Option<bool>,
 }
 
 impl RealSystem {
@@ -476,6 +478,8 @@ impl RealSystem {
             canon_paths: None,
             canon_cache: std::cell::RefCell::default(),
             wireguard_dirs: None,
+            #[cfg(feature = "testing")]
+            shutdown_state_for_test: None,
         }
     }
 
@@ -483,6 +487,14 @@ impl RealSystem {
     #[must_use]
     pub fn with_canon_paths(mut self, executable: PathBuf, run_root: PathBuf) -> Self {
         self.canon_paths = Some((executable, run_root));
+        self
+    }
+
+    /// Override only the shutdown-state query for real `ExecStop` lab trials.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn with_shutdown_state_for_test(mut self, stopping: bool) -> Self {
+        self.shutdown_state_for_test = Some(stopping);
         self
     }
 
@@ -668,6 +680,18 @@ impl RealSystem {
         input: Option<&[u8]>,
         timeout: Duration,
     ) -> Result<ExecOutput, ExecError> {
+        #[cfg(feature = "testing")]
+        if matches!(target, ExecTarget::Host)
+            && program == Program::Systemctl
+            && args == ["is-system-running"]
+            && let Some(stopping) = self.shutdown_state_for_test
+        {
+            return Ok(ExecOutput {
+                status: Some(i32::from(stopping)),
+                stdout: if stopping { "stopping\n" } else { "running\n" }.into(),
+                stderr: String::new(),
+            });
+        }
         if let ExecTarget::Netns(handle) = target {
             handle
                 .verify(handle.identity())
@@ -829,6 +853,8 @@ impl System for RealSystem {
             programs: self.programs.clone(),
             canon_paths: self.canon_paths.clone(),
             wireguard_dirs: self.wireguard_dirs.clone(),
+            #[cfg(feature = "testing")]
+            shutdown_state_for_test: self.shutdown_state_for_test,
         }))
     }
 
@@ -1036,6 +1062,13 @@ pub mod testing {
         }
     }
     impl System for RecordingSystem<'_> {
+        fn client_session_io(
+            &self,
+            held: &crate::netns::NetnsHandle,
+            request: &crate::client_sessions::Request,
+        ) -> std::io::Result<crate::client_sessions::Response> {
+            self.inner.client_session_io(held, request)
+        }
         fn wg_quick_units(&self) -> std::io::Result<Vec<String>> {
             self.inner.wg_quick_units()
         }
@@ -1155,6 +1188,48 @@ mod tests {
 
     fn args(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| (*arg).into()).collect()
+    }
+
+    #[cfg(feature = "testing")]
+    #[test]
+    fn shutdown_lab_adapter_changes_only_the_exact_host_query() -> Result<(), Box<dyn Error>> {
+        for stopping in [false, true] {
+            let sys = RealSystem::new(Programs::new([(
+                Program::Systemctl,
+                "/scupper-missing-systemctl",
+            )])?)
+            .with_shutdown_state_for_test(stopping);
+            let result = sys.run_in(
+                ExecTarget::Host,
+                Program::Systemctl,
+                &args(&["is-system-running"]),
+                EXEC_TIMEOUT,
+            )?;
+            assert_eq!(result.status, Some(i32::from(stopping)));
+            assert_eq!(
+                result.stdout,
+                if stopping { "stopping\n" } else { "running\n" }
+            );
+            assert!(
+                sys.run(
+                    Program::Systemctl,
+                    &args(&["is-system-running", "--wait"]),
+                    EXEC_TIMEOUT
+                )
+                .is_err()
+            );
+            let held = crate::netns::testing::handle()?;
+            assert!(
+                sys.run_in(
+                    ExecTarget::Netns(&held),
+                    Program::Systemctl,
+                    &args(&["is-system-running"]),
+                    EXEC_TIMEOUT
+                )
+                .is_err()
+            );
+        }
+        Ok(())
     }
 
     #[test]

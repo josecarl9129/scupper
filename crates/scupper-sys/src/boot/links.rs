@@ -131,6 +131,8 @@ pub(super) fn configure(
     handle: &NetnsHandle,
     cfg: &Inputs,
     guard: &crate::lock::WriterGuard,
+    daemonless_empty: bool,
+    open_quarantined: bool,
 ) -> Result<()> {
     let gw = cfg.site.gateway(&cfg.gateway).ok_or("unknown gateway")?;
     for name in super::configured_names(cfg)?
@@ -158,6 +160,20 @@ pub(super) fn configure(
                 .iter()
                 .any(|l| l.ifname == name && l.flags.iter().any(|f| f == "UP"));
             configure_body(deps, handle, cfg, name, false, true)?;
+            if cfg.state.quarantine.is_some() && !open_quarantined {
+                set_up(deps, handle, name, false)?;
+                continue;
+            }
+            if daemonless_empty && !cfg.site.health().require_daemon() {
+                crate::client_sessions::retire_empty(
+                    deps.state_root,
+                    deps.run_root,
+                    gw.client_tunnel().identity().public_key.as_str(),
+                    deps.system.now_unix_secs(),
+                    guard,
+                )
+                .map_err(|_| "daemonless EMPTY retirement failed".to_string())?;
+            }
             crate::client_sessions::before_up(
                 deps.system,
                 handle,
@@ -169,7 +185,16 @@ pub(super) fn configure(
                 guard,
             )
             .map_err(|_| "client session baseline unavailable".to_string())?;
-            set_up(deps, handle, name, true)?;
+            set_up(
+                deps,
+                handle,
+                name,
+                crate::client_sessions::may_serve(
+                    deps.state_root,
+                    gw.client_tunnel().identity().public_key.as_str(),
+                    deps.system.now_unix_secs(),
+                ),
+            )?;
         } else {
             configure_body(deps, handle, cfg, name, up, true)?;
         }

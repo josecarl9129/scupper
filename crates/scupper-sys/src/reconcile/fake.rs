@@ -32,6 +32,7 @@ pub struct Fault {
 pub struct FakeKernel {
     inner: Rc<RefCell<Inner>>,
 }
+type ActivityCheckpoint = Rc<dyn Fn(&WriterGuard) -> Result<(), StepError>>;
 struct Inner {
     model: KernelModel,
     desired: Desired,
@@ -42,6 +43,8 @@ struct Inner {
     boundaries: usize,
     remounts: usize,
     session_recoveries: usize,
+    activity_checkpoint: Option<ActivityCheckpoint>,
+    before_link_up: Option<ActivityCheckpoint>,
     session_checkpoints: Vec<usize>,
     edge_elsewhere: bool,
     memory_latch: Option<Latch>,
@@ -72,6 +75,8 @@ impl FakeKernel {
                 boundaries: 0,
                 remounts: 0,
                 session_recoveries: 0,
+                activity_checkpoint: None,
+                before_link_up: None,
                 session_checkpoints: vec![],
                 edge_elsewhere: false,
                 memory_latch: None,
@@ -132,6 +137,20 @@ impl FakeKernel {
     #[must_use]
     pub fn session_recoveries(&self) -> usize {
         self.inner.borrow().session_recoveries
+    }
+    /// Attach real durable activity tracking to the fake reconciliation kernel.
+    pub fn on_activity_checkpoint(
+        &self,
+        checkpoint: impl Fn(&WriterGuard) -> Result<(), StepError> + 'static,
+    ) {
+        self.inner.borrow_mut().activity_checkpoint = Some(Rc::new(checkpoint));
+    }
+    /// Attach the real session baseline hook to a simulated client `LinkUp`.
+    pub fn on_client_link_up(
+        &self,
+        checkpoint: impl Fn(&WriterGuard) -> Result<(), StepError> + 'static,
+    ) {
+        self.inner.borrow_mut().before_link_up = Some(Rc::new(checkpoint));
     }
     /// Number of executed steps at each pre-teardown session checkpoint.
     #[must_use]
@@ -285,6 +304,14 @@ impl FakeKernel {
     }
 }
 impl Kernel for FakeKernel {
+    fn checkpoint_client_activity(&self, guard: &WriterGuard) -> Result<(), StepError> {
+        let checkpoint = self.inner.borrow().activity_checkpoint.clone();
+        checkpoint.map_or(Ok(()), |checkpoint| checkpoint(guard))
+    }
+    fn before_client_link_up(&self, guard: &WriterGuard) -> Result<(), StepError> {
+        let checkpoint = self.inner.borrow().before_link_up.clone();
+        checkpoint.map_or(Ok(()), |checkpoint| checkpoint(guard))
+    }
     fn before_client_link_down(&self, _guard: &WriterGuard) -> Result<(), StepError> {
         let mut inner = self.inner.borrow_mut();
         let before = inner.history.len();

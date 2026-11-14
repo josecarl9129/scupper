@@ -15,6 +15,49 @@ use std::{
     time::{Duration, Instant},
 };
 
+// This file lives in /var/lib, so restarting the daemon cannot renew grace.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Grace {
+    last: u64,
+    first_session: Option<u64>,
+}
+// Each full check durably rewrites grace (part of the fsync budget). A second
+// result in the same wall-clock second is discarded and sends no heartbeat.
+fn grace(root: &std::path::Path, at: u64, code: u8, session_only: bool) -> std::io::Result<bool> {
+    let _guard = crate::lock::WriterLock::try_acquire(root.join("heartbeat-grace-writer"))?;
+    let file = root.join("heartbeat-session-grace.json");
+    let mut state = match std::fs::read(&file) {
+        Ok(bytes) => serde_json::from_slice::<Grace>(&bytes).map_err(std::io::Error::other)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Grace {
+            last: 0,
+            first_session: None,
+        },
+        Err(error) => return Err(error),
+    };
+    if at <= state.last {
+        return Ok(false);
+    }
+    state.last = at;
+    let eligible = if code == 0 {
+        state.first_session = None;
+        true
+    } else if code == 3 && session_only {
+        at.saturating_sub(*state.first_session.get_or_insert(at)) < 600
+    } else {
+        false
+    };
+    crate::fs::durable_replace(
+        &crate::fs::RealFs,
+        &file,
+        &serde_json::to_vec(&state).map_err(std::io::Error::other)?,
+        0o600,
+        &|_| Ok(()),
+        &|_| Ok(()),
+    )?;
+    Ok(eligible && code == 3 && session_only)
+}
+
 // Detached checks retain only a completion handle; at most this many may live.
 const MAX_DETACHED_CHECKS: usize = 4;
 
@@ -24,6 +67,7 @@ struct Checked {
     code: u8,
     reason: scupper_proto::ObjectKind,
     full_fresh_check: bool,
+    session_grace: bool,
     namespace: (u64, u64),
 }
 
@@ -99,13 +143,22 @@ impl Heartbeat {
                     context
                         .settings
                         .map_or(Decision::Skip(SkipReason::NotHealthy), |settings| {
+                            if checked.code == 3 && !checked.session_grace {
+                                return Decision::Skip(SkipReason::NotHealthy);
+                            }
+                            // Reuse the healthy cadence/deadline gate during grace;
+                            // status-code deliveries below retain the actual 3.
                             decide(
                                 settings,
                                 mono(now),
                                 Some(CompleteIteration {
                                     at: mono(checked.at),
                                     full_fresh_check: checked.full_fresh_check,
-                                    code: checked.code,
+                                    code: if checked.session_grace {
+                                        0
+                                    } else {
+                                        checked.code
+                                    },
                                 }),
                                 self.last_send.map(mono),
                             )
@@ -127,7 +180,14 @@ impl Heartbeat {
                     self.last_send = Some(now);
                     self.sending_deadline = Some(origin + deadline.0);
                     return Some(Work::Send {
-                        suffix: url_suffix,
+                        suffix: if checked.session_grace
+                            && context.settings.is_some_and(|settings| {
+                                settings.report == scupper_core::config::HeartbeatReport::StatusCode
+                            }) {
+                            "/3".into()
+                        } else {
+                            url_suffix
+                        },
                         deadline: origin + deadline.0,
                     });
                 }
@@ -415,7 +475,19 @@ impl Runtime<'_> {
                     .map_or(scupper_proto::ObjectKind::Unknown, |report| {
                         protection_reason(&report.verdict)
                     });
-                let code = result.map_or(1, |report| report.verdict.exit_code());
+                let code = result
+                    .as_ref()
+                    .map_or(1, |report| report.verdict.exit_code());
+                let session_grace = Instant::now() < deadline
+                    && result.as_ref().is_ok_and(|report| {
+                        grace(
+                            &state_root,
+                            report.at,
+                            report.verdict.exit_code(),
+                            report.session_only(),
+                        )
+                        .unwrap_or(false)
+                    });
                 #[cfg(feature = "testing")]
                 let code = std::fs::read_to_string(run_root.join("heartbeat-test-code"))
                     .ok()
@@ -425,6 +497,7 @@ impl Runtime<'_> {
                     at: now,
                     version: config.stamp.version,
                     code,
+                    session_grace,
                     reason,
                     full_fresh_check: Instant::now() < deadline,
                     namespace: held.identity(),
@@ -545,6 +618,7 @@ mod tests {
             code,
             reason: scupper_proto::ObjectKind::Unknown,
             full_fresh_check: fresh,
+            session_grace: false,
             version: 1,
             namespace: (2, 3),
         })
@@ -849,6 +923,7 @@ mod tests {
                         reason: scupper_proto::ObjectKind::Unknown,
                         code: 0,
                         full_fresh_check: true,
+                        session_grace: false,
                         namespace: (2, 3),
                     })
                     .unwrap();
@@ -896,7 +971,7 @@ mod tests {
             );
             assert!(state.check.is_some());
             let work = state.iteration(origin, origin, true, Some(context(&cfg)));
-            if code <= 4 {
+            if code <= 4 && code != 3 {
                 assert!(
                     matches!(work, Some(Work::Send { suffix, .. }) if suffix == format!("/{code}"))
                 );
@@ -1037,5 +1112,67 @@ mod tests {
         send.send(Ok(now)).unwrap();
         assert_eq!(heartbeat.collect(), None);
         assert_eq!(heartbeat.last_success, Some(now));
+    }
+    #[test]
+    fn session_grace_persists_across_restarts_and_only_zero_resets_it() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/tmp")
+            .join(format!("session-grace-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let _ = std::fs::remove_file(root.join("heartbeat-session-grace.json"));
+        assert!(grace(&root, 1000, 3, true).unwrap());
+        // Every call reloads disk, like a new daemon process.
+        assert!(grace(&root, 1599, 3, true).unwrap());
+        assert!(!grace(&root, 1600, 3, true).unwrap());
+        assert!(!grace(&root, 1700, 4, false).unwrap());
+        assert!(!grace(&root, 1800, 3, true).unwrap());
+        assert!(!grace(&root, 1700, 0, false).unwrap()); // late result cannot reset grace
+        assert!(!grace(&root, 1900, 0, false).unwrap()); // zero itself uses ordinary eligibility
+        assert!(grace(&root, 1901, 3, true).unwrap());
+        assert!(!grace(&root, 1902, 3, false).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn session_grace_uses_ordinary_heartbeat_cadence_and_expiry_suppresses_send() {
+        let now = Instant::now();
+        for mode in ["ok_only", "status_code"] {
+            let cfg = settings(mode, 60);
+            let mut state = Heartbeat::default();
+            let (send, receive) = mpsc::sync_channel(1);
+            state.check = Some(receive);
+            send.send(Checked {
+                at: now,
+                version: 1,
+                code: 3,
+                reason: scupper_proto::ObjectKind::Unknown,
+                full_fresh_check: true,
+                session_grace: true,
+                namespace: (2, 3),
+            })
+            .unwrap();
+            assert!(matches!(
+                state.iteration(now, now, true, Some(context(&cfg))),
+                Some(Work::Send { suffix, .. }) if suffix == if mode == "status_code" { "/3" } else { "" }
+            ));
+            state.sending_deadline = None;
+            let later = now + Duration::from_secs(60);
+            let (send, receive) = mpsc::sync_channel(1);
+            state.check = Some(receive);
+            send.send(Checked {
+                at: later,
+                version: 1,
+                code: 3,
+                reason: scupper_proto::ObjectKind::Unknown,
+                full_fresh_check: true,
+                session_grace: false,
+                namespace: (2, 3),
+            })
+            .unwrap();
+            assert!(!matches!(
+                state.iteration(later, now, true, Some(context(&cfg))),
+                Some(Work::Send { .. })
+            ));
+        }
     }
 }

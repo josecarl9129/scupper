@@ -1816,46 +1816,207 @@ survive; a reboot or recreation also loses the peer endpoints. Recovery is passi
 client endpoints are never persisted or restored, and the gateway does not contact
 an address learned from disk.
 
-`/var/lib/scupper/client-sessions.json` holds a versioned, bounded record under the
-global writer lock: the gateway's public identity, namespace/session generation,
-configured peer public keys, last authenticated observation times, fixed lease
-expiries, and curated full-resolution handshake/counter baselines. It contains no
-private/session keys, endpoints, receiver indices, or raw WireGuard dumps. Files
-use mode 0600 in the private state directory. Writes use same-directory temporary
-files, file fsync, atomic rename and directory fsync. Authenticated activity is
-checkpointed every 30 seconds at most, with immediate recovery transitions and a
-best-effort snapshot **before** planned daemon shutdown or client teardown.
-Reset intent is saved before LinkDown without waiting for telemetry; its preserved
-counters are captured after the command, including a timeout after kernel effect. Thus unexpected power loss
-has a bounded snapshot loss window; persistence is not shutdown-only.
+`/var/lib/scupper/client-sessions.json` is a bounded version-3 record bound to
+both the gateway public identity and a randomly provisioned gateway incarnation.
+It contains public peer keys, boot identity/interface index and namespace identity,
+per-peer reset generations, authenticated activity leases, full-resolution counter
+baselines, a commit sequence, complete-sample timestamps, and observation gaps.
+It never contains session/private keys, endpoints, receiver indices or raw dumps.
+Version 2 and other unsupported records are unavailable on upgrade. Root restoring
+an older valid snapshot, or deleting history and restoring an older valid history
+with its incarnation file, is undetectable.
 
-Each affected peer has one of four states:
+A NEW installation commits EMPTY history with a `never_served` marker and a new
+incarnation before service starts. This marker survives arbitrarily long install
+delays. Check never creates history. With `require_daemon=true`, boot leaves the
+client device down while EMPTY is present. The first daemon start (or the
+check-only lab's sampler)
+durably consumes EMPTY before clients can serve. Failed consumption prevents
+opening the device. Daemon initialization does not raise the client device.
+After observing safety, the planner raises it through `before_client_link_up`
+and `before_up`; session-only readiness 3 does not gate this repair. A device
+previously lowered for containment stays down until the planner permits LinkUp.
+With `require_daemon=false`, boot deliberately opens a fresh installation without
+a daemon: it first durably retires EMPTY to Unavailable, then runs `before_up`
+before raising the client device. This is the explicit exception to D1's
+planner-only opening rule; boot has already verified containment. Without a
+sampler, check remains session 3 indefinitely. A later daemon cannot mistake this
+history for never-served EMPTY. Daemonless boot also durably quarantines any
+invalid history before its opening hook, including corrupt records and seals
+rejected after a key change or clock rollback. No sampler is needed to reopen.
+CLI-local initialization never consumes EMPTY, and its planner cannot raise a
+device while EMPTY is still present. The exception
+applies to boot, including a daemon rebuild that invokes boot with
+`require_daemon=false`. CLI-local apply and rollback leave EMPTY untouched.
+Install upgrades and repair never provision EMPTY. The daemon
+may reconstruct missing, corrupt, stale or identity-mismatched history, but it
+must collect 180 seconds of complete samples first. There is no handshake shortcut
+and no deadline repeatedly recomputed by check. A sampler that never succeeds
+therefore never ages into 0. Damaged/future EMPTY tokens are durably quarantined
+before serving, so a later clock correction cannot make them reusable.
 
-| State | Meaning for check |
-|---|---|
-| `RequiredPending` | Authenticated activity lease still live, but no current-generation recovery evidence: exit 3 `ClientSessionsReset` |
-| `Recovered` | Current-generation recovery evidence observed and checkpointed |
-| `ExpiredUnconfirmed` | Original 180 s activity lease expired without confirmation; warning, excluded from the currently required cohort |
-| `Unknown` | No usable authenticated history for this peer; covered by the bounded unavailable-history policy |
+Session sampling has its own lightweight thread and its own lock, independent of
+the reconciler's writer, ticks, repairs, admin operations and outbound probe gate.
+It starts an observation every **5 seconds**. The telemetry child is bounded to
+3 seconds; freshness permits **10 seconds of collection/commit/scheduling slack**,
+for a **15-second threshold**. A 20-second reconciler tick or writer hold does not
+block sampling. The worker starts before startup resumption observations and
+updates its verified held namespace/configuration through a channel, retaining
+its cadence across reattachment. Missed slots are never backfilled. Missing the next 5 s slot explicitly opens
+a gap even inside the 15 s freshness slack. Sampler/storage overruns are
+honest gaps; they are not described as guaranteed sampling. The worker serializes
+sequence-numbered durable commits; older sequences cannot replace newer evidence.
+The startup writer remains held through route-switch recovery, sampler attachment
+and handoff observation, before readiness or a control-plane verdict is published.
+Sampling continues through alert/audit shutdown until daemon exit.
+A failed or late checkpoint never advances freshness: timestamps name observation
+time, not eventual write completion. Commit fences reject a missed five-second
+slot or changed invalidation token before rename and again after directory sync.
+A runtime sequence marker prevents check from using a renamed sample before its
+directory sync and commit checks finish. The telemetry child runs outside the
+session lock. Its starting record sequence
+and invalidation token must still match under the lock before load/merge/commit;
+an intervening reset or seal discards the old observation. Ordinary lock collisions
+with a newer writer discard a sample without opening a needless reconstruction gap.
+A blocked sample write retains only the session lock. Opening and post-down
+hooks share a five-second total deadline for telemetry, lock wait and persistence.
+The pre-containment hook tries the session lock without waiting and bounds all
+storage work to a 150 ms total caller budget. On contention or stalled storage
+it abandons persistence and spends at most 100 ms within that budget notifying
+readers through the runtime invalidation token, without reading durable history.
+Neither session-lock contention nor durable disk work can postpone LinkDown by
+seconds. Probe hooks reserve three seconds of their five-second
+budget for the child, skip the lock entirely when no probe is pending, and skip
+without invalidating readiness on a lock timeout. Probe timeouts are returned
+and logged as missed probes, including the race where an abandoned worker has
+already consumed the pending bit; they are counted and never silently reported
+as success. Storage workers own their lock and are deliberately abandoned rather
+than joined when I/O stalls. Repeated
+lifecycle operations during permanently stalled storage can accumulate abandoned
+workers and notifiers; a single long-lived storage worker remains future work.
+The original deadline and invalidation token fence rename and directory-sync
+completion, so an abandoned writer cannot later commit readiness. While LinkUp
+waits, a runtime opening marker withholds readiness. A failed/contended write may
+allow LinkUp only after a verified runtime invalidation guarantees non-ready
+readers; if notification or sealed-marker consumption cannot be guaranteed, it
+fails closed. An otherwise valid future seal is refused while it could still
+become valid. A fresh live-UP client observation proves an unconsumed seal
+obsolete, even if the device ID was reused: the sampler quarantines it under
+its lock before checking the seal fence. Reconstruction still needs the full
+180-second sampling horizon; peer recovery needs post-baseline authentication.
+Live-seal quarantine and daemonless retirement remove any older runtime fallback
+before renaming damaged durable history, so the rename cannot expose pre-seal
+readiness. Marker refusal
+and history failure never prevent containment.
+Startup EMPTY consumption and clean-stop sealing still require durable completion
+before their service/marker claims can be made. Dropping a sampler requests stop
+without joining its possibly blocked thread; the owner lease excludes replacement
+workers until it actually exits. Failed sampler startup retries at most every
+15 seconds rather than every reconciler tick.
 
-A lease expires 180 seconds after its last qualifying authenticated observation.
-The original deadline survives daemon restarts, link retries, recreation and
-reboot. Outbound probes and handshake responses do not renew it. Expiry never
-manufactures recovery. Exit 0 means protected and ready for the **currently
-required cohort**, and status retains expired-unconfirmed and unavailable-history
-warnings. Removed configured peers stop participating.
+Every complete sample contains every configured peer exactly once. Partial samples
+and failures record failure time without renewing any lease or `renewed_at`.
+Complete samples use mode 0600, same-directory temporary files, two file fsyncs,
+atomic rename and directory fsync. At 5-second cadence this deliberately accepts
+roughly 51,840 sync operations a day; renewal-only rewrites are not skipped.
+Runtime fallback evidence exposes failed storage, and never substitutes for valid
+reboot history. If durable and fallback writes fail, the commit barrier or a verified
+invalidation withholds old Ready evidence. If neither notification reaches readers,
+the writer retires both readable history copies as damaged history; a failed LinkUp
+notification still refuses reopening. Read-only check always reads telemetry, including for empty
+history, and never writes history or sends probes.
 
-Missing, corrupt, unsupported-version, mismatched-identity or clock-skewed history
-is unavailable evidence. The writer retains one private diagnostic copy, queues a value-free persistence
-alert event for the daemon, and checkpoints an unknown generation with one fixed 180 s deadline. Boot
-and D2 reopening continue under their independent safety gates. A private runtime
-fallback exposes durable-write failures to check without substituting for reboot
-history; fresh authenticated evidence can still restore readiness. Check returns 3
-`ClientSessionsUnknown` during that lease, unless all configured peers supply
-current-generation evidence; after expiry it retains a history warning. Retries
-and rebuilds preserve the unknown deadline. Backward clocks invalidate history;
-a forward jump may expire a lease, producing an unconfirmed warning, never a
-recovered state. Read-only check does not write history or send probes.
+Activity leases expire 180 wall-clock seconds after qualifying authentication.
+Their original deadlines survive restarts, retries and downtime. Probes and
+handshake responses never renew them; expiry is not recovery. Live missing peers
+remain required and retain their leases. Configured peers absent from valid
+history are not required. Required peers without current-generation recovery give
+`ClientSessionsReset`; expired unconfirmed peers retain a warning.
+
+A clean data-path stop (`boot --clean-stop`, the net unit's stop operation) runs
+only during system shutdown. A three-second `systemctl is-system-running` query
+must return exactly `stopping` (with its documented nonzero status); a failed or
+other-state query skips teardown. Manual `systemctl stop/restart scupper-net`
+preserves the device and the contract that stopping never tears protection down.
+If a shutdown transaction is cancelled after clean-stop deletes the device,
+clients remain down until scupper-net and scupperd are started again.
+The net unit explicitly conflicts with and orders before `shutdown.target` because
+`DefaultDependencies=no` omits those default edges. Shutdown ordering stops
+scupperd first; supervisor and sampler owner leases plus the global writer and
+session locks prove both workers quiescent before teardown. Final-sample token
+invalidation races retry collection within the original five-second budget;
+persistent contention refuses the marker. The final seal rechecks the token after
+delete, so a last-moment invalidation still refuses the marker honestly.
+The shutdown path lowers the client device, verifies it is quiesced, commits its
+final complete counters,
+deletes the client device and confirms absence, then writes a single-use marker
+bound to that incarnation, device identity and final sample sequence. Containment
+remains loaded. Any failed proof or write prevents a marker. A sealed marker is
+an immutable authoritative checkpoint: sampler, lifecycle and same-sequence writes,
+and runtime invalidation, are fenced until `before_up` consumes it. It contains
+no /run invalidation token. Readers recognize it before runtime fallback or token
+mismatch processing. Readers, writer fences and `before_up` share one predicate
+validating the sequence, live gateway key/incarnation, internal namespace/device
+binding, final complete sample, clock and peer lease invariants. Consumption always
+rebaselines against the live device; the marker's binding protects its internal
+consistency, not continuity with the next device. An invalid marker (including a
+backward clock step or changed client tunnel key) is renamed as damaged history
+and requires 180 seconds of complete samples; it never fences reconstruction.
+A sampler fenced by a valid seal reports that fact as a failed sample in its log.
+Losing /run at
+reboot therefore cannot discard it. The next boot consumes the marker durably
+before raising clients, evaluating freshness at the stop time. Leases still age
+across downtime and retain their original deadlines.
+Boot keeps the client device down while the planner quarantine latch is set,
+including a latch found only in the repair checkpoint. Explicit administrative
+apply may reopen as part of its verified latch-clear transaction. Daemonless boot
+may retire EMPTY only when `require_daemon=false`; this grants no session readiness
+and does not bypass quarantine.
+Ordinary daemon stop/restart preserves the observed client link state, including
+a device lowered by the previous process; initialization never force-raises it
+and cannot claim clean-stop history. Normal sampling freshness applies.
+An outstanding `down_since` makes read-only check and cached Status non-ready
+immediately, including before the next sampler observation. Sealing also publishes
+non-ready cached Status immediately. A complete sample observing a DOWN client
+records an intent even if no lifecycle hook ran; the next UP observation must reset. Identity, UP state and continuous counters
+cannot exclude a down/up bounce. On observing a live UP device with an abandoned
+intent (or a recorded down state), the sampler applies reset semantics: bump peer
+generations, set leased peers RequiredPending with their original deadlines,
+and establish new handshake/counter baselines. Clearing the intent and normalizing
+`record.down` commit atomically with that reset. Ordinary activity cannot extend a
+pending lease; only post-baseline recovery can restore readiness before expiry.
+
+A backward wall-clock step makes history unavailable, including a small step.
+A forward jump can expire leases/gaps early; this wall-clock model cannot tell it
+from elapsed time and retains unconfirmed warnings. Gaps longer than 15 seconds
+are recorded with start/end times and retained through 180 seconds of complete
+sampling after resumption, even without a rebuild and even if peers authenticate.
+This retains the conservative N1 policy: counters cannot exclude an unobserved
+external down/up. Check independently detects stale tracking. Setting
+`require_daemon=false` only changes supervision: without this sampler it continues
+to report session 3 indefinitely. The check-only lab explicitly provisions through
+the install provisioning API and runs the same sampler. Its check-only harness
+activates EMPTY before boot; product startup boots first, then activates the daemon.
+Daemon and systemd labs cover that product order. The systemd lab's simulated
+reboot explicitly injects only the `stopping` query result after stopping both
+units; all final sampling, teardown, sealing and strict Reset waits stay real.
+
+Lab recovery waits retry only code 3 with a session-only Degraded verdict
+(`ClientSessionsUnknown`, `ClientSessionsReset`, or `ClientSessionTelemetryUnknown`)
+and exclusively session warnings, following `Report::session_only`. Every other
+verdict returns immediately to the row's existing assertion. Each successful
+recovery records `session_time_to_0_ms` in the row artifact; leak and non-session
+assertions retain their original requirements.
+
+`connect` succeeds after protection and the exit path pass, including session-only
+3. It returns the full actual verdict and prints, for example, “exit connected;
+client session readiness unknown.” Session-only classification examines every
+warning as well as the primary verdict; unrelated diagnoses disqualify it.
+Status retains the session reason even when an earlier stage wins. Heartbeat pings
+on 0, and on session-only 3 for less than 600 seconds after the first such 3 since
+the last 0. That grace is stored durably and survives restarts and intervening
+nonzero verdicts; only a fresh 0 resets it. Expired grace suppresses pings so the
+external monitor alerts. Ordinary heartbeat cadence/freshness gates still apply.
 
 Recovery uses the netlink handshake timespec, including nanoseconds, and receive
 and transmit baselines from the current generation. Round 5's stronger receipt
@@ -1871,9 +2032,12 @@ end-to-end canary. Latched recovery is never inferred from elapsed time.
 
 Session readiness is considered only after forwarded routes, the exit-IP probe,
 and required supervisor namespace validation. Established safety violations give
-2; unresolved safety evidence keeps its existing policy; only then can session
-impairment give 3, before Protected or Unsupervised. Codes are never combined with
-a numeric maximum. A down client link retains `ClientSideBroken(LinkDown)`, with a
+2; unresolved safety evidence keeps its existing policy; existing link and exit
+failures retain their order (including exit 4), then failed required supervision
+gives 5, then session impairment gives 3, then Protected gives 0. Optional daemon
+failure is a warning and cannot bypass unknown activity evidence. Secondary session
+diagnoses remain warnings, including neutral `ClientSessionsPending` when an
+earlier stage wins. Codes are never combined with a numeric maximum. A down client link retains `ClientSideBroken(LinkDown)`, with a
 session warning, rather than reporting session reset as its primary diagnosis.
 
 Each client LinkUp queues at most one small fixed UDP datagram per configured
@@ -1893,10 +2057,28 @@ no learned endpoint, so this probe cannot accelerate recovery.
 L44 keeps its single canary with no retry. Its reboot regression preserves the
 client's old session, starts a check/receipt observer before the rebuild, and
 briefly blocks only client outer UDP to pin the false-OK window. Check must never
-be 0 before new authenticated client evidence. Recovery has a 90 s budget, followed
-by the existing single canary (2 s per request). First-install readiness separately
-allows the 180 s unknown-history lease plus 30 s for verification. Leak captures,
-positive controls and receipt checks retain their existing requirements.
+be 0 before new authenticated client evidence. The UDP block remains until both
+the Rust sampler and the independent observer acknowledge at least one `Degraded/ClientSessionsReset` verdict before
+authentication; an unrelated nonzero verdict cannot pass that assertion. Recovery
+depends on the case-wide 1400 s client UDP stream to trigger a fresh handshake;
+both configured peers also send recovery traffic through the entire case.
+An idle keepalive-0 client alone cannot meet the budget. Recovery has a 120 s overall budget,
+followed by the existing single canary (2 s per request). Residual in the observer:
+its receipt bracket tolerates authentication arriving during check, but also accepts
+a false 0 if authentication lands just after check and before the second receipt
+read. The case JSON records both sides so that narrow race remains auditable.
+Missing-history/rebuild readiness allows 240 s: 180 s complete sampling, 15 s
+first-sample bound, 30 s startup/check allowance and 15 s runner slack. Both
+configured clients send traffic while waiting; the final check must still be 0.
+L44 bounds the blocked session-observation window at 30 s and uses a 120 s overall
+budget (30 s startup, 30 s block, 15 s no-receive handshake trigger, 5 s retry,
+15 s sampler bound, 20 s check and 5 s runner slack). The observer and Rust harness
+use the same budget. Every applied lab nft input/file and inline
+add/create/insert/replace command passes `nft -c` in its actual namespace before
+application. Leak captures,
+positive controls and receipt checks retain their existing requirements. L54 reads
+the durable lab mount at `var-lib/scupper/client-sessions.json` and requires its
+per-peer generation to increase after the injected single Unknown tick.
 
 D2 still lowers the client link immediately on Unknown bypass inventory. It
 keeps that link down across every still-Unknown tick and every plan prefix;
@@ -1938,7 +2120,7 @@ with an unavailable supervisor treated as Dead.
 | 6 | exit-IP probe through the route over v4 and, when the active exit is v6-capable, over v6; on failure, one bound path probe on a standby to classify `CommonModeProbeFailure` vs `ExitProbeFailed` | 3; exit IP ∈ uplink addresses → 2 |
 | 7 | the DNS self-test (§7: cache-bypassing random label, UDP and TCP, each configured listener family) gets an upstream response, and edge's upstream generation equals scupperd's (M4+) | 3 |
 | 8 | scupperd alive: control-socket `Ping` answered within 2 s with last complete iteration < 30 s ago (only if `require_daemon`, M2+) | 5 |
-| 9 | client session readiness, after all preceding safety evidence: a live required lease returns `ClientSessionsReset`, unavailable history returns `ClientSessionsUnknown` for one bounded lease, and expired-unconfirmed peers warn before a protected or unsupervised result | 3 |
+| 9 | client session readiness, after all preceding stages including required supervision: a live required lease returns `ClientSessionsReset`; unavailable history requires 180 s of complete sampling, and stale tracking stays `ClientSessionsUnknown` through 180 s of resumed complete samples; failed check telemetry returns `ClientSessionTelemetryUnknown`; expired-unconfirmed peers warn before Protected | 3 |
 
 M1 order (v1 layout, v1 plus the exact comparison and a config
 cross-check): whole host ruleset exact, no tc qdisc or filter beyond the
@@ -2038,6 +2220,9 @@ pub enum Degraded {
     DisconnectNotEffective,
     OperationInProgress { from: u64, to: u64 }, // snapshot transition; no kernel comparison
     ClientSideBroken(ClientFault),             // wg0 absent/down, key, listen port or host socket
+    ClientSessionsReset,
+    ClientSessionsUnknown,
+    ClientSessionTelemetryUnknown,
     ExitProbeFailed(ProbeError),               // the probe ran and the path failed (not a local setup error)
     ExitProbeImplausible { ip: IpAddr },       // exit IP cannot be a public exit address
     CommonModeProbeFailure,
@@ -2048,7 +2233,9 @@ pub enum FailClosed { AdminDisconnected, NoHealthyExit, PinnedExitDown(ExitId), 
 pub enum Warning {
     StandbyUnhealthy(ExitId), ClockSkew, KeyFileMode(PathBuf), HardeningSysctl(String),
     HostForwardingOn, LegacyUnitEnabled(String), RepairSuppressed(RepairKind), DaemonDead,
-    ClientHandshakesStale,
+    ClientHandshakesStale, IdleClientSessionsReset, ClientSessionsPending,
+    ClientSessionPeerMissing, ClientSessionTelemetryUnavailable,
+    ClientSessionsExpiredUnconfirmed, ClientSessionHistoryUnavailable,
 }
 pub struct CheckError { pub stage: Stage, pub source: ProbeError }   // exit code 1
 
@@ -3096,15 +3283,16 @@ firewall or host sysctls (except the optional `90-scupper.conf`).
 Description=scupper data-path namespace
 DefaultDependencies=no
 After=local-fs.target systemd-modules-load.service
-Before=network-pre.target scupperd.service scupper-edge.service
+Before=network-pre.target scupperd.service scupper-edge.service shutdown.target
+Conflicts=shutdown.target
 Wants=network-pre.target
 [Service]
 Type=oneshot
 TimeoutStartSec=90
-TimeoutStopSec=10s
+TimeoutStopSec=30s
 RemainAfterExit=yes
 ExecStart=/usr/local/bin/scupper boot
-# no ExecStop: stopping the unit never tears protection down
+ExecStop=/usr/local/bin/scupper boot --clean-stop
 [Install]
 WantedBy=multi-user.target
 ```
@@ -4062,3 +4250,22 @@ Historical key policy (D5): retired exit keys continue to be deleted outside
 are gone `not restorable (key destroyed)`; apply refuses before mutation with the
 same explanation. Public history is retained; rollback cannot recreate destroyed
 private keys.
+
+
+Control protocol compatibility (round 9b): the shared Mac CLI/droplet decoder
+rejects unknown fields. A current CLI accepts an older Connect reply without
+`report` (shown as an unavailable/null verdict), and the old string exit decodes
+as `Some(exit)`. An older CLI cannot accept the new Connect `report` or a null
+exit, and cannot accept Status with a non-null `session_reason`; upgrade the CLI
+before or together with the droplet. Unknown fields remain rejected rather than
+silently discarding diagnoses. The round-9b protocol test pins this compatibility
+boundary.
+
+The heartbeat grace record is durably rewritten for each full check, in addition
+to the sampler's fsync budget. A second result in the same wall-clock second is
+discarded and sends no ping. `checkpoint_before_shutdown` and the kernel's
+`checkpoint_client_activity` remain optional diagnostic hooks for embedders/tests;
+production shutdown uses the quiesced clean-stop sample instead. The lab's nft
+preflight deliberately treats syntax errors as hard failures: no current mutation
+row expects nft failure, and a future negative case needs an explicit bypass.
+Actual nft syntax validation requires the privileged lab.

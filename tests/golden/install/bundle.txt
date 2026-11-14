@@ -14,9 +14,10 @@ note: provider/cloud firewalls (e.g. DigitalOcean cloud firewall) are not visibl
 13. directory /var/lib/scupper/config uid=0 mode=0700
 14. directory /var/lib/scupper/config/versions uid=0 mode=0700
 15. directory /var/lib/scupper/rendered uid=0 mode=0700
-16. file /etc/modules-load.d/scupper.conf uid=0 mode=0644 sha256=59c4be334ea4f8d2f6b0e5809640b0977c89ece270be3305eb2691e74b227954 (atomic)
-17. file /etc/scupper/gateway-id uid=0 mode=0644 sha256=17e439def43637c3dee712c48a6a8e26ef22fd1e06b20c8cc86d54aa00b6b927 (atomic)
-18. file /etc/systemd/system/scupper-net.service uid=0 mode=0644 sha256=27f3cf0c2128d9ae9f8e85f637b18e4a06c4ab5597bdaf9c7f83525456e1053a (atomic)
-19. file /etc/systemd/system/scupperd.service uid=0 mode=0644 sha256=92706c5b107a10d2f13a39d6c05b7a852c22d5b081dab4eb62f7762035d78290 (atomic)
-20. systemctl daemon-reload
-21. systemctl enable --now scupper-net scupperd
+16. provision new gateway incarnation and EMPTY never-served session history
+17. file /etc/modules-load.d/scupper.conf uid=0 mode=0644 sha256=59c4be334ea4f8d2f6b0e5809640b0977c89ece270be3305eb2691e74b227954 (atomic)
+18. file /etc/scupper/gateway-id uid=0 mode=0644 sha256=17e439def43637c3dee712c48a6a8e26ef22fd1e06b20c8cc86d54aa00b6b927 (atomic)
+19. file /etc/systemd/system/scupper-net.service uid=0 mode=0644 sha256=765bcb2270ec85a47ff5a3cba5edb8276e6ae939870a57a100ad9baf2225661f (atomic)
+20. file /etc/systemd/system/scupperd.service uid=0 mode=0644 sha256=92706c5b107a10d2f13a39d6c05b7a852c22d5b081dab4eb62f7762035d78290 (atomic)
+21. systemctl daemon-reload
+22. systemctl enable --now scupper-net scupperd

@@ -22,3 +22,26 @@ administrative disconnect keep precedence. DESIGN §12 defines the service gate.
 Remove the L44 positive TCP retry. Add daemon-L54 for one Unknown tick, no false
 OK during session loss, client-side handshake evidence and a first-attempt TCP
 canary within five seconds after recovery. Keep captures through service checks.
+
+## 2026-11-14: Gateway session history, fix round 8
+
+New provisioning commits incarnation-bound EMPTY/never-served history. Boot/check
+never create it; first daemon/sampler start consumes EMPTY durably before clients
+serve. Only the sampler may reconstruct unavailable history after 180 seconds of
+complete observations, without a handshake shortcut. Sampling has its own 5 s
+cadence and lock, with 10 s slack (15 s freshness); overruns remain gaps through
+180 s of resumed sampling, including without rebuild (N1 retained).
+
+Planned client-device teardown quiesces traffic, commits a final complete sample,
+confirms destruction, then writes a device/incarnation/sample-bound single-use
+clean-stop marker. Next start consumes it durably and judges freshness at stop;
+leases age in wall time and any backwards clock invalidates history. Ordinary
+daemon restart with a live link uses normal freshness. Abandoned reset intents
+require verified live identity, UP state and continuous counters before clearing.
+
+Connect accepts protection/exit success with an honest session-only degraded
+verdict. Heartbeat accepts session-only 3 for a durable, nonrenewable 600 s grace
+since the first such 3 after the last 0; all diagnoses participate in classification.
+Only 0 resets grace. Status exposes the session reason. Five-second durable
+renewals intentionally accept their fsync cost; root snapshot rollback remains
+undetectable. The check-only lab provisions explicitly and uses the product sampler.

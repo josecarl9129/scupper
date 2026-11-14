@@ -322,6 +322,14 @@ impl Kernel for RealKernel<'_> {
                 .public_key
                 .as_str(),
             guard,
+            &self
+                .health
+                .peers
+                .get(&self.health.client_iface)
+                .into_iter()
+                .flatten()
+                .map(|p| p.public_key)
+                .collect::<Vec<_>>(),
         )
         .map_err(|_| StepError("client activity snapshot failed"))
     }
@@ -346,7 +354,13 @@ impl Kernel for RealKernel<'_> {
         .map_err(|_| StepError("client reset intent checkpoint failed"))
     }
     fn client_link_down(&self, guard: &WriterGuard) -> Result<(), StepError> {
-        crate::client_sessions::link_down(
+        let deadline = Instant::now() + crate::client_sessions::SAMPLE_INTERVAL;
+        let link_is_down = boot::inventory(&self.deps, &self.held)
+            .map_err(|_| StepError("client link state unavailable after LinkDown"))?
+            .into_iter()
+            .find(|link| link.ifname == self.health.client_iface)
+            .is_none_or(|link| !link.flags.iter().any(|f| f == "UP"));
+        crate::client_sessions::link_down_until(
             self.deps.system,
             &self.held,
             &self.health.client_iface,
@@ -360,31 +374,34 @@ impl Kernel for RealKernel<'_> {
                 .public_key
                 .as_str(),
             guard,
+            link_is_down,
+            deadline,
         )
         .map_err(|_| StepError("client reset checkpoint failed"))
     }
     fn before_client_link_up(&self, guard: &WriterGuard) -> Result<(), StepError> {
+        let deadline = Instant::now() + crate::client_sessions::SAMPLE_INTERVAL;
         let inventory = boot::inventory(&self.deps, &self.held)
             .map_err(|_| StepError("client link inventory failed"))?;
         let link = inventory
             .iter()
-            .find(|l| l.ifname == self.health.client_iface)
+            .find(|link| link.ifname == self.health.client_iface)
             .ok_or(StepError("client link missing"))?;
-        crate::client_sessions::before_up(
+        let gateway = self
+            .site
+            .gateway(&self.gateway)
+            .ok_or(StepError("unknown gateway"))?;
+        crate::client_sessions::before_up_until(
             self.deps.system,
             &self.held,
             &self.health.client_iface,
             self.deps.state_root,
             self.deps.run_root,
-            self.site
-                .gateway(&self.gateway)
-                .ok_or(StepError("unknown gateway"))?
-                .client_tunnel()
-                .identity()
-                .public_key
-                .as_str(),
-            !link.flags.iter().any(|f| f == "UP"),
+            gateway.client_tunnel().identity().public_key.as_str(),
+            !link.flags.iter().any(|flag| flag == "UP"),
             guard,
+            deadline,
+            true,
         )
         .map_err(|_| StepError("client reset baseline unavailable"))
     }
@@ -413,22 +430,6 @@ impl Kernel for RealKernel<'_> {
         {
             return Ok(());
         }
-        crate::client_sessions::checkpoint_recovered(
-            self.deps.system,
-            &self.held,
-            &self.health.client_iface,
-            self.deps.state_root,
-            self.deps.run_root,
-            self.site
-                .gateway(&self.gateway)
-                .ok_or(StepError("unknown gateway"))?
-                .client_tunnel()
-                .identity()
-                .public_key
-                .as_str(),
-            guard,
-        )
-        .map_err(|_| StepError("client session readiness checkpoint failed"))?;
         self.verify(desired.fingerprint())?;
         crate::client_sessions::probe_pending(
             self.deps.system,
@@ -436,6 +437,7 @@ impl Kernel for RealKernel<'_> {
             &self.site,
             &self.gateway,
             self.deps.state_root,
+            self.deps.run_root,
             guard,
         )
         .map_err(|_| StepError("client session probe failed"))

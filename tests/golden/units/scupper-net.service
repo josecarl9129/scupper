@@ -1,16 +1,18 @@
 # scupper-net.service
+# Stop preserves protection; clean-stop tears down clients only during system shutdown.
 [Unit]
 Description=scupper data-path namespace
 DefaultDependencies=no
 After=local-fs.target systemd-modules-load.service
-Before=network-pre.target scupperd.service
+Before=network-pre.target scupperd.service shutdown.target
+Conflicts=shutdown.target
 Wants=network-pre.target
 [Service]
 Type=oneshot
 TimeoutStartSec=90
-TimeoutStopSec=10s
+TimeoutStopSec=30s
 RemainAfterExit=yes
 ExecStart=/usr/local/bin/scupper boot
-# no ExecStop: stopping the unit never tears protection down
+ExecStop=/usr/local/bin/scupper boot --clean-stop
 [Install]
 WantedBy=multi-user.target

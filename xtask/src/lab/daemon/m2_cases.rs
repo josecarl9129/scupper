@@ -147,7 +147,7 @@ impl DaemonGuard<'_> {
         }
         // CLI lab observations are second-resolution; product baselines use netlink.
         self.lab.runner.dwell(Duration::from_millis(1200))?;
-        let state_path = root.join("run/scupper/client-sessions.json");
+        let state_path = root.join("var-lib/scupper/client-sessions.json");
         let initial: serde_json::Value = serde_json::from_slice(&fs::read(&state_path)?)?;
         let generation = |v: &serde_json::Value| {
             v["peers"]
@@ -161,7 +161,7 @@ impl DaemonGuard<'_> {
         let previous = generation(&initial);
         // Permit handshakes, block all authenticated client transport, including
         // kernel-generated keepalives. No client-side retry can conceal false OK.
-        let table = "table inet reset_window { chain output { type filter hook output priority -200; policy accept; udp dport 51820 @th,64,32 0x04000000 drop; } }";
+        let table = "table inet reset_window {\n chain output {\n  type filter hook output priority -200; policy accept;\n  udp dport 51820 @th,64,32 0x04000000 drop;\n }\n}\n";
         self.lab.runner.input(
             &Invocation::new("client", "nft", &["-f", "-"]),
             Some(table.as_bytes()),

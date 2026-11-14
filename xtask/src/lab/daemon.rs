@@ -811,7 +811,7 @@ impl Lab {
             serde_json::to_vec_pretty(&boot)?,
         )?;
         super::boot::verify_modules(&boot)?;
-        let (code, report) = self.check_result(&Self::boot_binary()?, &root)?;
+        let (code, report) = self.wait_session_recovery(&Self::boot_binary()?, &root)?;
         fs::write(
             self.artifacts.join(format!("{stem}-supervised-check.json")),
             serde_json::to_vec_pretty(&report)?,
@@ -997,7 +997,7 @@ impl Lab {
             .daemon_ready_tick(&notify)
             .and_then(|()| trial(self, &root, &notify))
             .and_then(|value| {
-                let (code, report) = self.check_result(&Self::boot_binary()?, &root)?;
+                let (code, report) = self.wait_session_recovery(&Self::boot_binary()?, &root)?;
                 fs::write(
                     self.artifacts.join("L19-L3-repaired-check.json"),
                     serde_json::to_vec_pretty(&report)?,
@@ -1069,6 +1069,7 @@ impl Lab {
         )))
     }
     fn daemon_spawn(&mut self, case: &str, root: &Path, stage: &str) -> Result<Group> {
+        self.sampler.take();
         // Unlike root-started probes, heartbeat exec happens after uid/gid drop.
         // Neither executable may require traversal through a runner's home.
         let daemon = if matches!(case, "L10" | "L53" | "L53b" | "heartbeat" | "alerts") {
@@ -1428,18 +1429,19 @@ impl Lab {
                 }
                 self.cmd("scupper", "ip", &["link", "set", "ex-ch1", "up"])?;
                 let up = self.daemon_route_healthy(Duration::from_secs(70))?;
-                let (code, report) = self.check_result(&Self::boot_binary()?, root)?;
+                let (code, report) = self.wait_session_recovery(&Self::boot_binary()?, root)?;
                 if code != 0 || report["verdict"].get("Protected").is_none() {
                     return fail(format!("L16 expected recovered check 0: {code}: {report}"));
                 }
+                let session_ms = &report["session_time_to_0_ms"];
                 format!(
-                    "down_ms={down}; check_down=4; recovery_ms={up}; check_up=0; active_route_restored=true"
+                    "down_ms={down}; check_down=4; recovery_ms={up}; check_up=0; session_time_to_0_ms={session_ms}; active_route_restored=true"
                 )
             }
             "L17-V14" => {
                 let marker = Self::marker()?;
                 markers.push(marker.clone());
-                let mut stream = self.daemon_flow("udp", "client", &marker, &stem, 90)?;
+                let mut stream = self.daemon_flow("udp", "client", &marker, &stem, 300)?;
                 let stream_log = self.artifacts.join(format!("{stem}-udp.jsonl"));
                 self.daemon_wait("L17 live canary control", Duration::from_secs(3), |_| {
                     Ok(flow_counts(&stream_log)?.1 > 0)
@@ -1473,7 +1475,7 @@ impl Lab {
                 )?;
                 super::mounts::verify_restored_peers(child.supervised_pid()?)?;
                 // Reopen and audit the restored name without any intervening delete.
-                let (code, report) = self.check_result(&Self::boot_binary()?, root)?;
+                let (code, report) = self.wait_session_recovery(&Self::boot_binary()?, root)?;
                 super::mounts::save(
                     &self.artifacts,
                     "daemon-L17-V14-after-check",
@@ -1497,8 +1499,9 @@ impl Lab {
                 if sent.saturating_sub(replies) > 2 {
                     return fail(format!("L17 canary loss: sent={sent}, replies={replies}"));
                 }
+                let session_ms = &report["session_time_to_0_ms"];
                 format!(
-                    "remount_ms={remount}; mounts={mounts}; same_inode=true; shared_peers=true; netns_exec=true; fresh_check=0; second_namespace=false; stream_sent={sent}; stream_replies={replies}"
+                    "remount_ms={remount}; mounts={mounts}; same_inode=true; shared_peers=true; netns_exec=true; fresh_check=0; session_time_to_0_ms={session_ms}; second_namespace=false; stream_sent={sent}; stream_replies={replies}"
                 )
             }
             "L52" | "L52b" => {

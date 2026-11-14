@@ -130,6 +130,7 @@ fn capture_invocation(ns: &str, iface: &str, pcap: &Path) -> Result<Invocation> 
 struct Lab {
     boot_root: PathBuf,
     boot_root_ready: bool,
+    sampler: Option<scupper_sys::client_sessions::Sampler>,
     runner: Runner,
     registry: Registry,
     services: Vec<Group>,
@@ -248,6 +249,7 @@ fn run_inner(
     let mut lab = Lab {
         boot_root: daemon::short_boot_root("setup"),
         boot_root_ready: false,
+        sampler: None,
         runner,
         registry: Registry::default(),
         services: Vec::new(),

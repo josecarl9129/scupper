@@ -176,6 +176,48 @@ impl Lab {
         extra: &[&str],
         stem: &str,
     ) -> Result<(std::process::ExitStatus, String)> {
+        if self.sampler.take().is_some() {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                match scupper_sys::lock::WriterLock::try_acquire(
+                    self.boot_root.join("run/scupper/client-sampler-owner"),
+                ) {
+                    Ok(owner) => {
+                        drop(owner);
+                        break;
+                    }
+                    Err(_) if std::time::Instant::now() < until => {
+                        self.runner.dwell(std::time::Duration::from_millis(25))?;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        // The check-only lab activates its sampler before boot. Product startup
+        // boots first, then activates the daemon; daemon/systemd labs cover it.
+        if !self.site.health().require_daemon()
+            && let Ok(lease) =
+                scupper_sys::lock::SupervisorLease::try_acquire(self.boot_root.join("run/scupper"))
+        {
+            let activation = scupper_sys::lock::WriterLock::try_acquire(
+                self.boot_root.join("run/scupper/client-sampler-owner"),
+            )?;
+            let gateway = self
+                .site
+                .gateway(&scupper_core::config::GatewayId("gw1".into()))
+                .ok_or("missing gateway")?;
+            scupper_sys::client_sessions::activate(
+                &self.boot_root.join("var-lib/scupper"),
+                &self.boot_root.join("run/scupper"),
+                gateway.client_tunnel().identity().public_key.as_str(),
+                scupper_sys::system::System::now_unix_secs(
+                    &scupper_sys::system::RealSystem::default(),
+                ),
+                &activation,
+            )?;
+            drop(activation);
+            drop(lease);
+        }
         let binary = Self::boot_binary()?;
         let root = self.boot_root.clone();
         let trace = self.artifacts.join(format!("{stem}.calls.json"));
@@ -203,6 +245,7 @@ impl Lab {
             .trim()
             .parse()?;
         self.assert_transport_ports()?;
+        self.start_lab_sampler()?;
         Ok(report)
     }
     pub(super) fn boot_adopt(&mut self) -> Result<()> {

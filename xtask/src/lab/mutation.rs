@@ -811,7 +811,7 @@ impl Lab {
         self.boot_gateway(&[], "L19-L6-boot")?;
         let binary = Self::boot_binary()?;
         let trial = (|| {
-            let (code, report) = self.check_result(&binary, &root)?;
+            let (code, report) = self.wait_session_recovery(&binary, &root)?;
             fs::write(
                 self.artifacts.join("L19-L6-before.json"),
                 serde_json::to_vec_pretty(&report)?,

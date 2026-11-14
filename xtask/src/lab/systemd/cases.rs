@@ -115,6 +115,7 @@ impl SystemdLab {
         let mut stream = self.stream(case, &mut markers)?;
         let trial = (|| {
             if case == "L44" {
+                self.manual_stop_preserves_clients()?;
                 self.writers_canary("before-race", &mut markers)?;
                 self.reboot_sessions(&mut markers)?;
             } else {
@@ -638,10 +639,16 @@ impl SystemdLab {
         Ok(())
     }
     fn reboot_sessions(&mut self, markers: &mut Vec<String>) -> Result<()> {
+        // 30 s startup + 30 s blocked observation + 15 s no-receive trigger +
+        // 5 s retry + 15 s sample + 20 s check + 5 s runner slack.
+        let recovery_budget = Duration::from_secs(120);
+        let _traffic = self.lab.recovery_traffic("reboot-sessions")?;
         // Preserve the client's old session, including its receiver index.
         // Only block its outer UDP temporarily; all leak captures/oracles stay on.
+        // Recovery relies on the case-wide 1400 s client UDP stream to trigger
+        // a fresh client handshake; a keepalive-0 idle client cannot do that.
         let rules = format!(
-            "table inet reboot_sessions {{ chain output {{ type filter hook output priority filter; ip daddr {} meta l4proto udp counter drop; }} }}\n",
+            "table inet reboot_sessions {{\n chain output {{\n  type filter hook output priority filter;\n  ip daddr {} meta l4proto udp counter drop;\n }}\n}}\n",
             A.gwhost.peer
         );
         self.lab.runner.input(
@@ -649,9 +656,15 @@ impl SystemdLab {
             Some(rules.as_bytes()),
         )?;
         let trial = (|| {
-            self.reboot_stop()?;
+            self.reboot_stop_sealed()?;
             let log = self.lab.artifacts.join("L44-reboot-sessions-check.jsonl");
             let started = self.lab.private.join("reboot-observer-started");
+            let reset_seen = self.lab.private.join("reboot-observer-reset-seen");
+            for marker in [&started, &reset_seen] {
+                if marker.exists() {
+                    fs::remove_file(marker)?;
+                }
+            }
             let mut observer = self.lab.runner.background(
                 &Invocation::new(
                     "",
@@ -662,7 +675,9 @@ impl SystemdLab {
                         CLI,
                         log.to_str().ok_or("observer log path")?,
                         started.to_str().ok_or("observer startup path")?,
+                        reset_seen.to_str().ok_or("observer reset path")?,
                         &self.lab.public_keys[3],
+                        &recovery_budget.as_secs().to_string(),
                     ],
                 ),
                 &self.lab.artifacts.join("L44-reboot-observer.stdout"),
@@ -678,25 +693,38 @@ impl SystemdLab {
             self.reboot_start()?;
             // No authenticated client transport is possible during this interval.
             // Pin the absence of false OK independently of the observer's samples.
-            for _ in 0..6 {
-                let (status, _) = self
+            let mut saw_session_reset = false;
+            let session_deadline = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < session_deadline {
+                let (status, text) = self
                     .lab
                     .runner
-                    .output(&Invocation::new("", CLI, &["check"]), None)?;
+                    .output(&Invocation::new("", CLI, &["check", "--json"]), None)?;
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                    saw_session_reset |= value["verdict"]["Degraded"] == "ClientSessionsReset";
+                }
                 if status.code() == Some(0) {
                     return fail(
                         "reboot check falsely reported ready while client UDP was blocked",
                     );
                 }
                 observer.alive()?;
+                if saw_session_reset && reset_seen.exists() {
+                    break;
+                }
                 self.lab.runner.dwell(Duration::from_millis(500))?;
+            }
+            if !saw_session_reset || !reset_seen.exists() {
+                return fail(
+                    "blocked reboot window observers never confirmed Degraded/ClientSessionsReset",
+                );
             }
             self.lab.cmd(
                 "client",
                 "nft",
                 &["delete", "table", "inet", "reboot_sessions"],
             )?;
-            if !observer.wait_timeout(Duration::from_secs(90))?.success() {
+            if !observer.wait_timeout(recovery_budget)?.success() {
                 return fail(
                     "reboot session observer rejected readiness; see L44-reboot-sessions-check.jsonl",
                 );

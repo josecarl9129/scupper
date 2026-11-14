@@ -1829,7 +1829,19 @@ fn pending_sessions_collect_later_safety_stages_before_readiness() {
     obs.supervisor = passing().supervisor;
     assert_degraded(&obs, Degraded::ClientSessionsReset);
     obs.supervisor = Some(Supervisor::Dead);
-    assert_degraded(&obs, Degraded::ClientSessionsReset);
+    let result = report_with(&obs, &cfg);
+    assert!(matches!(result.verdict, Verdict::Unsupervised { .. }));
+    assert!(result.warnings.contains(&Warning::ClientSessionsPending));
+    let mut optional = cfg.clone();
+    optional.require_daemon = false;
+    forwarding(&mut obs).client_sessions.active_reset = false;
+    forwarding(&mut obs).client_sessions.unknown = true;
+    let result = report_with(&obs, &optional);
+    assert_eq!(
+        result.verdict,
+        Verdict::Degraded(Degraded::ClientSessionsUnknown)
+    );
+    assert!(result.warnings.contains(&Warning::DaemonDead));
 }
 
 #[test]
@@ -1876,4 +1888,67 @@ fn unavailable_history_is_last_and_expiry_is_a_warning_not_recovery() {
             .warnings
             .contains(&Warning::ClientSessionsExpiredUnconfirmed)
     );
+}
+
+#[test]
+fn client_telemetry_failure_has_distinct_reason_and_follows_supervision() {
+    let mut obs = passing();
+    forwarding(&mut obs).client_sessions.telemetry_unavailable = true;
+    assert_degraded(&obs, Degraded::ClientSessionTelemetryUnknown);
+    let result = report(&obs);
+    assert!(
+        result
+            .warnings
+            .contains(&Warning::ClientSessionTelemetryUnavailable)
+    );
+    assert!(!result.warnings.contains(&Warning::ClientSessionsPending));
+    obs.supervisor = Some(Supervisor::Dead);
+    assert!(matches!(report(&obs).verdict, Verdict::Unsupervised { .. }));
+    let mut optional = config();
+    optional.require_daemon = false;
+    let result = report_with(&obs, &optional);
+    assert_eq!(
+        result.verdict,
+        Verdict::Degraded(Degraded::ClientSessionTelemetryUnknown)
+    );
+    assert!(result.warnings.contains(&Warning::DaemonDead));
+    topology(&mut obs).ruleset = RulesetObs::Missing;
+    assert!(matches!(
+        report_with(&obs, &optional).verdict,
+        Verdict::Unprotected(_)
+    ));
+}
+
+#[test]
+fn session_only_classification_checks_every_diagnosis_and_pending_is_secondary() {
+    for reason in [
+        Degraded::ClientSessionsReset,
+        Degraded::ClientSessionsUnknown,
+        Degraded::ClientSessionTelemetryUnknown,
+    ] {
+        let mut report = report_with(&passing(), &config());
+        report.verdict = Verdict::Degraded(reason);
+        report.warnings = vec![
+            Warning::ClientSessionHistoryUnavailable,
+            Warning::ClientHandshakesStale,
+        ];
+        assert!(report.session_only());
+        report.warnings.push(Warning::DaemonDead);
+        assert!(
+            !report.session_only(),
+            "secondary supervision diagnosis must disqualify grace"
+        );
+    }
+    let mut obs = passing();
+    forwarding(&mut obs).client_sessions.active_reset = true;
+    let report = report_with(&obs, &config());
+    assert_eq!(
+        report.verdict,
+        Verdict::Degraded(Degraded::ClientSessionsReset)
+    );
+    assert!(!report.warnings.contains(&Warning::ClientSessionsPending));
+    obs.supervisor = Some(Supervisor::Dead);
+    let report = report_with(&obs, &config());
+    assert!(report.warnings.contains(&Warning::ClientSessionsPending));
+    assert!(!report.session_only());
 }

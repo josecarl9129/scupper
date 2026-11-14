@@ -70,14 +70,20 @@ pub(super) fn verified(op: &Op, report: Report) -> Result<OpResult, ApiError> {
             report: serde_json::to_value(report)
                 .map_err(|_| control::api(ApiErrorCode::Internal))?,
         }),
-        Op::Connect { .. } => match report.verdict {
-            Verdict::Protected { exit, .. } | Verdict::Unsupervised { exit, .. } => {
-                Ok(OpResult::Connect {
-                    exit: (&exit).into(),
-                })
-            }
-            _ => Err(control::api(ApiErrorCode::NotReady)),
-        },
+        Op::Connect { .. } => {
+            let exit = match &report.verdict {
+                Verdict::Protected { exit, .. } | Verdict::Unsupervised { exit, .. } => {
+                    Some(exit.into())
+                }
+                _ if report.session_only() => None,
+                _ => return Err(control::api(ApiErrorCode::NotReady)),
+            };
+            Ok(OpResult::Connect {
+                exit,
+                report: serde_json::to_value(report)
+                    .map_err(|_| control::api(ApiErrorCode::Internal))?,
+            })
+        }
         Op::Disconnect {}
             if report.verdict == Verdict::FailClosed(FailClosed::AdminDisconnected) =>
         {

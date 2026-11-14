@@ -65,6 +65,32 @@ fn verdict_matches(name: &str, report: &serde_json::Value) -> bool {
     }
 }
 
+// JSON equivalent of Report::session_only: unknown diagnoses and missing warnings
+// fail immediately. The parity test below uses actual serialized core Reports.
+fn session_recovery_pending(code: i32, report: &serde_json::Value) -> bool {
+    code == 3
+        && matches!(
+            report["verdict"]["Degraded"].as_str(),
+            Some("ClientSessionsUnknown" | "ClientSessionsReset" | "ClientSessionTelemetryUnknown")
+        )
+        && report["warnings"].as_array().is_some_and(|warnings| {
+            warnings.iter().all(|warning| {
+                matches!(
+                    warning.as_str(),
+                    Some(
+                        "ClientHandshakesStale"
+                            | "IdleClientSessionsReset"
+                            | "ClientSessionsPending"
+                            | "ClientSessionPeerMissing"
+                            | "ClientSessionTelemetryUnavailable"
+                            | "ClientSessionsExpiredUnconfirmed"
+                            | "ClientSessionHistoryUnavailable"
+                    )
+                )
+            })
+        })
+}
+
 impl Lab {
     pub(super) fn check_v2_case(&mut self) -> Result<String> {
         let binary = fs::canonicalize(
@@ -177,9 +203,32 @@ impl Lab {
         )?;
         store.write_rendered(&writer, version, &rules)?;
         fs::write(&self.rules, rules)?;
+        let gateway = self
+            .site
+            .gateway(&GatewayId("gw1".into()))
+            .ok_or("gateway missing")?;
+        scupper_sys::client_sessions::provision(
+            &state,
+            gateway.client_tunnel().identity().public_key.as_str(),
+            scupper_sys::system::System::now_unix_secs(&scupper_sys::system::RealSystem::default()),
+            &writer,
+        )?;
         self.prepare_short_boot_root()
     }
 
+    pub(super) fn start_lab_sampler(&mut self) -> Result<()> {
+        if self.sampler.is_none() && !self.site.health().require_daemon() {
+            self.sampler = Some(scupper_sys::client_sessions::Sampler::start(
+                self.boot_root.join("var-lib/scupper"),
+                self.boot_root.join("run/scupper"),
+                std::sync::Arc::new(scupper_sys::netns::NetnsHandle::open("/run/netns/scupper")?),
+                Self::boot_binary()?,
+                &self.site,
+                &GatewayId("gw1".into()),
+            )?);
+        }
+        Ok(())
+    }
     // Keep private state in place; only the public runtime pathname needs shortening.
     fn prepare_short_boot_root(&mut self) -> Result<PathBuf> {
         use super::cleanup::Resource;
@@ -243,6 +292,46 @@ impl Lab {
         Ok(result)
     }
 
+    // 180 s reconstruction + 15 s first-sample bound + 30 s check/startup
+    // allowance + 15 s runner slack. Traffic continues for both configured peers.
+    pub(super) fn recovery_traffic(&mut self, stem: &str) -> Result<Vec<super::command::Group>> {
+        let mut flows = Vec::new();
+        for ns in ["client", "client2"] {
+            flows.push(self.daemon_flow(
+                "udp",
+                ns,
+                &format!("session-recovery-{stem}-{ns}"),
+                &format!("session-recovery-{stem}-{ns}"),
+                240,
+            )?);
+        }
+        Ok(flows)
+    }
+    pub(super) fn wait_session_recovery(
+        &mut self,
+        binary: &Path,
+        root: &Path,
+    ) -> Result<(i32, serde_json::Value)> {
+        let _traffic = self.recovery_traffic("check")?;
+        let started = std::time::Instant::now();
+        let until = started + std::time::Duration::from_secs(240);
+        self.runner.phase = self.runner.phase.max(until).min(self.runner.whole);
+        loop {
+            let mut result = self.check_result(binary, root)?;
+            if !session_recovery_pending(result.0, &result.1) {
+                if result.0 == 0 {
+                    result.1["session_time_to_0_ms"] =
+                        serde_json::json!(started.elapsed().as_millis());
+                }
+                return Ok(result);
+            }
+            if std::time::Instant::now() >= until {
+                return fail(format!("session recovery exceeded 240 s: {}", result.1));
+            }
+            self.runner.dwell(std::time::Duration::from_secs(1))?;
+        }
+    }
+
     fn check_row(
         &mut self,
         name: &str,
@@ -289,7 +378,7 @@ impl Lab {
 
     #[allow(clippy::too_many_lines)] // Keep each injected fault beside its assertion and restoration.
     fn check_v2_faults(&mut self, binary: &Path, root: &Path) -> Result<String> {
-        let (code, report) = self.check_result(binary, root)?;
+        let (code, report) = self.wait_session_recovery(binary, root)?;
         // Skip only a classified exit-path error after every local stage passed.
         // A setup/collection error, wrong route or containment failure must fail.
         let no_internet = code == 3
@@ -401,7 +490,7 @@ impl Lab {
             )?;
             self.load_real_rules()?;
             self.wait_provider()?;
-            let (code, report) = self.check_result(binary, root)?;
+            let (code, report) = self.wait_session_recovery(binary, root)?;
             self.check_row(
                 &format!("restore-{fault}"),
                 0,
@@ -450,8 +539,67 @@ fn parse_check_output(
 
 #[cfg(test)]
 mod tests {
-    use super::{CHECK, parse_check_output, verdict_matches};
+    use super::{CHECK, parse_check_output, session_recovery_pending, verdict_matches};
     use serde_json::json;
+
+    #[test]
+    fn session_wait_retries_only_core_session_only_reports() -> super::Result<()> {
+        use scupper_core::verdict::v2::{Degraded, Report, Verdict, Warning};
+        let session_warnings = vec![
+            Warning::ClientHandshakesStale,
+            Warning::IdleClientSessionsReset,
+            Warning::ClientSessionsPending,
+            Warning::ClientSessionPeerMissing,
+            Warning::ClientSessionTelemetryUnavailable,
+            Warning::ClientSessionsExpiredUnconfirmed,
+            Warning::ClientSessionHistoryUnavailable,
+        ];
+        for reason in [
+            Degraded::ClientSessionsUnknown,
+            Degraded::ClientSessionsReset,
+            Degraded::ClientSessionTelemetryUnknown,
+        ] {
+            for warnings in [vec![], session_warnings.clone(), vec![Warning::ClockSkew]] {
+                let report = Report {
+                    verdict: Verdict::Degraded(reason.clone()),
+                    warnings,
+                    at: 1,
+                    config_version: 1,
+                };
+                let json = serde_json::to_value(&report)?;
+                assert_eq!(session_recovery_pending(3, &json), report.session_only());
+                for code in [0, 1, 2, 4, 5] {
+                    assert!(!session_recovery_pending(code, &json));
+                }
+            }
+        }
+        // Non-session verdicts and mixed/unknown warnings must return immediately.
+        for verdict in [
+            json!({"Degraded": {"DefaultRouteWrong": {"family": "V4", "got": "Missing"}}}),
+            json!({"Degraded": "ExitHandshakeStale"}),
+            json!({"Degraded": "ExitProbeFailed"}),
+            json!({"FailClosed": "NoHealthyExit"}),
+            json!({"Unprotected": []}),
+            json!({"Unsupervised": {}}),
+            json!({"Protected": {}}),
+        ] {
+            assert!(!session_recovery_pending(
+                3,
+                &json!({"verdict": verdict, "warnings": []})
+            ));
+        }
+        for warnings in [
+            json!(["ClientSessionsPending", "ClockSkew"]),
+            json!(["FutureWarning"]),
+            json!(null),
+        ] {
+            assert!(!session_recovery_pending(
+                3,
+                &json!({"verdict": {"Degraded": "ClientSessionsReset"}, "warnings": warnings})
+            ));
+        }
+        Ok(())
+    }
 
     #[test]
     fn check_json_errors_retain_raw_output_and_distinguish_timeout() -> super::Result<()> {

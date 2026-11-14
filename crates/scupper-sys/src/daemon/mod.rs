@@ -192,7 +192,7 @@ impl StartupRead {
             .ok_or_else(|| io::Error::other("missing startup inputs"))
     }
 }
-#[allow(clippy::too_many_lines)] // Keep locked checkpoint migration and startup attachment in one boundary.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)] // Keep locked migration, sampler attachment and handoff in one boundary.
 fn initialize<'a>(
     deps: BootDeps<'a>,
     gateway: GatewayId,
@@ -201,6 +201,8 @@ fn initialize<'a>(
     canon_deadline: Instant,
     inputs: &mut StartupRead,
     guard: Option<(&crate::lock::WriterGuard, bool)>,
+    activate_sessions: bool,
+    before_handoff: impl FnOnce(&Arc<NetnsHandle>, &Config),
 ) -> io::Result<(Machine<'a>, Arc<NetnsHandle>, Config)> {
     let owned_guard = if guard.is_none() {
         Some(crate::lock::WriterLock::acquire_timeout(
@@ -269,6 +271,19 @@ fn initialize<'a>(
         .ready
         .take()
         .ok_or_else(|| io::Error::other("missing startup inputs"))?;
+    let gw = config
+        .site
+        .gateway(&config.gateway)
+        .ok_or_else(|| io::Error::other("unknown gateway"))?;
+    if activate_sessions {
+        crate::client_sessions::activate(
+            deps.state_root,
+            deps.run_root,
+            gw.client_tunnel().identity().public_key.as_str(),
+            deps.system.now_unix_secs(),
+            writer,
+        )?;
+    }
     let kernel = RealKernel::from_boot_report(
         deps,
         held.clone(),
@@ -294,15 +309,14 @@ fn initialize<'a>(
         Box::new(move || (MonoTime(origin.elapsed()), unix())) as Box<dyn Fn() -> (MonoTime, u64)>,
         loaded.saved,
     )?;
-    if let Some((guard, recover)) = guard {
-        if recover {
-            machine.recover_route_switch_locked(guard)?;
-        }
-        machine.resume_existing_locked(guard);
-    } else {
+    if guard.is_none_or(|(_, recover)| recover) {
         machine.recover_route_switch_locked(writer)?;
-        machine.resume_existing_locked(writer);
     }
+    // Start/reattach independent sampling before the potentially slow handoff
+    // observation. Retain the startup writer: reacquiring it could time out and
+    // silently skip the observation before publishing daemon readiness.
+    before_handoff(&held, &config);
+    machine.resume_existing_locked(writer);
     Ok((machine, held, config))
 }
 
@@ -462,6 +476,8 @@ fn run_notified(
         notify: lease_notify,
         started_event: false,
         running: None,
+        sampler: None,
+        sampler_retry_at: Instant::now(),
         pending_canon: false,
         startup_read: StartupRead::default(),
         probes: probes::Probes::new(options.probe_binary.clone(), origin)
@@ -518,6 +534,8 @@ struct Runtime<'a> {
     notify: notify::Notify,
     started_event: bool,
     running: Option<(Machine<'a>, Arc<NetnsHandle>, Config)>,
+    sampler: SessionSampler,
+    sampler_retry_at: Instant,
     pending_canon: bool,
     startup_read: StartupRead,
     probes: probes::Probes,
@@ -555,6 +573,46 @@ impl<'a> Runtime<'a> {
         }
     }
 }
+type SessionSampler = Option<(u64, (u64, u64), crate::client_sessions::Sampler)>;
+
+fn attach_sampler(
+    options: &Options,
+    sampler: &mut SessionSampler,
+    retry_at: &mut Instant,
+    held: &Arc<NetnsHandle>,
+    config: &Config,
+) {
+    let key = (config.stamp.version, held.identity());
+    if sampler.as_ref().is_some_and(|(v, ns, _)| (*v, *ns) == key) {
+        return;
+    }
+    if let Some((version, namespace, sampler)) = sampler
+        && sampler
+            .attach(held.clone(), &config.site, &config.gateway)
+            .is_ok()
+    {
+        *version = key.0;
+        *namespace = key.1;
+        return;
+    }
+    if Instant::now() < *retry_at {
+        return;
+    }
+    sampler.take();
+    *retry_at = Instant::now() + Duration::from_secs(15);
+    match crate::client_sessions::Sampler::start(
+        options.state_root.clone(),
+        options.run_root.clone(),
+        held.clone(),
+        options.probe_binary.clone(),
+        &config.site,
+        &config.gateway,
+    ) {
+        Ok(worker) => *sampler = Some((key.0, key.1, worker)),
+        Err(error) => eprintln!("client sampler startup: {error}"),
+    }
+}
+
 impl Runtime<'_> {
     #[allow(clippy::too_many_lines)] // Keep applied settings and failed-boot fallback synchronization together.
     fn sync_alerts(&mut self) {
@@ -611,6 +669,19 @@ impl Runtime<'_> {
         }
     }
 
+    fn sync_sampler(&mut self) {
+        let Some((_, held, config)) = &self.running else {
+            self.sampler.take();
+            return;
+        };
+        attach_sampler(
+            self.options,
+            &mut self.sampler,
+            &mut self.sampler_retry_at,
+            held,
+            config,
+        );
+    }
     fn publish_snapshot(&self) {
         let mut snapshot = self
             .snapshot
@@ -816,6 +887,16 @@ impl Runtime<'_> {
                         Instant::now() + canon::CANON_TIMEOUT + crate::system::EXEC_TIMEOUT,
                         &mut self.startup_read,
                         Some((&guard, true)),
+                        true,
+                        |held, config| {
+                            attach_sampler(
+                                self.options,
+                                &mut self.sampler,
+                                &mut self.sampler_retry_at,
+                                held,
+                                config,
+                            );
+                        },
                     )
                     .ok()
                 };
@@ -862,6 +943,10 @@ impl Runtime<'_> {
                 .as_ref()
                 .ok_or_else(|| control::api(ApiErrorCode::SupervisorUnavailable))?;
             return Ok(OpResult::Status {
+                session_reason: crate::client_sessions::cached_reason(
+                    &self.options.run_root,
+                    unix(),
+                ),
                 health: health.clone(),
                 age: at.elapsed().as_secs(),
                 observations: observations.clone(),
@@ -904,6 +989,16 @@ impl Runtime<'_> {
             deadline,
             &mut self.startup_read,
             None,
+            true,
+            |held, config| {
+                attach_sampler(
+                    self.options,
+                    &mut self.sampler,
+                    &mut self.sampler_retry_at,
+                    held,
+                    config,
+                );
+            },
         ) {
             Ok(machine) => {
                 self.pending_canon = false;
@@ -926,6 +1021,7 @@ impl Runtime<'_> {
                 None
             }
         };
+        self.sync_sampler();
         self.publish_snapshot();
     }
 }
@@ -940,6 +1036,7 @@ impl DaemonDeps for Runtime<'_> {
         Runtime::control_requests(self);
     }
     fn started(&mut self) {
+        self.sync_sampler();
         self.sync_alerts();
         if self.running.is_none() {
             return;
@@ -964,6 +1061,7 @@ impl DaemonDeps for Runtime<'_> {
         }
     }
     fn notify(&mut self, iteration: &Iteration) {
+        self.sync_sampler();
         self.sync_alerts();
         self.snapshot
             .write()
@@ -990,16 +1088,14 @@ impl DaemonDeps for Runtime<'_> {
         self.heartbeat_iteration(true);
     }
     fn shutdown(&mut self) {
-        if let Some((machine, _, _)) = &self.running
-            && let Err(error) = machine.checkpoint_before_shutdown()
-        {
-            eprintln!("scupperd: client activity snapshot: {error}");
-        }
         self.alerts.stop();
         self.running.take();
         if let Err(error) = self.audit.shutdown() {
             eprintln!("scupperd: event flush: {error}");
         }
+        // Keep observing the live device through alert/audit shutdown. The net
+        // unit takes its final quiesced sample only after this process exits.
+        self.sampler.take();
     }
     fn initialize(&mut self) {
         self.startup_read.ready = None;
@@ -1729,6 +1825,14 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)] // Exercise production timeout, retry and handoff ordering together.
     fn production_initialize_retries_only_canon_then_recovers_before_handoff() {
+        for previous in ["down", "down_since", "latch", "local-empty"] {
+            initialize_preserves_client_containment(previous);
+        }
+    }
+
+    #[cfg(feature = "testing")]
+    #[allow(clippy::too_many_lines)] // Exercise initialization with each previous containment checkpoint.
+    fn initialize_preserves_client_containment(previous: &str) {
         use crate::{
             canon::CanonCache,
             system::{ExecError, ExecOutput, ExecTarget, Program, System},
@@ -1777,6 +1881,12 @@ mod tests {
                 args: &[String],
                 _: Duration,
             ) -> Result<ExecOutput, ExecError> {
+                assert!(
+                    !(p == Program::Ip
+                        && args.iter().any(|arg| arg == "wg0")
+                        && args.iter().any(|arg| arg == "up")),
+                    "initialize raised the contained client device before planner safety observation"
+                );
                 if p == Program::Conntrack {
                     self.flushes.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1811,6 +1921,7 @@ mod tests {
                 std::path::PathBuf::from,
             )
             .join("production-initialize")
+            .join(previous)
             .join(std::process::id().to_string());
         std::fs::create_dir_all(&root).unwrap();
         let guard = crate::lock::WriterLock::acquire(&root).unwrap();
@@ -1825,6 +1936,46 @@ mod tests {
             "/../scupper-core/tests/fixtures/site-m2.toml"
         ))
         .to_owned();
+        let site = validate(parse_site(&text).unwrap()).unwrap();
+        let identity = site
+            .gateway(&GatewayId("gw1".into()))
+            .unwrap()
+            .client_tunnel()
+            .identity()
+            .public_key
+            .as_str();
+        let writer = crate::lock::WriterLock::acquire(&root).unwrap();
+        crate::client_sessions::provision(&root, identity, 100, &writer).unwrap();
+        if previous != "local-empty" {
+            crate::client_sessions::activate(&root, &root, identity, 100, &writer).unwrap();
+        }
+        let sessions = root.join("client-sessions.json");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&sessions).unwrap()).unwrap();
+        if previous == "latch" {
+            let quarantine = crate::state::Quarantine {
+                reason: "previous containment".into(),
+                object: "wg0".into(),
+                since_unix: 100,
+                uncertain: false,
+            };
+            StateFile::open(&root, None)
+                .unwrap()
+                .write_repair_state(
+                    &writer,
+                    &crate::state::RepairState {
+                        quarantine: Some(quarantine),
+                        ..crate::state::RepairState::default()
+                    },
+                )
+                .unwrap();
+        } else if previous == "down" {
+            record["down"] = true.into();
+        } else if previous != "local-empty" {
+            record["down_since"] = 100.into();
+        }
+        std::fs::write(&sessions, serde_json::to_vec(&record).unwrap()).unwrap();
+        drop(writer);
         let held = Arc::new(crate::netns::testing::handle().unwrap());
         let (dev, ino) = held.identity();
         let report = BootReport {
@@ -1893,6 +2044,11 @@ mod tests {
                 Instant::now() + wait,
                 inputs,
                 None,
+                previous != "local-empty",
+                |_, _| {
+                    assert_eq!(system.reads.load(Ordering::Relaxed), 0);
+                    assert_eq!(system.flushes.load(Ordering::Relaxed), 1);
+                },
             )
         };
         let error = attempt(&mut inputs, Duration::from_millis(5))
@@ -1907,14 +2063,23 @@ mod tests {
         );
         // No state/version/boot files exist: retry must use the retained inputs.
         std::fs::write(root.join("route-switch"), b"target=exit\ntime=100\n").unwrap();
-        let (_machine, _, _) = attempt(&mut inputs, Duration::from_secs(3)).unwrap();
+        let (machine, _, _) = attempt(&mut inputs, Duration::from_secs(3)).unwrap();
         assert!(inputs.ready.is_none());
         assert_eq!(system.flushes.load(Ordering::Relaxed), 1);
         assert!(!root.join("route-switch").exists());
-        assert!(
-            system.reads.load(Ordering::Relaxed) > 0,
-            "production initialization skipped handoff observation"
-        );
+        if previous == "latch" {
+            assert!(machine.latch().is_some(), "startup lost the planner latch");
+        } else {
+            assert!(
+                system.reads.load(Ordering::Relaxed) > 0,
+                "production initialization skipped handoff observation"
+            );
+        }
+        if previous == "local-empty" {
+            let after: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&sessions).unwrap()).unwrap();
+            assert_eq!(after, record, "CLI-local initialization consumed EMPTY");
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2026,6 +2191,8 @@ pub mod testing {
             origin + Duration::from_secs(5),
             &mut StartupRead::default(),
             None,
+            true,
+            |_, _| {},
         )?;
         Ok(machine.tick())
     }
@@ -2210,6 +2377,8 @@ pub mod testing {
             notify: notify::Notify::disabled(),
             started_event: false,
             running: None,
+            sampler: None,
+            sampler_retry_at: Instant::now(),
             pending_canon: false,
             startup_read: StartupRead::default(),
             probes: probes::Probes::new(options.probe_binary.clone(), origin),
