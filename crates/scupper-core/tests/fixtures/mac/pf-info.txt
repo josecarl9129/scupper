@@ -1,0 +1,14 @@
+Status: Enabled for 0 days 00:42:11           Debug: Urgent
+
+State Table                          Total             Rate
+  current entries                       12
+  searches                           10500           4.1/s
+  inserts                              125           0.0/s
+  removals                             113           0.0/s
+Counters
+  match                               2048           0.8/s
+  bad-offset                             0           0.0/s
+  fragment                               0           0.0/s
+  short                                  0           0.0/s
+  normalize                              0           0.0/s
+  memory                                 0           0.0/s
