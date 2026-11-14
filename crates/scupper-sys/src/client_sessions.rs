@@ -361,12 +361,17 @@ fn is_sealed(root: &Path, gateway: &str, now: u64) -> bool {
     // Precondition: the supervisor lease, sampler-owner lock and session lock
     // exclude every writer during and after clean_stop, until a new opening.
     // In particular, no writer carrying a pre-seal `now` may run after sealing.
-    // A fresh live-UP observation quarantines an unconsumed seal before writers
-    // evaluate this predicate; a destroyed client device cannot still be UP.
+    // A fresh live-UP observation quarantines an unconsumed seal before the
+    // sampler or an opening hook evaluates this predicate.
     // Readers, lifecycle hooks and writer fences share this exact validation.
     sealed_record(root, gateway, now).is_some()
 }
 fn load_current(root: &Path, run: &Path, gateway: &str, now: u64) -> Record {
+    if run.join("client-session-seal-obsolete").exists()
+        && read_raw_record(&path(root)).is_ok_and(|record| record.clean_stop.is_some())
+    {
+        return Record::unknown(gateway, now);
+    }
     if let Some(record) = sealed_record(root, gateway, now) {
         return record;
     }
@@ -414,6 +419,15 @@ pub fn take_history_alert(run: &Path, _guard: &WriterGuard) -> bool {
     std::fs::remove_file(run.join("client-session-history-alert")).is_ok()
 }
 fn load_writer(root: &Path, run: &Path, gateway: &str, now: u64) -> Record {
+    load_writer_with_token(root, run, gateway, now, invalidation(run))
+}
+fn load_writer_with_token(
+    root: &Path,
+    run: &Path,
+    gateway: &str,
+    now: u64,
+    token: String,
+) -> Record {
     if let Some(record) = sealed_record(root, gateway, now) {
         return record;
     }
@@ -426,7 +440,6 @@ fn load_writer(root: &Path, run: &Path, gateway: &str, now: u64) -> Record {
     } else {
         current_path(root, run)
     };
-    let token = invalidation(run);
     let incarnation = match std::fs::read_to_string(root.join("gateway-incarnation")) {
         Ok(value) => value,
         Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
@@ -675,6 +688,11 @@ fn persist_checked(
             .or(Some(record.written_at.saturating_add(LEASE)));
     }
     let saved = save_checked(root, &durable, guard, commit_check).is_ok();
+    // An abandoned generation must not publish a stale runtime fallback either.
+    // Leave the pending barrier in place until a current writer replaces it.
+    if !saved && commit_check().is_err() {
+        return false;
+    }
     if barrier_written && saved {
         let _ = std::fs::remove_file(pending);
         let _ = std::fs::remove_file(fallback);
@@ -695,8 +713,20 @@ fn persist_checked(
         unavailable.unknown_until = Some(record.written_at.saturating_add(LEASE));
         unavailable.unknown_until = record.unknown_until.or(unavailable.unknown_until);
         let fallback_written = serde_json::to_vec(&unavailable).is_ok_and(|bytes| {
-            durable_replace(&RealFs, &fallback, &bytes, 0o600, &|_| Ok(()), &|_| Ok(())).is_ok()
+            durable_replace(&RealFs, &fallback, &bytes, 0o600, &|_| Ok(()), &|step| {
+                if matches!(
+                    step,
+                    crate::fs::DurableStep::FileSynced | crate::fs::DurableStep::DirectorySynced
+                ) {
+                    commit_check()?;
+                }
+                Ok(())
+            })
+            .is_ok()
         });
+        if commit_check().is_err() {
+            return false;
+        }
         if !saved
             && !fallback_written
             && !pending.exists()
@@ -845,9 +875,9 @@ pub fn activate(
     Ok(())
 }
 fn quarantine_history(root: &Path, run: &Path) -> io::Result<()> {
-    // A rejected durable record dominates any older runtime fallback. Revoke
-    // that fallback first, while readers can still see the damaged record, so
-    // its rename cannot expose pre-seal Ready evidence during reconstruction.
+    // A rejected durable record dominates any older runtime fallback. Fallbacks
+    // always contain Unavailable history and an open gap; discard the old one
+    // before starting reconstruction from the quarantined durable record.
     match std::fs::remove_file(run.join("client-sessions-fallback")) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -863,9 +893,10 @@ fn quarantine_history(root: &Path, run: &Path) -> io::Result<()> {
 // including recreation with the same device ID. Never let a later clock step
 // resurrect it and fence the sampler.
 fn quarantine_live_seal(root: &Path, run: &Path, sampled: &io::Result<Snapshot>) -> io::Result<()> {
-    if sampled
-        .as_ref()
-        .is_ok_and(|sample| sample.up && sample.device.is_some())
+    if (run.join("client-session-seal-obsolete").exists()
+        || sampled
+            .as_ref()
+            .is_ok_and(|sample| sample.up && sample.device.is_some()))
         && read_raw_record(&path(root)).is_ok_and(|record| record.clean_stop.is_some())
     {
         quarantine_history(root, run)?;
@@ -881,39 +912,58 @@ pub fn retire_empty(
     run: &Path,
     gateway: &str,
     now: u64,
-    guard: &WriterGuard,
+    _guard: &WriterGuard,
 ) -> io::Result<()> {
-    // Daemonless sites have no sampler to quarantine damage later. Retire it
-    // here, before the bounded opening hook and its timeout fallback.
-    match read_record(&path(root), gateway, now) {
-        Ok(record) if !record.never_served => return Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::InvalidData => {}
-        Err(error) => return Err(error),
-        Ok(_) => {}
+    // All disk reads and writes run off the boot caller. The worker's fast
+    // path avoids lock contention for ordinary non-EMPTY history.
+    let identity = gateway.to_owned();
+    bounded_hook(
+        root,
+        run,
+        gateway,
+        now,
+        Instant::now() + SAMPLE_INTERVAL,
+        HookMode::Retirement,
+        move |root, run, guard, deadline| {
+            let pending = run.join("client-session-retiring");
+            std::fs::write(&pending, b"retiring\n")?;
+            match read_record(&path(root), &identity, now) {
+                Ok(mut record) if record.never_served => {
+                    record.never_served = false;
+                    record.history = History::Unavailable;
+                    record.open_gap(now);
+                    record.unknown_until = Some(now.saturating_add(LEASE));
+                    record.written_at = now;
+                    record.sequence += 1;
+                    save_checked(root, &record, guard, &|| hook_deadline(deadline))?;
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                    quarantine_history(root, run)?;
+                }
+                Err(error) => return Err(error),
+            }
+            // A retry may find the renamed unavailable record after the first
+            // worker exceeded its deadline. Confirm the directory durability
+            // before removing the retirement barrier or permitting service.
+            std::fs::File::open(root)?.sync_all()?;
+            std::fs::remove_file(pending)?;
+            Ok(())
+        },
+    )
+}
+
+fn retirement_needed(root: &Path, run: &Path, gateway: &str, now: u64) -> io::Result<bool> {
+    if run.join("client-session-retiring").exists() {
+        return Ok(true);
     }
-    let _session = crate::lock::WriterLock::acquire_timeout(
-        run.join("client-session-writer"),
-        SAMPLE_INTERVAL,
-    )?;
     match read_record(&path(root), gateway, now) {
-        Ok(mut record) if record.never_served => {
-            record.never_served = false;
-            record.history = History::Unavailable;
-            record.open_gap(now);
-            record.unknown_until = Some(now.saturating_add(LEASE));
-            record.written_at = now;
-            record.sequence += 1;
-            save(root, &record, guard)?;
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-            quarantine_history(root, run)?;
-        }
-        Err(error) => return Err(error),
+        Ok(record) => Ok(record.never_served),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => Ok(true),
+        Err(error) => Err(error),
     }
-    Ok(())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -921,12 +971,14 @@ enum HookMode {
     Opening,
     OpeningLive,
     Containment,
+    Retirement,
     Tracking,
     Probe,
 }
 
 // Storage workers own their lock until all I/O exits. A timed-out caller never
-// joins one; every rename and commit is fenced by the original hook deadline.
+// joins one; checkpoint commits are fenced by the worker deadline and, for
+// live history, its invalidation token. Retirement never publishes Ready.
 #[allow(clippy::too_many_arguments)]
 fn bounded_hook(
     root: &Path,
@@ -938,32 +990,32 @@ fn bounded_hook(
     action: impl FnOnce(&Path, &Path, &WriterGuard, Instant) -> io::Result<()> + Send + 'static,
 ) -> io::Result<()> {
     let reopening = matches!(mode, HookMode::Opening | HookMode::OpeningLive);
-    let deadline = if mode == HookMode::Containment {
-        deadline.min(Instant::now() + Duration::from_millis(150))
+    // Containment has already synchronously invalidated readers. Its durable
+    // intent may finish after the caller returns, using the normal work budget.
+    let caller_deadline = if mode == HookMode::Containment {
+        deadline
+            .checked_sub(SAMPLE_INTERVAL.saturating_sub(Duration::from_millis(150)))
+            .unwrap_or(deadline)
     } else {
         deadline
     };
-    // Reserve a small part of the original deadline for reader notification.
-    // Even notification reads/writes happen off the caller, so a stalled file
-    // operation can never extend the hook's total bound.
     let remaining = deadline.saturating_duration_since(Instant::now());
-    // Containment's runtime-only token needs no fsync. Reserve a small slice
-    // for it rather than halving the already short durable-work allowance.
-    let notify_budget = Duration::from_millis(if mode == HookMode::Containment {
-        25
-    } else {
-        500
-    })
-    .min(remaining / 2);
+    let notify_budget = Duration::from_millis(500).min(remaining / 2);
     let work_deadline = deadline.checked_sub(notify_budget).unwrap_or(deadline);
     let worker_root = root.to_owned();
     let worker_run = run.to_owned();
+    let worker_gateway = gateway.to_owned();
     let (send, receive) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("scupper-session-hook".into())
         .spawn(move || {
             let result = (|| {
                 hook_deadline(work_deadline)?;
+                if mode == HookMode::Retirement
+                    && !retirement_needed(&worker_root, &worker_run, &worker_gateway, now)?
+                {
+                    return Ok(());
+                }
                 if reopening {
                     std::fs::write(
                         worker_run.join("client-session-opening"),
@@ -972,13 +1024,7 @@ fn bounded_hook(
                 }
                 let guard = crate::lock::WriterLock::acquire_timeout(
                     worker_run.join("client-session-writer"),
-                    if mode == HookMode::Containment {
-                        // Containment must never queue behind a sampler or an
-                        // abandoned storage writer, even for a single poll.
-                        Duration::ZERO
-                    } else {
-                        work_deadline.saturating_duration_since(Instant::now())
-                    },
+                    work_deadline.saturating_duration_since(Instant::now()),
                 )?;
                 hook_deadline(work_deadline)?;
                 action(&worker_root, &worker_run, &guard, work_deadline)?;
@@ -990,24 +1036,20 @@ fn bounded_hook(
             })();
             let _ = send.send(result);
         })?;
-    let error = match receive.recv_timeout(work_deadline.saturating_duration_since(Instant::now()))
+    let wait_deadline = caller_deadline.min(work_deadline);
+    let error = match receive.recv_timeout(wait_deadline.saturating_duration_since(Instant::now()))
     {
         Ok(Ok(())) => return Ok(()),
         Ok(Err(error)) => error,
+        // The non-ready token is already visible. Acceptance does not depend
+        // on whether normal disk latency happens to fit the caller budget.
+        Err(_) if mode == HookMode::Containment => return Ok(()),
         Err(_) => io::Error::new(io::ErrorKind::TimedOut, "client lifecycle hook deadline"),
     };
-    if mode == HookMode::Probe {
-        // Surface timeout to the caller: an abandoned worker may have consumed
-        // the pending bit just before its deadline. This must be counted/logged
-        // as a missed probe, never silently reported as success.
-        count_missed_probe();
+    if matches!(mode, HookMode::Probe | HookMode::Containment) {
+        // Probe accounting belongs to the owner of the committed pending bit.
         return Err(error);
     }
-    let notification_deadline = if mode == HookMode::Containment {
-        deadline.min(Instant::now() + Duration::from_millis(100))
-    } else {
-        deadline
-    };
     let notification_gateway = gateway.to_owned();
     let notification_root = root.to_owned();
     let notification_run = run.to_owned();
@@ -1015,11 +1057,14 @@ fn bounded_hook(
     std::thread::Builder::new()
         .name("scupper-session-invalidate".into())
         .spawn(move || {
-            let result = if matches!(mode, HookMode::Containment | HookMode::OpeningLive) {
-                // Containment never reads durable history on its failure path.
-                // For OpeningLive, fresh UP proves the seal obsolete; the
-                // sampler quarantines it before evaluating any writer fence.
-                invalidate_runtime(&notification_run, now)
+            let result = if mode == HookMode::OpeningLive {
+                // Remember this live proof even if wg0 goes down before the
+                // sampler or another opening hook can quarantine the seal.
+                std::fs::write(
+                    notification_run.join("client-session-seal-obsolete"),
+                    b"obsolete\n",
+                )
+                .and_then(|()| invalidate_runtime(&notification_run, now))
             } else {
                 invalidate_for_reopening(
                     &notification_root,
@@ -1038,7 +1083,7 @@ fn bounded_hook(
             let _ = send.send(result);
         })?;
     let notified = receive
-        .recv_timeout(notification_deadline.saturating_duration_since(Instant::now()))
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
         .unwrap_or_else(|_| {
             Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -1052,6 +1097,27 @@ fn bounded_hook(
     }
 }
 
+// 0: waiting, 1: committed, 2: caller abandoned. The side that observes
+// the other side's transition accounts for a consumed but unsent opportunity.
+fn probe_committed(state: &std::sync::atomic::AtomicU8) {
+    if state.swap(1, std::sync::atomic::Ordering::AcqRel) == 2 {
+        count_missed_probe();
+    }
+}
+fn probe_persistence_result(
+    result: io::Result<()>,
+    state: &std::sync::atomic::AtomicU8,
+) -> io::Result<bool> {
+    if let Err(error) = result {
+        if state.swap(2, std::sync::atomic::Ordering::AcqRel) == 1 {
+            // The bit was committed before the caller timed out. The reserved
+            // child budget can still send it, regardless of the worker result.
+            return Ok(true);
+        }
+        return Err(error);
+    }
+    Ok(state.load(std::sync::atomic::Ordering::Acquire) == 1)
+}
 static MISSED_PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn count_missed_probe() {
     let count = MISSED_PROBES
@@ -1092,13 +1158,16 @@ fn invalidate_for_reopening(root: &Path, run: &Path, gateway: &str, now: u64) ->
     invalidate_runtime(run, now)
 }
 fn invalidate_runtime(run: &Path, now: u64) -> io::Result<()> {
+    invalidate_runtime_token(run, now).map(|_| ())
+}
+fn invalidate_runtime_token(run: &Path, now: u64) -> io::Result<String> {
     let token = format!("{now}:{}", new_incarnation()?);
     let file = run.join("client-session-invalidation");
     std::fs::write(&file, &token)?;
     if std::fs::read_to_string(file)? != token {
         return Err(io::Error::other("readiness invalidation was superseded"));
     }
-    Ok(())
+    Ok(token)
 }
 fn samples(sys: &dyn System, held: &NetnsHandle, iface: &str) -> io::Result<Snapshot> {
     match sys.client_session_io(
@@ -1237,7 +1306,8 @@ fn reset(
     record.down = true;
     record.written_at = now;
 }
-/// Save reset intent before containment, without waiting for telemetry.
+/// Invalidate readers before containment, without waiting for telemetry.
+/// Accepted intent may finish saving within 4.5 seconds after this hook returns.
 /// # Errors
 /// History failures are exposed as unavailable evidence and do not block containment.
 pub fn before_down(
@@ -1249,9 +1319,18 @@ pub fn before_down(
 ) -> io::Result<()> {
     let deadline = Instant::now() + SAMPLE_INTERVAL;
     let now = sys.now_unix_secs();
+    // Publish non-ready before queuing disk work or allowing LinkDown. Loading
+    // against the prior token preserves healthy history across our own intent;
+    // committing against the new token fences every later generation.
+    let previous_token = invalidation(run);
+    // A containment request also makes any unconsumed seal obsolete, even
+    // when no sampler ever observed an externally raised device before DOWN.
+    let notified = std::fs::write(run.join("client-session-seal-obsolete"), b"obsolete\n")
+        .and_then(|()| invalidate_runtime_token(run, now));
+    let token = notified.as_ref().unwrap_or(&previous_token).clone();
     let hook_gateway = gateway.to_owned();
     let gateway = gateway.to_owned();
-    bounded_hook(
+    let result = bounded_hook(
         root,
         run,
         &hook_gateway,
@@ -1269,7 +1348,8 @@ pub fn before_down(
                 history_alert(run);
                 // load_writer quarantines invalid history and starts reconstruction.
             }
-            let mut record = load_writer(root, run, gateway, now);
+            let mut record = load_writer_with_token(root, run, gateway, now, previous_token);
+            record.invalidation = token;
             let now = now.max(record.written_at);
             if record.clean_stop.is_some() {
                 return Ok(());
@@ -1283,7 +1363,8 @@ pub fn before_down(
             }
             Ok(())
         },
-    )
+    );
+    result.and(notified.map(|_| ()))
 }
 /// Capture preserved counters after `LinkDown`, including a command timeout.
 /// # Errors
@@ -2074,6 +2155,11 @@ pub(crate) fn seal_clean_stop(
     // This durable checkpoint is independent of this boot's /run token.
     record.invalidation.clear();
     save(root, &record, guard)?;
+    match std::fs::remove_file(run.join("client-session-seal-obsolete")) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
     publish_readiness(run, &record, true);
     Ok(())
 }
@@ -2105,10 +2191,10 @@ pub fn probe_pending(
     {
         return Ok(());
     }
-    let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ready = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
     let worker_ready = ready.clone();
     let hook_gateway = identity.clone();
-    bounded_hook(
+    let persisted = bounded_hook(
         root,
         run,
         &hook_gateway,
@@ -2131,20 +2217,22 @@ pub fn probe_pending(
             if persist_checked(root, run, &record, guard, &|| {
                 sample_commit_check(root, run, &record, deadline)
             }) {
-                worker_ready.store(true, std::sync::atomic::Ordering::Release);
+                probe_committed(&worker_ready);
             }
             Ok(())
         },
-    )?;
-    if Instant::now() >= persistence_deadline {
+    );
+    if !probe_persistence_result(persisted, &ready)? {
+        return Ok(());
+    }
+    // Persistence has its own deadline so the reserved child budget remains
+    // available. Crossing that deadline after commit does not cancel the send.
+    if Instant::now() >= deadline {
         count_missed_probe();
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
-            "client probe persistence deadline",
+            "client probe send deadline",
         ));
-    }
-    if !ready.load(std::sync::atomic::Ordering::Acquire) {
-        return Ok(());
     }
     let destinations = site
         .devices()
@@ -2380,6 +2468,22 @@ mod tests {
             )
             .unwrap();
         }
+        fn before_down_committed(&self, run: &Path) {
+            before_down(&self.sys, &self.root, run, ID, &self.guard).unwrap();
+            let deadline = Instant::now() + SAMPLE_INTERVAL;
+            loop {
+                let worker =
+                    WriterLock::acquire_timeout(run.join("client-session-writer"), SAMPLE_INTERVAL)
+                        .unwrap();
+                let record = self.state();
+                if record.down_since.is_some() || record.clean_stop.is_some() {
+                    break;
+                }
+                drop(worker);
+                assert!(Instant::now() < deadline, "down intent did not commit");
+                std::thread::yield_now();
+            }
+        }
         fn down(&self) {
             link_down(
                 &self.sys,
@@ -2435,12 +2539,12 @@ mod tests {
         fn drop(&mut self) {
             // Bounded hooks may return while their fenced worker is unwinding.
             // Keep the fixture alive until ordinary local I/O has released it.
-            let _worker = WriterLock::acquire_timeout(
+            if let Ok(_worker) = WriterLock::acquire_timeout(
                 self.root.join("client-session-writer"),
                 Duration::from_secs(2),
-            )
-            .unwrap();
-            std::fs::remove_dir_all(&self.root).unwrap();
+            ) {
+                let _ = std::fs::remove_dir_all(&self.root);
+            }
         }
     }
     #[test]
@@ -2987,8 +3091,12 @@ mod tests {
         assert!(!rig.status().unknown);
         let _lock = WriterLock::try_acquire(rig.root.join("client-session-writer")).unwrap();
         let started = Instant::now();
-        assert!(before_down(&rig.sys, &rig.root, &rig.root, ID, &rig.guard).is_err());
-        assert!(started.elapsed() < Duration::from_millis(200));
+        before_down(&rig.sys, &rig.root, &rig.root, ID, &rig.guard).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "elapsed: {:?}",
+            started.elapsed()
+        );
         assert_ne!(invalidation(&rig.root), "");
         assert!(rig.status().unknown);
         assert_eq!(
@@ -2998,7 +3106,7 @@ mod tests {
     }
 
     #[test]
-    fn containment_disk_stall_is_bounded_and_invalidates_before_link_down() {
+    fn slow_containment_commits_after_caller_budget_and_recovers_without_a_gap() {
         let rig = Rig::new();
         rig.up();
         rig.authenticate();
@@ -3013,19 +3121,72 @@ mod tests {
             }),
         );
         let started = Instant::now();
-        assert!(before_down(&rig.sys, &rig.root, &rig.root, ID, &rig.guard).is_err());
+        before_down(&rig.sys, &rig.root, &rig.root, ID, &rig.guard).unwrap();
         assert!(started.elapsed() < Duration::from_millis(300));
         entry.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(rig.status().unknown);
         assert_ne!(invalidation(&rig.root), "");
         fsync_hooks().lock().unwrap().remove(&rig.root);
         release.send(()).unwrap();
-        // Wait for the abandoned storage worker before deleting its fixture.
-        let _worker = WriterLock::acquire_timeout(
+        // The accepted worker must finish its durable intent after caller return.
+        let worker = WriterLock::acquire_timeout(
             rig.root.join("client-session-writer"),
             Duration::from_secs(1),
         )
         .unwrap();
+        assert_eq!(rig.state().down_since, Some(1001));
+        assert_eq!(rig.state().history, History::Available);
+        assert!(rig.state().gaps.is_empty());
+        drop(worker);
+        rig.up();
+        assert!(rig.status().active_reset);
+        assert!(!rig.status().unknown);
+        rig.authenticate();
+        assert_eq!(rig.status(), ClientSessions::default());
+    }
+
+    #[test]
+    fn stalled_containment_stays_nonready_and_cannot_commit_after_supersession() {
+        let rig = Rig::new();
+        rig.up();
+        rig.authenticate();
+        let original = std::fs::read(path(&rig.root)).unwrap();
+        let (entered, entry) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let released = std::sync::Mutex::new(released);
+        fsync_hooks().lock().unwrap().insert(
+            rig.root.clone(),
+            std::sync::Arc::new(move || {
+                let _ = entered.send(());
+                let _ = released.lock().unwrap().recv();
+            }),
+        );
+        let started = Instant::now();
+        before_down(&rig.sys, &rig.root, &rig.root, ID, &rig.guard).unwrap();
+        assert!(started.elapsed() < Duration::from_millis(300));
+        entry.recv_timeout(Duration::from_secs(1)).unwrap();
+        for now in [1001, 1300, 5000] {
+            rig.sys.now.set(now);
+            let started = Instant::now();
+            assert!(rig.status().unknown);
+            assert_eq!(
+                cached_reason(&rig.root, now),
+                Some(scupper_proto::SessionReason::ClientSessionsUnknown)
+            );
+            assert!(started.elapsed() < Duration::from_millis(300));
+        }
+        // A later generation wins even if the old disk operation eventually exits.
+        invalidate_runtime(&rig.root, 5000).unwrap();
+        fsync_hooks().lock().unwrap().remove(&rig.root);
+        release.send(()).unwrap();
+        let _worker = WriterLock::acquire_timeout(
+            rig.root.join("client-session-writer"),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(path(&rig.root)).unwrap(), original);
+        assert!(!rig.root.join("client-sessions-fallback").exists());
+        assert!(rig.status().unknown);
     }
 
     #[test]
@@ -3082,18 +3243,19 @@ mod tests {
     }
 
     #[test]
-    fn probe_timeout_after_pending_bit_commit_counts_the_missed_probe() {
+    fn probe_timeout_after_pending_bit_commit_preserves_send_opportunity() {
         let rig = Rig::new();
         rig.up();
         rig.authenticate();
-        let count = MISSED_PROBES.load(Ordering::Relaxed);
+        let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let worker_state = state.clone();
         let (release, released) = std::sync::mpsc::channel();
         let result = bounded_hook(
             &rig.root,
             &rig.root,
             ID,
             1001,
-            Instant::now() + Duration::from_millis(200),
+            Instant::now() + EXEC_TIMEOUT + Duration::from_millis(200),
             HookMode::Probe,
             move |root, run, guard, deadline| {
                 let mut record = load_writer(root, run, ID, 1001);
@@ -3101,17 +3263,35 @@ mod tests {
                 assert!(persist_checked(root, run, &record, guard, &|| {
                     sample_commit_check(root, run, &record, deadline)
                 }));
+                probe_committed(&worker_state);
                 // The commit won the race but its result has not reached the
-                // caller before timeout, so no datagram will be sent.
+                // caller before timeout; its ready flag must preserve the send.
                 released.recv().unwrap();
                 Ok(())
             },
         );
-        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        let result = probe_persistence_result(result, &state);
+        assert!(
+            result.unwrap(),
+            "committed work can use the reserved send budget"
+        );
         assert!(!rig.state().probe_pending);
         assert_eq!(rig.sys.sends.get(), 0);
-        assert!(MISSED_PROBES.load(Ordering::Relaxed) > count);
         release.send(()).unwrap();
+    }
+
+    #[test]
+    fn abandoned_probe_counts_only_a_later_consumed_pending_bit() {
+        let count = MISSED_PROBES.load(Ordering::Relaxed);
+        let state = std::sync::atomic::AtomicU8::new(0);
+        assert!(probe_persistence_result(Err(io::ErrorKind::TimedOut.into()), &state).is_err());
+        assert_eq!(
+            MISSED_PROBES.load(Ordering::Relaxed),
+            count,
+            "retained pending work is retried, not missed"
+        );
+        probe_committed(&state);
+        assert!(MISSED_PROBES.load(Ordering::Relaxed) > count);
     }
 
     #[test]
@@ -3165,7 +3345,7 @@ mod tests {
         let rig = Rig::new();
         rig.up();
         rig.authenticate();
-        before_down(&rig.sys, &rig.root, &rig.root, ID, &rig.guard).unwrap();
+        rig.before_down_committed(&rig.root);
         link_down(
             &rig.sys, &rig.held, "wg0", &rig.root, &rig.root, ID, &rig.guard, false,
         )
@@ -3449,7 +3629,7 @@ mod tests {
         rig.up();
         rig.authenticate();
         let old = rig.state().peers[0].clone();
-        before_down(&rig.sys, &rig.root, &rig.root, ID, &rig.guard).unwrap();
+        rig.before_down_committed(&rig.root);
         assert!(
             rig.status().unknown,
             "intent immediately withholds readiness"
@@ -3487,7 +3667,7 @@ mod tests {
             if recorded_down {
                 rig.down();
             } else {
-                before_down(&rig.sys, &rig.root, &rig.root, ID, &rig.guard).unwrap();
+                rig.before_down_committed(&rig.root);
             }
             // A down/up preserves the old handshake and counters. No before_up.
             rig.sys.up.set(true);
@@ -3510,7 +3690,7 @@ mod tests {
     fn outstanding_down_intent_is_nonready_without_any_leased_peers() {
         let rig = Rig::new();
         rig.up();
-        before_down(&rig.sys, &rig.root, &rig.root, ID, &rig.guard).unwrap();
+        rig.before_down_committed(&rig.root);
         let state = status(&rig.sys, &rig.held, "wg0", &rig.root, &rig.root, ID, &[]).unwrap();
         assert!(state.unknown);
     }
@@ -3575,7 +3755,7 @@ mod tests {
             )
             .is_err()
         );
-        before_down(&rig.sys, &rig.root, &run, ID, &rig.guard).unwrap();
+        rig.before_down_committed(&run);
         link_down(
             &rig.sys, &rig.held, "wg0", &rig.root, &run, ID, &rig.guard, true,
         )
@@ -3932,8 +4112,30 @@ mod tests {
     }
 
     #[test]
-    fn quarantine_never_exposes_older_ready_runtime_fallback() {
-        for damage in ["live-seal", "future-seal", "corrupt"] {
+    fn production_fallback_always_has_unavailable_history_and_an_open_gap() {
+        let rig = Rig::new();
+        rig.up();
+        rig.authenticate();
+        assert_eq!(rig.status(), ClientSessions::default());
+        let record = rig.state();
+        let backup = rig.root.join("old-ready.json");
+        std::fs::rename(path(&rig.root), &backup).unwrap();
+        std::os::unix::fs::symlink(&backup, path(&rig.root)).unwrap();
+        assert!(!persist(&rig.root, &rig.root, &record, &rig.guard));
+        let fallback = read_record(&rig.root.join("client-sessions-fallback"), ID, 1001).unwrap();
+        assert_eq!(fallback.history, History::Unavailable);
+        assert!(fallback.gaps.last().is_some_and(|gap| gap.end.is_none()));
+        assert!(rig.status().unknown);
+        std::fs::remove_file(path(&rig.root)).unwrap();
+        assert!(
+            rig.status().unknown,
+            "removing durable history cannot expose Ready"
+        );
+    }
+
+    #[test]
+    fn obsolete_live_seal_is_not_consumed_after_link_down_without_a_sample() {
+        for fallback_open in [false, true] {
             let rig = Rig::new();
             *rig.sys.device.borrow_mut() = Some(DeviceId {
                 boot: "boot-a".into(),
@@ -3941,8 +4143,6 @@ mod tests {
             });
             rig.up();
             rig.authenticate();
-            assert_eq!(rig.status(), ClientSessions::default());
-            let ready = std::fs::read(path(&rig.root)).unwrap();
             seal_clean_stop(
                 &rig.root,
                 &rig.root,
@@ -3952,31 +4152,38 @@ mod tests {
                 &rig.guard,
             )
             .unwrap();
-            let fallback = rig.root.join("client-sessions-fallback");
-            std::fs::write(&fallback, ready).unwrap();
-            match damage {
-                "future-seal" => rig.sys.now.set(999),
-                "corrupt" => std::fs::write(path(&rig.root), b"broken history").unwrap(),
-                "live-seal" => {}
-                _ => unreachable!(),
+            let sealed = std::fs::read(path(&rig.root)).unwrap();
+            if fallback_open {
+                let lock = WriterLock::try_acquire(rig.root.join("client-session-writer")).unwrap();
+                before_up_until(
+                    &rig.sys,
+                    &rig.held,
+                    "wg0",
+                    &rig.root,
+                    &rig.root,
+                    ID,
+                    false,
+                    &rig.guard,
+                    Instant::now() + EXEC_TIMEOUT + Duration::from_millis(40),
+                    false,
+                )
+                .unwrap();
+                assert!(rig.root.join("client-session-seal-obsolete").exists());
+                drop(lock);
             }
-            if damage != "corrupt" {
-                assert!(rig.status().unknown);
-            }
-            if damage != "live-seal" {
-                // Daemonless retirement must also revoke an older fallback
-                // before its missing durable file permits the opening fallback.
-                retire_empty(&rig.root, &rig.root, ID, rig.sys.now.get(), &rig.guard).unwrap();
-                assert!(rig.status().unknown);
-                assert!(!fallback.exists());
-            }
+            // No sampler sees this external UP window before the planner lowers wg0.
+            rig.sys.up.set(false);
+            rig.before_down_committed(&rig.root);
+            rig.down();
             rig.sys.now.set(1002);
-            rig.checkpoint();
-            assert!(!fallback.exists());
-            assert!(rig.root.join("client-sessions.unavailable.json").exists());
+            rig.up();
+            assert_eq!(
+                std::fs::read(rig.root.join("client-sessions.unavailable.json")).unwrap(),
+                sealed
+            );
             assert!(rig.state().clean_stop.is_none());
-            assert!(rig.status().unknown, "{damage}");
-            assert_eq!(rig.state().peers[0].state, SessionState::Unknown);
+            assert_eq!(rig.state().history, History::Unavailable);
+            assert!(rig.status().unknown);
         }
     }
 
@@ -4256,7 +4463,7 @@ mod tests {
         rig.up();
         rig.authenticate();
         assert_eq!(cached_reason(&rig.root, 1001), None);
-        before_down(&rig.sys, &rig.root, &rig.root, ID, &rig.guard).unwrap();
+        rig.before_down_committed(&rig.root);
         assert_eq!(
             cached_reason(&rig.root, 1001),
             Some(scupper_proto::SessionReason::ClientSessionsUnknown)
@@ -4361,7 +4568,7 @@ mod tests {
         rig.up();
         rig.authenticate();
         let original = rig.state().peers[0].clone();
-        before_down(&rig.sys, &rig.root, &rig.root, ID, &rig.guard).unwrap();
+        rig.before_down_committed(&rig.root);
         rig.sys.now.set(1002);
         rig.sys.sample.borrow_mut().rx += 124;
         rig.checkpoint(); // still UP, between hook and command: abandoned reset

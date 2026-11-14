@@ -333,7 +333,8 @@ fn concurrent_emit_preserves_unique_sequence_and_file_order() {
         .collect();
     assigned.sort_unstable();
     assert_eq!(assigned, (1..=800).collect::<Vec<_>>());
-    flush(&handle);
+    // 800 fsyncs can exceed the usual small-test deadline on a shared CI disk.
+    handle.flush_blocking(Duration::from_secs(30)).unwrap();
     let text = fs::read_to_string(dir.0.join("events/1970-01.jsonl")).unwrap();
     let persisted: Vec<u64> = text
         .lines()

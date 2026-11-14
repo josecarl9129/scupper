@@ -170,7 +170,7 @@ fn record(log: &Path, protocol: &str, marker: &str, peer: SocketAddr) -> Result<
     file.write_all(line.as_bytes())?;
     Ok(())
 }
-fn valid_marker(text: &str) -> bool {
+pub(super) fn valid_marker(text: &str) -> bool {
     text.starts_with("scupper-canary-")
         && text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
         && text.len() <= 128

@@ -165,14 +165,21 @@ pub(super) fn configure(
                 continue;
             }
             if daemonless_empty && !cfg.site.health().require_daemon() {
-                crate::client_sessions::retire_empty(
-                    deps.state_root,
-                    deps.run_root,
-                    gw.client_tunnel().identity().public_key.as_str(),
-                    deps.system.now_unix_secs(),
-                    guard,
-                )
-                .map_err(|_| "daemonless EMPTY retirement failed".to_string())?;
+                let retire = || {
+                    crate::client_sessions::retire_empty(
+                        deps.state_root,
+                        deps.run_root,
+                        gw.client_tunnel().identity().public_key.as_str(),
+                        deps.system.now_unix_secs(),
+                        guard,
+                    )
+                };
+                // A sampler finishing an old write, or a delayed directory sync,
+                // must get another bounded opportunity before boot gives up.
+                if retire().is_err() && retire().is_err() {
+                    set_up(deps, handle, name, false)?;
+                    return Err("daemonless EMPTY retirement failed after retry".into());
+                }
             }
             crate::client_sessions::before_up(
                 deps.system,
@@ -185,16 +192,15 @@ pub(super) fn configure(
                 guard,
             )
             .map_err(|_| "client session baseline unavailable".to_string())?;
-            set_up(
-                deps,
-                handle,
-                name,
-                crate::client_sessions::may_serve(
-                    deps.state_root,
-                    gw.client_tunnel().identity().public_key.as_str(),
-                    deps.system.now_unix_secs(),
-                ),
-            )?;
+            let may_serve = crate::client_sessions::may_serve(
+                deps.state_root,
+                gw.client_tunnel().identity().public_key.as_str(),
+                deps.system.now_unix_secs(),
+            );
+            set_up(deps, handle, name, may_serve)?;
+            if daemonless_empty && !cfg.site.health().require_daemon() && !may_serve {
+                return Err("daemonless client device cannot serve after opening hook".into());
+            }
         } else {
             configure_body(deps, handle, cfg, name, up, true)?;
         }

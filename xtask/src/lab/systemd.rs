@@ -688,7 +688,13 @@ impl SystemdLab {
         let started = Instant::now();
         // 180 s complete sampling + 15 s first sample + 30 s startup/check
         // allowance + 15 s runner slack. Keep both configured clients active.
-        let _traffic = self.lab.recovery_traffic("systemd-ready")?;
+        // Pre-join install checks have no client tunnels or sinks yet. This
+        // flag is set only after both client wg0 interfaces and routes are up.
+        let mut traffic = if self.lab.client_ports_ready {
+            Some(self.lab.recovery_traffic("systemd-ready")?)
+        } else {
+            None
+        };
         let until = started + Duration::from_secs(240);
         self.lab.runner.phase = self.lab.runner.phase.max(until).min(self.lab.runner.whole);
         loop {
@@ -709,6 +715,9 @@ impl SystemdLab {
                 )?;
             }
             if status.code() == Some(0) {
+                if let Some(traffic) = &mut traffic {
+                    self.lab.assert_recovery_served(traffic)?;
+                }
                 break;
             }
             if Instant::now() >= until {

@@ -2,9 +2,9 @@
 //! overlays confine its fixed production roots to the lab's private directory.
 use super::{
     Lab, Result,
-    command::Invocation,
+    command::{Group, Invocation},
     evidence::{self, Row},
-    fail,
+    fail, helpers,
 };
 use scupper_core::{
     config::{DurationStr, GatewayId, HealthSettings, parse_site, validate},
@@ -18,8 +18,10 @@ use scupper_sys::{
 use sha2::{Digest, Sha256};
 use std::{
     fs,
+    io::{Read, Seek, SeekFrom},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 // Keep /run/netns propagation intact. Isolate only the two overlay destinations
@@ -89,6 +91,66 @@ fn session_recovery_pending(code: i32, report: &serde_json::Value) -> bool {
                 )
             })
         })
+}
+
+// Keep marker identities and their reply logs with the process guards so every
+// recovery caller (including daemon cases) uses the same served-traffic oracle.
+pub(super) struct RecoveryFlow {
+    ns: &'static str,
+    marker: String,
+    log: PathBuf,
+    process: Group,
+}
+
+fn recovery_markers() -> Result<[(&'static str, String); 2]> {
+    Ok([("client", Lab::marker()?), ("client2", Lab::marker()?)])
+}
+
+fn log_size(path: &Path) -> Result<u64> {
+    match fs::metadata(path) {
+        Ok(meta) => Ok(meta.len()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error.into()),
+    }
+}
+
+// Only complete records begun after the checkpoint count. A writer may have
+// been halfway through a record at check exit, or still be appending its tail.
+fn fresh_log(path: &Path, offset: u64) -> Result<String> {
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(error) => return Err(error.into()),
+    };
+    if file.metadata()?.len() < offset {
+        return fail(format!("recovery log was truncated: {}", path.display()));
+    }
+    file.seek(SeekFrom::Start(offset.saturating_sub(1)))?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    let tail = if offset == 0 {
+        text.as_str()
+    } else {
+        text.split_once('\n').map_or("", |(_, tail)| tail)
+    };
+    Ok(tail
+        .rsplit_once('\n')
+        .map_or("", |(complete, _)| complete)
+        .to_owned())
+}
+
+fn recovery_served(marker: &str, sink: &str, flow: &str) -> Result<(bool, bool)> {
+    let receipt = helpers::receipts(sink)?.iter().any(|receipt| {
+        receipt.marker == marker
+            && receipt.protocol == "udp"
+            && receipt.peer.ip().to_string() == super::addresses::A.provider.peer
+    });
+    let mut reply = false;
+    for line in flow.lines() {
+        let value: serde_json::Value = serde_json::from_str(line)?;
+        reply |= value["received"].as_u64().is_some_and(|n| n > 0);
+    }
+    Ok((receipt, reply))
 }
 
 impl Lab {
@@ -294,25 +356,71 @@ impl Lab {
 
     // 180 s reconstruction + 15 s first-sample bound + 30 s check/startup
     // allowance + 15 s runner slack. Traffic continues for both configured peers.
-    pub(super) fn recovery_traffic(&mut self, stem: &str) -> Result<Vec<super::command::Group>> {
+    pub(super) fn recovery_traffic(&mut self, stem: &str) -> Result<Vec<RecoveryFlow>> {
         let mut flows = Vec::new();
-        for ns in ["client", "client2"] {
-            flows.push(self.daemon_flow(
-                "udp",
+        for (ns, marker) in recovery_markers()? {
+            let stem = format!("session-recovery-{stem}-{ns}");
+            let process = self.daemon_flow("udp", ns, &marker, &stem, 240)?;
+            flows.push(RecoveryFlow {
                 ns,
-                &format!("session-recovery-{stem}-{ns}"),
-                &format!("session-recovery-{stem}-{ns}"),
-                240,
-            )?);
+                marker,
+                log: self.artifacts.join(format!("{stem}-udp.jsonl")),
+                process,
+            });
         }
         Ok(flows)
+    }
+
+    // Called only after observing check exit 0. Snapshot all logs at that point:
+    // neither pre-recovery receipts nor replies can satisfy this assertion.
+    pub(super) fn assert_recovery_served(&mut self, flows: &mut [RecoveryFlow]) -> Result<()> {
+        let sink = self.artifacts.join("sink.jsonl");
+        let sink_offset = log_size(&sink)?;
+        let offsets = flows
+            .iter()
+            .map(|flow| log_size(&flow.log))
+            .collect::<Result<Vec<_>>>()?;
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            self.ensure_services().map_err(|error| {
+                format!("false 0: check exited 0 but recovery service failed: {error}")
+            })?;
+            let receipts = fresh_log(&sink, sink_offset)?;
+            let mut missing = Vec::new();
+            for (flow, offset) in flows.iter_mut().zip(&offsets) {
+                flow.process.alive().map_err(|error| {
+                    format!(
+                        "false 0: check exited 0 but {} recovery flow failed: {error}",
+                        flow.ns
+                    )
+                })?;
+                let (receipt, reply) =
+                    recovery_served(&flow.marker, &receipts, &fresh_log(&flow.log, *offset)?)?;
+                if !receipt || !reply {
+                    missing.push(format!(
+                        "{} marker {}: sink receipt={receipt}, flow received>0={reply}",
+                        flow.ns, flow.marker
+                    ));
+                }
+            }
+            if missing.is_empty() {
+                return Ok(());
+            }
+            if Instant::now() >= until {
+                return fail(format!(
+                    "false 0: check exited 0 without served recovery traffic from both clients within 5 s after exit: {}",
+                    missing.join("; ")
+                ));
+            }
+            self.runner.dwell(Duration::from_millis(50))?;
+        }
     }
     pub(super) fn wait_session_recovery(
         &mut self,
         binary: &Path,
         root: &Path,
     ) -> Result<(i32, serde_json::Value)> {
-        let _traffic = self.recovery_traffic("check")?;
+        let mut traffic = self.recovery_traffic("check")?;
         let started = std::time::Instant::now();
         let until = started + std::time::Duration::from_secs(240);
         self.runner.phase = self.runner.phase.max(until).min(self.runner.whole);
@@ -322,6 +430,7 @@ impl Lab {
                 if result.0 == 0 {
                     result.1["session_time_to_0_ms"] =
                         serde_json::json!(started.elapsed().as_millis());
+                    self.assert_recovery_served(&mut traffic)?;
                 }
                 return Ok(result);
             }
@@ -541,6 +650,102 @@ fn parse_check_output(
 mod tests {
     use super::{CHECK, parse_check_output, session_recovery_pending, verdict_matches};
     use serde_json::json;
+
+    #[test]
+    fn daemon_flow_markers_satisfy_sink_contract() -> super::Result<()> {
+        // Ordinary daemon_flow callers use Lab::marker; recovery callers use
+        // this builder. Validate both against the actual sink's contract.
+        for _ in 0..32 {
+            assert!(super::helpers::valid_marker(&super::Lab::marker()?));
+            let markers = super::recovery_markers()?;
+            assert_eq!(markers[0].0, "client");
+            assert_eq!(markers[1].0, "client2");
+            assert_ne!(markers[0].1, markers[1].1);
+            for (_, marker) in markers {
+                assert!(super::helpers::valid_marker(&marker), "{marker}");
+            }
+        }
+        assert!(!super::helpers::valid_marker(
+            "session-recovery-check-client"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_requires_each_clients_udp_receipt_and_positive_reply() -> super::Result<()> {
+        let markers = super::recovery_markers()?;
+        let receipt = |marker: &str, protocol: &str, peer: &str| {
+            json!({"marker":marker,"protocol":protocol,"peer":peer}).to_string()
+        };
+        let sink = receipt(&markers[0].1, "udp", "192.0.2.6:12345");
+        let nat = format!("{}:12345", super::super::addresses::A.provider.peer);
+        let sink = format!("{sink}\n{}", receipt(&markers[0].1, "udp", &nat));
+        let reply = "{\"received\":48,\"sent\":48}";
+        assert_eq!(
+            super::recovery_served(&markers[0].1, &sink, reply)?,
+            (true, true)
+        );
+        // Serving client alone cannot prove client2 was served.
+        assert_eq!(
+            super::recovery_served(&markers[1].1, &sink, reply)?,
+            (false, true)
+        );
+        let both = format!("{sink}\n{}", receipt(&markers[1].1, "udp", &nat));
+        for (_, marker) in &markers {
+            assert_eq!(super::recovery_served(marker, &both, reply)?, (true, true));
+            assert_eq!(
+                super::recovery_served(marker, &both, "{\"received\":0}")?,
+                (true, false)
+            );
+            assert_eq!(super::recovery_served(marker, &both, "")?, (true, false));
+            for invalid in [
+                receipt(marker, "tcp", &nat),
+                receipt(marker, "udp", "192.0.2.6:12345"),
+                String::new(),
+            ] {
+                assert_eq!(
+                    super::recovery_served(marker, &invalid, reply)?,
+                    (false, true)
+                );
+            }
+        }
+        assert!(super::recovery_served(&markers[0].1, "bad JSON", reply).is_err());
+        assert!(super::recovery_served(&markers[0].1, &both, "bad JSON").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_evidence_excludes_pre_zero_and_partial_records() -> super::Result<()> {
+        use std::{fs, io::Write};
+        let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("recovery-evidence-{}", std::process::id()));
+        fs::create_dir_all(&root)?;
+        let log = root.join("flow.jsonl");
+        assert_eq!(super::log_size(&log)?, 0);
+        assert_eq!(super::fresh_log(&log, 0)?, "");
+        // This old successful record and in-progress record cannot be used
+        // even after the in-progress record finishes following check exit 0.
+        fs::write(&log, "{\"received\":48}\n{\"received\":")?;
+        let offset = super::log_size(&log)?;
+        let mut file = fs::OpenOptions::new().append(true).open(&log)?;
+        file.write_all(b"48}\n{\"received\":0}\n{\"received\":48}")?;
+        assert_eq!(super::fresh_log(&log, offset)?, "{\"received\":0}");
+        file.write_all(b"\n")?;
+        assert_eq!(
+            super::fresh_log(&log, offset)?,
+            "{\"received\":0}\n{\"received\":48}"
+        );
+        // A checkpoint on a record boundary includes the very next record.
+        let boundary = super::log_size(&log)?;
+        file.write_all(b"{\"received\":1}\n")?;
+        assert_eq!(super::fresh_log(&log, boundary)?, "{\"received\":1}");
+        assert!(super::fresh_log(&log, 0)?.starts_with("{\"received\":48}"));
+        drop(file);
+        fs::write(&log, "")?;
+        assert!(super::fresh_log(&log, offset).is_err());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
 
     #[test]
     fn session_wait_retries_only_core_session_only_reports() -> super::Result<()> {

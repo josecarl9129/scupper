@@ -1248,6 +1248,9 @@ impl Lab {
         address: &str,
         seconds: u64,
     ) -> Result<Group> {
+        if !super::helpers::valid_marker(marker) {
+            return fail(format!("invalid daemon flow marker: {marker}"));
+        }
         self.runner.background(
             &Invocation::new(
                 ns,

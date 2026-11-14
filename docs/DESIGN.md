@@ -1844,6 +1844,12 @@ sampler, check remains session 3 indefinitely. A later daemon cannot mistake thi
 history for never-served EMPTY. Daemonless boot also durably quarantines any
 invalid history before its opening hook, including corrupt records and seals
 rejected after a key change or clock rollback. No sampler is needed to reopen.
+Retirement runs in a storage worker with a five-second caller deadline and gets
+one bounded retry on failure, including session-lock contention and delayed
+storage. If both attempts fail, boot fails visibly with clients closed; EMPTY
+must be durably retired before serving. If the opening hook still leaves a seal
+or EMPTY blocking service, daemonless boot fails the links step after lowering
+wg0, so the unit cannot report successful startup with clients permanently down.
 CLI-local initialization never consumes EMPTY, and its planner cannot raise a
 device while EMPTY is still present. The exception
 applies to boot, including a daemon rebuild that invokes boot with
@@ -1880,17 +1886,23 @@ an intervening reset or seal discards the old observation. Ordinary lock collisi
 with a newer writer discard a sample without opening a needless reconstruction gap.
 A blocked sample write retains only the session lock. Opening and post-down
 hooks share a five-second total deadline for telemetry, lock wait and persistence.
-The pre-containment hook tries the session lock without waiting and bounds all
-storage work to a 150 ms total caller budget. On contention or stalled storage
-it abandons persistence and spends at most 100 ms within that budget notifying
-readers through the runtime invalidation token, without reading durable history.
-Neither session-lock contention nor durable disk work can postpone LinkDown by
-seconds. Probe hooks reserve three seconds of their five-second
+The pre-containment hook synchronously publishes a runtime invalidation token
+before starting durable work, then waits at most 150 ms for its worker. The
+worker retains the normal 4.5-second deadline for session-lock acquisition and
+durable down-intent persistence even after the caller returns. Its own token
+transition preserves healthy history; a later invalidation fences both durable
+commits and runtime fallback publication. A normal delayed save therefore keeps
+the reset baseline path instead of opening a 180-second reconstruction gap.
+Accepting containment means readers are non-ready, not that the save has already
+finished. A permanently stalled save remains non-ready. Neither session-lock
+contention nor durable disk work can postpone LinkDown by seconds. Probe hooks reserve three seconds of their five-second
 budget for the child, skip the lock entirely when no probe is pending, and skip
 without invalidating readiness on a lock timeout. Probe timeouts are returned
-and logged as missed probes, including the race where an abandoned worker has
-already consumed the pending bit; they are counted and never silently reported
-as success. Storage workers own their lock and are deliberately abandoned rather
+and logged. Retained pending work can be retried and is not counted as missed.
+If the worker already committed the pending-bit consumption, the caller uses the
+reserved child budget to send even after the persistence deadline. A commit
+that finishes after the caller abandoned the opportunity is counted as missed.
+The missed counter is process-local and logged, rather than exported as a metric. Storage workers own their lock and are deliberately abandoned rather
 than joined when I/O stalls. Repeated
 lifecycle operations during permanently stalled storage can accumulate abandoned
 workers and notifiers; a single long-lived storage worker remains future work.
@@ -1902,11 +1914,17 @@ readers; if notification or sealed-marker consumption cannot be guaranteed, it
 fails closed. An otherwise valid future seal is refused while it could still
 become valid. A fresh live-UP client observation proves an unconsumed seal
 obsolete, even if the device ID was reused: the sampler quarantines it under
-its lock before checking the seal fence. Reconstruction still needs the full
+its lock before checking the seal fence. An OpeningLive timeout also writes a
+runtime seal-obsolete marker. Readers reject the seal and the next opening or
+sample quarantines it even if wg0 went down before another live-UP observation.
+Containment also sets this marker without reading disk, covering an external
+raise followed by DOWN before any sampler or opening hook observed live-UP.
+Only a successfully committed new clean-stop seal clears this boot-local marker. Reconstruction still needs the full
 180-second sampling horizon; peer recovery needs post-baseline authentication.
-Live-seal quarantine and daemonless retirement remove any older runtime fallback
-before renaming damaged durable history, so the rename cannot expose pre-seal
-readiness. Marker refusal
+Runtime fallbacks always contain Unavailable history and an open observation
+gap; removing a durable record cannot expose a Ready fallback. Live-seal
+quarantine and daemonless retirement still remove the older fallback before
+renaming damaged durable history, discarding it before reconstruction. Marker refusal
 and history failure never prevent containment.
 Startup EMPTY consumption and clean-stop sealing still require durable completion
 before their service/marker claims can be made. Dropping a sampler requests stop

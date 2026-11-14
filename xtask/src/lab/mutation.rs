@@ -29,6 +29,40 @@ struct Evidence {
     live: serde_json::Value,
     observation: serde_json::Value,
 }
+// An aborted trial may never install the route. Preserve every other cleanup
+// failure; Runner fixes LC_ALL=C for these iproute2 diagnostics.
+fn missing_route_ok(result: Result<String>) -> Result<()> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(error)
+            if error
+                .to_string()
+                .contains("RTNETLINK answers: No such process")
+                || error
+                    .to_string()
+                    .contains("RTNETLINK answers: No such file or directory") =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[test]
+fn route_cleanup_tolerates_only_missing_routes() {
+    assert!(missing_route_ok(Ok(String::new())).is_ok());
+    for diagnostic in ["No such process", "No such file or directory"] {
+        assert!(missing_route_ok(Err(format!("RTNETLINK answers: {diagnostic}").into())).is_ok());
+    }
+    for diagnostic in [
+        "Operation not permitted",
+        "Network is unreachable",
+        "Invalid argument",
+    ] {
+        assert!(missing_route_ok(Err(format!("RTNETLINK answers: {diagnostic}").into())).is_err());
+    }
+}
+
 fn golden(mutation: Mutation) -> &'static str {
     match mutation {
         Mutation::Src => include_str!("../../../tests/golden/M-src.diff"),
@@ -756,8 +790,7 @@ impl Lab {
             Ok(())
         };
         let route_cleanup = if root.is_none() {
-            self.cmd("scupper", "ip", &["route", "del", &prefix])
-                .map(|_| ())
+            missing_route_ok(self.cmd("scupper", "ip", &["route", "del", &prefix]))
         } else {
             Ok(())
         };

@@ -53,6 +53,10 @@ impl Link {
 }
 pub struct Kernel {
     pub now: Cell<u64>,
+    // Exit health is fresh by default so session tests reach their own verdict.
+    // Set an age explicitly to model a stale exit handshake.
+    pub exit_handshake_age: Cell<u64>,
+    pub client_telemetry: Cell<bool>,
     pub during_client_sample: RefCell<Option<Box<dyn FnOnce()>>>,
     pub conntrack_loaded: Cell<bool>,
     pub wireguard_loaded: Cell<bool>,
@@ -79,6 +83,8 @@ impl Kernel {
     pub fn new() -> Self {
         Self {
             now: Cell::new(1000),
+            exit_handshake_age: Cell::new(1),
+            client_telemetry: Cell::new(false),
             during_client_sample: RefCell::new(None),
             conntrack_loaded: Cell::new(false),
             wireguard_loaded: Cell::new(false),
@@ -465,7 +471,10 @@ impl Kernel {
                             "endpoints" => format!("{key}\t{endpoint}\n"),
                             "persistent-keepalive" => format!("{key}\t{}\n", link.keepalive),
                             "latest-handshakes" => {
-                                format!("{key}\t{}\n", self.now.get().saturating_sub(1))
+                                format!(
+                                    "{key}\t{}\n",
+                                    self.now.get().saturating_sub(self.exit_handshake_age.get())
+                                )
                             }
                             _ => panic!("unexpected wg read"),
                         })
@@ -523,7 +532,18 @@ impl System for Kernel {
                 tx: 0,
             })
             .collect();
-        Ok(Response::Samples(samples))
+        Ok(if self.client_telemetry.get() {
+            Response::Telemetry {
+                device: scupper_sys::client_sessions::DeviceId {
+                    boot: "fixture-boot".into(),
+                    ifindex: 7,
+                },
+                up: link.up,
+                peers: samples,
+            }
+        } else {
+            Response::Samples(samples)
+        })
     }
 
     fn module_loaded(&self, module: &str) -> std::io::Result<bool> {

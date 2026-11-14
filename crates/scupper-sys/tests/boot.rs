@@ -85,8 +85,13 @@ impl Fixture {
         })
     }
     fn check(&self) -> scupper_core::verdict::v2::Report {
+        self.check_with_site(&support::site("ubuntu-24.04"))
+    }
+    fn check_with_site(
+        &self,
+        site: &scupper_core::config::ValidatedSite,
+    ) -> scupper_core::verdict::v2::Report {
         let held = testing::handle().unwrap();
-        let site = support::site("ubuntu-24.04");
         scupper_sys::check_v2::run_check_v2(
             &scupper_sys::check_v2::Dependencies {
                 system: &self.kernel,
@@ -96,7 +101,7 @@ impl Fixture {
                 run_root: &self.root.path.join("run"),
             },
             &scupper_sys::check_v2::Config {
-                site: &site,
+                site,
                 gateway: &scupper_core::config::GatewayId("gw1".into()),
                 stamp: self.root.stamp,
             },
@@ -119,6 +124,19 @@ fn assert_only_module_calls(f: &Fixture) {
             .borrow()
             .iter()
             .all(|call| call.starts_with("host Modprobe "))
+    );
+}
+
+#[test]
+fn boot_fixture_can_model_stale_exit_handshakes() {
+    let f = Fixture::new();
+    assert!(f.run(None).succeeded());
+    f.kernel.exit_handshake_age.set(900);
+    assert_eq!(
+        f.check().verdict,
+        scupper_core::verdict::v2::Verdict::FailClosed(
+            scupper_core::verdict::v2::FailClosed::NoHealthyExit
+        )
     );
 }
 
@@ -2964,16 +2982,51 @@ fn daemonless_damaged_history_boot(damage: &str, stall_hook: bool) {
     match damage {
         "clock" => f.kernel.now.set(990),
         "key" => {
-            // Simulate an offline client-key change across a real clean stop:
-            // the live configuration no longer matches the sealed gateway.
-            let mut record: serde_json::Value =
-                serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
-            record["gateway"] = serde_json::json!("previous-client-tunnel-key");
-            fs::write(&file, serde_json::to_vec(&record).unwrap()).unwrap();
+            use scupper_sys::store::{MetaInput, VersionStore};
+            let old_site = support::site("ubuntu-24.04");
+            let client = old_site.gateways().values().next().unwrap().client_tunnel();
+            let candidate = support::site_text("ubuntu-24.04").replacen(
+                client.identity().public_key.as_str(),
+                "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+                1,
+            );
+            let guard = WriterLock::acquire(f.root.path.join("lock")).unwrap();
+            let version = VersionStore::open(&f.root.path, Some(&guard))
+                .unwrap()
+                .commit(
+                    &guard,
+                    Some(1),
+                    &candidate,
+                    MetaInput {
+                        actor: "test".into(),
+                        at: 1000,
+                        reason: "offline client key rotation".into(),
+                    },
+                )
+                .unwrap();
+            StateFile::open(&f.root.path, Some(&guard))
+                .unwrap()
+                .update(&guard, |state| state.applied_version = Some(version))
+                .unwrap();
+            // Synthetic fixture key matching the newly configured public key.
+            fs::write(
+                f.root
+                    .path
+                    .join("secrets/wg")
+                    .join(client.identity().private_key_ref.name()),
+                "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=\n",
+            )
+            .unwrap();
         }
         "corrupt" => fs::write(&file, b"broken history").unwrap(),
         _ => panic!("unknown damage"),
     }
+    let (text, _) = scupper_sys::store::VersionStore::open(&f.root.path, None)
+        .unwrap()
+        .read(if damage == "key" { 2 } else { 1 })
+        .unwrap();
+    let configured =
+        scupper_core::config::validate(scupper_core::config::parse_site(&text).unwrap()).unwrap();
     let damaged = fs::read(&file).unwrap();
     let lock = std::rc::Rc::new(std::cell::RefCell::new(None));
     if stall_hook {
@@ -2997,7 +3050,7 @@ fn daemonless_damaged_history_boot(damage: &str, stall_hook: bool) {
         damaged
     );
     assert_eq!(
-        f.check().verdict,
+        f.check_with_site(&configured).verdict,
         scupper_core::verdict::v2::Verdict::Degraded(
             scupper_core::verdict::v2::Degraded::ClientSessionsUnknown
         )
@@ -3008,7 +3061,7 @@ fn daemonless_damaged_history_boot(damage: &str, stall_hook: bool) {
     f.kernel.now.set(1200);
     assert!(f.run(None).succeeded());
     assert!(f.kernel.ns.borrow()["wg0"].up);
-    assert_eq!(f.check().verdict.exit_code(), 3);
+    assert_eq!(f.check_with_site(&configured).verdict.exit_code(), 3);
 }
 #[test]
 fn daemonless_boot_after_clean_stop_and_client_key_change() {
@@ -3025,6 +3078,91 @@ fn daemonless_boot_with_corrupt_history() {
 #[test]
 fn daemonless_boot_with_damaged_history_and_opening_hook_timeout() {
     daemonless_damaged_history_boot("clock", true);
+}
+
+#[test]
+fn daemonless_boot_refuses_success_when_live_seal_opening_times_out() {
+    let f = Fixture::new();
+    assert!(f.run(None).succeeded());
+    let mut live_client = f.kernel.ns.borrow()["wg0"].clone();
+    live_client.mtu = 1380; // force the opening path rather than read-only adoption
+    scupper_sys::boot::clean_stop(&BootDeps {
+        system: &f.kernel,
+        namespace: &f.kernel,
+        state_root: &f.root.path,
+        config_root: &f.root.path,
+        run_root: &f.root.path.join("run"),
+        hook: None,
+        secret_owner: rustix::process::geteuid().as_raw(),
+    })
+    .unwrap();
+    // Model an external raise over an unconsumed, valid clean-stop seal.
+    f.kernel.ns.borrow_mut().insert("wg0".into(), live_client);
+    f.kernel.client_telemetry.set(true);
+    let lock = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let slot = lock.clone();
+    let run = f.root.path.join("run");
+    *f.kernel.during_client_sample.borrow_mut() = Some(Box::new(move || {
+        *slot.borrow_mut() =
+            Some(WriterLock::try_acquire(run.join("client-session-writer")).unwrap());
+    }));
+    let report = f.run(None);
+    assert!(!report.succeeded(), "{report:?}");
+    assert!(
+        report.steps.iter().any(|step| step.step == BootStep::Links
+            && step
+                .error
+                .as_ref()
+                .is_some_and(|error| error.contains("cannot serve"))),
+        "{report:?}"
+    );
+    assert!(!f.kernel.ns.borrow()["wg0"].up);
+    assert_ne!(f.check().verdict.exit_code(), 0);
+    drop(lock.borrow_mut().take());
+}
+
+#[test]
+fn daemonless_boot_retries_retirement_after_session_lock_stall() {
+    let f = Fixture::new();
+    let site = support::site("ubuntu-24.04");
+    let identity = site
+        .gateways()
+        .values()
+        .next()
+        .unwrap()
+        .client_tunnel()
+        .identity()
+        .public_key
+        .as_str();
+    fs::remove_file(f.root.path.join("client-sessions.json")).unwrap();
+    fs::remove_file(f.root.path.join("gateway-incarnation")).unwrap();
+    let guard = WriterLock::acquire(f.root.path.join("lock")).unwrap();
+    scupper_sys::client_sessions::provision(&f.root.path, identity, 1000, &guard).unwrap();
+    let run = f.root.path.join("run");
+    fs::create_dir_all(&run).unwrap();
+    let lock = WriterLock::try_acquire(run.join("client-session-writer")).unwrap();
+    let holder = std::thread::spawn(move || {
+        let _lock = lock;
+        let deadline = std::time::Instant::now() + Duration::from_secs(12);
+        // The first bounded attempt's notification proves it has timed out.
+        while !run.join("client-session-invalidation").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "retirement did not time out"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    });
+    let report = f.run(None);
+    holder.join().unwrap();
+    assert!(report.succeeded(), "{report:?}");
+    assert!(f.kernel.ns.borrow()["wg0"].up);
+    assert_eq!(
+        f.check().verdict,
+        scupper_core::verdict::v2::Verdict::Degraded(
+            scupper_core::verdict::v2::Degraded::ClientSessionsUnknown
+        )
+    );
 }
 
 #[test]
@@ -3211,7 +3349,12 @@ fn real_before_client_link_up_finishes_during_a_twenty_second_session_lock_hold(
         .unwrap();
     assert!(start.elapsed() < Duration::from_millis(5500));
     assert!(f.kernel.ns.borrow()["wg0"].up);
-    assert_ne!(f.check().verdict.exit_code(), 0);
+    assert_eq!(
+        f.check().verdict,
+        scupper_core::verdict::v2::Verdict::Degraded(
+            scupper_core::verdict::v2::Degraded::ClientSessionsUnknown
+        )
+    );
     holder.join().unwrap();
 }
 
@@ -3400,17 +3543,22 @@ fn real_before_client_link_down_does_not_wait_for_a_held_session_lock() {
     adapter.execute(&Step::FlushConntrack).unwrap();
     let start = std::time::Instant::now();
     let token = fs::read(config.run_root.join("client-session-invalidation")).ok();
-    assert!(adapter.before_client_link_down(&guard).is_err());
+    adapter.before_client_link_down(&guard).unwrap();
+    assert!(start.elapsed() < Duration::from_millis(300));
     // Pin the pre-LinkDown window: a failed command must not leave Ready.
     assert_ne!(
         fs::read(config.run_root.join("client-session-invalidation")).ok(),
         token
     );
-    assert_eq!(f.check().verdict.exit_code(), 3);
+    assert_eq!(
+        f.check().verdict,
+        scupper_core::verdict::v2::Verdict::Degraded(
+            scupper_core::verdict::v2::Degraded::ClientSessionsUnknown
+        )
+    );
     adapter
         .execute(&Step::LinkDown { name: "wg0".into() })
         .unwrap();
-    assert!(start.elapsed() < Duration::from_millis(200));
     assert!(!f.kernel.ns.borrow()["wg0"].up);
     assert_eq!(
         f.check().verdict,
