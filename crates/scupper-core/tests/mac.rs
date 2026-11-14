@@ -3432,7 +3432,13 @@ fn assert_backoff_invariant(m: &Machine, now: u64) {
             let clean = m.states_clean_at().unwrap();
             assert!(m.gap_after().is_none_or(|gap| clean >= gap));
         } else {
-            let retry = m.closing_retry().unwrap();
+            let retry = m.closing_retry().unwrap_or_else(|| {
+                panic!(
+                    "no closing_retry: target={target:?} plan={:?} pending={:?}",
+                    m.plan(),
+                    m.pending()
+                )
+            });
             assert_eq!(retry.until, retry.failed_at + 1);
             assert_eq!(retry.until, until);
             assert_eq!(retry.target, target);
@@ -4311,6 +4317,184 @@ fn first_prefix_and_replacement_disable_repair_at_the_very_next_effect_boundary(
             drive_to(m, None, &mut now).status_at(&Clock(now)),
             ConnectionStatus::Joined
         );
+    }
+}
+
+#[test]
+fn child_loss_then_rerender_still_completes_recovery() {
+    let mut now = 102;
+    let mut m = Machine::restart(Durable::default())
+        .transition(Event::Join, &Clock(now))
+        .unwrap();
+    m = property_transition(&m, Event::Completed(Step::PersistIntent), now);
+    for _ in 0..18 {
+        now = executor_time(&m, now + 1);
+        m = property_transition(&m, checked_completion_at(&m, now), now);
+    }
+    for disturbance in [2, 2, 8] {
+        now = executor_time(&m, now + 1);
+        let event = if disturbance == 2 {
+            Event::ChildDied
+        } else {
+            observed(
+                &m,
+                m.installed_form().unwrap(),
+                Verdict::Repair(Action::Rerender {
+                    form: m.installed_form().unwrap(),
+                }),
+            )
+        };
+        m = property_transition(&m, event, now);
+    }
+    assert!(m.tunnel().is_none());
+    assert_eq!(m.pending(), Some(Step::FlushStates));
+    now += 1;
+    m = property_transition(&m, checked_completion_at(&m, now), now);
+    assert_eq!(m.pending(), Some(Step::LoadPreTunnel));
+    for _ in 0..60 {
+        if m.pending().is_none() {
+            break;
+        }
+        now = executor_time(&m, now + 1);
+        m = property_transition(&m, checked_completion_at(&m, now), now);
+    }
+    assert_eq!(m.pending(), None);
+    assert_eq!(m.status_at(&Clock(now)), ConnectionStatus::Joined);
+}
+
+#[test]
+fn joined_unknown_twice_after_seventeen_completions_records_flush_retry() {
+    let mut now = 102;
+    let mut m = Machine::restart(Durable::default())
+        .transition(Event::Join, &Clock(now))
+        .unwrap();
+    m = property_transition(&m, Event::Completed(Step::PersistIntent), now);
+    for _ in 0..17 {
+        now = executor_time(&m, now + 1);
+        m = property_transition(&m, checked_completion_at(&m, now), now);
+    }
+    assert_eq!(m.pending(), Some(Step::VerifyJoined));
+    let generation = m.durable().previous_generation;
+    now += 1;
+    m = property_transition(
+        &m,
+        observed(&m, Form::Joined, Verdict::Unknown { since: now }),
+        now,
+    );
+    let failed_at = now;
+    let until = now + 1;
+    assert_eq!(
+        m.closing_retry(),
+        Some(ClosingRetry {
+            failed_at,
+            until,
+            target: Step::VerifyJoined,
+        })
+    );
+    assert_eq!(
+        m.plan(),
+        &[
+            Step::FlushStates,
+            Step::Backoff { until },
+            Step::VerifyJoined
+        ]
+    );
+    now = executor_time(&m, now + 1);
+    m = property_transition(
+        &m,
+        observed(&m, Form::Joined, Verdict::Unknown { since: now }),
+        now,
+    );
+    assert_eq!(m.closing_retry().unwrap().until, until);
+    m = property_transition(&m, checked_completion_at(&m, now), now);
+    assert_eq!(
+        m.plan(),
+        &[
+            Step::Backoff { until },
+            Step::FlushStates,
+            Step::VerifyJoined
+        ]
+    );
+    assert_eq!(
+        m.closing_retry(),
+        Some(ClosingRetry {
+            failed_at,
+            until,
+            target: Step::FlushStates,
+        })
+    );
+    for _ in 0..3 {
+        m = property_transition(
+            &m,
+            observed(&m, Form::Joined, Verdict::Unknown { since: now }),
+            now,
+        );
+        assert_eq!(m.closing_retry().unwrap().until, until);
+        assert_eq!(m.durable().retry_attempts, 0);
+    }
+    m = property_transition(&m, checked_completion_at(&m, now), now);
+    assert_eq!(m.pending(), Some(Step::FlushStates));
+    assert!(m.closing_retry().is_some());
+    m = property_transition(&m, checked_completion_at(&m, now), now);
+    assert_eq!(m.pending(), Some(Step::VerifyJoined));
+    assert_eq!(m.closing_retry(), None);
+    m = property_transition(&m, checked_completion_at(&m, now), now);
+    assert_eq!(m.pending(), None);
+    assert_eq!(m.status_at(&Clock(now)), ConnectionStatus::Joined);
+    assert_eq!(m.durable().previous_generation, generation);
+    assert_eq!(m.durable().retry_attempts, 0);
+}
+
+#[test]
+fn joined_verification_retry_keeps_its_deadline_when_recovery_replaces_the_target() {
+    let mut now = 102;
+    let m = Machine::restart(Durable::default())
+        .transition(Event::Join, &Clock(now))
+        .unwrap();
+    let mut m = drive_to(m, Some(Step::VerifyJoined), &mut now);
+    m = property_transition(
+        &m,
+        observed(&m, Form::Joined, Verdict::Unknown { since: now }),
+        now,
+    );
+    m = property_transition(&m, checked_completion_at(&m, now), now);
+    let retry = m.closing_retry().unwrap();
+    for flush_queued in [false, true] {
+        let mut waiting = m.clone();
+        if flush_queued {
+            waiting = property_transition(
+                &waiting,
+                observed(&waiting, Form::Joined, Verdict::Unknown { since: now }),
+                now,
+            );
+            assert_eq!(waiting.closing_retry().unwrap().target, Step::FlushStates);
+        }
+        for event in [
+            Event::InvalidateObservations { since: now },
+            observed(&waiting, Form::Joined, Verdict::Repair(Action::Rejoin)),
+            Event::ChildDied,
+        ] {
+            let recovering = property_transition(&waiting, event, now);
+            assert_eq!(recovering.pending(), Some(Step::LoadPreTunnel));
+            assert_eq!(
+                recovering.closing_retry(),
+                Some(ClosingRetry {
+                    target: Step::VerifyPreTunnel,
+                    ..retry
+                })
+            );
+            let mut finish_at = now;
+            let recovering = drive_to_backoff(recovering, &mut finish_at);
+            assert_backoff_invariant(&recovering, finish_at);
+            assert_eq!(
+                recovering.pending(),
+                Some(Step::Backoff { until: retry.until })
+            );
+            assert_eq!(
+                drive_to(recovering, None, &mut finish_at).status_at(&Clock(finish_at)),
+                ConnectionStatus::Joined
+            );
+        }
     }
 }
 

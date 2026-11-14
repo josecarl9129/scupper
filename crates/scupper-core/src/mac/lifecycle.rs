@@ -133,12 +133,12 @@ pub enum ReferenceIntent {
     /// Checked release of all recorded tokens.
     Release,
 }
-/// A closing failure has one immutable retry deadline and explicit recovery target.
+/// A closing or joined-verification failure has one immutable retry deadline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClosingRetry {
     /// Observation or failed-effect time.
     pub failed_at: u64,
-    /// Next closing effect, including `VerifyPreTunnel` after a failed `VerifyJoined`.
+    /// Next delayed effect, including a bounded same-attempt `VerifyJoined` retry.
     pub target: Step,
     /// Earliest retry time, exactly one second after failure.
     pub until: u64,
@@ -418,7 +418,7 @@ impl Machine {
     pub fn plan(&self) -> &[Step] {
         &self.pending
     }
-    /// Immutable closing retry policy, retained through coalesced evidence.
+    /// Recorded retry deadline and delayed effect, retained through coalesced evidence.
     #[must_use]
     pub fn closing_retry(&self) -> Option<ClosingRetry> {
         self.closing.retry
@@ -722,6 +722,7 @@ impl Machine {
         });
         if let Some(index) = self.pending.iter().position(|s| *s == retry.target)
             && retry.until > now
+            && (index == 0 || self.pending[index - 1] != (Step::Backoff { until: retry.until }))
         {
             self.pending
                 .insert(index, Step::Backoff { until: retry.until });
@@ -871,6 +872,18 @@ impl Machine {
         {
             self.pending.insert(index, Step::FlushStates);
         }
+        self.retarget_joined_wait();
+    }
+    fn retarget_joined_wait(&mut self) {
+        // A queued cleanup may become the delayed effect. Retarget only once
+        // the timer is at the head, so an earlier in-flight flush cannot clear it.
+        if let Some(Step::Backoff { until }) = self.pending()
+            && let Some(retry) = &mut self.closing.retry
+            && retry.until == until
+            && retry.target == Step::VerifyJoined
+        {
+            retry.target = self.pending[1];
+        }
     }
     fn rerun_closing(&mut self, now: u64) {
         let Some(rerun) = self.closing.rerun.take() else {
@@ -961,6 +974,9 @@ impl Machine {
         };
     }
     fn begin(&mut self, op: Operation, persist: bool, now: u64) {
+        let joined_retry = self.closing.retry.filter(|retry| {
+            !self.closing.active && matches!(retry.target, Step::FlushStates | Step::VerifyJoined)
+        });
         self.invalidate(true);
         self.operation = Some(op);
         self.pending.clear();
@@ -1020,6 +1036,14 @@ impl Machine {
             Step::VerifyJoinedLoad,
             Step::VerifyJoined,
         ]);
+        if let Some(retry) = joined_retry {
+            // A real loss ends the same-child retry, but cannot move its wait.
+            self.closing.retry = Some(ClosingRetry {
+                target: Step::VerifyPreTunnel,
+                ..retry
+            });
+            self.closing_wait(Step::VerifyPreTunnel, now);
+        }
     }
     fn resume_cleanup(&mut self) {
         self.invalidate(true);
@@ -1035,6 +1059,7 @@ impl Machine {
         if self.closing.retry.is_some_and(|r| r.target == completed) {
             self.closing.retry = None;
         }
+        self.retarget_joined_wait();
         if (self.pending() == Some(Step::VerifyPreTunnel)
             || matches!(self.pending(), Some(Step::Backoff { .. }))
                 && self.pending.get(1) == Some(&Step::VerifyPreTunnel)
@@ -1296,6 +1321,12 @@ impl Machine {
                     }
                     if self.installed_form != Some(form) {
                         return Err(Error("replacement form mismatch"));
+                    }
+                    if form == Form::Joined && self.tunnel.is_none() {
+                        // A later rerender cannot turn deferred child recovery
+                        // into a replacement of policy for a child that died.
+                        self.begin(Operation::Recover, false, now);
+                        return Ok(());
                     }
                     self.invalidate(false);
                     self.interface_states_removed_at = None;
@@ -1805,13 +1836,9 @@ impl Machine {
                                 && self.joined_unknown_retries < 3
                             {
                                 self.joined_unknown_retries += 1;
-                                self.pending = vec![
-                                    Step::FlushStates,
-                                    Step::Backoff {
-                                        until: now.saturating_add(1),
-                                    },
-                                    Step::VerifyJoined,
-                                ];
+                                self.pending = vec![Step::FlushStates, Step::VerifyJoined];
+                                self.closing.retry = None;
+                                self.closing_wait(Step::VerifyJoined, now);
                             } else if self.pending() == Some(Step::VerifyPreTunnel)
                                 || self.pending() == Some(Step::VerifyJoined)
                                     && matches!(
