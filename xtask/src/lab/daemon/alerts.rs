@@ -216,9 +216,12 @@ impl DaemonGuard<'_> {
   counter unmarked_invalid {{ }}
   chain output {{
     type filter hook output priority -150;
+    # 1. Clear any packet-supplied identity before consulting conntrack.
     ip daddr {endpoint} tcp dport 443 ip dscp set cs0;
-    meta skuid {uid} ip daddr {endpoint} tcp dport 443 ct mark set 0x5c;
-    ct mark 0x5c ip daddr {endpoint} tcp dport 443 ip dscp set cs7;
+    # 2. Only the delivery identity can set this dedicated connection bit.
+    meta skuid {uid} ct direction original ip daddr {endpoint} tcp dport 443 ct mark set ct mark | 0x40000000;
+    # 3. Restore identity for original-direction packets, including socketless replies.
+    ct mark & 0x40000000 != 0 ct direction original ip daddr {endpoint} tcp dport 443 ip dscp set cs7;
     ip daddr {endpoint} tcp dport 443 tcp flags == rst ct state != invalid counter name tracked_reset;
     ip daddr {endpoint} tcp dport 443 tcp flags == rst ct state invalid counter name invalid_reset;
     ip daddr {endpoint} tcp dport 443 ip dscp cs0 ct state != invalid counter name unmarked_tracked;
@@ -233,6 +236,10 @@ impl DaemonGuard<'_> {
             uid = identity.uid,
             endpoint = super::heartbeat::ENDPOINT
         );
+        self.lab.runner.input(
+            &Invocation::new("gwhost", "nft", &["-c", "-f", "-"]),
+            Some(mark.as_bytes()),
+        )?;
         self.lab.runner.input(
             &Invocation::new("gwhost", "nft", &["-f", "-"]),
             Some(mark.as_bytes()),

@@ -1758,6 +1758,29 @@ canary_markers = ["leak.example"]
 }
 
 #[test]
+fn alert_unmarked_socketless_reset_on_nonidentity_flow_is_not_allowlisted() {
+    for flags in [0x04, 0x14] {
+        let reset = alert_segment(true, 0, flags, ALERT_SEQ, 0, b"");
+        // No socket or preceding identity flow can authorize an unmarked RST.
+        let report = alert_report(std::slice::from_ref(&reset));
+        assert_eq!(report.violation_count, 1);
+        assert_eq!(report.packets[0].class, violation(Reason::NotAllowListed));
+
+        // Even a complete exchange and close on the same tuple cannot confer
+        // identity if none of its outbound packets had the identity mark.
+        let mut nonidentity = alert_close_sequence();
+        for packet in &mut nonidentity {
+            packet[1] = 0;
+        }
+        *nonidentity.last_mut().unwrap() = reset;
+        assert_eq!(
+            alert_report(&nonidentity).packets.last().unwrap().class,
+            violation(Reason::NotAllowListed)
+        );
+    }
+}
+
+#[test]
 fn alert_late_bare_reset_requires_the_marked_syn_fin_and_abort_sequence() {
     let packets = alert_close_sequence();
     assert_eq!(packets.len(), 20);
