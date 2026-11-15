@@ -154,7 +154,7 @@ fn simulate_result_is_empty_and_drift_has_exact_preconditions() {
             Change::Enable => {
                 host.enabled.extend(UNITS.into_iter().map(Into::into));
             }
-            Change::DaemonReload | Change::Permissions(..) => {}
+            Change::ProvisionSessions | Change::DaemonReload | Change::Permissions(..) => {}
         }
     }
     wanted.configuration = Configuration::Existing;

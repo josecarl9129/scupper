@@ -24,7 +24,7 @@ use scupper_sys::{
 use std::{
     cell::Cell,
     collections::{BTreeMap, BTreeSet},
-    fs,
+    fs, io,
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
     rc::Rc,
@@ -282,6 +282,10 @@ fn fs3_safety_budget_exhaustion_closes_tightens_persists() {
     rig.flush_rules();
     let report = rig.tick();
     assert_eq!(report.steps.first(), Some(&Step::ForwardingOff));
+    assert!(matches!(
+        report.steps.get(1),
+        Some(Step::PersistLatch { .. })
+    ));
     assert!(
         report
             .steps
@@ -388,17 +392,7 @@ fn fs7_persisted_and_memory_latches_hold_across_ticks() {
         }
         assert!(!raises(&rig.tick()));
         rig.restart();
-        if persist {
-            assert!(rig.machine().latch().is_some());
-        } else {
-            assert!(rig.machine().latch().is_none());
-            // Budgets are process-local. Persistent fighting is detected afresh.
-            for _ in 0..4 {
-                rig.flush_rules();
-                rig.tick();
-            }
-            assert!(rig.machine().latch().is_some());
-        }
+        assert!(rig.machine().latch().is_some());
         assert!(!raises(&rig.tick()));
     }
 }
@@ -502,7 +496,7 @@ fn fs12_inode_gone_requires_rebuild() {
         .mutate(|m| m.namespace = NamespaceState::InodeGone);
     let report = rig.tick();
     assert_eq!(report.escalations, vec![Escalation::RebuildRequired]);
-    assert_eq!(report.steps, vec![]);
+    assert_eq!(report.steps, [] as [Step; 0]);
     assert!(!report.complete);
 }
 #[test]
@@ -511,7 +505,7 @@ fn fs13_writer_lock_contention_executes_nothing() {
     let guard = WriterLock::acquire(&rig.root).unwrap();
     let report = rig.tick();
     assert!(!report.complete);
-    assert_eq!(report.steps, vec![]);
+    assert_eq!(report.steps, [] as [Step; 0]);
     assert_ne!(report.events, vec![]);
     drop(guard);
     assert!(rig.tick().complete);
@@ -902,32 +896,43 @@ fn fs13_other_process_holds_writer_lock() {
     std::io::Write::write_all(child.stdin.as_mut().unwrap(), b"x").unwrap();
     assert!(child.wait().unwrap().success());
     assert!(!report.complete);
-    assert_eq!(report.steps, vec![]);
+    assert_eq!(report.steps, [] as [Step; 0]);
 }
 
 type CollectorCall = (bool, scupper_sys::system::Program, Vec<String>, Duration);
 #[derive(Default)]
+#[allow(clippy::struct_excessive_bools)] // Independent injected collector faults.
 struct CollectorSystem {
     calls: std::cell::RefCell<Vec<CollectorCall>>,
     fail_ruleset: Cell<bool>,
+    fail_host_links: Cell<bool>,
+    fail_netns_links: Cell<bool>,
     stall: Cell<bool>,
+    per_link_race: Cell<u8>,
+    link_dumps: Cell<usize>,
+    tc_failure: Cell<u8>,
+    stop_on_link_read: std::cell::RefCell<Option<Arc<std::sync::atomic::AtomicBool>>>,
 }
 impl scupper_sys::system::System for CollectorSystem {
     fn run(
         &self,
+        purpose: scupper_sys::system::HelperPurpose,
         program: scupper_sys::system::Program,
         args: &[String],
         timeout: Duration,
     ) -> Result<scupper_sys::system::ExecOutput, scupper_sys::system::ExecError> {
         self.run_in(
+            purpose,
             scupper_sys::system::ExecTarget::Host,
             program,
             args,
             timeout,
         )
     }
+    #[allow(clippy::too_many_lines)] // Keep independent collector fault injections explicit.
     fn run_in(
         &self,
+        purpose: scupper_sys::system::HelperPurpose,
         target: scupper_sys::system::ExecTarget<'_>,
         program: scupper_sys::system::Program,
         args: &[String],
@@ -939,12 +944,95 @@ impl scupper_sys::system::System for CollectorSystem {
         self.calls
             .borrow_mut()
             .push((ns, program, args.to_vec(), timeout));
+        if ns
+            && program == Program::Ip
+            && args.iter().any(|arg| arg == "link")
+            && let Some(stop) = self.stop_on_link_read.borrow_mut().take()
+        {
+            stop.store(true, Ordering::Relaxed);
+            return Err(ExecError::Timeout { after: timeout });
+        }
         if self.stall.get() && self.calls.borrow().len() <= 2 {
             std::thread::sleep(timeout);
             return Err(ExecError::Timeout { after: timeout });
         }
         if self.fail_ruleset.get() && program == Program::Nft {
             return Err(ExecError::Timeout { after: timeout });
+        }
+        if program == Program::Ip
+            && args.iter().any(|a| a == "link")
+            && (if ns {
+                self.fail_netns_links.get()
+            } else {
+                self.fail_host_links.get()
+            })
+        {
+            return Err(ExecError::Timeout { after: timeout });
+        }
+        if ns && program == Program::Tc && args.iter().any(|arg| arg == "wg0") {
+            let qdisc = args.iter().any(|arg| arg == "qdisc");
+            let root = args.iter().any(|arg| arg == "root");
+            match self.tc_failure.get() {
+                1 if qdisc => return Err(ExecError::Timeout { after: timeout }),
+                2 if root => {
+                    return Ok(ExecOutput {
+                        status: None,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    });
+                }
+                3 if root => {
+                    return Ok(ExecOutput {
+                        status: Some(0),
+                        stdout: "bad json".into(),
+                        stderr: String::new(),
+                    });
+                }
+                4 if qdisc => {
+                    return Ok(ExecOutput {
+                        status: Some(0),
+                        stdout: r#"[{"kind":"clsact"}]"#.into(),
+                        stderr: String::new(),
+                    });
+                }
+                4 if root => return Err(ExecError::Timeout { after: timeout }),
+                _ => {}
+            }
+        }
+        let race = self.per_link_race.get();
+        if ns && race != 0 {
+            if program == Program::Ip && args.iter().any(|a| a == "link") {
+                let dump = self.link_dumps.get() + 1;
+                self.link_dumps.set(dump);
+                if race == 4 && dump > 1 {
+                    return Err(ExecError::Timeout { after: timeout });
+                }
+                let script = support::Script::new("ubuntu-24.04");
+                let output = script.run_in(purpose, target, program, args, timeout)?;
+                let mut links: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                if dump == 1 || matches!(race, 2 | 3) {
+                    links.as_array_mut().unwrap().push(serde_json::json!({
+                        "ifindex": if race == 3 && dump > 1 { 11 } else { 10 },
+                        "ifname":"foreign0", "flags":["BROADCAST"], "mtu":1500,
+                        "linkinfo":{"info_kind":"dummy"}
+                    }));
+                }
+                return Ok(ExecOutput {
+                    stdout: links.to_string(),
+                    ..output
+                });
+            }
+            let failed = program == Program::Tc && args.iter().any(|a| a == "foreign0")
+                || race == 5
+                    && program == Program::Sysctl
+                    && args.iter().any(|a| a.contains(".foreign0."));
+            if failed {
+                return Ok(ExecOutput {
+                    status: Some(1),
+                    stdout: String::new(),
+                    stderr: "Cannot find device foreign0".into(),
+                });
+            }
         }
         let text = if !ns && program == Program::Ip {
             "[]".into()
@@ -967,7 +1055,8 @@ impl scupper_sys::system::System for CollectorSystem {
         {
             "0".into()
         } else {
-            return support::Script::new("ubuntu-24.04").run_in(target, program, args, timeout);
+            return support::Script::new("ubuntu-24.04")
+                .run_in(purpose, target, program, args, timeout);
         };
         Ok(ExecOutput {
             status: Some(0),
@@ -983,9 +1072,44 @@ impl scupper_sys::system::System for CollectorSystem {
     }
 }
 fn observe_real(rig: &Rig, sys: &CollectorSystem) -> scupper_sys::reconcile::Observation {
+    observe_real_with_deadline(rig, sys, None)
+}
+fn observe_real_with_deadline(
+    rig: &Rig,
+    sys: &CollectorSystem,
+    deadline: Option<std::time::Instant>,
+) -> scupper_sys::reconcile::Observation {
+    use scupper_sys::reconcile::Kernel;
+    let kernel = collector_kernel(rig, sys);
+    if let Some(deadline) = deadline {
+        return kernel.observe_until(&rig.held, deadline);
+    }
+    let safety = kernel.observe(&rig.held);
+    kernel.observe_rest(
+        &rig.held,
+        safety,
+        std::time::Instant::now() + Duration::from_secs(20),
+    )
+}
+fn collector_config(rig: &Rig) -> Config {
+    let mut config = rig.config();
+    config.fingerprint = scupper_sys::canon::fingerprint(
+        &scupper_sys::canon::canonicalize(&support::fixture(
+            "ubuntu-24.04",
+            "scupper-nft-ruleset.json",
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    config
+}
+fn collector_kernel<'a>(
+    rig: &'a Rig,
+    sys: &'a CollectorSystem,
+) -> scupper_sys::reconcile::RealKernel<'a> {
     use scupper_sys::{
         boot::{BootDeps, GatewayNamespace},
-        reconcile::{Kernel, RealKernel},
+        reconcile::RealKernel,
     };
     let deps = BootDeps {
         system: sys,
@@ -1007,15 +1131,7 @@ fn observe_real(rig: &Rig, sys: &CollectorSystem) -> scupper_sys::reconcile::Obs
         1,
     )
     .unwrap();
-    let mut config = rig.config();
-    config.fingerprint = scupper_sys::canon::fingerprint(
-        &scupper_sys::canon::canonicalize(&support::fixture(
-            "ubuntu-24.04",
-            "scupper-nft-ruleset.json",
-        ))
-        .unwrap(),
-    )
-    .unwrap();
+    let config = collector_config(rig);
     let kernel = RealKernel::new(
         deps,
         rig.held.clone(),
@@ -1026,13 +1142,9 @@ fn observe_real(rig: &Rig, sys: &CollectorSystem) -> scupper_sys::reconcile::Obs
     )
     .unwrap();
     kernel.set_owned_links(BTreeMap::from([("wg0".into(), 2), ("ex-ch1".into(), 3)]));
-    let safety = kernel.observe(&rig.held);
-    kernel.observe_rest(
-        &rig.held,
-        safety,
-        std::time::Instant::now() + Duration::from_secs(20),
-    )
+    kernel
 }
+
 #[test]
 fn real_collector_safety_first_held_inode_and_failed_items() {
     use scupper_sys::system::Program;
@@ -1237,6 +1349,7 @@ fn fake_forwarding_faults_obey_guards_and_flush_is_per_tick() {
     assert_eq!(rig.kernel.model().forwarding_v4, Known::Value(0));
     rig.kernel.execute(&Step::FlushConntrack).unwrap();
     let latch = Latch {
+        uncertain: false,
         reason: "memory".into(),
         object: "test".into(),
     };
@@ -1643,6 +1756,7 @@ fn phase_b_receives_reobserved_safety_after_emergency_execution() {
     struct DuringContainment {
         inner: FakeKernel,
         mutated: Cell<bool>,
+        checked_first_rest: Cell<bool>,
         observations: Rc<Cell<usize>>,
     }
     impl Kernel for DuringContainment {
@@ -1656,7 +1770,7 @@ fn phase_b_receives_reobserved_safety_after_emergency_execution() {
             safety: Observation,
             deadline: Instant,
         ) -> Observation {
-            if self.mutated.get() {
+            if self.mutated.get() && !self.checked_first_rest.replace(true) {
                 assert!(self.observations.get() >= 2);
                 assert_eq!(
                     safety.model.links["wg0"].tc_hooks,
@@ -1690,6 +1804,7 @@ fn phase_b_receives_reobserved_safety_after_emergency_execution() {
         DuringContainment {
             inner: rig.kernel.clone(),
             mutated: Cell::new(false),
+            checked_first_rest: Cell::new(false),
             observations: observations.clone(),
         },
         rig.store.clone(),
@@ -1718,14 +1833,9 @@ fn full_observation_of_unknown_inventory_advances_ingress_quarantine() {
     rig.kernel
         .timeouts(BTreeSet::from([ObservationItem::Tc("wg0".into())]));
     assert!(!rig.tick().complete);
-    assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(true));
+    assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(false));
     let report = rig.tick();
     assert!(!report.complete);
-    assert!(
-        report
-            .steps
-            .contains(&Step::LinkDown { name: "wg0".into() })
-    );
     assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(false));
 }
 
@@ -2582,6 +2692,7 @@ fn control_repair_clear_preserves_another_writers_selection() {
         reason: "repair-budget".into(),
         object: "safety:ruleset".into(),
         since_unix: 1000,
+        uncertain: false,
     });
     let guard = WriterLock::acquire(&rig.root).unwrap();
     rig.store.write(&guard, &state).unwrap();
@@ -2606,6 +2717,7 @@ fn verified_apply_clear_is_not_undone_by_a_stale_daemon_version_handoff() {
         reason: "repair-budget".into(),
         object: "safety:ruleset".into(),
         since_unix: 1000,
+        uncertain: false,
     });
     rig.store.write(&guard, &state).unwrap();
     drop(guard);
@@ -2819,6 +2931,7 @@ fn connect_rejects_unconfigured_exit_and_quarantine() {
         reason: "state write failed".into(),
         object: "state".into(),
         since_unix: 1000,
+        uncertain: false,
     });
     let guard = WriterLock::acquire(&rig.root).unwrap();
     rig.store.write(&guard, &state).unwrap();
@@ -2848,6 +2961,7 @@ fn repair_clear_retains_operator_context_and_actual_latch_reason() {
         reason: "state write failed".into(),
         object: "state".into(),
         since_unix: 1000,
+        uncertain: false,
     });
     let guard = WriterLock::acquire(&rig.root).unwrap();
     rig.store.write(&guard, &state).unwrap();
@@ -2965,6 +3079,7 @@ fn repair_clear_reopens_forwarding_after_quarantined_restart() {
         reason: "repair budget".into(),
         object: "safety:ruleset".into(),
         since_unix: 1000,
+        uncertain: false,
     });
     let guard = WriterLock::acquire(&rig.root).unwrap();
     scupper_sys::reconcile::StateStore::write(&rig.store, &guard, &state).unwrap();
@@ -3025,6 +3140,7 @@ fn outage_latch_recovery_clear_and_second_outage_emit_two_firings() {
         reason: "repair budget".into(),
         object: "safety:ruleset".into(),
         since_unix: 1000,
+        uncertain: false,
     });
     let guard = WriterLock::acquire(&rig.root).unwrap();
     rig.store.write(&guard, &state).unwrap();
@@ -3094,8 +3210,9 @@ fn fake_kernel_ruleset_drift_reaches_daemon_full_check_alert_and_recovers() {
         run_root: root.path.clone(),
         lock_wait: Duration::ZERO,
     };
+    let recorded = scupper_sys::system::testing::RecordingSystem::new(&sys);
     let deps = BootDeps {
-        system: &sys,
+        system: &recorded,
         namespace: &GatewayNamespace,
         run_root: &root.path,
         state_root: &root.path,
@@ -3108,6 +3225,16 @@ fn fake_kernel_ruleset_drift_reaches_daemon_full_check_alert_and_recovers() {
     let (report, firing) =
         scupper_sys::daemon::testing::protection_alerts(&deps, &sys, &rig.held, &config).unwrap();
     assert_eq!(report.verdict.exit_code(), 2);
+    assert_eq!(
+        recorded.calls().first().map(|call| call.purpose),
+        Some(scupper_sys::system::HelperPurpose::Probe)
+    );
+    assert!(
+        recorded
+            .calls()
+            .iter()
+            .all(|call| call.purpose == scupper_sys::system::HelperPurpose::Probe)
+    );
     assert!(matches!(
         firing.as_slice(),
         [EventKind::CheckVerdictChanged {
@@ -3410,4 +3537,2413 @@ fn cold_start_without_resume_qualifies_at_real_cadence_without_incident() {
         )));
         rig.safe_history();
     }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep injected persistence failure, restart/reboot and explicit clearance in one lifecycle.
+fn failed_latch_persist_restart_and_reboot_keep_closed_with_durable_budgets() {
+    use scupper_sys::{
+        reconcile::StateStore,
+        state::{RepairState, StateRead},
+    };
+    use std::time::Instant;
+    struct FailingLatch(StateFile);
+    impl StateStore for FailingLatch {
+        fn read(&self) -> io::Result<State> {
+            StateStore::read(&self.0)
+        }
+        fn read_until(&self, deadline: Instant) -> io::Result<State> {
+            StateStore::read_until(&self.0, deadline)
+        }
+        fn write(&self, guard: &scupper_sys::lock::WriterGuard, state: &State) -> io::Result<()> {
+            self.0.write_with_hook(guard, state, &|step| {
+                if state.quarantine.is_some() && step == scupper_sys::fs::DurableStep::ContentSynced
+                {
+                    Err(io::Error::other("injected main latch persistence failure"))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+        fn repair_state(&self) -> Option<RepairState> {
+            Some(self.0.repair_state())
+        }
+        fn write_repair_state(
+            &self,
+            guard: &scupper_sys::lock::WriterGuard,
+            repair: &RepairState,
+        ) -> io::Result<()> {
+            self.0.write_repair_state(guard, repair)
+        }
+    }
+    for reboot in [false, true] {
+        let rig = Rig::new();
+        let state_root = rig.root.join("durable");
+        let run_root = rig.root.join("runtime");
+        let guard = WriterLock::acquire(&run_root).unwrap();
+        let file = StateFile::open(&state_root, Some(&guard)).unwrap();
+        file.write(&guard, &rig.store.state()).unwrap();
+        drop(guard);
+        let config = || {
+            let mut c = rig.config();
+            c.run_root = run_root.clone();
+            c
+        };
+        let mut machine = Reconciler::new(
+            rig.kernel.clone(),
+            FailingLatch(file),
+            rig.log.handle.clone(),
+            config(),
+            rig.held.clone(),
+            || (MonoTime(Duration::from_secs(100)), 1100),
+        )
+        .unwrap();
+        for _ in 0..4 {
+            rig.flush_rules();
+            machine.tick();
+        }
+        assert!(machine.latch().is_some());
+        assert!(run_root.join("latch-uncertain").is_file());
+        drop(machine);
+        let file = StateFile::open(&state_root, None).unwrap();
+        let StateRead::Present(raw) = file.read().unwrap() else {
+            panic!("missing state")
+        };
+        assert!(
+            raw.quarantine.is_none(),
+            "main state write must have failed"
+        );
+        assert_eq!(
+            file.repair_state().attempts_unix["safety:ruleset"],
+            vec![1100; 3]
+        );
+        if reboot {
+            fs::remove_dir_all(&run_root).unwrap();
+        }
+        let StateRead::Present(startup) = file.startup_read(&run_root).unwrap() else {
+            panic!("missing state")
+        };
+        assert!(startup.quarantine.is_some());
+        let mut restarted = Reconciler::new(
+            rig.kernel.clone(),
+            file,
+            rig.log.handle.clone(),
+            config(),
+            rig.held.clone(),
+            || (MonoTime(Duration::ZERO), 1200),
+        )
+        .unwrap();
+        assert!(restarted.latch().is_some());
+        let report = restarted.tick();
+        assert!(!raises(&report));
+        assert!(rig.kernel.model().forwarding_off());
+        let kind = report
+            .events
+            .iter()
+            .find(|event| {
+                matches!(
+                    event,
+                    EventKind::QuarantineChanged { active: true }
+                        | EventKind::QuarantineState { active: true }
+                )
+            })
+            .unwrap()
+            .clone();
+        let alert = scupper_proto::Event {
+            seq: 1,
+            at: UnixSeconds(1200),
+            kind,
+            actor: Actor::Daemon,
+            gateway: scupper_proto::Identifier::try_from("gw1".to_owned()).unwrap(),
+            config_version: Some(1),
+        }
+        .alert()
+        .unwrap();
+        assert_eq!(alert.severity, scupper_core::alerts::Severity::Critical);
+        scupper_sys::daemon::admin::execute(
+            &mut restarted,
+            scupper_proto::Op::Connect { exit: None },
+            0,
+            None,
+            |_| {
+                Ok(scupper_core::verdict::v2::Report {
+                    verdict: scupper_core::verdict::v2::Verdict::Protected {
+                        exit: scupper_core::config::ExitId("ch1".into()),
+                        exit_ip: "192.0.2.1".parse().unwrap(),
+                    },
+                    warnings: vec![],
+                    at: 1200,
+                    config_version: 1,
+                })
+            },
+        )
+        .unwrap();
+        assert!(restarted.latch().is_none());
+        let file = StateFile::open(&state_root, None).unwrap();
+        assert!(
+            file.repair_state()
+                .attempts_unix
+                .get("safety:ruleset")
+                .map_or(0, Vec::len)
+                <= 1,
+            "explicit connect resets the exhausted budget before repairing"
+        );
+        assert!(file.repair_state().latch().is_none());
+        assert!(!run_root.join("latch-uncertain").exists());
+    }
+}
+
+#[test]
+fn exhausted_durable_budget_without_latch_record_does_not_latch_after_reboot() {
+    let rig = Rig::new();
+    let run = rig.root.join("runtime");
+    let state_root = rig.root.join("durable");
+    let guard = WriterLock::acquire(&run).unwrap();
+    let file = StateFile::open(&state_root, Some(&guard)).unwrap();
+    file.write(&guard, &rig.store.state()).unwrap();
+    file.write_repair_state(
+        &guard,
+        &scupper_sys::state::RepairState {
+            attempts_unix: BTreeMap::from([("safety:ruleset".into(), vec![1100; 3])]),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    drop(guard);
+    fs::remove_dir_all(&run).unwrap();
+    let scupper_sys::state::StateRead::Present(saved) = file.startup_read(&run).unwrap() else {
+        panic!("missing state")
+    };
+    assert!(saved.quarantine.is_none());
+    assert_eq!(
+        file.repair_state().attempts_unix["safety:ruleset"],
+        vec![1100; 3]
+    );
+}
+
+#[test]
+fn three_successful_repairs_survive_restart_and_reboot_without_latch() {
+    for (reboot, gap) in [false, true]
+        .into_iter()
+        .flat_map(|reboot| [120, 600, 660].map(|gap| (reboot, gap)))
+    {
+        let rig = Rig::new();
+        let state_root = rig.root.join("durable");
+        let run_root = rig.root.join("runtime");
+        let guard = WriterLock::acquire(&run_root).unwrap();
+        let file = StateFile::open(&state_root, Some(&guard)).unwrap();
+        file.write(&guard, &rig.store.state()).unwrap();
+        drop(guard);
+        let config = || {
+            let mut c = rig.config();
+            c.run_root = run_root.clone();
+            c
+        };
+        let mut machine = Reconciler::new(
+            rig.kernel.clone(),
+            file,
+            rig.log.handle.clone(),
+            config(),
+            rig.held.clone(),
+            || (MonoTime(Duration::from_secs(100)), 1100),
+        )
+        .unwrap();
+        for _ in 0..3 {
+            rig.flush_rules();
+            let tick = machine.tick();
+            assert!(tick.failures.is_empty(), "{tick:?}");
+            assert!(
+                tick.steps
+                    .iter()
+                    .any(|step| matches!(step, Step::LoadRuleset { .. }))
+            );
+            assert!(machine.latch().is_none());
+        }
+        drop(machine);
+        if reboot {
+            fs::remove_dir_all(&run_root).unwrap();
+        }
+        let file = StateFile::open(&state_root, None).unwrap();
+        assert!(!file.repair_state().armed);
+        assert_eq!(
+            file.repair_state().attempts_unix["safety:ruleset"],
+            vec![1100; 3]
+        );
+        let scupper_sys::state::StateRead::Present(saved) = file.startup_read(&run_root).unwrap()
+        else {
+            unreachable!()
+        };
+        assert!(saved.quarantine.is_none());
+        let mut restarted = Reconciler::new(
+            rig.kernel.clone(),
+            file,
+            rig.log.handle.clone(),
+            config(),
+            rig.held.clone(),
+            || (MonoTime(Duration::ZERO), 1100 + gap),
+        )
+        .unwrap();
+        assert!(restarted.latch().is_none());
+        restarted.tick();
+        assert!(restarted.latch().is_none());
+        rig.flush_rules();
+        let tick = restarted.tick();
+        assert_eq!(
+            restarted.latch().is_some(),
+            gap < 600,
+            "gap={gap}, reboot={reboot}: {tick:?}"
+        );
+        if gap < 600 {
+            assert!(!raises(&tick));
+        } else {
+            assert!(tick.failures.is_empty(), "{tick:?}");
+            assert!(
+                tick.steps
+                    .iter()
+                    .any(|step| matches!(step, Step::LoadRuleset { .. })),
+                "{tick:?}"
+            );
+            assert_eq!(
+                rig.kernel.model().forwarding_v4,
+                Known::Value(1),
+                "{tick:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn failed_restore_disarms_its_own_checkpoint_and_does_not_latch_on_restart() {
+    let rig = Rig::new();
+    let state_root = rig.root.join("durable");
+    let guard = WriterLock::acquire(&rig.root).unwrap();
+    let file = StateFile::open(&state_root, Some(&guard)).unwrap();
+    file.write(&guard, &rig.store.state()).unwrap();
+    drop(guard);
+    let mut machine = Reconciler::new(
+        rig.kernel.clone(),
+        file,
+        rig.log.handle.clone(),
+        rig.config(),
+        rig.held.clone(),
+        || (MonoTime(Duration::from_secs(100)), 1100),
+    )
+    .unwrap();
+    rig.kernel.inject(Fault {
+        step: StepKind::LoadRuleset,
+        remaining: Some(1),
+        partial: false,
+    });
+    rig.flush_rules();
+    assert!(!machine.tick().complete);
+    let file = StateFile::open(&state_root, None).unwrap();
+    assert!(!file.repair_state().armed);
+    assert!(file.repair_state().latch().is_none());
+    assert!(!rig.root.join("latch-uncertain").exists());
+    machine.tick();
+    drop(machine);
+    let restarted = Reconciler::new(
+        rig.kernel.clone(),
+        file,
+        rig.log.handle.clone(),
+        rig.config(),
+        rig.held.clone(),
+        || (MonoTime(Duration::ZERO), 1200),
+    )
+    .unwrap();
+    assert!(restarted.latch().is_none());
+}
+
+#[test]
+fn real_collector_separates_host_and_gateway_inventory_failures() {
+    let rig = Rig::new();
+    for host in [true, false] {
+        let sys = CollectorSystem::default();
+        sys.fail_host_links.set(host);
+        sys.fail_netns_links.set(!host);
+        let observation = observe_real(&rig, &sys);
+        assert_eq!(observation.model.host_links_complete, !host);
+        assert_eq!(observation.model.links_complete, host);
+        let plan = scupper_core::planner::plan(
+            &rig.machine.as_ref().unwrap().desired().unwrap(),
+            &observation.model,
+            &scupper_core::planner::Budgets::default(),
+            None,
+            &scupper_core::planner::Debounce::default(),
+            MonoTime(Duration::ZERO),
+        );
+        assert_eq!(
+            plan.steps.contains(&Step::LinkDown { name: "wg0".into() }),
+            !host,
+            "{plan:?}"
+        );
+    }
+}
+
+#[test]
+fn failed_non_safety_checkpoint_does_not_block_forwarding_or_write_uncertainty() {
+    use scupper_sys::{reconcile::StateStore, state::RepairState};
+    use std::time::Instant;
+    struct FailedCheckpoint(StateFile);
+    impl StateStore for FailedCheckpoint {
+        fn read(&self) -> io::Result<State> {
+            StateStore::read(&self.0)
+        }
+        fn read_until(&self, deadline: Instant) -> io::Result<State> {
+            StateStore::read_until(&self.0, deadline)
+        }
+        fn write(&self, guard: &scupper_sys::lock::WriterGuard, state: &State) -> io::Result<()> {
+            self.0.write(guard, state)
+        }
+        fn repair_state(&self) -> Option<RepairState> {
+            Some(self.0.repair_state())
+        }
+        fn write_repair_state(
+            &self,
+            _: &scupper_sys::lock::WriterGuard,
+            _: &RepairState,
+        ) -> io::Result<()> {
+            Err(io::Error::other("full checkpoint disk"))
+        }
+    }
+    let rig = Rig::new();
+    let state_root = rig.root.join("durable");
+    let guard = WriterLock::acquire(&rig.root).unwrap();
+    let file = StateFile::open(&state_root, Some(&guard)).unwrap();
+    file.write(&guard, &rig.store.state()).unwrap();
+    drop(guard);
+    let mut machine = Reconciler::new(
+        rig.kernel.clone(),
+        FailedCheckpoint(file),
+        rig.log.handle.clone(),
+        rig.config(),
+        rig.held.clone(),
+        || (MonoTime(Duration::from_secs(100)), 1100),
+    )
+    .unwrap();
+    machine.resume_existing();
+    rig.kernel
+        .mutate(|model| model.forwarding_v4 = Known::Value(0));
+    let first = machine.tick();
+    let second = machine.tick();
+    assert!(raises(&first) || raises(&second), "{first:?} {second:?}");
+    assert!(first.failures.is_empty() && second.failures.is_empty());
+    assert!(machine.latch().is_none());
+    assert!(!rig.root.join("latch-uncertain").exists());
+}
+
+#[test]
+fn connect_clearance_uses_typed_uncertainty_instead_of_reason_words() {
+    for uncertain in [false, true] {
+        let mut rig = Rig::new();
+        let mut state = rig.store.state();
+        state.quarantine = Some(scupper_sys::state::Quarantine {
+            reason: "persistence appears in an ordinary fighter reason".into(),
+            object: "repair-history".into(),
+            since_unix: 1000,
+            uncertain,
+        });
+        let guard = WriterLock::acquire(&rig.root).unwrap();
+        scupper_sys::reconcile::StateStore::write(&rig.store, &guard, &state).unwrap();
+        drop(guard);
+        rig.restart();
+        let result = scupper_sys::daemon::admin::execute(
+            rig.machine(),
+            scupper_proto::Op::Connect { exit: None },
+            0,
+            None,
+            |_| {
+                Ok(scupper_core::verdict::v2::Report {
+                    verdict: scupper_core::verdict::v2::Verdict::Protected {
+                        exit: scupper_core::config::ExitId("ch1".into()),
+                        exit_ip: "192.0.2.1".parse().unwrap(),
+                    },
+                    warnings: vec![],
+                    at: 1100,
+                    config_version: 1,
+                })
+            },
+        );
+        if uncertain {
+            assert!(result.is_ok(), "{result:?}");
+            assert!(rig.machine().latch().is_none());
+        } else {
+            assert_eq!(
+                result.unwrap_err().code,
+                scupper_proto::ApiErrorCode::Quarantined
+            );
+            assert!(rig.machine().latch().is_some());
+        }
+    }
+}
+
+#[test]
+fn restored_attempts_keep_their_original_expiry_and_future_times_clamp_to_now() {
+    // Each attempt ages independently; count-only history is expired. Future
+    // timestamps count now, but do not extend the window beyond ten minutes.
+    for (history, elapsed, latched) in [
+        (
+            r#"{"attempts":{"safety:ruleset":3},"armed":false,"quarantine":null}"#,
+            0,
+            false,
+        ),
+        (
+            r#"{"attempts_unix":{"safety:ruleset":[1100,1100,1100]},"armed":false,"quarantine":null}"#,
+            479,
+            true,
+        ),
+        (
+            r#"{"attempts_unix":{"safety:ruleset":[1100,1100,1100]},"armed":false,"quarantine":null}"#,
+            480,
+            false,
+        ),
+        (
+            r#"{"attempts_unix":{"safety:ruleset":[1000,1100,1200]},"armed":false,"quarantine":null}"#,
+            380,
+            false,
+        ),
+        (
+            r#"{"attempts_unix":{"safety:ruleset":[9999,9999,9999]},"armed":false,"quarantine":null}"#,
+            599,
+            true,
+        ),
+        (
+            r#"{"attempts_unix":{"safety:ruleset":[9999,9999,9999]},"armed":false,"quarantine":null}"#,
+            600,
+            false,
+        ),
+    ] {
+        let rig = Rig::new();
+        let state_root = rig.root.join("durable");
+        let guard = WriterLock::acquire(&rig.root).unwrap();
+        let file = StateFile::open(&state_root, Some(&guard)).unwrap();
+        file.write(&guard, &rig.store.state()).unwrap();
+        fs::write(state_root.join("repair-state.json"), history).unwrap();
+        drop(guard);
+        let time = Cell::new(0);
+        let mut machine = Reconciler::new(
+            rig.kernel.clone(),
+            file,
+            rig.log.handle.clone(),
+            rig.config(),
+            rig.held.clone(),
+            || (MonoTime(Duration::from_secs(time.get())), 1220 + time.get()),
+        )
+        .unwrap();
+        time.set(elapsed);
+        rig.flush_rules();
+        let tick = machine.tick();
+        assert_eq!(
+            machine.latch().is_some(),
+            latched,
+            "elapsed={elapsed}, history={history}: {tick:?}"
+        );
+        if !latched {
+            assert!(
+                tick.steps
+                    .iter()
+                    .any(|step| matches!(step, Step::LoadRuleset { .. })),
+                "{tick:?}"
+            );
+            assert!(tick.failures.is_empty(), "{tick:?}");
+        }
+    }
+}
+
+#[test]
+fn repair_checkpoints_preserve_each_attempts_wall_timestamp_across_clock_steps() {
+    let rig = Rig::new();
+    let state_root = rig.root.join("durable");
+    let guard = WriterLock::acquire(&rig.root).unwrap();
+    let file = StateFile::open(&state_root, Some(&guard)).unwrap();
+    file.write(&guard, &rig.store.state()).unwrap();
+    drop(guard);
+    let time = Cell::new((100, 1100));
+    let mut machine = Reconciler::new(
+        rig.kernel.clone(),
+        file,
+        rig.log.handle.clone(),
+        rig.config(),
+        rig.held.clone(),
+        || {
+            let (mono, unix) = time.get();
+            (MonoTime(Duration::from_secs(mono)), unix)
+        },
+    )
+    .unwrap();
+    let mut expected = Vec::new();
+    for (mono, unix) in [(100, 1100), (200, 1105), (300, 2000)] {
+        time.set((mono, unix));
+        rig.flush_rules();
+        let tick = machine.tick();
+        assert!(tick.failures.is_empty(), "{tick:?}");
+        assert!(machine.latch().is_none());
+        expected.push(unix);
+        assert_eq!(
+            StateFile::open(&state_root, None)
+                .unwrap()
+                .repair_state()
+                .attempts_unix["safety:ruleset"],
+            expected
+        );
+    }
+}
+
+#[test]
+fn per_link_failure_redumps_once_and_positive_absence_avoids_d2() {
+    for race in [1, 2, 3, 4, 5] {
+        let rig = Rig::new();
+        let sys = CollectorSystem::default();
+        sys.per_link_race.set(race);
+        let observed = observe_real(&rig, &sys);
+        // One initial safety dump, exactly one safety re-dump, then phase B.
+        assert_eq!(sys.link_dumps.get(), 3);
+        let vanished = matches!(race, 1 | 5);
+        assert_eq!(observed.safety_complete, vanished, "race {race}");
+        assert_eq!(observed.model.links.contains_key("foreign0"), !vanished);
+        if vanished {
+            assert!(observed.model.links_complete);
+            assert!(
+                observed
+                    .model
+                    .links
+                    .values()
+                    .all(|l| l.tc_hooks != Known::Unknown)
+            );
+        } else {
+            assert_eq!(observed.model.links["foreign0"].tc_hooks, Known::Unknown);
+        }
+        let d = desired();
+        let p = scupper_core::planner::plan(
+            &d,
+            &observed.model,
+            &scupper_core::planner::Budgets::default(),
+            None,
+            &scupper_core::planner::Debounce::default(),
+            MonoTime(Duration::ZERO),
+        );
+        assert_eq!(
+            p.steps.contains(&Step::LinkDown { name: "wg0".into() }),
+            !vanished
+        );
+        assert_eq!(p.debounce.ingress_quarantined, !vanished);
+        assert_eq!(
+            p.steps.contains(&Step::Emit(
+                scupper_core::planner::PlannerEvent::ObservationUnknown
+            )),
+            !vanished
+        );
+    }
+}
+
+#[test]
+fn d2_recovery_raises_client_in_the_same_tick_and_events_identify_links() {
+    let mut rig = Rig::new();
+    rig.kernel.mutate(|m| {
+        foreign(m);
+        m.links.get_mut("foreign0").unwrap().tc_hooks = Known::Unknown;
+    });
+    let closed = rig.tick();
+    assert!(
+        closed
+            .steps
+            .contains(&Step::LinkDown { name: "wg0".into() })
+    );
+    assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(false));
+    assert_ne!(
+        rig.machine().verdict(),
+        Some(scupper_proto::VerdictCode::Protected)
+    );
+    rig.kernel.mutate(|m| {
+        m.links.remove("foreign0");
+    });
+    let recovered = rig.tick();
+    assert!(
+        recovered
+            .steps
+            .iter()
+            .any(|s| matches!(s, Step::LinkUp { name, .. } if name == "wg0"))
+    );
+    assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(true));
+    assert_eq!(
+        rig.machine().verdict(),
+        Some(scupper_proto::VerdictCode::Protected)
+    );
+    for report in [&closed, &recovered] {
+        for step in &report.steps {
+            if let Some(name) = step.link_name() {
+                assert!(report.events.iter().any(|e| matches!(e, EventKind::Repair { kind, object: Some(object), .. } if *kind == StepKind::from(step) && object == name)));
+            }
+        }
+    }
+}
+
+#[test]
+fn planner_reopens_client_through_baseline_hook_while_sessions_are_unknown() {
+    use scupper_sys::{
+        client_sessions::{self, Request, Response, Sample},
+        system::{ExecError, ExecOutput, Program, System},
+    };
+    struct SessionSystem;
+    impl System for SessionSystem {
+        fn run(
+            &self,
+            _purpose: scupper_sys::system::HelperPurpose,
+            _: Program,
+            _: &[String],
+            _: Duration,
+        ) -> Result<ExecOutput, ExecError> {
+            panic!("session hook must not run link commands")
+        }
+        fn now_unix_secs(&self) -> u64 {
+            1000
+        }
+        fn client_session_io(
+            &self,
+            _purpose: scupper_sys::system::HelperPurpose,
+            _: &NetnsHandle,
+            _: &Request,
+        ) -> io::Result<Response> {
+            Ok(Response::Samples(vec![Sample {
+                key: [3; 32],
+                handshake: (0, 0),
+                rx: 0,
+                tx: 0,
+            }]))
+        }
+    }
+    let mut rig = Rig::new();
+    let root = rig.root.join("sessions");
+    fs::create_dir(&root).unwrap();
+    let guard = WriterLock::acquire(root.join("provision")).unwrap();
+    client_sessions::provision(&root, "gateway", 1000, &guard).unwrap();
+    client_sessions::activate(&root, &root, "gateway", 1000, &guard).unwrap();
+    client_sessions::before_down(&SessionSystem, &root, &root, "gateway", &guard).unwrap();
+    let before_reads = rig.kernel.rest_reads();
+    let held = rig.held.clone();
+    let called = Rc::new(Cell::new(false));
+    let hook_called = called.clone();
+    let kernel = rig.kernel.clone();
+    let hook_root = root.clone();
+    rig.kernel.on_client_link_up(move |writer| {
+        assert!(
+            kernel.rest_reads() > before_reads,
+            "LinkUp preceded safety observation"
+        );
+        assert_eq!(kernel.model().links["wg0"].up, Known::Value(false));
+        let sessions = client_sessions::status(
+            &SessionSystem,
+            &held,
+            "wg0",
+            &hook_root,
+            &hook_root,
+            "gateway",
+            &[[3; 32]],
+        )
+        .unwrap();
+        assert!(
+            sessions.unknown,
+            "regression requires non-ready sessions at LinkUp"
+        );
+        client_sessions::before_up(
+            &SessionSystem,
+            &held,
+            "wg0",
+            &hook_root,
+            &hook_root,
+            "gateway",
+            true,
+            writer,
+        )
+        .unwrap();
+        hook_called.set(true);
+        Ok(())
+    });
+    rig.kernel
+        .mutate(|model| model.links.get_mut("wg0").unwrap().up = Known::Value(false));
+    for _ in 0..4 {
+        rig.round(true);
+        rig.tick();
+    }
+    assert!(
+        called.get(),
+        "session readiness 3 blocked the baseline/LinkUp repair"
+    );
+    assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(true));
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("client-sessions.json")).unwrap()).unwrap();
+    assert_eq!(record["down"], false);
+    assert_eq!(record["probe_pending"], true);
+    rig.kernel.on_client_link_up(|_| Ok(()));
+}
+
+#[test]
+fn complete_tick_cannot_report_protected_while_client_link_is_down_or_missing() {
+    for missing in [false, true] {
+        let mut rig = Rig::new();
+        rig.kernel.mutate(|m| {
+            if missing {
+                m.links.remove("wg0");
+            } else {
+                m.links.get_mut("wg0").unwrap().up = Known::Value(false);
+            }
+        });
+        let report = rig.tick(); // Availability repair is still debouncing.
+        assert!(report.complete);
+        assert_ne!(
+            rig.machine().verdict(),
+            Some(scupper_proto::VerdictCode::Protected)
+        );
+        assert_eq!(
+            rig.machine().verdict(),
+            Some(scupper_proto::VerdictCode::Degraded)
+        );
+    }
+}
+
+#[test]
+fn failed_d2_link_up_keeps_forwarding_closed_and_names_the_failed_link() {
+    let mut rig = Rig::new();
+    rig.kernel.mutate(|m| {
+        foreign(m);
+        m.links.get_mut("foreign0").unwrap().tc_hooks = Known::Unknown;
+    });
+    rig.tick();
+    rig.kernel.mutate(|m| {
+        m.links.remove("foreign0");
+    });
+    rig.kernel.inject(Fault {
+        step: StepKind::LinkUp,
+        remaining: None,
+        partial: false,
+    });
+    let report = rig.tick();
+    assert!(
+        report
+            .failures
+            .iter()
+            .any(|(s, _)| matches!(s, Step::LinkUp { .. }))
+    );
+    assert!(
+        !report
+            .steps
+            .iter()
+            .any(|s| matches!(s, Step::ForwardingOn { .. }))
+    );
+    assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(false));
+    assert!(rig.kernel.model().forwarding_off());
+    assert_ne!(
+        rig.machine().verdict(),
+        Some(scupper_proto::VerdictCode::Protected)
+    );
+    assert!(report.events.iter().any(|e| matches!(e, EventKind::Repair {
+        kind: StepKind::LinkUp, object: Some(name), result: scupper_proto::Outcome::Failed, ..
+    } if name == "wg0")));
+}
+
+#[test]
+fn manual_client_repair_dispatches_recovery_and_unknown_inventory_cannot_use_old_cache() {
+    let mut rig = Rig::new();
+    rig.kernel
+        .mutate(|m| m.links.get_mut("wg0").unwrap().up = Known::Value(false));
+    let before = rig.kernel.session_recoveries();
+    let steps = rig
+        .machine()
+        .apply_plan(false, Actor::Local { uid: 0 })
+        .unwrap();
+    assert!(steps.contains(&StepKind::LinkUp));
+    assert_eq!(
+        rig.kernel.session_recoveries(),
+        before,
+        "LinkUp requires a fresh next tick"
+    );
+    rig.tick();
+    assert!(rig.kernel.session_recoveries() > before);
+    assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(true));
+    // The last cached state was healthy. Manual repair must replace it with
+    // its fresh Unknown observation before deciding whether to send output.
+    rig.kernel
+        .timeouts(BTreeSet::from([ObservationItem::Tc("wg0".into())]));
+    let before = rig.kernel.session_recoveries();
+    rig.machine()
+        .apply_plan(false, Actor::Local { uid: 0 })
+        .unwrap();
+    assert_eq!(rig.kernel.session_recoveries(), before);
+    assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(false));
+}
+
+#[test]
+fn link_down_timeout_after_effect_has_a_prior_session_checkpoint() {
+    let mut rig = Rig::new();
+    rig.kernel.mutate(|m| {
+        foreign(m);
+        m.links.get_mut("foreign0").unwrap().tc_hooks = Known::Unknown;
+    });
+    rig.kernel.inject(Fault {
+        step: StepKind::LinkDown,
+        remaining: None,
+        partial: true,
+    });
+    let recoveries = rig.kernel.session_recoveries();
+    let report = rig.tick();
+    assert!(
+        report
+            .failures
+            .iter()
+            .any(|(s, _)| matches!(s, Step::LinkDown { name } if name == "wg0"))
+    );
+    assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(false));
+    let history = rig.kernel.history();
+    let checkpoint = rig.kernel.session_checkpoints();
+    let down = history
+        .iter()
+        .position(|(s, _)| matches!(s, Step::LinkDown { name } if name == "wg0"))
+        .unwrap();
+    assert!(
+        checkpoint.contains(&down),
+        "checkpoint must precede the failed command"
+    );
+    assert_eq!(
+        rig.kernel.session_recoveries(),
+        recoveries,
+        "failed plan cannot run recovery hook"
+    );
+}
+
+#[test]
+fn independent_sampler_renews_while_reconciler_has_persistent_nonfatal_failure() {
+    use scupper_sys::{
+        client_sessions::{self, Request, Response, Sample},
+        system::{ExecError, ExecOutput, Program, System},
+    };
+    struct ActivitySystem {
+        now: Cell<u64>,
+    }
+    impl System for ActivitySystem {
+        fn run(
+            &self,
+            _purpose: scupper_sys::system::HelperPurpose,
+            _: Program,
+            _: &[String],
+            _: Duration,
+        ) -> Result<ExecOutput, ExecError> {
+            panic!("activity sampling must not run repair commands")
+        }
+        fn now_unix_secs(&self) -> u64 {
+            self.now.get()
+        }
+        fn client_session_io(
+            &self,
+            _purpose: scupper_sys::system::HelperPurpose,
+            _: &NetnsHandle,
+            request: &Request,
+        ) -> io::Result<Response> {
+            assert!(request.probe.is_none());
+            Ok(Response::Samples(vec![Sample {
+                key: [3; 32],
+                handshake: (self.now.get(), 1),
+                rx: self.now.get() * 128,
+                tx: 0,
+            }]))
+        }
+    }
+    let mut rig = Rig::new();
+    let root = rig.root.join("sessions");
+    fs::create_dir_all(&root).unwrap();
+    let activity = Rc::new(ActivitySystem {
+        now: Cell::new(1000),
+    });
+    let sampler_guard = WriterLock::acquire(root.join("sampler-owner")).unwrap();
+    let held = rig.held.clone();
+    let sample = || {
+        client_sessions::checkpoint_recovered(
+            &*activity,
+            &held,
+            "wg0",
+            &root,
+            &root,
+            "public-gateway",
+            &sampler_guard,
+            &[[3; 32]],
+        )
+        .unwrap();
+    };
+    sample();
+    // Establish a baseline, then authenticated activity.
+    rig.tick();
+    activity.now.set(1002);
+    sample();
+    rig.tick();
+    rig.store.fail_writes(true);
+    let mut saw_failure = false;
+    for now in (1004..1040).step_by(2) {
+        activity.now.set(now);
+        sample();
+        rig.flush_rules(); // Exhaust the drift budget; latch persistence then fails every tick.
+        let before = rig.kernel.session_recoveries();
+        let report = rig.tick();
+        if !report.failures.is_empty() {
+            assert_eq!(
+                rig.kernel.session_recoveries(),
+                before,
+                "failed repairs must still suppress outbound probes"
+            );
+        }
+        saw_failure |= report
+            .failures
+            .iter()
+            .any(|(step, _)| step.failure() == scupper_core::planner::StepFailure::NonFatal);
+        let record: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("client-sessions.json")).unwrap()).unwrap();
+        assert_eq!(record["renewed_at"], now);
+        assert_eq!(record["peers"][0]["lease_until"], now + 180);
+    }
+    assert!(
+        saw_failure,
+        "fixture must exercise a real NonFatal step failure"
+    );
+}
+
+#[test]
+fn repairs_never_call_a_blocking_tick_checkpoint() {
+    let mut rig = Rig::new();
+    rig.kernel
+        .on_activity_checkpoint(|_| panic!("repair path called session persistence"));
+    rig.flush_rules();
+    let report = rig.tick();
+    assert!(report.steps.contains(&Step::ForwardingOff));
+}
+
+#[test]
+fn stop_during_unknown_observation_rechecks_once_without_repairs_when_safe() {
+    use std::sync::atomic::AtomicBool;
+    for item in [
+        ObservationItem::Links,
+        ObservationItem::Tc("wg0".into()),
+        ObservationItem::Ruleset,
+        ObservationItem::DefaultV4,
+        ObservationItem::DefaultV6,
+        ObservationItem::ExtraRoutes,
+        ObservationItem::Rules,
+    ] {
+        let mut rig = Rig::new();
+        let before = rig.kernel.model();
+        let stop = Arc::new(AtomicBool::new(false));
+        let signal = stop.clone();
+        let rechecks = Rc::new(Cell::new(0));
+        let count = rechecks.clone();
+        rig.kernel.on_next_observe(move |kernel| {
+            signal.store(true, Ordering::Relaxed);
+            kernel.timeouts(BTreeSet::from([item]));
+            kernel.on_next_observe(move |kernel| {
+                count.set(count.get() + 1);
+                kernel.timeouts(BTreeSet::new());
+            });
+        });
+        let report = rig.machine().tick_with_stop(&stop);
+        assert!(stop.load(Ordering::Relaxed));
+        assert_eq!(rechecks.get(), 1);
+        assert!(report.steps.is_empty(), "{:?}", report.steps);
+        assert_eq!(rig.kernel.history(), vec![]);
+        assert_eq!(rig.kernel.model(), before);
+        assert!(!report.events.iter().any(|event| matches!(
+            event,
+            EventKind::Repair { .. }
+                | EventKind::IngressQuarantineChanged { active: true }
+                | EventKind::QuarantineChanged { active: true }
+        )));
+    }
+}
+
+#[test]
+fn stop_with_persistent_unknown_fails_closed_after_exactly_one_recheck() {
+    use std::sync::atomic::AtomicBool;
+    let mut rig = Rig::new();
+    let stop = Arc::new(AtomicBool::new(false));
+    let signal = stop.clone();
+    let rechecks = Rc::new(Cell::new(0));
+    let count = rechecks.clone();
+    rig.kernel.on_next_observe(move |kernel| {
+        signal.store(true, Ordering::Relaxed);
+        kernel.timeouts(BTreeSet::from([ObservationItem::Tc("wg0".into())]));
+        kernel.on_next_observe(move |_| count.set(count.get() + 1));
+    });
+    let report = rig.machine().tick_with_stop(&stop);
+    assert_eq!(rechecks.get(), 1);
+    assert!(report.steps.contains(&Step::ForwardingOff));
+    assert!(
+        report
+            .steps
+            .contains(&Step::LinkDown { name: "wg0".into() })
+    );
+    assert_eq!(rig.kernel.model().forwarding_v4, Known::Value(0));
+    assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(false));
+    assert!(
+        report
+            .events
+            .contains(&EventKind::IngressQuarantineChanged { active: true })
+    );
+}
+
+#[test]
+fn stop_contains_known_drift_despite_unrelated_unknown_without_retry() {
+    use std::sync::atomic::AtomicBool;
+    let mut rig = Rig::new();
+    rig.kernel.mutate(|model| {
+        model.links.get_mut("wg0").unwrap().tc_hooks = Known::Value(vec!["root".into()]);
+    });
+    let stop = Arc::new(AtomicBool::new(false));
+    let signal = stop.clone();
+    let rechecks = Rc::new(Cell::new(0));
+    let count = rechecks.clone();
+    rig.kernel.on_next_observe(move |kernel| {
+        signal.store(true, Ordering::Relaxed);
+        kernel.timeouts(BTreeSet::from([ObservationItem::Tc("ex-ch1".into())]));
+        kernel.on_next_observe(move |_| count.set(count.get() + 1));
+    });
+    let report = rig.machine().tick_with_stop(&stop);
+    assert_eq!(rechecks.get(), 0);
+    assert!(report.steps.contains(&Step::ForwardingOff));
+    assert!(
+        report
+            .steps
+            .iter()
+            .any(|step| matches!(step, Step::TcDelete { name, .. } if name == "wg0"))
+    );
+    assert_eq!(rig.kernel.model().forwarding_v4, Known::Value(0));
+}
+
+#[test]
+fn stop_during_mutation_finishes_containment_sequence_at_safe_boundary() {
+    use std::sync::atomic::AtomicBool;
+    let mut rig = Rig::new();
+    rig.kernel.mutate(|model| {
+        model.links.get_mut("wg0").unwrap().tc_hooks = Known::Value(vec!["root".into()]);
+    });
+    let stop = Arc::new(AtomicBool::new(false));
+    let signal = stop.clone();
+    rig.kernel.on_next_step(move |step| {
+        assert_eq!(step, &Step::ForwardingOff);
+        signal.store(true, Ordering::Relaxed);
+    });
+    let report = rig.machine().tick_with_stop(&stop);
+    assert!(stop.load(Ordering::Relaxed));
+    assert!(
+        report
+            .steps
+            .iter()
+            .any(|step| matches!(step, Step::TcDelete { name, .. } if name == "wg0"))
+    );
+    assert_eq!(
+        rig.kernel.model().links["wg0"].tc_hooks,
+        Known::Value(vec![])
+    );
+    assert_eq!(rig.kernel.model().forwarding_v4, Known::Value(0));
+    rig.safe_history();
+}
+
+#[test]
+fn ingress_quarantine_fires_and_resolves_without_latch_change() {
+    let mut rig = Rig::new();
+    rig.kernel
+        .timeouts(BTreeSet::from([ObservationItem::Tc("wg0".into())]));
+    let first = rig.tick();
+    assert!(
+        first
+            .events
+            .contains(&EventKind::IngressQuarantineChanged { active: true })
+    );
+    rig.kernel.timeouts(BTreeSet::new());
+    let second = rig.tick();
+    assert!(
+        second
+            .events
+            .contains(&EventKind::IngressQuarantineChanged { active: false })
+    );
+    assert!(
+        !second
+            .events
+            .contains(&EventKind::QuarantineChanged { active: false })
+    );
+}
+
+#[test]
+fn safety_read_failures_identify_namespace_link_stage_and_failure_type() {
+    use scupper_proto::{ReadFailureKind as F, ReadNamespace as N, ReadStage as S};
+    let rig = Rig::new();
+    for (mode, stage, failure) in [
+        (1, S::TcQdisc, F::Timeout),
+        (2, S::TcFilterRoot, F::Signal),
+        (3, S::TcFilterRoot, F::Parse),
+    ] {
+        let sys = CollectorSystem::default();
+        sys.tc_failure.set(mode);
+        let observed = observe_real(&rig, &sys);
+        assert!(!observed.safety_complete);
+        assert!(
+            observed
+                .failures
+                .iter()
+                .any(|context| context.namespace == N::Held
+                    && context.link.as_deref() == Some("wg0")
+                    && context.stage == stage
+                    && context.failure == failure),
+            "{:?}",
+            observed.failures
+        );
+    }
+    let sys = CollectorSystem::default();
+    sys.fail_netns_links.set(true);
+    let observed = observe_real(&rig, &sys);
+    assert!(
+        observed
+            .failures
+            .iter()
+            .any(|context| context.namespace == N::Held
+                && context.link.is_none()
+                && context.stage == S::LinkList
+                && context.failure == F::Timeout)
+    );
+}
+
+#[test]
+fn positive_tc_finding_survives_an_unknown_later_filter_read() {
+    let rig = Rig::new();
+    let sys = CollectorSystem::default();
+    sys.tc_failure.set(4);
+    let observed = observe_real(&rig, &sys);
+    assert!(!observed.safety_complete);
+    assert_eq!(observed.model.links["wg0"].tc_hooks, Known::Unknown);
+    assert!(observed.known_unsafe_tc);
+    assert!(
+        observed
+            .failures
+            .iter()
+            .any(|context| context.stage == scupper_proto::ReadStage::TcFilterRoot)
+    );
+}
+
+#[test]
+fn restart_resolves_old_ingress_quarantine_from_fresh_inventory() {
+    let mut rig = Rig::new();
+    rig.kernel
+        .timeouts(BTreeSet::from([ObservationItem::Tc("wg0".into())]));
+    let first = rig.tick();
+    assert!(
+        first
+            .events
+            .contains(&EventKind::IngressQuarantineChanged { active: true })
+    );
+    rig.kernel.timeouts(BTreeSet::new());
+    rig.restart();
+    let mut resolved = false;
+    for _ in 0..3 {
+        let next = rig.tick();
+        if next
+            .events
+            .contains(&EventKind::IngressQuarantineState { active: false })
+        {
+            assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(true));
+            resolved = true;
+            break;
+        }
+        assert!(!ingress_resolved(&next));
+    }
+    assert!(
+        resolved,
+        "restart resolves only after the debounced lift is verified"
+    );
+}
+
+#[test]
+fn stop_during_full_plan_exits_only_after_a_complete_operation_and_safety_check() {
+    use std::sync::atomic::AtomicBool;
+    let mut rig = Rig::new();
+    rig.kernel.mutate(|model| {
+        let link = model.links.get_mut("wg0").unwrap();
+        let Known::Value(settings) = &mut link.settings else {
+            panic!("missing settings")
+        };
+        settings.mtu += 1;
+    });
+    rig.tick(); // Admit the debounced configuration repair on the next tick.
+    let stop = Arc::new(AtomicBool::new(false));
+    let signal = stop.clone();
+    rig.kernel
+        .on_next_step(move |_| signal.store(true, Ordering::Relaxed));
+    let report = rig.machine().tick_with_stop(&stop);
+    assert!(stop.load(Ordering::Relaxed));
+    assert!(!report.complete);
+    assert!(
+        report
+            .steps
+            .contains(&Step::LinkDown { name: "wg0".into() })
+    );
+    assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(true));
+    assert_eq!(rig.kernel.model().forwarding_v4, Known::Value(1));
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert!(safe(&rig.kernel.model(), &rig.machine().desired().unwrap()));
+    rig.safe_history();
+}
+
+#[test]
+fn shutdown_safety_reobservation_honors_the_two_second_shared_budget() {
+    let rig = Rig::new();
+    let sys = CollectorSystem::default();
+    sys.stall.set(true);
+    let start = std::time::Instant::now();
+    let observed = observe_real_with_deadline(&rig, &sys, Some(start + Duration::from_secs(2)));
+    assert!(!observed.safety_complete);
+    assert!(start.elapsed() <= Duration::from_millis(2100));
+    assert!(
+        sys.calls
+            .borrow()
+            .iter()
+            .all(|(_, _, _, timeout)| *timeout <= Duration::from_secs(2))
+    );
+}
+
+#[test]
+fn real_collector_unknown_after_stop_rechecks_without_any_repairs() {
+    use scupper_sys::system::Program;
+    use std::sync::atomic::AtomicBool;
+    let rig = Rig::new();
+    let sys = CollectorSystem::default();
+    let stop = Arc::new(AtomicBool::new(false));
+    *sys.stop_on_link_read.borrow_mut() = Some(stop.clone());
+    let kernel = collector_kernel(&rig, &sys);
+    let mut machine = Reconciler::new(
+        kernel,
+        rig.store.clone(),
+        rig.log.handle.clone(),
+        collector_config(&rig),
+        rig.held.clone(),
+        || (MonoTime(Duration::from_secs(30)), 1030),
+    )
+    .unwrap();
+    let report = machine.tick_with_stop(&stop);
+    assert!(stop.load(Ordering::Relaxed));
+    assert_eq!(report.steps, [] as [Step; 0]);
+    assert!(!report.events.iter().any(|event| matches!(
+        event,
+        EventKind::Repair { .. }
+            | EventKind::QuarantineChanged { active: true }
+            | EventKind::IngressQuarantineChanged { active: true }
+            | EventKind::IngressQuarantineState { active: true }
+    )));
+    let calls = sys.calls.borrow();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|(namespace, program, args, _)| *namespace
+                && *program == Program::Ip
+                && args.iter().any(|arg| arg == "link"))
+            .count(),
+        2
+    );
+    assert!(!calls.iter().any(|(_, _, args, _)| {
+        args.iter()
+            .any(|arg| arg == "-w" || arg == "down" || arg == "up")
+    }));
+}
+
+fn ingress_resolved(report: &TickReport) -> bool {
+    report
+        .events
+        .contains(&EventKind::IngressQuarantineChanged { active: false })
+}
+
+#[test]
+fn stop_with_clean_inventory_leaves_ingress_quarantine_active_while_client_down() {
+    let mut rig = Rig::new();
+    rig.kernel
+        .timeouts(BTreeSet::from([ObservationItem::Tc("wg0".into())]));
+    rig.tick();
+    rig.kernel.timeouts(BTreeSet::new());
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal = stop.clone();
+    rig.kernel
+        .on_next_observe(move |_| signal.store(true, Ordering::Release));
+    let report = rig.machine().tick_with_stop(&stop);
+    assert_eq!(report.steps, [] as [Step; 0]);
+    assert!(!ingress_resolved(&report));
+    assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(false));
+}
+
+#[test]
+fn ingress_resolve_requires_successful_link_up_and_all_lift_prerequisites() {
+    for failed_up in [true, false] {
+        let mut rig = Rig::new();
+        rig.kernel
+            .timeouts(BTreeSet::from([ObservationItem::Tc("wg0".into())]));
+        rig.tick();
+        rig.kernel.timeouts(BTreeSet::new());
+        if failed_up {
+            rig.kernel.inject(Fault {
+                step: StepKind::LinkUp,
+                remaining: None,
+                partial: false,
+            });
+        }
+        let second = rig.tick();
+        assert_eq!(ingress_resolved(&second), !failed_up, "{:?}", second.steps);
+        assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(!failed_up));
+    }
+}
+
+#[test]
+fn stop_after_forwarding_off_is_mutation_free_and_does_not_raise_an_alert() {
+    for unknown in [false, true] {
+        let mut rig = Rig::new();
+        rig.kernel.mutate(|model| {
+            model.forwarding_v4 = Known::Value(0);
+            model.forwarding_v6 = Known::Value(0);
+        });
+        let before = rig.kernel.model();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal = stop.clone();
+        rig.kernel.on_next_observe(move |kernel| {
+            signal.store(true, Ordering::Release);
+            if unknown {
+                kernel.timeouts(BTreeSet::from([ObservationItem::Tc("wg0".into())]));
+                kernel.on_next_observe(|kernel| kernel.timeouts(BTreeSet::new()));
+            }
+        });
+        let report = rig.machine().tick_with_stop(&stop);
+        assert_eq!(rig.kernel.drain_calls(), usize::from(unknown));
+        assert!(report.steps.is_empty(), "{:?}", report.steps);
+        assert_eq!(rig.kernel.model(), before);
+        assert!(!report.events.iter().any(|event| matches!(
+            event,
+            EventKind::IngressQuarantineChanged { active: true } | EventKind::Repair { .. }
+        )));
+    }
+}
+
+#[test]
+fn stop_read_drain_timeout_keeps_containment_and_successful_reap_allows_one_read() {
+    for reaped in [false, true] {
+        let mut rig = Rig::new();
+        rig.kernel.drain_result(reaped);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal = stop.clone();
+        let reads = Rc::new(Cell::new(0));
+        let count = reads.clone();
+        rig.kernel.on_next_observe(move |kernel| {
+            signal.store(true, Ordering::Release);
+            kernel.timeouts(BTreeSet::from([ObservationItem::Ruleset]));
+            kernel.on_next_observe(move |kernel| {
+                count.set(count.get() + 1);
+                kernel.timeouts(BTreeSet::new());
+            });
+        });
+        rig.kernel
+            .on_next_drain(|kernel| kernel.advance_stop_clock(Duration::from_secs(4)));
+        let report = rig.machine().tick_with_stop(&stop);
+        assert_eq!(rig.kernel.drain_calls(), 1);
+        assert_eq!(reads.get(), usize::from(reaped));
+        assert_eq!(report.steps.is_empty(), reaped);
+        if !reaped {
+            assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(false));
+            assert_eq!(rig.kernel.model().forwarding_v4, Known::Value(0));
+        }
+    }
+}
+
+#[test]
+fn stop_mid_restore_with_unknown_verification_preserves_closed_client() {
+    let mut rig = Rig::new();
+    rig.kernel.mutate(|model| {
+        let Known::Value(settings) = &mut model.links.get_mut("wg0").unwrap().settings else {
+            panic!("missing settings")
+        };
+        settings.mtu += 1;
+    });
+    rig.tick();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal = stop.clone();
+    let kernel = rig.kernel.clone();
+    rig.kernel.on_next_step(move |step| {
+        assert_eq!(step, &Step::LinkDown { name: "wg0".into() });
+        signal.store(true, Ordering::Release);
+        kernel.timeouts(BTreeSet::from([ObservationItem::Ruleset]));
+    });
+    let report = rig.machine().tick_with_stop(&stop);
+    assert!(!raises(&report));
+    assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(false));
+    assert_eq!(rig.kernel.model().forwarding_v4, Known::Value(0));
+    assert!(!ingress_resolved(&report));
+}
+
+#[test]
+fn stop_immediately_before_reopen_requires_fresh_safe_evidence_and_never_resolves() {
+    for evidence in ["safe", "unknown", "unsafe"] {
+        let mut rig = Rig::new();
+        rig.kernel
+            .timeouts(BTreeSet::from([ObservationItem::Tc("wg0".into())]));
+        let quarantined = rig.tick();
+        assert!(
+            quarantined
+                .events
+                .contains(&EventKind::IngressQuarantineChanged { active: true })
+        );
+        rig.kernel.timeouts(BTreeSet::new());
+        rig.kernel.mutate(|model| {
+            let Known::Value(settings) = &mut model.links.get_mut("wg0").unwrap().settings else {
+                panic!("settings")
+            };
+            settings.mtu += 1;
+        });
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal = stop.clone();
+        let kernel = rig.kernel.clone();
+        let reopen_reads = Rc::new(Cell::new(0));
+        let reads = reopen_reads.clone();
+        // LinkReconfigure is a genuine Restore. The first stopping safety check
+        // succeeds; only the final full read immediately before reopening fails.
+        rig.kernel.on_each_step(move |step| {
+            if matches!(step, Step::LinkReconfigure { .. }) {
+                signal.store(true, Ordering::Release);
+                let reads = reads.clone();
+                kernel.on_next_rest(move |kernel| {
+                    reads.set(reads.get() + 1);
+                    if evidence == "unknown" {
+                        kernel.timeouts(BTreeSet::from([ObservationItem::Rules]));
+                    } else if evidence == "unsafe" {
+                        kernel.mutate(|m| {
+                            m.links.get_mut("wg0").unwrap().tc_hooks =
+                                Known::Value(vec!["root".into()]);
+                        });
+                    }
+                });
+            }
+        });
+        let report = rig.machine().tick_with_stop(&stop);
+        assert!(stop.load(Ordering::Acquire));
+        assert_eq!(
+            reopen_reads.get(),
+            1,
+            "reopen verification was skipped: {:?}",
+            report.steps
+        );
+        assert!(
+            report
+                .steps
+                .iter()
+                .any(|s| matches!(s, Step::LinkReconfigure { .. }))
+        );
+        assert!(!ingress_resolved(&report));
+        assert_eq!(
+            rig.kernel.model().links["wg0"].up,
+            Known::Value(evidence == "safe"),
+            "{:?}",
+            report.steps
+        );
+    }
+}
+
+#[test]
+fn stop_during_lift_verification_cannot_commit_a_resolve() {
+    let mut rig = Rig::new();
+    rig.kernel
+        .timeouts(BTreeSet::from([ObservationItem::Tc("wg0".into())]));
+    rig.tick();
+    rig.kernel.timeouts(BTreeSet::new());
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal = stop.clone();
+    let kernel = rig.kernel.clone();
+    rig.kernel.on_each_step(move |step| {
+        if matches!(step, Step::LinkUp { .. }) {
+            let signal = signal.clone();
+            kernel.on_next_observe(move |_| signal.store(true, Ordering::Release));
+        }
+    });
+    let report = rig.machine().tick_with_stop(&stop);
+    assert!(stop.load(Ordering::Acquire));
+    assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(true));
+    assert!(!ingress_resolved(&report));
+}
+
+fn exhaust_tc_budget(rig: &mut Rig) {
+    for _ in 0..3 {
+        rig.kernel.mutate(|model| {
+            model.links.get_mut("wg0").unwrap().tc_hooks = Known::Value(vec!["root".into()]);
+        });
+        let first = rig.tick();
+        let report = if raises(&first) { first } else { rig.tick() };
+        assert!(raises(&report), "{:?}", report.steps);
+    }
+    assert!(rig.machine().latch().is_none());
+    // This drift first appears in phase B, so the full-plan executor owns the
+    // latch, rather than relying on a preceding phase-A persistence attempt.
+    rig.kernel.on_next_rest(|kernel| {
+        kernel.mutate(|model| {
+            model.links.get_mut("wg0").unwrap().tc_hooks = Known::Value(vec!["root".into()]);
+        });
+    });
+}
+
+#[test]
+fn stop_at_latching_containment_boundaries_finishes_tightening_before_persistence() {
+    for boundary in 1..=4 {
+        let mut rig = Rig::new();
+        exhaust_tc_budget(&mut rig);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal = stop.clone();
+        let store = rig.store.clone();
+        let marker = rig.root.join("latch-uncertain");
+        let count = Rc::new(Cell::new(0));
+        let seen = count.clone();
+        rig.kernel.on_each_step(move |step| {
+            seen.set(seen.get() + 1);
+            assert!(
+                marker.exists() || store.state().quarantine.is_some(),
+                "crash evidence precedes {step:?}"
+            );
+            if matches!(step, Step::TcDelete { .. }) {
+                assert!(
+                    store.state().quarantine.is_none(),
+                    "tc removal precedes durable storage"
+                );
+            }
+            if seen.get() == boundary {
+                signal.store(true, Ordering::Release);
+            }
+        });
+        let report = rig.machine().tick_with_stop(&stop);
+        assert!(count.get() >= boundary);
+        assert_eq!(report.steps.first(), Some(&Step::ForwardingOff));
+        let persist = report
+            .steps
+            .iter()
+            .position(|step| matches!(step, Step::PersistLatch { .. }))
+            .unwrap();
+        let tc = report
+            .steps
+            .iter()
+            .position(|step| matches!(step, Step::TcDelete { .. }))
+            .unwrap();
+        assert!(tc < persist, "{:?}", report.steps);
+        assert!(
+            report.steps[..persist]
+                .iter()
+                .all(|step| !matches!(step, Step::Emit(_)))
+        );
+        assert!(rig.store.state().quarantine.is_some());
+        assert!(
+            matches!(rig.kernel.model().links["wg0"].tc_hooks, Known::Value(ref hooks) if hooks.is_empty())
+        );
+        rig.restart();
+        assert!(rig.machine().latch().is_some());
+    }
+}
+
+#[test]
+fn stop_before_persist_latch_and_failed_persistence_still_tightens() {
+    for fail in [false, true] {
+        let mut rig = Rig::new();
+        exhaust_tc_budget(&mut rig);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal = stop.clone();
+        // Set stop at the full-observation boundary, before any latch write.
+        rig.kernel.on_next_rest(move |kernel| {
+            kernel.mutate(|model| {
+                model.links.get_mut("wg0").unwrap().tc_hooks = Known::Value(vec!["root".into()]);
+            });
+            signal.store(true, Ordering::Release);
+        });
+        rig.store.fail_writes(fail);
+        let report = rig.machine().tick_with_stop(&stop);
+        assert_eq!(report.steps.first(), Some(&Step::ForwardingOff));
+        let persist = report
+            .steps
+            .iter()
+            .position(|step| matches!(step, Step::PersistLatch { .. }))
+            .unwrap();
+        let tc = report
+            .steps
+            .iter()
+            .position(|step| matches!(step, Step::TcDelete { .. }))
+            .unwrap();
+        assert!(tc < persist, "{:?}", report.steps);
+        assert!(
+            report.steps[..persist]
+                .iter()
+                .all(|step| !matches!(step, Step::Emit(_)))
+        );
+        assert_eq!(rig.store.state().quarantine.is_some(), !fail);
+        assert_eq!(rig.machine().latch_persistence_failed(), fail);
+        assert_eq!(rig.root.join("latch-uncertain").exists(), fail);
+        assert_eq!(rig.kernel.model().forwarding_v4, Known::Value(0));
+        assert!(
+            matches!(rig.kernel.model().links["wg0"].tc_hooks, Known::Value(ref hooks) if hooks.is_empty())
+        );
+        assert_eq!(
+            report
+                .events
+                .iter()
+                .any(|event| matches!(event, EventKind::PersistenceFailed { .. })),
+            fail
+        );
+    }
+}
+
+#[test]
+fn restart_after_every_latching_containment_boundary_keeps_quarantine() {
+    let boundaries = {
+        let mut rig = Rig::new();
+        exhaust_tc_budget(&mut rig);
+        rig.tick().steps.len()
+    };
+    for boundary in 1..=boundaries {
+        let mut rig = Rig::new();
+        exhaust_tc_budget(&mut rig);
+        rig.kernel.crash_after(boundary);
+        let result = catch_unwind(AssertUnwindSafe(|| rig.tick()));
+        assert!(result.is_err());
+        assert!(
+            rig.store.state().quarantine.is_some() || rig.root.join("latch-uncertain").exists()
+        );
+        // The bypass disappeared while the process was down; detection cannot
+        // recreate this administrative latch on the restarted process's behalf.
+        rig.kernel
+            .mutate(|m| m.links.get_mut("wg0").unwrap().tc_hooks = Known::Value(vec![]));
+        rig.restart();
+        assert!(rig.machine().latch().is_some());
+        assert!(!raises(&rig.tick()));
+    }
+}
+
+#[test]
+fn stop_fallback_at_injected_deadline_attempts_mandatory_fail_closed_action() {
+    let mut rig = Rig::new();
+    rig.kernel.mutate(|model| {
+        model.links.get_mut("wg0").unwrap().tc_hooks =
+            Known::Value(vec!["a".into(), "b".into(), "c".into()]);
+    });
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal = stop.clone();
+    let kernel = rig.kernel.clone();
+    rig.kernel.on_each_step(move |step| {
+        if *step == Step::ForwardingOff {
+            signal.store(true, Ordering::Release);
+        }
+        if matches!(step, Step::TcDelete { .. }) {
+            kernel.advance_stop_clock(Duration::from_secs(120));
+        }
+    });
+    let report = rig.machine().tick_with_stop(&stop);
+    assert_eq!(
+        report
+            .steps
+            .iter()
+            .filter(|step| matches!(step, Step::TcDelete { .. }))
+            .count(),
+        1
+    );
+    let down = report
+        .steps
+        .iter()
+        .position(|step| matches!(step, Step::LinkDown { name } if name == "wg0"))
+        .unwrap();
+    assert_eq!(report.steps[down + 1], Step::ForwardingOff);
+    assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(false));
+    assert_eq!(rig.kernel.model().forwarding_v4, Known::Value(0));
+}
+
+#[test]
+fn link_up_success_without_safe_lift_prerequisites_never_resolves() {
+    let mut rig = Rig::new();
+    rig.kernel
+        .timeouts(BTreeSet::from([ObservationItem::Tc("wg0".into())]));
+    rig.tick();
+    rig.kernel.timeouts(BTreeSet::new());
+    let kernel = rig.kernel.clone();
+    rig.kernel.on_each_step(move |step| {
+        if matches!(step, Step::LinkUp { .. }) {
+            kernel.timeouts(BTreeSet::from([ObservationItem::Rules]));
+        }
+    });
+    let report = rig.tick();
+    assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(true));
+    assert!(!ingress_resolved(&report));
+}
+
+#[test]
+fn failed_lift_after_restart_cannot_publish_a_resolved_state_snapshot() {
+    let mut rig = Rig::new();
+    rig.kernel
+        .timeouts(BTreeSet::from([ObservationItem::Tc("wg0".into())]));
+    rig.tick();
+    rig.kernel.timeouts(BTreeSet::new());
+    rig.restart();
+    rig.kernel.inject(Fault {
+        step: StepKind::LinkUp,
+        remaining: None,
+        partial: false,
+    });
+    let report = rig.tick();
+    assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(false));
+    assert!(!report.events.iter().any(|event| matches!(
+        event,
+        EventKind::IngressQuarantineState { active: false }
+            | EventKind::IngressQuarantineChanged { active: false }
+    )));
+}
+
+#[test]
+fn stop_on_tick_after_planner_forwarding_off_preserves_state_without_new_alert() {
+    let mut rig = Rig::new();
+    rig.kernel.mutate(|model| {
+        model.links.get_mut("wg0").unwrap().tc_hooks = Known::Value(vec!["root".into()]);
+    });
+    let first = rig.tick();
+    assert!(first.steps.contains(&Step::ForwardingOff));
+    assert_eq!(rig.kernel.model().forwarding_v4, Known::Value(0));
+    let before = rig.kernel.model();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal = stop.clone();
+    rig.kernel
+        .on_next_observe(move |_| signal.store(true, Ordering::Release));
+    let report = rig.machine().tick_with_stop(&stop);
+    assert_eq!(report.steps, [] as [Step; 0]);
+    assert_eq!(rig.kernel.drain_calls(), 0);
+    assert_eq!(rig.kernel.model(), before);
+    assert!(!report.events.iter().any(|event| matches!(
+        event,
+        EventKind::IngressQuarantineChanged { .. } | EventKind::Repair { .. }
+    )));
+}
+
+#[test]
+fn stop_whole_reread_expiry_cannot_promote_complete_but_late_evidence() {
+    let mut rig = Rig::new();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal = stop.clone();
+    rig.kernel.on_next_observe(move |kernel| {
+        signal.store(true, Ordering::Release);
+        kernel.timeouts(BTreeSet::from([ObservationItem::Ruleset]));
+        kernel.on_next_observe(|kernel| {
+            kernel.timeouts(BTreeSet::new());
+            kernel.advance_stop_clock(Duration::from_secs(3));
+        });
+    });
+    let report = rig.machine().tick_with_stop(&stop);
+    assert_eq!(rig.kernel.drain_calls(), 1);
+    assert!(report.steps.contains(&Step::ForwardingOff));
+    assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(false));
+}
+
+#[test]
+fn stop_treats_rejecting_policy_rules_and_routes_as_more_closed() {
+    let mut rig = Rig::new();
+    rig.kernel.mutate(|model| {
+        model.extra_rules = Known::Value(vec![
+            r#"{"v6":false,"rule":{"priority":100,"action":"blackhole"}}"#.into(),
+        ]);
+        let entry = scupper_core::parse::parse_ip_route(
+            r#"[{"type":"blackhole","dst":"198.51.100.0/24"}]"#,
+        )
+        .unwrap()
+        .remove(0);
+        model.extra_routes = Known::Value(vec![scupper_core::planner::RouteKey {
+            family: scupper_core::render::Family::V4,
+            entry,
+        }]);
+    });
+    let before = rig.kernel.model();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal = stop.clone();
+    rig.kernel
+        .on_next_observe(move |_| signal.store(true, Ordering::Release));
+    let report = rig.machine().tick_with_stop(&stop);
+    assert_eq!(report.steps, [] as [Step; 0]);
+    assert_eq!(rig.kernel.drain_calls(), 0);
+    assert_eq!(rig.kernel.model(), before);
+}
+
+#[test]
+fn pending_latch_storage_never_delays_tc_redirect_removal_and_restart_keeps_marker() {
+    for error in [io::ErrorKind::TimedOut, io::ErrorKind::WouldBlock] {
+        let mut rig = Rig::new();
+        exhaust_tc_budget(&mut rig);
+        rig.kernel.on_next_rest(|kernel| {
+            kernel.mutate(|model| {
+                model.links.get_mut("wg0").unwrap().tc_hooks =
+                    Known::Value(vec!["mirred redirect dev foreign0".into()]);
+                foreign(model);
+            });
+        });
+        let kernel = rig.kernel.clone();
+        let marker = rig.root.join("latch-uncertain");
+        let ran = Rc::new(Cell::new(false));
+        let hook_ran = ran.clone();
+        rig.store.on_latch_write(move || {
+            hook_ran.set(true);
+            assert!(marker.exists(), "marker must precede all containment");
+            assert_eq!(kernel.model().forwarding_v4, Known::Value(0));
+            assert_eq!(kernel.model().forwarding_v6, Known::Value(0));
+            assert!(matches!(kernel.model().links["wg0"].tc_hooks, Known::Value(ref hooks) if hooks.is_empty()), "tc redirect must be gone before storage starts");
+            assert_eq!(kernel.model().links["foreign0"].up, Known::Value(false));
+            // Storage remains pending while every independent bypass is closed.
+            if error == io::ErrorKind::TimedOut {
+                std::thread::sleep(Duration::from_secs(2));
+            }
+            // Exercise the caller fallback as well as the already-present case.
+            fs::remove_file(marker).unwrap();
+            Err(io::Error::new(error, "pending latch storage"))
+        });
+        rig.tick();
+        assert!(ran.get(), "stalled storage hook must run");
+        assert!(rig.root.join("latch-uncertain").exists());
+        rig.kernel
+            .mutate(|m| m.links.get_mut("wg0").unwrap().tc_hooks = Known::Value(vec![]));
+        rig.restart();
+        assert!(rig.machine().latch().is_some_and(|latch| latch.uncertain));
+        assert!(!raises(&rig.tick()));
+    }
+}
+
+#[test]
+fn marker_creation_failure_cannot_block_containment_or_durable_latch() {
+    let mut rig = Rig::new();
+    exhaust_tc_budget(&mut rig);
+    let root = rig.root.clone();
+    let saved = root.with_extension("saved");
+    let restore = saved.clone();
+    rig.kernel.on_next_rest(move |kernel| {
+        kernel.mutate(|m| {
+            m.links.get_mut("wg0").unwrap().tc_hooks = Known::Value(vec!["root".into()]);
+        });
+        // The writer lock is already held. A non-directory parent forces a real
+        // marker creation error regardless of the test user's uid or mode bits.
+        fs::rename(&root, &saved).unwrap();
+        fs::write(&root, b"not a directory").unwrap();
+    });
+    let report = rig.tick();
+    fs::remove_file(&rig.root).unwrap();
+    fs::rename(restore, &rig.root).unwrap();
+    assert!(
+        report
+            .failures
+            .iter()
+            .any(|(_, error)| error.0 == "latch marker creation failed")
+    );
+    assert_eq!(rig.kernel.model().forwarding_v4, Known::Value(0));
+    assert!(rig.store.state().quarantine.is_some());
+    assert!(!raises(&report));
+}
+
+#[test]
+fn failed_forwarding_off_tightens_before_waiting_on_storage() {
+    let mut rig = Rig::new();
+    exhaust_tc_budget(&mut rig);
+    rig.kernel.inject(Fault {
+        step: StepKind::ForwardingOff,
+        remaining: None,
+        partial: false,
+    });
+    let kernel = rig.kernel.clone();
+    rig.store.on_latch_write(move || {
+        assert_eq!(kernel.model().links["wg0"].up, Known::Value(false));
+        assert!(matches!(kernel.model().links["wg0"].tc_hooks, Known::Value(ref hooks) if hooks.is_empty()));
+        Ok(())
+    });
+    rig.tick();
+    assert!(rig.store.state().quarantine.is_some());
+}
+
+#[test]
+fn crash_at_latch_write_entry_restarts_latched_after_bypass_disappears() {
+    let mut rig = Rig::new();
+    exhaust_tc_budget(&mut rig);
+    rig.store
+        .on_latch_write(|| panic!("crash before durable latch"));
+    assert!(catch_unwind(AssertUnwindSafe(|| rig.tick())).is_err());
+    assert!(rig.root.join("latch-uncertain").exists());
+    assert!(rig.store.state().quarantine.is_none());
+    rig.kernel
+        .mutate(|m| m.links.get_mut("wg0").unwrap().tc_hooks = Known::Value(vec![]));
+    rig.restart();
+    assert!(rig.machine().latch().is_some());
+    assert!(!raises(&rig.tick()));
+}
+
+#[test]
+fn term_during_heartbeat_read_on_healthy_gateway_is_mutation_free_without_alert() {
+    let mut rig = Rig::new();
+    // Keep the real read pending until the test releases its stdin, rather
+    // than depending on a sleep outlasting the stop check under CI load.
+    let (input, release) = std::os::unix::net::UnixStream::pair().unwrap();
+    let file = fs::File::from(std::os::fd::OwnedFd::from(input));
+    let worker = std::thread::Builder::new()
+        .name("scupper-heartbeat-check".into())
+        .spawn(move || {
+            let command = std::process::Command::new("/usr/bin/cat");
+            scupper_sys::system::execute_file_command(
+                scupper_sys::system::HelperPurpose::Observation,
+                command,
+                file,
+                Duration::from_secs(2),
+            )
+            .unwrap()
+        })
+        .unwrap();
+    let until = std::time::Instant::now() + Duration::from_secs(2);
+    while !scupper_sys::system::testing::observation_active() {
+        assert!(
+            std::time::Instant::now() < until,
+            "heartbeat helper never spawned"
+        );
+        std::thread::yield_now();
+    }
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal = stop.clone();
+    rig.kernel.on_next_observe(move |_| {
+        assert!(scupper_sys::system::testing::observation_active());
+        scupper_sys::system::request_daemon_stop(&signal);
+    });
+    let before = rig.kernel.model();
+    let report = rig.machine().tick_with_stop(&stop);
+    assert!(report.steps.is_empty(), "{:?}", report.steps);
+    assert_eq!(rig.kernel.model(), before);
+    assert!(!report.events.iter().any(|event| matches!(
+        event,
+        EventKind::IngressQuarantineChanged { active: true }
+            | EventKind::QuarantineChanged { active: true }
+            | EventKind::Repair { .. }
+    )));
+    drop(release);
+    assert_eq!(worker.join().unwrap().status, Some(0));
+}
+
+#[test]
+fn stop_completes_only_the_link_restore_group_already_started() {
+    let mut rig = Rig::new();
+    rig.kernel.mutate(|model| {
+        for name in ["wg0", "ex-ch1"] {
+            let Known::Value(settings) = &mut model.links.get_mut(name).unwrap().settings else {
+                panic!("settings")
+            };
+            settings.mtu += 1;
+        }
+    });
+    rig.tick();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal = stop.clone();
+    let group = Rc::new(std::cell::RefCell::new(None));
+    let started = group.clone();
+    rig.kernel.on_each_step(move |step| {
+        if let Step::LinkReconfigure { link } = step {
+            if started.borrow().is_none() {
+                *started.borrow_mut() = Some(link.name.clone());
+            }
+            signal.store(true, Ordering::Release);
+        }
+    });
+    let report = rig.machine().tick_with_stop(&stop);
+    let name = group.borrow().clone().unwrap();
+    assert!(
+        report.steps.iter().all(|step| match step {
+            Step::LinkReconfigure { link } | Step::LinkCreate { link, .. } => link.name == name,
+            Step::LinkUp { name: up, .. } => up == &name,
+            _ => true,
+        }),
+        "{:?}",
+        report.steps
+    );
+    assert!(!ingress_resolved(&report));
+}
+
+#[test]
+fn stop_before_reconfigure_does_not_lower_a_healthy_client_to_start_restore() {
+    let mut rig = Rig::new();
+    rig.kernel.mutate(|model| {
+        let Known::Value(settings) = &mut model.links.get_mut("wg0").unwrap().settings else {
+            panic!("settings")
+        };
+        settings.mtu += 1;
+    });
+    rig.tick();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal = stop.clone();
+    rig.kernel
+        .on_next_rest(move |_| signal.store(true, Ordering::Release));
+    let report = rig.machine().tick_with_stop(&stop);
+    assert!(report.steps.is_empty(), "{:?}", report.steps);
+    assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(true));
+}
+
+#[test]
+fn restart_after_marker_creation_before_forwarding_off_stays_latched() {
+    let mut rig = Rig::new();
+    // The process dies immediately after creating the presence marker, before
+    // either the first kernel write or durable persistence can run.
+    fs::File::create(rig.root.join("latch-uncertain")).unwrap();
+    assert!(rig.store.state().quarantine.is_none());
+    assert_eq!(rig.kernel.model().forwarding_v4, Known::Value(1));
+    rig.restart();
+    assert!(rig.machine().latch().is_some_and(|latch| latch.uncertain));
+    assert!(!raises(&rig.tick()));
+    assert_eq!(rig.kernel.model().forwarding_v4, Known::Value(0));
+}
+
+#[test]
+fn stopping_exit_restore_can_reopen_its_verified_link_while_client_stays_down() {
+    let mut rig = Rig::new();
+    rig.kernel.mutate(|model| {
+        let Known::Value(settings) = &mut model.links.get_mut("ex-ch1").unwrap().settings else {
+            panic!("settings")
+        };
+        settings.mtu += 1;
+    });
+    rig.tick();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal = stop.clone();
+    let kernel = rig.kernel.clone();
+    rig.kernel.on_each_step(move |step| {
+        if matches!(step, Step::LinkReconfigure { link } if link.name == "ex-ch1") {
+            kernel.mutate(|model| model.links.get_mut("wg0").unwrap().up = Known::Value(false));
+            signal.store(true, Ordering::Release);
+        }
+    });
+    let report = rig.machine().tick_with_stop(&stop);
+    assert!(stop.load(Ordering::Acquire));
+    assert_eq!(
+        rig.kernel.model().links["ex-ch1"].up,
+        Known::Value(true),
+        "{:?}",
+        report.steps
+    );
+    assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(false));
+    assert!(!ingress_resolved(&report));
+}
+
+fn journal_snapshot(rig: &Rig) -> Vec<EventKind> {
+    let root = rig
+        .root
+        .join(format!("journal-{}", NEXT.fetch_add(1, Ordering::Relaxed)));
+    let disk = EventLog::open(&root, GatewayId("gw1".into()), || UnixSeconds(1000)).unwrap();
+    rig.log.handle.replay_into(&disk.handle).unwrap();
+    disk.handle.flush_blocking(Duration::from_secs(2)).unwrap();
+    scupper_sys::events::read_since(&root, 0, None)
+        .map(|event| event.unwrap().kind)
+        .collect()
+}
+
+fn latch_with_ruleset_restore(
+    rig: &mut Rig,
+    fail_forwarding: bool,
+    fail_flush: bool,
+) -> Rc<Cell<bool>> {
+    exhaust_tc_budget(rig);
+    // Ruleset evidence is collected in phase A and carried into phase B.
+    rig.flush_rules();
+    rig.kernel.on_next_rest(move |kernel| {
+        kernel.mutate(|model| {
+            model.links.get_mut("wg0").unwrap().tc_hooks = Known::Value(vec!["root".into()]);
+        });
+        if fail_flush {
+            kernel.inject(Fault {
+                step: StepKind::FlushConntrack,
+                remaining: Some(1),
+                partial: false,
+            });
+        }
+        if fail_forwarding {
+            // Fail only prepare_latch's closure, after phase A has completed.
+            kernel.inject(Fault {
+                step: StepKind::ForwardingOff,
+                remaining: Some(1),
+                partial: false,
+            });
+        }
+    });
+    let kernel = rig.kernel.clone();
+    let ran = Rc::new(Cell::new(false));
+    let hook_ran = ran.clone();
+    rig.store.on_latch_write(move || {
+        hook_ran.set(true);
+        let model = kernel.model();
+        assert!(matches!(&model.links["wg0"].tc_hooks, Known::Value(hooks) if hooks.is_empty()));
+        assert!(
+            fail_flush || model.conntrack_flushed,
+            "successful containment flush precedes storage"
+        );
+        if fail_flush {
+            assert_eq!(model.forwarding_v4, Known::Value(0));
+            assert_eq!(model.forwarding_v6, Known::Value(0));
+            assert_eq!(model.links["wg0"].up, Known::Value(false));
+        }
+        Ok(())
+    });
+    ran
+}
+
+fn assert_drift_and_suppression_journaled(events: &[EventKind]) {
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EventKind::DriftDetected {
+                reason: scupper_proto::Reason::SafetyDrift,
+                ..
+            }
+        )),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, EventKind::RepairSuppressed { .. })),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn failed_pre_storage_flush_still_persists_latch_and_journals_alerts() {
+    for fail_forwarding in [false, true] {
+        let mut rig = Rig::new();
+        let storage_ran = latch_with_ruleset_restore(&mut rig, fail_forwarding, true);
+        let before = journal_snapshot(&rig).len();
+        let report = rig.tick();
+        assert!(
+            storage_ran.get(),
+            "failed flush must not skip latch storage"
+        );
+        assert!(rig.store.state().quarantine.is_some());
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|(step, _)| *step == Step::FlushConntrack)
+        );
+        assert_eq!(
+            report
+                .steps
+                .iter()
+                .filter(|step| **step == Step::FlushConntrack)
+                .count(),
+            1
+        );
+        assert!(!report.steps.iter().any(|step| matches!(
+            step,
+            Step::LoadRuleset { .. }
+                | Step::VerifyRuleset { .. }
+                | Step::LinkUp { .. }
+                | Step::ForwardingOn { .. }
+        )));
+        let model = rig.kernel.model();
+        assert_eq!(model.forwarding_v4, Known::Value(0));
+        assert_eq!(model.forwarding_v6, Known::Value(0));
+        assert_eq!(model.links["wg0"].up, Known::Value(false));
+        assert_drift_and_suppression_journaled(&journal_snapshot(&rig)[before..]);
+    }
+}
+
+#[test]
+fn latching_alerts_are_journaled_before_a_failing_restore_in_both_gate_branches() {
+    for fail_forwarding in [false, true] {
+        let mut rig = Rig::new();
+        let storage_ran = latch_with_ruleset_restore(&mut rig, fail_forwarding, false);
+        let before = journal_snapshot(&rig).len();
+        rig.kernel.inject(Fault {
+            step: StepKind::VerifyRuleset,
+            remaining: None,
+            partial: false,
+        });
+        let report = rig.tick();
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|(step, _)| matches!(step, Step::VerifyRuleset { .. })),
+            "{report:?}"
+        );
+        assert!(storage_ran.get(), "latch storage hook must run");
+        let journal = journal_snapshot(&rig);
+        let events = &journal[before..];
+        assert_drift_and_suppression_journaled(events);
+        let failure = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    EventKind::Repair {
+                        kind: StepKind::VerifyRuleset,
+                        result: scupper_proto::Outcome::Failed,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert_drift_and_suppression_journaled(&events[..failure]);
+    }
+}
+
+#[test]
+fn latching_alerts_survive_stop_at_the_restore_boundary_in_both_gate_branches() {
+    for fail_forwarding in [false, true] {
+        let mut rig = Rig::new();
+        let storage_ran = latch_with_ruleset_restore(&mut rig, fail_forwarding, false);
+        let before = journal_snapshot(&rig).len();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal = stop.clone();
+        rig.kernel.on_each_step(move |step| {
+            if matches!(step, Step::PersistLatch { .. }) {
+                signal.store(true, Ordering::Release);
+            }
+        });
+        let report = rig.machine().tick_with_stop(&stop);
+        assert!(stop.load(Ordering::Acquire));
+        assert!(storage_ran.get(), "latch storage hook must run");
+        assert!(
+            !report
+                .steps
+                .iter()
+                .any(|step| matches!(step, Step::LoadRuleset { .. } | Step::VerifyRuleset { .. })),
+            "{report:?}"
+        );
+        assert_drift_and_suppression_journaled(&journal_snapshot(&rig)[before..]);
+        // Later ticks must journal normally, after the latching buffer was drained.
+        rig.kernel.on_each_step(|_| {});
+        rig.machine().clear_latch(Actor::Local { uid: 0 }).unwrap();
+        assert!(
+            journal_snapshot(&rig)
+                .iter()
+                .any(|event| matches!(event, EventKind::QuarantineChanged { active: false }))
+        );
+    }
+}
+
+#[test]
+fn stale_runtime_marker_does_not_weaken_a_durable_latch_on_restart() {
+    let mut rig = Rig::new();
+    exhaust_tc_budget(&mut rig);
+    rig.tick();
+    assert!(
+        rig.store
+            .state()
+            .quarantine
+            .is_some_and(|latch| !latch.uncertain)
+    );
+    fs::File::create(rig.root.join("latch-uncertain")).unwrap();
+    rig.restart();
+    assert!(rig.machine().latch().is_some_and(|latch| !latch.uncertain));
+}
+
+#[test]
+fn inode_loss_with_memory_only_latch_retries_storage_without_kernel_operations() {
+    let mut rig = Rig::new();
+    exhaust_tc_budget(&mut rig);
+    rig.store.fail_writes(true);
+    rig.tick();
+    assert!(rig.machine().latch().is_some());
+    assert!(rig.store.state().quarantine.is_none());
+    rig.kernel
+        .mutate(|model| model.namespace = NamespaceState::InodeGone);
+    rig.kernel.clear_history();
+    let report = rig.tick();
+    assert!(report.escalations.contains(&Escalation::RebuildRequired));
+    assert!(
+        report
+            .steps
+            .iter()
+            .any(|step| matches!(step, Step::PersistLatch { .. }))
+    );
+    assert!(
+        report
+            .steps
+            .iter()
+            .all(|step| matches!(step, Step::PersistLatch { .. } | Step::Emit(_))),
+        "{:?}",
+        report.steps
+    );
+    assert_eq!(rig.kernel.history(), Vec::new());
+}
+
+#[test]
+fn failed_forwarding_latch_keeps_recreated_link_hardening_after_creation() {
+    let mut rig = Rig::new();
+    exhaust_tc_budget(&mut rig);
+    // Prime the missing-link debounce without introducing the fourth tc drift.
+    rig.kernel.on_next_rest(|kernel| {
+        kernel.mutate(|model| {
+            model.links.remove("ex-ch1");
+        });
+    });
+    rig.tick();
+    assert!(rig.machine().latch().is_none());
+    rig.kernel.on_next_rest(|kernel| {
+        kernel.mutate(|model| {
+            model.links.get_mut("wg0").unwrap().tc_hooks = Known::Value(vec!["root".into()]);
+            model.links.remove("ex-ch1");
+        });
+    });
+    rig.kernel.inject(Fault {
+        step: StepKind::ForwardingOff,
+        remaining: None,
+        partial: false,
+    });
+    let report = rig.tick();
+    let configure = report.steps.iter().position(|step| matches!(step, Step::LinkCreate { link, phase: scupper_core::planner::LinkPhase::Configure } if link.name == "ex-ch1")).unwrap();
+    let persist = report
+        .steps
+        .iter()
+        .position(|step| matches!(step, Step::PersistLatch { .. }))
+        .unwrap();
+    let harden = report
+        .steps
+        .iter()
+        .skip(persist + 1)
+        .position(|step| matches!(step, Step::LinkForwardingOff { name } if name == "ex-ch1"))
+        .unwrap();
+    let harden = harden + persist + 1;
+    assert!(
+        persist < configure && configure < harden,
+        "{:?}",
+        report.steps
+    );
+    assert_eq!(
+        rig.kernel.model().links["ex-ch1"].forwarding_v4,
+        Known::Value(0)
+    );
+    assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(false));
+}
+
+#[test]
+fn stop_does_not_skip_peer_containment_when_the_same_link_needs_reconfigure() {
+    let mut rig = Rig::new();
+    rig.kernel.mutate(|model| {
+        let Known::Value(settings) = &mut model.links.get_mut("wg0").unwrap().settings else {
+            panic!("settings")
+        };
+        settings.mtu += 1;
+    });
+    rig.tick();
+    rig.kernel
+        .mutate(|model| model.links.get_mut("wg0").unwrap().peers = Known::Value(vec![]));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal = stop.clone();
+    rig.kernel.on_each_step(move |step| {
+        if *step == Step::ForwardingOff {
+            signal.store(true, Ordering::Release);
+        }
+    });
+    let report = rig.machine().tick_with_stop(&stop);
+    assert!(
+        report
+            .steps
+            .contains(&Step::LinkDown { name: "wg0".into() }),
+        "{:?}",
+        report.steps
+    );
+    assert_eq!(rig.kernel.model().links["wg0"].up, Known::Value(false));
+    assert!(
+        !report
+            .steps
+            .iter()
+            .any(|step| matches!(step, Step::LinkReconfigure { .. })),
+        "{:?}",
+        report.steps
+    );
 }

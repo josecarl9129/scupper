@@ -430,3 +430,21 @@ fn dispatcher_connect_observes_readiness_at_seven_seconds() {
     ));
     assert!(dispatcher.pending_admin.is_empty());
 }
+
+#[test]
+fn connect_accepts_session_only_degradation_and_returns_actual_verdict() {
+    use scupper_core::verdict::v2::{Degraded, Warning};
+    let op = Op::Connect { exit: None };
+    let mut observation = report(&op);
+    observation.verdict = Verdict::Degraded(Degraded::ClientSessionsUnknown);
+    observation
+        .warnings
+        .push(Warning::ClientSessionHistoryUnavailable);
+    let result = verified(&op, observation.clone()).unwrap();
+    let OpResult::Connect { report, .. } = result else {
+        panic!("connect result");
+    };
+    assert_eq!(report["verdict"]["Degraded"], "ClientSessionsUnknown");
+    observation.warnings.push(Warning::DaemonStale);
+    assert!(verified(&op, observation).is_err());
+}

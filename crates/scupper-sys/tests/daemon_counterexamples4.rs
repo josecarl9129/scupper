@@ -208,7 +208,13 @@ impl System for Worker {
     fn canon_run_root(&self) -> &Path {
         &self.root
     }
-    fn run(&self, program: Program, _: &[String], _: Duration) -> Result<ExecOutput, ExecError> {
+    fn run(
+        &self,
+        _purpose: scupper_sys::system::HelperPurpose,
+        program: Program,
+        _: &[String],
+        _: Duration,
+    ) -> Result<ExecOutput, ExecError> {
         if program == Program::Unshare {
             unshare(self.upgraded)
         } else {
@@ -217,6 +223,7 @@ impl System for Worker {
     }
     fn run_in(
         &self,
+        _purpose: scupper_sys::system::HelperPurpose,
         _: ExecTarget<'_>,
         _: Program,
         _: &[String],
@@ -239,11 +246,18 @@ impl System for WorkerWithPath {
     fn canon_run_root(&self) -> &Path {
         self.inner.canon_run_root()
     }
-    fn run(&self, p: Program, a: &[String], t: Duration) -> Result<ExecOutput, ExecError> {
-        self.inner.run(p, a, t)
+    fn run(
+        &self,
+        purpose: scupper_sys::system::HelperPurpose,
+        p: Program,
+        a: &[String],
+        t: Duration,
+    ) -> Result<ExecOutput, ExecError> {
+        self.inner.run(purpose, p, a, t)
     }
     fn run_in(
         &self,
+        _purpose: scupper_sys::system::HelperPurpose,
         _: ExecTarget<'_>,
         _: Program,
         _: &[String],
@@ -272,7 +286,13 @@ impl System for SlowFailSystem {
             cache: RefCell::default(),
         }))
     }
-    fn run(&self, program: Program, _: &[String], _: Duration) -> Result<ExecOutput, ExecError> {
+    fn run(
+        &self,
+        _purpose: scupper_sys::system::HelperPurpose,
+        program: Program,
+        _: &[String],
+        _: Duration,
+    ) -> Result<ExecOutput, ExecError> {
         if program == Program::Unshare {
             unshare(self.upgraded.get())
         } else {
@@ -281,6 +301,7 @@ impl System for SlowFailSystem {
     }
     fn run_in(
         &self,
+        _purpose: scupper_sys::system::HelperPurpose,
         _: ExecTarget<'_>,
         _: Program,
         _: &[String],

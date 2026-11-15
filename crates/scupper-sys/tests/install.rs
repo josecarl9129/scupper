@@ -1015,7 +1015,7 @@ fn empty_unit_listing_is_accepted_by_both_install_detection_calls() {
                 *program == Program::Systemctl && args[0] == "list-unit-files"
             })
             .count(),
-        2
+        0
     );
 }
 
@@ -1037,5 +1037,63 @@ fn absent_ufw_uses_nft_walker_without_error() {
         fake.calls.borrow().iter().any(|(program, args)| {
             *program == Program::Nft && args == &["-j", "list", "ruleset"]
         })
+    );
+}
+
+#[test]
+fn service_start_failure_leaves_empty_provisioned_and_repair_never_recreates_history() {
+    let host = Host::new();
+    let mut fake = Fake {
+        enable_failure: true,
+        ..Fake::default()
+    };
+    let prepared = host.prepare(&fake).unwrap();
+    assert!(install::apply(&fake, &host.paths, prepared).is_err());
+    let state = host.paths.at(model::STATE_ROOT);
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(state.join("client-sessions.json")).unwrap()).unwrap();
+    assert_eq!(record["never_served"], true);
+    assert_eq!(record["peers"], serde_json::json!([]));
+    let incarnation = fs::read_to_string(state.join("gateway-incarnation")).unwrap();
+    assert_eq!(incarnation.len(), 64);
+    assert_eq!(record["incarnation"], incarnation);
+    fs::remove_file(state.join("client-sessions.json")).unwrap();
+    fake.enable_failure = false;
+    let repair = host.prepare(&fake).unwrap();
+    assert!(
+        !repair
+            .plan
+            .steps
+            .iter()
+            .any(|step| step.change == model::Change::ProvisionSessions)
+    );
+    install::apply(&fake, &host.paths, repair).unwrap();
+    assert!(!state.join("client-sessions.json").exists());
+    assert_eq!(
+        fs::read_to_string(state.join("gateway-incarnation")).unwrap(),
+        incarnation
+    );
+}
+
+#[test]
+fn session_provisioning_without_a_published_head_is_an_error() {
+    let host = Host::new();
+    let fake = Fake::default();
+    let mut prepared = host.prepare(&fake).unwrap();
+    prepared
+        .plan
+        .steps
+        .retain(|step| !matches!(step.change, model::Change::Configuration(_)));
+    let error = install::apply(&fake, &host.paths, prepared).unwrap_err();
+    assert!(
+        error.contains("cannot provision sessions without an installed version"),
+        "{error}"
+    );
+    assert!(
+        !host
+            .paths
+            .at(model::STATE_ROOT)
+            .join("gateway-incarnation")
+            .exists()
     );
 }

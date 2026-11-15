@@ -132,7 +132,7 @@ impl Desired {
             disconnected,
         })
     }
-    /// Last verified applied version; planning never advances it.
+    /// Published convergence target; planning never advances it.
     #[must_use]
     pub const fn applied_version(&self) -> u64 {
         self.version

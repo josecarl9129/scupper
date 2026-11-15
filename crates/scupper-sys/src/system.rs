@@ -5,7 +5,11 @@ use std::{
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::mpsc,
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -20,6 +24,276 @@ pub const EXEC_TIMEOUT: Duration = Duration::from_secs(3);
 /// Deadline for starting or stopping a tunnel unit.
 pub const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(30);
 const OUTPUT_CAP: usize = 1024 * 1024;
+
+// The main process owns every exec, including detached timeout reapers.
+// Closing admission prevents a delayed background worker from spawning after
+// the final drain observed zero children.
+/// Purpose controls stop admission and which helpers can affect a re-read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HelperPurpose {
+    /// Read-only helper admitted through the final stop observation.
+    Observation,
+    /// Kernel writer that must settle before stop can certify safety.
+    Mutation,
+    /// External delivery cancelled at stop.
+    Notification,
+    /// Optional check rejected once stop begins.
+    Probe,
+    /// Durable writer retained until its storage worker finishes.
+    Storage,
+}
+#[derive(Default)]
+struct Helpers {
+    next: u64,
+    active: std::collections::BTreeMap<u64, (HelperPurpose, Option<u32>)>,
+    closed: bool,
+    stop: Option<Arc<AtomicBool>>,
+}
+struct HelperTracker(Mutex<Helpers>, Condvar);
+impl HelperTracker {
+    const fn new() -> Self {
+        Self(
+            Mutex::new(Helpers {
+                next: 0,
+                active: std::collections::BTreeMap::new(),
+                closed: false,
+                stop: None,
+            }),
+            Condvar::new(),
+        )
+    }
+    fn state(&self) -> std::sync::MutexGuard<'_, Helpers> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+static HELPERS: HelperTracker = HelperTracker::new();
+fn helper_state() -> std::sync::MutexGuard<'static, Helpers> {
+    HELPERS.state()
+}
+/// Register the daemon's flag; every spawn and resolve commit uses this lock.
+pub(crate) fn daemon_helpers(stop: Arc<AtomicBool>) {
+    helper_state().stop = Some(stop);
+}
+pub(crate) fn daemon_helpers_active() -> bool {
+    helper_state().stop.is_some()
+}
+pub(crate) fn daemon_stopping() -> bool {
+    helper_state()
+        .stop
+        .as_ref()
+        .is_some_and(|stop| stop.load(Ordering::Acquire))
+}
+/// Set TERM/INT under the same lock used for helper admission and resolve commit.
+/// Signal delivery calls this from a normal signal-iterator thread.
+pub fn request_daemon_stop(stop: &AtomicBool) {
+    request_stop_tracked(&HELPERS, stop);
+}
+fn request_stop_tracked(tracker: &HelperTracker, stop: &AtomicBool) {
+    let state = tracker.state();
+    stop.store(true, Ordering::Release);
+    // In-flight notifications are cancelled, never counted in the read drain.
+    // Queued notifications cannot acquire a new lease after this boundary.
+    for (purpose, pid) in state.active.values() {
+        if *purpose == HelperPurpose::Notification
+            && let Some(pid) = pid.and_then(|p| Pid::from_raw(p.cast_signed()))
+        {
+            let _ = kill_process_group(pid, Signal::KILL);
+        }
+    }
+    tracker.1.notify_all();
+}
+/// Sleep until stop admission changes or the keepalive owner finishes.
+pub(crate) fn wait_for_stop(stop: &AtomicBool, finished: &AtomicBool) {
+    let mut state = helper_state();
+    while !stop.load(Ordering::Acquire) && !finished.load(Ordering::Acquire) {
+        state = HELPERS
+            .1
+            .wait(state)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+}
+pub(crate) fn finish_stop_wait(finished: &AtomicBool) {
+    let _state = helper_state();
+    finished.store(true, Ordering::Release);
+    HELPERS.1.notify_all();
+}
+pub(crate) fn while_running<T>(stop: Option<&AtomicBool>, action: impl FnOnce() -> T) -> Option<T> {
+    let state = helper_state();
+    if stop.is_some_and(|flag| flag.load(Ordering::Acquire))
+        || state
+            .stop
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+    {
+        return None;
+    }
+    Some(action())
+}
+struct HelperLease {
+    tracker: &'static HelperTracker,
+    id: u64,
+}
+impl HelperLease {
+    fn spawn(command: &mut Command, purpose: HelperPurpose) -> Result<(Self, Child), ExecError> {
+        Self::spawn_tracked(&HELPERS, command, purpose)
+    }
+    fn spawn_tracked(
+        tracker: &'static HelperTracker,
+        command: &mut Command,
+        purpose: HelperPurpose,
+    ) -> Result<(Self, Child), ExecError> {
+        let mut state = tracker.state();
+        if state.closed
+            || matches!(purpose, HelperPurpose::Notification | HelperPurpose::Probe)
+                && state
+                    .stop
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            return Err(ExecError::spawn("daemon helpers are draining"));
+        }
+        let child = command.spawn().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ExecError::NotFound {
+                    program: Program::Nsenter,
+                }
+            } else {
+                ExecError::spawn(&error.to_string())
+            }
+        })?;
+        let id = state.next;
+        state.next += 1;
+        state.active.insert(id, (purpose, Some(child.id())));
+        Ok((Self { tracker, id }, child))
+    }
+    fn try_wait(&self, child: &mut Child) -> std::io::Result<Option<std::process::ExitStatus>> {
+        // Admission, killpg and reap share this lock. A pid is never published
+        // after waitpid releases it for reuse by an unrelated process group.
+        let mut state = self.tracker.state();
+        let result = child.try_wait();
+        if matches!(result, Ok(Some(_)))
+            && let Some((_, pid)) = state.active.get_mut(&self.id)
+        {
+            *pid = None;
+        }
+        result
+    }
+    fn reaped(&self) {
+        if let Some((_, pid)) = self.tracker.state().active.get_mut(&self.id) {
+            *pid = None;
+        }
+    }
+    #[cfg(test)]
+    fn acquire_tracked(
+        tracker: &'static HelperTracker,
+        purpose: HelperPurpose,
+    ) -> Result<Self, ExecError> {
+        let mut state = tracker.state();
+        if state.closed {
+            return Err(ExecError::spawn("daemon helpers are draining"));
+        }
+        let id = state.next;
+        state.next += 1;
+        state.active.insert(id, (purpose, None));
+        Ok(Self { tracker, id })
+    }
+}
+impl Drop for HelperLease {
+    fn drop(&mut self) {
+        self.tracker.state().active.remove(&self.id);
+        self.tracker.1.notify_all();
+    }
+}
+fn wait_helpers(
+    tracker: &HelperTracker,
+    deadline: Instant,
+    relevant: impl Fn(HelperPurpose) -> bool,
+) -> bool {
+    let mut state = tracker.state();
+    while state.active.values().any(|(purpose, _)| relevant(*purpose)) && Instant::now() < deadline
+    {
+        state = tracker
+            .1
+            .wait_timeout(state, deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0;
+    }
+    !state.active.values().any(|(purpose, _)| relevant(*purpose))
+}
+pub(crate) fn mutations_settled() -> bool {
+    mutations_settled_tracked(&HELPERS)
+}
+fn mutations_settled_tracked(tracker: &HelperTracker) -> bool {
+    !tracker
+        .state()
+        .active
+        .values()
+        .any(|(purpose, _)| *purpose == HelperPurpose::Mutation)
+}
+/// Outstanding mutations must settle before observing; only read helpers are
+/// killed at the drain deadline. Notifications and probes never delay this drain.
+pub(crate) fn drain_helpers_until(deadline: Instant) -> bool {
+    drain_tracked(&HELPERS, deadline)
+}
+fn drain_tracked(tracker: &HelperTracker, deadline: Instant) -> bool {
+    if !wait_helpers(tracker, deadline, |p| {
+        matches!(p, HelperPurpose::Observation | HelperPurpose::Mutation)
+    }) {
+        let state = tracker.state();
+        for (purpose, pid) in state.active.values() {
+            if *purpose == HelperPurpose::Observation
+                && let Some(pid) = pid.and_then(|p| Pid::from_raw(p.cast_signed()))
+            {
+                let _ = kill_process_group(pid, Signal::KILL);
+            }
+        }
+        drop(state);
+        return wait_helpers(tracker, Instant::now() + Duration::from_secs(1), |p| {
+            matches!(p, HelperPurpose::Observation | HelperPurpose::Mutation)
+        });
+    }
+    true
+}
+/// Bound storage I/O without dropping ownership of an in-flight durable write.
+/// The retained writer capability and lease outlive a caller timeout.
+pub(crate) fn storage_until<T: Send + 'static>(
+    deadline: Instant,
+    action: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+) -> std::io::Result<T> {
+    let lease = {
+        let mut state = helper_state();
+        let id = state.next;
+        state.next += 1;
+        state.active.insert(id, (HelperPurpose::Storage, None));
+        HelperLease {
+            tracker: &HELPERS,
+            id,
+        }
+    };
+    let (send, receive) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("scupper-durable-write".into())
+        .spawn(move || {
+            let _lease = lease;
+            let _ = send.send(action());
+        })?;
+    receive
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "durable write deadline"))?
+}
+/// Keep the main PID and supervisor lease until all children are reaped.
+pub(crate) fn shutdown_helpers() {
+    let mut state = helper_state();
+    state.closed = true;
+    while !state.active.is_empty() {
+        state = HELPERS
+            .1
+            .wait(state)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+}
 
 /// A kernel utility selected without a shell or PATH lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
@@ -300,6 +574,30 @@ pub enum ExecTarget<'a> {
 /// }
 /// ```
 pub trait System {
+    /// Collect bounded, value-free read failure context when observing safety.
+    fn record_read_failure(&self, _failure: scupper_proto::ReadFailure) {}
+    /// Retain a positive unsafe hook finding even if a later tc read fails.
+    fn record_unsafe_tc(&self, _link: &str) {}
+
+    /// Bounded public netlink telemetry or a fixed client session probe.
+    /// # Errors
+    /// Returns unsupported or child/namespace errors.
+    fn client_session_io(
+        &self,
+        _purpose: crate::system::HelperPurpose,
+        _held: &NetnsHandle,
+        _request: &crate::client_sessions::Request,
+    ) -> std::io::Result<crate::client_sessions::Response> {
+        Err(std::io::Error::other("client session helper unsupported"))
+    }
+
+    /// Enabled wg-quick instances from public filesystem inventory.
+    /// # Errors
+    /// Returns an error when the inventory cannot be read.
+    fn wg_quick_units(&self) -> std::io::Result<Vec<String>> {
+        Err(std::io::Error::other("unit inventory unsupported"))
+    }
+
     /// Checks the host's read-only sysfs inventory for a loaded kernel module.
     ///
     /// # Errors
@@ -345,13 +643,22 @@ pub trait System {
         Path::new("/run/scupper")
     }
 
-    /// Executes one utility with literal arguments and a hard deadline.
+    /// Executes one utility with an explicit purpose and a hard deadline.
+    ///
+    /// Omitting the purpose is a compile error, including through a trait object.
+    /// ```compile_fail
+    /// use scupper_sys::system::{Program, System, EXEC_TIMEOUT};
+    /// fn unlabelled(system: &dyn System) {
+    ///     let _ = system.run(Program::Ip, &[], EXEC_TIMEOUT);
+    /// }
+    /// ```
     ///
     /// # Errors
     ///
     /// Returns an execution error rather than partial or lossy output.
     fn run(
         &self,
+        purpose: crate::system::HelperPurpose,
         program: Program,
         args: &[String],
         timeout: Duration,
@@ -366,13 +673,14 @@ pub trait System {
     /// Returns an execution error or an unsupported-target error.
     fn run_in(
         &self,
+        purpose: crate::system::HelperPurpose,
         target: ExecTarget<'_>,
         program: Program,
         args: &[String],
         timeout: Duration,
     ) -> Result<ExecOutput, ExecError> {
         match target {
-            ExecTarget::Host => self.run(program, args, timeout),
+            ExecTarget::Host => self.run(purpose, program, args, timeout),
             ExecTarget::Netns(_) => Err(ExecError::spawn("namespace execution unsupported")),
         }
     }
@@ -385,6 +693,7 @@ pub trait System {
     /// Returns an execution error; host-only legacy adapters reject stdin.
     fn run_with_stdin(
         &self,
+        _purpose: crate::system::HelperPurpose,
         _target: ExecTarget<'_>,
         _program: Program,
         _args: &[String],
@@ -447,6 +756,8 @@ pub struct RealSystem {
     programs: Programs,
     canon_paths: Option<(PathBuf, PathBuf)>,
     wireguard_dirs: Option<Vec<PathBuf>>,
+    #[cfg(feature = "testing")]
+    shutdown_state_for_test: Option<bool>,
 }
 
 impl RealSystem {
@@ -458,6 +769,8 @@ impl RealSystem {
             canon_paths: None,
             canon_cache: std::cell::RefCell::default(),
             wireguard_dirs: None,
+            #[cfg(feature = "testing")]
+            shutdown_state_for_test: None,
         }
     }
 
@@ -465,6 +778,14 @@ impl RealSystem {
     #[must_use]
     pub fn with_canon_paths(mut self, executable: PathBuf, run_root: PathBuf) -> Self {
         self.canon_paths = Some((executable, run_root));
+        self
+    }
+
+    /// Override only the shutdown-state query for real `ExecStop` lab trials.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn with_shutdown_state_for_test(mut self, stopping: bool) -> Self {
+        self.shutdown_state_for_test = Some(stopping);
         self
     }
 
@@ -503,13 +824,16 @@ impl RealSystem {
 
 // Never block the caller on a child in uninterruptible kernel sleep. A detached
 // reaper owns it after a bounded poll, so it can be reaped if it eventually exits.
-fn terminate(mut child: Child, deadline: Instant) {
+fn terminate(mut child: Child, deadline: Instant, lease: Option<HelperLease>) {
     if let Some(pgid) = Pid::from_raw(child.id().cast_signed()) {
         let _ = kill_process_group(pgid, Signal::KILL);
     }
     let reap_deadline = (Instant::now() + Duration::from_millis(500)).min(deadline);
     loop {
-        match child.try_wait() {
+        match match &lease {
+            Some(lease) => lease.try_wait(&mut child),
+            None => child.try_wait(),
+        } {
             Ok(Some(_)) => return,
             Err(_) => break,
             Ok(None) => {}
@@ -521,11 +845,19 @@ fn terminate(mut child: Child, deadline: Instant) {
             Duration::from_millis(2).min(reap_deadline.saturating_duration_since(Instant::now())),
         );
     }
-    let _ = thread::Builder::new()
-        .name("exec-reaper".into())
-        .spawn(move || {
-            let _ = child.wait();
-        });
+    thread::spawn(move || {
+        loop {
+            if let Some(lease) = &lease {
+                match lease.try_wait(&mut child) {
+                    Ok(Some(_)) | Err(_) => break,
+                    Ok(None) => thread::sleep(Duration::from_millis(10)),
+                }
+            } else {
+                let _ = child.wait();
+                break;
+            }
+        }
+    });
 }
 
 fn join_readers(readers: Vec<thread::JoinHandle<()>>, deadline: Instant) {
@@ -560,6 +892,7 @@ fn collect(
     timeout: Duration,
     readers: &mut Vec<thread::JoinHandle<()>>,
     mut input: Option<&[u8]>,
+    lease: Option<&HelperLease>,
 ) -> Result<ExecOutput, ExecError> {
     // Nonblocking writes are interleaved with output draining and deadline
     // checks. A full stdin pipe cannot block this thread or outlive the budget.
@@ -625,12 +958,18 @@ fn collect(
         while let Ok((index, result)) = receiver.try_recv() {
             streams[index] = Some(result?);
         }
-        let status = child
-            .try_wait()
-            .map_err(|error| ExecError::spawn(&error.to_string()))?;
-        if let (Some(status), [Some(stdout), Some(stderr)]) = (status, &mut streams)
-            && stdin.is_none()
-        {
+        // Keep an exited leader unreaped until inherited pipes close. Its zombie
+        // reserves the pgid so timeout cleanup can still safely kill descendants.
+        let status = if stdin.is_none() && streams.iter().all(Option::is_some) {
+            match lease {
+                Some(lease) => lease.try_wait(child),
+                None => child.try_wait(),
+            }
+            .map_err(|error| ExecError::spawn(&error.to_string()))?
+        } else {
+            None
+        };
+        if let (Some(status), [Some(stdout), Some(stderr)]) = (status, &mut streams) {
             return Ok(ExecOutput {
                 status: status.code(),
                 stdout: std::mem::take(stdout),
@@ -649,7 +988,20 @@ impl RealSystem {
         args: &[String],
         input: Option<&[u8]>,
         timeout: Duration,
+        purpose: HelperPurpose,
     ) -> Result<ExecOutput, ExecError> {
+        #[cfg(feature = "testing")]
+        if matches!(target, ExecTarget::Host)
+            && program == Program::Systemctl
+            && args == ["is-system-running"]
+            && let Some(stopping) = self.shutdown_state_for_test
+        {
+            return Ok(ExecOutput {
+                status: Some(i32::from(stopping)),
+                stdout: if stopping { "stopping\n" } else { "running\n" }.into(),
+                stderr: String::new(),
+            });
+        }
         if let ExecTarget::Netns(handle) = target {
             handle
                 .verify(handle.identity())
@@ -658,7 +1010,7 @@ impl RealSystem {
                 check_wg_args(self, args)?;
             }
         }
-        self.execute_verified(target, program, args, input, timeout)
+        self.execute_verified(target, program, args, input, timeout, purpose)
     }
 
     // Only reached after identity/socket checks. Kept separate so unprivileged
@@ -670,14 +1022,15 @@ impl RealSystem {
         args: &[String],
         input: Option<&[u8]>,
         timeout: Duration,
+        purpose: HelperPurpose,
     ) -> Result<ExecOutput, ExecError> {
         let started = Instant::now();
         let mut command = self.command(target, program, args);
         if input.is_some() {
             command.stdin(Stdio::piped());
         }
-        let mut child = command.spawn().map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
+        let (lease, mut child) = HelperLease::spawn(&mut command, purpose).map_err(|error| {
+            if matches!(error, ExecError::NotFound { .. }) {
                 ExecError::NotFound {
                     program: match target {
                         ExecTarget::Host => program,
@@ -685,14 +1038,23 @@ impl RealSystem {
                     },
                 }
             } else {
-                ExecError::spawn(&error.to_string())
+                error
             }
         })?;
         let deadline = started + timeout + Duration::from_millis(900);
         let mut readers = Vec::with_capacity(2);
-        let result = collect(&mut child, started, timeout, &mut readers, input);
+        let result = collect(
+            &mut child,
+            started,
+            timeout,
+            &mut readers,
+            input,
+            Some(&lease),
+        );
         if result.is_err() {
-            terminate(child, deadline);
+            terminate(child, deadline, Some(lease));
+        } else {
+            lease.reaped();
         }
         join_readers(readers, deadline);
         namespace_result(target, result)
@@ -724,14 +1086,21 @@ pub fn execute_input_command(
         command.env("SCUPPER_TEST_CA_DER", ca);
     }
     let started = Instant::now();
-    let mut child = command
-        .spawn()
-        .map_err(|_| ExecError::spawn("delivery spawn failed"))?;
+    let (lease, mut child) = HelperLease::spawn(&mut command, HelperPurpose::Notification)?;
     let deadline = started + timeout + Duration::from_millis(900);
     let mut readers = Vec::with_capacity(2);
-    let result = collect(&mut child, started, timeout, &mut readers, Some(input));
+    let result = collect(
+        &mut child,
+        started,
+        timeout,
+        &mut readers,
+        Some(input),
+        Some(&lease),
+    );
     if result.is_err() {
-        terminate(child, deadline);
+        terminate(child, deadline, Some(lease));
+    } else {
+        lease.reaped();
     }
     join_readers(readers, deadline);
     result
@@ -746,6 +1115,16 @@ pub fn execute_input_command(
 /// # Errors
 /// Returns spawn, capture, output-limit or timeout errors.
 pub fn execute_file_command(
+    purpose: HelperPurpose,
+    command: Command,
+    file: std::fs::File,
+    timeout: Duration,
+) -> Result<ExecOutput, ExecError> {
+    execute_file_command_tracked(&HELPERS, purpose, command, file, timeout)
+}
+fn execute_file_command_tracked(
+    tracker: &'static HelperTracker,
+    purpose: HelperPurpose,
     mut command: Command,
     file: std::fs::File,
     timeout: Duration,
@@ -764,14 +1143,21 @@ pub fn execute_file_command(
         command.env("SCUPPER_TEST_CA_DER", ca);
     }
     let started = Instant::now();
-    let mut child = command
-        .spawn()
-        .map_err(|error| ExecError::spawn(&error.to_string()))?;
+    let (lease, mut child) = HelperLease::spawn_tracked(tracker, &mut command, purpose)?;
     let deadline = started + timeout + Duration::from_millis(900);
     let mut readers = Vec::with_capacity(2);
-    let result = collect(&mut child, started, timeout, &mut readers, None);
+    let result = collect(
+        &mut child,
+        started,
+        timeout,
+        &mut readers,
+        None,
+        Some(&lease),
+    );
     if result.is_err() {
-        terminate(child, deadline);
+        terminate(child, deadline, Some(lease));
+    } else {
+        lease.reaped();
     }
     join_readers(readers, deadline);
     result
@@ -794,12 +1180,26 @@ fn namespace_result(
 }
 
 impl System for RealSystem {
+    fn client_session_io(
+        &self,
+        purpose: crate::system::HelperPurpose,
+        held: &NetnsHandle,
+        request: &crate::client_sessions::Request,
+    ) -> std::io::Result<crate::client_sessions::Response> {
+        crate::client_sessions::execute(self, purpose, held, request)
+    }
+
+    fn wg_quick_units(&self) -> std::io::Result<Vec<String>> {
+        crate::v1_detect::wg_quick_units_at(Path::new("/"))
+    }
     fn canon_worker(&self) -> Option<Box<dyn System + Send>> {
         Some(Box::new(Self {
             canon_cache: std::cell::RefCell::default(),
             programs: self.programs.clone(),
             canon_paths: self.canon_paths.clone(),
             wireguard_dirs: self.wireguard_dirs.clone(),
+            #[cfg(feature = "testing")]
+            shutdown_state_for_test: self.shutdown_state_for_test,
         }))
     }
 
@@ -819,32 +1219,35 @@ impl System for RealSystem {
 
     fn run(
         &self,
+        purpose: crate::system::HelperPurpose,
         program: Program,
         args: &[String],
         timeout: Duration,
     ) -> Result<ExecOutput, ExecError> {
-        self.run_in(ExecTarget::Host, program, args, timeout)
+        self.run_in(purpose, ExecTarget::Host, program, args, timeout)
     }
 
     fn run_in(
         &self,
+        purpose: crate::system::HelperPurpose,
         target: ExecTarget<'_>,
         program: Program,
         args: &[String],
         timeout: Duration,
     ) -> Result<ExecOutput, ExecError> {
-        self.execute(target, program, args, None, timeout)
+        self.execute(target, program, args, None, timeout, purpose)
     }
 
     fn run_with_stdin(
         &self,
+        purpose: crate::system::HelperPurpose,
         target: ExecTarget<'_>,
         program: Program,
         args: &[String],
         stdin: &[u8],
         timeout: Duration,
     ) -> Result<ExecOutput, ExecError> {
-        self.execute(target, program, args, Some(stdin), timeout)
+        self.execute(target, program, args, Some(stdin), timeout, purpose)
     }
 
     fn wireguard_socket_dirs(&self) -> Vec<PathBuf> {
@@ -864,6 +1267,14 @@ impl System for RealSystem {
 /// Scripted test support, available only with the `testing` feature.
 #[cfg(feature = "testing")]
 pub mod testing {
+    /// Whether an actual read helper is currently tracked in this process.
+    #[must_use]
+    pub fn observation_active() -> bool {
+        super::helper_state()
+            .active
+            .values()
+            .any(|(purpose, _)| *purpose == super::HelperPurpose::Observation)
+    }
     use std::{cell::RefCell, collections::BTreeMap, collections::VecDeque, time::Duration};
 
     use super::{ExecError, ExecOutput, ExecTarget, Path, Program, System};
@@ -871,6 +1282,9 @@ pub mod testing {
     /// One recorded command, including its execution budget.
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
     pub struct Call {
+        /// Explicit admission classification (excluded from command goldens).
+        #[serde(skip)]
+        pub purpose: super::HelperPurpose,
         /// The selected executable.
         pub program: Program,
         /// Literal command arguments.
@@ -942,6 +1356,7 @@ pub mod testing {
         #[allow(clippy::panic)] // An unscripted command is a test failure by contract.
         fn dispatch(
             &self,
+            purpose: super::HelperPurpose,
             target: ExecTarget<'_>,
             program: Program,
             args: &[String],
@@ -950,6 +1365,7 @@ pub mod testing {
         ) -> Result<ExecOutput, ExecError> {
             let target_identity = identity(target);
             self.calls.borrow_mut().push(Call {
+                purpose,
                 program,
                 args: args.to_vec(),
                 timeout,
@@ -991,6 +1407,7 @@ pub mod testing {
         }
         fn record(
             &self,
+            purpose: super::HelperPurpose,
             target: ExecTarget<'_>,
             program: Program,
             args: &[String],
@@ -998,6 +1415,7 @@ pub mod testing {
             timeout: Duration,
         ) {
             self.calls.borrow_mut().push(Call {
+                purpose,
                 program,
                 args: args.to_vec(),
                 target_identity: identity(target),
@@ -1007,6 +1425,17 @@ pub mod testing {
         }
     }
     impl System for RecordingSystem<'_> {
+        fn client_session_io(
+            &self,
+            purpose: crate::system::HelperPurpose,
+            held: &crate::netns::NetnsHandle,
+            request: &crate::client_sessions::Request,
+        ) -> std::io::Result<crate::client_sessions::Response> {
+            self.inner.client_session_io(purpose, held, request)
+        }
+        fn wg_quick_units(&self) -> std::io::Result<Vec<String>> {
+            self.inner.wg_quick_units()
+        }
         fn module_loaded(&self, module: &str) -> std::io::Result<bool> {
             self.inner.module_loaded(module)
         }
@@ -1019,33 +1448,36 @@ pub mod testing {
         }
         fn run(
             &self,
+            purpose: crate::system::HelperPurpose,
             program: Program,
             args: &[String],
             timeout: Duration,
         ) -> Result<ExecOutput, ExecError> {
-            self.run_in(ExecTarget::Host, program, args, timeout)
+            self.run_in(purpose, ExecTarget::Host, program, args, timeout)
         }
         fn run_in(
             &self,
+            purpose: crate::system::HelperPurpose,
             target: ExecTarget<'_>,
             program: Program,
             args: &[String],
             timeout: Duration,
         ) -> Result<ExecOutput, ExecError> {
-            self.record(target, program, args, None, timeout);
-            self.inner.run_in(target, program, args, timeout)
+            self.record(purpose, target, program, args, None, timeout);
+            self.inner.run_in(purpose, target, program, args, timeout)
         }
         fn run_with_stdin(
             &self,
+            purpose: crate::system::HelperPurpose,
             target: ExecTarget<'_>,
             program: Program,
             args: &[String],
             stdin: &[u8],
             timeout: Duration,
         ) -> Result<ExecOutput, ExecError> {
-            self.record(target, program, args, Some(stdin.len()), timeout);
+            self.record(purpose, target, program, args, Some(stdin.len()), timeout);
             self.inner
-                .run_with_stdin(target, program, args, stdin, timeout)
+                .run_with_stdin(purpose, target, program, args, stdin, timeout)
         }
         fn now_unix_secs(&self) -> u64 {
             self.inner.now_unix_secs()
@@ -1066,34 +1498,40 @@ pub mod testing {
     }
 
     impl System for FakeSystem {
+        fn wg_quick_units(&self) -> std::io::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
         fn run(
             &self,
+            purpose: crate::system::HelperPurpose,
             program: Program,
             args: &[String],
             timeout: Duration,
         ) -> Result<ExecOutput, ExecError> {
-            self.run_in(ExecTarget::Host, program, args, timeout)
+            self.run_in(purpose, ExecTarget::Host, program, args, timeout)
         }
 
         fn run_in(
             &self,
+            purpose: crate::system::HelperPurpose,
             target: ExecTarget<'_>,
             program: Program,
             args: &[String],
             timeout: Duration,
         ) -> Result<ExecOutput, ExecError> {
-            self.dispatch(target, program, args, None, timeout)
+            self.dispatch(purpose, target, program, args, None, timeout)
         }
 
         fn run_with_stdin(
             &self,
+            purpose: crate::system::HelperPurpose,
             target: ExecTarget<'_>,
             program: Program,
             args: &[String],
             stdin: &[u8],
             timeout: Duration,
         ) -> Result<ExecOutput, ExecError> {
-            self.dispatch(target, program, args, Some(stdin.len()), timeout)
+            self.dispatch(purpose, target, program, args, Some(stdin.len()), timeout)
         }
 
         fn wireguard_socket_dirs(&self) -> Vec<std::path::PathBuf> {
@@ -1122,20 +1560,67 @@ mod tests {
         args.iter().map(|arg| (*arg).into()).collect()
     }
 
+    #[cfg(feature = "testing")]
+    #[test]
+    fn shutdown_lab_adapter_changes_only_the_exact_host_query() -> Result<(), Box<dyn Error>> {
+        for stopping in [false, true] {
+            let sys = RealSystem::new(Programs::new([(
+                Program::Systemctl,
+                "/scupper-missing-systemctl",
+            )])?)
+            .with_shutdown_state_for_test(stopping);
+            let result = sys.run_in(
+                crate::system::HelperPurpose::Observation,
+                ExecTarget::Host,
+                Program::Systemctl,
+                &args(&["is-system-running"]),
+                EXEC_TIMEOUT,
+            )?;
+            assert_eq!(result.status, Some(i32::from(stopping)));
+            assert_eq!(
+                result.stdout,
+                if stopping { "stopping\n" } else { "running\n" }
+            );
+            assert!(
+                sys.run(
+                    crate::system::HelperPurpose::Observation,
+                    Program::Systemctl,
+                    &args(&["is-system-running", "--wait"]),
+                    EXEC_TIMEOUT
+                )
+                .is_err()
+            );
+            let held = crate::netns::testing::handle()?;
+            assert!(
+                sys.run_in(
+                    crate::system::HelperPurpose::Observation,
+                    ExecTarget::Netns(&held),
+                    Program::Systemctl,
+                    &args(&["is-system-running"]),
+                    EXEC_TIMEOUT
+                )
+                .is_err()
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn adapter_defaults_preserve_host_and_reject_unsupported_netns() -> Result<(), Box<dyn Error>> {
         struct TargetAware;
         impl System for TargetAware {
             fn run(
                 &self,
+                purpose: crate::system::HelperPurpose,
                 program: Program,
                 args: &[String],
                 timeout: Duration,
             ) -> Result<ExecOutput, ExecError> {
-                self.run_in(ExecTarget::Host, program, args, timeout)
+                self.run_in(purpose, ExecTarget::Host, program, args, timeout)
             }
             fn run_in(
                 &self,
+                _purpose: crate::system::HelperPurpose,
                 target: ExecTarget<'_>,
                 _program: Program,
                 _args: &[String],
@@ -1156,30 +1641,50 @@ mod tests {
         impl System for Legacy {
             fn run(
                 &self,
+                purpose: crate::system::HelperPurpose,
                 program: Program,
                 args: &[String],
                 timeout: Duration,
             ) -> Result<ExecOutput, ExecError> {
-                TargetAware.run(program, args, timeout)
+                TargetAware.run(purpose, program, args, timeout)
             }
             fn now_unix_secs(&self) -> u64 {
                 0
             }
         }
         assert_eq!(
-            TargetAware.run(Program::Ip, &[], EXEC_TIMEOUT)?.status,
+            TargetAware
+                .run(
+                    crate::system::HelperPurpose::Observation,
+                    Program::Ip,
+                    &[],
+                    EXEC_TIMEOUT
+                )?
+                .status,
             Some(0)
         );
         assert_eq!(
             Legacy
-                .run_in(ExecTarget::Host, Program::Ip, &[], EXEC_TIMEOUT)?
+                .run_in(
+                    crate::system::HelperPurpose::Observation,
+                    ExecTarget::Host,
+                    Program::Ip,
+                    &[],
+                    EXEC_TIMEOUT
+                )?
                 .status,
             Some(0)
         );
         let handle = crate::netns::testing::handle()?;
         assert!(
             Legacy
-                .run_in(ExecTarget::Netns(&handle), Program::Ip, &[], EXEC_TIMEOUT)
+                .run_in(
+                    crate::system::HelperPurpose::Observation,
+                    ExecTarget::Netns(&handle),
+                    Program::Ip,
+                    &[],
+                    EXEC_TIMEOUT
+                )
                 .is_err()
         );
         Ok(())
@@ -1229,7 +1734,8 @@ mod tests {
                     Program::Ip,
                     &[],
                     input,
-                    EXEC_TIMEOUT
+                    EXEC_TIMEOUT,
+                    HelperPurpose::Observation,
                 ),
                 Err(ExecError::NamespaceIdentity)
             );
@@ -1253,6 +1759,7 @@ mod tests {
             let result = namespace_result(
                 ExecTarget::Netns(&handle),
                 sys.run(
+                    crate::system::HelperPurpose::Observation,
                     Program::Wg,
                     &args(&["-c", &format!("printf '%s' '{stderr}' >&2; exit {code}")]),
                     EXEC_TIMEOUT,
@@ -1272,6 +1779,7 @@ mod tests {
     #[test]
     fn broken_stdin_pipe_preserves_child_diagnostics() -> Result<(), Box<dyn Error>> {
         let output = system("/bin/sh")?.run_with_stdin(
+            crate::system::HelperPurpose::Observation,
             ExecTarget::Host,
             Program::Wg,
             &args(&[
@@ -1292,6 +1800,7 @@ mod tests {
         let sys = system("/bin/sh")?;
         for bytes in [Vec::new(), b"hello\n".to_vec(), vec![b'x'; 512 * 1024]] {
             let output = sys.run_with_stdin(
+                crate::system::HelperPurpose::Observation,
                 ExecTarget::Host,
                 Program::Wg,
                 &args(&["-c", "exec /usr/bin/cat"]),
@@ -1305,6 +1814,7 @@ mod tests {
         let started = Instant::now();
         assert_eq!(
             sys.run_with_stdin(
+                crate::system::HelperPurpose::Observation,
                 ExecTarget::Host,
                 Program::Wg,
                 &args(&["-c", "exec /usr/bin/sleep 30"]),
@@ -1320,11 +1830,153 @@ mod tests {
     #[test]
     fn exec_success_and_status() -> Result<(), Box<dyn Error>> {
         for (path, code) in [("/usr/bin/true", 0), ("/usr/bin/false", 1)] {
-            let output = system(path)?.run(Program::Wg, &[], EXEC_TIMEOUT)?;
+            let output = system(path)?.run(
+                crate::system::HelperPurpose::Observation,
+                Program::Wg,
+                &[],
+                EXEC_TIMEOUT,
+            )?;
             assert_eq!(output.status, Some(code));
             assert_eq!(output.stdout, "");
             assert_eq!(output.stderr, "");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn final_session_sample_uses_real_admission_after_term() -> Result<(), Box<dyn Error>> {
+        static TRACKER: HelperTracker = HelperTracker::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        TRACKER.state().stop = Some(stop.clone());
+        request_stop_tracked(&TRACKER, &stop);
+        let run = |purpose| -> Result<ExecOutput, Box<dyn Error>> {
+            Ok(execute_file_command_tracked(
+                &TRACKER,
+                purpose,
+                Command::new("/usr/bin/true"),
+                std::fs::File::open(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))?,
+                EXEC_TIMEOUT,
+            )?)
+        };
+        assert!(run(HelperPurpose::Probe).is_err());
+        assert_eq!(run(HelperPurpose::Observation)?.status, Some(0));
+        TRACKER.state().closed = true;
+        assert!(run(HelperPurpose::Observation).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn heartbeat_read_is_not_a_mutation_but_real_mutations_must_settle()
+    -> Result<(), Box<dyn Error>> {
+        static TRACKER: HelperTracker = HelperTracker::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        TRACKER.state().stop = Some(stop.clone());
+        let read = HelperLease::acquire_tracked(&TRACKER, HelperPurpose::Observation)?;
+        request_stop_tracked(&TRACKER, &stop);
+        assert!(mutations_settled_tracked(&TRACKER));
+        let mutation = HelperLease::acquire_tracked(&TRACKER, HelperPurpose::Mutation)?;
+        assert!(!mutations_settled_tracked(&TRACKER));
+        drop(read);
+        assert!(!drain_tracked(&TRACKER, Instant::now()));
+        drop(mutation);
+        assert!(drain_tracked(&TRACKER, Instant::now()));
+        Ok(())
+    }
+
+    #[test]
+    fn completed_child_pid_is_cleared_while_its_lease_is_still_owned() -> Result<(), Box<dyn Error>>
+    {
+        static TRACKER: HelperTracker = HelperTracker::new();
+        let (lease, mut child) = HelperLease::spawn_tracked(
+            &TRACKER,
+            &mut Command::new("/usr/bin/true"),
+            HelperPurpose::Notification,
+        )?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while lease.try_wait(&mut child)?.is_none() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert_eq!(
+            TRACKER.state().active.get(&lease.id),
+            Some(&(HelperPurpose::Notification, None))
+        );
+        drop(lease);
+        assert!(TRACKER.state().active.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn helper_drain_timeout_kills_only_reads_and_reaps_them() -> Result<(), Box<dyn Error>> {
+        static TRACKER: HelperTracker = HelperTracker::new();
+        let mut command = Command::new("/usr/bin/cat");
+        command
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null());
+        let (lease, mut child) =
+            HelperLease::spawn_tracked(&TRACKER, &mut command, HelperPurpose::Observation)?;
+        let _input = child.stdin.take(); // Keep the read blocked until killed.
+        let worker = thread::spawn(move || {
+            let _lease = lease;
+            child.wait()
+        });
+        assert!(drain_tracked(&TRACKER, Instant::now()));
+        assert!(!worker.join().map_err(|_| "reaper panicked")??.success());
+        assert!(TRACKER.state().active.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn slow_alert_and_probe_do_not_delay_observation_drain_or_admit_late_helpers()
+    -> Result<(), Box<dyn Error>> {
+        static TRACKER: HelperTracker = HelperTracker::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        TRACKER.state().stop = Some(stop.clone());
+        let alert = HelperLease::acquire_tracked(&TRACKER, HelperPurpose::Notification)?;
+        let probe = HelperLease::acquire_tracked(&TRACKER, HelperPurpose::Probe)?;
+        request_stop_tracked(&TRACKER, &stop);
+        assert!(drain_tracked(&TRACKER, Instant::now()));
+        assert_eq!(TRACKER.state().active.len(), 2);
+        for purpose in [HelperPurpose::Notification, HelperPurpose::Probe] {
+            assert!(
+                HelperLease::spawn_tracked(&TRACKER, &mut Command::new("/usr/bin/true"), purpose)
+                    .is_err()
+            );
+        }
+        // A late completion is reaped/bookkept, never a reason to reopen admission.
+        drop(alert);
+        drop(probe);
+        assert!(TRACKER.state().active.is_empty());
+        assert!(
+            HelperLease::spawn_tracked(
+                &TRACKER,
+                &mut Command::new("/usr/bin/true"),
+                HelperPurpose::Notification
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_cancels_in_flight_notification_and_retains_its_reaper() -> Result<(), Box<dyn Error>> {
+        static TRACKER: HelperTracker = HelperTracker::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        TRACKER.state().stop = Some(stop.clone());
+        let mut command = Command::new("/usr/bin/cat");
+        command
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null());
+        let (lease, mut child) =
+            HelperLease::spawn_tracked(&TRACKER, &mut command, HelperPurpose::Notification)?;
+        let _input = child.stdin.take();
+        request_stop_tracked(&TRACKER, &stop);
+        assert_eq!(TRACKER.state().active.len(), 1);
+        assert!(!child.wait()?.success());
+        drop(lease);
+        assert!(TRACKER.state().active.is_empty());
         Ok(())
     }
 
@@ -1339,11 +1991,11 @@ mod tests {
         let pid = child.id();
         let mut readers = vec![];
         assert_eq!(
-            collect(&mut child, started, timeout, &mut readers, None),
+            collect(&mut child, started, timeout, &mut readers, None, None),
             Err(ExecError::Timeout { after: timeout })
         );
         let deadline = started + timeout + Duration::from_millis(900);
-        terminate(child, deadline);
+        terminate(child, deadline, None);
         join_readers(readers, deadline);
         assert!(started.elapsed() < timeout + Duration::from_secs(1));
         // kill -0 fails for a process that has been killed AND reaped (including
@@ -1360,7 +2012,12 @@ mod tests {
     #[test]
     fn exec_stdin_is_null() -> Result<(), Box<dyn Error>> {
         let started = Instant::now();
-        let output = system("/usr/bin/cat")?.run(Program::Wg, &[], EXEC_TIMEOUT)?;
+        let output = system("/usr/bin/cat")?.run(
+            crate::system::HelperPurpose::Observation,
+            Program::Wg,
+            &[],
+            EXEC_TIMEOUT,
+        )?;
         assert_eq!(
             output,
             ExecOutput {
@@ -1375,7 +2032,12 @@ mod tests {
 
     #[test]
     fn exec_cwd_is_root() -> Result<(), Box<dyn Error>> {
-        let output = system("/usr/bin/pwd")?.run(Program::Wg, &[], EXEC_TIMEOUT)?;
+        let output = system("/usr/bin/pwd")?.run(
+            crate::system::HelperPurpose::Observation,
+            Program::Wg,
+            &[],
+            EXEC_TIMEOUT,
+        )?;
         assert_eq!(output.status, Some(0));
         assert_eq!(output.stdout, "/\n");
         Ok(())
@@ -1415,6 +2077,7 @@ mod tests {
         // A shell is used only in this test to arrange an inherited-pipe tree.
         let script = format!("/usr/bin/sleep 30 & printf '%s' \"$!\" > \"$1\"; {tail}");
         let result = system("/bin/sh")?.run(
+            crate::system::HelperPurpose::Observation,
             Program::Wg,
             &[
                 "-c".into(),
@@ -1526,7 +2189,12 @@ mod tests {
     fn exec_output_cap() -> Result<(), Box<dyn Error>> {
         let started = Instant::now();
         assert_eq!(
-            system("/usr/bin/yes")?.run(Program::Wg, &[], EXEC_TIMEOUT),
+            system("/usr/bin/yes")?.run(
+                crate::system::HelperPurpose::Observation,
+                Program::Wg,
+                &[],
+                EXEC_TIMEOUT
+            ),
             Err(ExecError::OutputTooLarge {
                 stream: Stream::Stdout
             })
@@ -1537,7 +2205,12 @@ mod tests {
 
     #[test]
     fn exec_env_is_clean() -> Result<(), Box<dyn Error>> {
-        let output = system("/usr/bin/env")?.run(Program::Wg, &[], EXEC_TIMEOUT)?;
+        let output = system("/usr/bin/env")?.run(
+            crate::system::HelperPurpose::Observation,
+            Program::Wg,
+            &[],
+            EXEC_TIMEOUT,
+        )?;
         let mut lines: Vec<_> = output.stdout.lines().collect();
         lines.sort_unstable();
         assert_eq!(lines, ["LC_ALL=C", "PATH=/usr/sbin:/usr/bin:/sbin:/bin"]);
@@ -1576,6 +2249,7 @@ mod tests {
     fn fixture(name: &str) -> Result<ExecOutput, Box<dyn Error>> {
         let sys = RealSystem::new(Programs::new([(Program::Wg, std::env::current_exe()?)])?);
         Ok(sys.run(
+            crate::system::HelperPurpose::Observation,
             Program::Wg,
             &args(&["--ignored", "--exact", name, "--nocapture"]),
             EXEC_TIMEOUT,
@@ -1646,6 +2320,11 @@ mod tests {
     #[should_panic(expected = "unexpected or exhausted command: Ip")]
     fn fake_rejects_unknown_calls() {
         let fake = testing::FakeSystem::new(1_000);
-        let _ = fake.run(Program::Ip, &args(&["route"]), EXEC_TIMEOUT);
+        let _ = fake.run(
+            crate::system::HelperPurpose::Observation,
+            Program::Ip,
+            &args(&["route"]),
+            EXEC_TIMEOUT,
+        );
     }
 }

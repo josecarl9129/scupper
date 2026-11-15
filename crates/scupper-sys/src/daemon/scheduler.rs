@@ -47,7 +47,7 @@ pub trait DaemonDeps {
     fn notify(&mut self, iteration: &Iteration);
     /// Schedule fresh heartbeat work only after a completed watchdog iteration.
     fn heartbeat(&mut self) {}
-    /// Release the reconciler and flush audit data; no kernel work is permitted.
+    /// Release the reconciler and flush audit data after bounded stop containment.
     fn shutdown(&mut self);
 }
 /// Run the same cadence and signal handling with real or fake dependencies.
@@ -86,7 +86,9 @@ pub fn run_with(deps: &mut impl DaemonDeps, stop: &AtomicBool) {
                 Err(error) => deps.budget_error(&error),
             }
         }
-        deps.maintenance();
+        if !stop.load(Ordering::Acquire) {
+            deps.maintenance();
+        }
         let iteration = Iteration {
             complete: !rebuild
                 && report.as_ref().is_some_and(|r| r.complete)

@@ -1,4 +1,4 @@
-//! Audit records deliberately exclude arbitrary strings and network observations.
+//! Audit records exclude packet observations; link repairs retain the interface name.
 use crate::{Identifier, UnixSeconds, sampled_enum, vocabulary};
 use scupper_core::{
     failover::{FailClosedReason, FailoverEvent},
@@ -6,6 +6,67 @@ use scupper_core::{
 };
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+
+vocabulary!(
+    ReadNamespace,
+    "Namespace in which a safety read failed.",
+    Held,
+    Host,
+    Edge
+);
+vocabulary!(
+    ReadStage,
+    "Command stage of a failed safety read.",
+    NamespaceIdentity,
+    LinkList,
+    Ruleset,
+    Sysctl,
+    TcQdisc,
+    TcFilterRoot,
+    TcFilterIngress,
+    TcFilterEgress
+);
+vocabulary!(
+    ReadFailureKind,
+    "Failure class without command output.",
+    Timeout,
+    Signal,
+    ExitStatus,
+    Spawn,
+    Parse,
+    OutputTooLarge,
+    NonUtf8,
+    NamespaceIdentity,
+    Io
+);
+/// Value-free context for a failed safety observation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadFailure {
+    /// The held namespace, host, or edge namespace.
+    pub namespace: ReadNamespace,
+    /// Interface for per-link reads.
+    pub link: Option<String>,
+    /// Command/read stage.
+    pub stage: ReadStage,
+    /// Failure type, never raw stderr or argv.
+    pub failure: ReadFailureKind,
+}
+impl ReadFailure {
+    /// Affected safety object.
+    #[must_use]
+    pub fn object(&self) -> ObjectKind {
+        match self.stage {
+            ReadStage::NamespaceIdentity | ReadStage::LinkList => ObjectKind::Link,
+            ReadStage::Ruleset => ObjectKind::Ruleset,
+            ReadStage::Sysctl => ObjectKind::Forwarding,
+            ReadStage::TcQdisc
+            | ReadStage::TcFilterRoot
+            | ReadStage::TcFilterIngress
+            | ReadStage::TcFilterEgress => ObjectKind::TcHook,
+        }
+    }
+}
 
 sampled_enum! {
 /// Identity that authorized or originated an event.
@@ -147,6 +208,7 @@ vocabulary!(
     RouteReplace,
     RouteDelete,
     LinkDown,
+    LinkUp,
     LinkForwardingOff,
     LinkCreate,
     LinkReconfigure,
@@ -173,11 +235,11 @@ pub struct Release {
 // Every declaration requires a sample. Both enumeration and exhaustive sample
 // matching are generated here, so a new kind cannot silently escape privacy tests.
 macro_rules! event_kinds {
-    ($( $name:ident { $( $field:ident : $ty:ty = $sample:expr ),* $(,)? } ),+ $(,)?) => {
+    ($( $name:ident { $( $(#[$field_meta:meta])* $field:ident : $ty:ty = $sample:expr ),* $(,)? } ),+ $(,)?) => {
         /// Closed audit alphabet. `kind` names the variant and `data` holds its fields.
         #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
         #[serde(tag = "kind", content = "data", deny_unknown_fields)]
-        pub enum EventKind { $(#[doc = stringify!($name)] $name { $(#[doc = stringify!($field)] $field: $ty),* }),+ }
+        pub enum EventKind { $(#[doc = stringify!($name)] $name { $( $(#[$field_meta])* #[doc = stringify!($field)] $field: $ty),* }),+ }
         #[cfg(test)]
         impl EventKind {
             pub(crate) const NAMES: &'static [&'static str] = &[$(stringify!($name)),+];
@@ -194,6 +256,7 @@ macro_rules! event_kinds {
 event_kinds! {
     ConfigCommitted { version: u64 = 2, parent: Option<u64> = Some(1), sha: [u8; 32] = [0; 32], reason: Reason = Reason::Operator },
     ConfigApplied { version: u64 = 2 },
+    RepairCheckpointCreated {},
     ApplyFailed { version: Option<u64> = Some(2), step: StepKind = StepKind::LoadRuleset, reason: Reason = Reason::ExecutionFailed },
     Failover { from: Identifier = Identifier("ch1".into()), to: Identifier = Identifier("ch2".into()), cause: Reason = Reason::HealthFailure },
     Failback { from: Identifier = Identifier("ch2".into()), to: Identifier = Identifier("ch1".into()) },
@@ -202,8 +265,8 @@ event_kinds! {
     QuarantineState { active: bool = false },
     FailClosedEnded { duration: Duration = Duration::from_secs(4) },
     ExitHealthChanged { exit: Identifier = Identifier("ch1".into()), from: Health = Health::Healthy, to: Health = Health::Down },
-    DriftDetected { object: ObjectKind = ObjectKind::Ruleset, reason: Reason = Reason::SafetyDrift },
-    Repair { kind: StepKind = StepKind::LoadRuleset, class: RepairClass = RepairClass::Restore, result: Outcome = Outcome::Succeeded },
+    DriftDetected { object: ObjectKind = ObjectKind::Ruleset, reason: Reason = Reason::SafetyDrift, #[serde(default, skip_serializing_if = "Option::is_none")] read: Option<ReadFailure> = None },
+    Repair { #[serde(default, skip_serializing_if = "Option::is_none")] object: Option<String> = Some("wg0".into()), kind: StepKind = StepKind::LinkDown, class: RepairClass = RepairClass::Tighten, result: Outcome = Outcome::Succeeded },
     RepairSuppressed { object: ObjectKind = ObjectKind::Ruleset },
     CheckVerdictChanged { from: VerdictCode = VerdictCode::Protected, to: VerdictCode = VerdictCode::Unprotected, reason: ObjectKind = ObjectKind::Ruleset },
     VerdictChanged { from: VerdictCode = VerdictCode::Protected, to: VerdictCode = VerdictCode::FailClosed },
@@ -212,6 +275,8 @@ event_kinds! {
     DaemonStarted { version: Release = Release {major: 0, minor: 1, patch: 0} },
     Boot { result: Outcome = Outcome::Recovered, step: StepKind = StepKind::EventLog },
     QuarantineChanged { active: bool = true },
+    IngressQuarantineChanged { active: bool = true },
+    IngressQuarantineState { active: bool = false },
     EventSkipped { seq: u64 = 1 },
     SinkFailed { sink: Identifier = Identifier("primary".into()), reason: Reason = Reason::ExecutionFailed },
     HeartbeatFailed { reason: Reason = Reason::EdgeDead },
@@ -275,18 +340,24 @@ impl From<PlannerEvent> for EventKind {
                 object: object_kind(&object),
             },
             PlannerEvent::SafetyDrift { object } => Self::DriftDetected {
+                read: None,
                 object: object_kind(&object),
                 reason: Reason::SafetyDrift,
             },
             PlannerEvent::ObservationUnknown => Self::DriftDetected {
+                read: None,
                 object: ObjectKind::Unknown,
                 reason: Reason::ObservationUnknown,
             },
-            PlannerEvent::IngressQuarantined => Self::QuarantineChanged { active: true },
+            PlannerEvent::IngressQuarantined => Self::IngressQuarantineChanged { active: true },
+            PlannerEvent::IngressQuarantineLifted => {
+                Self::IngressQuarantineChanged { active: false }
+            }
             PlannerEvent::PersistenceFailed => Self::PersistenceFailed {
                 reason: Reason::StateWrite,
             },
             PlannerEvent::EdgeDead => Self::DriftDetected {
+                read: None,
                 object: ObjectKind::Unknown,
                 reason: Reason::EdgeDead,
             },
@@ -342,6 +413,7 @@ impl From<&Step> for StepKind {
             Step::RouteReplace { .. } => Self::RouteReplace,
             Step::RouteDelete { .. } => Self::RouteDelete,
             Step::LinkDown { .. } => Self::LinkDown,
+            Step::LinkUp { .. } => Self::LinkUp,
             Step::LinkForwardingOff { .. } => Self::LinkForwardingOff,
             Step::LinkCreate { .. } => Self::LinkCreate,
             Step::LinkReconfigure { .. } => Self::LinkReconfigure,
@@ -350,6 +422,58 @@ impl From<&Step> for StepKind {
             Step::ReResolveEndpoint { .. } => Self::ReResolveEndpoint,
             Step::PersistLatch { .. } => Self::PersistLatch,
             Step::Emit(_) => Self::Emit,
+        }
+    }
+}
+
+#[cfg(test)]
+mod repair_tests {
+    use super::*;
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn repair_link_object_round_trips_and_old_records_still_decode() {
+        let old = serde_json::json!({"kind":"Repair", "data":{
+            "kind":"LinkDown", "class":"Tighten", "result":"Succeeded"
+        }});
+        let mut event: EventKind = serde_json::from_value(old.clone()).unwrap();
+        assert!(matches!(event, EventKind::Repair { object: None, .. }));
+        if let EventKind::Repair { object, .. } = &mut event {
+            *object = Some("wg0".into());
+        }
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["data"]["object"], "wg0");
+        assert_eq!(serde_json::from_value::<EventKind>(json).unwrap(), event);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod read_failure_tests {
+    use super::*;
+    #[test]
+    fn read_context_roundtrips_and_old_drift_records_remain_readable() {
+        let old = serde_json::json!({"kind":"DriftDetected","data":{"object":"Ruleset","reason":"ObservationUnknown"}});
+        let event: EventKind = serde_json::from_value(old).unwrap();
+        assert!(matches!(event, EventKind::DriftDetected { read: None, .. }));
+        for namespace in ReadNamespace::NAMES {
+            for stage in ReadStage::NAMES {
+                for failure in ReadFailureKind::NAMES {
+                    let context: ReadFailure = serde_json::from_value(serde_json::json!({
+                        "namespace": namespace, "stage": stage, "failure": failure, "link": "wg0"
+                    }))
+                    .unwrap();
+                    let event = EventKind::DriftDetected {
+                        object: context.object(),
+                        reason: Reason::ObservationUnknown,
+                        read: Some(context),
+                    };
+                    assert_eq!(
+                        serde_json::from_value::<EventKind>(serde_json::to_value(&event).unwrap())
+                            .unwrap(),
+                        event
+                    );
+                }
+            }
         }
     }
 }

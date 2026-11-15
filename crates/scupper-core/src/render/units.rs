@@ -1,15 +1,20 @@
 //! M2 host units. Installation is a separate administrative operation.
 
-/// Boot the kernel data path; stopping this unit never tears it down.
+/// Boot the data path; only system shutdown stops clients, preserving containment.
 #[must_use]
 pub const fn scupper_net() -> &'static str {
-    "# scupper-net.service\n[Unit]\nDescription=scupper data-path namespace\nDefaultDependencies=no\nAfter=local-fs.target systemd-modules-load.service\nBefore=network-pre.target scupperd.service\nWants=network-pre.target\n[Service]\nType=oneshot\nTimeoutStartSec=90\nTimeoutStopSec=10s\nRemainAfterExit=yes\nExecStart=/usr/local/bin/scupper boot\n# no ExecStop: stopping the unit never tears protection down\n[Install]\nWantedBy=multi-user.target\n"
+    "# scupper-net.service\n# Stop preserves protection; clean-stop tears down clients only during system shutdown.\n[Unit]\nDescription=scupper data-path namespace\nDefaultDependencies=no\nAfter=local-fs.target systemd-modules-load.service\nBefore=network-pre.target scupperd.service shutdown.target\nConflicts=shutdown.target\nWants=network-pre.target\n[Service]\nType=oneshot\nTimeoutStartSec=90\nTimeoutStopSec=30s\nRemainAfterExit=yes\nExecStart=/usr/local/bin/scupper boot\nExecStop=/usr/local/bin/scupper boot --clean-stop\n[Install]\nWantedBy=multi-user.target\n"
 }
 
 /// Run the single writer in the host mount and network namespaces.
+/// Stop bound: current mutation/session hooks 40s + safety observation 6s +
+/// fixed stop budget 150s (read drain 3s, kill/reap 1s, whole re-read 3s,
+/// bounded latch persistence 3s, cleanup and final containment in the remaining
+/// budget) + non-kernel helper reap 31s + audit/session cleanup 6s = 233s.
+/// TimeoutStopSec=270s leaves 37s margin; fallback starts at 120s of that budget.
 #[must_use]
 pub const fn scupperd() -> &'static str {
-    "# scupperd.service\n[Unit]\nDescription=scupper reconciler\nWants=scupper-net.service network-online.target\nAfter=scupper-net.service network-online.target\nStartLimitIntervalSec=0\n[Service]\nType=notify\nWatchdogSec=30\nRestart=always\nRestartSec=2s\nTimeoutStartSec=90\nLimitCORE=0\n# Keep the host mount namespace: restore_mount needs /run/netns propagation.\nExecStart=/usr/local/bin/scupperd\n[Install]\nWantedBy=multi-user.target\n"
+    "# scupperd.service\n[Unit]\nDescription=scupper reconciler\nWants=scupper-net.service network-online.target\nAfter=scupper-net.service network-online.target\nStartLimitIntervalSec=0\n[Service]\nType=notify\nWatchdogSec=30\nRestart=always\nRestartSec=2s\nTimeoutStartSec=90\nKillMode=mixed\nTimeoutStopSec=270s\nLimitCORE=0\n# Keep the host mount namespace: restore_mount needs /run/netns propagation.\nExecStart=/usr/local/bin/scupperd\n[Install]\nWantedBy=multi-user.target\n"
 }
 
 #[cfg(test)]

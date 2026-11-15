@@ -33,7 +33,12 @@ impl ProbeExec for ProbeCommand {
     ) -> Result<ExecOutput, ExecError> {
         let mut command = std::process::Command::new(&self.0);
         command.args(["probe", json]);
-        crate::system::execute_file_command(command, namespace, timeout)
+        crate::system::execute_file_command(
+            crate::system::HelperPurpose::Probe,
+            command,
+            namespace,
+            timeout,
+        )
     }
 }
 /// Exit IP results keep an observed leak distinct from ordinary probe failure.
@@ -237,7 +242,12 @@ mod tests {
         ) -> Result<ExecOutput, ExecError> {
             let mut command = std::process::Command::new("/bin/sh");
             command.arg(&self.0).args(["probe", json]);
-            crate::system::execute_file_command(command, namespace, timeout)
+            crate::system::execute_file_command(
+                crate::system::HelperPurpose::Probe,
+                command,
+                namespace,
+                timeout,
+            )
         }
     }
     fn spawn(

@@ -103,6 +103,8 @@ pub enum LinkPhase {
 /// Persisted quarantine identity. Persistence supplies the wall-clock timestamp.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Latch {
+    /// Failed persistence or unreadable safety evidence, clearable by connect.
+    pub uncertain: bool,
     /// Why recurring safety drift closed the gateway.
     pub reason: String,
     /// Stable budget object key.
@@ -152,6 +154,11 @@ pub enum Repair {
         /// Configured name.
         name: String,
     },
+    /// Raise an already configured owned client link without changing identity.
+    LinkUp {
+        /// Configured name.
+        name: String,
+    },
     /// Disable, but never delete, a foreign link.
     ForeignLinkDown {
         /// Raw interface name.
@@ -179,7 +186,7 @@ pub enum Repair {
         /// Configured exit identity.
         exit: ExitId,
     },
-    /// Record a new memory quarantine after closing forwarding.
+    /// Record a new memory quarantine before tightening, with a bounded I/O budget.
     PersistLatch {
         /// Reason.
         reason: String,
@@ -209,6 +216,7 @@ impl Repair {
             | Self::HardeningSysctl { .. }
             | Self::LinkRecreate { .. }
             | Self::LinkReconfigure { .. }
+            | Self::LinkUp { .. }
             | Self::ExitRehandshake { .. }
             | Self::HostLinkCleanup { .. } => RepairClass::Restore,
             Self::RouteReplace { target, .. } => match target {
@@ -240,7 +248,9 @@ impl Repair {
                 route.entry.metric,
                 route.entry.dev
             ),
-            Self::LinkRecreate { name } | Self::LinkReconfigure { name } => format!("link:{name}"),
+            Self::LinkRecreate { name }
+            | Self::LinkReconfigure { name }
+            | Self::LinkUp { name } => format!("link:{name}"),
             Self::ExitDown { name } => format!("exit-down:{name}"),
             Self::HostLinkCleanup { name } => format!("host-link:{name}"),
             Self::PeerContainment { name } => format!("peer-containment:{name}"),
@@ -364,8 +374,10 @@ pub enum PlannerEvent {
     },
     /// Failed collection forces the emergency gate closed.
     ObservationUnknown,
-    /// Two consecutive incomplete link/tc inventories stopped client ingress.
+    /// An incomplete link/tc inventory stopped client ingress.
     IngressQuarantined,
+    /// Link/tc inventory is known again; ingress containment lifted.
+    IngressQuarantineLifted,
     /// Non-fatal latch persistence failure; the executor retains the memory latch.
     PersistenceFailed,
     /// The edge is supervised by systemd; the planner only alerts.
@@ -438,6 +450,13 @@ pub enum Step {
         /// Raw interface name.
         name: String,
     },
+    /// Raise a configured owned client link under the forwarding restore gates.
+    LinkUp {
+        /// Namespace interface name.
+        name: String,
+        /// Required whole-namespace fingerprint.
+        requires: Fingerprint,
+    },
     /// Close forwarding on a newly moved or reconfigured device before `LinkUp`.
     LinkForwardingOff {
         /// Namespace interface name.
@@ -472,7 +491,8 @@ pub enum Step {
         /// Configured exit.
         exit: ExitId,
     },
-    /// Persist the latch already adopted from `Plan::latch`, after tightening.
+    /// Persist the latch already adopted from `Plan::latch`; executors prioritize
+    /// this bounded attempt before tightening, even during stop.
     /// Non-fatal: on failure continue execution, retain the memory latch and
     /// raise `PlannerEvent::PersistenceFailed`. Disk I/O never blocks tightening.
     PersistLatch {
@@ -496,6 +516,18 @@ pub enum StepFailure {
     NonFatal,
 }
 impl Step {
+    /// Interface acted on by this step, for local operational audit records.
+    #[must_use]
+    pub fn link_name(&self) -> Option<&str> {
+        match self {
+            Self::LinkDown { name }
+            | Self::LinkUp { name, .. }
+            | Self::LinkForwardingOff { name }
+            | Self::TcDelete { name, .. } => Some(name),
+            Self::LinkCreate { link, .. } | Self::LinkReconfigure { link } => Some(&link.name),
+            _ => None,
+        }
+    }
     /// Failure policy carried by this step. Failed containment blocks every
     /// later `Stop` (Restore) step, while later `Contain`/`NonFatal` steps still run.
     /// `NonFatal` failures neither block Restore nor clear containment failure.
@@ -514,6 +546,7 @@ impl Step {
             } => StepFailure::Contain,
             Self::PersistLatch { .. } | Self::Emit(_) => StepFailure::NonFatal,
             Self::ForwardingOn { .. }
+            | Self::LinkUp { .. }
             | Self::LoadRuleset { .. }
             | Self::VerifyRuleset { .. }
             | Self::FlushConntrack
@@ -581,7 +614,8 @@ pub struct Debounce {
 /// Pure planner output; callers persist/retain returned bookkeeping.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Plan {
-    /// Execute in order using each step's [`Step::failure`] policy.
+    /// Execute using each step's [`Step::failure`] policy. Pending `PersistLatch`
+    /// steps have priority before the remaining, ordered containment sequence.
     pub steps: Vec<Step>,
     /// New quarantine decision. Adopt in memory before executing step zero,
     /// without I/O, and union it with persisted quarantine on every later tick.

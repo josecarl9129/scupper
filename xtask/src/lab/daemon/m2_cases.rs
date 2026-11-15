@@ -18,6 +18,7 @@ pub(super) fn is_m2(case: &str) -> bool {
             | "L9-host-link"
             | "L11"
             | "L12"
+            | "L54"
             | "L15"
             | "L18"
             | "L20"
@@ -69,6 +70,7 @@ impl DaemonGuard<'_> {
             "L8" => self.host_nft(&root, &mut markers)?,
             "L11" => self.isolation(&stem)?,
             "L12" => self.spoof(&root, &stem)?,
+            "L54" => self.client_reset(&root, &stem, &mut markers)?,
             "L15" => self.exit_ip_target(&root)?,
             "L9" | "L9b" | "L9-host-link" => {
                 // Both real CLI boot and daemon boot crash at each checkpoint;
@@ -118,6 +120,156 @@ impl DaemonGuard<'_> {
             }
         ))
     }
+    #[allow(clippy::too_many_lines)] // Keep the fault window, check samples and first-attempt canary together.
+    fn client_reset(&mut self, root: &Path, stem: &str, markers: &mut Vec<String>) -> Result<()> {
+        use std::io::Write as _;
+        use std::time::Instant;
+        let binary = Lab::boot_binary()?;
+        let peer = self.lab.public_keys[0].clone();
+        self.lab.cmd(
+            "client",
+            "wg",
+            &["set", "wg0", "peer", &peer, "persistent-keepalive", "0"],
+        )?;
+        self.lab
+            .capture("client", "wg0", &format!("{stem}-inner"))?;
+        let handshake = |lab: &mut Lab| -> Result<u64> {
+            let text = lab.cmd("client", "wg", &["show", "wg0", "latest-handshakes"])?;
+            text.split_whitespace()
+                .nth(1)
+                .ok_or("missing client handshake")?
+                .parse()
+                .map_err(Into::into)
+        };
+        let before = handshake(self.lab)?;
+        if before == 0 {
+            return fail("L54 requires an established client session");
+        }
+        // CLI lab observations are second-resolution; product baselines use netlink.
+        self.lab.runner.dwell(Duration::from_millis(1200))?;
+        let state_path = root.join("var-lib/scupper/client-sessions.json");
+        let initial: serde_json::Value = serde_json::from_slice(&fs::read(&state_path)?)?;
+        let generation = |v: &serde_json::Value| {
+            v["peers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|p| p["generation"].as_u64())
+                .max()
+                .unwrap_or(0)
+        };
+        let previous = generation(&initial);
+        // Permit handshakes, block all authenticated client transport, including
+        // kernel-generated keepalives. No client-side retry can conceal false OK.
+        let table = "table inet reset_window {\n chain output {\n  type filter hook output priority -200; policy accept;\n  udp dport 51820 @th,64,32 0x04000000 drop;\n }\n}\n";
+        self.lab.runner.input(
+            &Invocation::new("client", "nft", &["-f", "-"]),
+            Some(table.as_bytes()),
+        )?;
+        let started = Instant::now();
+        let trial = (|| -> Result<()> {
+            fs::write(root.join("run/scupper/unknown-inventory-once"), b"one tick")?;
+            let until = Instant::now() + Duration::from_secs(10);
+            let mut saw_down = false;
+            loop {
+                let value: serde_json::Value = serde_json::from_slice(&fs::read(&state_path)?)?;
+                if generation(&value) > previous {
+                    saw_down = true;
+                    fs::write(
+                        self.lab.artifacts.join("L54-link-down.json"),
+                        serde_json::to_vec_pretty(&value)?,
+                    )?;
+                    break;
+                }
+                if Instant::now() >= until {
+                    break;
+                }
+                self.lab.runner.dwell(Duration::from_millis(20))?;
+            }
+            if !saw_down {
+                return fail("L54 single Unknown tick never checkpointed LinkDown");
+            }
+            let mut samples = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.lab.artifacts.join("L54-check-window.jsonl"))?;
+            let until = Instant::now() + Duration::from_secs(10);
+            let mut recovered_handshake = false;
+            loop {
+                let (code, report) = self.lab.check_result(&binary, root)?;
+                writeln!(
+                    samples,
+                    "{}",
+                    serde_json::json!({"elapsed_ms":started.elapsed().as_millis(),"phase":"transport-blocked","code":code,"report":report})
+                )?;
+                samples.flush()?;
+                if code == 0 {
+                    return fail(
+                        "L54 check falsely returned 0 after LinkDown without authenticated client transport",
+                    );
+                }
+                if handshake(self.lab)? > before {
+                    recovered_handshake = true;
+                    self.expect_check(
+                        root,
+                        3,
+                        Some(("Degraded", "ClientSessionsReset")),
+                        "handshake-without-transport",
+                    )?;
+                    break;
+                }
+                if Instant::now() >= until {
+                    break;
+                }
+                self.lab.runner.dwell(Duration::from_millis(50))?;
+            }
+            if !recovered_handshake {
+                return fail("L54 gateway probe did not recover the client-side handshake");
+            }
+            self.lab.cmd(
+                "client",
+                "nft",
+                &["delete", "table", "inet", "reset_window"],
+            )?;
+            let released = Instant::now();
+            let marker = Lab::marker()?;
+            markers.push(marker.clone());
+            let old_phase = self.lab.runner.phase;
+            self.lab.runner.phase = old_phase.min(released + Duration::from_secs(5));
+            let attempt = self
+                .lab
+                .send("client", "tcp", A.internet.peer, &marker, false);
+            self.lab.runner.phase = old_phase;
+            let tcp_elapsed = released.elapsed();
+            if attempt? != super::super::helpers::Outcome::Delivered
+                || tcp_elapsed > Duration::from_secs(5)
+            {
+                return fail(
+                    "L54 first TCP canary did not deliver within 5 seconds after recovery",
+                );
+            }
+            let receipts = super::super::helpers::receipts(&fs::read_to_string(
+                self.lab.artifacts.join("sink.jsonl"),
+            )?)?;
+            super::super::check_positive_receipt(&receipts, &marker, true)?;
+            self.expect_check(root, 0, None, "authenticated-transport-recovered")?;
+            fs::write(
+                self.lab.artifacts.join("L54-recovery.json"),
+                serde_json::to_vec_pretty(
+                    &serde_json::json!({"client_handshake_before":before,"client_handshake_after":handshake(self.lab)?,"tcp_elapsed_ms":tcp_elapsed.as_millis(),"tcp_attempts":1,"marker":marker}),
+                )?,
+            )?;
+            Ok(())
+        })();
+        if trial.is_err() {
+            let _ = self.lab.cmd(
+                "client",
+                "nft",
+                &["delete", "table", "inet", "reset_window"],
+            );
+        }
+        trial
+    }
     fn ping(&mut self, ns: &str, target: &str, delivered: bool) -> Result<()> {
         let (status, output) = self.lab.runner.output(
             &Invocation::new(ns, "ping", &["-n", "-c", "2", "-W", "1", target]),
@@ -126,11 +278,17 @@ impl DaemonGuard<'_> {
         if status.code() != Some(i32::from(!delivered)) {
             return fail(format!("{ns} ping {target}: {status}: {output}"));
         }
+        if delivered {
+            self.lab
+                .last_probe_served
+                .insert(ns.into(), super::super::check_v2::lab_now());
+        }
         Ok(())
     }
     fn query(&mut self, ns: &str, target: &str, port: u16, protocol: &str) -> Result<Flow> {
         let marker = Lab::marker()?;
         self.lab.fault_markers.push(marker.clone());
+        self.lab.peer_markers.insert(marker.clone(), ns.into());
         let source_port = self.lab.next_source_port;
         self.lab.next_source_port += 1;
         let exe = self.lab.executable.clone();
@@ -770,13 +928,28 @@ impl DaemonGuard<'_> {
     fn rebuild(&mut self, root: &Path, case: &str) -> Result<()> {
         let marker = Lab::marker()?;
         self.lab.fault_markers.push(marker.clone());
-        let mut canary = self.lab.daemon_flow("udp", "client", &marker, case, 120)?;
+        let mut canary = self.lab.daemon_flow(
+            "udp",
+            "client",
+            &marker,
+            case,
+            self.lab.recovery_flow_seconds(),
+        )?;
         let flow = self.lab.artifacts.join(format!("{case}-udp.jsonl"));
         self.lab.daemon_wait(
             "rebuild traffic live before loss",
             Duration::from_secs(5),
             |_| Ok(super::flow_counts(&flow)?.1 > 0),
         )?;
+        // Both peers are required by the recovery decision. Keep their
+        // authenticated transport flowing across at least one full sample
+        // interval before stopping, and through namespace destruction/recovery.
+        let mut recovery = self.lab.recovery_traffic(&format!("{case}-rebuild"))?;
+        self.lab
+            .assert_recovery_served(&mut recovery, &serde_json::json!({}), root)?;
+        self.lab.runner.dwell(Duration::from_secs(6))?;
+        self.lab
+            .assert_recovery_served(&mut recovery, &serde_json::json!({}), root)?;
         let before = self
             .lab
             .cmd("scupper", "readlink", &["/proc/self/ns/net"])?;
@@ -835,6 +1008,18 @@ impl DaemonGuard<'_> {
                 self.child.as_mut().ok_or("daemon")?,
                 self.notify.as_ref().ok_or("notify")?,
             )?;
+        }
+        let (code, report) =
+            self.lab
+                .wait_required_session_recovery(&Lab::boot_binary()?, root, &mut recovery)?;
+        fs::write(
+            self.lab
+                .artifacts
+                .join(format!("{case}-rebuild-recovery.json")),
+            serde_json::to_vec_pretty(&report)?,
+        )?;
+        if code != 0 {
+            return fail(format!("{case} rebuild recovery: {code}: {report}"));
         }
         canary.stop(Signal::TERM)?;
         Ok(())

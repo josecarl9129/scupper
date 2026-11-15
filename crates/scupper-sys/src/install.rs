@@ -26,7 +26,7 @@ mod execute;
 mod firewall;
 mod observe;
 mod ufw;
-pub use execute::{ApplyError, apply, apply_with_fs};
+pub use execute::{ApplyError, Mutations, apply, apply_with_fs, apply_with_fs_tracked};
 use observe::observe;
 
 /// Flag inputs. No field holds key material.
@@ -123,17 +123,24 @@ fn command(system: &dyn System, program: Program, args: &[&str]) -> Result<Strin
     if program == Program::Systemctl && matches!(args.first(), Some(&"enable" | &"daemon-reload")) {
         arguments.push("--job-mode=replace".into());
     }
-    let out = system.run(program, &arguments, timeout).map_err(|error| {
-        let detail = if matches!(error, crate::system::ExecError::Timeout { .. }) {
-            "timed out"
-        } else {
-            "execution error"
-        };
-        Refusal::CommandFailed(format!(
-            "{program_path} {} failed ({detail})",
-            args.join(" ")
-        ))
-    })?;
+    let out = system
+        .run(
+            crate::system::HelperPurpose::Mutation,
+            program,
+            &arguments,
+            timeout,
+        )
+        .map_err(|error| {
+            let detail = if matches!(error, crate::system::ExecError::Timeout { .. }) {
+                "timed out"
+            } else {
+                "execution error"
+            };
+            Refusal::CommandFailed(format!(
+                "{program_path} {} failed ({detail})",
+                args.join(" ")
+            ))
+        })?;
     if out.status != Some(0) {
         return Err(Refusal::CommandFailed(format!(
             "{program_path} {} failed (exit {})",

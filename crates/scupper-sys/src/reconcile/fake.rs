@@ -24,7 +24,7 @@ pub struct Fault {
     pub step: StepKind,
     /// Remaining failures; None means always.
     pub remaining: Option<usize>,
-    /// `ForwardingOn` writes IPv4 before returning an error.
+    /// `ForwardingOn` writes IPv4; `LinkDown` takes effect before returning an error.
     pub partial: bool,
 }
 /// Shared fake state survives destruction and recreation of a reconciler.
@@ -32,6 +32,10 @@ pub struct Fault {
 pub struct FakeKernel {
     inner: Rc<RefCell<Inner>>,
 }
+type ObserveHook = Box<dyn FnOnce(&FakeKernel)>;
+type StepHook = Box<dyn FnOnce(&Step)>;
+type StepObserver = Rc<dyn Fn(&Step)>;
+type ActivityCheckpoint = Rc<dyn Fn(&WriterGuard) -> Result<(), StepError>>;
 struct Inner {
     model: KernelModel,
     desired: Desired,
@@ -41,6 +45,19 @@ struct Inner {
     crash_after: Option<usize>,
     boundaries: usize,
     remounts: usize,
+    session_recoveries: usize,
+    activity_checkpoint: Option<ActivityCheckpoint>,
+    next_observe: Option<ObserveHook>,
+    next_rest: Option<ObserveHook>,
+    every_step: Option<StepObserver>,
+    next_drain: Option<ObserveHook>,
+    drain_result: bool,
+    drain_calls: usize,
+    clock_origin: Instant,
+    clock_offset: Duration,
+    next_step: Option<StepHook>,
+    before_link_up: Option<ActivityCheckpoint>,
+    session_checkpoints: Vec<usize>,
     edge_elsewhere: bool,
     memory_latch: Option<Latch>,
     flushed: bool,
@@ -69,6 +86,19 @@ impl FakeKernel {
                 crash_after: None,
                 boundaries: 0,
                 remounts: 0,
+                session_recoveries: 0,
+                activity_checkpoint: None,
+                next_observe: None,
+                next_rest: None,
+                every_step: None,
+                next_drain: None,
+                drain_result: true,
+                drain_calls: 0,
+                clock_origin: Instant::now(),
+                clock_offset: Duration::ZERO,
+                next_step: None,
+                before_link_up: None,
+                session_checkpoints: vec![],
                 edge_elsewhere: false,
                 memory_latch: None,
                 flushed: false,
@@ -84,6 +114,39 @@ impl FakeKernel {
                 handshakes: std::collections::BTreeMap::new(),
             })),
         }
+    }
+    /// Interrupt one observation before its reads, without changing the kernel.
+    pub fn on_next_observe(&self, hook: impl FnOnce(&Self) + 'static) {
+        self.inner.borrow_mut().next_observe = Some(Box::new(hook));
+    }
+    /// Reveal full-observation-only drift before the next availability read.
+    pub fn on_next_rest(&self, hook: impl FnOnce(&Self) + 'static) {
+        self.inner.borrow_mut().next_rest = Some(Box::new(hook));
+    }
+    /// Observe all operation boundaries, including durable/event-only steps.
+    pub fn on_each_step(&self, hook: impl Fn(&Step) + 'static) {
+        self.inner.borrow_mut().every_step = Some(Rc::new(hook));
+    }
+    /// Advance only the injectable monotonic stop clock, without sleeping.
+    pub fn advance_stop_clock(&self, elapsed: Duration) {
+        self.inner.borrow_mut().clock_offset += elapsed;
+    }
+    /// Inject a read-helper drain result and an optional completion boundary.
+    pub fn drain_result(&self, result: bool) {
+        self.inner.borrow_mut().drain_result = result;
+    }
+    /// Run once when the read drain begins.
+    pub fn on_next_drain(&self, hook: impl FnOnce(&Self) + 'static) {
+        self.inner.borrow_mut().next_drain = Some(Box::new(hook));
+    }
+    /// Number of pre-re-read drains.
+    #[must_use]
+    pub fn drain_calls(&self) -> usize {
+        self.inner.borrow().drain_calls
+    }
+    /// Request shutdown after one complete operation, before bookkeeping.
+    pub fn on_next_step(&self, hook: impl FnOnce(&Step) + 'static) {
+        self.inner.borrow_mut().next_step = Some(Box::new(hook));
     }
     /// A complete current kernel snapshot, independent of process bookkeeping.
     #[must_use]
@@ -123,6 +186,30 @@ impl FakeKernel {
     #[must_use]
     pub fn remounts(&self) -> usize {
         self.inner.borrow().remounts
+    }
+    /// Successful dispatches of the verified client session recovery hook.
+    #[must_use]
+    pub fn session_recoveries(&self) -> usize {
+        self.inner.borrow().session_recoveries
+    }
+    /// Attach real durable activity tracking to the fake reconciliation kernel.
+    pub fn on_activity_checkpoint(
+        &self,
+        checkpoint: impl Fn(&WriterGuard) -> Result<(), StepError> + 'static,
+    ) {
+        self.inner.borrow_mut().activity_checkpoint = Some(Rc::new(checkpoint));
+    }
+    /// Attach the real session baseline hook to a simulated client `LinkUp`.
+    pub fn on_client_link_up(
+        &self,
+        checkpoint: impl Fn(&WriterGuard) -> Result<(), StepError> + 'static,
+    ) {
+        self.inner.borrow_mut().before_link_up = Some(Rc::new(checkpoint));
+    }
+    /// Number of executed steps at each pre-teardown session checkpoint.
+    #[must_use]
+    pub fn session_checkpoints(&self) -> Vec<usize> {
+        self.inner.borrow().session_checkpoints.clone()
     }
     /// Clear history without changing kernel state.
     pub fn clear_history(&self) {
@@ -261,6 +348,8 @@ impl FakeKernel {
             })
             .collect();
         Observation {
+            failures: vec![],
+            known_unsafe_tc: false,
             model,
             safety_complete: complete,
             safety_ms: if complete { 0 } else { 3_000 },
@@ -271,6 +360,64 @@ impl FakeKernel {
     }
 }
 impl Kernel for FakeKernel {
+    fn mutations_settled(&self) -> bool {
+        // Fake mutations finish synchronously. Real helpers in other tests must
+        // not change this kernel's stop verdict; drain_result injects failures.
+        true
+    }
+    fn checkpoint_client_activity(&self, guard: &WriterGuard) -> Result<(), StepError> {
+        let checkpoint = self.inner.borrow().activity_checkpoint.clone();
+        checkpoint.map_or(Ok(()), |checkpoint| checkpoint(guard))
+    }
+    fn before_client_link_up(&self, guard: &WriterGuard) -> Result<(), StepError> {
+        let checkpoint = self.inner.borrow().before_link_up.clone();
+        checkpoint.map_or(Ok(()), |checkpoint| checkpoint(guard))
+    }
+    fn before_client_link_down(&self, _guard: &WriterGuard) -> Result<(), StepError> {
+        let mut inner = self.inner.borrow_mut();
+        let before = inner.history.len();
+        inner.session_checkpoints.push(before);
+        Ok(())
+    }
+    fn recover_client_sessions(
+        &self,
+        _guard: &WriterGuard,
+        desired: &Desired,
+        model: &KernelModel,
+    ) -> Result<(), StepError> {
+        assert!(scupper_core::planner::client_output_verified(
+            model, desired
+        ));
+        self.inner.borrow_mut().session_recoveries += 1;
+        Ok(())
+    }
+
+    fn now(&self) -> Instant {
+        let inner = self.inner.borrow();
+        inner.clock_origin + inner.clock_offset
+    }
+    fn drain_helpers(&self, _deadline: Instant) -> bool {
+        self.inner.borrow_mut().drain_calls += 1;
+        let hook = self.inner.borrow_mut().next_drain.take();
+        if let Some(hook) = hook {
+            hook(self);
+        }
+        self.inner.borrow().drain_result
+    }
+    fn observe_until(&self, held: &NetnsHandle, deadline: Instant) -> Observation {
+        let flushed = self.inner.borrow().flushed;
+        let remaining = deadline.saturating_duration_since(self.now());
+        let latency = self.inner.borrow().safety_latency;
+        let mut observation = self.observe(held);
+        self.inner.borrow_mut().clock_offset += latency.min(remaining);
+        self.inner.borrow_mut().flushed = flushed;
+        if self.now() >= deadline {
+            observation.safety_complete = false;
+            observation.complete = false;
+            observation.model.links_complete = false;
+        }
+        observation
+    }
     fn within_deadline(&self, deadline: Instant) -> bool {
         Instant::now() < deadline && self.inner.borrow().elapsed < Duration::from_secs(20)
     }
@@ -278,6 +425,10 @@ impl Kernel for FakeKernel {
         self.inner.borrow_mut().elapsed = Duration::ZERO;
     }
     fn observe(&self, _held: &NetnsHandle) -> Observation {
+        let hook = self.inner.borrow_mut().next_observe.take();
+        if let Some(hook) = hook {
+            hook(self);
+        }
         let mut observation = self.snapshot();
         let mut inner = self.inner.borrow_mut();
         inner.flushed = false;
@@ -302,6 +453,10 @@ impl Kernel for FakeKernel {
         safety: Observation,
         deadline: Instant,
     ) -> Observation {
+        let hook = self.inner.borrow_mut().next_rest.take();
+        if let Some(hook) = hook {
+            hook(self);
+        }
         let mut observation = self.snapshot();
         // Availability collection cannot turn a failed phase-A fingerprint into
         // a successful safety observation without actually collecting it again.
@@ -321,7 +476,7 @@ impl Kernel for FakeKernel {
     #[allow(clippy::too_many_lines)] // Keep guards, injected failures and partial effects in order.
     fn execute(&self, step: &Step) -> Result<(), StepError> {
         let mut inner = self.inner.borrow_mut();
-        if let Step::ForwardingOn { requires } = step {
+        if let Step::ForwardingOn { requires } | Step::LinkUp { requires, .. } = step {
             if inner.memory_latch.is_some()
                 || inner.model.latch.is_some()
                 || !matches!(inner.model.ruleset, Known::Value(Ruleset::Verified(f) | Ruleset::Unverified(f)) if f == *requires)
@@ -357,6 +512,9 @@ impl Kernel for FakeKernel {
         let result = if let Some(partial) = fail {
             if partial && matches!(step, Step::ForwardingOn { .. }) {
                 inner.model.forwarding_v4 = Known::Value(1);
+            }
+            if partial && matches!(step, Step::LinkDown { .. }) {
+                inner.model = inner.model.apply(step);
             }
             Err(StepError("injected step failure"))
         } else {
@@ -439,7 +597,15 @@ impl Kernel for FakeKernel {
         let mut inner = self.inner.borrow_mut();
         inner.memory_latch = latch.cloned();
     }
-    fn step_boundary(&self, _step: &Step) {
+    fn step_boundary(&self, step: &Step) {
+        let every = self.inner.borrow().every_step.clone();
+        if let Some(hook) = every {
+            hook(step);
+        }
+        let hook = self.inner.borrow_mut().next_step.take();
+        if let Some(hook) = hook {
+            hook(step);
+        }
         let crash = {
             let mut inner = self.inner.borrow_mut();
             inner.boundaries += 1;
@@ -459,11 +625,14 @@ impl Kernel for FakeKernel {
 #[derive(Debug)]
 pub struct Crash;
 
+type LatchHook = Box<dyn FnOnce() -> io::Result<()>>;
 /// Shared durable state with injectable writes, used for memory-only latch tests.
 #[derive(Clone)]
 pub struct MemoryStore {
     state: Rc<RefCell<State>>,
     fail: Rc<RefCell<bool>>,
+    repair: Rc<RefCell<crate::state::RepairState>>,
+    latch_hook: Rc<RefCell<Option<LatchHook>>>,
 }
 impl MemoryStore {
     /// Create a durable reference snapshot.
@@ -472,11 +641,17 @@ impl MemoryStore {
         Self {
             state: Rc::new(RefCell::new(state)),
             fail: Rc::new(RefCell::new(false)),
+            repair: Rc::new(RefCell::new(crate::state::RepairState::default())),
+            latch_hook: Rc::new(RefCell::new(None)),
         }
     }
     /// Fail every write until reset, leaving the previous durable state intact.
     pub fn fail_writes(&self, fail: bool) {
         *self.fail.borrow_mut() = fail;
+    }
+    /// Intercept the next bounded latch write before any durable state changes.
+    pub fn on_latch_write(&self, hook: impl FnOnce() -> io::Result<()> + 'static) {
+        *self.latch_hook.borrow_mut() = Some(Box::new(hook));
     }
     /// Inspect the durable snapshot independently of the reconciler.
     #[must_use]
@@ -485,6 +660,36 @@ impl MemoryStore {
     }
 }
 impl StateStore for MemoryStore {
+    fn write_latch_until(
+        &self,
+        guard: &WriterGuard,
+        state: &State,
+        repair: &crate::state::RepairState,
+        _run_root: &std::path::Path,
+        _deadline: Instant,
+    ) -> io::Result<()> {
+        let hook = self.latch_hook.borrow_mut().take();
+        if let Some(hook) = hook {
+            hook()?;
+        }
+        self.write_repair_state(guard, repair)
+            .and_then(|()| self.write(guard, state))
+    }
+    fn repair_state(&self) -> Option<crate::state::RepairState> {
+        Some(self.repair.borrow().clone())
+    }
+    fn write_repair_state(
+        &self,
+        _guard: &WriterGuard,
+        repair: &crate::state::RepairState,
+    ) -> io::Result<()> {
+        *self.repair.borrow_mut() = repair.clone();
+        Ok(())
+    }
+    fn clear_repair_state(&self, _guard: &WriterGuard, _root: &std::path::Path) -> io::Result<()> {
+        *self.repair.borrow_mut() = crate::state::RepairState::default();
+        Ok(())
+    }
     fn applied_snapshot_until(&self, _deadline: Instant) -> Option<State> {
         Some(self.state())
     }

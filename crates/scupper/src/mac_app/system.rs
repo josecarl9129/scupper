@@ -19,6 +19,9 @@ const PGREP: &str = "/usr/bin/pgrep";
 const IFCONFIG: &str = "/sbin/ifconfig";
 
 pub(super) trait Processes {
+    fn applications_root(&self) -> &Path {
+        Path::new("/Applications")
+    }
     fn output(&self, program: &str, args: &[&str]) -> io::Result<Output>;
 }
 #[cfg(target_os = "macos")]
@@ -88,13 +91,12 @@ fn read_profile_address(path: &Path) -> Result<Ipv4Addr, String> {
 fn config_path(home: &Path) -> PathBuf {
     home.join(".config/qBittorrent/qBittorrent.ini")
 }
-fn installed(home: &Path, app: App) -> bool {
+fn installed(home: &Path, applications: &Path, app: App) -> bool {
     let bundle = match app {
         App::Transmission => "Transmission.app",
         App::Qbittorrent => "qBittorrent.app",
     };
-    Path::new("/Applications").join(bundle).is_dir()
-        || home.join("Applications").join(bundle).is_dir()
+    applications.join(bundle).is_dir() || home.join("Applications").join(bundle).is_dir()
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TransmissionBinding {
@@ -436,9 +438,9 @@ pub(super) fn execute(
             writeln!(out, "{} bound to {address}. Verify once: join the tunnel, start a torrent, then leave the tunnel on a network with IPv6. Transfers must stop before you rely on this binding.", app.name())
                 .map_err(|_| "could not write binding result")?;
         }
-        AppCommand::Unbind { app } => {
+        AppCommand::Unbind { app, force } => {
             require_quit(process, *app)?;
-            change(home, *app, None, process, out)?;
+            change_with_force(home, *app, None, *force, process, out)?;
             writeln!(
                 out,
                 "{} previous binding restored; it may use the home connection when the tunnel is down",
@@ -493,13 +495,22 @@ fn status(
                 continue;
             }
         };
-        warned |= status_binding(home, app, &binding, &expected, &assigned, out)?;
+        warned |= status_binding(
+            home,
+            process.applications_root(),
+            app,
+            &binding,
+            &expected,
+            &assigned,
+            out,
+        )?;
     }
     Ok(u8::from(warned))
 }
 
 fn status_binding(
     home: &Path,
+    applications: &Path,
     app: App,
     binding: &CurrentBinding,
     expected: &Result<Ipv4Addr, String>,
@@ -548,7 +559,7 @@ fn status_binding(
         out,
         "{}: {}; bind {}; profile {}; {}; interface {}; IPv6 {}{}",
         app.name(),
-        if installed(home, app) {
+        if installed(home, applications, app) {
             "installed"
         } else {
             "not installed"
@@ -579,7 +590,19 @@ fn change(
     process: &impl Processes,
     out: &mut dyn Write,
 ) -> Result<(), String> {
-    if !installed(home, app) {
+    change_with_force(home, app, address, false, process, out)
+}
+
+#[allow(clippy::too_many_lines)] // Keep each app's comparison, restore and state retention in one transaction.
+fn change_with_force(
+    home: &Path,
+    app: App,
+    address: Option<Ipv4Addr>,
+    force: bool,
+    process: &impl Processes,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    if !installed(home, process.applications_root(), app) {
         return Err(format!(
             "{} is not installed in /Applications or ~/Applications",
             app.name()
@@ -607,10 +630,32 @@ fn change(
                     .clone()
                     .ok_or("no scupper binding to restore; nothing changed")?
             };
+            let written = path.with_extension("written");
+            if address.is_some() {
+                save_binding(&written, &desired)?;
+            } else if !force {
+                let current = TransmissionBinding::read(process)?;
+                let expected = saved_binding(&written)?;
+                let matches = expected.as_ref().map_or_else(
+                    || {
+                        current.ipv4.is_some_and(|ip| {
+                            client_profile::tunnel_address(&ip.to_string()).is_ok()
+                        }) && current.ipv6 == Some(Ipv6Addr::LOCALHOST)
+                    },
+                    |expected| expected == &current,
+                );
+                if !matches {
+                    return Err(format!(
+                        "Transmission values changed since bind: current {current:?}, scupper wrote {:?}; saved state retained; nothing changed; use --force to restore anyway",
+                        saved_binding(&written)?
+                    ));
+                }
+            }
             desired.write_verified(process, address.is_some())?;
             if address.is_none() && saved.is_some() {
                 fs::remove_file(path)
                     .map_err(|_| "preferences restored but could not remove state file")?;
+                remove_written(&written)?;
             }
         }
         App::Qbittorrent => {
@@ -625,6 +670,7 @@ fn change(
             let state = qbit_state_path(home);
             let saved = saved_qbit_binding(&state)?;
             let already_bound = ini::scupper_binding(&original);
+            let written = state.with_extension("written");
             let edited = if let Some(ip) = address {
                 if saved.is_none() {
                     if already_bound {
@@ -632,11 +678,26 @@ fn change(
                     }
                     save_qbit_binding(&state, &ini::values(&original))?;
                 }
-                ini::edit(&original, Some(ip))
+                let edited = ini::edit(&original, Some(ip));
+                save_qbit_binding(&written, &ini::values(&edited))?;
+                edited
             } else {
                 let values = saved
                     .as_ref()
                     .ok_or("no scupper binding to restore; nothing changed")?;
+                let expected = saved_qbit_binding(&written)?;
+                let matches = expected.as_ref().map_or_else(
+                    || ini::scupper_binding(&original),
+                    |expected| expected == &ini::values(&original),
+                );
+                if !force && !matches {
+                    return Err(format!(
+                        "qBittorrent values changed since bind: current {:?}, scupper wrote {:?}; saved state retained; nothing changed; use --force to restore anyway",
+                        ini::values(&original).map(|v| String::from_utf8_lossy(&v).into_owned()),
+                        saved_qbit_binding(&written)?
+                            .map(|v| v.map(|v| String::from_utf8_lossy(&v).into_owned()))
+                    ));
+                }
                 ini::edit_values(&original, &[&values[0], &values[1], &values[2]])
             };
             require_quit(process, app)?;
@@ -658,10 +719,18 @@ fn change(
             if address.is_none() {
                 fs::remove_file(&state)
                     .map_err(|_| "preferences restored but could not remove state file")?;
+                remove_written(&written)?;
             }
         }
     }
     Ok(())
+}
+fn remove_written(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err("preferences restored but could not remove written-values record".into()),
+    }
 }
 fn replace_config(path: &Path, original: &[u8], edited: &[u8], backup: bool) -> io::Result<()> {
     if backup {
@@ -730,6 +799,12 @@ mod tests {
     }
     struct Fake(RefCell<VecDeque<Call>>);
     impl Processes for Fake {
+        fn applications_root(&self) -> &Path {
+            Path::new(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/target/test-applications"
+            ))
+        }
         fn output(&self, program: &str, args: &[&str]) -> io::Result<Output> {
             let call = self.0.borrow_mut().pop_front().unwrap();
             assert_eq!(program, call.program);
@@ -799,7 +874,7 @@ mod tests {
         ] {
             for command in [
                 AppCommand::Bind { app, address: None },
-                AppCommand::Unbind { app },
+                AppCommand::Unbind { app, force: false },
             ] {
                 let p = fake(vec![call(PGREP, &["-x", name], 0, b"123\n")]);
                 let error = execute(
@@ -910,16 +985,20 @@ mod tests {
                 0o600
             );
         }
+        // The previous release saved only the original values, without a .written record.
+        fs::remove_file(state_path(&home.0).with_extension("written")).unwrap();
         let mut calls = vec![
             call(PGREP, &["-x", "Transmission"], 1, b""),
             call(PGREP, &["-x", "Transmission"], 1, b""),
         ];
+        calls.extend(read_calls(b"10.99.0.3\n", b"::1\n"));
         calls.extend(write_calls("192.168.1.3", "fd00::5"));
         calls.extend(read_calls(b"192.168.1.3\n", b"fd00::5\n"));
         let p = fake(calls);
         execute(
             &args(AppCommand::Unbind {
                 app: App::Transmission,
+                force: false,
             }),
             &home.0,
             &p,
@@ -958,10 +1037,11 @@ mod tests {
             calls.push(call(DEFAULTS, &["delete", DOMAIN, key], 0, b""));
         }
         calls.extend([missing(KEY), missing(KEY6)]);
-        change(
+        change_with_force(
             &home.0,
             App::Transmission,
             None,
+            true,
             &fake(calls),
             &mut Vec::new(),
         )
@@ -1065,6 +1145,9 @@ mod tests {
             Some("10.99.0.2".parse().unwrap()),
             None,
         ] {
+            if address.is_none() {
+                fs::remove_file(qbit_state_path(&home.0).with_extension("written")).unwrap();
+            }
             let p = fake(vec![call(PGREP, &["-x", "qbittorrent"], 1, b"")]);
             change(&home.0, App::Qbittorrent, address, &p, &mut Vec::new()).unwrap();
             let after_bytes = fs::read(&path).unwrap();
@@ -1440,7 +1523,8 @@ mod tests {
             fake: fake(calls),
             path,
         };
-        let error = change(&home.0, App::Transmission, None, &p, &mut Vec::new()).unwrap_err();
+        let error = change_with_force(&home.0, App::Transmission, None, true, &p, &mut Vec::new())
+            .unwrap_err();
         assert!(error.contains("preferences restored but could not remove state file"));
         assert!(p.fake.0.borrow().is_empty());
     }
@@ -1491,5 +1575,92 @@ mod tests {
         change(&home.0, App::Qbittorrent, None, &p, &mut Vec::new()).unwrap();
         assert_eq!(fs::read(path).unwrap(), original);
         assert!(!state.exists());
+    }
+    #[test]
+    fn transmission_unbind_conflict_keeps_all_values_and_force_restores() {
+        let home = Fixture::new();
+        let path = state_path(&home.0);
+        let original = TransmissionBinding {
+            ipv4: Some(Ipv4Addr::UNSPECIFIED),
+            ipv6: None,
+        };
+        save_binding(&path, &original).unwrap();
+        save_binding(
+            &path.with_extension("written"),
+            &TransmissionBinding {
+                ipv4: Some("10.99.0.2".parse().unwrap()),
+                ipv6: Some(Ipv6Addr::LOCALHOST),
+            },
+        )
+        .unwrap();
+        for (v4, v6) in [
+            (b"10.99.0.3\n".as_slice(), b"::1\n".as_slice()),
+            (b"10.99.0.2\n", b"::\n"),
+        ] {
+            let before = fs::read(&path).unwrap();
+            let mut calls = vec![call(PGREP, &["-x", "Transmission"], 1, b"")];
+            calls.extend(read_calls(v4, v6));
+            let p = fake(calls);
+            let error =
+                change_with_force(&home.0, App::Transmission, None, false, &p, &mut Vec::new())
+                    .unwrap_err();
+            assert!(error.contains("changed since bind") && error.contains("--force"));
+            assert_eq!(fs::read(&path).unwrap(), before);
+            assert!(p.0.borrow().is_empty());
+        }
+        let mut calls = vec![
+            call(PGREP, &["-x", "Transmission"], 1, b""),
+            call(
+                DEFAULTS,
+                &["write", DOMAIN, KEY, "-string", "0.0.0.0"],
+                0,
+                b"",
+            ),
+            missing(KEY6),
+        ];
+        calls.push(call(DEFAULTS, &["read", DOMAIN, KEY], 0, b"0.0.0.0\n"));
+        calls.push(missing(KEY6));
+        let p = fake(calls);
+        change_with_force(&home.0, App::Transmission, None, true, &p, &mut Vec::new()).unwrap();
+        assert!(!path.exists());
+        assert!(p.0.borrow().is_empty());
+    }
+
+    #[test]
+    fn qbit_unbind_conflict_changes_nothing_and_force_restores() {
+        let home = Fixture::new();
+        let path = config_path(&home.0);
+        let original = b"[BitTorrent]\nSession\\Interface=utun7\nSession\\InterfaceAddress=\nSession\\InterfaceName=utun7\n";
+        fs::write(&path, original).unwrap();
+        change(
+            &home.0,
+            App::Qbittorrent,
+            Some("10.99.0.2".parse().unwrap()),
+            &fake(vec![call(PGREP, &["-x", "qbittorrent"], 1, b"")]),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let modified = ini::edit(
+            &fs::read(&path).unwrap(),
+            Some("10.99.0.3".parse().unwrap()),
+        );
+        fs::write(&path, &modified).unwrap();
+        let saved = fs::read(qbit_state_path(&home.0)).unwrap();
+        let p = fake(vec![]);
+        let error = change(&home.0, App::Qbittorrent, None, &p, &mut Vec::new()).unwrap_err();
+        assert!(error.contains("changed since bind") && error.contains("--force"));
+        assert_eq!(fs::read(&path).unwrap(), modified);
+        assert_eq!(fs::read(qbit_state_path(&home.0)).unwrap(), saved);
+        change_with_force(
+            &home.0,
+            App::Qbittorrent,
+            None,
+            true,
+            &fake(vec![call(PGREP, &["-x", "qbittorrent"], 1, b"")]),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(!qbit_state_path(&home.0).exists());
     }
 }

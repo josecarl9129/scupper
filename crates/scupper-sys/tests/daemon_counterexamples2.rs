@@ -144,7 +144,13 @@ impl System for CacheSystem {
             delay: self.delay,
         }))
     }
-    fn run(&self, program: Program, _: &[String], _: Duration) -> Result<ExecOutput, ExecError> {
+    fn run(
+        &self,
+        _purpose: scupper_sys::system::HelperPurpose,
+        program: Program,
+        _: &[String],
+        _: Duration,
+    ) -> Result<ExecOutput, ExecError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         if program == Program::Unshare {
             std::thread::sleep(self.delay);
@@ -161,6 +167,7 @@ impl System for CacheSystem {
     }
     fn run_in(
         &self,
+        _purpose: scupper_sys::system::HelperPurpose,
         _: ExecTarget<'_>,
         _: Program,
         _: &[String],

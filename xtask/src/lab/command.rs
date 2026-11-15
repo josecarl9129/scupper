@@ -46,6 +46,32 @@ impl Invocation {
             args: words,
         }
     }
+    fn nft_preflight(&self) -> Option<Self> {
+        if self.program != "nft" && !self.args.iter().any(|word| word == "nft") {
+            return None;
+        }
+        if self
+            .args
+            .iter()
+            .any(|word| word == "-c" || word == "--check")
+        {
+            return None;
+        }
+        let arguments = if self.program == "nft" {
+            0
+        } else {
+            self.args.iter().position(|word| word == "nft")? + 1
+        };
+        let at = self.args[arguments..].iter().position(|word| {
+            matches!(
+                word.as_str(),
+                "-f" | "--file" | "add" | "create" | "insert" | "replace"
+            )
+        })? + arguments;
+        let mut check = self.clone();
+        check.args.insert(at, "-c".into());
+        Some(check)
+    }
     // GNU timeout also bounds descendants if the supervising process disappears.
     pub fn timed(&self, seconds: u64, kill_after: u64) -> Vec<String> {
         let mut args = vec![
@@ -171,6 +197,15 @@ impl Runner {
         input: Option<&[u8]>,
         seconds: u64,
     ) -> Result<(ExitStatus, String)> {
+        // No current lab row expects an nft mutation to fail. Such a future
+        // negative case needs an explicit preflight bypass: syntax errors here
+        // are hard failures, validated by nft only in the privileged lab.
+        if let Some(check) = invocation.nft_preflight() {
+            let (status, _) = self.output_timeout(&check, input, seconds)?;
+            if !status.success() {
+                return fail(format!("nft syntax preflight failed: {}", self.last_stderr));
+            }
+        }
         let mut cmd = self.command(invocation, seconds, 2)?;
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         cmd.stdin(if input.is_some() {
@@ -540,6 +575,42 @@ impl Drop for Group {
 #[cfg(test)]
 mod output_tests {
     use super::*;
+    #[test]
+    fn nft_preflight_covers_inline_files_and_every_namespace_wrapper() {
+        for namespace in ["", "client", "scupper", "gwhost"] {
+            for file in ["-", "/rules with spaces.nft"] {
+                let invocation = Invocation::new(namespace, "nft", &["-f", file]);
+                let check = invocation.nft_preflight().unwrap();
+                let at = check.args.iter().position(|word| word == "-f").unwrap();
+                assert_eq!(check.args[at - 1], "-c");
+                assert_eq!(check.args[at + 1], file);
+                assert!(check.nft_preflight().is_none());
+            }
+        }
+        for namespace in ["", "client", "scupper", "gwhost"] {
+            let invocation = Invocation::new(
+                namespace,
+                "nft",
+                &[
+                    "add",
+                    "chain",
+                    "inet",
+                    "test",
+                    "output",
+                    "{ type filter hook output priority 0; policy accept; }",
+                ],
+            );
+            let check = invocation.nft_preflight().unwrap();
+            let at = check.args.iter().position(|word| word == "add").unwrap();
+            assert_eq!(check.args[at - 1], "-c");
+            assert!(check.nft_preflight().is_none());
+        }
+        assert!(
+            Invocation::new("scupper", "ip", &["link", "show"])
+                .nft_preflight()
+                .is_none()
+        );
+    }
     #[test]
     fn output_is_capped_and_excess_is_drained() {
         let bytes = vec![b'x'; OUTPUT_LIMIT + 17];

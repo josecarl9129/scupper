@@ -644,7 +644,15 @@ impl Lab {
     }
     fn judge(&self, case: Case, markers: &[String]) -> Result<String> {
         let stem = case.name();
-        let uplink = evidence::report(&self.artifacts, stem, markers, false, self.exit_port)?;
+        let policy_markers: Vec<_> = markers.iter().chain(&self.fault_markers).cloned().collect();
+        let uplink = evidence::report(
+            &self.artifacts,
+            stem,
+            &policy_markers,
+            false,
+            self.exit_port,
+            self.client_ports_ready,
+        )?;
         if case == Case::Uplink {
             let marker = markers.get(4).ok_or("injection marker missing")?;
             evidence::injected_only(
@@ -677,6 +685,7 @@ impl Lab {
                 markers,
                 true,
                 self.exit_port,
+                self.client_ports_ready,
             )?;
             if case == Case::Bridge && !evidence::contained(&report) {
                 return fail("bridge containment oracle failed");

@@ -1,3 +1,4 @@
+//! Sender deadlines provide best-effort bounded staleness, not a network delivery guarantee.
 //! Pure external heartbeat eligibility; all times come from the caller.
 use crate::{
     config::{HeartbeatReport, HeartbeatSettings},
@@ -39,11 +40,11 @@ pub enum SkipReason {
 /// Work authorized by a complete iteration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
-    /// Append the suffix to the secret URL and deliver before the deadline.
+    /// Append the suffix and attempt sending before the sender deadline; arrival is not guaranteed.
     Send {
         /// Empty for healthy-only; `/0` through `/4` for status reporting.
         url_suffix: String,
-        /// Absolute monotonic deadline derived from the verdict.
+        /// Absolute monotonic sender deadline; best-effort staleness bound, not network delivery.
         deadline: MonoTime,
     },
     /// Do not spawn a delivery child.

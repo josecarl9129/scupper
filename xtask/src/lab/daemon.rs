@@ -25,13 +25,32 @@ mod alerts;
 mod control_cases;
 mod heartbeat;
 mod m2_cases;
+mod stop_observation;
 mod watchdog;
+
+// Use the base case stem for both the trial and its injected control capture.
+pub(super) fn capture_policy(
+    stem: &str,
+    markers: &[String],
+    port: u16,
+    client2: bool,
+) -> Result<String> {
+    let stem = stem.strip_suffix("-control").unwrap_or(stem);
+    let mut text = evidence::policy_for_case(markers, false, port, client2)?;
+    if stem.contains("heartbeat") || stem == "control-L10" || stem == "alerts" {
+        text = format!("heartbeat = \"{}:443\"\n{text}", heartbeat::ENDPOINT);
+    }
+    if stem == "alerts" {
+        text = format!("heartbeat_dscp = 56\n{text}");
+    }
+    Ok(text)
+}
 
 pub(super) fn short_boot_root(case: &str) -> std::path::PathBuf {
     Path::new("/run/scupper-lab").join(format!("{}-{case}", std::process::id()))
 }
 
-pub(super) const CASES: [&str; 32] = [
+pub(super) const CASES: [&str; 34] = [
     "L1",
     "L2",
     "L5",
@@ -40,6 +59,7 @@ pub(super) const CASES: [&str; 32] = [
     "L9b",
     "L11",
     "L12",
+    "L54",
     "L15",
     "L18",
     "L20",
@@ -59,6 +79,7 @@ pub(super) const CASES: [&str; 32] = [
     "L53b",
     "heartbeat",
     "alerts",
+    "stop-observation",
     "L14",
     "L43",
     "L44",
@@ -285,6 +306,9 @@ impl DaemonGuard<'_> {
     fn run(&mut self, case: &str) -> Result<String> {
         if case == "alerts" {
             return self.run_alerts();
+        }
+        if case == "stop-observation" {
+            return self.run_stop_observation();
         }
         if matches!(case, "L53" | "L53b" | "heartbeat") {
             return self.run_heartbeat(case);
@@ -718,7 +742,14 @@ impl Lab {
             baseline_version: None,
             deliberately_killed: false,
         };
-        let result = guard.run(case);
+        let result = guard.run(case).and_then(|detail| {
+            guard.lab.assert_client_link()?;
+            Ok(detail)
+        });
+        if result.is_err() {
+            let root = guard.lab.boot_root.clone();
+            guard.lab.save_session_failure(&root, case);
+        }
         let cleanup = guard.finish();
         match (result, cleanup) {
             (Ok(observed), Ok(())) => Ok(observed),
@@ -746,6 +777,46 @@ impl Lab {
         let result = child.wait_timeout(Duration::from_secs(30));
         super::mutation::finish(result, notify.finish())
     }
+    // Every successful check gets independent link/address evidence. Return the
+    // identity so L43 can also prove containment never recreates client ingress.
+    pub(super) fn assert_client_link(&mut self) -> Result<u64> {
+        let address = self
+            .site
+            .gateways()
+            .values()
+            .next()
+            .ok_or("missing gateway")?
+            .client_tunnel()
+            .address4();
+        let expected_addr = address.addr().to_string();
+        let links: serde_json::Value = serde_json::from_str(&self.cmd(
+            "scupper",
+            "ip",
+            &["-j", "address", "show", "dev", "wg0"],
+        )?)?;
+        let link = &links[0];
+        if link["ifname"] != "wg0"
+            || !link["flags"]
+                .as_array()
+                .is_some_and(|flags| flags.iter().any(|f| f == "UP"))
+            || !link["addr_info"].as_array().is_some_and(|addrs| {
+                addrs
+                    .iter()
+                    .any(|a| a["local"] == expected_addr && a["prefixlen"] == address.prefix_len())
+            })
+        {
+            return fail(format!(
+                "client link down, missing or missing configured address: {links}"
+            ));
+        }
+        fs::write(
+            self.artifacts.join("client-link-final.json"),
+            serde_json::to_vec_pretty(&links)?,
+        )?;
+        link["ifindex"]
+            .as_u64()
+            .ok_or_else(|| "missing client ifindex".into())
+    }
     pub(super) fn daemon_boot_recover(&mut self, stem: &str) -> Result<String> {
         let root = self.boot_root.clone();
         self.reset_boot_budget(stem)?;
@@ -767,7 +838,7 @@ impl Lab {
             serde_json::to_vec_pretty(&boot)?,
         )?;
         super::boot::verify_modules(&boot)?;
-        let (code, report) = self.check_result(&Self::boot_binary()?, &root)?;
+        let (code, report) = self.wait_session_recovery(&Self::boot_binary()?, &root)?;
         fs::write(
             self.artifacts.join(format!("{stem}-supervised-check.json")),
             serde_json::to_vec_pretty(&report)?,
@@ -953,7 +1024,7 @@ impl Lab {
             .daemon_ready_tick(&notify)
             .and_then(|()| trial(self, &root, &notify))
             .and_then(|value| {
-                let (code, report) = self.check_result(&Self::boot_binary()?, &root)?;
+                let (code, report) = self.wait_session_recovery(&Self::boot_binary()?, &root)?;
                 fs::write(
                     self.artifacts.join("L19-L3-repaired-check.json"),
                     serde_json::to_vec_pretty(&report)?,
@@ -1025,6 +1096,7 @@ impl Lab {
         )))
     }
     fn daemon_spawn(&mut self, case: &str, root: &Path, stage: &str) -> Result<Group> {
+        self.sampler.take();
         // Unlike root-started probes, heartbeat exec happens after uid/gid drop.
         // Neither executable may require traversal through a runner's home.
         let daemon = if matches!(case, "L10" | "L53" | "L53b" | "heartbeat" | "alerts") {
@@ -1203,6 +1275,18 @@ impl Lab {
         address: &str,
         seconds: u64,
     ) -> Result<Group> {
+        if !super::helpers::valid_marker(marker) {
+            return fail(format!("invalid daemon flow marker: {marker}"));
+        }
+        if matches!(ns, "client" | "client2") {
+            self.peer_markers.insert(marker.into(), ns.into());
+        }
+        let log = self.artifacts.join(format!("{stem}-{mode}.jsonl"));
+        if matches!(ns, "client" | "client2")
+            && !self.peer_flow_logs.iter().any(|(_, path)| path == &log)
+        {
+            self.peer_flow_logs.push((ns.to_owned(), log));
+        }
         self.runner.background(
             &Invocation::new(
                 ns,
@@ -1384,18 +1468,19 @@ impl Lab {
                 }
                 self.cmd("scupper", "ip", &["link", "set", "ex-ch1", "up"])?;
                 let up = self.daemon_route_healthy(Duration::from_secs(70))?;
-                let (code, report) = self.check_result(&Self::boot_binary()?, root)?;
+                let (code, report) = self.wait_session_recovery(&Self::boot_binary()?, root)?;
                 if code != 0 || report["verdict"].get("Protected").is_none() {
                     return fail(format!("L16 expected recovered check 0: {code}: {report}"));
                 }
+                let session_ms = &report["session_time_to_0_ms"];
                 format!(
-                    "down_ms={down}; check_down=4; recovery_ms={up}; check_up=0; active_route_restored=true"
+                    "down_ms={down}; check_down=4; recovery_ms={up}; check_up=0; session_time_to_0_ms={session_ms}; active_route_restored=true"
                 )
             }
             "L17-V14" => {
                 let marker = Self::marker()?;
                 markers.push(marker.clone());
-                let mut stream = self.daemon_flow("udp", "client", &marker, &stem, 90)?;
+                let mut stream = self.daemon_flow("udp", "client", &marker, &stem, 300)?;
                 let stream_log = self.artifacts.join(format!("{stem}-udp.jsonl"));
                 self.daemon_wait("L17 live canary control", Duration::from_secs(3), |_| {
                     Ok(flow_counts(&stream_log)?.1 > 0)
@@ -1429,7 +1514,7 @@ impl Lab {
                 )?;
                 super::mounts::verify_restored_peers(child.supervised_pid()?)?;
                 // Reopen and audit the restored name without any intervening delete.
-                let (code, report) = self.check_result(&Self::boot_binary()?, root)?;
+                let (code, report) = self.wait_session_recovery(&Self::boot_binary()?, root)?;
                 super::mounts::save(
                     &self.artifacts,
                     "daemon-L17-V14-after-check",
@@ -1453,8 +1538,9 @@ impl Lab {
                 if sent.saturating_sub(replies) > 2 {
                     return fail(format!("L17 canary loss: sent={sent}, replies={replies}"));
                 }
+                let session_ms = &report["session_time_to_0_ms"];
                 format!(
-                    "remount_ms={remount}; mounts={mounts}; same_inode=true; shared_peers=true; netns_exec=true; fresh_check=0; second_namespace=false; stream_sent={sent}; stream_replies={replies}"
+                    "remount_ms={remount}; mounts={mounts}; same_inode=true; shared_peers=true; netns_exec=true; fresh_check=0; session_time_to_0_ms={session_ms}; second_namespace=false; stream_sent={sent}; stream_replies={replies}"
                 )
             }
             "L52" | "L52b" => {
@@ -1557,13 +1643,7 @@ impl Lab {
         old_port: u16,
         new_port: u16,
     ) -> Result<()> {
-        let mut text = evidence::policy_for_case(markers, false, old_port, stem == "daemon-L11")?;
-        if stem.contains("heartbeat") || stem == "control-L10" || stem == "alerts" {
-            text = format!("heartbeat = \"{}:443\"\n{text}", heartbeat::ENDPOINT);
-        }
-        if stem == "alerts" {
-            text = format!("heartbeat_dscp = 56\n{text}");
-        }
+        let mut text = capture_policy(stem, markers, old_port, self.client_ports_ready)?;
         let combined: Vec<_> = markers.iter().chain(&self.fault_markers).collect();
         text = text
             .lines()
@@ -1609,7 +1689,8 @@ impl Lab {
         self.service_check(&mut markers)?;
         self.uplink_fault(&mut markers)?;
         self.stop_captures()?;
-        let report = evidence::report(&self.artifacts, &stem, &markers, false, self.exit_port)?;
+        let policy = capture_policy(&stem, &markers, self.exit_port, self.client_ports_ready)?;
+        let report = evidence::report_with_policy(&self.artifacts, &stem, &policy)?;
         evidence::injected_only(
             &report,
             &fs::read(self.artifacts.join(format!("{stem}.pcap")))?,
@@ -2156,6 +2237,10 @@ pub(super) fn daemon_wanted(case: &str) -> &'static str {
         }
         "L11" => "second client isolation; gateway/provider scans denied; allowed client echo",
         "L12" => "WireGuard source rejection; widened peer check 2; traced antispoof drop",
+        "L54" => "single Unknown tick resets active client; no false OK; first TCP within 5 s",
+        "stop-observation" => {
+            "TERM during phase A: one bounded re-read, no repair/quarantine, forwarding 1 and wg0 UP"
+        }
         "L15" => "real fake HTTPS exit-IP target: 0, uplink address 2, restored 0",
         "L18" => "host sysctl inheritance overridden; forwarding toggle reapplies hardening",
         "L20" => "supervised IPv4 PMTU; IPv6 renderer chain property, unsupervised",

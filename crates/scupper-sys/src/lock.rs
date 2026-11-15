@@ -18,17 +18,30 @@ pub struct WriterLock;
 /// twice: independent file descriptions can deadlock even within one process.
 #[derive(Debug)]
 pub struct WriterGuard {
-    file: File,
+    file: std::sync::Arc<LockedFile>,
     // A capability may move between threads but cannot authorize concurrent writes.
     _not_sync: std::marker::PhantomData<std::cell::Cell<()>>,
 }
 
-impl Drop for WriterGuard {
+#[derive(Debug)]
+struct LockedFile(File);
+impl WriterGuard {
+    // A bounded storage worker retains the same lock after a caller timeout.
+    // Only storage may use this capability; the caller then does kernel-only
+    // containment and cannot hand a new writer the lock over a late write.
+    pub(crate) fn retain_for_storage(&self) -> Self {
+        Self {
+            file: self.file.clone(),
+            _not_sync: std::marker::PhantomData,
+        }
+    }
+}
+impl Drop for LockedFile {
     fn drop(&mut self) {
         // A concurrent fork can briefly inherit this open file description
         // before exec closes CLOEXEC descriptors. Explicit unlock ends ownership
         // at the guard boundary instead of waiting for that unrelated exec.
-        let _ = flock(&self.file, FlockOperation::Unlock);
+        let _ = flock(&self.0, FlockOperation::Unlock);
     }
 }
 
@@ -110,7 +123,7 @@ impl WriterLock {
         file.set_len(0)?;
         writeln!(file, "{}", std::process::id())?;
         Ok(WriterGuard {
-            file,
+            file: std::sync::Arc::new(LockedFile(file)),
             _not_sync: std::marker::PhantomData,
         })
     }
@@ -165,4 +178,32 @@ impl SupervisorLease {
         )
         .map(|guard| Self { _guard: guard })
     }
+}
+
+#[cfg(test)]
+#[test]
+#[allow(clippy::unwrap_used)]
+fn bounded_storage_timeout_retains_writer_until_late_completion() {
+    let root = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/tmp"))
+        .join(format!("late-latch-writer-{}", std::process::id()));
+    let guard = WriterLock::acquire(&root).unwrap();
+    let retained = guard.retain_for_storage();
+    let (release, wait) = std::sync::mpsc::channel();
+    let (done, completed) = std::sync::mpsc::channel();
+    let result = crate::system::storage_until(Instant::now(), move || {
+        let _ = wait.recv();
+        drop(retained);
+        let _ = done.send(());
+        Ok(())
+    });
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    drop(guard);
+    assert_eq!(
+        WriterLock::try_acquire(&root).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    release.send(()).unwrap();
+    completed.recv_timeout(Duration::from_secs(1)).unwrap();
+    drop(WriterLock::try_acquire(&root).unwrap());
+    std::fs::remove_dir_all(root).unwrap();
 }

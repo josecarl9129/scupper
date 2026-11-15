@@ -378,7 +378,12 @@ impl ProbeExec for RealSystem {
     ) -> Result<ExecOutput, ExecError> {
         let mut command = std::process::Command::new("/proc/self/exe");
         command.args(["probe", json]);
-        crate::system::execute_file_command(command, namespace, timeout)
+        crate::system::execute_file_command(
+            crate::system::HelperPurpose::Probe,
+            command,
+            namespace,
+            timeout,
+        )
     }
 }
 
@@ -774,6 +779,7 @@ mod tests {
             r#"{"kind":"Path"}"#,
         ]);
         let output = crate::system::execute_file_command(
+            crate::system::HelperPurpose::Probe,
             command,
             File::open(&file_path)?,
             Duration::from_secs(2),
@@ -787,6 +793,7 @@ mod tests {
         let started = Instant::now();
         assert!(matches!(
             crate::system::execute_file_command(
+                crate::system::HelperPurpose::Probe,
                 command,
                 File::open(&file_path)?,
                 Duration::from_millis(30)

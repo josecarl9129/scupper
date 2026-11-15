@@ -140,6 +140,31 @@ impl Fs for RealFs {
     }
 }
 
+// Session writers have a different lock from the general store. Reap only
+// demonstrably dead processes' temporary files, never another live writer's.
+pub(crate) fn cleanup_orphaned_temps(directory: &Path) -> io::Result<()> {
+    let uid = rustix::process::geteuid().as_raw();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str().filter(|name| is_temp_name(name)) else {
+            continue;
+        };
+        let pid = name
+            .strip_prefix(".scupper-")
+            .and_then(|name| name.split_once('-'))
+            .and_then(|(pid, _)| pid.parse().ok())
+            .and_then(rustix::process::Pid::from_raw);
+        if let Some(pid) = pid
+            && rustix::process::test_kill_process(pid) == Err(rustix::io::Errno::SRCH)
+            && owned_regular_file(&fs::symlink_metadata(entry.path())?, uid)
+        {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
 fn create_temp_file(path: &Path) -> io::Result<File> {
     OpenOptions::new()
         .write(true)

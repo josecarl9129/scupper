@@ -26,6 +26,55 @@ pub struct Quarantine {
     pub object: String,
     /// Unix seconds when the latch was set.
     pub since_unix: u64,
+    /// Failed persistence or unreadable latch evidence; connect may clear this.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub uncertain: bool,
+}
+
+/// Write-ahead repair history, independent of the main state replacement.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RepairState {
+    /// Unix seconds per attempt; legacy count-only checkpoints carry no live history.
+    #[serde(default)]
+    pub attempts_unix: std::collections::BTreeMap<String, Vec<u64>>,
+    /// A restore is in flight; this never constitutes a quarantine latch.
+    pub armed: bool,
+    /// A quarantine whose main state replacement may have failed.
+    pub quarantine: Option<Quarantine>,
+}
+impl RepairState {
+    /// Only a recorded latch survives startup; counts and in-flight restores do not latch.
+    #[must_use]
+    pub fn startup_latch(&self) -> Option<Quarantine> {
+        self.latch()
+    }
+    /// A checkpointed latch may precede a failed main-state replacement.
+    #[must_use]
+    pub fn latch(&self) -> Option<Quarantine> {
+        self.quarantine.clone().map(|mut q| {
+            q.uncertain = true;
+            q
+        })
+    }
+}
+
+/// Missing legacy checkpoints carry no latch evidence; unreadable ones fail closed.
+#[derive(Debug, Clone)]
+pub enum RepairStateRead {
+    /// No repair record exists.
+    Missing,
+    /// A readable checkpoint.
+    Present(RepairState),
+    /// I/O or decoding failed.
+    Unreadable,
+}
+fn uncertain_quarantine() -> Quarantine {
+    Quarantine {
+        reason: "latch persistence or clearance uncertain; run scupper connect".into(),
+        object: "repair-history".into(),
+        since_unix: 0,
+        uncertain: true,
+    }
 }
 
 /// On-disk state schema. Missing optional fields are refused, as are unknown fields.
@@ -34,14 +83,39 @@ pub struct Quarantine {
 pub struct State {
     /// The supported state schema, currently 1.
     pub schema: u32,
-    /// Last successfully applied immutable configuration version.
+    /// Convergence target published under closed gates before target boot.
     #[serde(deserialize_with = "required_option")]
     pub applied_version: Option<u64>,
     /// Durable operator selection, including deliberate disconnection.
     pub selection: Selection,
     /// Persistent quarantine latch, cleared only by explicit administrative action.
-    #[serde(deserialize_with = "required_option")]
+    #[serde(
+        deserialize_with = "required_option",
+        serialize_with = "legacy_quarantine"
+    )]
     pub quarantine: Option<Quarantine>,
+}
+// Keep state.json readable by the previous release, whose latch rejects unknown
+// fields. Typed uncertainty lives only in repair-state.json.
+#[allow(clippy::ref_option)] // Serde serialize_with borrows the complete field.
+fn legacy_quarantine<S: serde::Serializer>(
+    quarantine: &Option<Quarantine>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    #[derive(Serialize)]
+    struct LegacyQuarantine<'a> {
+        reason: &'a str,
+        object: &'a str,
+        since_unix: u64,
+    }
+    quarantine
+        .as_ref()
+        .map(|q| LegacyQuarantine {
+            reason: &q.reason,
+            object: &q.object,
+            since_unix: q.since_unix,
+        })
+        .serialize(serializer)
 }
 fn required_option<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
     d: D,
@@ -132,6 +206,7 @@ type PendingJob<T> = (Option<u64>, std::sync::mpsc::Receiver<io::Result<T>>);
 #[derive(Debug, Default)]
 struct ReadCapacity {
     busy: AtomicBool,
+    write_busy: AtomicBool,
     // Writes invalidate other handles of this file, never unrelated state roots.
     // The writer-lock boundary and metadata check handle other processes.
     generation: AtomicU64,
@@ -143,6 +218,13 @@ impl Drop for ReadPermit {
         self.0.busy.store(false, Ordering::SeqCst);
     }
 }
+struct LatchWritePermit(Arc<ReadCapacity>);
+impl Drop for LatchWritePermit {
+    fn drop(&mut self) {
+        self.0.write_busy.store(false, Ordering::SeqCst);
+    }
+}
+
 fn read_capacity(path: &Path) -> Arc<ReadCapacity> {
     static CAPACITIES: OnceLock<Mutex<std::collections::BTreeMap<PathBuf, Weak<ReadCapacity>>>> =
         OnceLock::new();
@@ -182,6 +264,7 @@ fn canonical_root(root: &Path) -> io::Result<PathBuf> {
 pub struct StateFile {
     path: PathBuf,
     capacity: Arc<ReadCapacity>,
+    latch_worker: bool,
     pending_read: std::cell::RefCell<Option<PendingJob<Snapshot>>>,
     pending_metadata: std::cell::RefCell<Option<PendingJob<Option<StateRead>>>>,
 }
@@ -201,6 +284,7 @@ impl StateFile {
         Ok(Self {
             path,
             capacity,
+            latch_worker: false,
             pending_read: std::cell::RefCell::new(None),
             pending_metadata: std::cell::RefCell::new(None),
         })
@@ -213,13 +297,134 @@ impl StateFile {
     pub fn read(&self) -> io::Result<StateRead> {
         match RealFs.read(&self.path) {
             Ok(text) => {
-                let state: State = serde_json::from_str(&text)
+                let mut state: State = serde_json::from_str(&text)
                     .map_err(|_| io::Error::other("invalid state.json"))?;
                 check_schema(&state)?;
+                // Reattach only typed metadata to an existing latch; raw reads
+                // never synthesize a quarantine from missing or unreadable state.
+                if let Some(main) = &mut state.quarantine
+                    && let Some(checkpoint) = self.repair_state().quarantine
+                    && checkpoint.uncertain
+                    && main.reason == checkpoint.reason
+                    && main.object == checkpoint.object
+                    && main.since_unix == checkpoint.since_unix
+                {
+                    main.uncertain = true;
+                }
                 Ok(StateRead::Present(state))
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(StateRead::Missing),
             Err(error) => Err(error),
+        }
+    }
+
+    /// Read safety state at a process/boot boundary, honoring uncertainty records.
+    /// # Errors
+    /// Returns main-state read failures. Corrupt or unreadable repair history is latched.
+    pub fn startup_read(&self, run_root: &Path) -> io::Result<StateRead> {
+        self.safety_read(run_root)
+    }
+
+    /// Read current latch uncertainty without interpreting completed budgets as a restart.
+    /// # Errors
+    /// Returns main-state read errors.
+    pub fn safety_read(&self, run_root: &Path) -> io::Result<StateRead> {
+        let mut saved = self.read()?;
+        if let StateRead::Present(state) = &mut saved {
+            let marker = std::fs::symlink_metadata(run_root.join("latch-uncertain"));
+            if state.applied_version.is_some() {
+                let repair = self.repair_state();
+                state.quarantine = state.quarantine.take().or_else(|| {
+                    repair.latch().map(|mut q| {
+                        q.reason = format!(
+                            "latch persistence or clearance uncertain: {}; run scupper connect",
+                            q.reason
+                        );
+                        q
+                    })
+                });
+            }
+            if !matches!(marker, Err(ref e) if e.kind() == io::ErrorKind::NotFound) {
+                state.quarantine.get_or_insert_with(uncertain_quarantine);
+            }
+        }
+        Ok(saved)
+    }
+
+    /// Read the checkpoint without conflating absence and failed observation.
+    #[must_use]
+    pub fn repair_state_read(&self) -> RepairStateRead {
+        match RealFs.read(&self.path.with_file_name("repair-state.json")) {
+            Ok(text) => serde_json::from_str(&text)
+                .map_or(RepairStateRead::Unreadable, RepairStateRead::Present),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => RepairStateRead::Missing,
+            Err(_) => RepairStateRead::Unreadable,
+        }
+    }
+
+    /// Effective repair history: no record is empty, unreadable evidence latches.
+    #[must_use]
+    pub fn repair_state(&self) -> RepairState {
+        match self.repair_state_read() {
+            RepairStateRead::Missing => RepairState::default(),
+            RepairStateRead::Present(repair) => repair,
+            RepairStateRead::Unreadable => RepairState {
+                quarantine: Some(uncertain_quarantine()),
+                ..RepairState::default()
+            },
+        }
+    }
+
+    /// Establish a legacy checkpoint under the writer lock without changing state.
+    /// Returns true exactly when a checkpoint was created, for the migration audit.
+    /// # Errors
+    /// Returns main-state or durable checkpoint write errors.
+    pub fn migrate_repair_state(&self, writer: &WriterGuard, run_root: &Path) -> io::Result<bool> {
+        if !matches!(self.repair_state_read(), RepairStateRead::Missing)
+            || !matches!(
+                self.read()?,
+                StateRead::Present(State {
+                    applied_version: Some(_),
+                    ..
+                })
+            )
+            || !matches!(std::fs::symlink_metadata(run_root.join("latch-uncertain")), Err(e) if e.kind() == io::ErrorKind::NotFound)
+        {
+            return Ok(false);
+        }
+        self.write_repair_state(writer, &RepairState::default())?;
+        Ok(true)
+    }
+
+    /// Persist a repair checkpoint before allowing an automatic restore.
+    /// # Errors
+    /// Returns serialization, write or durability failures.
+    pub fn write_repair_state(
+        &self,
+        _writer: &WriterGuard,
+        repair: &RepairState,
+    ) -> io::Result<()> {
+        self.check_late_write()?;
+        let bytes = serde_json::to_vec(repair).map_err(io::Error::other)?;
+        durable_replace(
+            &RealFs,
+            &self.path.with_file_name("repair-state.json"),
+            &bytes,
+            0o600,
+            &|_| Ok(()),
+            &|_| Ok(()),
+        )
+    }
+
+    /// Record explicit administrative clearance after the main state is durable.
+    /// # Errors
+    /// Returns checkpoint or runtime-marker removal/durability failures.
+    pub fn clear_repair_state(&self, writer: &WriterGuard, run_root: &Path) -> io::Result<()> {
+        self.write_repair_state(writer, &RepairState::default())?;
+        match std::fs::remove_file(run_root.join("latch-uncertain")) {
+            Ok(()) => RealFs.sync_dir(run_root),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
         }
     }
 
@@ -317,6 +522,7 @@ impl StateFile {
                     let file = Self {
                         path,
                         capacity: permit.0.clone(),
+                        latch_worker: false,
                         pending_read: std::cell::RefCell::new(None),
                         pending_metadata: std::cell::RefCell::new(None),
                     };
@@ -400,6 +606,62 @@ impl StateFile {
         self.write_with_hook(writer, state, &|_| Ok(()))
     }
 
+    fn check_late_write(&self) -> io::Result<()> {
+        if !self.latch_worker && self.capacity.write_busy.load(Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "latch write still pending",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Bounded latch write. Late I/O retains both the lock and helper ownership;
+    /// it cannot race a subsequent daemon or administrative state update.
+    /// # Errors
+    /// Returns persistence failure or the whole three-second write deadline.
+    pub(crate) fn write_latch_bounded(
+        &self,
+        writer: &WriterGuard,
+        state: &State,
+        repair: &RepairState,
+        run_root: &Path,
+        deadline: std::time::Instant,
+    ) -> io::Result<()> {
+        self.invalidate_reads();
+        self.capacity
+            .write_busy
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| {
+                let _ = crate::reconcile::write_uncertainty_marker(run_root);
+                io::Error::new(io::ErrorKind::WouldBlock, "latch write still pending")
+            })?;
+        let permit = LatchWritePermit(self.capacity.clone());
+        let writer = writer.retain_for_storage();
+        let path = self.path.clone();
+        let state = state.clone();
+        let repair = repair.clone();
+        let worker_root = run_root.to_path_buf();
+        crate::system::storage_until(deadline, move || {
+            let _permit = permit;
+            let mut store = Self::open(
+                path.parent()
+                    .ok_or_else(|| io::Error::other("state parent"))?,
+                None,
+            )?;
+            store.latch_worker = true;
+            store
+                .write_repair_state(&writer, &repair)
+                .and_then(|()| store.write(&writer, &state))
+                .inspect_err(|_| {
+                    let _ = crate::reconcile::write_uncertainty_marker(&worker_root);
+                })
+        })
+        .inspect_err(|_| {
+            let _ = crate::reconcile::write_uncertainty_marker(run_root);
+        })
+    }
+
     /// Reads, modifies, and durably writes state under one global writer guard.
     /// Missing state requires an explicit boot/install decision, never a reset.
     ///
@@ -428,10 +690,11 @@ impl StateFile {
     /// remains; after rename the new file remains.
     pub fn write_with_hook(
         &self,
-        _writer: &WriterGuard,
+        writer: &WriterGuard,
         state: &State,
         hook: &dyn Fn(DurableStep) -> io::Result<()>,
     ) -> io::Result<()> {
+        self.check_late_write()?;
         self.invalidate_reads();
         self.capacity
             .generation
@@ -443,6 +706,14 @@ impl StateFile {
             .parent()
             .ok_or_else(|| io::Error::other("missing state directory"))?;
         durable_directory(parent)?;
+        if state.quarantine.is_some() {
+            let mut repair = self.repair_state();
+            repair.quarantine.clone_from(&state.quarantine);
+            self.write_repair_state(writer, &repair)?;
+        } else if !self.path.try_exists()? {
+            // Only first creation establishes a clean history automatically.
+            self.write_repair_state(writer, &RepairState::default())?;
+        }
         durable_replace(&RealFs, &self.path, &bytes, 0o600, &|_| Ok(()), hook)
     }
 }
@@ -464,6 +735,107 @@ mod tests {
         time::{Duration, Instant},
     };
     static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn runtime_marker_is_latched_before_the_first_applied_version() {
+        let root = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/tmp"))
+            .join(format!("initial-marker-{}", std::process::id()));
+        let guard = WriterLock::acquire(&root).unwrap();
+        let file = StateFile::open(root.join("state"), Some(&guard)).unwrap();
+        file.write(&guard, &State::default()).unwrap();
+        crate::reconcile::write_uncertainty_marker(&root).unwrap();
+        let StateRead::Present(state) = file.safety_read(&root).unwrap() else {
+            panic!("missing state")
+        };
+        assert!(state.applied_version.is_none());
+        assert!(state.quarantine.is_some_and(|latch| latch.uncertain));
+        drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_marker_does_not_make_durable_quarantine_clearable_by_connect() {
+        let root = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/tmp"))
+            .join(format!("durable-marker-{}", std::process::id()));
+        let guard = WriterLock::acquire(&root).unwrap();
+        let file = StateFile::open(root.join("state"), Some(&guard)).unwrap();
+        let mut quarantine = uncertain_quarantine();
+        quarantine.uncertain = false;
+        file.write(
+            &guard,
+            &State {
+                applied_version: Some(1),
+                quarantine: Some(quarantine),
+                ..State::default()
+            },
+        )
+        .unwrap();
+        crate::reconcile::write_uncertainty_marker(&root).unwrap();
+        let StateRead::Present(state) = file.safety_read(&root).unwrap() else {
+            panic!("missing state")
+        };
+        assert!(state.quarantine.is_some_and(|latch| !latch.uncertain));
+        drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bounded_latch_write_is_independent_of_reads_and_blocks_competing_writes() {
+        let root = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/tmp"))
+            .join(format!("bounded-latch-{}", std::process::id()));
+        let guard = WriterLock::acquire(&root).unwrap();
+        let file = StateFile::open(root.join("state"), Some(&guard)).unwrap();
+        let read = file.reserve_worker().unwrap();
+        let state = State {
+            quarantine: Some(uncertain_quarantine()),
+            ..State::default()
+        };
+        file.write_latch_bounded(
+            &guard,
+            &state,
+            &RepairState::default(),
+            &root,
+            Instant::now() + Duration::from_secs(3),
+        )
+        .unwrap();
+        drop(read);
+        assert!(matches!(
+            file.read().unwrap(),
+            StateRead::Present(State {
+                quarantine: Some(_),
+                ..
+            })
+        ));
+        file.capacity.write_busy.store(true, Ordering::SeqCst);
+        let pending = LatchWritePermit(file.capacity.clone());
+        assert_eq!(
+            file.write_latch_bounded(
+                &guard,
+                &state,
+                &RepairState::default(),
+                &root,
+                Instant::now()
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(root.join("latch-uncertain").is_file());
+        assert_eq!(
+            file.write(&guard, &State::default()).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            file.write_repair_state(&guard, &RepairState::default())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(pending);
+        file.write(&guard, &state).unwrap();
+        drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn worker_capacity_is_shared_across_handles_and_survives_handle_drop() {

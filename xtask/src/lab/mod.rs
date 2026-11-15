@@ -12,7 +12,6 @@ mod helpers;
 mod mounts;
 mod mutation;
 mod policy_fixture;
-mod positive;
 mod route_fixture;
 pub use mutation::run_mutation;
 pub use route_fixture::route_check;
@@ -131,6 +130,7 @@ fn capture_invocation(ns: &str, iface: &str, pcap: &Path) -> Result<Invocation> 
 struct Lab {
     boot_root: PathBuf,
     boot_root_ready: bool,
+    sampler: Option<scupper_sys::client_sessions::Sampler>,
     runner: Runner,
     registry: Registry,
     services: Vec<Group>,
@@ -150,6 +150,11 @@ struct Lab {
     inheritance: Option<boot::InheritanceGuard>,
     host_sysctls: Option<boot::InheritanceGuard>,
     fault_markers: Vec<String>,
+    peer_flow_logs: Vec<(String, PathBuf)>,
+    peer_markers: std::collections::BTreeMap<String, String>,
+    last_probe_served: std::collections::BTreeMap<String, u64>,
+    session_check_at: Option<u64>,
+    gateway_activity: check_v2::GatewayActivity,
     next_source_port: u16,
     exit_port: u16,
     client_ports_ready: bool,
@@ -249,6 +254,7 @@ fn run_inner(
     let mut lab = Lab {
         boot_root: daemon::short_boot_root("setup"),
         boot_root_ready: false,
+        sampler: None,
         runner,
         registry: Registry::default(),
         services: Vec::new(),
@@ -268,6 +274,11 @@ fn run_inner(
         inheritance: None,
         host_sysctls: None,
         fault_markers: Vec::new(),
+        peer_flow_logs: Vec::new(),
+        peer_markers: std::collections::BTreeMap::new(),
+        last_probe_served: std::collections::BTreeMap::new(),
+        session_check_at: None,
+        gateway_activity: check_v2::GatewayActivity::default(),
         next_source_port: 20000,
         exit_port: 51821,
         client_ports_ready: false,
@@ -342,6 +353,8 @@ fn run_inner(
         }
     })();
     if let Err(error) = &outcome {
+        let root = lab.boot_root.clone();
+        lab.save_session_failure(&root, "lab");
         fs::write(lab.artifacts.join("failure.txt"), error.to_string())?;
         if lab.rows.is_empty() {
             lab.rows.push(Row {
@@ -581,6 +594,7 @@ impl Lab {
         ipv6: bool,
         source: Option<&str>,
     ) -> Result<helpers::Outcome> {
+        self.peer_markers.insert(marker.into(), namespace.into());
         let exe = self.executable.clone();
         // A unique UDP tuple avoids reusing an earlier case's conntrack NAT
         // mapping when the permissive ruleset temporarily removes masquerading.
@@ -630,7 +644,7 @@ impl Lab {
         writeln!(
             log,
             "{}",
-            serde_json::json!({"namespace": namespace, "attempt": attempt, "status": status.code()})
+            serde_json::json!({"at": check_v2::lab_now(), "namespace": namespace, "attempt": attempt, "status": status.code()})
         )?;
         // GNU timeout, signals and launcher errors must never masquerade as a drop.
         if !status.success() && status.code() != Some(1) {
@@ -642,6 +656,10 @@ impl Lab {
         if matches!(attempt.outcome, helpers::Outcome::HarnessError { .. }) {
             return fail(format!("probe harness error: {:?}", attempt.outcome));
         }
+        if attempt.outcome == helpers::Outcome::Delivered {
+            self.last_probe_served
+                .insert(namespace.into(), check_v2::lab_now());
+        }
         Ok(attempt.outcome)
     }
     fn canaries(
@@ -650,52 +668,10 @@ impl Lab {
         ipv6: bool,
         healthy: bool,
     ) -> Result<Vec<String>> {
-        self.canaries_with_tcp_retry(markers, ipv6, healthy, None)
-    }
-    fn canaries_with_tcp_retry(
-        &mut self,
-        markers: &mut Vec<String>,
-        ipv6: bool,
-        healthy: bool,
-        retry_log: Option<&Path>,
-    ) -> Result<Vec<String>> {
         let mut sent = Vec::new();
         for protocol in ["tcp", "udp"] {
             for by_name in [false, true] {
                 self.runner.check()?;
-                if healthy
-                    && protocol == "tcp"
-                    && let Some(log) = retry_log
-                {
-                    let delivered = positive::tcp(markers, log, |marker, deadline| {
-                        self.ensure_services()?;
-                        let target = if by_name {
-                            format!("{marker}.lab.test")
-                        } else {
-                            A.internet.peer.into()
-                        };
-                        // Bound the entire subprocess (including pipes and cleanup),
-                        // rather than allowing a last 15 s launcher at the deadline.
-                        let phase = self.runner.phase;
-                        self.runner.phase = phase.min(deadline);
-                        let result = self.send("client", protocol, &target, marker, ipv6);
-                        self.runner.phase = phase;
-                        let outcome = result?;
-                        // A lost ACK can leave a receipt even on a timeout. Such
-                        // receipts must still be unique and from provider NAT.
-                        let receipts = helpers::receipts(&fs::read_to_string(
-                            self.artifacts.join("sink.jsonl"),
-                        )?)?;
-                        check_positive_receipt(
-                            &receipts,
-                            marker,
-                            outcome == helpers::Outcome::Delivered,
-                        )?;
-                        Ok(outcome)
-                    })?;
-                    sent.push(delivered);
-                    continue;
-                }
                 let marker = Self::marker()?;
                 let target = if by_name {
                     format!("{marker}.lab.test")
@@ -722,21 +698,22 @@ impl Lab {
         Ok(sent)
     }
     fn service_check(&mut self, markers: &mut Vec<String>) -> Result<()> {
-        self.service_check_with_tcp_retry(markers, None)
-    }
-    fn service_check_with_tcp_retry(
-        &mut self,
-        markers: &mut Vec<String>,
-        retry_log: Option<&Path>,
-    ) -> Result<()> {
-        self.ensure_services()?;
-        let first_marker = markers.len();
-        let sent = self.canaries_with_tcp_retry(markers, false, true, retry_log)?;
-        let receipts = helpers::receipts(&fs::read_to_string(self.artifacts.join("sink.jsonl"))?)?;
-        for marker in &markers[first_marker..] {
-            check_positive_receipt(&receipts, marker, sent.contains(marker))?;
+        let outcome = (|| {
+            self.ensure_services()?;
+            let first_marker = markers.len();
+            let sent = self.canaries(markers, false, true)?;
+            let receipts =
+                helpers::receipts(&fs::read_to_string(self.artifacts.join("sink.jsonl"))?)?;
+            for marker in &markers[first_marker..] {
+                check_positive_receipt(&receipts, marker, sent.contains(marker))?;
+            }
+            Ok(())
+        })();
+        if outcome.is_err() {
+            let root = self.boot_root.clone();
+            self.save_session_failure(&root, "service-check");
         }
-        Ok(())
+        outcome
     }
     fn capture(&mut self, ns: &str, iface: &str, stem: &str) -> Result<()> {
         if self

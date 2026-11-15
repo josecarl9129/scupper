@@ -20,9 +20,10 @@ use scupper_core::{
     rules::IfName,
     verdict::v2::{DefaultRouteObs, HealthConfigV2, Probe, ProbeError},
 };
+use scupper_proto::ReadFailureKind;
 use std::{
-    cell::Cell,
-    collections::BTreeMap,
+    cell::{Cell, RefCell},
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -30,10 +31,53 @@ use std::{
 /// Applies a shared safety deadline in addition to the per-exec bound.
 pub(crate) struct SafetySystem<'a> {
     pub(crate) system: &'a dyn System,
+    pub(crate) read_purpose: crate::system::HelperPurpose,
     pub(crate) deadline: Instant,
     pub(crate) failed: Cell<bool>,
+    pub(crate) failures: RefCell<Vec<scupper_proto::ReadFailure>>,
+    pub(crate) unsafe_tc: RefCell<BTreeSet<String>>,
+}
+impl SafetySystem<'_> {
+    fn purpose(&self, purpose: crate::system::HelperPurpose) -> crate::system::HelperPurpose {
+        use crate::system::HelperPurpose;
+        match purpose {
+            HelperPurpose::Observation | HelperPurpose::Probe => self.read_purpose,
+            HelperPurpose::Mutation | HelperPurpose::Storage | HelperPurpose::Notification => {
+                purpose
+            }
+        }
+    }
 }
 impl System for SafetySystem<'_> {
+    fn record_unsafe_tc(&self, link: &str) {
+        self.unsafe_tc.borrow_mut().insert(link.to_owned());
+    }
+
+    fn record_read_failure(&self, failure: scupper_proto::ReadFailure) {
+        self.failed.set(true);
+        let mut failures = self.failures.borrow_mut();
+        if failures.len() < 64 && !failures.contains(&failure) {
+            failures.push(failure);
+        }
+    }
+
+    fn client_session_io(
+        &self,
+        purpose: crate::system::HelperPurpose,
+        held: &NetnsHandle,
+        request: &crate::client_sessions::Request,
+    ) -> std::io::Result<crate::client_sessions::Response> {
+        if Instant::now() >= self.deadline {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        let result = self
+            .system
+            .client_session_io(self.purpose(purpose), held, request)?;
+        if Instant::now() >= self.deadline {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        Ok(result)
+    }
     fn canon_safety_deadline(&self) -> Option<Instant> {
         Some(self.deadline)
     }
@@ -50,27 +94,58 @@ impl System for SafetySystem<'_> {
         self.system.canon_cache()
     }
 
-    fn run(&self, p: Program, args: &[String], timeout: Duration) -> Result<ExecOutput, ExecError> {
-        self.run_in(ExecTarget::Host, p, args, timeout)
+    fn run(
+        &self,
+        purpose: crate::system::HelperPurpose,
+        p: Program,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<ExecOutput, ExecError> {
+        self.run_in(purpose, ExecTarget::Host, p, args, timeout)
     }
     fn run_in(
         &self,
+        purpose: crate::system::HelperPurpose,
         target: ExecTarget<'_>,
         p: Program,
         args: &[String],
         timeout: Duration,
     ) -> Result<ExecOutput, ExecError> {
-        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        // Reserve executor cleanup/reaping time within this shared deadline.
+        let remaining = self
+            .deadline
+            .saturating_duration_since(Instant::now())
+            .saturating_sub(Duration::from_millis(900));
+        let purpose = self.purpose(purpose);
         let result = if remaining.is_zero() {
             Err(ExecError::Timeout {
                 after: Duration::from_secs(6),
             })
         } else {
-            self.system
-                .run_in(target, p, args, timeout.min(EXEC_TIMEOUT).min(remaining))
+            self.system.run_in(
+                purpose,
+                target,
+                p,
+                args,
+                timeout.min(EXEC_TIMEOUT).min(remaining),
+            )
         };
         if !result.as_ref().is_ok_and(|out| out.status == Some(0)) {
             self.failed.set(true);
+            let failure = match &result {
+                Ok(out) if out.status.is_none() => ReadFailureKind::Signal,
+                Ok(_) => ReadFailureKind::ExitStatus,
+                Err(ExecError::Timeout { .. }) => ReadFailureKind::Timeout,
+                Err(ExecError::OutputTooLarge { .. }) => ReadFailureKind::OutputTooLarge,
+                Err(ExecError::NonUtf8) => ReadFailureKind::NonUtf8,
+                Err(ExecError::NamespaceIdentity | ExecError::NamespaceEnter { .. }) => {
+                    ReadFailureKind::NamespaceIdentity
+                }
+                Err(_) => ReadFailureKind::Spawn,
+            };
+            if let Some(context) = read_context(target, p, args, failure) {
+                self.record_read_failure(context);
+            }
         }
         result
     }
@@ -83,6 +158,71 @@ impl System for SafetySystem<'_> {
     fn read_host_udp(&self, ipv6: bool) -> std::io::Result<String> {
         self.system.read_host_udp(ipv6)
     }
+}
+fn read_context(
+    target: ExecTarget<'_>,
+    program: Program,
+    args: &[String],
+    failure: scupper_proto::ReadFailureKind,
+) -> Option<scupper_proto::ReadFailure> {
+    use scupper_proto::{ReadNamespace as N, ReadStage as S};
+    let has = |arg: &str| args.iter().any(|value| value == arg);
+    let stage = match program {
+        Program::Ip if has("link") => S::LinkList,
+        Program::Nft => S::Ruleset,
+        Program::Sysctl => S::Sysctl,
+        Program::Tc if has("qdisc") => S::TcQdisc,
+        Program::Tc if has("ingress") => S::TcFilterIngress,
+        Program::Tc if has("egress") => S::TcFilterEgress,
+        Program::Tc => S::TcFilterRoot,
+        _ => return None,
+    };
+    let link = args
+        .windows(2)
+        .find(|pair| pair[0] == "dev")
+        .map(|pair| pair[1].clone())
+        .or_else(|| {
+            if program == Program::Sysctl {
+                args.iter().find_map(|arg| {
+                    arg.split(".conf.")
+                        .nth(1)
+                        .and_then(|tail| tail.split('.').next())
+                        .filter(|name| !matches!(*name, "all" | "default"))
+                        .map(str::to_owned)
+                })
+            } else {
+                None
+            }
+        });
+    Some(scupper_proto::ReadFailure {
+        namespace: match target {
+            ExecTarget::Host => N::Host,
+            ExecTarget::Netns(_) => N::Held,
+        },
+        link,
+        stage,
+        failure,
+    })
+}
+fn read_parsed<T>(
+    sys: &dyn System,
+    target: ExecTarget<'_>,
+    cmd: &KernelCmd,
+    parse: impl FnOnce(&str) -> Result<T, scupper_core::parse::ParseError>,
+) -> Probe<T> {
+    let text = read_in(sys, target, cmd)?;
+    parse(&text).map_err(|error| {
+        let (program, args) = cmd.render();
+        if let Some(context) = read_context(
+            target,
+            program,
+            &args,
+            scupper_proto::ReadFailureKind::Parse,
+        ) {
+            sys.record_read_failure(context);
+        }
+        error.into()
+    })
 }
 fn read(sys: &dyn System, held: &NetnsHandle, cmd: &KernelCmd) -> Probe<String> {
     command_result(run_cmd(sys, ExecTarget::Netns(held), cmd, EXEC_TIMEOUT))
@@ -97,18 +237,16 @@ fn gate(
     scope: Scope,
     name: &'static str,
 ) -> Known<i64> {
-    known(
-        read(
-            sys,
-            held,
-            &KernelCmd::Sysctl(SysctlCmd::Read(SysctlKey {
-                family,
-                scope,
-                name,
-            })),
-        )
-        .and_then(|s| Ok(parse_sysctl(&s)?)),
-    )
+    known(read_parsed(
+        sys,
+        ExecTarget::Netns(held),
+        &KernelCmd::Sysctl(SysctlCmd::Read(SysctlKey {
+            family,
+            scope,
+            name,
+        })),
+        parse_sysctl,
+    ))
 }
 
 pub(crate) fn hooks(
@@ -124,15 +262,21 @@ fn read_in(sys: &dyn System, target: ExecTarget<'_>, cmd: &KernelCmd) -> Probe<S
 }
 fn hooks_in(sys: &dyn System, target: ExecTarget<'_>, name: &str, xdp: bool) -> Probe<Vec<String>> {
     let dev = IfName::new(name).map_err(|_| ProbeError::io("unrepresentable tc link"))?;
-    let qdiscs = parse_tc_qdisc(&read_in(
+    let mut hooks = if xdp { vec!["xdp".into()] } else { Vec::new() };
+    let qdiscs = match read_parsed(
         sys,
         target,
         &KernelCmd::Tc(TcCmd::QdiscShowJson { dev: dev.clone() }),
-    )?)?;
-    let mut hooks = Vec::new();
-    if xdp {
-        hooks.push("xdp".into());
-    }
+        parse_tc_qdisc,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            if !hooks.is_empty() {
+                sys.record_unsafe_tc(name);
+            }
+            return Err(error);
+        }
+    };
     for q in qdiscs {
         if q.kind == "noqueue"
             && q.root
@@ -152,14 +296,23 @@ fn hooks_in(sys: &dyn System, target: ExecTarget<'_>, name: &str, xdp: bool) -> 
         });
     }
     for parent in [TcParent::Root, TcParent::Ingress, TcParent::Egress] {
-        let filters = parse_tc_filter(&read_in(
+        let filters = match read_parsed(
             sys,
             target,
             &KernelCmd::Tc(TcCmd::FilterShowJson {
                 dev: dev.clone(),
                 parent,
             }),
-        )?)?;
+            parse_tc_filter,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                if !hooks.is_empty() {
+                    sys.record_unsafe_tc(name);
+                }
+                return Err(error);
+            }
+        };
         if !filters.is_empty() {
             hooks.push(
                 match parent {
@@ -316,16 +469,55 @@ pub(crate) fn observe(
     sys: &dyn System,
     held: &NetnsHandle,
     desired: &Desired,
-    _cfg: &HealthConfigV2,
+    cfg: &HealthConfigV2,
     namespace: &Path,
     edge: Option<&Path>,
     owned: &BTreeMap<String, u32>,
 ) -> Observation {
+    observe_until(
+        sys,
+        held,
+        desired,
+        cfg,
+        namespace,
+        edge,
+        owned,
+        Instant::now() + Duration::from_secs(6),
+    )
+}
+
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+pub(crate) fn observe_until(
+    sys: &dyn System,
+    held: &NetnsHandle,
+    desired: &Desired,
+    cfg: &HealthConfigV2,
+    namespace: &Path,
+    edge: Option<&Path>,
+    owned: &BTreeMap<String, u32>,
+    deadline: Instant,
+) -> Observation {
+    observe_safety(sys, held, desired, cfg, namespace, edge, owned, deadline)
+}
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+fn observe_safety(
+    sys: &dyn System,
+    held: &NetnsHandle,
+    desired: &Desired,
+    cfg: &HealthConfigV2,
+    namespace: &Path,
+    edge: Option<&Path>,
+    owned: &BTreeMap<String, u32>,
+    deadline: Instant,
+) -> Observation {
     let start = Instant::now();
     let safety = SafetySystem {
+        read_purpose: crate::system::HelperPurpose::Observation,
         system: sys,
-        deadline: start + Duration::from_secs(6),
+        deadline,
         failed: Cell::new(false),
+        failures: RefCell::new(Vec::new()),
+        unsafe_tc: RefCell::new(BTreeSet::new()),
     };
     let mut model = KernelModel::desired(desired);
     model.conntrack_flushed = false;
@@ -335,7 +527,12 @@ pub(crate) fn observe(
         Ok(_) => NamespaceState::NameGone,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => NamespaceState::NameGone,
         Err(_) => {
-            safety.failed.set(true);
+            safety.record_read_failure(scupper_proto::ReadFailure {
+                namespace: scupper_proto::ReadNamespace::Held,
+                link: None,
+                stage: scupper_proto::ReadStage::NamespaceIdentity,
+                failure: scupper_proto::ReadFailureKind::Io,
+            });
             NamespaceState::Unknown
         }
     };
@@ -348,54 +545,81 @@ pub(crate) fn observe(
             }
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => model.edge_dead = true,
-            Err(_) => safety.failed.set(true),
+            Err(_) => safety.record_read_failure(scupper_proto::ReadFailure {
+                namespace: scupper_proto::ReadNamespace::Edge,
+                link: None,
+                stage: scupper_proto::ReadStage::NamespaceIdentity,
+                failure: scupper_proto::ReadFailureKind::Io,
+            }),
         }
     }
-    let raw = read(&safety, held, &KernelCmd::Ip(IpCmd::LinkShowJson))
-        .and_then(|s| Ok(parse_ip_link(&s)?));
+    let raw = read_parsed(
+        &safety,
+        ExecTarget::Netns(held),
+        &KernelCmd::Ip(IpCmd::LinkShowJson),
+        parse_ip_link,
+    );
     model.links_complete = raw.is_ok();
     let raw = raw.unwrap_or_else(|_| {
         safety.failed.set(true);
         vec![]
     });
     model.links.clear();
-    model.ruleset = if safety.canon_cache().is_some() {
-        known(
-            crate::canon::netns_rulesets_safety(&safety, held, desired.rendered()).and_then(
-                |(want, live)| {
-                    Ok(if live == want {
-                        Ruleset::Verified(desired.fingerprint())
-                    } else if live
-                        .get("nftables")
-                        .and_then(serde_json::Value::as_array)
-                        .is_some_and(Vec::is_empty)
-                    {
-                        Ruleset::Absent
-                    } else {
-                        Ruleset::Unverified(fingerprint(&live)?)
-                    })
-                },
-            ),
-        )
-    } else {
-        known(
-            read(&safety, held, &KernelCmd::Nft(NftCmd::ListRulesetJson)).and_then(|s| {
-                let canon = canonicalize(&s)?;
-                let live = fingerprint(&canon)?;
-                Ok(if live == desired.fingerprint() {
-                    Ruleset::Verified(live)
-                } else if canon
+    let ruleset = if safety.canon_cache().is_some() {
+        crate::canon::netns_rulesets_safety(&safety, held, desired.rendered()).and_then(
+            |(want, live)| {
+                Ok(if live == want {
+                    Ruleset::Verified(desired.fingerprint())
+                } else if live
                     .get("nftables")
                     .and_then(serde_json::Value::as_array)
                     .is_some_and(Vec::is_empty)
                 {
                     Ruleset::Absent
                 } else {
-                    Ruleset::Unverified(live)
+                    Ruleset::Unverified(fingerprint(&live)?)
                 })
-            }),
+            },
         )
+    } else {
+        read(&safety, held, &KernelCmd::Nft(NftCmd::ListRulesetJson)).and_then(|text| {
+            let canon = canonicalize(&text)?;
+            let live = fingerprint(&canon)?;
+            Ok(if live == desired.fingerprint() {
+                Ruleset::Verified(live)
+            } else if canon
+                .get("nftables")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(Vec::is_empty)
+            {
+                Ruleset::Absent
+            } else {
+                Ruleset::Unverified(live)
+            })
+        })
     };
+    if let Err(error) = &ruleset
+        && !safety
+            .failures
+            .borrow()
+            .iter()
+            .any(|context| context.stage == scupper_proto::ReadStage::Ruleset)
+    {
+        let failure = match error {
+            ProbeError::Timeout => ReadFailureKind::Timeout,
+            ProbeError::ExitStatus { code: None, .. } => ReadFailureKind::Signal,
+            ProbeError::ExitStatus { .. } => ReadFailureKind::ExitStatus,
+            ProbeError::Parse(_) => ReadFailureKind::Parse,
+            _ => ReadFailureKind::Io,
+        };
+        safety.record_read_failure(scupper_proto::ReadFailure {
+            namespace: scupper_proto::ReadNamespace::Held,
+            link: None,
+            stage: scupper_proto::ReadStage::Ruleset,
+            failure,
+        });
+    }
+    model.ruleset = known(ruleset);
     model.forwarding_v4 = gate(
         &safety,
         held,
@@ -418,31 +642,53 @@ pub(crate) fn observe(
         Scope::Default,
         "forwarding",
     );
+    let mut failed_links = Vec::new();
     for link in &raw {
+        // Per-link failures can mean deletion after the dump. Keep their failure
+        // accounting separate until one bounded re-dump can prove absence.
+        let per_link = SafetySystem {
+            read_purpose: crate::system::HelperPurpose::Observation,
+            system: sys,
+            deadline: safety.deadline,
+            failed: Cell::new(false),
+            failures: RefCell::new(Vec::new()),
+            unsafe_tc: RefCell::new(BTreeSet::new()),
+        };
         let name = &link.ifname;
         let ifname = IfName::new(name);
         let (gates, tc) = match ifname {
             Ok(dev) => (
                 [
                     gate(
-                        &safety,
+                        &per_link,
                         held,
                         SysctlFamily::Ipv4,
                         Scope::Link(dev.clone()),
                         "forwarding",
                     ),
                     gate(
-                        &safety,
+                        &per_link,
                         held,
                         SysctlFamily::Ipv6,
                         Scope::Link(dev),
                         "forwarding",
                     ),
                 ],
-                known(hooks(&safety, held, name, link.xdp)),
+                known(hooks(&per_link, held, name, link.xdp)),
             ),
             Err(_) => ([Known::Unknown, Known::Unknown], Known::Unknown),
         };
+        if per_link.failed.get() || gates.contains(&Known::Unknown) || tc == Known::Unknown {
+            failed_links.push((name.clone(), link.ifindex));
+        }
+        safety
+            .failures
+            .borrow_mut()
+            .extend(per_link.failures.into_inner());
+        safety
+            .unsafe_tc
+            .borrow_mut()
+            .extend(per_link.unsafe_tc.into_inner());
         model.links.insert(
             name.clone(),
             KernelLink {
@@ -469,12 +715,60 @@ pub(crate) fn observe(
             },
         );
     }
-    model.client_forwarding_v4 = model
-        .links
-        .get(&model.client_link)
-        .map_or(Known::Value(0), |l| l.forwarding_v4.clone());
-    let safety_complete = !safety.failed.get()
-        && start.elapsed() <= Duration::from_secs(6)
+    if !failed_links.is_empty() {
+        // A complete second dump proves only absence of the same identity, never
+        // safety of a replacement with the same name or a newly introduced link.
+        // One re-dump for the entire failed batch uses the original safety deadline.
+        let again = read_parsed(
+            &safety,
+            ExecTarget::Netns(held),
+            &KernelCmd::Ip(IpCmd::LinkShowJson),
+            parse_ip_link,
+        );
+        match again {
+            Ok(again) => {
+                if again.iter().any(|link| {
+                    !raw.iter()
+                        .any(|old| old.ifname == link.ifname && old.ifindex == link.ifindex)
+                }) {
+                    model.links_complete = false;
+                }
+                for (name, ifindex) in failed_links {
+                    if again
+                        .iter()
+                        .all(|link| link.ifname != name && link.ifindex != ifindex)
+                    {
+                        model.links.remove(&name);
+                        safety.unsafe_tc.borrow_mut().remove(&name);
+                        safety
+                            .failures
+                            .borrow_mut()
+                            .retain(|failure| failure.link.as_ref() != Some(&name));
+                    } else {
+                        safety.failed.set(true);
+                    }
+                }
+            }
+            Err(_) => safety.failed.set(true),
+        }
+    }
+    model.client_forwarding_v4 = model.links.get(&model.client_link).map_or_else(
+        || {
+            if model.links_complete {
+                Known::Value(0)
+            } else {
+                Known::Unknown
+            }
+        },
+        |link| link.forwarding_v4.clone(),
+    );
+    // Routing evidence is part of the stop classification even with closed
+    // ingress/forwarding; an unrelated closed gate is not a global safety proof.
+    model.extra_rules = known(rules(&safety, held));
+    routes(&safety, held, cfg, &mut model);
+    let safety_complete = model.links_complete
+        && !safety.failed.get()
+        && Instant::now() < deadline
         && model.ruleset != Known::Unknown
         && [
             &model.forwarding_v4,
@@ -492,6 +786,8 @@ pub(crate) fn observe(
     let safety_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     super::super::reconcile::unknown_nonsafety(&mut model);
     Observation {
+        failures: safety.failures.into_inner(),
+        known_unsafe_tc: !safety.unsafe_tc.into_inner().is_empty(),
         model,
         safety_complete,
         safety_ms,
@@ -511,14 +807,30 @@ pub(crate) fn observe_rest(
     observed: Observation,
     deadline: Instant,
 ) -> Observation {
+    observe_availability(system, held, desired, cfg, observed, deadline)
+}
+#[allow(clippy::too_many_lines)]
+fn observe_availability(
+    system: &dyn System,
+    held: &NetnsHandle,
+    desired: &Desired,
+    cfg: &HealthConfigV2,
+    observed: Observation,
+    deadline: Instant,
+) -> Observation {
     let bounded = SafetySystem {
+        read_purpose: crate::system::HelperPurpose::Observation,
         system,
         deadline,
         failed: Cell::new(false),
+        failures: RefCell::new(Vec::new()),
+        unsafe_tc: RefCell::new(BTreeSet::new()),
     };
     let sys: &dyn System = &bounded;
     let Observation {
         mut model,
+        mut failures,
+        known_unsafe_tc,
         safety_complete,
         safety_ms,
         ..
@@ -593,6 +905,7 @@ pub(crate) fn observe_rest(
     ))
     .and_then(|s| Ok(parse_ip_addr(&s)?))
     .ok();
+    model.host_links_complete = host.is_ok();
     if let Ok(host) = host {
         for link in host
             .into_iter()
@@ -649,9 +962,6 @@ pub(crate) fn observe_rest(
             }
             model.host_links.insert(link.ifname, record);
         }
-    } else {
-        // Prevent speculative host creation; the executor also rechecks on every add.
-        model.links_complete = false;
     }
     let mut handshakes = BTreeMap::new();
     let mut exit_links = BTreeMap::new();
@@ -681,7 +991,10 @@ pub(crate) fn observe_rest(
             },
         );
     }
+    failures.extend(bounded.failures.into_inner());
     Observation {
+        failures,
+        known_unsafe_tc,
         model,
         safety_complete,
         safety_ms,

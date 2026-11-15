@@ -16,6 +16,7 @@ use std::{
 pub struct Notify {
     socket: Option<(UnixDatagram, SocketAddr)>,
     ready: bool,
+    stopping: bool,
 }
 impl Notify {
     /// Disabled endpoint used when service-manager configuration is invalid.
@@ -24,6 +25,7 @@ impl Notify {
         Self {
             socket: None,
             ready: false,
+            stopping: false,
         }
     }
     /// Parse a filesystem or `@` abstract socket address.
@@ -46,6 +48,7 @@ impl Notify {
         Ok(Self {
             socket,
             ready: false,
+            stopping: false,
         })
     }
     /// Announce entry into the main loop, independently of kernel health.
@@ -82,6 +85,28 @@ impl Notify {
         }
         Ok(())
     }
+    /// Announce TERM once and feed the watchdog while bounded stop work progresses.
+    /// This reports lifecycle progress, independently of data-plane health.
+    /// # Errors
+    /// Returns a nonblocking socket error.
+    pub fn stopping(&mut self) -> io::Result<()> {
+        if !self.stopping {
+            self.send(b"STOPPING=1")?;
+            self.stopping = true;
+        }
+        self.send(b"WATCHDOG=1")
+    }
+    pub(crate) fn clone_endpoint(&self) -> io::Result<Self> {
+        Ok(Self {
+            socket: self
+                .socket
+                .as_ref()
+                .map(|(socket, address)| Ok::<_, io::Error>((socket.try_clone()?, address.clone())))
+                .transpose()?,
+            ready: self.ready,
+            stopping: self.stopping,
+        })
+    }
     /// Extend a bounded full apply and keep its service watchdog alive.
     /// # Errors
     /// Returns a nonblocking socket error.
@@ -101,6 +126,60 @@ impl Notify {
         }
         Ok(())
     }
+}
+
+/// Keep notifications alive through reconciliation, persistence, and final reaping.
+/// No helper is admitted here. A stalled shutdown cannot renew the budget forever.
+pub(crate) fn with_stop_keepalive<T>(
+    stop: &std::sync::atomic::AtomicBool,
+    mut notify: Notify,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Completion<'a> {
+        finished: &'a std::sync::atomic::AtomicBool,
+        done: std::sync::mpsc::Sender<()>,
+    }
+    impl Drop for Completion<'_> {
+        fn drop(&mut self) {
+            crate::system::finish_stop_wait(self.finished);
+            let _ = self.done.send(());
+        }
+    }
+    let finished = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let (done, receive) = std::sync::mpsc::channel();
+        let finished = &finished;
+        scope.spawn(move || {
+            crate::system::wait_for_stop(stop, finished);
+            let mut started = None;
+            let mut next = std::time::Instant::now();
+            loop {
+                let now = std::time::Instant::now();
+                if stop.load(std::sync::atomic::Ordering::Acquire) {
+                    let first = *started.get_or_insert(now);
+                    if now >= next
+                        && now.duration_since(first) < std::time::Duration::from_secs(240)
+                    {
+                        let _ = notify.stopping();
+                        next = now + std::time::Duration::from_secs(5);
+                    }
+                }
+                if receive.recv_timeout(std::time::Duration::from_secs(5))
+                    != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                {
+                    // Even an immediate stop/exit publishes the lifecycle boundary.
+                    if stop.load(std::sync::atomic::Ordering::Acquire) && started.is_none() {
+                        let _ = notify.stopping();
+                    }
+                    break;
+                }
+            }
+        });
+        let completion = Completion { finished, done };
+        let result = run();
+        drop(completion);
+        result
+    })
 }
 
 /// Notification lifetime for an explicit apply on the tick owner.
@@ -156,6 +235,54 @@ impl Drop for ApplyKeepalive {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[test]
+    fn stop_notify_sequence_reports_lifecycle_and_keeps_watchdog_alive() {
+        let name = format!("scupper-stop-notify-{}", std::process::id());
+        let address = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        let socket = UnixDatagram::bind_addr(&address).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let mut notify = Notify::new(Some(OsStr::new(&format!("@{name}")))).unwrap();
+        notify.iteration(true, "reconciling").unwrap();
+        notify.stopping().unwrap(); // TERM, before read drain.
+        notify.stopping().unwrap(); // Containment/persistence progress.
+        notify.stopping().unwrap(); // Final helper/audit cleanup.
+        let mut messages = Vec::new();
+        let mut buffer = [0; 128];
+        while let Ok(len) = socket.recv(&mut buffer) {
+            messages.push(String::from_utf8(buffer[..len].to_vec()).unwrap());
+        }
+        assert_eq!(
+            messages,
+            [
+                "READY=1",
+                "STATUS=reconciling",
+                "WATCHDOG=1",
+                "STOPPING=1",
+                "WATCHDOG=1",
+                "WATCHDOG=1",
+                "WATCHDOG=1"
+            ]
+        );
+    }
+
+    #[test]
+    fn immediate_stop_still_notifies_before_keepalive_scope_exits() {
+        let name = format!("scupper-immediate-stop-{}", std::process::id());
+        let address = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        let socket = UnixDatagram::bind_addr(&address).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let notify = Notify::new(Some(OsStr::new(&format!("@{name}")))).unwrap();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        with_stop_keepalive(&stop, notify, || {
+            stop.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let mut buffer = [0; 128];
+        let len = socket.recv(&mut buffer).unwrap();
+        assert_eq!(&buffer[..len], b"STOPPING=1");
+        let len = socket.recv(&mut buffer).unwrap();
+        assert_eq!(&buffer[..len], b"WATCHDOG=1");
+    }
+
     #[test]
     fn apply_extends_service_timeout_and_feeds_watchdog() {
         let name = format!("scupper-apply-notify-{}", std::process::id());

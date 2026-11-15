@@ -137,6 +137,15 @@ impl DaemonGuard<'_> {
             .lab
             .artifacts
             .join(format!("{}-heartbeat.jsonl", self.case));
+        // Keep the listener alive through long session-recovery cases, including
+        // their final injected control capture. Round up the remaining budget.
+        let seconds = self
+            .lab
+            .runner
+            .whole
+            .saturating_duration_since(std::time::Instant::now())
+            .as_secs()
+            .saturating_add(1);
         let child = self.lab.runner.background(
             &Invocation::new(
                 "internet",
@@ -152,7 +161,7 @@ impl DaemonGuard<'_> {
                     "--log",
                     log.to_str().ok_or("sink log path")?,
                     "--seconds",
-                    "600",
+                    &seconds.to_string(),
                 ],
             ),
             &self

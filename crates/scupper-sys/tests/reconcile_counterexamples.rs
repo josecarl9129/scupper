@@ -271,11 +271,13 @@ struct Sys {
 impl scupper_sys::system::System for Sys {
     fn run(
         &self,
+        purpose: scupper_sys::system::HelperPurpose,
         program: scupper_sys::system::Program,
         args: &[String],
         timeout: Duration,
     ) -> Result<scupper_sys::system::ExecOutput, scupper_sys::system::ExecError> {
         self.run_in(
+            purpose,
             scupper_sys::system::ExecTarget::Host,
             program,
             args,
@@ -284,6 +286,7 @@ impl scupper_sys::system::System for Sys {
     }
     fn run_in(
         &self,
+        purpose: scupper_sys::system::HelperPurpose,
         target: scupper_sys::system::ExecTarget<'_>,
         program: scupper_sys::system::Program,
         args: &[String],
@@ -350,7 +353,8 @@ impl scupper_sys::system::System for Sys {
         {
             "0".into()
         } else {
-            return support::Script::new("ubuntu-24.04").run_in(target, program, args, timeout);
+            return support::Script::new("ubuntu-24.04")
+                .run_in(purpose, target, program, args, timeout);
         };
         Ok(ExecOutput {
             status: Some(0),

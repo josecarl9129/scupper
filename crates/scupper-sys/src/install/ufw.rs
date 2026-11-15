@@ -59,6 +59,7 @@ pub(super) fn parse(text: &str) -> Option<Status> {
 pub(super) fn observe(system: &dyn System) -> Result<Option<Status>, Refusal> {
     let run = |args: &[&str]| {
         system.run(
+            crate::system::HelperPurpose::Observation,
             Program::Ufw,
             &args.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
             EXEC_TIMEOUT,
@@ -98,7 +99,17 @@ impl Status {
         } else {
             &self.outgoing
         };
-        *policy != Policy::Allow && !self.rules.iter().any(|line| allows(line, packet))
+        // Preserve first-match order. A matching deny/reject makes the
+        // availability heuristic uncertain even if an allow follows it.
+        for line in &self.rules {
+            if matches_row(line, packet, false) {
+                return true;
+            }
+            if allows(line, packet) {
+                return false;
+            }
+        }
+        *policy != Policy::Allow
     }
 }
 
@@ -118,6 +129,10 @@ fn on_uplink<'a>(fields: &'a [&'a str], uplink: &str) -> Option<&'a [&'a str]> {
 }
 
 fn allows(line: &str, packet: Packet<'_>) -> bool {
+    matches_row(line, packet, true)
+}
+
+fn matches_row(line: &str, packet: Packet<'_>, allow: bool) -> bool {
     let line = line.split('#').next().unwrap_or("");
     let ipv6 = line.split_whitespace().any(|field| field == "(v6)");
     if ipv6 != packet.destination.is_ipv6() {
@@ -127,7 +142,13 @@ fn allows(line: &str, packet: Packet<'_>) -> bool {
         .split_whitespace()
         .filter(|field| *field != "(v6)")
         .collect();
-    let Some(action) = fields.iter().position(|field| *field == "ALLOW") else {
+    let Some(action) = fields.iter().position(|field| {
+        if allow {
+            *field == "ALLOW"
+        } else {
+            matches!(*field, "DENY" | "REJECT" | "LIMIT")
+        }
+    }) else {
         return false;
     };
     let direction = if packet.hook == "input" { "IN" } else { "OUT" };

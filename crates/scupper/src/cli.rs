@@ -56,6 +56,13 @@ enum Command {
     /// Construct or adopt the gateway namespace, stopping at the first failure.
     #[command(hide = true)]
     Boot {
+        /// Quiesce and destroy only the client device for planned shutdown.
+        #[arg(long)]
+        clean_stop: bool,
+        /// Test-only shutdown query adapter for installed `ExecStop` trials.
+        #[cfg(feature = "testing")]
+        #[arg(long, hide = true, requires = "clean_stop", value_parser = ["running", "stopping"])]
+        test_shutdown_state: Option<String>,
         /// Test-only process kill after a numbered checkpoint.
         #[cfg(feature = "testing")]
         #[arg(long, value_parser = clap::value_parser!(u8).range(0..=8))]
@@ -75,6 +82,9 @@ enum Command {
         /// One JSON `ProbeRequest` (stdin is not a byte stream).
         request: String,
     },
+    /// Internal public netlink observation and fixed client recovery probe.
+    #[command(hide = true)]
+    ClientSessions { request: String },
     /// Internal unprivileged delivery using a secret stdin protocol.
     #[command(hide = true)]
     Deliver {
@@ -300,6 +310,17 @@ where
     let executable =
         std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/usr/local/bin/scupper"));
     let system = RealSystem::default().with_canon_paths(executable, run_root);
+    #[cfg(feature = "testing")]
+    let system = match Cli::try_parse_from(args.clone())
+        .ok()
+        .map(|cli| cli.command)
+    {
+        Some(Command::Boot {
+            test_shutdown_state: Some(state),
+            ..
+        }) => system.with_shutdown_state_for_test(state == "stopping"),
+        _ => system,
+    };
     run_with(
         args,
         &Dependencies {
@@ -449,6 +470,9 @@ fn dispatch(
         }
         Command::Remote { staged } => crate::remote::run_mode(io::stdin().lock(), stdout, staged),
         Command::Boot {
+            clean_stop,
+            #[cfg(feature = "testing")]
+                test_shutdown_state: _,
             #[cfg(feature = "testing")]
             stop_after,
             #[cfg(feature = "testing")]
@@ -457,6 +481,20 @@ fn dispatch(
             trace,
         } => {
             require_root(deps, "boot")?;
+            if clean_stop {
+                scupper_sys::boot::clean_stop(&scupper_sys::boot::BootDeps {
+                    system: deps.system,
+                    namespace: &BootNamespaces(deps.namespaces),
+                    state_root: deps.state_root,
+                    config_root: deps.config_root,
+                    run_root: deps.writer_root,
+                    #[cfg(feature = "testing")]
+                    hook: None,
+                    #[cfg(feature = "testing")]
+                    secret_owner: 0,
+                })?;
+                return Ok(0);
+            }
             let _lease = match scupper_sys::lock::SupervisorLease::try_acquire(deps.writer_root) {
                 Ok(lease) => lease,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -474,7 +512,7 @@ fn dispatch(
                             "{error}; holder is not an initialized, responsive scupperd attached to the named namespace; boot refused; stop scupperd, then rerun"
                         ));
                     }
-                    writeln!(stderr, "scupperd owns the namespace; boot skipped successfully; use scupper apply for a verified update").map_err(output_error)?;
+                    writeln!(stderr, "supervisor attached; scupperd owns the namespace; boot skipped successfully; use scupper check for health and scupper apply for a verified update").map_err(output_error)?;
                     return Ok(0);
                 }
                 Err(error) => return Err(format!("supervisor lease unavailable: {error}")),
@@ -539,6 +577,13 @@ fn dispatch(
             command: DeliverCommand::Alert,
         } => Ok(scupper_sys::heartbeat::alert_child(std::io::stdin().lock())
             .map_or_else(scupper_sys::heartbeat::Failure::exit_code, |()| 0)),
+        Command::ClientSessions { request } => {
+            let result = scupper_sys::client_sessions::child(&request)
+                .map_err(|_| "client session helper failed".to_string())?;
+            serde_json::to_writer(&mut *stdout, &result).map_err(|e| e.to_string())?;
+            writeln!(stdout).map_err(output_error)?;
+            Ok(0)
+        }
         Command::Probe { request } => {
             let outcome = scupper_sys::probe_child::child_main(&request)?;
             serde_json::to_writer(&mut *stdout, &outcome).map_err(|error| error.to_string())?;

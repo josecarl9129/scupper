@@ -358,26 +358,46 @@ impl KernelCmd {
         }
     }
 
-    /// Whether dispatch requires a pinned namespace, never an `ExecTarget`.
+    /// Whether dispatch mutates the kernel and requires a pinned namespace.
     #[must_use]
     pub const fn mutates(&self) -> bool {
-        matches!(
-            self,
-            Self::Ip(
+        match self {
+            Self::ReadUdp(_) => false,
+            Self::Ip(cmd) => match cmd {
                 IpCmd::RouteReplace(..)
-                    | IpCmd::RouteDelete(_)
-                    | IpCmd::LinkSetDown(_)
-                    | IpCmd::LinkDelete(_)
-            ) | Self::Wg(
+                | IpCmd::RouteDelete(_)
+                | IpCmd::LinkSetDown(_)
+                | IpCmd::LinkDelete(_) => true,
+                IpCmd::LinkShowJson
+                | IpCmd::AddrShowJson
+                | IpCmd::RouteShowJson { .. }
+                | IpCmd::DefaultShowJson(_)
+                | IpCmd::RuleShowJson { .. }
+                | IpCmd::RouteGet { .. } => false,
+            },
+            Self::Wg(cmd) => match cmd {
                 WgCmd::SetPrivateKeyFromStdin { .. }
-                    | WgCmd::SetPresharedKeyFromStdin { .. }
-                    | WgCmd::SetListenPort { .. }
-                    | WgCmd::SetPeer { .. }
-                    | WgCmd::RemovePeer { .. }
-            ) | Self::Nft(NftCmd::LoadStdin)
-                | Self::Sysctl(SysctlCmd::Write(..))
-                | Self::Conntrack(_)
-        )
+                | WgCmd::SetPresharedKeyFromStdin { .. }
+                | WgCmd::SetListenPort { .. }
+                | WgCmd::SetPeer { .. }
+                | WgCmd::RemovePeer { .. } => true,
+                WgCmd::Show { .. } | WgCmd::Pubkey => false,
+            },
+            Self::Nft(cmd) => match cmd {
+                NftCmd::LoadStdin => true,
+                NftCmd::ListRulesetJson | NftCmd::CheckStdin => false,
+            },
+            Self::Sysctl(cmd) => match cmd {
+                SysctlCmd::Write(..) => true,
+                SysctlCmd::Read(_) => false,
+            },
+            Self::Tc(cmd) => match cmd {
+                TcCmd::QdiscShowJson { .. } | TcCmd::FilterShowJson { .. } => false,
+            },
+            Self::Conntrack(cmd) => match cmd {
+                ConntrackCmd::Flush => true,
+            },
+        }
     }
 
     /// Whether this command requires an explicitly supplied stdin stream.
@@ -482,9 +502,14 @@ fn dispatch(
     if program == Program::Wg && matches!(target, ExecTarget::Netns(_)) {
         crate::system::check_wg_args(sys, &args)?;
     }
+    let purpose = if cmd.mutates() {
+        crate::system::HelperPurpose::Mutation
+    } else {
+        crate::system::HelperPurpose::Observation
+    };
     match input {
-        Some(bytes) => sys.run_with_stdin(target, program, &args, bytes, timeout),
-        None => sys.run_in(target, program, &args, timeout),
+        Some(bytes) => sys.run_with_stdin(purpose, target, program, &args, bytes, timeout),
+        None => sys.run_in(purpose, target, program, &args, timeout),
     }
 }
 
@@ -626,18 +651,21 @@ pub(crate) fn delete_observed_rule(
     if matches.len() != 1 || matches[0] != rule {
         return Err(ExecError::spawn("rule changed before deletion"));
     }
-    let output = sys.run_in(
-        ExecTarget::Netns(held),
-        Program::Ip,
-        &strings(&[
-            family_flag(family),
-            "rule",
-            "del",
-            "priority",
-            &priority.to_string(),
-        ]),
-        crate::system::EXEC_TIMEOUT,
-    )?;
+    let output = {
+        sys.run_in(
+            crate::system::HelperPurpose::Mutation,
+            ExecTarget::Netns(held),
+            Program::Ip,
+            &strings(&[
+                family_flag(family),
+                "rule",
+                "del",
+                "priority",
+                &priority.to_string(),
+            ]),
+            crate::system::EXEC_TIMEOUT,
+        )
+    }?;
     if output.status != Some(0) {
         return Err(ExecError::spawn("rule deletion failed"));
     }

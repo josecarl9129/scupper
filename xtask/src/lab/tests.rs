@@ -219,6 +219,54 @@ fn udp(source: [u8; 4], destination: [u8; 4], sport: u16, dport: u16, payload: &
 }
 
 #[test]
+fn client2_transport_allowance_requires_exact_tuple_and_wireguard_shape() {
+    use crate::pcap::{Class, Reason};
+    let mut encrypted = vec![0; 32];
+    encrypted[0] = 4;
+    let packets = [
+        udp([192, 0, 2, 10], [198, 51, 100, 2], 51820, 51820, &encrypted),
+        udp([198, 51, 100, 2], [192, 0, 2, 10], 51820, 51820, &encrypted),
+        udp(
+            [192, 0, 2, 10],
+            [198, 51, 100, 2],
+            51820,
+            51820,
+            b"not wireguard",
+        ),
+        udp([192, 0, 2, 10], [198, 51, 100, 2], 51820, 51822, &encrypted),
+    ];
+    for enabled in [false, true] {
+        let policy =
+            Policy::from_toml(&evidence::policy_for_case(&[], false, 51821, enabled).unwrap())
+                .unwrap();
+        let report = classify(&capture(&packets), &policy, 30).unwrap();
+        if enabled {
+            for packet in &report.packets[..2] {
+                assert!(matches!(&packet.class, Class::Allowed(rule) if rule == "wireguard[2]"));
+            }
+            assert_eq!(
+                report.packets[2].class,
+                Class::Violation(Reason::MalformedWireGuard)
+            );
+        } else {
+            assert!(
+                report.packets[..3]
+                    .iter()
+                    .all(|p| p.class == Class::Violation(Reason::NotAllowListed))
+            );
+        }
+        assert_eq!(
+            report.packets[3].class,
+            Class::Violation(Reason::NotAllowListed)
+        );
+        let text: toml::Value =
+            toml::from_str(&evidence::policy_for_case(&[], false, 51821, enabled).unwrap())
+                .unwrap();
+        assert_eq!(text["expect"].as_array().unwrap().len(), 2);
+    }
+}
+
+#[test]
 fn foreign_control_accepts_any_exact_udp_marker_but_rejects_silence_and_substrings() {
     let markers: Vec<String> = ["control-first", "control-second", "control-third"]
         .map(String::from)
@@ -777,11 +825,12 @@ fn capture_loss_or_missing_statistics_cannot_establish_silence() {
 }
 
 #[test]
-fn positive_retry_receipts_still_require_provider_nat_and_uniqueness() {
+fn positive_receipts_require_provider_nat_and_uniqueness() {
     let marker = "scupper-canary-receipt";
     assert!(super::check_positive_receipt(&[], marker, true).is_err());
     assert!(super::check_positive_receipt(&[], marker, false).is_ok());
     let receipt = |ip| super::helpers::Receipt {
+        at: None,
         marker: marker.into(),
         protocol: "tcp".into(),
         peer: format!("{ip}:12345").parse().unwrap(),
@@ -855,21 +904,8 @@ fn healthy_outer_packets() -> Vec<Vec<u8>> {
 }
 
 #[test]
-fn recovered_positive_canary_cannot_hide_a_timed_out_attempts_leak() {
-    let dir = test_dir("retry-leak");
-    let mut markers = Vec::new();
-    let mut attempts = 0;
-    let delivered = super::positive::tcp(&mut markers, &dir.join("attempts.jsonl"), |_, _| {
-        attempts += 1;
-        Ok(if attempts == 1 {
-            super::helpers::Outcome::TimedOut
-        } else {
-            super::helpers::Outcome::Delivered
-        })
-    })
-    .unwrap();
-    assert_eq!(markers.len(), 2);
-    assert_eq!(delivered, markers[1]);
+fn a_later_positive_canary_cannot_hide_an_earlier_markers_leak() {
+    let markers = vec![super::Lab::marker().unwrap(), super::Lab::marker().unwrap()];
     let policy = Policy::from_toml(&evidence::policy(&markers, false).unwrap()).unwrap();
     let mut packets = healthy_outer_packets();
     assert!(evidence::contained(
@@ -891,7 +927,82 @@ fn recovered_positive_canary_cannot_hide_a_timed_out_attempts_leak() {
     assert_eq!(report.violation_count, 1);
     assert_eq!(report.counts["Violation(CanaryMarker)"], 1);
     assert!(!evidence::contained(&report));
-    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn daemon_control_and_main_share_restricted_heartbeat_policy() {
+    use super::daemon::capture_policy;
+    use crate::pcap::Class;
+
+    for stem in ["control-L10", "heartbeat", "heartbeat-tls", "alerts", "L11"] {
+        let main = capture_policy(stem, &[], 51821, true).unwrap();
+        let control = capture_policy(&format!("{stem}-control"), &[], 51821, true).unwrap();
+        let heartbeat_lines = |text: &str| {
+            text.lines()
+                .filter(|line| line.starts_with("heartbeat"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(heartbeat_lines(&main), heartbeat_lines(&control));
+        let lines = heartbeat_lines(&control);
+        if stem == "L11" {
+            assert_eq!(lines, [] as [String; 0]);
+        } else {
+            assert!(lines.contains(&"heartbeat = \"198.51.100.10:443\"".into()));
+            assert_eq!(lines.len(), if stem == "alerts" { 2 } else { 1 });
+            if stem == "alerts" {
+                assert!(lines.contains(&"heartbeat_dscp = 56".into()));
+            }
+        }
+    }
+
+    let tcp = |source: [u8; 4], destination: [u8; 4], sport: u16, dport: u16, flags: u8| {
+        let mut bytes = vec![0_u8; 40];
+        bytes[0] = 0x45;
+        bytes[2..4].copy_from_slice(&40_u16.to_be_bytes());
+        bytes[8] = 64;
+        bytes[9] = 6;
+        bytes[12..16].copy_from_slice(&source);
+        bytes[16..20].copy_from_slice(&destination);
+        bytes[20..22].copy_from_slice(&sport.to_be_bytes());
+        bytes[22..24].copy_from_slice(&dport.to_be_bytes());
+        bytes[32] = 0x50;
+        bytes[33] = flags;
+        bytes
+    };
+    let marker = "scupper-canary-00112233445566778899aabbccddeeff".to_owned();
+    let markers = std::slice::from_ref(&marker);
+    let mut packets = healthy_outer_packets();
+    packets.extend(super::helpers::injection_packets(&marker).unwrap());
+    let before_heartbeat = packets.len();
+    packets.extend([
+        tcp([198, 51, 100, 2], [198, 51, 100, 10], 44322, 443, 0x02),
+        tcp([198, 51, 100, 10], [198, 51, 100, 2], 443, 44322, 0x14),
+    ]);
+    for stem in ["control-L10", "control-L10-control"] {
+        let policy =
+            Policy::from_toml(&capture_policy(stem, markers, 51821, true).unwrap()).unwrap();
+        let bytes = capture(&packets);
+        let report = classify(&bytes, &policy, 30).unwrap();
+        evidence::injected_only(&report, &bytes, &marker).unwrap();
+        assert_eq!(report.violation_count, 3);
+        assert!(
+            report.packets[before_heartbeat..]
+                .iter()
+                .all(|packet| matches!(&packet.class, Class::Allowed(rule) if rule == "heartbeat"))
+        );
+        for invalid in [
+            tcp([198, 51, 100, 3], [198, 51, 100, 10], 44322, 443, 0x02),
+            tcp([198, 51, 100, 2], [198, 51, 100, 10], 44322, 444, 0x02),
+        ] {
+            let mut bad = packets.clone();
+            bad.push(invalid);
+            let bytes = capture(&bad);
+            let report = classify(&bytes, &policy, 30).unwrap();
+            assert_eq!(report.violation_count, 4);
+            assert!(evidence::injected_only(&report, &bytes, &marker).is_err());
+        }
+    }
 }
 
 #[test]
@@ -1177,10 +1288,10 @@ fn boot_prefix_oracle_rejects_plaintext_and_silence_with_ephemeral_exit_ports() 
         ),
     ];
     fs::write(dir.join("prefix.pcap"), capture(&packets)).unwrap();
-    evidence::boot_prefix(&dir, "prefix", markers, 43210, false).unwrap();
-    evidence::boot_prefix(&dir, "prefix", markers, 43210, true).unwrap();
+    evidence::boot_prefix(&dir, "prefix", markers, 43210, false, false).unwrap();
+    evidence::boot_prefix(&dir, "prefix", markers, 43210, true, false).unwrap();
     fs::write(dir.join("prefix.pcap"), capture(&packets[..1])).unwrap();
-    assert!(evidence::boot_prefix(&dir, "prefix", markers, 43210, true).is_err());
+    assert!(evidence::boot_prefix(&dir, "prefix", markers, 43210, true, false).is_err());
     let mut initiation = vec![0; 148];
     initiation[0] = 1;
     let handshake_only = vec![
@@ -1194,10 +1305,10 @@ fn boot_prefix_oracle_rejects_plaintext_and_silence_with_ephemeral_exit_ports() 
         ),
     ];
     fs::write(dir.join("prefix.pcap"), capture(&handshake_only)).unwrap();
-    evidence::boot_prefix(&dir, "prefix", markers, 43210, false).unwrap();
-    assert!(evidence::boot_prefix(&dir, "prefix", markers, 43210, true).is_err());
+    evidence::boot_prefix(&dir, "prefix", markers, 43210, false, false).unwrap();
+    assert!(evidence::boot_prefix(&dir, "prefix", markers, 43210, true, false).is_err());
     fs::write(dir.join("prefix.pcap"), capture(&packets)).unwrap();
-    assert!(evidence::boot_prefix(&dir, "prefix", markers, 51821, false).is_err());
+    assert!(evidence::boot_prefix(&dir, "prefix", markers, 51821, false, false).is_err());
     packets.push(udp(
         [10, 99, 0, 2],
         [192, 0, 2, 6],
@@ -1206,9 +1317,50 @@ fn boot_prefix_oracle_rejects_plaintext_and_silence_with_ephemeral_exit_ports() 
         marker.as_bytes(),
     ));
     fs::write(dir.join("prefix.pcap"), capture(&packets)).unwrap();
-    assert!(evidence::boot_prefix(&dir, "prefix", markers, 43210, false).is_err());
+    assert!(evidence::boot_prefix(&dir, "prefix", markers, 43210, false, false).is_err());
     fs::write(dir.join("prefix.pcap"), capture(&[])).unwrap();
-    assert!(evidence::boot_prefix(&dir, "prefix", markers, 43210, false).is_err());
+    assert!(evidence::boot_prefix(&dir, "prefix", markers, 43210, false, false).is_err());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn boot_prefix_client2_errors_require_exact_encrypted_quotation() {
+    let dir = test_dir("boot-prefix-client2");
+    let mut encrypted = vec![0; 32];
+    encrypted[0] = 4;
+    let mut packets = healthy_outer_packets();
+    let quote = udp([192, 0, 2, 10], [198, 51, 100, 2], 51820, 51820, &encrypted);
+    let error = |quote: &[u8]| {
+        let mut packet = vec![0; 28];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&u16::try_from(28 + quote.len()).unwrap().to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 1;
+        packet[12..16].copy_from_slice(&[198, 51, 100, 2]);
+        packet[16..20].copy_from_slice(&[192, 0, 2, 10]);
+        packet[20] = 3;
+        packet[21] = 3;
+        packet.extend(quote);
+        packet
+    };
+    packets.push(error(&quote));
+    fs::write(dir.join("prefix.pcap"), capture(&packets)).unwrap();
+    evidence::boot_prefix(&dir, "prefix", &[], 51821, false, true).unwrap();
+    assert!(evidence::boot_prefix(&dir, "prefix", &[], 51821, false, false).is_err());
+    for quote in [
+        udp([192, 0, 2, 10], [198, 51, 100, 2], 51820, 51822, &encrypted),
+        udp(
+            [192, 0, 2, 10],
+            [198, 51, 100, 2],
+            51820,
+            51820,
+            b"plaintext",
+        ),
+    ] {
+        *packets.last_mut().unwrap() = error(&quote);
+        fs::write(dir.join("prefix.pcap"), capture(&packets)).unwrap();
+        assert!(evidence::boot_prefix(&dir, "prefix", &[], 51821, false, true).is_err());
+    }
     fs::remove_dir_all(dir).unwrap();
 }
 

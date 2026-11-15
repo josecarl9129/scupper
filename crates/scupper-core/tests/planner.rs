@@ -666,7 +666,15 @@ fn assert_plan(d: &Desired, m: &KernelModel, p: &Plan, latch: Option<&Latch>) {
     let mut verified = m.ruleset == Known::Value(Ruleset::Verified(d.fingerprint()));
     let mut invariant_seen = forwarding_invariant(d, &current);
     for (i, s) in p.steps.iter().enumerate() {
-        if let Step::ForwardingOn { requires } = s {
+        if matches!(s, Step::ForwardingOn { .. }) {
+            assert!(
+                current
+                    .links
+                    .get("wg0")
+                    .is_some_and(|l| l.ready(&d.links()["wg0"]))
+            );
+        }
+        if let Step::ForwardingOn { requires } | Step::LinkUp { requires, .. } = s {
             assert!(i > 0 && p.steps[i - 1] == Step::FlushConntrack);
             assert!(!latching && latch.is_none() && m.latch.is_none());
             assert!(verified);
@@ -760,6 +768,7 @@ fn failure_state(d: &Desired, m: &KernelModel, p: &Plan, failed: usize) -> Kerne
 fn latch_survives_ticks_restore_repairs_and_failure_replanning() {
     let d = desired();
     let latch = Latch {
+        uncertain: false,
         reason: "fighting".into(),
         object: "link:foreign0".into(),
     };
@@ -925,6 +934,7 @@ fn observations(
         tc_hooks: vec![],
     };
     let forwarding = Forwarding {
+        client_sessions: scupper_core::verdict::v2::ClientSessions::default(),
         client_v4: 1,
         netns_sockets: vec![],
         v4: 1,
@@ -1154,6 +1164,7 @@ fn repair_slot(repair: &Repair) -> usize {
         Repair::ForwardingOff => 12,
         Repair::ExitDown { .. } => 13,
         Repair::HostLinkCleanup { .. } => 14,
+        Repair::LinkUp { .. } => 16,
     }
 }
 fn escalation_slot(escalation: &Escalation) -> usize {
@@ -1240,6 +1251,7 @@ fn drift(d: &Desired, mode: u8) -> KernelModel {
         37 => m.default_forwarding_v6 = Known::Unknown,
         38 => m.links.get_mut("wg0").unwrap().forwarding_v4 = Known::Unknown,
         39 => m.links.get_mut(&exit).unwrap().forwarding_v6 = Known::Unknown,
+        43 => m.links.get_mut("wg0").unwrap().up = Known::Value(false),
         41 | 42 => {
             let (mut topology, forwarding, gates, routes, mut details) = observations(d);
             if mode == 41 {
@@ -1262,7 +1274,7 @@ fn drift(d: &Desired, mode: u8) -> KernelModel {
 }
 #[derive(Default, Debug)]
 struct Coverage {
-    repairs: [usize; 16],
+    repairs: [usize; 17],
     escalations: [usize; 5],
     latch: usize,
     suppression: usize,
@@ -1406,8 +1418,9 @@ fn random_models_prefixes_failures_determinism_and_coverage() {
     let coverage = RefCell::new(Coverage::default());
     let strategy = (
         prop_oneof![
-            prop::collection::vec(0_u8..43, 2..12),
-            prop::collection::vec(0_u8..14, 1..2)
+            prop::collection::vec(0_u8..44, 2..12),
+            prop::collection::vec(0_u8..14, 1..2),
+            Just(vec![43])
         ],
         any::<bool>(),
         any::<bool>(),
@@ -1435,6 +1448,7 @@ fn random_models_prefixes_failures_determinism_and_coverage() {
                 let mut m = random_model(&d, &modes);
                 if seed_latch {
                     m.latch = Some(Latch {
+                        uncertain: false,
                         reason: "generated quarantine".into(),
                         object: SafetyClass::TcHook.key().into(),
                     });
@@ -1694,6 +1708,7 @@ fn unrelated_link_restore_cannot_bypass_route_debounce_and_external_latch_cannot
         }
     )));
     let latch = Latch {
+        uncertain: false,
         reason: "external persisted quarantine".into(),
         object: "ruleset".into(),
     };
@@ -1723,6 +1738,7 @@ fn ingress_forwarding_drift_is_not_hidden_by_the_global_values() {
     assert_eq!(tick(&d, &m, &Debounce::default()).steps, []);
     assert_eq!(settled(&d, &m).steps, on(&d));
     let latch = Latch {
+        uncertain: false,
         reason: "quarantine".into(),
         object: "ruleset".into(),
     };
@@ -1774,7 +1790,50 @@ fn blocked_restores_reserve_nothing_and_unknown_rulesets_only_close() {
 }
 
 #[test]
-fn unknown_inventory_closes_ingress_on_second_tick_then_recovers() {
+fn known_foreign_link_drift_and_deletion_preserve_client_identity() {
+    let d = desired();
+    let mut m = KernelModel::desired(&d);
+    m.links.insert("foreign0".into(), foreign(&d));
+    let first = tick(&d, &m, &Debounce::default());
+    assert!(first.steps.contains(&Step::LinkDown {
+        name: "foreign0".into()
+    }));
+    let client = m.links["wg0"].clone();
+    let mut budgets = first.budgets.clone();
+    let mut debounce = first.debounce.clone();
+    m = run(&m, &first.steps);
+    m.links.remove("foreign0"); // A successful inventory positively establishes absence.
+    let mut plans = vec![first];
+    for second in [2, 4] {
+        let next = plan(&d, &m, &budgets, None, &debounce, at(second));
+        budgets = next.budgets.clone();
+        debounce = next.debounce.clone();
+        m = run(&m, &next.steps);
+        plans.push(next);
+    }
+    for p in plans {
+        assert!(!p.debounce.ingress_quarantined);
+        assert!(
+            !p.steps
+                .contains(&Step::Emit(PlannerEvent::IngressQuarantined))
+        );
+        assert!(
+            !p.steps
+                .contains(&Step::Emit(PlannerEvent::ObservationUnknown))
+        );
+        assert!(!p.steps.iter().any(|s| match s {
+            Step::LinkDown { name } => name == "wg0",
+            Step::LinkCreate { link, .. } | Step::LinkReconfigure { link } => link.name == "wg0",
+            _ => false,
+        }));
+    }
+    assert_eq!(m.links["wg0"], client);
+    assert_eq!(m.forwarding_v4, Known::Value(1));
+    assert_eq!(m.forwarding_v6, Known::Value(1));
+}
+
+#[test]
+fn unknown_inventory_closes_ingress_immediately_then_recovers() {
     let d = desired();
     for missing_links in [false, true] {
         let mut m = KernelModel::desired(&d);
@@ -1785,16 +1844,16 @@ fn unknown_inventory_closes_ingress_on_second_tick_then_recovers() {
         }
         let first = tick(&d, &m, &Debounce::default());
         assert_eq!(first.steps.first(), Some(&Step::ForwardingOff));
-        assert!(!first.steps.contains(&Step::LinkDown { name: "wg0".into() }));
+        assert!(first.steps.contains(&Step::LinkDown { name: "wg0".into() }));
         m = run(&m, &first.steps);
         let second = plan(&d, &m, &first.budgets, None, &first.debounce, at(2));
         assert!(
-            second
+            !second
                 .steps
                 .contains(&Step::LinkDown { name: "wg0".into() })
         );
         assert!(
-            second
+            first
                 .steps
                 .contains(&Step::Emit(PlannerEvent::IngressQuarantined))
         );
@@ -1815,8 +1874,17 @@ fn unknown_inventory_closes_ingress_on_second_tick_then_recovers() {
         m.links.get_mut("wg0").unwrap().tc_hooks = Known::Value(vec![]);
         let third = plan(&d, &m, &second.budgets, None, &second.debounce, at(4));
         m = run(&m, &third.steps);
-        let fourth = plan(&d, &m, &third.budgets, None, &third.debounce, at(6));
-        m = run(&m, &fourth.steps);
+        assert_eq!(m.links["wg0"].up, Known::Value(true));
+        assert!(
+            third
+                .steps
+                .iter()
+                .position(|s| matches!(s, Step::LinkUp { name, .. } if name == "wg0"))
+                < third
+                    .steps
+                    .iter()
+                    .position(|s| matches!(s, Step::ForwardingOn { .. }))
+        );
         assert_eq!(m.links["wg0"].up, Known::Value(true));
         assert!(safe(&m, &d));
     }
@@ -2100,6 +2168,7 @@ fn inheritance_and_model_effects_expose_wrongly_emitted_steps() {
     assert_eq!(m.client_forwarding_v4, Known::Value(1));
     m = m.apply(&Step::ForwardingOff);
     m.latch = Some(Latch {
+        uncertain: false,
         reason: "test".into(),
         object: SafetyClass::TcHook.key().into(),
     });
@@ -2125,7 +2194,7 @@ proptest! {
     #![proptest_config(ProptestConfig {cases:128,failure_persistence:None,..ProptestConfig::default()})]
     #[test]
     fn plans_never_restore_routes_through_links_left_down(
-        modes in prop::collection::vec(0_u8..43, 0..12),
+        modes in prop::collection::vec(0_u8..44, 0..12),
         disconnected in any::<bool>(),
     ) {
         let connected = desired();
@@ -2325,6 +2394,7 @@ fn admin_actions_reset_only_safety_and_pending_classes_cannot_create_a_latch() {
             .any(|s| matches!(s, Step::ForwardingOn { .. }))
     );
     let latch = Latch {
+        uncertain: false,
         reason: "test".into(),
         object: SafetyClass::TcHook.key().into(),
     };
@@ -2442,6 +2512,7 @@ fn memory_latch_persistence_survives_namespace_loss() {
     let mut m = KernelModel::desired(&d);
     m.namespace = NamespaceState::InodeGone;
     let latch = Latch {
+        uncertain: false,
         reason: "fighting".into(),
         object: SafetyClass::TcHook.key().into(),
     };
@@ -2574,5 +2645,131 @@ fn disconnected_safety_requires_every_forwarding_gate_closed() {
         let plan = tick(&d, &open, &Debounce::default());
         assert_eq!(plan.steps.first(), Some(&Step::ForwardingOff));
         assert_plan(&d, &open, &plan, None);
+    }
+}
+
+#[test]
+fn unknown_host_inventory_closes_forwarding_without_flapping_client_link() {
+    let d = desired();
+    let mut m = KernelModel::desired(&d);
+    m.host_links_complete = false;
+    let first = tick(&d, &m, &Debounce::default());
+    assert_eq!(first.steps.first(), Some(&Step::ForwardingOff));
+    assert!(!first.steps.contains(&Step::LinkDown { name: "wg0".into() }));
+    assert!(!first.debounce.ingress_quarantined);
+    m.links.remove("ex-ch1");
+    let next = settled(&d, &m);
+    assert!(
+        !next
+            .repairs
+            .iter()
+            .any(|r| matches!(r, Repair::LinkRecreate { .. }))
+    );
+}
+
+#[test]
+fn d2_foreign_tc_failure_then_positive_absence_restores_client_before_forwarding() {
+    let d = desired();
+    let mut m = KernelModel::desired(&d);
+    let client = m.links["wg0"].clone();
+    let mut link = foreign(&d);
+    link.tc_hooks = Known::Unknown;
+    m.links.insert("foreign0".into(), link);
+    let first = tick(&d, &m, &Debounce::default());
+    assert!(first.steps.contains(&Step::LinkDown { name: "wg0".into() }));
+    m = run(&m, &first.steps);
+    assert_eq!(m.links["wg0"].up, Known::Value(false));
+    m.links.remove("foreign0");
+    let second = plan(&d, &m, &first.budgets, None, &first.debounce, at(2));
+    let up = second
+        .steps
+        .iter()
+        .position(|s| matches!(s, Step::LinkUp { name, .. } if name == "wg0"))
+        .unwrap();
+    let open = second
+        .steps
+        .iter()
+        .position(|s| matches!(s, Step::ForwardingOn { .. }))
+        .unwrap();
+    assert!(up < open);
+    assert_eq!(second.steps[up - 1], Step::FlushConntrack);
+    for p in [&first, &second] {
+        assert!(!p.steps.iter().any(|s| matches!(s, Step::LinkCreate { link, .. } | Step::LinkReconfigure { link } if link.name == "wg0")));
+    }
+    m = run(&m, &second.steps);
+    assert_eq!(m.links["wg0"], client);
+    assert_eq!(m.forwarding_v4, Known::Value(1));
+    assert!(!second.budgets.attempts.contains_key("link:wg0"));
+    // The same gates must prevent LinkUp and forwarding while policy is closed
+    // or the inventory is still unknown, even after debounce has elapsed.
+    for cause in 0..4 {
+        let mut blocked = m
+            .apply(&Step::ForwardingOff)
+            .apply(&Step::LinkDown { name: "wg0".into() });
+        let mut intent = d.clone();
+        match cause {
+            0 => blocked.links_complete = false,
+            1 => blocked.ruleset = Known::Unknown,
+            2 => {
+                blocked.latch = Some(Latch {
+                    uncertain: false,
+                    reason: "test".into(),
+                    object: "ruleset".into(),
+                });
+            }
+            _ => intent = desired_with("ch1", [7; 32], &Selection::Disconnected),
+        }
+        let p = settled(&intent, &blocked);
+        assert!(
+            !p.steps
+                .iter()
+                .any(|s| matches!(s, Step::ForwardingOn { .. } | Step::LinkUp { .. }))
+        );
+    }
+}
+
+#[test]
+fn unknown_never_raises_client_in_any_tick_prefix_and_probes_require_known_output() {
+    let d = desired();
+    for name in ["wg0", "ex-ch1"] {
+        let mut model = KernelModel::desired(&d);
+        model.links.get_mut(name).unwrap().tc_hooks = Known::Unknown;
+        let mut budgets = Budgets::default();
+        let mut debounce = Debounce::default();
+        for t in 0..8 {
+            let p = plan(&d, &model, &budgets, None, &debounce, at(t));
+            for step in &p.steps {
+                assert!(!matches!(
+                    step,
+                    Step::LinkUp { .. }
+                        | Step::LinkCreate {
+                            phase: LinkPhase::Up,
+                            ..
+                        }
+                ));
+                model = model.apply(step);
+                assert!(!client_output_verified(&model, &d));
+            }
+            assert_eq!(model.links["wg0"].up, Known::Value(false));
+            budgets = p.budgets;
+            debounce = p.debounce;
+        }
+        model.links.get_mut(name).unwrap().tc_hooks = Known::Value(vec![]);
+        let p = plan(&d, &model, &budgets, None, &debounce, at(10));
+        model = run(&model, &p.steps);
+        assert!(client_output_verified(&model, &d));
+    }
+    let clean = KernelModel::desired(&d);
+    assert!(client_output_verified(&clean, &d));
+    for item in 0..5 {
+        let mut m = clean.clone();
+        match item {
+            0 => m.links_complete = false,
+            1 => m.host_links_complete = false,
+            2 => m.links.get_mut("wg0").unwrap().peers = Known::Unknown,
+            3 => m.ruleset = Known::Unknown,
+            _ => m.links.get_mut("ex-ch1").unwrap().tc_hooks = Known::Unknown,
+        }
+        assert!(!client_output_verified(&m, &d));
     }
 }

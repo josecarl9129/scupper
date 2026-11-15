@@ -21,7 +21,7 @@ use std::{
     cell::{Cell, RefCell},
     path::PathBuf,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 /// Production adapter sharing boot's command operations and held namespace.
@@ -30,6 +30,8 @@ pub struct RealKernel<'a> {
     deps: BootDeps<'a>,
     held: Arc<NetnsHandle>,
     desired: Desired,
+    site: scupper_core::config::ValidatedSite,
+    gateway: scupper_core::config::GatewayId,
     exit_keys:
         std::collections::BTreeMap<scupper_core::config::ExitId, scupper_core::config::SecretName>,
     health: HealthConfigV2,
@@ -37,6 +39,9 @@ pub struct RealKernel<'a> {
     edge_path: RefCell<Option<PathBuf>>,
     owned_links: RefCell<std::collections::BTreeMap<String, u32>>,
     memory_latch: Cell<bool>,
+    execution_deadline: Cell<Option<Instant>>,
+    #[cfg(feature = "testing")]
+    unknown_inventory_tick: Cell<bool>,
     owned_dirty: Cell<bool>,
     flushed: Cell<bool>,
     state: crate::state::StateFile,
@@ -93,12 +98,17 @@ impl<'a> RealKernel<'a> {
             deps,
             held,
             desired,
+            site: config.site.clone(),
+            gateway: config.gateway.clone(),
             exit_keys,
             health,
             namespace_path,
             edge_path: RefCell::new(edge_path),
             owned_links: RefCell::new(std::collections::BTreeMap::new()),
             memory_latch: Cell::new(false),
+            execution_deadline: Cell::new(None),
+            #[cfg(feature = "testing")]
+            unknown_inventory_tick: Cell::new(false),
             owned_dirty: Cell::new(false),
             flushed: Cell::new(false),
             state,
@@ -210,6 +220,29 @@ impl<'a> RealKernel<'a> {
             Err(StepError("ruleset verification failed"))
         }
     }
+    // Both reopening operations recheck applied version, durable/memory closure,
+    // conntrack flushing and the live canonical ruleset at execution time.
+    fn restore_gate(&self, requires: scupper_core::planner::Fingerprint) -> Result<(), StepError> {
+        // Re-read durable quarantine as well as the executor's memory gate.
+        self.state.invalidate_reads();
+        let state = self
+            .state
+            .read_until(Instant::now() + EXEC_TIMEOUT)
+            .map_err(|_| StepError("state unavailable"))?;
+        let crate::state::StateRead::Present(state) = state else {
+            return Err(StepError("state unavailable"));
+        };
+        if state.applied_version != Some(self.desired.applied_version())
+            || self.memory_latch.get()
+            || state.quarantine.is_some()
+            || state.selection == scupper_core::verdict::v2::Selection::Disconnected
+            || !self.flushed.get()
+        {
+            return Err(StepError("forwarding gate refused"));
+        }
+        self.verify(requires)?;
+        Ok(())
+    }
     fn forwarding(&self, on: bool, only: Option<&str>) -> Result<(), StepError> {
         forwarding(&self.deps, &self.held, on, only)
     }
@@ -276,6 +309,142 @@ impl<'a> RealKernel<'a> {
     }
 }
 impl Kernel for RealKernel<'_> {
+    fn checkpoint_client_activity(&self, guard: &WriterGuard) -> Result<(), StepError> {
+        crate::client_sessions::before_shutdown(
+            self.deps.system,
+            &self.held,
+            &self.health.client_iface,
+            self.deps.state_root,
+            self.deps.run_root,
+            self.site
+                .gateway(&self.gateway)
+                .ok_or(StepError("unknown gateway"))?
+                .client_tunnel()
+                .identity()
+                .public_key
+                .as_str(),
+            guard,
+            &self
+                .health
+                .peers
+                .get(&self.health.client_iface)
+                .into_iter()
+                .flatten()
+                .map(|p| p.public_key)
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|_| StepError("client activity snapshot failed"))
+    }
+
+    fn take_client_session_alert(&self, guard: &WriterGuard) -> bool {
+        crate::client_sessions::take_history_alert(self.deps.run_root, guard)
+    }
+    fn before_client_link_down(&self, guard: &WriterGuard) -> Result<(), StepError> {
+        crate::client_sessions::before_down(
+            self.deps.system,
+            self.deps.state_root,
+            self.deps.run_root,
+            self.site
+                .gateway(&self.gateway)
+                .ok_or(StepError("unknown gateway"))?
+                .client_tunnel()
+                .identity()
+                .public_key
+                .as_str(),
+            guard,
+        )
+        .map_err(|_| StepError("client reset intent checkpoint failed"))
+    }
+    fn client_link_down(&self, guard: &WriterGuard) -> Result<(), StepError> {
+        let deadline = Instant::now() + crate::client_sessions::SAMPLE_INTERVAL;
+        let link_is_down = boot::inventory(&self.deps, &self.held)
+            .map_err(|_| StepError("client link state unavailable after LinkDown"))?
+            .into_iter()
+            .find(|link| link.ifname == self.health.client_iface)
+            .is_none_or(|link| !link.flags.iter().any(|f| f == "UP"));
+        crate::client_sessions::link_down_until(
+            self.deps.system,
+            &self.held,
+            &self.health.client_iface,
+            self.deps.state_root,
+            self.deps.run_root,
+            self.site
+                .gateway(&self.gateway)
+                .ok_or(StepError("unknown gateway"))?
+                .client_tunnel()
+                .identity()
+                .public_key
+                .as_str(),
+            guard,
+            link_is_down,
+            deadline,
+        )
+        .map_err(|_| StepError("client reset checkpoint failed"))
+    }
+    fn before_client_link_up(&self, guard: &WriterGuard) -> Result<(), StepError> {
+        let deadline = Instant::now() + crate::client_sessions::SAMPLE_INTERVAL;
+        let inventory = boot::inventory(&self.deps, &self.held)
+            .map_err(|_| StepError("client link inventory failed"))?;
+        let link = inventory
+            .iter()
+            .find(|link| link.ifname == self.health.client_iface)
+            .ok_or(StepError("client link missing"))?;
+        let gateway = self
+            .site
+            .gateway(&self.gateway)
+            .ok_or(StepError("unknown gateway"))?;
+        crate::client_sessions::before_up_until(
+            self.deps.system,
+            &self.held,
+            &self.health.client_iface,
+            self.deps.state_root,
+            self.deps.run_root,
+            gateway.client_tunnel().identity().public_key.as_str(),
+            !link.flags.iter().any(|flag| flag == "UP"),
+            guard,
+            deadline,
+            true,
+        )
+        .map_err(|_| StepError("client reset baseline unavailable"))
+    }
+    fn recover_client_sessions(
+        &self,
+        guard: &WriterGuard,
+        desired: &Desired,
+        model: &scupper_core::planner::KernelModel,
+    ) -> Result<(), StepError> {
+        if !scupper_core::planner::client_output_verified(model, desired) {
+            return Ok(());
+        }
+        if self.memory_latch.get() {
+            return Ok(());
+        }
+        let state = self
+            .state
+            .read_until(Instant::now() + EXEC_TIMEOUT)
+            .map_err(|_| StepError("client session state unavailable"))?;
+        let crate::state::StateRead::Present(state) = state else {
+            return Err(StepError("client session state unavailable"));
+        };
+        if state.quarantine.is_some()
+            || state.selection == scupper_core::verdict::v2::Selection::Disconnected
+            || state.applied_version != Some(desired.applied_version())
+        {
+            return Ok(());
+        }
+        self.verify(desired.fingerprint())?;
+        crate::client_sessions::probe_pending(
+            self.deps.system,
+            &self.held,
+            &self.site,
+            &self.gateway,
+            self.deps.state_root,
+            self.deps.run_root,
+            guard,
+        )
+        .map_err(|_| StepError("client session probe failed"))
+    }
+
     fn checkpoint_owned(&self, guard: &WriterGuard) -> Result<(), StepError> {
         if !self.owned_dirty.get() {
             return Ok(());
@@ -290,12 +459,34 @@ impl Kernel for RealKernel<'_> {
         Ok(())
     }
 
+    fn begin_tick(&self) {
+        self.invalidate_state();
+        #[cfg(feature = "testing")]
+        self.unknown_inventory_tick
+            .set(std::fs::remove_file(self.deps.run_root.join("unknown-inventory-once")).is_ok());
+    }
     fn invalidate_state(&self) {
         self.state.invalidate_reads();
     }
     fn observe(&self, held: &NetnsHandle) -> Observation {
         self.flushed.set(false);
-        collect::reconcile::observe(
+        // Deterministic stop regression: pause inside a healthy observation,
+        // then return the Unknown an interrupted inventory helper would yield.
+        // The shutdown re-observation bypasses this one-shot hook.
+        #[cfg(feature = "testing")]
+        let interrupted = if std::fs::remove_file(self.deps.run_root.join("pause-observation-once"))
+            .is_ok()
+        {
+            let _ = std::fs::write(self.deps.run_root.join("observation-paused"), b"phase A");
+            let until = Instant::now() + Duration::from_secs(10);
+            while self.deps.run_root.join("hold-observation").exists() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            true
+        } else {
+            false
+        };
+        let observation = collect::reconcile::observe(
             self.deps.system,
             held,
             &self.desired,
@@ -303,6 +494,35 @@ impl Kernel for RealKernel<'_> {
             &self.namespace_path,
             self.edge_path.borrow().as_deref(),
             &self.owned_links.borrow(),
+        );
+        #[cfg(feature = "testing")]
+        let observation = if self.unknown_inventory_tick.get() || interrupted {
+            let mut observation = observation;
+            observation.model.links_complete = false;
+            observation.safety_complete = false;
+            observation.complete = false;
+            observation
+        } else {
+            observation
+        };
+        observation
+    }
+    fn mutations_settled(&self) -> bool {
+        crate::system::mutations_settled()
+    }
+    fn drain_helpers(&self, deadline: Instant) -> bool {
+        crate::system::drain_helpers_until(deadline)
+    }
+    fn observe_until(&self, held: &NetnsHandle, deadline: Instant) -> Observation {
+        collect::reconcile::observe_until(
+            self.deps.system,
+            held,
+            &self.desired,
+            &self.health,
+            &self.namespace_path,
+            self.edge_path.borrow().as_deref(),
+            &self.owned_links.borrow(),
+            deadline,
         )
     }
     fn observe_rest(
@@ -365,29 +585,63 @@ impl Kernel for RealKernel<'_> {
         observation.complete &= Instant::now() < deadline;
         observation
     }
-    #[allow(clippy::too_many_lines)]
+    fn execution_deadline(&self, deadline: Option<Instant>) {
+        self.execution_deadline.set(deadline);
+    }
+    #[allow(clippy::too_many_lines)] // Keep idempotent dispatch and shared budgets together.
+    fn hold_latch(&self, latch: Option<&scupper_core::planner::Latch>) {
+        self.memory_latch.set(latch.is_some());
+    }
     fn execute(&self, step: &Step) -> Result<(), StepError> {
+        self.execute_mutation(step)
+    }
+    fn restore_name(&self, held: &NetnsHandle, guard: &WriterGuard) -> Result<(), StepError> {
+        self.restore_name_until(
+            held,
+            guard,
+            Instant::now() + std::time::Duration::from_millis(100),
+        )
+    }
+    fn restore_name_until(
+        &self,
+        held: &NetnsHandle,
+        guard: &WriterGuard,
+        deadline: Instant,
+    ) -> Result<(), StepError> {
+        restore_mount_until(held, &self.namespace_path, guard, deadline).map_err(|error| {
+            if matches!(error, NetnsError::MountEscalation { .. }) {
+                eprintln!("scupperd: {error}");
+                StepError("namespace restore escalation")
+            } else {
+                StepError("namespace rebind failed")
+            }
+        })
+    }
+}
+impl RealKernel<'_> {
+    #[allow(clippy::too_many_lines)]
+    fn execute_mutation(&self, step: &Step) -> Result<(), StepError> {
+        // A tightening operation has a whole-operation budget, rather than a
+        // fresh three seconds for every link/sysctl in an adversarial inventory.
+        let bounded = collect::reconcile::SafetySystem {
+            read_purpose: crate::system::HelperPurpose::Observation,
+            system: self.deps.system,
+            deadline: self
+                .execution_deadline
+                .get()
+                .unwrap_or_else(|| Instant::now() + Duration::from_secs(30)),
+            failed: Cell::new(false),
+            failures: RefCell::new(Vec::new()),
+            unsafe_tc: std::cell::RefCell::new(std::collections::BTreeSet::new()),
+        };
+        let deps = BootDeps {
+            system: &bounded,
+            ..self.deps
+        };
         match step {
-            Step::ForwardingOff => self.forwarding(false, None),
+            Step::ForwardingOff => forwarding(&deps, &self.held, false, None),
             Step::ForwardingOn { requires } => {
-                // Re-read durable quarantine as well as the executor's memory gate.
-                self.state.invalidate_reads();
-                let state = self
-                    .state
-                    .read_until(Instant::now() + EXEC_TIMEOUT)
-                    .map_err(|_| StepError("state unavailable"))?;
-                let crate::state::StateRead::Present(state) = state else {
-                    return Err(StepError("state unavailable"));
-                };
-                if state.applied_version != Some(self.desired.applied_version())
-                    || self.memory_latch.get()
-                    || state.quarantine.is_some()
-                    || state.selection == scupper_core::verdict::v2::Selection::Disconnected
-                    || !self.flushed.get()
-                {
-                    return Err(StepError("forwarding gate refused"));
-                }
-                self.verify(*requires)?;
+                self.restore_gate(*requires)?;
                 self.forwarding(true, None)
             }
             Step::LoadRuleset {
@@ -470,21 +724,37 @@ impl Kernel for RealKernel<'_> {
                 crate::cmd::delete_observed_rule(self.deps.system, &self.held, rule)
                     .map_err(|_| StepError("rule deletion failed"))
             }
-            Step::LinkDown { name } => boot::links::set_up(&self.deps, &self.held, name, false)
+            Step::LinkDown { name } => boot::links::set_up(&deps, &self.held, name, false)
                 .map_err(|_| StepError("link down failed")),
-            Step::LinkForwardingOff { name } => self.forwarding(false, Some(name)),
+            Step::LinkUp { name, requires } => {
+                self.restore_gate(*requires)?;
+                if name != &self.health.client_iface
+                    || !boot::inventory(&self.deps, &self.held)
+                        .map_err(|_| StepError("link inventory failed"))?
+                        .iter()
+                        .any(|link| {
+                            link.ifname == *name
+                                && link.kind.as_deref() == Some("wireguard")
+                                && self.owned_links.borrow().get(name) == Some(&link.ifindex)
+                        })
+                {
+                    return Err(StepError("client link ownership changed"));
+                }
+                boot::links::set_up(&self.deps, &self.held, name, true)
+                    .map_err(|_| StepError("link up failed"))
+            }
+            Step::LinkForwardingOff { name } => forwarding(&deps, &self.held, false, Some(name)),
             Step::LinkCreate { .. }
             | Step::LinkReconfigure { .. }
             | Step::ReResolveEndpoint { .. } => self.link_step(step),
             Step::TcDelete { name, hook } => {
-                boot::links::delete_hook(&self.deps, &self.held, name, hook)
+                boot::links::delete_hook(&deps, &self.held, name, hook)
                     .map_err(|_| StepError("hook removal failed"))?;
-                let links = boot::inventory(&self.deps, &self.held)
+                let links = boot::inventory(&deps, &self.held)
                     .map_err(|_| StepError("hook verification failed"))?;
                 if let Some(link) = links.iter().find(|l| &l.ifname == name) {
-                    let hooks =
-                        collect::reconcile::hooks(self.deps.system, &self.held, name, link.xdp)
-                            .map_err(|_| StepError("hook verification failed"))?;
+                    let hooks = collect::reconcile::hooks(deps.system, &self.held, name, link.xdp)
+                        .map_err(|_| StepError("hook verification failed"))?;
                     if hooks.contains(hook) {
                         return Err(StepError("hook still present"));
                     }
@@ -496,31 +766,6 @@ impl Kernel for RealKernel<'_> {
             }
         }
     }
-    fn hold_latch(&self, latch: Option<&scupper_core::planner::Latch>) {
-        self.memory_latch.set(latch.is_some());
-    }
-    fn restore_name(&self, held: &NetnsHandle, guard: &WriterGuard) -> Result<(), StepError> {
-        self.restore_name_until(
-            held,
-            guard,
-            Instant::now() + std::time::Duration::from_millis(100),
-        )
-    }
-    fn restore_name_until(
-        &self,
-        held: &NetnsHandle,
-        guard: &WriterGuard,
-        deadline: Instant,
-    ) -> Result<(), StepError> {
-        restore_mount_until(held, &self.namespace_path, guard, deadline).map_err(|error| {
-            if matches!(error, NetnsError::MountEscalation { .. }) {
-                eprintln!("scupperd: {error}");
-                StepError("namespace restore escalation")
-            } else {
-                StepError("namespace rebind failed")
-            }
-        })
-    }
 }
 
 pub(crate) fn forwarding(
@@ -529,6 +774,18 @@ pub(crate) fn forwarding(
     on: bool,
     only: Option<&str>,
 ) -> Result<(), StepError> {
+    let bounded = collect::reconcile::SafetySystem {
+        read_purpose: crate::system::HelperPurpose::Observation,
+        system: deps.system,
+        deadline: Instant::now() + Duration::from_secs(30),
+        failed: Cell::new(false),
+        failures: RefCell::new(Vec::new()),
+        unsafe_tc: std::cell::RefCell::new(std::collections::BTreeSet::new()),
+    };
+    let deps = &BootDeps {
+        system: &bounded,
+        ..*deps
+    };
     let mut failed = false;
     // Close both global gates before inventory or per-device work. A failed
     // family write never prevents attempting the other family or later gates.

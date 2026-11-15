@@ -187,6 +187,26 @@ pub enum RepairKind {
     SafetyDrift,
 }
 
+/// Client service evidence after a client link reset, independent of containment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // Independent cohorts can coexist; per-peer storage uses explicit states.
+pub struct ClientSessions {
+    /// A peer active in the 180 seconds preceding reset has not recovered.
+    pub active_reset: bool,
+    /// An idle or never-connected peer has not recovered.
+    pub idle_reset: bool,
+    /// History is unavailable during its initial lease or a tracking gap recovery.
+    pub unknown: bool,
+    /// Historical evidence is unavailable; this is not confirmed recovery.
+    pub history_unavailable: bool,
+    /// An authenticated activity lease expired without confirmation.
+    pub expired_unconfirmed: bool,
+    /// Check could not read current client activity; uncertainty is unbounded.
+    pub telemetry_unavailable: bool,
+    /// A configured peer is absent from the current device sample.
+    pub peer_missing: bool,
+}
+
 /// Forwarding and the listening side of the client tunnel, observed together.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Forwarding {
@@ -210,6 +230,8 @@ pub struct Forwarding {
     pub host_sockets: Vec<UdpSocket>,
     /// Every configured client peer's handshake, including explicit Never.
     pub client_handshakes: BTreeMap<[u8; 32], Handshake>,
+    /// Persistent reset generation evaluated against fresh client transport.
+    pub client_sessions: ClientSessions,
 }
 
 /// One client's forwarded lookup results for both address families.
@@ -224,7 +246,7 @@ pub struct RouteObs {
 /// Client listener disagreement; client reachability beyond the host is unproven.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum ClientFault {
-    /// Client-facing link is administratively down.
+    /// Client-facing link is administratively down or positively absent.
     LinkDown,
     /// Client-facing public identity differs or is unset.
     PublicKey,
@@ -415,6 +437,12 @@ pub enum Degraded {
     DisconnectNotEffective,
     /// The gateway's client listener is broken.
     ClientSideBroken(ClientFault),
+    /// Recently active clients still lack authenticated post-reset transport.
+    ClientSessionsReset,
+    /// Session history is unavailable, including stalled activity tracking.
+    ClientSessionsUnknown,
+    /// Check's own client telemetry read failed.
+    ClientSessionTelemetryUnknown,
     /// Probe ran but the exit path failed.
     ExitProbeFailed(ProbeError),
     /// Probe returned an implausible public IPv4 exit address.
@@ -479,6 +507,18 @@ pub enum Warning {
     DaemonStale,
     /// At least one configured client has a stale or never handshake.
     ClientHandshakesStale,
+    /// Idle clients have unconfirmed sessions after a client link reset.
+    IdleClientSessionsReset,
+    /// Session readiness is pending while an earlier stage has precedence.
+    ClientSessionsPending,
+    /// A configured peer was missing from the device sample.
+    ClientSessionPeerMissing,
+    /// Check could not read client activity telemetry.
+    ClientSessionTelemetryUnavailable,
+    /// Session activity lease expired without confirmation.
+    ClientSessionsExpiredUnconfirmed,
+    /// Durable activity history is unavailable or has an observation gap.
+    ClientSessionHistoryUnavailable,
 }
 
 /// Observation stage, in execution order.
@@ -576,6 +616,32 @@ pub struct Report {
     pub config_version: u64,
 }
 
+impl Report {
+    /// True only when every diagnosis concerns client session readiness.
+    #[must_use]
+    pub fn session_only(&self) -> bool {
+        matches!(
+            self.verdict,
+            Verdict::Degraded(
+                Degraded::ClientSessionsReset
+                    | Degraded::ClientSessionsUnknown
+                    | Degraded::ClientSessionTelemetryUnknown
+            )
+        ) && self.warnings.iter().all(|warning| {
+            matches!(
+                warning,
+                Warning::ClientHandshakesStale
+                    | Warning::IdleClientSessionsReset
+                    | Warning::ClientSessionsPending
+                    | Warning::ClientSessionPeerMissing
+                    | Warning::ClientSessionTelemetryUnavailable
+                    | Warning::ClientSessionsExpiredUnconfirmed
+                    | Warning::ClientSessionHistoryUnavailable
+            )
+        })
+    }
+}
+
 /// Next required stage, or a decisive report/error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Next {
@@ -619,6 +685,9 @@ impl std::fmt::Display for Verdict {
         match self {
             Self::Protected { exit, exit_ip } => write!(f, "protected: {exit} ({exit_ip})"),
             Self::Unprotected(violations) => write!(f, "UNPROTECTED: {:?}", violations.as_slice()),
+            Self::Degraded(Degraded::ClientSideBroken(ClientFault::LinkDown)) => {
+                f.write_str("degraded: client link down")
+            }
             Self::Degraded(reason) => write!(f, "degraded: {reason:?}"),
             Self::FailClosed(reason) => write!(f, "fail closed: {reason:?}"),
             Self::Unsupervised { exit, exit_ip, why } => {

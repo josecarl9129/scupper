@@ -47,6 +47,86 @@ const REBOOT_STEPS: &[RebootStep] = &[
     RebootStep::StartUnits,
 ];
 
+fn deadline_properties(rendered: &str) -> Result<Vec<(&'static str, u64)>> {
+    let mut values = Vec::new();
+    for (directive, property) in [
+        ("TimeoutStartSec=", "TimeoutStartUSec"),
+        ("TimeoutStopSec=", "TimeoutStopUSec"),
+        ("WatchdogSec=", "WatchdogUSec"),
+    ] {
+        if let Some(value) = rendered
+            .lines()
+            .find_map(|line| line.strip_prefix(directive))
+        {
+            let seconds: u64 = value.trim_end_matches('s').parse()?;
+            values.push((property, seconds * 1_000_000));
+        }
+    }
+    Ok(values)
+}
+fn verify_unit_deadlines(effective: &str, rendered: &str) -> Result<()> {
+    for (property, expected) in deadline_properties(rendered)? {
+        let value = effective
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix(property)
+                    .and_then(|rest| rest.strip_prefix('='))
+            })
+            .ok_or_else(|| format!("missing effective unit deadline: {property}"))?;
+        // systemctl show renders the shipped integral-second deadlines as
+        // seconds or minutes; compare durations, not lines in systemctl cat.
+        let mut actual = 0_u64;
+        for component in value.split_whitespace() {
+            let (number, scale) = [
+                ("min", 60_000_000),
+                ("ms", 1_000),
+                ("us", 1),
+                ("s", 1_000_000),
+                ("h", 3_600_000_000),
+            ]
+            .into_iter()
+            .find_map(|(suffix, scale)| {
+                component.strip_suffix(suffix).map(|number| (number, scale))
+            })
+            .ok_or_else(|| format!("unsupported effective unit deadline: {property}={value}"))?;
+            actual += number.parse::<u64>()? * scale;
+        }
+        if actual != expected {
+            return fail(format!(
+                "effective unit deadline differs from renderer: {property}={value}"
+            ));
+        }
+    }
+    if rendered.lines().any(|line| line == "KillMode=mixed")
+        && !effective.lines().any(|line| line == "KillMode=mixed")
+    {
+        return fail("effective daemon KillMode is not mixed");
+    }
+    Ok(())
+}
+fn verify_shutdown_ordering(properties: &str) -> Result<()> {
+    for property in ["Conflicts=", "Before="] {
+        if !properties.lines().any(|line| {
+            line.strip_prefix(property).is_some_and(|targets| {
+                targets
+                    .split_whitespace()
+                    .any(|target| target == "shutdown.target")
+            })
+        }) {
+            return fail(format!("net unit lacks {property}shutdown.target"));
+        }
+    }
+    Ok(())
+}
+fn shutdown_stop_override(state: &str) -> Result<String> {
+    if !matches!(state, "running" | "stopping") {
+        return fail("unknown shutdown-state adapter value");
+    }
+    Ok(format!(
+        "[Service]\nExecStop=\nExecStop={CLI} boot --clean-stop --test-shutdown-state {state}\n"
+    ))
+}
+
 struct SystemdLab {
     lab: Lab,
     baseline: HostSnapshot,
@@ -100,6 +180,7 @@ pub fn run(artifacts: &Path, binaries: &Path, case: &str) -> Result<()> {
         lab: Lab {
             boot_root: private.clone(),
             boot_root_ready: false,
+            sampler: None,
             runner,
             registry: Registry::default(),
             services: Vec::new(),
@@ -119,6 +200,11 @@ pub fn run(artifacts: &Path, binaries: &Path, case: &str) -> Result<()> {
             inheritance: None,
             host_sysctls: None,
             fault_markers: Vec::new(),
+            peer_flow_logs: Vec::new(),
+            peer_markers: std::collections::BTreeMap::new(),
+            last_probe_served: std::collections::BTreeMap::new(),
+            session_check_at: None,
+            gateway_activity: super::check_v2::GatewayActivity::default(),
             next_source_port: 20000,
             exit_port: 51821,
             client_ports_ready: false,
@@ -152,6 +238,7 @@ pub fn run(artifacts: &Path, binaries: &Path, case: &str) -> Result<()> {
         || captures.is_err()
         || routes_cleanup.is_err()
     {
+        harness.lab.save_session_failure(Path::new("/"), "systemd");
         harness.failure_diagnostics()
     } else {
         Ok(())
@@ -519,12 +606,30 @@ impl SystemdLab {
         self.lab.start_sinks()?;
         self.ready()?;
         let units = self.systemctl(&["cat", "scupper-net", "scupperd"])?;
-        if !["TimeoutStartSec=90", "TimeoutStopSec=10s", "WatchdogSec=30"]
-            .iter()
-            .all(|s| units.contains(s))
-        {
-            return fail("installed unit deadlines differ from design");
+        for (unit, rendered) in [
+            ("scupper-net", scupper_core::render::units::scupper_net()),
+            ("scupperd", scupper_core::render::units::scupperd()),
+        ] {
+            verify_unit_deadlines(
+                &self.systemctl(&[
+                    "show",
+                    unit,
+                    "-p",
+                    "TimeoutStartUSec",
+                    "-p",
+                    "TimeoutStopUSec",
+                    "-p",
+                    "WatchdogUSec",
+                    "-p",
+                    "KillMode",
+                ])?,
+                rendered,
+            )?;
         }
+        let ordering =
+            self.systemctl(&["show", "scupper-net", "-p", "Conflicts", "-p", "Before"])?;
+        verify_shutdown_ordering(&ordering)?;
+        fs::write(self.lab.artifacts.join("shutdown-ordering.txt"), ordering)?;
         fs::write(self.lab.artifacts.join("installed-units.txt"), units)?;
         let rendered = self.cli(&["rules"])?;
         fs::write(&self.lab.rules, rendered)?;
@@ -593,10 +698,30 @@ impl SystemdLab {
         self.ready_recorded(None)
     }
     fn ready_recorded(&mut self, label: Option<&str>) -> Result<()> {
+        let outcome = self.ready_recorded_inner(label);
+        if outcome.is_err() {
+            self.lab
+                .save_session_failure(Path::new("/"), "systemd-ready");
+        }
+        outcome
+    }
+    fn ready_recorded_inner(&mut self, label: Option<&str>) -> Result<()> {
         let started = Instant::now();
-        let until = started + Duration::from_secs(90);
+        // 180 s complete sampling + 15 s first sample + 30 s startup/check
+        // allowance + 15 s runner slack. Keep both configured clients active.
+        // Pre-join install checks have no client tunnels or sinks yet. This
+        // flag is set only after both client wg0 interfaces and routes are up.
+        let mut traffic = if self.lab.client_ports_ready {
+            Some(self.lab.recovery_traffic("systemd-ready")?)
+        } else {
+            None
+        };
+        let until = started + Duration::from_secs(240);
+        self.lab.runner.phase = self.lab.runner.phase.max(until).min(self.lab.runner.whole);
         loop {
             self.lab.runner.check()?;
+            self.lab.sample_gateway_activity();
+            self.lab.session_check_at = Some(super::check_v2::lab_now());
             let (status, output) = self
                 .lab
                 .runner
@@ -613,6 +738,11 @@ impl SystemdLab {
                 )?;
             }
             if status.code() == Some(0) {
+                if let Some(traffic) = &mut traffic {
+                    let report: serde_json::Value = serde_json::from_str(&output)?;
+                    self.lab
+                        .assert_recovery_served(traffic, &report, Path::new("/"))?;
+                }
                 break;
             }
             if Instant::now() >= until {
@@ -648,6 +778,116 @@ impl SystemdLab {
         }
         Ok(())
     }
+    // The installed CLI, launched by systemd's actual ExecStop, changes only
+    // its shutdown-state query. All leases, telemetry, deletion and sealing run
+    // in that child; there is no in-process replacement for the stop operation.
+    fn stop_with_shutdown_state(&mut self, state: &str) -> Result<()> {
+        let directory = Path::new("/run/systemd/system/scupper-net.service.d");
+        fs::create_dir_all(directory)?;
+        let drop_in = directory.join("90-scupper-lab-shutdown.conf");
+        fs::write(&drop_in, shutdown_stop_override(state)?)?;
+        let trial = (|| {
+            self.systemctl(&["daemon-reload"])?;
+            // Separate calls ensure the reconciler releases its lease before
+            // ExecStop samples and seals the network unit's clean stop.
+            self.systemctl(&["stop", "scupperd"])?;
+            self.require_stop_success("scupperd")?;
+            self.systemctl(&["stop", "scupper-net"])?;
+            self.require_stop_success("scupper-net")?;
+            self.require_stop_success("scupperd")?;
+            Ok(())
+        })();
+        let cleanup = (|| {
+            fs::remove_file(&drop_in)?;
+            self.systemctl(&["daemon-reload"])?;
+            Ok(())
+        })();
+        super::mutation::finish(trial, cleanup)
+    }
+    fn require_stop_success(&mut self, unit: &str) -> Result<()> {
+        let result = self.systemctl(&["show", unit, "-p", "Result", "--value"])?;
+        if result.trim() != "success" {
+            return fail(format!("{unit} stop failed: Result={}", result.trim()));
+        }
+        Ok(())
+    }
+    fn client_protection(&mut self) -> Result<(serde_json::Value, String)> {
+        let rules = scupper_core::canon::canonicalize(&self.lab.cmd(
+            "scupper",
+            "nft",
+            &["-j", "list", "ruleset"],
+        )?)?;
+        let forwarding = self.lab.cmd(
+            "scupper",
+            "sysctl",
+            &["-n", "net.ipv4.ip_forward", "net.ipv6.conf.all.forwarding"],
+        )?;
+        Ok((rules, forwarding))
+    }
+    fn manual_stop_preserves_clients(&mut self) -> Result<()> {
+        let initial = self.client_protection()?;
+        if initial.1.lines().any(|value| value.trim() != "1") {
+            return fail("daemon stop baseline forwarding is not enabled");
+        }
+        // Freeze the sampler before taking the byte-for-byte baseline.
+        self.systemctl(&["stop", "scupperd"])?;
+        self.require_stop_success("scupperd")?;
+        if self.client_protection()? != initial {
+            return fail("real daemon stop changed ruleset or forwarding");
+        }
+        let before = fs::read("/var/lib/scupper/client-sessions.json")?;
+        let protection = self.client_protection()?;
+        // Exercise the shipped ExecStop and its genuine running/degraded query.
+        self.systemctl(&["stop", "scupper-net"])?;
+        self.require_stop_success("scupper-net")?;
+        if self.client_protection()? != protection {
+            return fail("manual ExecStop changed ruleset or forwarding");
+        }
+        let links: serde_json::Value = serde_json::from_str(&self.lab.cmd(
+            "scupper",
+            "ip",
+            &["-j", "link", "show", "dev", "wg0"],
+        )?)?;
+        if !links[0]["flags"]
+            .as_array()
+            .is_some_and(|flags| flags.iter().any(|flag| flag == "UP"))
+            || fs::read("/var/lib/scupper/client-sessions.json")? != before
+            || !serde_json::from_slice::<serde_json::Value>(&before)?["clean_stop"].is_null()
+        {
+            return fail("manual ExecStop changed wg0 or session history");
+        }
+        fs::write(self.lab.artifacts.join("manual-exec-stop.json"), &before)?;
+        self.systemctl(&["start", "scupper-net", "scupperd"])?;
+        self.ready()
+    }
+    fn verify_shutdown_checkpoint(&mut self) -> Result<()> {
+        let record: serde_json::Value =
+            serde_json::from_slice(&fs::read("/var/lib/scupper/client-sessions.json")?)?;
+        if !record["clean_stop"].is_object() {
+            return fail("real shutdown ExecStop did not seal a marker");
+        }
+        let (status, _) = self.lab.runner.output(
+            &Invocation::new("scupper", "ip", &["link", "show", "dev", "wg0"]),
+            None,
+        )?;
+        if status.success() {
+            return fail("real shutdown ExecStop left wg0 present");
+        }
+        fs::write(
+            self.lab.artifacts.join("exec-stop-sealed.json"),
+            serde_json::to_vec_pretty(&record)?,
+        )?;
+        Ok(())
+    }
+    fn reboot_stop_sealed(&mut self) -> Result<()> {
+        dispatch_reboot_steps(&REBOOT_STEPS[..REBOOT_STEPS.len() - 1], |step| {
+            self.reboot_step(step)?;
+            if step == RebootStep::StopUnits {
+                self.verify_shutdown_checkpoint()?;
+            }
+            Ok(())
+        })
+    }
     fn reboot_stop(&mut self) -> Result<()> {
         dispatch_reboot_steps(&REBOOT_STEPS[..REBOOT_STEPS.len() - 1], |step| {
             self.reboot_step(step)
@@ -661,7 +901,7 @@ impl SystemdLab {
         let exists = Path::new("/run/netns/scupper").exists();
         match step {
             RebootStep::StopUnits => {
-                self.systemctl(&["stop", "scupperd", "scupper-net"])?;
+                self.stop_with_shutdown_state("stopping")?;
             }
             RebootStep::FlushHostConntrack => {
                 // A reboot loses outer WireGuard conntrack too. Never flush
@@ -853,7 +1093,12 @@ impl SystemdLab {
     }
     fn evaluate(&mut self, stem: &str, markers: &[String]) -> Result<crate::pcap::Report> {
         self.lab.stop_captures()?;
-        let policy = uplink_policy(markers, &self.ports, self.lab.exit_port)?;
+        let policy_markers: Vec<_> = markers
+            .iter()
+            .chain(&self.lab.fault_markers)
+            .cloned()
+            .collect();
+        let policy = uplink_policy(&policy_markers, &self.ports, self.lab.exit_port)?;
         fs::write(
             self.lab.artifacts.join(format!("{stem}.policy.toml")),
             &policy,
@@ -935,6 +1180,9 @@ impl SystemdLab {
         {
             return fail("negative canary has no client tunnel route");
         }
+        self.lab
+            .peer_markers
+            .insert(marker.into(), namespace.into());
         let (status, text) = self.lab.runner.output(
             &Invocation::new(
                 namespace,
@@ -1039,6 +1287,68 @@ fn uplink_policy(markers: &[String], ports: &[u16], current_port: u16) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stop_budget_check_rejects_previous_shorter_unit_timeout() {
+        let rendered = scupper_core::render::units::scupperd();
+        assert!(
+            deadline_properties(rendered)
+                .unwrap()
+                .contains(&("TimeoutStopUSec", 270_000_000))
+        );
+        let effective =
+            "TimeoutStartUSec=90s\nTimeoutStopUSec=270s\nWatchdogUSec=30s\nKillMode=mixed";
+        verify_unit_deadlines(effective, rendered).unwrap();
+        assert!(verify_unit_deadlines(&effective.replace("270s", "240s"), rendered).is_err());
+    }
+    #[test]
+    fn installed_deadlines_follow_each_renderer_and_shutdown_edges_are_required() {
+        for rendered in [
+            scupper_core::render::units::scupper_net(),
+            scupper_core::render::units::scupperd(),
+        ] {
+            let mut effective = deadline_properties(rendered)
+                .unwrap()
+                .into_iter()
+                .map(|(property, micros)| format!("{property}={}s", micros / 1_000_000))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if rendered.contains("KillMode=mixed") {
+                assert!(verify_unit_deadlines(&effective, rendered).is_err());
+                effective.push_str("\nKillMode=mixed");
+                assert!(
+                    verify_unit_deadlines(
+                        &effective.replace("KillMode=mixed", "KillMode=control-group"),
+                        rendered
+                    )
+                    .is_err()
+                );
+            }
+            verify_unit_deadlines(&effective, rendered).unwrap();
+            verify_unit_deadlines(&effective.replace("90s", "1min 30s"), rendered).unwrap();
+            assert!(verify_unit_deadlines(&effective.replace("90s", "89s"), rendered).is_err());
+            assert!(verify_unit_deadlines(&effective.replace("90s", "1min"), rendered).is_err());
+            assert!(verify_unit_deadlines(rendered, rendered).is_err());
+        }
+        verify_shutdown_ordering(
+            "Before=scupperd.service shutdown.target\nConflicts=shutdown.target\n",
+        )
+        .unwrap();
+        for missing in [
+            "Before=shutdown.target",
+            "Conflicts=shutdown.target",
+            "Before=shutdown.target.extra\nConflicts=shutdown.target",
+        ] {
+            assert!(verify_shutdown_ordering(missing).is_err());
+        }
+        for state in ["running", "stopping"] {
+            let text = shutdown_stop_override(state).unwrap();
+            assert!(text.contains(&format!(
+                "ExecStop={CLI} boot --clean-stop --test-shutdown-state {state}"
+            )));
+        }
+        assert!(shutdown_stop_override("degraded").is_err());
+    }
+
     #[test]
     fn labs_derive_kill_points_from_every_product_boot_step_in_order() {
         use scupper_sys::boot::BootStep;

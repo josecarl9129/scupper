@@ -265,6 +265,26 @@ impl Script {
     }
 }
 impl System for Script {
+    fn client_session_io(
+        &self,
+        _purpose: scupper_sys::system::HelperPurpose,
+        _: &NetnsHandle,
+        request: &scupper_sys::client_sessions::Request,
+    ) -> std::io::Result<scupper_sys::client_sessions::Response> {
+        assert!(request.probe.is_none());
+        Ok(scupper_sys::client_sessions::Response::Samples(
+            site(&self.runner)
+                .devices()
+                .values()
+                .map(|peer| scupper_sys::client_sessions::Sample {
+                    key: peer.public_key(),
+                    handshake: (0, 0),
+                    rx: 0,
+                    tx: 0,
+                })
+                .collect(),
+        ))
+    }
     fn module_loaded(&self, _: &str) -> std::io::Result<bool> {
         // These captures describe a running gateway with its modules loaded.
         Ok(true)
@@ -273,11 +293,18 @@ impl System for Script {
     fn canon_run_root(&self) -> &Path {
         Path::new(env!("CARGO_MANIFEST_DIR"))
     }
-    fn run(&self, p: Program, args: &[String], _: Duration) -> Result<ExecOutput, ExecError> {
+    fn run(
+        &self,
+        _purpose: scupper_sys::system::HelperPurpose,
+        p: Program,
+        args: &[String],
+        _: Duration,
+    ) -> Result<ExecOutput, ExecError> {
         self.execute(false, p, args)
     }
     fn run_in(
         &self,
+        _purpose: scupper_sys::system::HelperPurpose,
         target: ExecTarget<'_>,
         p: Program,
         args: &[String],
@@ -406,6 +433,25 @@ impl Root {
             path.join("boot.json"),
             serde_json::json!({"netns": {"dev": handle.identity().0, "ino": handle.identity().1}})
                 .to_string(),
+        )
+        .unwrap();
+        // These safety fixtures model fresh, maintained history with an empty
+        // required cohort. Session lifecycle/unknown-history tests replace it.
+        let site = validate(parse_site(text).unwrap()).unwrap();
+        let gateway = site.gateway(&GatewayId("gw1".into())).unwrap();
+        scupper_sys::client_sessions::provision(
+            &path,
+            gateway.client_tunnel().identity().public_key.as_str(),
+            1000,
+            &writer,
+        )
+        .unwrap();
+        scupper_sys::client_sessions::activate(
+            &path,
+            &path,
+            gateway.client_tunnel().identity().public_key.as_str(),
+            1000,
+            &writer,
         )
         .unwrap();
         Self {

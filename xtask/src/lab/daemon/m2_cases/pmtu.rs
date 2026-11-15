@@ -91,6 +91,9 @@ impl DaemonGuard<'_> {
         let (sport, dport) = ports;
         let marker = super::Lab::marker()?;
         self.lab.fault_markers.push(marker.clone());
+        if ns == "client" || ns == "client2" {
+            self.lab.peer_markers.insert(marker.clone(), ns.into());
+        }
         let bytes = datagram(source, destination, sport, dport, size, marker.as_bytes())?;
         let file = self.lab.private.join("m2-datagram.bin");
         let length = bytes.len();
@@ -349,6 +352,9 @@ impl DaemonGuard<'_> {
             .daemon_wait("PMTU established NAT tuple", Duration::from_secs(3), |_| {
                 Ok(fs::read_to_string(&log).is_ok_and(|s| !s.is_empty()))
             })?;
+        self.lab
+            .last_probe_served
+            .insert("client".into(), crate::lab::check_v2::lab_now());
         let (ns, iface, source, destination, router, sport, dport) = if reverse {
             ("provA", "wgp", provider, exit, exit, 8080, 40020)
         } else {
@@ -372,6 +378,7 @@ impl DaemonGuard<'_> {
         )?;
         self.raw_udp(ns, iface, (source, destination), (sport, dport), 1400)?;
         self.lab.runner.dwell(Duration::from_millis(500))?;
+        self.lab.sample_gateway_activity();
         self.lab.stop_capture()?;
         self.lab.stop_capture()?;
         pmtu_sender(
@@ -470,12 +477,31 @@ impl DaemonGuard<'_> {
             None,
         );
         if self.case == "L11" {
-            // Clear this trial's learned endpoint/session timers before later
-            // cases require zero ciphertext on the idle client's transport.
+            // Clear this trial's learned endpoint/session timers. Bouncing
+            // wg0 flushes its routes, so restore the active recovery client's
+            // default before later cases use it.
             self.lab
                 .cmd("client2", "ip", &["link", "set", "wg0", "down"])?;
             self.lab
                 .cmd("client2", "ip", &["link", "set", "wg0", "up"])?;
+            self.lab.cmd(
+                "client2",
+                "ip",
+                &["route", "replace", "default", "dev", "wg0"],
+            )?;
+            let route = self
+                .lab
+                .cmd("client2", "ip", &["route", "get", A.internet.peer])?;
+            if !route
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .any(|pair| pair == ["dev", "wg0"])
+            {
+                return fail(format!(
+                    "L11 cleanup left client2 without its wg0 route: {route}"
+                ));
+            }
             self.lab.assert_transport_ports()?;
             let peer = self.lab.public_keys[4].clone();
             self.lab

@@ -20,7 +20,12 @@ impl ProbeExec for Executable {
     ) -> std::result::Result<ExecOutput, ExecError> {
         let mut command = Command::new(&self.0);
         command.args(["probe", json]);
-        execute_file_command(command, namespace, timeout)
+        execute_file_command(
+            scupper_sys::system::HelperPurpose::Probe,
+            command,
+            namespace,
+            timeout,
+        )
     }
 }
 impl Lab {

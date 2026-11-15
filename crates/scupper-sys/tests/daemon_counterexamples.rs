@@ -275,7 +275,13 @@ impl System for Cached {
     fn canon_run_root(&self) -> &Path {
         &self.temp
     }
-    fn run(&self, program: Program, args: &[String], _: Duration) -> Result<ExecOutput, ExecError> {
+    fn run(
+        &self,
+        _purpose: scupper_sys::system::HelperPurpose,
+        program: Program,
+        args: &[String],
+        _: Duration,
+    ) -> Result<ExecOutput, ExecError> {
         let stdout = match program {
             Program::Nft if args == ["--version"] => {
                 self.infra_calls.set(self.infra_calls.get() + 1);
@@ -296,12 +302,13 @@ impl System for Cached {
     }
     fn run_in(
         &self,
+        purpose: scupper_sys::system::HelperPurpose,
         _: ExecTarget<'_>,
         p: Program,
         a: &[String],
         t: Duration,
     ) -> Result<ExecOutput, ExecError> {
-        self.run(p, a, t)
+        self.run(purpose, p, a, t)
     }
     fn now_unix_secs(&self) -> u64 {
         0

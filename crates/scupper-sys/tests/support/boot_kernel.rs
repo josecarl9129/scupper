@@ -52,9 +52,16 @@ impl Link {
     }
 }
 pub struct Kernel {
+    pub now: Cell<u64>,
+    // Exit health is fresh by default so session tests reach their own verdict.
+    // Set an age explicitly to model a stale exit handshake.
+    pub exit_handshake_age: Cell<u64>,
+    pub client_telemetry: Cell<bool>,
+    pub during_client_sample: RefCell<Option<Box<dyn FnOnce()>>>,
     pub conntrack_loaded: Cell<bool>,
     pub wireguard_loaded: Cell<bool>,
     pub exists: Cell<bool>,
+    pub system_state: RefCell<(Option<i32>, String)>,
     pub host: RefCell<BTreeMap<String, Link>>,
     pub ns: RefCell<BTreeMap<String, Link>>,
     pub values: RefCell<BTreeMap<String, String>>,
@@ -75,9 +82,14 @@ pub struct Kernel {
 impl Kernel {
     pub fn new() -> Self {
         Self {
+            now: Cell::new(1000),
+            exit_handshake_age: Cell::new(1),
+            client_telemetry: Cell::new(false),
+            during_client_sample: RefCell::new(None),
             conntrack_loaded: Cell::new(false),
             wireguard_loaded: Cell::new(false),
             exists: Cell::new(false),
+            system_state: RefCell::new((Some(1), "stopping\n".into())),
             host: RefCell::default(),
             ns: RefCell::new(BTreeMap::from([("lo".into(), Link::new("loopback"))])),
             values: RefCell::default(),
@@ -197,6 +209,14 @@ impl Kernel {
             });
         }
         match p {
+            Program::Systemctl if a(0) == "is-system-running" => {
+                let (status, stdout) = self.system_state.borrow().clone();
+                return Ok(ExecOutput {
+                    status,
+                    stdout,
+                    stderr: String::new(),
+                });
+            }
             Program::Modprobe => {
                 assert!(!ns);
                 if a(0) == "nf_conntrack" {
@@ -230,7 +250,11 @@ impl Kernel {
                 map.borrow_mut().insert(a(2).into(), Link::new("wireguard"));
             }
             Program::Ip if a(0) == "link" && a(1) == "delete" => {
-                assert!(!ns);
+                // Clean stop destroys the quiesced client in its held namespace.
+                if ns {
+                    assert_eq!(a(3), "wg0");
+                    assert!(!map.borrow()[a(3)].up);
+                }
                 map.borrow_mut().remove(a(3));
             }
             Program::Ip if a(0) == "link" && a(1) == "set" => {
@@ -274,6 +298,18 @@ impl Kernel {
                 );
                 let mut routes: Vec<serde_json::Value> =
                     serde_json::from_str(&self.script.text(&filename)).unwrap();
+                // Replacing an exit address also replaces its kernel local route.
+                for route in &mut routes {
+                    if route["type"] != "local" || route["dev"] != "ex-ch1" {
+                        continue;
+                    }
+                    let links = self.ns.borrow();
+                    if let Some(address) = links.get("ex-ch1").and_then(|l| l.addresses.first()) {
+                        let host = address.split('/').next().unwrap();
+                        route["prefsrc"] = serde_json::json!(host);
+                        route["dst"] = serde_json::json!(host);
+                    }
+                }
                 if let Some(route) = self.defaults.borrow().get(&(a(1) == "-6")) {
                     routes.retain(|r| r["dst"] != "default");
                     routes.push(if route.contains("unreachable") {
@@ -320,6 +356,12 @@ impl Kernel {
                         && self.values.borrow().get(k).is_some_and(|old| old != v)
                     {
                         let mut values = self.values.borrow_mut();
+                        // Linux propagates a global IPv4 forwarding change to
+                        // existing devices. Model this so full check reaches the
+                        // session verdict instead of a spurious forwarding fault.
+                        for name in self.ns.borrow().keys() {
+                            values.insert(format!("net.ipv4.conf.{name}.forwarding"), v.into());
+                        }
                         for scope in ["all", "default", "lo", "wg0", "ex-ch1"] {
                             values.insert(
                                 format!("net.ipv4.conf.{scope}.accept_redirects"),
@@ -404,7 +446,13 @@ impl Kernel {
                 if map.borrow().get(a(4)).is_some_and(|l| l.hooks) {
                     stdout = r#"[{"kind":"clsact","handle":"ffff:","parent":"ffff:fff1"}]"#.into();
                 } else {
-                    return self.script.run_in(target, p, args, Duration::from_secs(3));
+                    return self.script.run_in(
+                        scupper_sys::system::HelperPurpose::Observation,
+                        target,
+                        p,
+                        args,
+                        Duration::from_secs(3),
+                    );
                 }
             }
             Program::Tc if a(0) == "qdisc" => {
@@ -428,13 +476,26 @@ impl Kernel {
                             "allowed-ips" => format!("{key}\t{allowed}\n"),
                             "endpoints" => format!("{key}\t{endpoint}\n"),
                             "persistent-keepalive" => format!("{key}\t{}\n", link.keepalive),
-                            "latest-handshakes" => format!("{key}\t999\n"),
+                            "latest-handshakes" => {
+                                format!(
+                                    "{key}\t{}\n",
+                                    self.now.get().saturating_sub(self.exit_handshake_age.get())
+                                )
+                            }
                             _ => panic!("unexpected wg read"),
                         })
                         .collect(),
                 };
             }
-            _ => return self.script.run_in(target, p, args, Duration::from_secs(3)),
+            _ => {
+                return self.script.run_in(
+                    scupper_sys::system::HelperPurpose::Observation,
+                    target,
+                    p,
+                    args,
+                    Duration::from_secs(3),
+                );
+            }
         }
         self.closed();
         if self.fail_after.get() == Some(count) {
@@ -448,6 +509,58 @@ impl Kernel {
     }
 }
 impl System for Kernel {
+    fn client_session_io(
+        &self,
+        _purpose: scupper_sys::system::HelperPurpose,
+        _: &NetnsHandle,
+        request: &scupper_sys::client_sessions::Request,
+    ) -> std::io::Result<scupper_sys::client_sessions::Response> {
+        use scupper_sys::client_sessions::{Response, Sample};
+        self.calls.borrow_mut().push(format!(
+            "client-session {} {}",
+            request.iface,
+            if request.probe.is_some() {
+                "probe"
+            } else {
+                "checkpoint-samples"
+            }
+        ));
+        if let Some((_, destinations)) = &request.probe {
+            return Ok(Response::Probes(vec![true; destinations.len()]));
+        }
+        if let Some(action) = self.during_client_sample.borrow_mut().take() {
+            action();
+        }
+        let ns = self.ns.borrow();
+        let link = ns
+            .get(&request.iface)
+            .ok_or_else(|| std::io::Error::other("missing client link"))?;
+        let samples = link
+            .peers
+            .keys()
+            .map(|key| Sample {
+                key: scupper_core::config::PublicKey(key.clone())
+                    .bytes()
+                    .unwrap(),
+                handshake: (0, 0),
+                rx: 0,
+                tx: 0,
+            })
+            .collect();
+        Ok(if self.client_telemetry.get() {
+            Response::Telemetry {
+                device: scupper_sys::client_sessions::DeviceId {
+                    boot: "fixture-boot".into(),
+                    ifindex: 7,
+                },
+                up: link.up,
+                peers: samples,
+            }
+        } else {
+            Response::Samples(samples)
+        })
+    }
+
     fn module_loaded(&self, module: &str) -> std::io::Result<bool> {
         if *self.script.file_error.borrow() {
             return Err(std::io::ErrorKind::PermissionDenied.into());
@@ -468,11 +581,18 @@ impl System for Kernel {
     fn canon_run_root(&self) -> &std::path::Path {
         std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
     }
-    fn run(&self, p: Program, a: &[String], _: Duration) -> Result<ExecOutput, ExecError> {
+    fn run(
+        &self,
+        _purpose: scupper_sys::system::HelperPurpose,
+        p: Program,
+        a: &[String],
+        _: Duration,
+    ) -> Result<ExecOutput, ExecError> {
         self.exec(ExecTarget::Host, p, a, None)
     }
     fn run_in(
         &self,
+        _purpose: scupper_sys::system::HelperPurpose,
         t: ExecTarget<'_>,
         p: Program,
         a: &[String],
@@ -486,6 +606,7 @@ impl System for Kernel {
     }
     fn run_with_stdin(
         &self,
+        _purpose: scupper_sys::system::HelperPurpose,
         t: ExecTarget<'_>,
         p: Program,
         a: &[String],
@@ -494,11 +615,14 @@ impl System for Kernel {
     ) -> Result<ExecOutput, ExecError> {
         self.exec(t, p, a, Some(b))
     }
+    fn read_host_udp(&self, ipv6: bool) -> std::io::Result<String> {
+        self.script.read_host_udp(ipv6)
+    }
     fn wireguard_socket_dirs(&self) -> Vec<std::path::PathBuf> {
         vec![]
     }
     fn now_unix_secs(&self) -> u64 {
-        1000
+        self.now.get()
     }
 }
 impl BootNamespace for Kernel {

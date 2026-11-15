@@ -16,6 +16,8 @@ const IO_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Receipt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<u64>,
     pub protocol: String,
     pub marker: String,
     pub peer: SocketAddr,
@@ -160,6 +162,7 @@ pub(super) fn receipts(text: &str) -> Result<Vec<Receipt>> {
 }
 fn record(log: &Path, protocol: &str, marker: &str, peer: SocketAddr) -> Result<()> {
     let receipt = Receipt {
+        at: Some(super::check_v2::lab_now()),
         protocol: protocol.into(),
         marker: marker.into(),
         peer,
@@ -170,7 +173,7 @@ fn record(log: &Path, protocol: &str, marker: &str, peer: SocketAddr) -> Result<
     file.write_all(line.as_bytes())?;
     Ok(())
 }
-fn valid_marker(text: &str) -> bool {
+pub(super) fn valid_marker(text: &str) -> bool {
     text.starts_with("scupper-canary-")
         && text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
         && text.len() <= 128
@@ -540,6 +543,7 @@ mod tests {
     #[test]
     fn strict_sink_log_and_spoofed_packet() {
         let receipt = Receipt {
+            at: Some(1000),
             protocol: "udp".into(),
             marker: "scupper-canary-12345678901234567890123456789012".into(),
             peer: "203.0.113.2:40000".parse().unwrap(),

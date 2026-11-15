@@ -196,6 +196,29 @@ pub struct BootDeps<'a> {
     #[cfg(feature = "testing")]
     pub secret_owner: u32,
 }
+impl<'a> BootDeps<'a> {
+    /// Fixed I/O roots with no fault-injection hooks.
+    #[must_use]
+    pub fn new(
+        system: &'a dyn System,
+        namespace: &'a dyn BootNamespace,
+        state_root: &'a Path,
+        config_root: &'a Path,
+        run_root: &'a Path,
+    ) -> Self {
+        Self {
+            system,
+            namespace,
+            state_root,
+            config_root,
+            run_root,
+            #[cfg(feature = "testing")]
+            hook: None,
+            #[cfg(feature = "testing")]
+            secret_owner: 0,
+        }
+    }
+}
 
 type Result<T, E = String> = std::result::Result<T, E>;
 pub(crate) struct Inputs {
@@ -258,7 +281,7 @@ pub(crate) fn inputs_for_version(
         None => store.head()?.ok_or("no configuration")?,
     };
     let resolved = StateFile::open(deps.state_root, None)
-        .and_then(|file| file.read())
+        .and_then(|file| file.startup_read(deps.run_root))
         .map_err(|e| InputError::Persistence(e.to_string()))?
         .for_boot(true);
     if target.is_some() && resolved.missing_state_alert {
@@ -385,6 +408,7 @@ fn strings(args: &[&str]) -> Vec<String> {
 // Commands receiving secret stdin must never retain child diagnostics.
 pub(crate) fn execute(
     deps: &BootDeps<'_>,
+    purpose: crate::system::HelperPurpose,
     target: ExecTarget<'_>,
     program: Program,
     args: &[String],
@@ -394,10 +418,13 @@ pub(crate) fn execute(
         crate::system::check_wg_args(deps.system, args).map_err(|e| e.to_string())?;
     }
     let out = match input {
-        Some(input) => deps
+        Some(input) => {
+            deps.system
+                .run_with_stdin(purpose, target, program, args, input, EXEC_TIMEOUT)
+        }
+        None => deps
             .system
-            .run_with_stdin(target, program, args, input, EXEC_TIMEOUT),
-        None => deps.system.run_in(target, program, args, EXEC_TIMEOUT),
+            .run_in(purpose, target, program, args, EXEC_TIMEOUT),
     }
     .map_err(|e| format!("{program:?} execution failed: {e}"))?;
     if out.status != Some(0) {
@@ -428,6 +455,7 @@ pub(crate) fn inventory(
 ) -> Result<Vec<scupper_core::parse::IpLink>> {
     parse_ip_link(&execute(
         deps,
+        crate::system::HelperPurpose::Observation,
         ExecTarget::Netns(handle),
         Program::Ip,
         &strings(&["-d", "-j", "link", "show"]),
@@ -450,15 +478,16 @@ pub(crate) fn sysctls(
         for value in &values {
             // procps can return nonzero even for a successful write. Read all
             // values after all writes, including hardening reset by ip_forward.
-            let output = deps
-                .system
-                .run_in(
+            let output = {
+                deps.system.run_in(
+                    crate::system::HelperPurpose::Mutation,
                     target,
                     Program::Sysctl,
                     &strings(&["-w", &format!("{}={}", value.key, value.value)]),
                     EXEC_TIMEOUT,
                 )
-                .map_err(|e| format!("Sysctl execution failed: {e}"))?;
+            }
+            .map_err(|e| format!("Sysctl execution failed: {e}"))?;
             if output.status != Some(0) {
                 write_errors.insert(value.key.to_string(), diagnostic(&output.stderr));
             }
@@ -467,6 +496,7 @@ pub(crate) fn sysctls(
     for value in values {
         let got = execute(
             deps,
+            crate::system::HelperPurpose::Observation,
             target,
             Program::Sysctl,
             &strings(&["-n", &value.key.to_string()]),
@@ -546,11 +576,108 @@ fn step(
     ok
 }
 
+/// Quiesce clients, sample their final counters, confirm device destruction,
+/// then durably seal a single-use clean-stop marker. Containment remains loaded.
+/// Ordinary daemon restarts do not call this path.
+/// # Errors
+/// Any missing proof prevents the marker from being written.
+pub fn clean_stop(deps: &BootDeps<'_>) -> Result<()> {
+    let state = deps.system.run_in(
+        crate::system::HelperPurpose::Observation,
+        ExecTarget::Host,
+        Program::Systemctl,
+        &strings(&["is-system-running"]),
+        EXEC_TIMEOUT,
+    );
+    // `stopping` exits nonzero. Inspect stdout, never a success-only wrapper.
+    let Ok(state) = state else {
+        return Ok(());
+    };
+    if state.status != Some(1) || !matches!(state.stdout.as_str(), "stopping" | "stopping\n") {
+        return Ok(());
+    }
+    // Shutdown unit ordering stops scupperd first. The supervisor lease proves
+    // it has exited and prevents another reconciler from attaching mid-teardown.
+    let _supervisor =
+        crate::lock::SupervisorLease::try_acquire(deps.run_root).map_err(|e| e.to_string())?;
+    let _sampler =
+        WriterLock::acquire_timeout(deps.run_root.join("client-sampler-owner"), EXEC_TIMEOUT)
+            .map_err(|e| e.to_string())?;
+    let guard = WriterLock::acquire(deps.run_root).map_err(|e| e.to_string())?;
+    let Some(held) = deps.namespace.open().map_err(|e| e.to_string())? else {
+        return Ok(());
+    };
+    let cfg = inputs(deps, &mut BootReport::default())?;
+    let gw = cfg.site.gateway(&cfg.gateway).ok_or("unknown gateway")?;
+    let iface = gw.client_tunnel().ifname().as_str();
+    // A bounded check confirmation may still be finishing after scupperd exits.
+    // Wait for its session lock without invalidating otherwise continuous history.
+    let _session =
+        WriterLock::acquire_timeout(deps.run_root.join("client-session-writer"), EXEC_TIMEOUT)
+            .map_err(|e| e.to_string())?;
+    if !inventory(deps, &held)?
+        .iter()
+        .any(|link| link.ifname == iface)
+    {
+        return Ok(());
+    }
+    links::set_up(deps, &held, iface, false)?;
+    if inventory(deps, &held)?
+        .iter()
+        .any(|link| link.ifname == iface && link.flags.iter().any(|flag| flag == "UP"))
+    {
+        return Err("client device failed to quiesce".into());
+    }
+    let keys = crate::client_sessions::configured_keys(&cfg.site, &cfg.gateway);
+    crate::client_sessions::checkpoint_activity_locked(
+        deps.system,
+        &held,
+        iface,
+        deps.state_root,
+        deps.run_root,
+        gw.client_tunnel().identity().public_key.as_str(),
+        &guard,
+        &keys,
+    )
+    .map_err(|e| e.to_string())?;
+    let now = deps.system.now_unix_secs();
+    execute(
+        deps,
+        crate::system::HelperPurpose::Mutation,
+        ExecTarget::Netns(&held),
+        Program::Ip,
+        &strings(&["link", "delete", "dev", iface]),
+        None,
+    )?;
+    if inventory(deps, &held)?
+        .iter()
+        .any(|link| link.ifname == iface)
+    {
+        return Err("client teardown unconfirmed".into());
+    }
+    crate::client_sessions::seal_clean_stop(
+        deps.state_root,
+        deps.run_root,
+        gw.client_tunnel().identity().public_key.as_str(),
+        now,
+        held.identity(),
+        &guard,
+    )
+    .map_err(|e| e.to_string())
+}
+
 /// Builds or adopts the gateway under the bounded global writer lock. Stops on
 /// the first failure; never deletes the namespace or clears the quarantine latch.
 #[must_use]
 #[allow(clippy::too_many_lines)] // The numbered sequence is intentionally visible in one function.
 pub fn boot(deps: &BootDeps<'_>) -> BootReport {
+    boot_with_log(deps, None)
+}
+
+pub(crate) fn boot_with_log(
+    deps: &BootDeps<'_>,
+    log: Option<&crate::events::LogHandle>,
+) -> BootReport {
     let mut report = BootReport::default();
     let guard = match WriterLock::acquire(deps.run_root) {
         Ok(guard) => guard,
@@ -563,20 +690,71 @@ pub fn boot(deps: &BootDeps<'_>) -> BootReport {
             return report;
         }
     };
-    boot_with_guard(deps, &guard)
+    boot_policy_with_guard(deps, &guard, false, true, log)
 }
 
-pub(crate) fn boot_with_guard(deps: &BootDeps<'_>, guard: &WriterGuard) -> BootReport {
-    boot_apply_with_guard(deps, guard, false)
+pub(crate) fn boot_with_guard(
+    deps: &BootDeps<'_>,
+    guard: &WriterGuard,
+    log: Option<&crate::events::LogHandle>,
+) -> BootReport {
+    boot_apply_with_guard(deps, guard, false, log)
 }
 
 /// Explicit apply may open the gate while durable quarantine remains until verification.
 pub(crate) fn boot_apply_with_guard(
     deps: &BootDeps<'_>,
-    _guard: &WriterGuard,
+    guard: &WriterGuard,
     open_quarantined: bool,
+    log: Option<&crate::events::LogHandle>,
 ) -> BootReport {
-    let report = boot_locked(deps, BootReport::default(), open_quarantined);
+    boot_policy_with_guard(deps, guard, open_quarantined, false, log)
+}
+fn boot_policy_with_guard(
+    deps: &BootDeps<'_>,
+    guard: &WriterGuard,
+    open_quarantined: bool,
+    daemonless_empty: bool,
+    log: Option<&crate::events::LogHandle>,
+) -> BootReport {
+    let mut initial = BootReport::default();
+    let migration = (|| -> std::io::Result<()> {
+        let file = StateFile::open(deps.state_root, None)?;
+        if file.migrate_repair_state(guard, deps.run_root)? {
+            if let Some(log) = log {
+                log.repair_checkpoint_created(scupper_proto::Actor::Daemon, None);
+                return Ok(());
+            }
+            let gateway = GatewayId(
+                RealFs
+                    .read(&deps.config_root.join("gateway-id"))?
+                    .trim()
+                    .into(),
+            );
+            let opened = crate::events::EventLog::open(deps.state_root, gateway, || {
+                scupper_proto::UnixSeconds(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                )
+            })
+            .map_err(std::io::Error::other)?;
+            opened
+                .handle
+                .repair_checkpoint_created(scupper_proto::Actor::Boot, None);
+            opened
+                .handle
+                .flush_blocking(std::time::Duration::from_secs(5))?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = migration {
+        initial
+            .warnings
+            .push(format!("repair checkpoint migration: {error}"));
+    }
+    let report = boot_locked(deps, initial, open_quarantined, daemonless_empty, guard);
     if !report.succeeded() {
         let mut report = report;
         if let Err(error) = save_report(deps, &report) {
@@ -606,7 +784,13 @@ pub(crate) fn save_report_at(run_root: &Path, report: &BootReport) -> Result<()>
 }
 
 #[allow(clippy::too_many_lines)] // Keep the ordered build and its failure boundaries together.
-fn boot_locked(deps: &BootDeps<'_>, mut report: BootReport, open_quarantined: bool) -> BootReport {
+fn boot_locked(
+    deps: &BootDeps<'_>,
+    mut report: BootReport,
+    open_quarantined: bool,
+    daemonless_empty: bool,
+    guard: &WriterGuard,
+) -> BootReport {
     if !step(&mut report, deps, BootStep::Lock, false, || Ok(())) {
         return report;
     }
@@ -628,6 +812,7 @@ fn boot_locked(deps: &BootDeps<'_>, mut report: BootReport, open_quarantined: bo
             }
             execute(
                 deps,
+                crate::system::HelperPurpose::Mutation,
                 ExecTarget::Host,
                 Program::Modprobe,
                 &strings(&[module]),
@@ -648,6 +833,7 @@ fn boot_locked(deps: &BootDeps<'_>, mut report: BootReport, open_quarantined: bo
         } else {
             execute(
                 deps,
+                crate::system::HelperPurpose::Mutation,
                 ExecTarget::Host,
                 Program::Ip,
                 &strings(&["netns", "add", "scupper"]),
@@ -684,6 +870,7 @@ fn boot_locked(deps: &BootDeps<'_>, mut report: BootReport, open_quarantined: bo
             if closed.is_ok() {
                 execute(
                     deps,
+                    crate::system::HelperPurpose::Mutation,
                     ExecTarget::Netns(&handle),
                     Program::Ip,
                     &strings(&["link", "set", "lo", "up"]),
@@ -727,6 +914,11 @@ fn boot_locked(deps: &BootDeps<'_>, mut report: BootReport, open_quarantined: bo
         for args in [strings(&["-c", "-f", "-"]), strings(&["-f", "-"])] {
             execute(
                 deps,
+                if args.iter().any(|arg| arg == "-c") {
+                    crate::system::HelperPurpose::Observation
+                } else {
+                    crate::system::HelperPurpose::Mutation
+                },
                 ExecTarget::Netns(&handle),
                 Program::Nft,
                 &args,
@@ -742,6 +934,7 @@ fn boot_locked(deps: &BootDeps<'_>, mut report: BootReport, open_quarantined: bo
         if existed {
             execute(
                 deps,
+                crate::system::HelperPurpose::Mutation,
                 ExecTarget::Netns(&handle),
                 Program::Conntrack,
                 &strings(&["-F"]),
@@ -759,7 +952,14 @@ fn boot_locked(deps: &BootDeps<'_>, mut report: BootReport, open_quarantined: bo
         if adopted {
             Ok(())
         } else {
-            links::configure(deps, &handle, &cfg)
+            links::configure(
+                deps,
+                &handle,
+                &cfg,
+                guard,
+                daemonless_empty,
+                open_quarantined,
+            )
         }
     }) {
         return report;
@@ -792,6 +992,7 @@ fn boot_locked(deps: &BootDeps<'_>, mut report: BootReport, open_quarantined: bo
                 }
                 execute(
                     deps,
+                    crate::system::HelperPurpose::Mutation,
                     ExecTarget::Netns(&handle),
                     Program::Ip,
                     &strings(&["link", "set", "dev", exit.ifname().as_str(), "up"]),
@@ -802,6 +1003,7 @@ fn boot_locked(deps: &BootDeps<'_>, mut report: BootReport, open_quarantined: bo
         for (family, target) in desired_routes(&cfg.site, &cfg.gateway, selected) {
             execute(
                 deps,
+                crate::system::HelperPurpose::Mutation,
                 ExecTarget::Netns(&handle),
                 Program::Ip,
                 &route_argv(family, &target),
@@ -815,6 +1017,7 @@ fn boot_locked(deps: &BootDeps<'_>, mut report: BootReport, open_quarantined: bo
             for exit in gw.exits() {
                 execute(
                     deps,
+                    crate::system::HelperPurpose::Mutation,
                     ExecTarget::Netns(&handle),
                     Program::Ip,
                     &strings(&["link", "set", "dev", exit.ifname().as_str(), "down"]),
@@ -831,6 +1034,8 @@ fn boot_locked(deps: &BootDeps<'_>, mut report: BootReport, open_quarantined: bo
             return Ok(());
         }
         containment(deps, &handle, &cfg, &mut owned_links)?;
+        // Recovery probes follow on the daemon's next fresh verified tick.
+        // Their availability must never gate boot or forwarding.
         sysctls(
             deps,
             &handle,

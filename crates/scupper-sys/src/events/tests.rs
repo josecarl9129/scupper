@@ -333,7 +333,8 @@ fn concurrent_emit_preserves_unique_sequence_and_file_order() {
         .collect();
     assigned.sort_unstable();
     assert_eq!(assigned, (1..=800).collect::<Vec<_>>());
-    flush(&handle);
+    // 800 fsyncs can exceed the usual small-test deadline on a shared CI disk.
+    handle.flush_blocking(Duration::from_secs(30)).unwrap();
     let text = fs::read_to_string(dir.0.join("events/1970-01.jsonl")).unwrap();
     let persisted: Vec<u64> = text
         .lines()
@@ -1153,6 +1154,7 @@ fn retention_errors_warn_once_continue_appending_and_retry_while_idle() {
             .filter(|e| matches!(
                 e.kind,
                 EventKind::Repair {
+                    object: None,
                     kind: StepKind::EventLog,
                     result: Outcome::Failed,
                     ..
@@ -1299,4 +1301,28 @@ fn replay_uses_disk_sequence_space_even_when_local_ids_are_far_ahead() {
     let reopened = EventLog::open(&dir.0, gateway(), || UnixSeconds(0)).unwrap();
     assert!(emit(&reopened.handle) > high);
     flush(&reopened.handle);
+}
+
+#[test]
+fn failed_checkpoint_audit_is_best_effort_and_raises_persistence_alert() {
+    let opened = EventLog::memory_buffer(GatewayId("gw1".into()), || UnixSeconds(1000)).unwrap();
+    let handle = opened.handle;
+    drop(opened.log);
+    assert!(!handle.shared.lock().failure);
+    handle.repair_checkpoint_created(Actor::Daemon, Some(1));
+    let queue = handle.shared.lock();
+    assert!(queue.failure);
+    let event = queue
+        .events
+        .iter()
+        .find(|event| {
+            matches!(
+                event.kind,
+                EventKind::PersistenceFailed {
+                    reason: Reason::EventWrite
+                }
+            )
+        })
+        .unwrap();
+    assert_eq!(event.alert().unwrap().key, AlertKey::Persistence);
 }

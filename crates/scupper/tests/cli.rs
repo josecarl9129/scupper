@@ -34,7 +34,13 @@ impl Default for Harness {
     }
 }
 impl System for Harness {
-    fn run(&self, program: Program, args: &[String], _: Duration) -> Result<ExecOutput, ExecError> {
+    fn run(
+        &self,
+        _purpose: scupper_sys::system::HelperPurpose,
+        program: Program,
+        args: &[String],
+        _: Duration,
+    ) -> Result<ExecOutput, ExecError> {
         self.calls.borrow_mut().push(Call {
             program,
             args: args.into(),

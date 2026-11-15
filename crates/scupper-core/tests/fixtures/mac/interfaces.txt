@@ -1,8 +1,0 @@
-all
-lo0 (skip)
-en0
-en7
-utun6
-awdl0
-bridge100
-vmnet1

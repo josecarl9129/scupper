@@ -72,6 +72,7 @@ fn fixture() -> (AppliedConfig, Report, Observations) {
             Handshake::At { unix_secs: 959 },
         )]))),
         forwarding: Some(Ok(Forwarding {
+            client_sessions: scupper_core::verdict::v2::ClientSessions::default(),
             client_v4: 1,
             netns_sockets: vec![],
             v4: 1,

@@ -12,7 +12,7 @@ use crate::{
 };
 use std::collections::BTreeSet;
 
-/// Plans only toward the last verified applied configuration. Reservations count
+/// Plans only toward the published convergence target. Reservations count
 /// attempts, even if execution later fails. No caller state is mutated.
 #[must_use]
 #[allow(clippy::too_many_lines)] // Keep the safety-critical execution order visible together.
@@ -120,6 +120,7 @@ pub fn plan(
         .steps
         .iter()
         .filter_map(|step| match step {
+            Step::LinkUp { name, .. } => Some(name.clone()),
             Step::LinkCreate {
                 link,
                 phase: LinkPhase::Up,
@@ -145,7 +146,7 @@ fn reservation_keys(
         .iter()
         .filter(|r| {
             r.class() == RepairClass::Restore
-                && !matches!(r, Repair::LinkReconfigure { name }
+                && !matches!(r, Repair::LinkReconfigure { name } | Repair::LinkUp { name }
                 if p.budgets.downed_by_planner.contains(name)
                     && observed.links.get(name).is_some_and(|link| {
                         desired.links.get(name).is_some_and(|want| link.matches_config(want))
@@ -237,10 +238,10 @@ fn build_plan(
             }) {
                 continue;
             }
-            if repair != Repair::RulesetReload
-                && !(repair == Repair::ForwardingRestore && safety_reopen)
-                && !debounce.previous.contains(&object)
-            {
+            let immediate = repair == Repair::RulesetReload
+                || repair == Repair::ForwardingRestore && safety_reopen
+                || matches!(&repair, Repair::LinkUp { name } if budgets.downed_by_planner.contains(name));
+            if !immediate && !debounce.previous.contains(&object) {
                 continue;
             }
         }
@@ -266,6 +267,7 @@ fn build_plan(
             .iter()
             .find(|(_, safety)| *safety)
             .map(|(object, _)| Latch {
+                uncertain: false,
                 reason: "safety repair budget exhausted".into(),
                 object: object.clone(),
             })
@@ -310,9 +312,8 @@ fn build_plan(
     for repair in tighten {
         builder.tighten(repair);
     }
-    builder.result.debounce.ingress_quarantined = unknown_inventory
-        && (debounce.ingress_quarantined || debounce.previous.contains("unknown-inventory"));
-    if builder.result.debounce.ingress_quarantined {
+    builder.result.debounce.ingress_quarantined = debounce.ingress_quarantined || unknown_inventory;
+    if unknown_inventory {
         // Only a positively down or positively absent device is contained.
         // Omission from incomplete inventory must still trigger a down attempt.
         let client = &desired.link_order[0];
@@ -337,8 +338,9 @@ fn build_plan(
             builder.push(Step::Emit(PlannerEvent::IngressQuarantined));
         }
     }
-    // Tightening, including ingress quarantine, precedes synchronous disk I/O.
-    // Containment failure still permits persistence, and memory-only latches retry.
+    // The executor marks synchronously, completes containment, then persists
+    // this latch with a bounded budget before events and restore groups.
+    // Persistence failure retains the marker; memory-only latches retry.
     if let Some(latch) = builder
         .model
         .latch
@@ -437,6 +439,7 @@ fn build_plan(
             | Repair::RouteReplace { .. }
             | Repair::RulesetReload
             | Repair::ForwardingRestore
+            | Repair::LinkUp { .. }
             | Repair::ExtraRouteDelete { .. }
             | Repair::ForeignLinkDown { .. }
             | Repair::PeerContainment { .. }
@@ -472,6 +475,22 @@ fn build_plan(
     }
     if switched {
         builder.push(Step::FlushConntrack);
+    }
+    // D2 changes only administrative state. Once inventory is known and all
+    // reopening gates pass, restore the same configured device before forwarding.
+    for repair in &admitted {
+        if let Repair::LinkUp { name } = repair
+            && !unknown_inventory
+            && !closed_by_policy(suppressed, effective_latch)
+            && builder.can_raise_client(name)
+        {
+            builder.result.repairs.push(repair.clone());
+            builder.push(Step::FlushConntrack);
+            builder.push(Step::LinkUp {
+                name: name.clone(),
+                requires: desired.fingerprint,
+            });
+        }
     }
     let link_work = builder
         .result
@@ -528,6 +547,15 @@ fn build_plan(
     }
     if observed.edge_dead {
         builder.push(Step::Emit(PlannerEvent::EdgeDead));
+    }
+    if debounce.ingress_quarantined
+        && !unknown_inventory
+        && super::client_output_verified(&builder.model, desired)
+    {
+        // Predicted completion only: the executor re-observes and commits this
+        // transition after the entire lift, serialized against stop admission.
+        builder.result.debounce.ingress_quarantined = false;
+        builder.push(Step::Emit(PlannerEvent::IngressQuarantineLifted));
     }
     builder.result
 }
@@ -650,8 +678,20 @@ fn detect(d: &Desired, m: &KernelModel) -> Vec<Repair> {
     for name in &d.link_order {
         let want = &d.links[name];
         match m.links.get(name) {
-            None if m.links_complete && m.host_links.get(name).is_none_or(host_leftover) => {
+            None if m.links_complete
+                && m.host_links_complete
+                && m.host_links.get(name).is_none_or(host_leftover) =>
+            {
                 out.push(Repair::LinkRecreate { name: name.clone() });
+            }
+            Some(link)
+                if name == &m.client_link
+                    && link.owned()
+                    && link.matches_config(want)
+                    && want.up
+                    && link.up != Known::Value(true) =>
+            {
+                out.push(Repair::LinkUp { name: name.clone() });
             }
             Some(link)
                 if link.owned()
@@ -718,6 +758,7 @@ fn detect(d: &Desired, m: &KernelModel) -> Vec<Repair> {
 fn has_unknown_safety(m: &KernelModel) -> bool {
     m.namespace == NamespaceState::Unknown
         || !m.links_complete
+        || !m.host_links_complete
         || matches!(m.ruleset, Known::Unknown)
         || matches!(m.forwarding_v4, Known::Unknown)
         || matches!(m.forwarding_v6, Known::Unknown)
@@ -769,7 +810,27 @@ impl Builder<'_> {
         }
         self.push(Step::ReadBackSysctls);
     }
+    fn can_raise_client(&self, name: &str) -> bool {
+        let raised = self.model.apply(&Step::LinkUp {
+            name: name.to_owned(),
+            requires: self.desired.fingerprint,
+        });
+        self.can_reopen() && safe(&raised, self.desired)
+    }
     fn can_forward(&self) -> bool {
+        self.can_reopen()
+            && self
+                .model
+                .links
+                .get(&self.model.client_link)
+                .is_some_and(|link| {
+                    self.desired
+                        .links
+                        .get(&self.model.client_link)
+                        .is_some_and(|want| link.ready(want))
+                })
+    }
+    fn can_reopen(&self) -> bool {
         let mut closed = self.model.clone();
         closed.forwarding_v4 = Known::Value(0);
         closed.forwarding_v6 = Known::Value(0);
@@ -862,6 +923,7 @@ impl Builder<'_> {
             }
             | Repair::LinkRecreate { .. }
             | Repair::LinkReconfigure { .. }
+            | Repair::LinkUp { .. }
             | Repair::ExitRehandshake { .. }
             | Repair::PersistLatch { .. }
             | Repair::ForwardingOff

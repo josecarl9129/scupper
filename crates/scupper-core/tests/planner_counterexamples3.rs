@@ -212,13 +212,13 @@ fn omitted_client_is_quarantined_and_retried_unless_positively_contained() {
         at(0),
     );
     let down = Step::LinkDown { name: "wg0".into() };
-    assert!(!first.steps.contains(&down));
+    assert!(first.steps.contains(&down));
     m = run(&m, &first.steps);
     let second = plan(&d, &m, &first.budgets, None, &first.debounce, at(10));
     assert!(second.steps.contains(&down));
     assert!(second.budgets.downed_by_planner.contains("wg0"));
     assert!(
-        second
+        first
             .steps
             .contains(&Step::Emit(PlannerEvent::IngressQuarantined))
     );
@@ -275,7 +275,7 @@ fn quarantine_ownership_does_not_exempt_configuration_drift() {
     m.links.get_mut("wg0").unwrap().addresses = Known::Value(vec![]);
     let warm = plan(&d, &m, &second.budgets, None, &second.debounce, at(20));
     let restore = plan(&d, &m, &warm.budgets, None, &warm.debounce, at(30));
-    assert_eq!(restore.budgets.attempts["link:wg0"], vec![at(30)]);
+    assert_eq!(restore.budgets.attempts["link:wg0"], vec![at(20), at(30)]);
     m = run(&m, &restore.steps);
     assert_eq!(m.links["wg0"].up, Known::Value(true));
     let recovered = plan(&d, &m, &restore.budgets, None, &restore.debounce, at(40));

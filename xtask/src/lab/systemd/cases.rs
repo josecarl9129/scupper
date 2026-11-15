@@ -115,7 +115,9 @@ impl SystemdLab {
         let mut stream = self.stream(case, &mut markers)?;
         let trial = (|| {
             if case == "L44" {
+                self.manual_stop_preserves_clients()?;
                 self.writers_canary("before-race", &mut markers)?;
+                self.reboot_sessions(&mut markers)?;
             } else {
                 self.lab.service_check(&mut markers)?;
             }
@@ -141,6 +143,13 @@ impl SystemdLab {
     fn stream(&mut self, stem: &str, markers: &mut Vec<String>) -> Result<Group> {
         let marker = Lab::marker()?;
         markers.push(marker.clone());
+        self.lab.peer_flow_logs.push((
+            "client".into(),
+            self.lab.artifacts.join(format!("{stem}-flow.jsonl")),
+        ));
+        self.lab
+            .peer_markers
+            .insert(marker.clone(), "client".into());
         self.lab.runner.background(
             &Invocation::new(
                 "client",
@@ -340,7 +349,7 @@ impl SystemdLab {
             let rx = if has_client {
                 let until = Instant::now() + Duration::from_secs(15);
                 loop {
-                    self.lab.runner.output(
+                    let (status, _) = self.lab.runner.output(
                         &Invocation::new(
                             "client",
                             "ping",
@@ -348,6 +357,11 @@ impl SystemdLab {
                         ),
                         None,
                     )?;
+                    if status.success() {
+                        self.lab
+                            .last_probe_served
+                            .insert("client".into(), super::super::check_v2::lab_now());
+                    }
                     let handshakes =
                         self.lab
                             .cmd("scupper", "wg", &["show", "wg0", "latest-handshakes"])?;
@@ -584,10 +598,15 @@ impl SystemdLab {
         self.fresh_session()?;
         let until = Instant::now() + Duration::from_secs(15);
         loop {
-            self.lab.runner.output(
+            let (status, _) = self.lab.runner.output(
                 &Invocation::new("client", "ping", &["-c", "1", "-W", "1", A.gateway_inner]),
                 None,
             )?;
+            if status.success() {
+                self.lab
+                    .last_probe_served
+                    .insert("client".into(), super::super::check_v2::lab_now());
+            }
             if self
                 .lab
                 .cmd("scupper", "wg", &["show", "wg0", "latest-handshakes"])?
@@ -636,25 +655,177 @@ impl SystemdLab {
         self.systemctl(&["daemon-reload"])?;
         Ok(())
     }
+    fn reboot_sessions(&mut self, markers: &mut Vec<String>) -> Result<()> {
+        // Separately bound fresh exit qualification, then allow the original
+        // recovery budget: 30 s blocked observation + 15 s no-receive trigger +
+        // 5 s retry + 15 s sample + 20 s check + 5 s runner slack.
+        let startup_budget = self.lab.site.initial_qualification() + Duration::from_secs(15);
+        let recovery_budget = Duration::from_secs(120) + startup_budget;
+        let _traffic = self.lab.recovery_traffic("reboot-sessions")?;
+        // Preserve the client's old session, including its receiver index.
+        // Only block its outer UDP temporarily; all leak captures/oracles stay on.
+        // Recovery relies on the case-wide 1400 s client UDP stream to trigger
+        // a fresh client handshake; a keepalive-0 idle client cannot do that.
+        let rules = format!(
+            "table inet reboot_sessions {{\n chain output {{\n  type filter hook output priority filter;\n  ip daddr {} meta l4proto udp counter drop;\n }}\n}}\n",
+            A.gwhost.peer
+        );
+        self.lab.runner.input(
+            &Invocation::new("client", "nft", &["-f", "-"]),
+            Some(rules.as_bytes()),
+        )?;
+        let trial = (|| {
+            self.reboot_stop_sealed()?;
+            let log = self.lab.artifacts.join("L44-reboot-sessions-check.jsonl");
+            let started = self.lab.private.join("reboot-observer-started");
+            let reset_seen = self.lab.private.join("reboot-observer-reset-seen");
+            for marker in [&started, &reset_seen] {
+                if marker.exists() {
+                    fs::remove_file(marker)?;
+                }
+            }
+            let mut observer = self.lab.runner.background(
+                &Invocation::new(
+                    "",
+                    "python3",
+                    &[
+                        "-c",
+                        include_str!("reboot_sessions.py"),
+                        CLI,
+                        log.to_str().ok_or("observer log path")?,
+                        started.to_str().ok_or("observer startup path")?,
+                        reset_seen.to_str().ok_or("observer reset path")?,
+                        &self.lab.public_keys[3],
+                        &recovery_budget.as_secs().to_string(),
+                    ],
+                ),
+                &self.lab.artifacts.join("L44-reboot-observer.stdout"),
+            )?;
+            let until = Instant::now() + Duration::from_secs(5);
+            while !started.exists() {
+                observer.alive()?;
+                if Instant::now() >= until {
+                    return fail("reboot observer did not start");
+                }
+                self.lab.runner.dwell(Duration::from_millis(50))?;
+            }
+            let reboot_started = Instant::now();
+            self.reboot_start()?;
+            self.observe_blocked_reboot(
+                &mut observer,
+                &reset_seen,
+                reboot_started,
+                startup_budget,
+            )?;
+            self.lab.cmd(
+                "client",
+                "nft",
+                &["delete", "table", "inet", "reboot_sessions"],
+            )?;
+            if !observer.wait_timeout(recovery_budget)?.success() {
+                return fail(
+                    "reboot session observer rejected readiness; see L44-reboot-sessions-check.jsonl",
+                );
+            }
+            // One ordinary canary, with the existing 2 s per-request budget.
+            // There is no retry and no fresh_session() client reset.
+            self.lab.service_check(markers)
+        })();
+        let cleanup = self
+            .lab
+            .runner
+            .output(
+                &Invocation::new(
+                    "client",
+                    "nft",
+                    &["delete", "table", "inet", "reboot_sessions"],
+                ),
+                None,
+            )
+            .map(|_| ());
+        super::super::mutation::finish(trial, cleanup)
+    }
+    fn observe_blocked_reboot(
+        &mut self,
+        observer: &mut Group,
+        reset_seen: &Path,
+        reboot_started: Instant,
+        startup_budget: Duration,
+    ) -> Result<()> {
+        let mut log = fs::File::create(self.lab.artifacts.join("L44-reboot-inline-check.jsonl"))?;
+        let startup_deadline = reboot_started + startup_budget;
+        let mut observation_deadline = None;
+        let mut saw_session_reset = false;
+        let mut boot_complete = false;
+        loop {
+            let now = Instant::now();
+            if let Some(deadline) = observation_deadline {
+                if now >= deadline {
+                    break;
+                }
+            } else if now >= startup_deadline {
+                return fail("blocked reboot startup never passed exit qualification");
+            }
+            boot_complete |= Path::new("/run/scupper/boot.json").exists();
+            let (status, text) = self
+                .lab
+                .runner
+                .output(&Invocation::new("", CLI, &["check", "--json"]), None)?;
+            let value = serde_json::from_str::<serde_json::Value>(&text).unwrap_or_default();
+            writeln!(
+                log,
+                "{}",
+                serde_json::json!({
+                    "elapsed_ms": reboot_started.elapsed().as_millis(),
+                    "phase": if observation_deadline.is_some() { "blocked-observation" } else { "startup" },
+                    "startup_budget_ms": startup_budget.as_millis(),
+                    "boot_complete_before_check": boot_complete,
+                    "check_exit": status.code(), "check": text
+                })
+            )?;
+            // UDP stays blocked throughout both phases: any OK is a false OK.
+            match status.code() {
+                Some(0) => {
+                    return fail(
+                        "reboot check falsely reported ready while client UDP was blocked",
+                    );
+                }
+                Some(1 | 2) if !boot_complete && observation_deadline.is_none() => {}
+                Some(3) => {
+                    if observation_deadline.is_none() {
+                        if Instant::now() >= startup_deadline {
+                            return fail(
+                                "blocked reboot exit qualification exceeded startup budget",
+                            );
+                        }
+                        observation_deadline = Some(Instant::now() + Duration::from_secs(30));
+                    }
+                    saw_session_reset |= value["verdict"]["Degraded"] == "ClientSessionsReset";
+                }
+                Some(4) if value["verdict"]["FailClosed"] == "NoHealthyExit" => {}
+                _ => return fail("blocked reboot check failed; see L44-reboot-inline-check.jsonl"),
+            }
+            observer.alive()?;
+            self.lab.runner.dwell(Duration::from_millis(500))?;
+        }
+        if !saw_session_reset || !reset_seen.exists() {
+            return fail(
+                "blocked reboot window observers never confirmed Degraded/ClientSessionsReset",
+            );
+        }
+        Ok(())
+    }
     fn writers_canary(&mut self, label: &str, markers: &mut Vec<String>) -> Result<()> {
         let started = Instant::now();
         let first_marker = markers.len();
         let mut ready_ms = None;
         let result = (|| {
-            // ready polls check=0 for at most 90 seconds and proves provider
+            // ready allows the initial 180 s unknown lease plus 30 s and proves provider
             // transport. Do this after the final unit start, before any probe.
             self.ready_recorded(Some(&format!("L44-{label}")))?;
             ready_ms = Some(started.elapsed().as_millis());
             self.check_code(0)?;
-            self.lab.service_check_with_tcp_retry(
-                markers,
-                Some(
-                    &self
-                        .lab
-                        .artifacts
-                        .join(format!("L44-{label}-tcp-attempts.jsonl")),
-                ),
-            )
+            self.lab.service_check(markers)
         })();
         fs::write(
             self.lab.artifacts.join(format!("L44-{label}-canary.json")),
@@ -848,7 +1019,7 @@ impl SystemdLab {
                             "boot refused; stop scupperd, then rerun",
                             "supervisor lease unavailable:",
                             "writer lock timeout:",
-                            "boot skipped successfully; use scupper apply for a verified update",
+                            "boot skipped successfully; use scupper check for health and scupper apply for a verified update",
                         ]
                         .iter()
                         .any(|refusal| journal.contains(refusal))
@@ -1052,6 +1223,45 @@ impl SystemdLab {
                 "port", "51820",
             ],
         )?;
+        // ready() has already served client2 traffic. Reset the gateway peer
+        // to require a fresh handshake, rather than asserting an idle premise.
+        let peer = self.lab.public_keys[4].clone();
+        self.lab
+            .cmd("scupper", "wg", &["set", "wg0", "peer", &peer, "remove"])?;
+        self.lab.cmd(
+            "scupper",
+            "wg",
+            &["set", "wg0", "peer", &peer, "allowed-ips", "10.99.0.3/32"],
+        )?;
+        // Existing established UDP is accepted by ufw's before rules. Remove
+        // only lab tuples, then require a fresh handshake to be blocked.
+        for (source, destination) in [
+            (A.client.peer, A.gwhost.peer),
+            (A.client2.peer, A.gwhost.peer),
+            (A.gwhost.peer, A.provider.peer),
+        ] {
+            let (status, _) = self.lab.runner.output(
+                &Invocation::new(
+                    "",
+                    "conntrack",
+                    &[
+                        "-D",
+                        "-p",
+                        "udp",
+                        "-s",
+                        source,
+                        "-d",
+                        destination,
+                        "--dport",
+                        "51820",
+                    ],
+                ),
+                None,
+            )?;
+            if !matches!(status.code(), Some(0 | 1)) {
+                return fail("scoped conntrack delete failed");
+            }
+        }
         self.cmd(
             "ufw",
             &[
@@ -1080,36 +1290,7 @@ impl SystemdLab {
         }
         let trial = (|| {
             self.ufw_controls()?;
-            // Existing established UDP is accepted by ufw's before rules. Remove
-            // only lab tuples, then require a fresh handshake to be blocked.
-            for (source, destination) in [
-                (A.client.peer, A.gwhost.peer),
-                (A.gwhost.peer, A.provider.peer),
-            ] {
-                let (status, _) = self.lab.runner.output(
-                    &Invocation::new(
-                        "",
-                        "conntrack",
-                        &[
-                            "-D",
-                            "-p",
-                            "udp",
-                            "-s",
-                            source,
-                            "-d",
-                            destination,
-                            "--dport",
-                            "51820",
-                        ],
-                    ),
-                    None,
-                )?;
-                if !matches!(status.code(), Some(0 | 1)) {
-                    return fail("scoped conntrack delete failed");
-                }
-            }
-            // client2 has never sent traffic, so ufw's earlier ESTABLISHED
-            // accept cannot mask the deny rule via an old gateway session.
+            // The gateway peer and conntrack were reset before arming deny.
             let marker = Lab::marker()?;
             markers.push(marker.clone());
             if self
@@ -1216,6 +1397,24 @@ fn writer_holders(locks: &str, inode: u64) -> Vec<&str> {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reboot_session_observer_receipt_rules() -> Result<(), Box<dyn std::error::Error>> {
+        let result = std::process::Command::new("python3")
+            .args([
+                "-B",
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/src/lab/systemd/reboot_sessions_test.py"
+                ),
+            ])
+            .output()?;
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        Ok(())
+    }
     #[test]
     fn contention_requires_a_failed_product_lock_syscall() {
         assert!(super::polling_waiter(

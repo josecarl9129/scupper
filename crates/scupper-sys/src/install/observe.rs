@@ -22,6 +22,7 @@ pub(super) fn observe(system: &dyn System, paths: &Paths) -> Result<Facts, Refus
     for package in model::PACKAGES {
         let out = system
             .run(
+                crate::system::HelperPurpose::Observation,
                 Program::DpkgQuery,
                 &["-W".into(), "-f=${Status}".into(), package.into()],
                 EXEC_TIMEOUT,
@@ -138,6 +139,7 @@ fn observe_accounts(system: &dyn System, facts: &mut Facts) -> Result<(), Refusa
     for user in model::USERS {
         let out = system
             .run(
+                crate::system::HelperPurpose::Observation,
                 Program::Getent,
                 &["passwd".into(), user.into()],
                 EXEC_TIMEOUT,
@@ -162,6 +164,7 @@ fn observe_accounts(system: &dyn System, facts: &mut Facts) -> Result<(), Refusa
     }
     let group = system
         .run(
+            crate::system::HelperPurpose::Observation,
             Program::Getent,
             &["group".into(), model::ADMIN_GROUP.into()],
             EXEC_TIMEOUT,
@@ -222,6 +225,7 @@ fn observe_files(system: &dyn System, paths: &Paths, facts: &mut Facts) -> Resul
         }
         let out = system
             .run(
+                crate::system::HelperPurpose::Observation,
                 Program::Systemctl,
                 &["is-enabled".into(), format!("{unit}.service")],
                 EXEC_TIMEOUT,

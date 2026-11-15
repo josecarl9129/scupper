@@ -70,14 +70,20 @@ pub(super) fn verified(op: &Op, report: Report) -> Result<OpResult, ApiError> {
             report: serde_json::to_value(report)
                 .map_err(|_| control::api(ApiErrorCode::Internal))?,
         }),
-        Op::Connect { .. } => match report.verdict {
-            Verdict::Protected { exit, .. } | Verdict::Unsupervised { exit, .. } => {
-                Ok(OpResult::Connect {
-                    exit: (&exit).into(),
-                })
-            }
-            _ => Err(control::api(ApiErrorCode::NotReady)),
-        },
+        Op::Connect { .. } => {
+            let exit = match &report.verdict {
+                Verdict::Protected { exit, .. } | Verdict::Unsupervised { exit, .. } => {
+                    Some(exit.into())
+                }
+                _ if report.session_only() => None,
+                _ => return Err(control::api(ApiErrorCode::NotReady)),
+            };
+            Ok(OpResult::Connect {
+                exit,
+                report: serde_json::to_value(report)
+                    .map_err(|_| control::api(ApiErrorCode::Internal))?,
+            })
+        }
         Op::Disconnect {}
             if report.verdict == Verdict::FailClosed(FailClosed::AdminDisconnected) =>
         {
@@ -311,12 +317,17 @@ impl Runtime<'_> {
         let Some((machine, _, _)) = &mut self.running else {
             return super::admin::durable_intent(&self.deps(), op, uid);
         };
-        if matches!(op, Op::Connect { .. }) && machine.latch().is_some() {
-            return Err(control::api(ApiErrorCode::Quarantined));
-        }
         let guard = machine
             .writer_guard()
             .map_err(|_| control::api(ApiErrorCode::Conflict))?;
+        if matches!(op, Op::Connect { .. }) {
+            super::admin::prepare_connect(
+                machine,
+                &guard,
+                &selection,
+                scupper_proto::Actor::Local { uid },
+            )?;
+        }
         machine.set_intent_locked(&guard, selection).map_err(|e| {
             control::api(if e.to_string() == "unconfigured exit" {
                 ApiErrorCode::InvalidRequest

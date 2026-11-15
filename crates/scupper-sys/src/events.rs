@@ -527,6 +527,14 @@ impl LogHandle {
         self.shared.failed();
     }
 
+    // A completed checkpoint must never depend on audit availability.
+    pub(crate) fn repair_checkpoint_created(&self, actor: Actor, version: Option<u64>) {
+        if let Err(error) = self.emit(EventKind::RepairCheckpointCreated {}, actor, version) {
+            eprintln!("scupperd: repair checkpoint audit failed: {error}");
+            self.persistence_failed();
+        }
+    }
+
     /// Assigns a unique sequence and enqueues without disk I/O or a capacity wait.
     /// Overflow discards the oldest buffered event and records a bounded gap note.
     ///
@@ -880,6 +888,7 @@ fn maintain_retention(shared: &Shared, disk: &mut Disk) {
         if let Ok(event) = shared.event(
             &mut queue,
             EventKind::Repair {
+                object: None,
                 kind: StepKind::EventLog,
                 class: scupper_proto::RepairClass::Tighten,
                 result: Outcome::Failed,

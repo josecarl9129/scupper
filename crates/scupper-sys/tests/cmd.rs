@@ -540,11 +540,18 @@ fn route_delete_requires_observed_absence() -> Result<(), Box<dyn Error>> {
         fn now_unix_secs(&self) -> u64 {
             1000
         }
-        fn run(&self, _: Program, _: &[String], _: Duration) -> Result<ExecOutput, ExecError> {
+        fn run(
+            &self,
+            _purpose: scupper_sys::system::HelperPurpose,
+            _: Program,
+            _: &[String],
+            _: Duration,
+        ) -> Result<ExecOutput, ExecError> {
             unreachable!()
         }
         fn run_in(
             &self,
+            _purpose: scupper_sys::system::HelperPurpose,
             target: ExecTarget<'_>,
             program: Program,
             args: &[String],

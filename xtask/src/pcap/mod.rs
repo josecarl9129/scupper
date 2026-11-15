@@ -3,6 +3,7 @@
 mod control;
 mod decode;
 mod dns;
+mod heartbeat;
 #[cfg(target_os = "linux")]
 pub(crate) mod path;
 mod policy;
@@ -573,6 +574,7 @@ pub fn classify(capture: &[u8], policy: &Policy, limit: usize) -> Result<Report,
     let capture = reader::read(capture)?;
     let mut packets = Vec::new();
     let mut pending: BTreeMap<Key, Assembly> = BTreeMap::new();
+    let mut late_resets = heartbeat::LateResets::default();
     for (index, record) in capture.records.iter().enumerate() {
         let mut touched = None;
         let mut packet = Packet {
@@ -657,6 +659,19 @@ pub fn classify(capture: &[u8], policy: &Policy, limit: usize) -> Result<Report,
                         }
                     } else {
                         packet.class = datagram(policy, &ip);
+                        // Never let the closing-reset proof override marker, address,
+                        // padding, truncation or decoding failures. Fragments cannot
+                        // establish or consume delivery-identity proof either.
+                        if evidence.is_none()
+                            && matches!(
+                                &packet.class,
+                                Class::Allowed(_) | Class::Violation(Reason::NotAllowListed)
+                            )
+                            && late_resets.observe(policy, &ip, &packet.class)
+                            && packet.class == Class::Violation(Reason::NotAllowListed)
+                        {
+                            packet.class = Class::Allowed("heartbeat_late_reset".into());
+                        }
                         if matches!(packet.class, Class::Allowed(_))
                             && let Some(reason) = evidence
                         {

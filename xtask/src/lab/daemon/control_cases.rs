@@ -15,6 +15,40 @@ use scupper_sys::{
 use sha2::{Digest, Sha256};
 use std::{fmt::Write as _, os::unix::fs::MetadataExt};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+enum RepairOutcome {
+    Latched,
+    Reopened,
+}
+
+fn repair_outcome(file: &StateFile, run_root: &Path, open: bool) -> Result<Option<RepairOutcome>> {
+    Ok(match file.safety_read(run_root)? {
+        StateRead::Present(state) if state.quarantine.is_some() => Some(RepairOutcome::Latched),
+        StateRead::Present(_) if open => Some(RepairOutcome::Reopened),
+        _ => None,
+    })
+}
+
+fn clear_control_latch(
+    file: &StateFile,
+    guard: &scupper_sys::lock::WriterGuard,
+    run_root: &Path,
+) -> Result<()> {
+    if let StateRead::Present(mut state) = file.read()? {
+        state.selection = Selection::Auto;
+        state.quarantine = None;
+        file.write(guard, &state)?;
+    }
+    // Use the product's repair-clear path, including its durable checkpoint and
+    // uncertain-marker clearance, while still holding the same writer lock.
+    file.clear_repair_state(guard, run_root)?;
+    if repair_outcome(file, run_root, false)? == Some(RepairOutcome::Latched) {
+        return fail("control fixture reset left a latch source behind");
+    }
+    Ok(())
+}
+
 /// Whether a verdict payload carries `reason`.
 ///
 /// A reason is a unit variant (`"X"`) or a single-variant object (`{"X": ..}`). `Unprotected`
@@ -212,7 +246,7 @@ fn compare_sessions(before: &str, after: &str, traffic: bool) -> bool {
         && before.iter().all(|(key, (time, rx, tx))| {
             let (next_time, next_rx, next_tx) = after[key];
             *time > 0
-                && next_time >= *time
+                && (traffic && next_time >= *time || !traffic && next_time == *time)
                 && next_rx >= *rx
                 && next_tx >= *tx
                 && (!traffic || (next_rx > *rx && next_tx > *tx))
@@ -428,7 +462,11 @@ impl DaemonGuard<'_> {
         expected: Option<(&str, &str)>,
         stem: &str,
     ) -> Result<()> {
-        let (got, report) = self.lab.check_result(&Lab::boot_binary()?, root)?;
+        let (got, report) = if code == 0 {
+            self.lab.wait_session_recovery(&Lab::boot_binary()?, root)?
+        } else {
+            self.lab.check_result(&Lab::boot_binary()?, root)?
+        };
         fs::write(
             self.lab
                 .artifacts
@@ -499,10 +537,8 @@ impl DaemonGuard<'_> {
     fn client_session(&mut self) -> Result<String> {
         let handshakes = self
             .lab
-            .cmd("scupper", "wg", &["show", "wg0", "latest-handshakes"])?;
-        let transfers = self
-            .lab
-            .cmd("scupper", "wg", &["show", "wg0", "transfer"])?;
+            .cmd("client", "wg", &["show", "wg0", "latest-handshakes"])?;
+        let transfers = self.lab.cmd("client", "wg", &["show", "wg0", "transfer"])?;
         let times = handshakes
             .lines()
             .filter_map(|line| line.split_once(char::is_whitespace))
@@ -510,7 +546,7 @@ impl DaemonGuard<'_> {
         let mut sample = String::new();
         for line in transfers
             .lines()
-            .filter(|line| line.split_whitespace().next() == Some(self.lab.public_keys[3].as_str()))
+            .filter(|line| line.split_whitespace().next() == Some(self.lab.public_keys[0].as_str()))
         {
             let (peer, counters) = line
                 .split_once(char::is_whitespace)
@@ -634,7 +670,7 @@ impl DaemonGuard<'_> {
         let after = self.client_session()?;
         if !session_continues(before, &after) {
             return fail(format!(
-                "apply reset client transfer counters: {before:?} -> {after:?}"
+                "apply changed client session: {before:?} -> {after:?}"
             ));
         }
         Ok(())
@@ -741,6 +777,9 @@ impl DaemonGuard<'_> {
             "pause-apply",
             "apply-paused",
             "incomplete-tick",
+            "hold-observation",
+            "pause-observation-once",
+            "observation-paused",
             "heartbeat-pause",
             "heartbeat-request-pause",
             "heartbeat-status",
@@ -770,11 +809,9 @@ impl DaemonGuard<'_> {
                 )?;
                 fs::write(&self.lab.rules, rules)?;
             }
-            state.selection = Selection::Auto;
-            state.quarantine = None;
             file.write(&guard, &state)?;
         }
-        Ok(())
+        clear_control_latch(&file, &guard, &root.join("run/scupper"))
     }
     fn assert_latched(&mut self, root: &Path, phase: &str) -> Result<()> {
         for key in ["net.ipv4.ip_forward", "net.ipv6.conf.all.forwarding"] {
@@ -782,8 +819,8 @@ impl DaemonGuard<'_> {
                 return fail(format!("L43 {phase}: gate {key} opened"));
             }
         }
-        let StateRead::Present(state) =
-            StateFile::open(root.join("var-lib/scupper"), None)?.read()?
+        let StateRead::Present(state) = StateFile::open(root.join("var-lib/scupper"), None)?
+            .safety_read(&root.join("run/scupper"))?
         else {
             return fail("L43 missing state");
         };
@@ -851,10 +888,23 @@ impl DaemonGuard<'_> {
                 self.heartbeat_cadence_control()?;
                 let marker = Lab::marker()?;
                 markers.push(marker.clone());
-                let mut flow = self.lab.daemon_flow("udp", "client", &marker, &stem, 360)?;
+                // L10 includes repeated heartbeat cadence controls and 32 s
+                // stalls; keep the canary alive for the remaining case budget.
+                let seconds = self
+                    .lab
+                    .runner
+                    .whole
+                    .saturating_duration_since(Instant::now())
+                    .as_secs()
+                    .saturating_add(1);
+                let mut flow = self
+                    .lab
+                    .daemon_flow("udp", "client", &marker, &stem, seconds)?;
                 let path = self.lab.artifacts.join(format!("{stem}-udp.jsonl"));
                 self.lab
                     .daemon_wait("L10 canary control", Duration::from_secs(5), |_| {
+                        flow.alive()
+                            .map_err(|error| format!("harness: L10 canary flow exited: {error}"))?;
                         Ok(flow_counts(&path)?.1 > 10)
                     })?;
                 self.notify
@@ -890,7 +940,11 @@ impl DaemonGuard<'_> {
                 self.lab.daemon_wait(
                     "L10 traffic while stopped",
                     Duration::from_secs(3),
-                    |_| Ok(flow_counts(&path)?.1 > before),
+                    |_| {
+                        flow.alive()
+                            .map_err(|error| format!("harness: L10 canary flow exited: {error}"))?;
+                        Ok(flow_counts(&path)?.1 > before)
+                    },
                 )?;
                 self.assert_heartbeat_quiet(Duration::from_secs(32), Duration::from_secs(5))?;
                 let heartbeat_before = self.heartbeat_count()?;
@@ -935,7 +989,11 @@ impl DaemonGuard<'_> {
                 self.lab.daemon_wait(
                     "L10 traffic after SIGKILL",
                     Duration::from_secs(3),
-                    |_| Ok(flow_counts(&path)?.1 > before),
+                    |_| {
+                        flow.alive()
+                            .map_err(|error| format!("harness: L10 canary flow exited: {error}"))?;
+                        Ok(flow_counts(&path)?.1 > before)
+                    },
                 )?;
                 self.assert_heartbeat_quiet(Duration::from_secs(32), Duration::from_secs(5))?;
                 flow.stop(Signal::TERM)?;
@@ -1033,6 +1091,7 @@ impl DaemonGuard<'_> {
                 self.expect_check(&root, 0, None, "real-reboot-connected")?;
             }
             "L43" => {
+                let client_ifindex = self.lab.assert_client_link()?;
                 for attempt in 0..5 {
                     self.lab.cmd(
                         "scupper",
@@ -1052,25 +1111,44 @@ impl DaemonGuard<'_> {
                     )?;
                     self.lab
                         .cmd("scupper", "ip", &["link", "del", "foreign0"])?;
-                    let state = StateFile::open(root.join("var-lib/scupper"), None)?.read()?;
-                    if matches!(state, StateRead::Present(ref state) if state.quarantine.is_some())
-                    {
-                        break;
-                    }
                     // Each incident must finish reopening before the next one:
                     // the class budget charges reopenings, not repeated sightings
-                    // during one continuously closed repair.
-                    self.lab.daemon_route_healthy(Duration::from_secs(30))?;
-                    self.lab.daemon_wait(
-                        "L43 repair reopened",
+                    // during one continuously closed repair. LinkDown precedes
+                    // PersistLatch, so wait for either terminal outcome together.
+                    let file = StateFile::open(root.join("var-lib/scupper"), None)?;
+                    let run_root = root.join("run/scupper");
+                    let mut outcome = None;
+                    let elapsed_ms = self.lab.daemon_wait(
+                        "L43 repair latched or reopened",
                         Duration::from_secs(20),
                         |lab| {
-                            Ok(lab
-                                .cmd("scupper", "sysctl", &["-n", "net.ipv4.ip_forward"])?
-                                .trim()
-                                == "1")
+                            outcome = repair_outcome(&file, &run_root, false)?;
+                            if outcome.is_none() {
+                                let open = lab
+                                    .cmd("scupper", "sysctl", &["-n", "net.ipv4.ip_forward"])?
+                                    .trim()
+                                    == "1";
+                                outcome = repair_outcome(&file, &run_root, open)?;
+                            }
+                            Ok(outcome.is_some())
                         },
                     )?;
+                    fs::write(
+                        self.lab
+                            .artifacts
+                            .join(format!("L43-repair-{attempt}.json")),
+                        serde_json::to_vec_pretty(&serde_json::json!({
+                            "attempt": attempt, "outcome": outcome, "elapsed_ms": elapsed_ms,
+                        }))?,
+                    )?;
+                    if outcome == Some(RepairOutcome::Latched) {
+                        break;
+                    }
+                    if self.lab.assert_client_link()? != client_ifindex {
+                        return fail("L43 containment changed wg0 ifindex");
+                    }
+                    self.assert_client_traffic(&mut markers)?;
+                    self.lab.daemon_route_healthy(Duration::from_secs(30))?;
                     if attempt == 4 {
                         return fail("L43 recurring foreign links did not latch");
                     }
@@ -1447,6 +1525,121 @@ fn exit_change(old: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scupper_sys::state::{Quarantine, RepairState, State};
+
+    fn fixture(
+        name: &str,
+    ) -> (
+        std::path::PathBuf,
+        scupper_sys::lock::WriterGuard,
+        StateFile,
+    ) {
+        let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("control-{name}-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let guard = WriterLock::acquire(root.join("run/scupper")).unwrap();
+        let file = StateFile::open(root.join("var-lib/scupper"), Some(&guard)).unwrap();
+        file.write(
+            &guard,
+            &State {
+                applied_version: Some(1),
+                ..State::default()
+            },
+        )
+        .unwrap();
+        (root, guard, file)
+    }
+
+    fn quarantine() -> Quarantine {
+        Quarantine {
+            reason: "safety repair budget exhausted".into(),
+            object: "safety:foreign-link".into(),
+            since_unix: 476,
+            uncertain: false,
+        }
+    }
+
+    #[test]
+    fn fixture_reset_clears_every_latch_source() {
+        let (root, guard, file) = fixture("reset");
+        let run_root = root.join("run/scupper");
+        // Test each source alone as well as all three together.
+        for sources in 1..8 {
+            file.write(
+                &guard,
+                &State {
+                    applied_version: Some(1),
+                    selection: Selection::Disconnected,
+                    quarantine: (sources & 1 != 0).then(quarantine),
+                    ..State::default()
+                },
+            )
+            .unwrap();
+            file.write_repair_state(
+                &guard,
+                &RepairState {
+                    armed: true,
+                    quarantine: (sources & 2 != 0).then(quarantine),
+                    ..RepairState::default()
+                },
+            )
+            .unwrap();
+            if sources & 4 != 0 {
+                fs::write(run_root.join("latch-uncertain"), b"uncertain").unwrap();
+            }
+            assert_eq!(
+                repair_outcome(&file, &run_root, false).unwrap(),
+                Some(RepairOutcome::Latched)
+            );
+            clear_control_latch(&file, &guard, &run_root).unwrap();
+            let state = file.safety_read(&run_root).unwrap();
+            assert!(
+                matches!(state, StateRead::Present(_)),
+                "reset lost main state"
+            );
+            let StateRead::Present(state) = state else {
+                return;
+            };
+            assert_eq!(state.selection, Selection::Auto);
+            assert!(state.quarantine.is_none());
+            let repair = file.repair_state();
+            assert!(repair.quarantine.is_none());
+            assert!(repair.attempts_unix.is_empty());
+            assert!(!repair.armed);
+            assert!(!run_root.join("latch-uncertain").exists());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn l43_wait_observes_checkpoint_before_main_latch_and_prioritizes_it_over_open() {
+        let (root, guard, file) = fixture("outcome");
+        let run_root = root.join("run/scupper");
+        assert_eq!(repair_outcome(&file, &run_root, false).unwrap(), None);
+        assert_eq!(
+            repair_outcome(&file, &run_root, true).unwrap(),
+            Some(RepairOutcome::Reopened)
+        );
+        file.write_repair_state(
+            &guard,
+            &RepairState {
+                quarantine: Some(quarantine()),
+                ..RepairState::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(file.read().unwrap(), StateRead::Present(state) if state.quarantine.is_none())
+        );
+        for open in [false, true] {
+            assert_eq!(
+                repair_outcome(&file, &run_root, open).unwrap(),
+                Some(RepairOutcome::Latched)
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn exit_only_keepalive_change_respects_lab_handshake_budget() {
         let mut config = parse_site(include_str!("../../../lab/site-lab.toml")).unwrap();
@@ -1462,9 +1655,9 @@ mod tests {
 mod session_tests {
     use super::{session_continues, session_has_traffic};
     #[test]
-    fn counters_allow_idle_sessions_and_rekeys_but_reject_resets() {
+    fn client_handshakes_detect_rekeys_and_resets_even_when_counters_survive() {
         let before = "peer 100 1000 2000\n";
-        assert!(session_continues(before, "peer 220 1100 2100"));
+        assert!(!session_continues(before, "peer 220 1100 2100"));
         assert!(session_continues(before, before));
         assert!(session_continues(before, "peer 100 1100 2000"));
         assert!(session_has_traffic(before, "peer 220 1100 2100"));

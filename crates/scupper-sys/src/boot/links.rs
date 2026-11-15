@@ -17,6 +17,7 @@ use scupper_core::{
 pub(crate) fn cleanup_host(deps: &BootDeps<'_>, name: &str) -> Result<()> {
     let links = parse_ip_link(&execute(
         deps,
+        crate::system::HelperPurpose::Observation,
         ExecTarget::Host,
         Program::Ip,
         &strings(&["-d", "-j", "link", "show"]),
@@ -33,6 +34,7 @@ pub(crate) fn cleanup_host(deps: &BootDeps<'_>, name: &str) -> Result<()> {
         }
         execute(
             deps,
+            crate::system::HelperPurpose::Mutation,
             ExecTarget::Host,
             Program::Ip,
             &strings(&["link", "delete", "dev", name]),
@@ -71,7 +73,14 @@ pub(crate) fn host_link_removable(
         if program == Program::Wg {
             crate::system::check_wg_args(system, &args)?;
         }
-        let output = system.run(program, &args, crate::system::EXEC_TIMEOUT)?;
+        let output = {
+            system.run(
+                crate::system::HelperPurpose::Observation,
+                program,
+                &args,
+                crate::system::EXEC_TIMEOUT,
+            )
+        }?;
         if output.status != Some(0) {
             return Err(HostLinkError::Status {
                 program,
@@ -94,6 +103,7 @@ pub(crate) fn add_host(deps: &BootDeps<'_>, name: &str) -> Result<()> {
     raw_name(name)?;
     execute(
         deps,
+        crate::system::HelperPurpose::Mutation,
         ExecTarget::Host,
         Program::Ip,
         &strings(&["link", "add", name, "type", "wireguard"]),
@@ -112,6 +122,7 @@ pub(crate) fn move_link(deps: &BootDeps<'_>, handle: &NetnsHandle, name: &str) -
     raw_name(name)?;
     execute(
         deps,
+        crate::system::HelperPurpose::Mutation,
         ExecTarget::Host,
         Program::Ip,
         &strings(&[
@@ -126,7 +137,14 @@ pub(crate) fn move_link(deps: &BootDeps<'_>, handle: &NetnsHandle, name: &str) -
     Ok(())
 }
 
-pub(super) fn configure(deps: &BootDeps<'_>, handle: &NetnsHandle, cfg: &Inputs) -> Result<()> {
+pub(super) fn configure(
+    deps: &BootDeps<'_>,
+    handle: &NetnsHandle,
+    cfg: &Inputs,
+    guard: &crate::lock::WriterGuard,
+    daemonless_empty: bool,
+    open_quarantined: bool,
+) -> Result<()> {
     let gw = cfg.site.gateway(&cfg.gateway).ok_or("unknown gateway")?;
     for name in super::configured_names(cfg)?
         .iter()
@@ -148,7 +166,55 @@ pub(super) fn configure(deps: &BootDeps<'_>, handle: &NetnsHandle, cfg: &Inputs)
         }
         let up = name == gw.client_tunnel().ifname().as_str()
             || cfg.state.selection != scupper_core::verdict::v2::Selection::Disconnected;
-        configure_body(deps, handle, cfg, name, up, true)?;
+        if name == gw.client_tunnel().ifname().as_str() {
+            let was_down = !existing
+                .iter()
+                .any(|l| l.ifname == name && l.flags.iter().any(|f| f == "UP"));
+            configure_body(deps, handle, cfg, name, false, true)?;
+            if cfg.state.quarantine.is_some() && !open_quarantined {
+                set_up(deps, handle, name, false)?;
+                continue;
+            }
+            if daemonless_empty && !cfg.site.health().require_daemon() {
+                let retire = || {
+                    crate::client_sessions::retire_empty(
+                        deps.state_root,
+                        deps.run_root,
+                        gw.client_tunnel().identity().public_key.as_str(),
+                        deps.system.now_unix_secs(),
+                        guard,
+                    )
+                };
+                // A sampler finishing an old write, or a delayed directory sync,
+                // must get another bounded opportunity before boot gives up.
+                if retire().is_err() && retire().is_err() {
+                    set_up(deps, handle, name, false)?;
+                    return Err("daemonless EMPTY retirement failed after retry".into());
+                }
+            }
+            crate::client_sessions::before_up(
+                deps.system,
+                handle,
+                name,
+                deps.state_root,
+                deps.run_root,
+                gw.client_tunnel().identity().public_key.as_str(),
+                was_down,
+                guard,
+            )
+            .map_err(|_| "client session baseline unavailable".to_string())?;
+            let may_serve = crate::client_sessions::may_serve(
+                deps.state_root,
+                gw.client_tunnel().identity().public_key.as_str(),
+                deps.system.now_unix_secs(),
+            );
+            set_up(deps, handle, name, may_serve)?;
+            if daemonless_empty && !cfg.site.health().require_daemon() && !may_serve {
+                return Err("daemonless client device cannot serve after opening hook".into());
+            }
+        } else {
+            configure_body(deps, handle, cfg, name, up, true)?;
+        }
     }
     Ok(())
 }
@@ -172,6 +238,7 @@ pub(crate) fn configure_one(
         if name != client.ifname().as_str() {
             execute(
                 deps,
+                crate::system::HelperPurpose::Mutation,
                 ExecTarget::Netns(handle),
                 Program::Ip,
                 &strings(&["link", "set", "dev", name, "down"]),
@@ -218,6 +285,7 @@ fn configure_body(
     // may be recreated; unknown client peers must still be removed.
     let peers = execute(
         deps,
+        crate::system::HelperPurpose::Observation,
         target,
         Program::Wg,
         &strings(&["show", name, "peers"]),
@@ -245,6 +313,7 @@ fn configure_body(
     configure_peers(deps, handle, cfg, name)?;
     execute(
         deps,
+        crate::system::HelperPurpose::Mutation,
         target,
         Program::Ip,
         &strings(&["addr", "flush", "dev", name]),
@@ -252,6 +321,7 @@ fn configure_body(
     )?;
     execute(
         deps,
+        crate::system::HelperPurpose::Mutation,
         target,
         Program::Ip,
         &strings(&["addr", "add", &address, "dev", name]),
@@ -271,7 +341,14 @@ fn configure_body(
     if up {
         args.push("up");
     }
-    execute(deps, target, Program::Ip, &strings(&args), None)?;
+    execute(
+        deps,
+        crate::system::HelperPurpose::Mutation,
+        target,
+        Program::Ip,
+        &strings(&args),
+        None,
+    )?;
     Ok(())
 }
 
@@ -284,6 +361,7 @@ pub(crate) fn set_up(
     raw_name(name)?;
     execute(
         deps,
+        crate::system::HelperPurpose::Mutation,
         ExecTarget::Netns(handle),
         Program::Ip,
         &strings(&["link", "set", "dev", name, if up { "up" } else { "down" }]),
@@ -379,8 +457,21 @@ fn wg(
     cmd: WgCmd,
     input: Option<&[u8]>,
 ) -> Result<String> {
-    let (program, args) = KernelCmd::Wg(cmd).render();
-    execute(deps, ExecTarget::Netns(handle), program, &args, input)
+    let command = KernelCmd::Wg(cmd);
+    let purpose = if command.mutates() {
+        crate::system::HelperPurpose::Mutation
+    } else {
+        crate::system::HelperPurpose::Observation
+    };
+    let (program, args) = command.render();
+    execute(
+        deps,
+        purpose,
+        ExecTarget::Netns(handle),
+        program,
+        &args,
+        input,
+    )
 }
 
 pub(crate) fn raw_name(name: &str) -> Result<()> {
@@ -409,6 +500,7 @@ pub(super) fn close(deps: &BootDeps<'_>, handle: &NetnsHandle, cfg: &Inputs) -> 
         let result = raw_name(&link.ifname).and_then(|()| {
             execute(
                 deps,
+                crate::system::HelperPurpose::Mutation,
                 ExecTarget::Netns(handle),
                 Program::Ip,
                 &strings(&["link", "set", "dev", &link.ifname, "down"]),
@@ -444,6 +536,7 @@ pub(crate) fn clear_hooks(deps: &BootDeps<'_>, handle: &NetnsHandle, name: &str)
         let result = (|| {
             if let Err(error) = execute(
                 deps,
+                crate::system::HelperPurpose::Mutation,
                 target,
                 Program::Tc,
                 &strings(&["qdisc", "del", "dev", name, kind]),
@@ -451,6 +544,7 @@ pub(crate) fn clear_hooks(deps: &BootDeps<'_>, handle: &NetnsHandle, name: &str)
             ) {
                 let got = execute(
                     deps,
+                    crate::system::HelperPurpose::Observation,
                     target,
                     Program::Tc,
                     &strings(&["-j", "qdisc", "show", "dev", name]),
@@ -472,6 +566,7 @@ pub(crate) fn clear_hooks(deps: &BootDeps<'_>, handle: &NetnsHandle, name: &str)
     }
     if let Err(error) = execute(
         deps,
+        crate::system::HelperPurpose::Mutation,
         target,
         Program::Ip,
         &strings(&["link", "set", "dev", name, "xdp", "off"]),
@@ -485,6 +580,7 @@ pub(crate) fn clear_hooks(deps: &BootDeps<'_>, handle: &NetnsHandle, name: &str)
     // A failed detach must not leave a configured link able to redirect traffic.
     if let Err(error) = execute(
         deps,
+        crate::system::HelperPurpose::Mutation,
         target,
         Program::Ip,
         &strings(&["link", "set", "dev", name, "down"]),
@@ -593,6 +689,7 @@ pub(crate) fn delete_hook(
     if hook == "root" {
         if let Err(error) = execute(
             deps,
+            crate::system::HelperPurpose::Mutation,
             ExecTarget::Netns(held),
             Program::Tc,
             &strings(&["qdisc", "del", "dev", name, "root"]),

@@ -19,6 +19,10 @@ impl Event {
             | EventKind::QuarantineState { active: true } => E::QuarantineSet,
             EventKind::FailClosedState { closed: false } => E::FailClosedEnded(0),
             EventKind::FailClosedEnded { duration } => E::FailClosedEnded(duration.as_secs()),
+            EventKind::IngressQuarantineChanged { active: true }
+            | EventKind::IngressQuarantineState { active: true } => E::IngressQuarantineSet,
+            EventKind::IngressQuarantineChanged { active: false }
+            | EventKind::IngressQuarantineState { active: false } => E::IngressQuarantineCleared,
             EventKind::Failover { .. } => E::Failover,
             EventKind::Failback { .. } => E::Failback,
             EventKind::RepairSuppressed { .. } => E::RepairSuppressed,
@@ -120,9 +124,13 @@ mod tests {
                 let object = serde_json::from_value(serde_json::json!(object)).unwrap();
                 let reason = serde_json::from_value(serde_json::json!(reason)).unwrap();
                 assert!(
-                    event(EventKind::DriftDetected { object, reason })
-                        .alert()
-                        .is_none()
+                    event(EventKind::DriftDetected {
+                        read: None,
+                        object,
+                        reason
+                    })
+                    .alert()
+                    .is_none()
                 );
             }
         }
@@ -221,6 +229,7 @@ mod tests {
             ),
             (
                 EventKind::Repair {
+                    object: None,
                     kind: crate::StepKind::LoadRuleset,
                     class: crate::RepairClass::Restore,
                     result: Outcome::Succeeded,
@@ -278,6 +287,56 @@ mod tests {
             .alert()
             .is_none()
         );
+    }
+    #[test]
+    fn ingress_and_latch_quarantine_have_independent_overlapping_lifecycles() {
+        use scupper_core::{
+            alerts::{AlertKey as K, AlertState as S, Coalescer},
+            config::Severity,
+        };
+        for ingress_clears_first in [true, false] {
+            let mut current = std::collections::BTreeMap::new();
+            let mut coalescer = Coalescer::default();
+            let ends = if ingress_clears_first {
+                [
+                    EventKind::IngressQuarantineChanged { active: false },
+                    EventKind::QuarantineChanged { active: false },
+                ]
+            } else {
+                [
+                    EventKind::QuarantineChanged { active: false },
+                    EventKind::IngressQuarantineChanged { active: false },
+                ]
+            };
+            for (index, kind) in [
+                EventKind::IngressQuarantineChanged { active: true },
+                EventKind::QuarantineChanged { active: true },
+                ends[0].clone(),
+                ends[1].clone(),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut audit = event(kind);
+                audit.seq = index as u64 + 1;
+                let alert = audit.alert().unwrap();
+                assert_eq!(alert.severity, Severity::Critical);
+                coalescer.push_at(alert.clone(), index as u64);
+                current.insert(alert.key, alert.state);
+                if index == 2 {
+                    let (cleared, active) = if ingress_clears_first {
+                        (K::IngressQuarantine, K::Quarantine)
+                    } else {
+                        (K::Quarantine, K::IngressQuarantine)
+                    };
+                    assert_eq!(current[&cleared], S::Resolved);
+                    assert_eq!(current[&active], S::Firing);
+                    assert!(coalescer.incident_stats(active).is_some());
+                }
+            }
+            assert_eq!(current[&K::IngressQuarantine], S::Resolved);
+            assert_eq!(current[&K::Quarantine], S::Resolved);
+        }
     }
     proptest::proptest! {
         #[test]

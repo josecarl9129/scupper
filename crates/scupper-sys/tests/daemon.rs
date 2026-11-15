@@ -170,6 +170,7 @@ fn a_cached_difference_must_survive_a_fresh_kernel_canonicalization() {
         }
         fn run(
             &self,
+            _purpose: scupper_sys::system::HelperPurpose,
             program: Program,
             args: &[String],
             _: Duration,
@@ -194,12 +195,13 @@ fn a_cached_difference_must_survive_a_fresh_kernel_canonicalization() {
         }
         fn run_in(
             &self,
+            purpose: scupper_sys::system::HelperPurpose,
             _: ExecTarget<'_>,
             program: Program,
             args: &[String],
             timeout: Duration,
         ) -> Result<ExecOutput, ExecError> {
-            self.run(program, args, timeout)
+            self.run(purpose, program, args, timeout)
         }
         fn now_unix_secs(&self) -> u64 {
             0

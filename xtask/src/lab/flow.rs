@@ -109,7 +109,7 @@ pub fn flow(mode: &str, address: SocketAddr, marker: &str, log: &Path, seconds: 
         writeln!(
             log,
             "{}",
-            serde_json::json!({"elapsed_ms":start.elapsed().as_millis(),"sent":sent,"received":received,"local":local})
+            serde_json::json!({"at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(), "elapsed_ms":start.elapsed().as_millis(),"sent":sent,"received":received,"local":local})
         )?;
         log.flush()?;
         thread::sleep(Duration::from_millis(25));
@@ -141,7 +141,7 @@ fn connect_canary(
         writeln!(
             log,
             "{}",
-            serde_json::json!({"elapsed_ms":start.elapsed().as_millis(),"attempted":1,"sent":sent,"received":received})
+            serde_json::json!({"at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),"elapsed_ms":start.elapsed().as_millis(),"attempted":1,"sent":sent,"received":received})
         )?;
         log.flush()?;
         thread::sleep(Duration::from_millis(25));

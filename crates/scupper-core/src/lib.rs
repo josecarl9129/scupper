@@ -6,7 +6,6 @@
 compile_error!("lab-mutation is restricted to debug lab builds");
 
 pub mod install;
-pub mod mac;
 
 pub mod alerts;
 pub mod canon;

@@ -1,1 +1,0 @@
-lo0 en0 en7 utun6 awdl0 bridge100 vmnet1

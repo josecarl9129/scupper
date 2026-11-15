@@ -10,7 +10,7 @@ use crate::{
     events::LogHandle,
     lock::{WriterGuard, WriterLock},
     netns::NetnsHandle,
-    state::{Quarantine, State, StateFile, StateRead},
+    state::{Quarantine, RepairState, State, StateFile, StateRead},
 };
 use scupper_core::{
     config::{ExitId, GatewayId, ValidatedSite},
@@ -23,16 +23,25 @@ use scupper_core::{
 };
 use scupper_proto::{Actor, Command, EventKind, Outcome, Reason, StepKind, VerdictCode};
 use std::{
+    cell::RefCell,
     collections::BTreeMap,
     io,
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 /// Fresh kernel and health observations. Unknown values remain unknown.
 #[derive(Debug, Clone)]
 pub struct Observation {
+    /// Failed read contexts, without helper output.
+    pub failures: Vec<scupper_proto::ReadFailure>,
+    /// At least one unsafe tc sub-read succeeded before a later read failed.
+    /// The model still retains Unknown inventory, preserving immediate D2.
+    pub known_unsafe_tc: bool,
     /// Planner input through the held inode; phase A leaves non-safety fields Unknown.
     pub model: KernelModel,
     /// All required safety observations succeeded within their group deadline.
@@ -55,6 +64,49 @@ pub struct StepError(pub &'static str);
 /// Namespace kernel adapter. Implementations must bound every exec to three seconds
 /// and collect safety first with a six-second shared deadline.
 pub trait Kernel {
+    /// Optional diagnostic hook for embedders/tests; no production caller.
+    /// Periodic activity runs on an independent sampler.
+    /// # Errors
+    /// Returns telemetry failure, never a reason to block shutdown.
+    fn checkpoint_client_activity(&self, _guard: &WriterGuard) -> Result<(), StepError> {
+        Ok(())
+    }
+
+    /// Drain the value-free session history alert queued by boot or recovery.
+    fn take_client_session_alert(&self, _guard: &WriterGuard) -> bool {
+        false
+    }
+
+    /// Save reset intent before containment without waiting for telemetry.
+    /// # Errors
+    /// Failure is logged but never prevents the containment command.
+    fn before_client_link_down(&self, _guard: &WriterGuard) -> Result<(), StepError> {
+        Ok(())
+    }
+    /// Capture client reset state while down, before any reopening.
+    /// # Errors
+    /// Returns durable checkpoint or netlink failure.
+    fn client_link_down(&self, _guard: &WriterGuard) -> Result<(), StepError> {
+        Ok(())
+    }
+    /// Checkpoint reset baseline and a single probe before client `LinkUp`.
+    /// # Errors
+    /// Failure blocks reopening.
+    fn before_client_link_up(&self, _guard: &WriterGuard) -> Result<(), StepError> {
+        Ok(())
+    }
+    /// Consume pending client probes only under the pure planner output gate.
+    /// # Errors
+    /// Returns probe failure; callers log it without changing containment.
+    fn recover_client_sessions(
+        &self,
+        _guard: &WriterGuard,
+        _desired: &Desired,
+        _model: &KernelModel,
+    ) -> Result<(), StepError> {
+        Ok(())
+    }
+
     /// Publish newly recreated owned link identities while holding the writer.
     /// Called after safety work; failed publication is retried on later ticks.
     ///
@@ -66,6 +118,22 @@ pub trait Kernel {
 
     /// Observe the original inode even if its mount name was removed or hijacked.
     fn observe(&self, held: &NetnsHandle) -> Observation;
+    /// One shutdown safety re-observation. Implementations must honor the shared
+    /// deadline, including helper execution and collection.
+    fn observe_until(&self, held: &NetnsHandle, _deadline: Instant) -> Observation {
+        self.observe(held)
+    }
+    /// No outstanding mutation can complete after this observation and reopen traffic.
+    fn mutations_settled(&self) -> bool {
+        true
+    }
+    /// Drain observation helpers and settle outstanding mutations before the
+    /// shutdown re-observation. The deadline bounds the read drain; a separate
+    /// one-second kill/reap budget follows. Non-kernel helpers are excluded.
+    /// False means an unreaped kernel helper keeps safety UNKNOWN.
+    fn drain_helpers(&self, _deadline: Instant) -> bool {
+        true
+    }
     /// Complete non-safety observations after emergency containment, before deadline.
     fn observe_rest(
         &self,
@@ -73,6 +141,10 @@ pub trait Kernel {
         safety: Observation,
         deadline: Instant,
     ) -> Observation;
+    /// Injectable monotonic clock for the fixed shutdown deadline.
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
     /// Whether execution may still start a Restore within this tick.
     fn within_deadline(&self, deadline: Instant) -> bool {
         Instant::now() < deadline
@@ -83,6 +155,8 @@ pub trait Kernel {
     }
     /// Invalidate durable reads at the current writer-lock boundary or after a write.
     fn invalidate_state(&self) {}
+    /// Share the shutdown containment deadline across all tightening helpers.
+    fn execution_deadline(&self, _deadline: Option<Instant>) {}
     /// Execute one idempotent operation, preserving partial failure effects.
     ///
     /// # Errors
@@ -116,6 +190,51 @@ pub trait Kernel {
 
 /// Durable state boundary. Implementations must not acknowledge a write before fsync.
 pub trait StateStore {
+    /// Optional durable repair checkpoint (memory-only adapters may omit it).
+    fn repair_state(&self) -> Option<RepairState> {
+        None
+    }
+    /// Persist write-ahead repair history under the writer guard.
+    /// # Errors
+    /// Returns persistence failures before a restore can begin.
+    fn write_repair_state(&self, _guard: &WriterGuard, _repair: &RepairState) -> io::Result<()> {
+        Ok(())
+    }
+    /// Explicitly clear repair uncertainty and its runtime marker.
+    /// # Errors
+    /// Returns durable clearance failures.
+    fn clear_repair_state(
+        &self,
+        _guard: &WriterGuard,
+        _run_root: &std::path::Path,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+    /// Whether an external latch clear has durable proof.
+    fn clearance_proven(&self) -> bool {
+        self.repair_state()
+            .is_none_or(|s| s.startup_latch().is_none())
+    }
+
+    /// Persist a latch and repair history within one shared I/O budget. A timed
+    /// out worker must retain the writer capability until it finishes.
+    /// # Errors
+    /// Returns failure without preventing subsequent kernel containment.
+    fn write_latch_until(
+        &self,
+        guard: &WriterGuard,
+        state: &State,
+        repair: &RepairState,
+        run_root: &std::path::Path,
+        _deadline: Instant,
+    ) -> io::Result<()> {
+        self.write_repair_state(guard, repair)
+            .and_then(|()| self.write(guard, state))
+            .inspect_err(|_| {
+                let _ = write_uncertainty_marker(run_root);
+            })
+    }
+
     /// Read the complete durable state, refusing absence or corruption.
     ///
     /// # Errors
@@ -141,6 +260,30 @@ pub trait StateStore {
     fn write(&self, guard: &WriterGuard, state: &State) -> io::Result<()>;
 }
 impl StateStore for StateFile {
+    fn write_latch_until(
+        &self,
+        guard: &WriterGuard,
+        state: &State,
+        repair: &RepairState,
+        run_root: &std::path::Path,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        self.write_latch_bounded(guard, state, repair, run_root, deadline)
+    }
+    fn repair_state(&self) -> Option<RepairState> {
+        Some(Self::repair_state(self))
+    }
+    fn write_repair_state(&self, guard: &WriterGuard, repair: &RepairState) -> io::Result<()> {
+        Self::write_repair_state(self, guard, repair)
+    }
+    fn clear_repair_state(
+        &self,
+        guard: &WriterGuard,
+        run_root: &std::path::Path,
+    ) -> io::Result<()> {
+        Self::clear_repair_state(self, guard, run_root)
+    }
+
     fn begin_tick(&self) {
         self.invalidate_reads();
     }
@@ -248,6 +391,8 @@ pub struct Reconciler<K, S, C> {
     failover: Failover,
     failover_config: FailoverConfig,
     budgets: Budgets,
+    // Preserve the wall timestamp assigned to each reservation across later checkpoints.
+    repair_times: BTreeMap<MonoTime, u64>,
     debounce: Debounce,
     latch: Option<Latch>,
     persisted: State,
@@ -257,10 +402,15 @@ pub struct Reconciler<K, S, C> {
     actions: Vec<FailoverAction>,
     verdict: Option<VerdictCode>,
     reported_quarantine: Option<bool>,
+    reported_ingress_quarantine: Option<bool>,
     reported_fail_closed: Option<bool>,
     forwarding: bool,
     deadline: Option<Instant>,
-    // Evidence only: no reservations or debounce are committed by emergency work.
+    stop_deadline: Option<Instant>,
+    // Latching containment never waits on event journaling before tightening.
+    latch_events: RefCell<Option<Vec<(EventKind, Actor)>>>,
+    // Containment evidence only: emergency work commits ingress quarantine,
+    // but never commits availability debounce or restore reservations.
     emergency_steps: Vec<Step>,
     startup: bool,
     admin_resume_until: Option<MonoTime>,
@@ -298,13 +448,58 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             FailoverConfig::from_site(&config.site, &config.gateway).map_err(io::Error::other)?;
         let (failover, actions) =
             Failover::new(clock().0, persisted.selection.clone(), &failover_config);
-        let latch = persisted.quarantine.as_ref().map(|q| Latch {
+        let repair = store.repair_state().unwrap_or_default();
+        let (mono, unix) = clock();
+        // Planner time has a ten-minute headroom so even an origin of zero can
+        // represent attempts from before this process started.
+        let repair_now = mono.after(Duration::from_secs(600));
+        let mut startup_quarantine = persisted.quarantine.clone().or_else(|| {
+            repair.startup_latch().map(|mut q| {
+                q.reason = format!(
+                    "latch persistence or clearance uncertain: {}; run scupper connect",
+                    q.reason
+                );
+                q
+            })
+        });
+        // Presence, including an unreadable marker, is proof of an interrupted latch.
+        if !matches!(std::fs::symlink_metadata(config.run_root.join("latch-uncertain")), Err(e) if e.kind() == io::ErrorKind::NotFound)
+        {
+            startup_quarantine.get_or_insert_with(|| Quarantine {
+                reason: "latch persistence uncertain; run scupper connect".into(),
+                object: "unknown".into(),
+                since_unix: unix,
+                uncertain: true,
+            });
+        }
+        let latch = startup_quarantine.as_ref().map(|q| Latch {
+            uncertain: q.uncertain,
             reason: q.reason.clone(),
             object: q.object.clone(),
         });
         config.desired(&persisted.selection, failover.desired_route())?;
         kernel.hold_latch(latch.as_ref());
         kernel.persisted_latch(latch.as_ref());
+        let mut repair_times = BTreeMap::new();
+        let attempts = repair
+            .attempts_unix
+            .into_iter()
+            .filter_map(|(key, times)| {
+                let times: Vec<_> = times
+                    .into_iter()
+                    .map(|at| at.min(unix)) // Future attempts clamp to now.
+                    .filter(|at| unix - at < 600)
+                    .take(3)
+                    .map(|at| {
+                        let mono =
+                            MonoTime(repair_now.0.saturating_sub(Duration::from_secs(unix - at)));
+                        repair_times.insert(mono, at);
+                        mono
+                    })
+                    .collect();
+                (!times.is_empty()).then_some((key, times))
+            })
+            .collect();
         Ok(Self {
             kernel,
             store,
@@ -312,7 +507,11 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             config,
             failover,
             failover_config,
-            budgets: Budgets::default(),
+            budgets: Budgets {
+                attempts,
+                ..Budgets::default()
+            },
+            repair_times,
             debounce: Debounce::default(),
             latch,
             persisted,
@@ -322,14 +521,26 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             actions,
             verdict: None,
             reported_quarantine: None,
+            reported_ingress_quarantine: None,
             reported_fail_closed: None,
             forwarding: false,
             deadline: None,
+            stop_deadline: None,
+            latch_events: RefCell::new(None),
             emergency_steps: vec![],
             startup: true,
             admin_resume_until: None,
             cached: None,
         })
+    }
+    /// Optional diagnostic snapshot for embedders/tests; no production caller.
+    /// System shutdown uses `boot::clean_stop` after daemon exit.
+    /// # Errors
+    /// Returns lock contention or telemetry failure; shutdown remains best effort.
+    pub fn checkpoint_before_shutdown(&self) -> Result<(), StepError> {
+        let guard = WriterLock::try_acquire(&self.config.run_root)
+            .map_err(|_| StepError("session snapshot writer unavailable"))?;
+        self.kernel.checkpoint_client_activity(&guard)
     }
     /// Adapter access for lifecycle updates such as edge's new namespace path.
     pub fn kernel(&self) -> &K {
@@ -465,6 +676,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 let result = self.kernel.execute(&Step::FlushConntrack);
                 let _ = self.log.emit(
                     EventKind::Repair {
+                        object: None,
                         kind: StepKind::FlushConntrack,
                         class: repair_class(&Step::FlushConntrack),
                         result: if result.is_ok() {
@@ -503,6 +715,14 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         scupper_core::verdict::v2::NetnsIdentity { device, inode }
     }
 
+    /// Whether the quarantine lacks durable main-state persistence.
+    pub fn connect_clearable_latch(&self) -> bool {
+        self.budgets.persistence_failed || self.latch.as_ref().is_some_and(|latch| latch.uncertain)
+    }
+    /// Whether a latch write failed during this process.
+    pub fn latch_persistence_failed(&self) -> bool {
+        self.budgets.persistence_failed
+    }
     /// Current memory quarantine, including a latch whose durable write failed.
     pub fn latch(&self) -> Option<&Latch> {
         self.latch.as_ref()
@@ -540,8 +760,12 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         self.actions.extend(actions);
     }
     /// Observe, plan and execute once, with bounded same-tick failure recovery.
-    #[allow(clippy::manual_let_else, clippy::single_match_else)] // Keep lock-failure reporting together.
     pub fn tick(&mut self) -> TickReport {
+        self.tick_with_stop(&AtomicBool::new(false))
+    }
+    /// Finish containment at safe operation boundaries when shutdown overlaps a tick.
+    #[allow(clippy::manual_let_else, clippy::single_match_else)] // Keep lock-failure reporting together.
+    pub fn tick_with_stop(&mut self, stop: &AtomicBool) -> TickReport {
         self.startup = false;
         let mut report = TickReport {
             complete: true,
@@ -554,6 +778,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 report.complete = false;
                 self.emit(
                     EventKind::DriftDetected {
+                        read: None,
                         object: scupper_proto::ObjectKind::Unknown,
                         reason: Reason::ExecutionFailed,
                     },
@@ -563,7 +788,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 return report;
             }
         };
-        self.tick_locked(&guard, &mut report);
+        self.tick_locked(&guard, &mut report, stop);
         let mut seen = Vec::new();
         report.escalations.retain(|item| {
             if seen.contains(item) {
@@ -582,17 +807,36 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             complete: true,
             ..TickReport::default()
         };
-        self.tick_locked(guard, &mut report);
+        self.tick_locked(guard, &mut report, &AtomicBool::new(false));
         report
     }
     #[allow(clippy::single_match_else)] // Durable success and failure retain different latch views.
     fn observe(&mut self, report: &mut TickReport) -> Observation {
-        let mut observation = self.kernel.observe(&self.held);
-        self.cached = Some((Instant::now(), observation.model.clone()));
+        let observation = self.kernel.observe(&self.held);
+        self.record_safety(observation, report)
+    }
+    fn record_safety(
+        &mut self,
+        mut observation: Observation,
+        report: &mut TickReport,
+    ) -> Observation {
+        for failure in &observation.failures {
+            self.emit(
+                EventKind::DriftDetected {
+                    object: failure.object(),
+                    reason: Reason::ObservationUnknown,
+                    read: Some(failure.clone()),
+                },
+                Actor::Daemon,
+                report,
+            );
+        }
         observation.model.latch = self.persisted.quarantine.as_ref().map(|q| Latch {
+            uncertain: q.uncertain,
             reason: q.reason.clone(),
             object: q.object.clone(),
         });
+        self.cached = Some((Instant::now(), observation.model.clone()));
         self.forwarding = observation.model.forwarding_v4 == planner::Known::Value(1)
             && observation.model.forwarding_v6 == planner::Known::Value(1)
             && observation.model.client_forwarding_v4 == planner::Known::Value(1);
@@ -608,22 +852,43 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         report: &mut TickReport,
     ) -> Observation {
         let mut observation = self.kernel.observe_rest(&self.held, safety, deadline);
+        for failure in &observation.failures {
+            if !report.events.iter().any(|event| {
+                matches!(event,
+                EventKind::DriftDetected { read: Some(existing), .. } if existing == failure)
+            }) {
+                self.emit(
+                    EventKind::DriftDetected {
+                        object: failure.object(),
+                        reason: Reason::ObservationUnknown,
+                        read: Some(failure.clone()),
+                    },
+                    Actor::Daemon,
+                    report,
+                );
+            }
+        }
         report.complete &= observation.safety_complete;
         report.complete &= observation.complete;
         // Persisted view is deliberately separate from the memory latch.
         match self.store.read_until(deadline) {
             Ok(state) => {
                 observation.model.latch = state.quarantine.as_ref().map(|q| Latch {
+                    uncertain: q.uncertain,
                     reason: q.reason.clone(),
                     object: q.object.clone(),
                 });
                 self.kernel
                     .persisted_latch(observation.model.latch.as_ref());
-                if self.persisted.quarantine.is_some() && state.quarantine.is_none() {
+                if self.persisted.quarantine.is_some()
+                    && state.quarantine.is_none()
+                    && self.store.clearance_proven()
+                {
                     // Another authorized writer durably cleared the latch while
                     // this process was unavailable. Memory-only latches still hold.
                     self.latch = None;
                     self.budgets = Budgets::default();
+                    self.repair_times.clear();
                     self.kernel.hold_latch(None);
                 }
                 if self.latch.is_none() {
@@ -653,6 +918,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 // Do not turn unreadable persisted quarantine into an implicit clear.
                 observation.model.ruleset = planner::Known::Unknown;
                 observation.model.latch = self.persisted.quarantine.as_ref().map(|q| Latch {
+                    uncertain: q.uncertain,
                     reason: q.reason.clone(),
                     object: q.object.clone(),
                 });
@@ -667,10 +933,25 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         self.cached = Some((at, observation.model.clone()));
         observation
     }
+    fn tick_locked(&mut self, guard: &WriterGuard, report: &mut TickReport, stop: &AtomicBool) {
+        self.tick_locked_inner(guard, report, stop);
+        // Every return path must release the buffer, including a SAFE stop in
+        // the middle of a link restore group.
+        self.flush_latch_events(report);
+    }
     #[allow(clippy::too_many_lines)] // Preserve the observe/health/plan/execute ordering in one place.
-    fn tick_locked(&mut self, guard: &WriterGuard, report: &mut TickReport) {
+    fn tick_locked_inner(
+        &mut self,
+        guard: &WriterGuard,
+        report: &mut TickReport,
+        stop: &AtomicBool,
+    ) {
+        if !stop.load(Ordering::Acquire) {
+            self.stop_deadline = None;
+        }
         self.store.begin_tick();
         self.kernel.begin_tick();
+        self.session_history_alert(guard, report);
         // Read the applied identity before comparing against this render. A
         // concurrent writer holds the same lock, so it cannot race this check.
         if let Some(mut latest) = self
@@ -682,6 +963,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             let closed = self.execute_step(&Step::ForwardingOff, false, guard, report);
             self.emit(
                 EventKind::Repair {
+                    object: None,
                     kind: StepKind::ForwardingOff,
                     class: scupper_proto::RepairClass::Tighten,
                     result: if closed.is_ok() {
@@ -706,12 +988,14 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 self.kernel.persisted_latch(None);
                 self.kernel.hold_latch(None);
                 self.budgets = Budgets::default();
+                self.repair_times.clear();
             }
             if let Some(latch) = &self.latch {
                 latest.quarantine = Some(Quarantine {
                     reason: latch.reason.clone(),
                     object: latch.object.clone(),
                     since_unix: (self.clock)().1,
+                    uncertain: latch.uncertain,
                 });
                 if self.store.write(guard, &latest).is_err() {
                     self.persistence_failure(report);
@@ -721,7 +1005,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             report.escalations.push(Escalation::ReinitializeRequired);
             return;
         }
-        self.tick_inner(guard, report);
+        self.tick_inner(guard, report, stop);
         if self
             .deadline
             .is_some_and(|d| !self.kernel.within_deadline(d))
@@ -731,13 +1015,17 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         if self.kernel.checkpoint_owned(guard).is_err() {
             self.boot_write_failure(report);
         }
-        self.report_verdict(report);
+        self.report_verdict(report, stop);
     }
     #[allow(clippy::too_many_lines)]
-    fn tick_inner(&mut self, guard: &WriterGuard, report: &mut TickReport) {
+    fn tick_inner(&mut self, guard: &WriterGuard, report: &mut TickReport, stop: &AtomicBool) {
         let deadline = Instant::now() + Duration::from_secs(20);
         self.deadline = Some(deadline);
         let mut safety = self.observe(report);
+        if stop.load(Ordering::Relaxed) {
+            self.finish_stop(safety, guard, report);
+            return;
+        }
         match safety.model.namespace {
             planner::NamespaceState::InodeGone => {
                 report.complete = false;
@@ -757,13 +1045,25 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 &self.budgets,
                 self.latch.as_ref(),
                 &self.debounce,
-                (self.clock)().0,
+                self.repair_now(),
             );
             if self.latch.is_none() {
                 self.latch = prefix.latch;
             }
             self.kernel.hold_latch(self.latch.as_ref());
-            self.run_emergency(prefix.steps, &mut safety.model, &desired, guard, report);
+            self.debounce.ingress_quarantined = prefix.debounce.ingress_quarantined;
+            self.run_emergency_stopping(
+                prefix.steps,
+                &mut safety.model,
+                &desired,
+                guard,
+                report,
+                Some(stop),
+            );
+            if stop.load(Ordering::Relaxed) {
+                report.complete = false;
+                return;
+            }
         }
         // Rebinding the held inode's name is namespace containment, not a
         // network Restore. It must not depend on availability/storage reads.
@@ -773,7 +1073,15 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         if !report.steps.is_empty() {
             safety = self.observe(report);
         }
+        if stop.load(Ordering::Relaxed) {
+            self.finish_stop(safety, guard, report);
+            return;
+        }
         let observed = self.observe_rest(safety, deadline, report);
+        if stop.load(Ordering::Relaxed) {
+            self.finish_stop(observed, guard, report);
+            return;
+        }
         if !observed.complete {
             report.complete = false;
             return;
@@ -831,7 +1139,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             &planning_budgets,
             self.latch.as_ref(),
             &self.debounce,
-            now,
+            now.after(Duration::from_secs(600)),
         );
         if observed.model.forwarding_off()
             && report.steps.contains(&Step::ForwardingOff)
@@ -931,10 +1239,124 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 .steps
                 .insert(before_forwarding, Step::FlushConntrack);
         }
-        self.run_plan(planned, &desired, guard, report, true);
+        self.run_plan(planned, &desired, guard, report, true, Some(stop));
+    }
+    fn start_stop_deadline(&mut self) {
+        if self.stop_deadline.is_none() {
+            self.stop_deadline = Some(self.kernel.now() + Duration::from_secs(150));
+        }
+    }
+    // Observation helpers are synchronous and reaped by their executor before
+    // returning (a timed-out reaper is drained before this single retry).
+    fn finish_stop(
+        &mut self,
+        mut observed: Observation,
+        guard: &WriterGuard,
+        report: &mut TickReport,
+    ) {
+        self.start_stop_deadline();
+        report.complete = false; // This tick deliberately omits availability work.
+        let Ok(desired) = self.desired() else { return };
+        if stop_safety(
+            &observed,
+            &desired,
+            self.latch.is_some(),
+            self.kernel.mutations_settled(),
+        ) == StopSafety::Unknown
+        {
+            // Drain only observation helpers. Timed-out reads are killed and
+            // reaped by the adapter before the single whole-read budget starts.
+            if self
+                .kernel
+                .drain_helpers(self.kernel.now() + crate::system::EXEC_TIMEOUT)
+            {
+                let deadline = self.kernel.now() + Duration::from_secs(3);
+                observed = self.kernel.observe_until(&self.held, deadline);
+                observed = self.record_safety(observed, report);
+                if self.kernel.now() >= deadline {
+                    observed.safety_complete = false;
+                    observed.model.links_complete = false;
+                }
+            } else {
+                // A helper that cannot be reaped is still unknown safety. Do
+                // not start another observation over it; contain now, then keep
+                // the main PID alive in the final drain until systemd's timeout.
+                observed.safety_complete = false;
+                observed.model.links_complete = false;
+            }
+        }
+        if stop_safety(
+            &observed,
+            &desired,
+            self.latch.is_some(),
+            self.kernel.mutations_settled(),
+        ) == StopSafety::Safe
+        {
+            return;
+        }
+        // Still unknown is fail closed. Complete the entire tightening prefix;
+        // a stop request never interrupts a multi-command containment operation.
+        if !observed.safety_complete && !phase_a_unknown(&observed.model) {
+            observed.model.links_complete = false;
+        }
+        let prefix = planner::plan(
+            &desired,
+            &observed.model,
+            &self.budgets,
+            self.latch.as_ref(),
+            &self.debounce,
+            self.repair_now(),
+        );
+        self.adopt_safety(&prefix);
+        self.debounce.ingress_quarantined = prefix.debounce.ingress_quarantined;
+        self.run_emergency_stopping(
+            prefix.steps,
+            &mut observed.model,
+            &desired,
+            guard,
+            report,
+            Some(&AtomicBool::new(true)),
+        );
     }
     #[allow(clippy::too_many_lines)] // Publish independent incident state alongside the tick verdict.
-    fn report_verdict(&mut self, report: &mut TickReport) {
+    fn report_verdict(&mut self, report: &mut TickReport, stop: &AtomicBool) {
+        let ingress = self.debounce.ingress_quarantined;
+        // An inactive restart snapshot waits for a fresh, mutation-free tick;
+        // a predicted post-restore model cannot resolve a durable old incident.
+        let fresh_snapshot = self.reported_ingress_quarantine.is_some()
+            || report
+                .steps
+                .iter()
+                .all(|step| matches!(step, Step::Emit(_) | Step::PersistLatch { .. }));
+        let lift_verified = report.complete
+            && fresh_snapshot
+            && self.desired().is_ok_and(|desired| {
+                self.cached
+                    .as_ref()
+                    .is_some_and(|(_, model)| planner::client_output_verified(model, &desired))
+            });
+        if Some(ingress) != self.reported_ingress_quarantine && (ingress || lift_verified) {
+            let already_emitted = report.events.iter().any(|event| {
+                matches!(event, EventKind::IngressQuarantineChanged { active } if *active == ingress)
+            });
+            let event = if self.reported_ingress_quarantine.is_none() {
+                EventKind::IngressQuarantineState { active: ingress }
+            } else {
+                EventKind::IngressQuarantineChanged { active: ingress }
+            };
+            let published = if already_emitted {
+                true
+            } else if ingress {
+                self.emit(event, Actor::Daemon, report);
+                true
+            } else {
+                crate::system::while_running(Some(stop), || self.emit(event, Actor::Daemon, report))
+                    .is_some()
+            };
+            if published {
+                self.reported_ingress_quarantine = Some(ingress);
+            }
+        }
         let active = self.latch.is_some();
         if Some(active) != self.reported_quarantine {
             self.emit(
@@ -962,11 +1384,19 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             }
             self.reported_fail_closed = Some(closed);
         }
+        let client_up = self.cached.as_ref().is_some_and(|(_, model)| {
+            model
+                .links
+                .get(&model.client_link)
+                .is_some_and(|link| link.up == planner::Known::Value(true))
+        });
         let verdict = if !report.complete {
             VerdictCode::ObservationError
-        } else if self.latch.is_some()
-            || !self.forwarding
-            || self.persisted.selection == Selection::Disconnected
+        } else if self.latch.is_some() || self.persisted.selection == Selection::Disconnected {
+            VerdictCode::FailClosed
+        } else if !client_up {
+            VerdictCode::Degraded
+        } else if !self.forwarding
             || *self.failover.desired_route() == scupper_core::render::RouteTarget::Unreachable
         {
             VerdictCode::FailClosed
@@ -994,13 +1424,66 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         guard: &WriterGuard,
         report: &mut TickReport,
     ) {
+        self.run_emergency_stopping(steps, model, desired, guard, report, None);
+    }
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Keep bounded containment and its failure recovery together.
+    fn run_emergency_stopping(
+        &mut self,
+        steps: Vec<Step>,
+        model: &mut KernelModel,
+        desired: &Desired,
+        guard: &WriterGuard,
+        report: &mut TickReport,
+        stop: Option<&AtomicBool>,
+    ) {
         // Last-chance recovery may arrive from a full observation. Failure
         // replanning here must still use only the phase-A projection.
         unknown_nonsafety(model);
-        let mut steps = std::collections::VecDeque::from(steps);
+        let mut steps =
+            std::collections::VecDeque::from(self.prepare_latch(steps, guard, report, Some(model)));
         let mut retried = false;
-        while let Some(step) = steps.pop_front() {
-            if !emergency_allowed(&step, model, desired) {
+        let mut shutdown_until = self
+            .stop_deadline
+            .and_then(|until| until.checked_sub(Duration::from_secs(30)));
+        let mut fallback = false;
+        while let Some(mut step) = steps.pop_front() {
+            if matches!(step, Step::Emit(_)) {
+                self.flush_latch_events(report);
+            }
+            if shutdown_until.is_none() && stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                self.start_stop_deadline();
+                shutdown_until = self
+                    .stop_deadline
+                    .and_then(|until| until.checked_sub(Duration::from_secs(30)));
+            }
+            if !fallback
+                && shutdown_until.is_some_and(|until| self.kernel.now() >= until)
+                && !matches!(step, Step::PersistLatch { .. })
+            {
+                // Optional bypass cleanup has exhausted its whole budget. Finish
+                // the current operation, then close ingress and the global gates
+                // as a final bounded containment sequence before exiting.
+                if matches!(step, Step::Emit(_)) {
+                    steps.push_front(step);
+                }
+                steps.retain(|step| matches!(step, Step::Emit(_) | Step::PersistLatch { .. }));
+                steps.push_front(Step::ForwardingOff);
+                step = Step::LinkDown {
+                    name: model.client_link.clone(),
+                };
+                fallback = true;
+                retried = true;
+                // One fixed deadline: reserve the last 30 seconds for mandatory closure.
+                // The optional cleanup deadline is never renewed.
+                shutdown_until = shutdown_until.map(|until| until + Duration::from_secs(30));
+            }
+            self.kernel.execution_deadline(
+                shutdown_until.map(|until| until.min(self.kernel.now() + Duration::from_secs(30))),
+            );
+            if !(emergency_allowed(&step, model, desired)
+                || fallback
+                    && matches!(&step, Step::LinkDown { name } if name == &model.client_link))
+            {
                 continue;
             }
             if !self.emergency_steps.contains(&step) {
@@ -1016,6 +1499,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             if !matches!(step, Step::Emit(_)) {
                 self.emit(
                     EventKind::Repair {
+                        object: step.link_name().map(str::to_owned),
                         kind: StepKind::from(&step),
                         class: repair_class(&step),
                         result: if result.is_ok() {
@@ -1038,11 +1522,19 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                         &self.budgets,
                         self.latch.as_ref(),
                         &self.debounce,
-                        (self.clock)().0,
+                        self.repair_now(),
                     );
                     self.adopt_safety(&recovery);
                     if !retried {
                         steps.extend(recovery.steps);
+                        // A recovery can introduce a latch after the original
+                        // prefix began. Mark and close forwarding before storage.
+                        steps = std::collections::VecDeque::from(self.prepare_latch(
+                            steps.into_iter().collect(),
+                            guard,
+                            report,
+                            Some(model),
+                        ));
                         retried = true;
                     }
                     report.complete = false;
@@ -1052,6 +1544,164 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 report.failures.push((step, error));
             }
         }
+        self.kernel.execution_deadline(None);
+        self.flush_latch_events(report);
+    }
+    fn client_link_down_step(&self) -> Step {
+        Step::LinkDown {
+            name: self.config.site.gateway(&self.config.gateway).map_or_else(
+                || "wg0".into(),
+                |gw| gw.client_tunnel().ifname().as_str().to_owned(),
+            ),
+        }
+    }
+    // A failed containment flush leaves stale flows unproven. Independently
+    // close ingress before storage, without running any restore/recovery work.
+    fn contain_failed_latch_flush(
+        &mut self,
+        guard: &WriterGuard,
+        report: &mut TickReport,
+        prefix_start: usize,
+    ) {
+        let down = self.client_link_down_step();
+        if report.steps[prefix_start..].contains(&down)
+            && !report.failures.iter().any(|(step, _)| *step == down)
+        {
+            return;
+        }
+        report.steps.push(down.clone());
+        let result = self.execute_step(&down, false, guard, report);
+        self.kernel.step_boundary(&down);
+        self.emit(
+            EventKind::Repair {
+                object: down.link_name().map(str::to_owned),
+                kind: StepKind::from(&down),
+                class: repair_class(&down),
+                result: if result.is_ok() {
+                    Outcome::Succeeded
+                } else {
+                    Outcome::Failed
+                },
+            },
+            Actor::Daemon,
+            report,
+        );
+        if let Err(error) = result {
+            report.failures.push((down, error));
+        }
+    }
+    /// Finish containment before durable storage, then publish events before restores.
+    #[allow(clippy::too_many_lines)] // Keep marker, closure and publication ordering auditable together.
+    fn prepare_latch(
+        &mut self,
+        mut steps: Vec<Step>,
+        guard: &WriterGuard,
+        report: &mut TickReport,
+        model: Option<&mut KernelModel>,
+    ) -> Vec<Step> {
+        let Some(latch_step) = steps
+            .iter()
+            .find(|s| matches!(s, Step::PersistLatch { .. }))
+            .cloned()
+        else {
+            return steps;
+        };
+        self.latch_events.borrow_mut().get_or_insert_with(Vec::new);
+        if write_uncertainty_marker(&self.config.run_root).is_err() {
+            report
+                .failures
+                .push((latch_step, StepError("latch marker creation failed")));
+            self.emit(
+                EventKind::PersistenceFailed {
+                    reason: Reason::StateWrite,
+                },
+                Actor::Daemon,
+                report,
+            );
+        }
+        let mut tighten = Vec::new();
+        let inode_gone = report.escalations.contains(&Escalation::RebuildRequired)
+            || model
+                .as_ref()
+                .is_some_and(|m| m.namespace == planner::NamespaceState::InodeGone);
+        if !inode_gone {
+            report.steps.push(Step::ForwardingOff);
+            let result = self.execute_step(&Step::ForwardingOff, false, guard, report);
+            self.kernel.step_boundary(&Step::ForwardingOff);
+            self.emit(
+                EventKind::Repair {
+                    object: None,
+                    kind: StepKind::ForwardingOff,
+                    class: scupper_proto::RepairClass::Tighten,
+                    result: if result.is_ok() {
+                        Outcome::Succeeded
+                    } else {
+                        Outcome::Failed
+                    },
+                },
+                Actor::Daemon,
+                report,
+            );
+            if result.is_ok()
+                && let Some(model) = model
+            {
+                *model = model.apply(&Step::ForwardingOff);
+            }
+            if let Err(error) = result {
+                report.complete = false;
+                report.failures.push((Step::ForwardingOff, error));
+                // A failed global gate also requires independent client closure.
+                tighten.push(self.client_link_down_step());
+            }
+        }
+        steps.retain(|s| *s != Step::ForwardingOff);
+        let restore_start = containment_end(&steps);
+        let restore_tighten: std::collections::BTreeSet<_> = steps.windows(2)
+            .enumerate().filter_map(|(index, pair)| {
+                if starts_link_restore(&pair[0], &pair[1]) {
+                    Some(index)
+                } else if matches!((&pair[0], &pair[1]),
+                    (Step::LinkCreate { link, .. } | Step::LinkReconfigure { link }, Step::LinkForwardingOff { name })
+                    if &link.name == name)
+                {
+                    Some(index + 1)
+                } else {
+                    None
+                }
+            }).collect();
+        let mut persist = Vec::new();
+        let mut events = Vec::new();
+        let mut restore = Vec::new();
+        for (index, step) in steps.into_iter().enumerate() {
+            match step {
+                Step::PersistLatch { .. } => persist.push(step),
+                Step::Emit(_) => events.push(step),
+                // These belong to a link restore group. Preserve its order:
+                // a recreated link cannot be hardened before it exists.
+                Step::LinkDown { .. } | Step::LinkForwardingOff { .. }
+                    if restore_tighten.contains(&index) =>
+                {
+                    restore.push(step);
+                }
+                Step::FlushConntrack if index >= restore_start => {
+                    // Flush containment now; a later ruleset load invalidates
+                    // that proof, so retain the group's post-load flush too.
+                    tighten.push(step.clone());
+                    restore.push(step);
+                }
+                _ if repair_class(&step) == scupper_proto::RepairClass::Tighten => {
+                    if !matches!(step, Step::LinkDown { .. }) || !tighten.contains(&step) {
+                        tighten.push(step);
+                    }
+                }
+                _ => restore.push(step),
+            }
+        }
+        steps = tighten;
+        steps.extend(persist);
+        steps.extend(events);
+        steps.extend(restore);
+        steps
     }
     fn boot_write_failure(&self, report: &mut TickReport) {
         self.emit(
@@ -1098,12 +1748,13 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         guard: &WriterGuard,
         report: &mut TickReport,
         recover: bool,
+        stop: Option<&AtomicBool>,
     ) {
         // Safety reservations are charged only at the actual Restore attempt:
         // ruleset load or foreign-link/tc reopening. Failed Tighten spends nothing.
         let mut plan = plan;
         let mut safety_reservations = Vec::new();
-        let now = (self.clock)().0;
+        let now = self.repair_now();
         for class in [
             planner::SafetyClass::Ruleset,
             planner::SafetyClass::ForeignLink,
@@ -1146,7 +1797,10 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 }
             }
         }
+        let ingress_quarantined = self.debounce.ingress_quarantined;
         self.adopt(&plan); // In memory before step zero; no disk I/O here.
+        // A predicted lift is committed only after execution and fresh readback.
+        self.debounce.ingress_quarantined |= ingress_quarantined;
         let mut restore_name = false;
         for escalation in plan.escalations {
             match escalation {
@@ -1171,6 +1825,8 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 }
             }
         }
+        let latch_prefix_start = report.steps.len();
+        plan.steps = self.prepare_latch(plan.steps, guard, report, None);
         let inode_gone = report.escalations.contains(&Escalation::RebuildRequired);
         if inode_gone {
             report.complete = false;
@@ -1182,7 +1838,141 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             .steps
             .iter()
             .rposition(|step| *step == Step::FlushConntrack);
+        let latch_write = plan
+            .steps
+            .iter()
+            .position(|step| matches!(step, Step::PersistLatch { .. }));
+        let containment_end = containment_end(&plan.steps);
+        let restore_starts: std::collections::BTreeSet<_> = plan
+            .steps
+            .windows(2)
+            .enumerate()
+            .filter_map(|(index, pair)| starts_link_restore(&pair[0], &pair[1]).then_some(index))
+            .collect();
+        let mut restore_started = false;
+        let mut restore_group: Option<String> = None;
+        let mut restore_group_complete = false;
+        let mut stopping_restore = false;
         for (index, step) in plan.steps.into_iter().enumerate() {
+            if matches!(step, Step::Emit(_)) || index >= containment_end {
+                self.flush_latch_events(report);
+            }
+            let stopping = stop.is_some_and(|flag| flag.load(Ordering::Acquire));
+            let starts_link_restore = restore_starts.contains(&index);
+            if stopping
+                && !restore_started
+                && (index >= containment_end || starts_link_restore && self.latch.is_none())
+            {
+                // A Step is the operation boundary; never interrupt its internal
+                // command sequence. Re-certify safety before leaving the plan.
+                let safety = self.observe(report);
+                self.finish_stop(safety, guard, report);
+                return;
+            }
+            if stopping {
+                self.start_stop_deadline();
+            }
+            if stopping && restore_started {
+                if starts_link_restore && step.link_name() != restore_group.as_deref() {
+                    continue;
+                }
+                // Finish only the link group already issued. A later independent
+                // restore is new work, even when it shares this full plan.
+                if repair_class(&step) == scupper_proto::RepairClass::Restore {
+                    let same_group = step
+                        .link_name()
+                        .is_some_and(|name| restore_group.as_deref() == Some(name));
+                    let group_route = matches!(&step, Step::RouteReplace { target: scupper_core::render::RouteTarget::Exit(exit), .. }
+                        if restore_group.as_deref() == Some(exit.as_str()));
+                    let group_hardening = restore_group.is_some()
+                        && !restore_group_complete
+                        && matches!(step, Step::WriteSysctl { .. } | Step::ReadBackSysctls);
+                    let completes_gate = matches!(step, Step::ForwardingOn { .. });
+                    if !same_group && !group_route && !group_hardening && !completes_gate {
+                        continue;
+                    }
+                }
+                if !stopping_restore {
+                    let safety = self
+                        .kernel
+                        .observe_until(&self.held, self.kernel.now() + Duration::from_secs(3));
+                    let safety = self.record_safety(safety, report);
+                    if !safety.safety_complete
+                        || phase_a_unknown(&safety.model)
+                        || safety.known_unsafe_tc
+                        || known_unsafe(&safety.model, desired, self.latch.is_some())
+                    {
+                        self.finish_stop(safety, guard, report);
+                        return;
+                    }
+                }
+                stopping_restore = true;
+                report.complete = false;
+                // Complete an already started restore only while its fresh
+                // evidence is SAFE. UNKNOWN preserves/establishes containment.
+                if is_reopen(&step) {
+                    let deadline = self.deadline.unwrap_or_else(|| self.kernel.now());
+                    let safety = self
+                        .kernel
+                        .observe_until(&self.held, self.kernel.now() + Duration::from_secs(3));
+                    let safety = self.record_safety(safety, report);
+                    let observed = self.observe_rest(safety, deadline, report);
+                    let raised = observed.model.apply(&step);
+                    if !observed.complete
+                        || !observed.safety_complete
+                        || !reopen_verified(&step, &raised, desired)
+                    {
+                        self.finish_stop(observed, guard, report);
+                        return;
+                    }
+                }
+            }
+            if step == Step::Emit(planner::PlannerEvent::IngressQuarantineLifted) {
+                if stopping {
+                    continue;
+                }
+                let deadline = self.deadline.unwrap_or_else(|| self.kernel.now());
+                let safety = self.observe(report);
+                let mut observed = self.observe_rest(safety, deadline, report);
+                if observed.complete
+                    && observed.safety_complete
+                    && planner::client_output_verified(&observed.model, desired)
+                {
+                    // Signal handling takes the same admission lock.
+                    let committed = crate::system::while_running(stop, || {
+                        self.execute_step(&step, false, guard, report)
+                    });
+                    if committed.is_some_and(|result| result.is_ok()) {
+                        self.debounce.ingress_quarantined = false;
+                    }
+                } else if !observed.safety_complete
+                    || phase_a_unknown(&observed.model)
+                    || observed.known_unsafe_tc
+                    || known_unsafe(&observed.model, desired, self.latch.is_some())
+                {
+                    // Normal ticks still contain the first Unknown; a failed
+                    // post-lift verification cannot leave ingress reopened.
+                    let prefix = planner::plan(
+                        desired,
+                        &observed.model,
+                        &self.budgets,
+                        self.latch.as_ref(),
+                        &self.debounce,
+                        self.repair_now(),
+                    );
+                    self.adopt_safety(&prefix);
+                    self.debounce.ingress_quarantined = prefix.debounce.ingress_quarantined;
+                    self.run_emergency_stopping(
+                        prefix.steps,
+                        &mut observed.model,
+                        desired,
+                        guard,
+                        report,
+                        stop,
+                    );
+                }
+                continue;
+            }
             // Namespace loss prevents kernel execution, but never drops a
             // planned audit or durable quarantine operation.
             if inode_gone && !matches!(step, Step::Emit(_) | Step::PersistLatch { .. }) {
@@ -1212,28 +2002,93 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 .into_iter()
                 .partition(|(trigger, _)| *trigger == StepKind::from(&step));
             safety_reservations = pending;
-            for (_, key) in charged {
+            let repair_now = self.repair_now();
+            for (_, key) in &charged {
                 self.budgets
                     .attempts
-                    .entry(key)
+                    .entry(key.clone())
                     .or_default()
-                    .push((self.clock)().0);
+                    .push(repair_now);
+            }
+            let checkpoint = if repair_class(&step) == scupper_proto::RepairClass::Restore {
+                let checkpoint = self.checkpoint_repairs(guard, true);
+                if charged.is_empty() {
+                    Ok(())
+                } else {
+                    checkpoint
+                }
+            } else {
+                Ok(())
+            };
+            if checkpoint.is_err() {
+                // No Restore was attempted. Never manufacture an exhausted
+                // memory budget without its durable write-ahead reservation.
+                for (_, key) in charged {
+                    if let Some(times) = self.budgets.attempts.get_mut(&key) {
+                        times.pop();
+                    }
+                    if self.budgets.attempts.get(&key).is_some_and(Vec::is_empty) {
+                        self.budgets.attempts.remove(&key);
+                    }
+                }
+            }
+            if repair_class(&step) == scupper_proto::RepairClass::Restore || starts_link_restore {
+                if !restore_started || !stopping {
+                    if !matches!(step, Step::WriteSysctl { .. } | Step::ReadBackSysctls) {
+                        restore_group = step.link_name().map(str::to_owned);
+                    }
+                    restore_group_complete = false;
+                }
+                restore_started = true;
             }
             report.steps.push(step.clone());
-            let result = self.execute_step(
-                &step,
-                last_flush.is_some_and(|flush| index < flush),
-                guard,
-                report,
-            );
+            let result = checkpoint.and_then(|()| {
+                self.execute_step(
+                    &step,
+                    last_flush.is_some_and(|flush| index < flush),
+                    guard,
+                    report,
+                )
+            });
             self.kernel.step_boundary(&step);
+            if result.is_ok() && is_reopen(&step) && step.link_name() == restore_group.as_deref() {
+                restore_group_complete = true;
+            }
+            if repair_class(&step) == scupper_proto::RepairClass::Restore {
+                // This restore's execution/readback has ended, including Stop failures.
+                // Keep charged counts even if completion checkpointing fails.
+                let _ = self.checkpoint_repairs(guard, false);
+            }
             if let Err(error) = result {
+                if step == Step::FlushConntrack && latch_write.is_some_and(|write| index < write) {
+                    // This containment copy must not discard durable quarantine
+                    // or its planned alerts. The group's post-load flush retains
+                    // Stop policy, and no later Stop step may run this tick.
+                    contained = true;
+                    report.complete = false;
+                    report.failures.push((step.clone(), error));
+                    self.emit(
+                        EventKind::Repair {
+                            object: None,
+                            kind: StepKind::FlushConntrack,
+                            class: repair_class(&step),
+                            result: Outcome::Failed,
+                        },
+                        Actor::Daemon,
+                        report,
+                    );
+                    self.contain_failed_latch_flush(guard, report, latch_prefix_start);
+                    continue;
+                }
                 if step.failure() == StepFailure::NonFatal {
                     if !matches!(step, Step::Emit(_)) {
                         refresh_before_restore = true;
                     }
                     if matches!(step, Step::PersistLatch { .. }) {
                         self.budgets.persistence_failed = true;
+                        if let Some(latch) = &mut self.latch {
+                            latch.uncertain = true;
+                        }
                         self.emit(
                             EventKind::PersistenceFailed {
                                 reason: Reason::StateWrite,
@@ -1255,7 +2110,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                         &self.budgets,
                         self.latch.as_ref(),
                         &self.debounce,
-                        (self.clock)().0,
+                        self.repair_now(),
                     );
                     self.adopt_safety(&containment);
                     self.run_emergency(
@@ -1283,7 +2138,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                     &self.budgets,
                     self.latch.as_ref(),
                     &self.debounce,
-                    (self.clock)().0,
+                    self.repair_now(),
                 );
                 if !observed.complete {
                     // Full observations include routes/rules: preserve their alert
@@ -1309,6 +2164,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 report.failures.push((step.clone(), error));
                 self.emit(
                     EventKind::Repair {
+                        object: step.link_name().map(str::to_owned),
                         kind: StepKind::from(&step),
                         class: repair_class(&step),
                         result: Outcome::Failed,
@@ -1318,7 +2174,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 );
                 if may_recover {
                     may_recover = false;
-                    self.run_plan(recovery, desired, guard, report, false);
+                    self.run_plan(recovery, desired, guard, report, false, stop);
                 } else {
                     self.adopt_safety(&recovery);
                     // Bounded recovery may also fail partially. Execute its emergency
@@ -1333,6 +2189,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             } else if !matches!(step, Step::Emit(_)) {
                 self.emit(
                     EventKind::Repair {
+                        object: step.link_name().map(str::to_owned),
                         kind: StepKind::from(&step),
                         class: repair_class(&step),
                         result: Outcome::Succeeded,
@@ -1342,9 +2199,95 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 );
             }
         }
+        self.flush_latch_events(report);
+        if stopping_restore {
+            let safety = self.observe(report);
+            self.finish_stop(safety, guard, report);
+        }
         if restore_name {
             self.restore_namespace(guard, report);
         }
+        let client_changed = report.steps.iter().any(|step| {
+            matches!(
+                step,
+                Step::LinkUp { .. }
+                    | Step::LinkDown { .. }
+                    | Step::LinkCreate { .. }
+                    | Step::LinkReconfigure { .. }
+            )
+        });
+        if report.failures.is_empty()
+            && !client_changed
+            && let Some((_, model)) = &self.cached
+            && planner::client_output_verified(model, desired)
+            && self.deadline.is_none_or(|d| self.kernel.within_deadline(d))
+            && let Err(error) = self.kernel.recover_client_sessions(guard, desired, model)
+        {
+            eprintln!("client session recovery probe failed: {error}; awaiting client retry");
+        }
+        self.session_history_alert(guard, report);
+    }
+    fn session_history_alert(&self, guard: &WriterGuard, report: &mut TickReport) {
+        if self.kernel.take_client_session_alert(guard) {
+            self.emit(
+                EventKind::PersistenceFailed {
+                    reason: scupper_proto::Reason::StateWrite,
+                },
+                Actor::Daemon,
+                report,
+            );
+        }
+    }
+    fn repair_now(&self) -> MonoTime {
+        (self.clock)().0.after(Duration::from_secs(600))
+    }
+    fn checkpoint_repairs(&mut self, guard: &WriterGuard, armed: bool) -> Result<(), StepError> {
+        let repair = self.repair_checkpoint(armed);
+        self.store
+            .write_repair_state(guard, &repair)
+            .map_err(|_| StepError("repair checkpoint failed"))
+    }
+    fn repair_checkpoint(&mut self, armed: bool) -> RepairState {
+        let (mono, unix) = (self.clock)();
+        let now = mono.after(Duration::from_secs(600));
+        let mut repair_times = BTreeMap::new();
+        let repair = RepairState {
+            attempts_unix: self
+                .budgets
+                .attempts
+                .iter()
+                .map(|(key, times)| {
+                    (
+                        key.clone(),
+                        times
+                            .iter()
+                            .map(|at| {
+                                let unix =
+                                    self.repair_times.get(at).copied().unwrap_or_else(|| {
+                                        unix.saturating_sub(now.elapsed_since(*at).as_secs())
+                                    });
+                                repair_times.insert(*at, unix);
+                                unix
+                            })
+                            .collect(),
+                    )
+                })
+                .collect(),
+            armed,
+            quarantine: self.latch.as_ref().map(|latch| Quarantine {
+                reason: latch.reason.clone(),
+                object: latch.object.clone(),
+                since_unix: self
+                    .persisted
+                    .quarantine
+                    .as_ref()
+                    .filter(|q| q.reason == latch.reason && q.object == latch.object)
+                    .map_or(unix, |q| q.since_unix),
+                uncertain: latch.uncertain,
+            }),
+        };
+        self.repair_times = repair_times;
+        repair
     }
     fn restore_namespace(&self, guard: &WriterGuard, report: &mut TickReport) {
         if !report.escalations.contains(&Escalation::RebindNamespace) {
@@ -1362,6 +2305,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             report.complete = false;
             self.emit(
                 EventKind::DriftDetected {
+                    read: None,
                     object: scupper_proto::ObjectKind::Unknown,
                     reason: Reason::ExecutionFailed,
                 },
@@ -1370,6 +2314,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             );
         }
     }
+    #[allow(clippy::too_many_lines)] // Keep persistence, client reset checkpoint and kernel ordering together.
     fn execute_step(
         &mut self,
         step: &Step,
@@ -1377,6 +2322,31 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         guard: &WriterGuard,
         report: &mut TickReport,
     ) -> Result<(), StepError> {
+        let client = self
+            .config
+            .site
+            .gateway(&self.config.gateway)
+            .map(|gw| gw.client_tunnel().ifname().as_str().to_owned());
+        let raises_client = match step {
+            Step::LinkUp { name, .. } => Some(name.as_str()) == client.as_deref(),
+            Step::LinkCreate {
+                link,
+                phase: planner::LinkPhase::Up,
+            } => link.up && Some(link.name.as_str()) == client.as_deref(),
+            _ => false,
+        };
+        if raises_client {
+            self.kernel.before_client_link_up(guard)?;
+        }
+        let lowers_client = match step {
+            Step::LinkDown { name } => Some(name.as_str()) == client.as_deref(),
+            Step::LinkReconfigure { link } => Some(link.name.as_str()) == client.as_deref(),
+            _ => false,
+        };
+        if lowers_client && let Err(error) = self.kernel.before_client_link_down(guard) {
+            // Checkpoint before the command: a timeout can mean it took effect.
+            eprintln!("client reset checkpoint failed: {error}");
+        }
         let result = match step {
             Step::PersistLatch { reason, object } => {
                 let mut state = self.persisted.clone();
@@ -1384,20 +2354,43 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                     reason: reason.clone(),
                     object: object.clone(),
                     since_unix: (self.clock)().1,
+                    uncertain: self.connect_clearable_latch(),
                 });
                 self.kernel.invalidate_state();
+                let repair = self.repair_checkpoint(false);
+                let deadline = (self.kernel.now() + Duration::from_secs(3)).min(
+                    self.stop_deadline
+                        .unwrap_or_else(|| self.kernel.now() + Duration::from_secs(3)),
+                );
                 self.store
-                    .write(guard, &state)
+                    .write_latch_until(guard, &state, &repair, &self.config.run_root, deadline)
                     .map(|()| {
+                        // Only confirmed durability or explicit administrative clearance
+                        // permits removing the presence-means-latched marker.
+                        let _ = std::fs::remove_file(self.config.run_root.join("latch-uncertain"));
                         self.kernel.persisted_latch(Some(&Latch {
+                            uncertain: self.connect_clearable_latch(),
                             reason: reason.clone(),
                             object: object.clone(),
                         }));
                         self.persisted = state;
                     })
-                    .map_err(|_| StepError("latch persistence failed"))
+                    .map_err(|_| {
+                        // The caller must cover timeout and an earlier pending write;
+                        // neither guarantees that the worker will ever return.
+                        let _ = write_uncertainty_marker(&self.config.run_root);
+                        self.budgets.persistence_failed = true;
+                        StepError("latch not durable")
+                    })
             }
             Step::Emit(event) => {
+                if *event == planner::PlannerEvent::ObservationUnknown
+                    && report.events.iter().any(|event| {
+                        matches!(event, EventKind::DriftDetected { read: Some(_), .. })
+                    })
+                {
+                    return Ok(());
+                }
                 let event = EventKind::from(event.clone());
                 report.events.push(event.clone());
                 self.log
@@ -1408,7 +2401,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                         StepError("event emission failed")
                     })
             }
-            Step::ForwardingOn { .. } if self.latch.is_some() => {
+            Step::ForwardingOn { .. } | Step::LinkUp { .. } if self.latch.is_some() => {
                 Err(StepError("quarantine blocks forwarding"))
             }
             // A route restore from fail-closed intentionally preserves conntrack.
@@ -1432,6 +2425,10 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             }),
             _ => self.kernel.execute(step),
         };
+        if lowers_client && let Err(error) = self.kernel.client_link_down(guard) {
+            // Counters survive LinkDown, even if the command timed out after applying it.
+            eprintln!("client reset baseline checkpoint failed: {error}");
+        }
         if result.is_ok()
             && matches!(
                 step,
@@ -1445,6 +2442,9 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             self.boot_write_failure(report);
         }
         if result.is_ok() {
+            if let Some((_, model)) = &mut self.cached {
+                *model = model.apply(step);
+            }
             match step {
                 Step::ForwardingOn { .. } => {
                     self.forwarding = true;
@@ -1459,6 +2459,11 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         result
     }
     fn emit(&self, event: EventKind, actor: Actor, report: &mut TickReport) {
+        if let Some(pending) = self.latch_events.borrow_mut().as_mut() {
+            pending.push((event.clone(), actor));
+            report.events.push(event);
+            return;
+        }
         if self
             .log
             .emit(event.clone(), actor, self.persisted.applied_version)
@@ -1468,7 +2473,22 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         }
         report.events.push(event);
     }
+    fn flush_latch_events(&self, report: &mut TickReport) {
+        let pending = self.latch_events.borrow_mut().take().unwrap_or_default();
+        for (event, actor) in pending {
+            if self
+                .log
+                .emit(event, actor, self.persisted.applied_version)
+                .is_err()
+            {
+                report.dropped_events = report.dropped_events.saturating_add(1);
+            }
+        }
+    }
     fn refresh_admin_state(&mut self) -> io::Result<State> {
+        if !crate::system::daemon_stopping() {
+            self.stop_deadline = None;
+        }
         self.store.begin_tick();
         self.kernel.begin_tick();
         let state = self
@@ -1479,12 +2499,17 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 "applied version changed; reconciler must reload",
             ));
         }
-        if self.persisted.quarantine.is_some() && state.quarantine.is_none() {
+        if self.persisted.quarantine.is_some()
+            && state.quarantine.is_none()
+            && self.store.clearance_proven()
+        {
             self.latch = None;
             self.budgets = Budgets::default();
+            self.repair_times.clear();
         }
         if self.latch.is_none() {
             self.latch = state.quarantine.as_ref().map(|q| Latch {
+                uncertain: q.uncertain,
                 reason: q.reason.clone(),
                 object: q.object.clone(),
             });
@@ -1546,7 +2571,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             actor,
             &mut report,
         );
-        self.tick_locked(guard, &mut report);
+        self.tick_locked(guard, &mut report, &AtomicBool::new(false));
         if selection != Selection::Disconnected && self.latch.is_none() && report.complete {
             // An explicit connect can restore a verified fresh candidate before
             // background probes confirm it. As on attachment, it remains
@@ -1577,7 +2602,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                         FailoverAction::SetRoute(target),
                         FailoverAction::FlushConntrack,
                     ]);
-                    self.tick_locked(guard, &mut report);
+                    self.tick_locked(guard, &mut report, &AtomicBool::new(false));
                     break;
                 }
             }
@@ -1654,6 +2679,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 reason: latch.reason.clone(),
                 object: latch.object.clone(),
                 since_unix: (self.clock)().1,
+                uncertain: latch.uncertain,
             });
         }
         state.selection = selection.clone();
@@ -1693,6 +2719,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 reason: latch.reason.clone(),
                 object: latch.object.clone(),
                 since_unix: (self.clock)().1,
+                uncertain: latch.uncertain,
             });
             self.store.write(guard, &state)?;
         }
@@ -1721,6 +2748,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                     reason: latch.reason.clone(),
                     object: latch.object.clone(),
                     since_unix: (self.clock)().1,
+                    uncertain: latch.uncertain,
                 });
                 self.kernel.invalidate_state();
                 if let Err(error) = self.store.write(&guard, &state) {
@@ -1736,7 +2764,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 self.persisted = state;
             }
         }
-        Ok(crate::boot::boot_with_guard(deps, &guard))
+        Ok(crate::boot::boot_with_guard(deps, &guard, Some(&self.log)))
     }
     /// Cached observed kernel facts and their earliest collection time.
     #[must_use]
@@ -1785,7 +2813,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             &self.budgets,
             self.latch.as_ref(),
             &self.debounce,
-            (self.clock)().0,
+            self.repair_now(),
         )
         .steps
         .iter()
@@ -1833,7 +2861,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             &budgets,
             self.latch.as_ref(),
             &self.debounce,
-            (self.clock)().0,
+            self.repair_now(),
         );
         let planned = planner::plan(
             &desired,
@@ -1841,11 +2869,13 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             &budgets,
             self.latch.as_ref(),
             &first.debounce,
-            (self.clock)().0,
+            self.repair_now(),
         );
         if dry_run {
             return Ok(planned.steps.iter().map(StepKind::from).collect());
         }
+        // Manual repair uses the same fresh output proof as a periodic tick.
+        self.cached = Some((Instant::now(), observed.model.clone()));
         let mut report = TickReport {
             complete: observed.complete && observed.safety_complete,
             ..TickReport::default()
@@ -1858,7 +2888,7 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
             actor,
             &mut report,
         );
-        self.run_plan(planned, &desired, guard, &mut report, true);
+        self.run_plan(planned, &desired, guard, &mut report, true, None);
         Ok(report.steps.iter().map(StepKind::from).collect())
     }
     /// Explicit repair-clear transition. Memory quarantine remains if durability fails.
@@ -1906,8 +2936,11 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         let mut state = self.refresh_admin_state()?;
         let Some(latch) = &self.latch else {
             self.store.write(guard, &state)?;
+            self.store
+                .clear_repair_state(guard, &self.config.run_root)?;
             self.persisted = state;
             self.budgets = Budgets::default();
+            self.repair_times.clear();
             let _ = self.log.emit(
                 EventKind::AdminAction {
                     reason,
@@ -1926,6 +2959,8 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
         state.quarantine = None;
         self.kernel.invalidate_state();
         self.store.write(guard, &state)?;
+        self.store
+            .clear_repair_state(guard, &self.config.run_root)?;
         self.persisted = state;
         self.latch = transition.latch;
         let _ = self.log.emit(
@@ -1965,6 +3000,26 @@ pub fn open_event_log(
         .or_else(|_| crate::events::EventLog::memory_only(gateway, move || clock()))
 }
 
+// A containment LinkDown may share a name with a later restore. Only the
+// adjacent configure/create operation makes it the start of that restore group.
+fn starts_link_restore(step: &Step, next: &Step) -> bool {
+    matches!((step, next),
+        (Step::LinkDown { name }, Step::LinkReconfigure { link } | Step::LinkCreate { link, .. })
+        if name == &link.name)
+}
+fn containment_end(steps: &[Step]) -> usize {
+    steps
+        .iter()
+        .enumerate()
+        .position(|(index, step)| {
+            repair_class(step) == scupper_proto::RepairClass::Restore
+                || steps
+                    .get(index + 1)
+                    .is_some_and(|next| starts_link_restore(step, next))
+        })
+        .unwrap_or(steps.len())
+}
+
 // Execution failure policy and policy effect are independent: a failed flush
 // stops Restore, while flushing itself is a tightening operation.
 const fn repair_class(step: &Step) -> scupper_proto::RepairClass {
@@ -1983,6 +3038,7 @@ const fn repair_class(step: &Step) -> scupper_proto::RepairClass {
             ..
         } => scupper_proto::RepairClass::Tighten,
         Step::ForwardingOn { .. }
+        | Step::LinkUp { .. }
         | Step::LoadRuleset { .. }
         | Step::VerifyRuleset { .. }
         | Step::WriteSysctl { .. }
@@ -1997,12 +3053,8 @@ const fn repair_class(step: &Step) -> scupper_proto::RepairClass {
     }
 }
 
-// Phase A deliberately cannot certify addresses, peers, configuration or routing.
+// Phase A deliberately cannot certify addresses, peers or configuration.
 pub(crate) fn unknown_nonsafety(model: &mut KernelModel) {
-    model.default_v4 = planner::Known::Unknown;
-    model.default_v6 = planner::Known::Unknown;
-    model.extra_routes = planner::Known::Unknown;
-    model.extra_rules = planner::Known::Unknown;
     model.host_links.clear();
     model
         .hardening
@@ -2020,6 +3072,7 @@ pub(crate) fn unknown_nonsafety(model: &mut KernelModel) {
 // A phase-A plan may act only on objects actually observed by phase A.
 fn emergency_allowed(step: &Step, model: &KernelModel, desired: &Desired) -> bool {
     match step {
+        Step::Emit(planner::PlannerEvent::IngressQuarantineLifted) => false,
         Step::Emit(planner::PlannerEvent::ObservationUnknown) => phase_a_unknown(model),
         Step::ForwardingOff
         | Step::LinkForwardingOff { .. }
@@ -2043,6 +3096,134 @@ fn emergency_allowed(step: &Step, model: &KernelModel, desired: &Desired) -> boo
         }
         _ => false,
     }
+}
+pub(crate) fn write_uncertainty_marker(root: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // /run is independent of the durable state disk. Contents and fsync are
+    // unnecessary: any existing directory entry means latched on restart.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(root.join("latch-uncertain"))
+    {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+fn reopen_verified(step: &Step, raised: &KernelModel, desired: &Desired) -> bool {
+    if let Some(name) = step.link_name()
+        && name != raised.client_link
+    {
+        // Reopening the active exit-link group does not require separately
+        // reopening a client link that is deliberately still contained.
+        return planner::safe(raised, desired)
+            && !known_unsafe(raised, desired, raised.latch.is_some())
+            && desired
+                .links()
+                .get(name)
+                .is_some_and(|want| raised.links.get(name).is_some_and(|link| link.ready(want)));
+    }
+    planner::client_output_verified(raised, desired)
+}
+fn is_reopen(step: &Step) -> bool {
+    matches!(
+        step,
+        Step::ForwardingOn { .. }
+            | Step::LinkUp { .. }
+            | Step::LinkCreate {
+                phase: planner::LinkPhase::Up,
+                ..
+            }
+    )
+}
+fn rejecting_rule(rule: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(rule).is_ok_and(|value| {
+        value.get("rule").is_some_and(|rule| {
+            ["action", "type"].into_iter().any(|key| {
+                matches!(
+                    rule.get(key).and_then(serde_json::Value::as_str),
+                    Some("unreachable" | "blackhole" | "prohibit")
+                )
+            })
+        })
+    })
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StopSafety {
+    Safe,
+    Unsafe,
+    Unknown,
+}
+fn stop_safety(
+    observed: &Observation,
+    desired: &Desired,
+    latched: bool,
+    settled: bool,
+) -> StopSafety {
+    if observed.known_unsafe_tc || known_unsafe(&observed.model, desired, latched) {
+        StopSafety::Unsafe
+    } else if !observed.safety_complete || phase_a_unknown(&observed.model) || !settled {
+        StopSafety::Unknown
+    } else {
+        StopSafety::Safe
+    }
+}
+// Each check keeps its own completeness: an unrelated Unknown can never
+// suppress a positive bypass, ruleset mismatch, or policy gate violation.
+fn known_unsafe(model: &KernelModel, desired: &Desired, latched: bool) -> bool {
+    use planner::{Known, Ruleset};
+    let verified = model.ruleset == Known::Value(Ruleset::Verified(desired.fingerprint()));
+    let gate = if latched || desired.disconnected() {
+        Some(0)
+    } else if verified {
+        Some(1)
+    } else {
+        None
+    };
+    let wrong_gate = |value: &Known<i64>| matches!(value, Known::Value(v) if !matches!(*v, 0 | 1) || gate.is_some_and(|g| *v > g));
+    matches!(&model.ruleset, Known::Value(r) if *r != Ruleset::Verified(desired.fingerprint()))
+        || [
+            &model.forwarding_v4,
+            &model.forwarding_v6,
+            &model.default_forwarding_v4,
+            &model.default_forwarding_v6,
+            &model.client_forwarding_v4,
+        ]
+        .into_iter()
+        .any(wrong_gate)
+        || [&model.default_v4, &model.default_v6]
+            .into_iter()
+            .any(|route| match route {
+                Known::Value(scupper_core::verdict::v2::DefaultRouteObs::Other(_)) => true,
+                Known::Value(scupper_core::verdict::v2::DefaultRouteObs::Dev(name)) => {
+                    !desired.exits().values().any(|exit| exit == name)
+                        || model
+                            .links
+                            .get(name)
+                            .is_some_and(|link| link.ours == Known::Value(false))
+                }
+                _ => false,
+            })
+        || matches!(&model.extra_rules, Known::Value(rules) if rules.iter().any(|rule| !rejecting_rule(rule)))
+        || matches!(&model.extra_routes, Known::Value(routes) if routes.iter().any(|route| {
+            use scupper_core::parse::RouteKind;
+            !matches!(route.entry.kind, RouteKind::Unreachable | RouteKind::Blackhole | RouteKind::Prohibit | RouteKind::Local)
+                && route.entry.dev.as_ref().is_none_or(|name| !desired.exits().values().any(|exit| exit == name))
+        }))
+        || model.links.iter().any(|(name, link)| {
+            let foreign = !desired.links().contains_key(name)
+                || matches!(link.ours, Known::Value(false))
+                || matches!(&link.kind, Known::Value(k) if k != "wireguard" && k != "loopback");
+            matches!(&link.tc_hooks, Known::Value(hooks) if !hooks.is_empty())
+                || link.up == Known::Value(true)
+                    && link.kind != Known::Value("loopback".into())
+                    && (foreign || desired.disconnected() && name != &model.client_link)
+                || [&link.forwarding_v4, &link.forwarding_v6]
+                    .into_iter()
+                    .any(wrong_gate)
+        })
 }
 fn safety_drift(model: &KernelModel, desired: &Desired, latched: bool) -> bool {
     use planner::{Known, NamespaceState, Ruleset};
@@ -2091,6 +3272,10 @@ fn phase_a_unknown(model: &KernelModel) -> bool {
         ]
         .contains(&&Known::Unknown)
         || model.ruleset == Known::Unknown
+        || model.default_v4 == Known::Unknown
+        || model.default_v6 == Known::Unknown
+        || model.extra_routes == Known::Unknown
+        || model.extra_rules == Known::Unknown
         || model.links.values().any(|link| {
             link.tc_hooks == Known::Unknown
                 || link.forwarding_v4 == Known::Unknown

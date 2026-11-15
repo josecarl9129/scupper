@@ -74,6 +74,14 @@ impl Default for Fake {
     }
 }
 impl System for Fake {
+    fn wg_quick_units(&self) -> std::io::Result<Vec<String>> {
+        Ok(if self.marker == Some("unit") {
+            vec!["wg-quick@foreign.service".into()]
+        } else {
+            vec![]
+        })
+    }
+
     fn wireguard_socket_dirs(&self) -> Vec<PathBuf> {
         Vec::new()
     }
@@ -83,6 +91,7 @@ impl System for Fake {
     #[allow(clippy::too_many_lines)] // Keep the literal command allow-list together.
     fn run(
         &self,
+        _purpose: scupper_sys::system::HelperPurpose,
         program: Program,
         args: &[String],
         timeout: Duration,
@@ -233,6 +242,7 @@ impl System for Fake {
     }
     fn run_with_stdin(
         &self,
+        _purpose: scupper_sys::system::HelperPurpose,
         _: ExecTarget<'_>,
         program: Program,
         args: &[String],

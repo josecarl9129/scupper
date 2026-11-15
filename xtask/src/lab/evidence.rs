@@ -56,14 +56,15 @@ impl Case {
 }
 #[cfg(test)]
 pub(super) fn policy(markers: &[String], auxiliary: bool) -> Result<String> {
-    policy_with_exit_port(markers, auxiliary, 51821)
+    policy_with_exit_port(markers, auxiliary, 51821, false)
 }
 pub(super) fn policy_with_exit_port(
     markers: &[String],
     auxiliary: bool,
     exit_port: u16,
+    client2: bool,
 ) -> Result<String> {
-    policy_for_case(markers, auxiliary, exit_port, false)
+    policy_for_case(markers, auxiliary, exit_port, client2)
 }
 pub(super) fn policy_for_case(
     markers: &[String],
@@ -133,17 +134,16 @@ pub(super) fn report(
     markers: &[String],
     auxiliary: bool,
     port: u16,
+    client2: bool,
 ) -> Result<Report> {
-    let text = policy_for_case(
-        markers,
-        auxiliary,
-        port,
-        matches!(stem, "daemon-L11" | "daemon-L11-control"),
-    )?;
-    fs::write(dir.join(format!("{stem}.policy.toml")), &text)?;
+    let text = policy_for_case(markers, auxiliary, port, client2)?;
+    report_with_policy(dir, stem, &text)
+}
+pub(super) fn report_with_policy(dir: &Path, stem: &str, text: &str) -> Result<Report> {
+    fs::write(dir.join(format!("{stem}.policy.toml")), text)?;
     let report = classify(
         &fs::read(dir.join(format!("{stem}.pcap")))?,
-        &Policy::from_toml(&text)?,
+        &Policy::from_toml(text)?,
         30,
     )?;
     fs::write(
@@ -405,8 +405,14 @@ pub(super) fn boot_prefix(
     markers: &[String],
     port: u16,
     provider: bool,
+    client2: bool,
 ) -> Result<()> {
-    let base = policy_with_exit_port(markers, false, port)?;
+    // In any case, client sockets can send before the gateway's wg0 listens.
+    // Its port-unreachable must quote an incoming listed WireGuard tuple; the
+    // existing wireguard_error classifier checks quotation shape and plaintext.
+    // This applies equally to client2 once its lab tunnel exists, without a
+    // host_allow exception for client2 or counting errors as positive evidence.
+    let base = policy_with_exit_port(markers, false, port, client2)?;
     let base = base
         .lines()
         .map(|line| {

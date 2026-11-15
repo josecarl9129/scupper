@@ -20,6 +20,20 @@ struct PolicyDrift {
     installed: Cell<bool>,
 }
 impl System for PolicyDrift {
+    fn client_session_io(
+        &self,
+        purpose: scupper_sys::system::HelperPurpose,
+        held: &NetnsHandle,
+        request: &scupper_sys::client_sessions::Request,
+    ) -> std::io::Result<scupper_sys::client_sessions::Response> {
+        self.real.client_session_io(purpose, held, request)
+    }
+    fn wg_quick_units(&self) -> std::io::Result<Vec<String>> {
+        self.real.wg_quick_units()
+    }
+    fn module_loaded(&self, module: &str) -> std::io::Result<bool> {
+        self.real.module_loaded(module)
+    }
     fn canon_cache(&self) -> Option<(&std::cell::RefCell<scupper_sys::canon::CanonCache>, &Path)> {
         self.real.canon_cache()
     }
@@ -34,20 +48,22 @@ impl System for PolicyDrift {
     }
     fn run(
         &self,
+        purpose: scupper_sys::system::HelperPurpose,
         program: Program,
         args: &[String],
         timeout: Duration,
     ) -> std::result::Result<ExecOutput, ExecError> {
-        self.run_in(ExecTarget::Host, program, args, timeout)
+        self.run_in(purpose, ExecTarget::Host, program, args, timeout)
     }
     fn run_in(
         &self,
+        purpose: scupper_sys::system::HelperPurpose,
         target: ExecTarget<'_>,
         program: Program,
         args: &[String],
         timeout: Duration,
     ) -> std::result::Result<ExecOutput, ExecError> {
-        let output = self.real.run_in(target, program, args, timeout)?;
+        let output = self.real.run_in(purpose, target, program, args, timeout)?;
         if matches!(target, ExecTarget::Netns(_))
             && program == Program::Sysctl
             && args == ["-n", "net.ipv4.ip_forward"]
@@ -56,7 +72,13 @@ impl System for PolicyDrift {
             let fault: Vec<_> = ["rule", "add", "pref", "100", "iif", "wg0", "unreachable"]
                 .map(str::to_owned)
                 .into();
-            let result = self.real.run_in(target, Program::Ip, &fault, timeout)?;
+            let result = self.real.run_in(
+                scupper_sys::system::HelperPurpose::Mutation,
+                target,
+                Program::Ip,
+                &fault,
+                timeout,
+            )?;
             if result.status != Some(0) {
                 return Err(ExecError::spawn("L19 policy drift installation failed"));
             }

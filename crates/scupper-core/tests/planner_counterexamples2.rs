@@ -188,6 +188,7 @@ fn n3_recreated_exit_must_forward_replies_when_the_plan_ends() {
 
 /// N4. A replaced name must not stop containment of the live held namespace.
 #[test]
+#[allow(clippy::too_many_lines)] // Includes the client session readiness observation.
 fn n4_wrong_name_with_live_held_inode_must_still_tighten() {
     let d = desired();
     let good = KernelModel::desired(&d);
@@ -217,6 +218,7 @@ fn n4_wrong_name_with_live_held_inode_must_still_tighten() {
         tc_hooks: vec![],
     };
     let forwarding = Forwarding {
+        client_sessions: scupper_core::verdict::v2::ClientSessions::default(),
         client_v4: 1,
         netns_sockets: vec![],
         v4: 1,

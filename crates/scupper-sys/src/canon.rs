@@ -90,11 +90,12 @@ fn permission_failure(message: &str) -> bool {
 
 pub(crate) fn command(
     sys: &dyn System,
+    purpose: crate::system::HelperPurpose,
     program: Program,
     args: &[String],
     timeout: Duration,
 ) -> Probe<String> {
-    command_result(sys.run(program, args, timeout))
+    command_result(sys.run(purpose, program, args, timeout))
 }
 
 pub(crate) fn command_result(result: Result<ExecOutput, ExecError>) -> Probe<String> {
@@ -249,6 +250,7 @@ fn isolated_ruleset(
     }
     let before = command(
         sys,
+        crate::system::HelperPurpose::Observation,
         Program::Nft,
         &["-j".into(), "list".into(), "ruleset".into()],
         EXEC_TIMEOUT,
@@ -272,12 +274,14 @@ fn isolated_ruleset(
     }
     command(
         sys,
+        crate::system::HelperPurpose::Mutation,
         Program::Nft,
         &["-f".into(), path_arg(path)?],
         EXEC_TIMEOUT,
     )?;
     command(
         sys,
+        crate::system::HelperPurpose::Observation,
         Program::Nft,
         &["-j".into(), "list".into(), "ruleset".into()],
         EXEC_TIMEOUT,
@@ -394,7 +398,13 @@ fn tool_facts(sys: &dyn System) -> Probe<CacheKey> {
     let meta = fs::metadata(nft).map_err(|e| file_error(&e))?;
     Ok(CacheKey {
         rendered: [0; 32],
-        nft_version: command(sys, Program::Nft, &["--version".into()], EXEC_TIMEOUT)?,
+        nft_version: command(
+            sys,
+            crate::system::HelperPurpose::Probe,
+            Program::Nft,
+            &["--version".into()],
+            EXEC_TIMEOUT,
+        )?,
         nft_identity: (meta.dev(), meta.ino(), meta.mtime(), meta.mtime_nsec()),
         kernel_release: fs::read_to_string("/proc/sys/kernel/osrelease")
             .map_err(|e| file_error(&e))?,
@@ -429,7 +439,13 @@ fn load_want(sys: &dyn System, inode: u64, rendered: &str) -> Probe<(CacheKey, V
     let file = PrivateRuleset::create(sys.canon_run_root(), rendered)?;
     let mut args = unshare_argv(sys.canon_executable(), &outer, &file.path())?;
     args.splice(6..6, ["--gateway-netns".into(), format!("net:[{inode}]")]);
-    let value = canonicalize(&command(sys, Program::Unshare, &args, CANON_TIMEOUT)?)?;
+    let value = canonicalize(&command(
+        sys,
+        crate::system::HelperPurpose::Probe,
+        Program::Unshare,
+        &args,
+        CANON_TIMEOUT,
+    )?)?;
     Ok((key, value))
 }
 
@@ -476,6 +492,9 @@ fn worker_want(
             std::thread::Builder::new()
                 .name("scupper-canon".into())
                 .spawn(move || {
+                    // This helper only builds an expected ruleset in an isolated
+                    // namespace; it cannot mutate the held data plane. Each
+                    // underlying command carries its explicit purpose.
                     let _ = send.send(load_want(worker.as_ref(), inode, &text));
                 })
                 .map_err(|e| file_error(&e))?;
@@ -646,8 +665,14 @@ fn canonical_pair(
                 format!("net:[{}]", handle.identity().1),
             ],
         );
-        command(sys, Program::Unshare, &args, CANON_TIMEOUT)
-            .and_then(|text| Ok(canonicalize(&text)?))
+        command(
+            sys,
+            crate::system::HelperPurpose::Probe,
+            Program::Unshare,
+            &args,
+            CANON_TIMEOUT,
+        )
+        .and_then(|text| Ok(canonicalize(&text)?))
     };
     let want = if sys.canon_worker().is_some() {
         let live_hash = live

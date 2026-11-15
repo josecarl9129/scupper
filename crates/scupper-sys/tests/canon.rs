@@ -49,17 +49,24 @@ impl FakeSystem {
 impl System for FakeSystem {
     fn run_in(
         &self,
+        purpose: scupper_sys::system::HelperPurpose,
         _: scupper_sys::system::ExecTarget<'_>,
         p: Program,
         args: &[String],
         timeout: Duration,
     ) -> Result<ExecOutput, ExecError> {
-        self.run(p, args, timeout)
+        self.run(purpose, p, args, timeout)
     }
     fn canon_run_root(&self) -> &Path {
         Path::new(env!("CARGO_TARGET_TMPDIR"))
     }
-    fn run(&self, p: Program, a: &[String], t: Duration) -> Result<ExecOutput, ExecError> {
+    fn run(
+        &self,
+        _purpose: scupper_sys::system::HelperPurpose,
+        p: Program,
+        a: &[String],
+        t: Duration,
+    ) -> Result<ExecOutput, ExecError> {
         self.calls.borrow_mut().push((p, a.into(), t));
         if a == ["-j", "list", "ruleset"] {
             return self

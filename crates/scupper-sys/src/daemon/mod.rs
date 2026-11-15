@@ -125,7 +125,7 @@ impl StartupRead {
                     .spawn(move || {
                         let result = (|| {
                             let state = StateFile::open(&state_root, None)?;
-                            let StateRead::Present(saved) = state.read()? else {
+                            let StateRead::Present(saved) = state.startup_read(&run_root)? else {
                                 return Err(io::Error::other("missing safety state"));
                             };
                             let version = saved
@@ -192,6 +192,7 @@ impl StartupRead {
             .ok_or_else(|| io::Error::other("missing startup inputs"))
     }
 }
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)] // Keep locked migration, sampler attachment and handoff in one boundary.
 fn initialize<'a>(
     deps: BootDeps<'a>,
     gateway: GatewayId,
@@ -200,8 +201,27 @@ fn initialize<'a>(
     canon_deadline: Instant,
     inputs: &mut StartupRead,
     guard: Option<(&crate::lock::WriterGuard, bool)>,
+    activate_sessions: bool,
+    before_handoff: impl FnOnce(&Arc<NetnsHandle>, &Config),
 ) -> io::Result<(Machine<'a>, Arc<NetnsHandle>, Config)> {
+    let owned_guard = if guard.is_none() {
+        Some(crate::lock::WriterLock::acquire_timeout(
+            deps.run_root,
+            canon_deadline.saturating_duration_since(Instant::now()),
+        )?)
+    } else {
+        None
+    };
+    let writer = guard
+        .map(|(writer, _)| writer)
+        .or(owned_guard.as_ref())
+        .ok_or_else(|| io::Error::other("missing startup writer"))?;
+    // Keep migration and attachment in one writer transaction. A slow read or
+    // canon preparation can make concurrent CLI intent time out and retry.
     let loaded = inputs.load(&deps, canon_deadline)?;
+    if loaded.state.migrate_repair_state(writer, deps.run_root)? {
+        log.repair_checkpoint_created(Actor::Daemon, loaded.saved.applied_version);
+    }
     let site = validate(parse_site(&loaded.text).map_err(io::Error::other)?)
         .map_err(|_| io::Error::other("invalid applied configuration"))?;
     let version = loaded
@@ -251,6 +271,19 @@ fn initialize<'a>(
         .ready
         .take()
         .ok_or_else(|| io::Error::other("missing startup inputs"))?;
+    let gw = config
+        .site
+        .gateway(&config.gateway)
+        .ok_or_else(|| io::Error::other("unknown gateway"))?;
+    if activate_sessions {
+        crate::client_sessions::activate(
+            deps.state_root,
+            deps.run_root,
+            gw.client_tunnel().identity().public_key.as_str(),
+            deps.system.now_unix_secs(),
+            writer,
+        )?;
+    }
     let kernel = RealKernel::from_boot_report(
         deps,
         held.clone(),
@@ -276,15 +309,14 @@ fn initialize<'a>(
         Box::new(move || (MonoTime(origin.elapsed()), unix())) as Box<dyn Fn() -> (MonoTime, u64)>,
         loaded.saved,
     )?;
-    if let Some((guard, recover)) = guard {
-        if recover {
-            machine.recover_route_switch_locked(guard)?;
-        }
-        machine.resume_existing_locked(guard);
-    } else {
-        machine.recover_route_switch()?;
-        machine.resume_existing();
+    if guard.is_none_or(|(_, recover)| recover) {
+        machine.recover_route_switch_locked(writer)?;
     }
+    // Start/reattach independent sampling before the potentially slow handoff
+    // observation. Retain the startup writer: reacquiring it could time out and
+    // silently skip the observation before publishing daemon readiness.
+    before_handoff(&held, &config);
+    machine.resume_existing_locked(writer);
     Ok((machine, held, config))
 }
 
@@ -391,18 +423,36 @@ impl Drop for Audit {
     }
 }
 
-/// Run until SIGTERM/SIGINT sets `stop`, finishing any current tick first.
+/// Run until SIGTERM/SIGINT sets `stop`, finishing in-progress operations safely.
 /// Notification, probes and audit maintenance occur outside the writer lock.
-/// Shutdown never executes kernel operations, even if flushing fails.
+/// On stop, known-unsafe safety findings are contained even if another read is
+/// unknown. Unknown safety drains observation helpers and gets one re-observation within three
+/// seconds: known-safe exits without mutation; still unknown fails closed.
+/// Containment operations always finish at a safe boundary before exit.
 ///
 /// # Errors
 /// Returns invalid identity/configuration roots or notify socket setup errors.
 #[allow(clippy::too_many_lines)]
-pub fn run(options: &Options, stop: &AtomicBool) -> io::Result<()> {
+pub fn run(options: &Options, stop: &Arc<AtomicBool>) -> io::Result<()> {
     eprintln!("scupperd: start");
     let lease_notify = notify::Notify::new(std::env::var_os("NOTIFY_SOCKET").as_deref())
         .unwrap_or_else(|_| notify::Notify::disabled());
-    run_notified(options, stop, lease_notify)
+    crate::system::daemon_helpers(stop.clone());
+    let stop_notify = lease_notify
+        .clone_endpoint()
+        .unwrap_or_else(|_| notify::Notify::disabled());
+    notify::with_stop_keepalive(stop, stop_notify, || {
+        run_notified(options, stop, lease_notify)
+    })
+}
+
+struct HelperShutdown;
+impl Drop for HelperShutdown {
+    fn drop(&mut self) {
+        if crate::system::daemon_helpers_active() {
+            crate::system::shutdown_helpers();
+        }
+    }
 }
 
 fn run_notified(
@@ -418,6 +468,8 @@ fn run_notified(
         },
     )
     .map_err(|error| io::Error::new(error.kind(), "cannot acquire supervisor lease"))?;
+    // Drop order retains the supervisor lease through reaping on every return.
+    let _helper_shutdown = HelperShutdown;
     let origin = Instant::now();
     let gateway = GatewayId(
         RealFs
@@ -444,6 +496,10 @@ fn run_notified(
         notify: lease_notify,
         started_event: false,
         running: None,
+        sampler: None,
+        #[cfg(all(test, feature = "testing"))]
+        final_sample_result: None,
+        sampler_retry_at: Instant::now(),
         pending_canon: false,
         startup_read: StartupRead::default(),
         probes: probes::Probes::new(options.probe_binary.clone(), origin)
@@ -464,6 +520,7 @@ fn run_notified(
         cached: None,
     };
     run_with(&mut runtime, stop);
+    drop(runtime);
     Ok(())
 }
 type AlertSettings = std::collections::BTreeMap<String, scupper_core::config::AlertSink>;
@@ -500,6 +557,10 @@ struct Runtime<'a> {
     notify: notify::Notify,
     started_event: bool,
     running: Option<(Machine<'a>, Arc<NetnsHandle>, Config)>,
+    sampler: SessionSampler,
+    #[cfg(all(test, feature = "testing"))]
+    final_sample_result: Option<(io::Result<()>, Duration)>,
+    sampler_retry_at: Instant,
     pending_canon: bool,
     startup_read: StartupRead,
     probes: probes::Probes,
@@ -537,6 +598,46 @@ impl<'a> Runtime<'a> {
         }
     }
 }
+type SessionSampler = Option<(u64, (u64, u64), crate::client_sessions::Sampler)>;
+
+fn attach_sampler(
+    options: &Options,
+    sampler: &mut SessionSampler,
+    retry_at: &mut Instant,
+    held: &Arc<NetnsHandle>,
+    config: &Config,
+) {
+    let key = (config.stamp.version, held.identity());
+    if sampler.as_ref().is_some_and(|(v, ns, _)| (*v, *ns) == key) {
+        return;
+    }
+    if let Some((version, namespace, sampler)) = sampler
+        && sampler
+            .attach(held.clone(), &config.site, &config.gateway)
+            .is_ok()
+    {
+        *version = key.0;
+        *namespace = key.1;
+        return;
+    }
+    if Instant::now() < *retry_at {
+        return;
+    }
+    sampler.take();
+    *retry_at = Instant::now() + Duration::from_secs(15);
+    match crate::client_sessions::Sampler::start(
+        options.state_root.clone(),
+        options.run_root.clone(),
+        held.clone(),
+        options.probe_binary.clone(),
+        &config.site,
+        &config.gateway,
+    ) {
+        Ok(worker) => *sampler = Some((key.0, key.1, worker)),
+        Err(error) => eprintln!("client sampler startup: {error}"),
+    }
+}
+
 impl Runtime<'_> {
     #[allow(clippy::too_many_lines)] // Keep applied settings and failed-boot fallback synchronization together.
     fn sync_alerts(&mut self) {
@@ -593,6 +694,19 @@ impl Runtime<'_> {
         }
     }
 
+    fn sync_sampler(&mut self) {
+        let Some((_, held, config)) = &self.running else {
+            self.sampler.take();
+            return;
+        };
+        attach_sampler(
+            self.options,
+            &mut self.sampler,
+            &mut self.sampler_retry_at,
+            held,
+            config,
+        );
+    }
     fn publish_snapshot(&self) {
         let mut snapshot = self
             .snapshot
@@ -798,12 +912,22 @@ impl Runtime<'_> {
                         Instant::now() + canon::CANON_TIMEOUT + crate::system::EXEC_TIMEOUT,
                         &mut self.startup_read,
                         Some((&guard, true)),
+                        true,
+                        |held, config| {
+                            attach_sampler(
+                                self.options,
+                                &mut self.sampler,
+                                &mut self.sampler_retry_at,
+                                held,
+                                config,
+                            );
+                        },
                     )
                     .ok()
                 };
-                if self.running.is_none() {
-                    close_only(&deps, self.options);
-                }
+                finish_apply_reattach(&mut result, &guard, self.running.is_some(), |guard| {
+                    close_only_locked(&deps, guard)
+                });
                 self.cached = None;
                 self.last_complete = None;
                 self.publish_snapshot();
@@ -844,6 +968,10 @@ impl Runtime<'_> {
                 .as_ref()
                 .ok_or_else(|| control::api(ApiErrorCode::SupervisorUnavailable))?;
             return Ok(OpResult::Status {
+                session_reason: crate::client_sessions::cached_reason(
+                    &self.options.run_root,
+                    unix(),
+                ),
                 health: health.clone(),
                 age: at.elapsed().as_secs(),
                 observations: observations.clone(),
@@ -886,6 +1014,16 @@ impl Runtime<'_> {
             deadline,
             &mut self.startup_read,
             None,
+            true,
+            |held, config| {
+                attach_sampler(
+                    self.options,
+                    &mut self.sampler,
+                    &mut self.sampler_retry_at,
+                    held,
+                    config,
+                );
+            },
         ) {
             Ok(machine) => {
                 self.pending_canon = false;
@@ -899,6 +1037,7 @@ impl Runtime<'_> {
                 );
                 let _ = self.audit.handle().emit(
                     EventKind::DriftDetected {
+                        read: None,
                         object: scupper_proto::ObjectKind::Unknown,
                         reason: scupper_proto::Reason::ObservationUnknown,
                     },
@@ -908,6 +1047,7 @@ impl Runtime<'_> {
                 None
             }
         };
+        self.sync_sampler();
         self.publish_snapshot();
     }
 }
@@ -922,6 +1062,7 @@ impl DaemonDeps for Runtime<'_> {
         Runtime::control_requests(self);
     }
     fn started(&mut self) {
+        self.sync_sampler();
         self.sync_alerts();
         if self.running.is_none() {
             return;
@@ -946,6 +1087,15 @@ impl DaemonDeps for Runtime<'_> {
         }
     }
     fn notify(&mut self, iteration: &Iteration) {
+        if crate::system::daemon_stopping() {
+            self.snapshot
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .current_iteration = None;
+            self.publish_snapshot();
+            return;
+        }
+        self.sync_sampler();
         self.sync_alerts();
         self.snapshot
             .write()
@@ -976,6 +1126,22 @@ impl DaemonDeps for Runtime<'_> {
         self.running.take();
         if let Err(error) = self.audit.shutdown() {
             eprintln!("scupperd: event flush: {error}");
+        }
+        // Keep observing through alert/audit shutdown, then record traffic in
+        // the last partial interval even for a daemon-only stop or rebuild.
+        if let Some((_, _, sampler)) = self.sampler.take() {
+            #[cfg(all(test, feature = "testing"))]
+            let started = Instant::now();
+            let result = sampler.stop();
+            #[cfg(all(test, feature = "testing"))]
+            let elapsed = started.elapsed();
+            if let Err(error) = &result {
+                eprintln!("scupperd: final client sample: {error}");
+            }
+            #[cfg(all(test, feature = "testing"))]
+            {
+                self.final_sample_result = Some((result, elapsed));
+            }
         }
     }
     fn initialize(&mut self) {
@@ -1021,7 +1187,7 @@ impl DaemonDeps for Runtime<'_> {
         let report = if let Some((machine, _, _)) = &mut self.running {
             machine.rebuild(&deps).ok()
         } else {
-            Some(boot::boot(&deps))
+            Some(boot::boot_with_log(&deps, Some(&self.audit.handle())))
         };
         if report.as_ref().is_some_and(BootReport::succeeded) {
             eprintln!("scupperd: boot retry: success");
@@ -1089,6 +1255,7 @@ impl DaemonDeps for Runtime<'_> {
                         );
                         let _ = audit.handle().emit(
                             EventKind::DriftDetected {
+                                read: None,
                                 object: scupper_proto::ObjectKind::Unknown,
                                 reason: scupper_proto::Reason::ObservationUnknown,
                             },
@@ -1109,6 +1276,7 @@ impl DaemonDeps for Runtime<'_> {
                 {
                     let _ = audit.handle().emit(
                         EventKind::DriftDetected {
+                            read: None,
                             object: scupper_proto::ObjectKind::Unknown,
                             reason: scupper_proto::Reason::HealthFailure,
                         },
@@ -1120,7 +1288,7 @@ impl DaemonDeps for Runtime<'_> {
             if stop.load(Ordering::Relaxed) {
                 return Some(crate::reconcile::TickReport::default());
             }
-            let report = machine.tick();
+            let report = machine.tick_with_stop(stop);
             if let Some(verdict) = machine.verdict() {
                 let (at, kernel) = machine.cached_observation().map_or_else(
                     || (Instant::now(), None),
@@ -1199,6 +1367,7 @@ impl DaemonDeps for Runtime<'_> {
                                     eprintln!("scupperd: probe interface: {error}");
                                     let _ = audit.handle().emit(
                                         EventKind::DriftDetected {
+                                            read: None,
                                             object: scupper_proto::ObjectKind::Unknown,
                                             reason: scupper_proto::Reason::ObservationUnknown,
                                         },
@@ -1233,18 +1402,61 @@ impl DaemonDeps for Runtime<'_> {
         }
     }
 }
+// Reattachment failure is contained synchronously under the apply's writer.
+fn finish_apply_reattach(
+    result: &mut Result<scupper_proto::OpResult, scupper_proto::ApiError>,
+    guard: &crate::lock::WriterGuard,
+    attached: bool,
+    close: impl FnOnce(&crate::lock::WriterGuard) -> Result<(), crate::reconcile::StepError>,
+) {
+    if attached {
+        return;
+    }
+    let closed = close(guard);
+    if closed.is_ok()
+        && let Ok(scupper_proto::OpResult::Apply { warnings, .. }) = result
+    {
+        warnings.push("Apply succeeded but supervisor reattachment failed; forwarding is closed while the supervisor retries".into());
+    }
+    if let Err(error) = closed {
+        let mut failure = result
+            .as_ref()
+            .err()
+            .cloned()
+            .unwrap_or_else(|| control::api(scupper_proto::ApiErrorCode::Internal));
+        let observation = failure
+            .observation
+            .get_or_insert_with(|| serde_json::json!({}));
+        if let Some(fields) = observation.as_object_mut() {
+            fields.insert("closure_error".into(), serde_json::json!(error.to_string()));
+        } else {
+            *observation =
+                serde_json::json!({"closure_error": error.to_string(), "previous": observation});
+        }
+        *result = Err(failure);
+    }
+}
+
+fn close_only_locked(
+    deps: &BootDeps<'_>,
+    _guard: &crate::lock::WriterGuard,
+) -> Result<(), crate::reconcile::StepError> {
+    let held = NetnsHandle::open("/run/netns/scupper")
+        .map_err(|_| crate::reconcile::StepError("closure namespace unavailable"))?;
+    crate::reconcile::forwarding_gates(deps, &held, false, None)
+}
+
 // An invalid handoff cannot authorize restoration. Close gates only, using the
 // same bounded kernel executor and writer lock as reconciliation.
 fn close_only(deps: &BootDeps<'_>, options: &Options) {
-    let Ok(_guard) =
+    let Ok(guard) =
         crate::lock::WriterLock::acquire_timeout(&options.run_root, Duration::from_millis(100))
     else {
         return;
     };
-    let Ok(held) = NetnsHandle::open("/run/netns/scupper") else {
-        return;
-    };
-    let _ = crate::reconcile::forwarding_gates(deps, &held, false, None);
+    if let Err(error) = close_only_locked(deps, &guard) {
+        eprintln!("scupperd: emergency closure failed: {error}");
+    }
 }
 
 // Fault injection is confined to testing builds and still executes real boot.
@@ -1270,6 +1482,57 @@ fn testing_boot_hook(point: boot::BootPoint) -> Result<(), String> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apply_reattach_closes_under_real_writer_before_return_and_propagates_failure() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/tmp/apply-close")
+            .join(std::process::id().to_string());
+        let guard = crate::lock::WriterLock::acquire(&root).unwrap();
+        for fail in [false, true] {
+            let mut forwarding = true;
+            let mut result = Ok(scupper_proto::OpResult::Apply {
+                version: 1,
+                dry_run: false,
+                warnings: vec![],
+                repair_plan: vec![],
+                plan: vec![],
+            });
+            finish_apply_reattach(&mut result, &guard, false, |held| {
+                assert!(std::ptr::eq(held, &raw const guard));
+                assert!(crate::lock::WriterLock::try_acquire(&root).is_err());
+                forwarding = false;
+                if fail {
+                    Err(crate::reconcile::StepError("injected closure failure"))
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(!forwarding, "closure must complete before returning");
+            assert_eq!(result.is_err(), fail);
+            if let Ok(scupper_proto::OpResult::Apply { warnings, .. }) = &result {
+                assert!(
+                    warnings
+                        .iter()
+                        .any(|warning| warning.contains("reattachment failed")
+                            && warning.contains("forwarding is closed"))
+                );
+            }
+            if fail {
+                let error = result.unwrap_err();
+                assert!(error.to_string().contains("closure failed"));
+                assert!(
+                    error
+                        .observation
+                        .unwrap()
+                        .to_string()
+                        .contains("closure failure")
+                );
+            }
+        }
+        drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[cfg(feature = "testing")]
     #[test]
@@ -1612,6 +1875,14 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)] // Exercise production timeout, retry and handoff ordering together.
     fn production_initialize_retries_only_canon_then_recovers_before_handoff() {
+        for previous in ["down", "down_since", "latch", "local-empty"] {
+            initialize_preserves_client_containment(previous);
+        }
+    }
+
+    #[cfg(feature = "testing")]
+    #[allow(clippy::too_many_lines)] // Exercise initialization with each previous containment checkpoint.
+    fn initialize_preserves_client_containment(previous: &str) {
         use crate::{
             canon::CanonCache,
             system::{ExecError, ExecOutput, ExecTarget, Program, System},
@@ -1639,7 +1910,13 @@ mod tests {
                     flushes: self.flushes.clone(),
                 }))
             }
-            fn run(&self, p: Program, _: &[String], _: Duration) -> Result<ExecOutput, ExecError> {
+            fn run(
+                &self,
+                _purpose: crate::system::HelperPurpose,
+                p: Program,
+                _: &[String],
+                _: Duration,
+            ) -> Result<ExecOutput, ExecError> {
                 if p == Program::Unshare {
                     std::thread::sleep(Duration::from_millis(200));
                 }
@@ -1655,11 +1932,18 @@ mod tests {
             }
             fn run_in(
                 &self,
+                _purpose: crate::system::HelperPurpose,
                 _: ExecTarget<'_>,
                 p: Program,
                 args: &[String],
                 _: Duration,
             ) -> Result<ExecOutput, ExecError> {
+                assert!(
+                    !(p == Program::Ip
+                        && args.iter().any(|arg| arg == "wg0")
+                        && args.iter().any(|arg| arg == "up")),
+                    "initialize raised the contained client device before planner safety observation"
+                );
                 if p == Program::Conntrack {
                     self.flushes.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1694,13 +1978,61 @@ mod tests {
                 std::path::PathBuf::from,
             )
             .join("production-initialize")
+            .join(previous)
             .join(std::process::id().to_string());
         std::fs::create_dir_all(&root).unwrap();
+        let guard = crate::lock::WriterLock::acquire(&root).unwrap();
+        StateFile::open(&root, None)
+            .unwrap()
+            .write_repair_state(&guard, &crate::state::RepairState::default())
+            .unwrap();
+        drop(guard);
+
         let text = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../scupper-core/tests/fixtures/site-m2.toml"
         ))
         .to_owned();
+        let site = validate(parse_site(&text).unwrap()).unwrap();
+        let identity = site
+            .gateway(&GatewayId("gw1".into()))
+            .unwrap()
+            .client_tunnel()
+            .identity()
+            .public_key
+            .as_str();
+        let writer = crate::lock::WriterLock::acquire(&root).unwrap();
+        crate::client_sessions::provision(&root, identity, 100, &writer).unwrap();
+        if previous != "local-empty" {
+            crate::client_sessions::activate(&root, &root, identity, 100, &writer).unwrap();
+        }
+        let sessions = root.join("client-sessions.json");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&sessions).unwrap()).unwrap();
+        if previous == "latch" {
+            let quarantine = crate::state::Quarantine {
+                reason: "previous containment".into(),
+                object: "wg0".into(),
+                since_unix: 100,
+                uncertain: false,
+            };
+            StateFile::open(&root, None)
+                .unwrap()
+                .write_repair_state(
+                    &writer,
+                    &crate::state::RepairState {
+                        quarantine: Some(quarantine),
+                        ..crate::state::RepairState::default()
+                    },
+                )
+                .unwrap();
+        } else if previous == "down" {
+            record["down"] = true.into();
+        } else if previous != "local-empty" {
+            record["down_since"] = 100.into();
+        }
+        std::fs::write(&sessions, serde_json::to_vec(&record).unwrap()).unwrap();
+        drop(writer);
         let held = Arc::new(crate::netns::testing::handle().unwrap());
         let (dev, ino) = held.identity();
         let report = BootReport {
@@ -1769,6 +2101,11 @@ mod tests {
                 Instant::now() + wait,
                 inputs,
                 None,
+                previous != "local-empty",
+                |_, _| {
+                    assert_eq!(system.reads.load(Ordering::Relaxed), 0);
+                    assert_eq!(system.flushes.load(Ordering::Relaxed), 1);
+                },
             )
         };
         let error = attempt(&mut inputs, Duration::from_millis(5))
@@ -1783,14 +2120,23 @@ mod tests {
         );
         // No state/version/boot files exist: retry must use the retained inputs.
         std::fs::write(root.join("route-switch"), b"target=exit\ntime=100\n").unwrap();
-        let (_machine, _, _) = attempt(&mut inputs, Duration::from_secs(3)).unwrap();
+        let (machine, _, _) = attempt(&mut inputs, Duration::from_secs(3)).unwrap();
         assert!(inputs.ready.is_none());
         assert_eq!(system.flushes.load(Ordering::Relaxed), 1);
         assert!(!root.join("route-switch").exists());
-        assert!(
-            system.reads.load(Ordering::Relaxed) > 0,
-            "production initialization skipped handoff observation"
-        );
+        if previous == "latch" {
+            assert!(machine.latch().is_some(), "startup lost the planner latch");
+        } else {
+            assert!(
+                system.reads.load(Ordering::Relaxed) > 0,
+                "production initialization skipped handoff observation"
+            );
+        }
+        if previous == "local-empty" {
+            let after: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&sessions).unwrap()).unwrap();
+            assert_eq!(after, record, "CLI-local initialization consumed EMPTY");
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1886,6 +2232,59 @@ pub mod testing {
         runtime.shutdown();
         Ok(report)
     }
+    /// Exercise initialization with an unavailable audit sender.
+    /// # Errors
+    /// Returns startup failures, which must not include a failed migration event.
+    pub fn restart_tick_with_log(
+        deps: BootDeps<'_>,
+        log: crate::events::LogHandle,
+    ) -> io::Result<crate::reconcile::TickReport> {
+        let origin = Instant::now();
+        let (mut machine, _, _) = super::initialize(
+            deps,
+            GatewayId("gw1".into()),
+            log,
+            origin,
+            origin + Duration::from_secs(5),
+            &mut StartupRead::default(),
+            None,
+            true,
+            |_, _| {},
+        )?;
+        Ok(machine.tick())
+    }
+
+    /// Exercise both runtime rebuild paths with the audit writer already held.
+    /// # Errors
+    /// Returns fixture, rebuild or audit persistence failures.
+    pub fn rebuild_legacy(deps: BootDeps<'_>, running: bool) -> io::Result<()> {
+        use super::scheduler::DaemonDeps as _;
+        let options = Options {
+            state_root: deps.state_root.into(),
+            config_root: deps.config_root.into(),
+            run_root: deps.run_root.into(),
+            probe_binary: deps.run_root.join("unused-probe"),
+        };
+        let mut runtime = runtime(deps, &options)?;
+        runtime.audit.opened = EventLog::open(deps.state_root, GatewayId("gw1".into()), || {
+            UnixSeconds(unix())
+        })
+        .map_err(io::Error::other)?;
+        if let Some((machine, _, _)) = &mut runtime.running {
+            machine.set_log(runtime.audit.handle());
+        }
+        if !running {
+            runtime.running = None;
+        }
+        std::fs::remove_file(deps.state_root.join("repair-state.json"))?;
+        runtime.rebuild();
+        if runtime.running.is_none() {
+            return Err(io::Error::other("rebuild did not reattach"));
+        }
+        runtime.shutdown();
+        Ok(())
+    }
+
     /// Run the daemon's fresh full check and its production alert projection.
     /// # Errors
     /// Returns fixture or observation failures.
@@ -2020,11 +2419,20 @@ pub mod testing {
     }
 
     fn runtime<'a>(deps: BootDeps<'a>, options: &'a Options) -> io::Result<Runtime<'a>> {
+        let mut runtime = runtime_shell(deps, options)?;
+        runtime.initialize_until(Instant::now() + Duration::from_secs(5));
+        if runtime.running.is_none() {
+            return Err(io::Error::other("fixture runtime did not initialize"));
+        }
+        Ok(runtime)
+    }
+
+    fn runtime_shell<'a>(deps: BootDeps<'a>, options: &'a Options) -> io::Result<Runtime<'a>> {
         let origin = Instant::now();
         let gateway = GatewayId("gw1".into());
         let audit =
             Audit::open(deps.state_root, gateway.clone(), origin).map_err(io::Error::other)?;
-        let mut runtime = Runtime {
+        let runtime = Runtime {
             options,
             system: deps.system,
             namespace: deps.namespace,
@@ -2035,6 +2443,10 @@ pub mod testing {
             notify: notify::Notify::disabled(),
             started_event: false,
             running: None,
+            sampler: None,
+            #[cfg(all(test, feature = "testing"))]
+            final_sample_result: None,
+            sampler_retry_at: Instant::now(),
             pending_canon: false,
             startup_read: StartupRead::default(),
             probes: probes::Probes::new(options.probe_binary.clone(), origin),
@@ -2053,11 +2465,36 @@ pub mod testing {
             snapshot: control::SharedSnapshot::default(),
             cached: None,
         };
-        runtime.initialize_until(origin + Duration::from_secs(5));
-        if runtime.running.is_none() {
-            return Err(io::Error::other("fixture runtime did not initialize"));
-        }
         Ok(runtime)
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::unwrap_used)] // Test fixture initialization must succeed.
+    pub(crate) fn shutdown_sampler(
+        root: &std::path::Path,
+        sampler: crate::client_sessions::Sampler,
+    ) -> Option<(io::Result<()>, Duration)> {
+        let options = Options {
+            state_root: root.into(),
+            config_root: root.into(),
+            run_root: root.into(),
+            probe_binary: root.join("unused-probe"),
+        };
+        let system = crate::system::RealSystem::default();
+        let deps = BootDeps {
+            system: &system,
+            namespace: &super::GatewayNamespace,
+            state_root: root,
+            config_root: root,
+            run_root: root,
+            hook: None,
+            secret_owner: 0,
+        };
+        let mut runtime = runtime_shell(deps, &options).unwrap();
+        runtime.sampler = Some((1, (0, 0), sampler));
+        // Exercise the actual scheduler shutdown boundary, including audit flush.
+        runtime.shutdown();
+        runtime.final_sample_result
     }
 
     /// Counts startup audit events after two READY writes to a missing socket.

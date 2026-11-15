@@ -10,6 +10,8 @@ WatchdogSec=30
 Restart=always
 RestartSec=2s
 TimeoutStartSec=90
+KillMode=mixed
+TimeoutStopSec=270s
 LimitCORE=0
 # Keep the host mount namespace: restore_mount needs /run/netns propagation.
 ExecStart=/usr/local/bin/scupperd

@@ -2,8 +2,8 @@
 //!
 //! Stages follow DESIGN §12: containment → administrative closure → observed
 //! defaults/handshakes → forwarding/client listener → forwarded routes → exit
-//! probe → required supervisor. Standby probing is reserved for multi-exit M2k;
-//! DNS self-tests begin with the M4 forwarder. Neither is requested in M2.
+//! probe → required supervisor/netns → client sessions. Standby probing is
+//! reserved for multi-exit M2k; DNS self-tests begin with the M4 forwarder. Neither is requested in M2.
 //!
 //! Known violations in any supplied observation win over observation errors.
 //! Supplied required-observation errors win over availability results, even if
@@ -19,7 +19,7 @@
 //! both families to prove M2's IPv6 rejection without requesting a stage twice.
 //! Interface names in inventories are raw strings so foreign kernel
 //! names outside config syntax remain representable. Missing/duplicate links
-//! use `ForeignLink`. Disconnected exits may have no peers (the documented
+//! use `ForeignLink`, except absent client ingress (degraded link down). Disconnected exits may have no peers (the documented
 //! administrative closure), but any peers still present must match policy.
 //! FailoverPending/Stuck and other future variants are retained as vocabulary,
 //! without multi-exit logic. The constructor requires exactly one exit. Assigned
@@ -48,7 +48,17 @@ fn error(stage: Stage, source: &ProbeError) -> Next {
     }))
 }
 
-fn report(verdict: Verdict, warnings: Vec<Warning>, cfg: &HealthConfigV2, now: u64) -> Next {
+fn report(verdict: Verdict, mut warnings: Vec<Warning>, cfg: &HealthConfigV2, now: u64) -> Next {
+    if matches!(
+        verdict,
+        Verdict::Degraded(
+            Degraded::ClientSessionsReset
+                | Degraded::ClientSessionsUnknown
+                | Degraded::ClientSessionTelemetryUnknown
+        )
+    ) {
+        warnings.retain(|warning| *warning != Warning::ClientSessionsPending);
+    }
     Next::Done(Ok(Report {
         verdict,
         warnings,
@@ -174,11 +184,9 @@ fn topology_violations(
             )));
         }
     }
-    for name in cfg
-        .links
-        .keys()
-        .filter(|name| t.links_complete && !seen.contains(name.as_str()))
-    {
+    for name in cfg.links.keys().filter(|name| {
+        t.links_complete && *name != &cfg.client_iface && !seen.contains(name.as_str())
+    }) {
         found.push(Violation::ForeignLink(name.clone()));
     }
     let names: BTreeSet<_> = cfg.peers.keys().chain(t.peers.keys()).collect();
@@ -481,6 +489,25 @@ pub fn next(obs: &Observations, cfg: &HealthConfigV2, now: u64) -> Next {
     let mut warnings = Vec::new();
     if let Some(Ok(f)) = &obs.forwarding {
         warnings.extend(f.hardening.iter().cloned().map(Warning::HardeningSysctl));
+        let sessions = f.client_sessions;
+        if sessions.active_reset || sessions.unknown {
+            warnings.push(Warning::ClientSessionsPending);
+        }
+        if sessions.idle_reset {
+            warnings.push(Warning::IdleClientSessionsReset);
+        }
+        if sessions.history_unavailable {
+            warnings.push(Warning::ClientSessionHistoryUnavailable);
+        }
+        if sessions.expired_unconfirmed {
+            warnings.push(Warning::ClientSessionsExpiredUnconfirmed);
+        }
+        if sessions.peer_missing {
+            warnings.push(Warning::ClientSessionPeerMissing);
+        }
+        if sessions.telemetry_unavailable {
+            warnings.push(Warning::ClientSessionTelemetryUnavailable);
+        }
     }
     if let Some(Ok(f)) = &obs.forwarding
         && let Some(reason) = &f.quarantine
@@ -510,6 +537,36 @@ pub fn next(obs: &Observations, cfg: &HealthConfigV2, now: u64) -> Next {
     let Some(Ok(defaults)) = &obs.defaults else {
         return Next::Defaults;
     };
+    // Client ingress being cut off is an availability failure even if the exit
+    // is also down. Administrative closure and effective quarantine outrank it.
+    if obs.selection != Selection::Disconnected
+        && !topology
+            .links
+            .iter()
+            .any(|link| link.name == cfg.client_iface && link.up)
+    {
+        let Some(Ok(forwarding)) = &obs.forwarding else {
+            return Next::Forwarding;
+        };
+        if forwarding.v4 == 0
+            && let Some(reason) = &forwarding.quarantine
+        {
+            return report(
+                Verdict::FailClosed(FailClosed::Quarantined {
+                    reason: reason.clone(),
+                }),
+                warnings,
+                cfg,
+                now,
+            );
+        }
+        return report(
+            Verdict::Degraded(Degraded::ClientSideBroken(ClientFault::LinkDown)),
+            warnings,
+            cfg,
+            now,
+        );
+    }
     if let Some(verdict) = defaults_failure(topology, defaults, obs, cfg) {
         return report(verdict, warnings, cfg, now);
     }
@@ -553,18 +610,6 @@ pub fn next(obs: &Observations, cfg: &HealthConfigV2, now: u64) -> Next {
     if forwarding.v4 != 1 || forwarding.client_v4 != 1 {
         return report(
             Verdict::Degraded(Degraded::ForwardingDisabled),
-            warnings,
-            cfg,
-            now,
-        );
-    }
-    if !topology
-        .links
-        .iter()
-        .any(|link| link.name == cfg.client_iface && link.up)
-    {
-        return report(
-            Verdict::Degraded(Degraded::ClientSideBroken(ClientFault::LinkDown)),
             warnings,
             cfg,
             now,
@@ -640,6 +685,7 @@ pub fn next(obs: &Observations, cfg: &HealthConfigV2, now: u64) -> Next {
         );
     }
     let exit = cfg.exit.clone();
+    let mut supervisor_fault = None;
     if cfg.require_daemon {
         let why = match obs.supervisor {
             None => return Next::Supervisor,
@@ -652,18 +698,7 @@ pub fn next(obs: &Observations, cfg: &HealthConfigV2, now: u64) -> Next {
             Some(Supervisor::Dead) => Some(SupervisorFault::Dead),
             Some(Supervisor::NotRequired) => Some(SupervisorFault::NotRequired),
         };
-        if let Some(why) = why {
-            return report(
-                Verdict::Unsupervised {
-                    exit,
-                    exit_ip: ip,
-                    why,
-                },
-                warnings,
-                cfg,
-                now,
-            );
-        }
+        supervisor_fault = why;
     } else {
         match obs.supervisor {
             Some(Supervisor::Dead) => warnings.push(Warning::DaemonDead),
@@ -674,6 +709,42 @@ pub fn next(obs: &Observations, cfg: &HealthConfigV2, now: u64) -> Next {
             }
             _ => {}
         }
+    }
+    if let Some(why) = supervisor_fault {
+        return report(
+            Verdict::Unsupervised {
+                exit,
+                exit_ip: ip,
+                why,
+            },
+            warnings,
+            cfg,
+            now,
+        );
+    }
+    if forwarding.client_sessions.telemetry_unavailable {
+        return report(
+            Verdict::Degraded(Degraded::ClientSessionTelemetryUnknown),
+            warnings,
+            cfg,
+            now,
+        );
+    }
+    if forwarding.client_sessions.unknown {
+        return report(
+            Verdict::Degraded(Degraded::ClientSessionsUnknown),
+            warnings,
+            cfg,
+            now,
+        );
+    }
+    if forwarding.client_sessions.active_reset {
+        return report(
+            Verdict::Degraded(Degraded::ClientSessionsReset),
+            warnings,
+            cfg,
+            now,
+        );
     }
     report(Verdict::Protected { exit, exit_ip: ip }, warnings, cfg, now)
 }

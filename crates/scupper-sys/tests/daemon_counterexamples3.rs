@@ -67,7 +67,13 @@ impl System for UpgradeSystem {
             delay: self.delay,
         }))
     }
-    fn run(&self, program: Program, _: &[String], _: Duration) -> Result<ExecOutput, ExecError> {
+    fn run(
+        &self,
+        _purpose: scupper_sys::system::HelperPurpose,
+        program: Program,
+        _: &[String],
+        _: Duration,
+    ) -> Result<ExecOutput, ExecError> {
         if program == Program::Unshare {
             std::thread::sleep(self.delay);
         }
@@ -83,6 +89,7 @@ impl System for UpgradeSystem {
     }
     fn run_in(
         &self,
+        _purpose: scupper_sys::system::HelperPurpose,
         _: ExecTarget<'_>,
         _: Program,
         _: &[String],
@@ -478,6 +485,10 @@ fn interrupted_route_switch_flushes_once_before_handoff_and_normal_restart_does_
     kernel.clear_history();
     let (_, config) = healthy(&root);
     let mut restarted = make(config);
+    assert!(
+        restarted.latch().is_none(),
+        "an interrupted routine restore must recover without explicit clearance"
+    );
     restarted.recover_route_switch().unwrap();
     assert!(!root.join("route-switch").exists());
     restarted.resume_existing();

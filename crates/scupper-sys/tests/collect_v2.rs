@@ -1002,3 +1002,427 @@ fn probe_runtime_child() {
     }
     fs::write(sentinel, "completed").unwrap();
 }
+
+#[test]
+fn check_accepts_legacy_layout_and_in_flight_restore_without_false_quarantine() {
+    use scupper_sys::{
+        lock::WriterLock,
+        state::{RepairState, StateFile},
+    };
+    let runner = "ubuntu-24.04";
+    let held = testing::handle().unwrap();
+    let root = Root::new(runner, &held);
+    let sys = Script::new(runner);
+    fresh(&sys);
+    let site = site(runner);
+    let gateway = GatewayId("gw1".into());
+    let config = cfg(&site, &gateway, root.stamp);
+    fs::write(
+        root.path.join("state.json"),
+        r#"{"schema":1,"applied_version":1,"selection":"Auto","quarantine":null}"#,
+    )
+    .unwrap();
+    fs::remove_file(root.path.join("repair-state.json")).unwrap();
+    let deps = Dependencies {
+        system: &sys,
+        probe_exec: &sys,
+        handle: Some(&held),
+        state_root: &root.path,
+        run_root: &root.path,
+    };
+    assert_eq!(
+        check_v2::run_check_v2(&deps, &config)
+            .unwrap()
+            .verdict
+            .exit_code(),
+        0
+    );
+    let guard = WriterLock::acquire(&root.path).unwrap();
+    StateFile::open(&root.path, None)
+        .unwrap()
+        .write_repair_state(
+            &guard,
+            &RepairState {
+                armed: true,
+                attempts_unix: std::collections::BTreeMap::from([(
+                    "safety:ruleset".into(),
+                    vec![1100; 3],
+                )]),
+                ..RepairState::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        check_v2::run_check_v2(&deps, &config)
+            .unwrap()
+            .verdict
+            .exit_code(),
+        0
+    );
+}
+
+#[test]
+fn full_check_reports_client_link_down_or_missing_without_probing_the_missing_device() {
+    use scupper_core::verdict::v2::{ClientFault, Degraded, Verdict};
+    for missing in [false, true] {
+        let runner = "ubuntu-24.04";
+        let handle = testing::handle().unwrap();
+        let root = Root::new(runner, &handle);
+        let site = site(runner);
+        let gateway = GatewayId("gw1".into());
+        let cfg = cfg(&site, &gateway, root.stamp);
+        let sys = Script::new(runner);
+        fresh(&sys);
+        for file in ["scupper--4-link.json", "scupper--4-addr.json"] {
+            let mut rows: serde_json::Value = serde_json::from_str(&sys.text(file)).unwrap();
+            if missing {
+                rows.as_array_mut()
+                    .unwrap()
+                    .retain(|l| l["ifname"] != "wg0");
+            } else {
+                for link in rows.as_array_mut().unwrap() {
+                    if link["ifname"] == "wg0" {
+                        link["flags"] = serde_json::json!(["POINTOPOINT", "NOARP"]);
+                    }
+                }
+            }
+            sys.replace(file, &rows.to_string());
+        }
+        let deps = Dependencies {
+            system: &sys,
+            probe_exec: &sys,
+            handle: Some(&handle),
+            run_root: &root.path,
+            state_root: &root.path,
+        };
+        let report = check_v2::run_check_v2(&deps, &cfg).unwrap();
+        assert_eq!(
+            report.verdict,
+            Verdict::Degraded(Degraded::ClientSideBroken(ClientFault::LinkDown))
+        );
+        assert_eq!(report.verdict.exit_code(), 3);
+        if missing {
+            assert!(
+                !sys.calls
+                    .borrow()
+                    .iter()
+                    .any(|(_, _, args)| args.iter().any(|s| s == "wg0" || s.contains(".wg0.")))
+            );
+        }
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Run the public checkpoint and check driver on both captured kernels.
+fn client_reset_checkpoint_gates_the_real_check_driver_on_both_runners() {
+    use scupper_core::verdict::v2::{Degraded, Verdict};
+    use scupper_sys::{
+        client_sessions::{self, Request, Response, Sample},
+        lock::WriterLock,
+        netns::NetnsHandle,
+        system::{ExecError, ExecOutput, ExecTarget, Program, System},
+    };
+    use std::{cell::RefCell, time::Duration};
+    struct Sessions {
+        inner: Script,
+        sample: RefCell<Sample>,
+        fail_read: std::cell::Cell<bool>,
+        now: std::cell::Cell<u64>,
+    }
+    impl System for Sessions {
+        fn run(
+            &self,
+            purpose: scupper_sys::system::HelperPurpose,
+            p: Program,
+            args: &[String],
+            timeout: Duration,
+        ) -> Result<ExecOutput, ExecError> {
+            self.inner.run(purpose, p, args, timeout)
+        }
+        fn run_in(
+            &self,
+            purpose: scupper_sys::system::HelperPurpose,
+            t: ExecTarget<'_>,
+            p: Program,
+            args: &[String],
+            timeout: Duration,
+        ) -> Result<ExecOutput, ExecError> {
+            self.inner.run_in(purpose, t, p, args, timeout)
+        }
+        fn now_unix_secs(&self) -> u64 {
+            self.now.get()
+        }
+        fn wireguard_socket_dirs(&self) -> Vec<std::path::PathBuf> {
+            vec![]
+        }
+        fn read_host_udp(&self, ipv6: bool) -> std::io::Result<String> {
+            self.inner.read_host_udp(ipv6)
+        }
+        fn canon_run_root(&self) -> &Path {
+            self.inner.canon_run_root()
+        }
+        fn client_session_io(
+            &self,
+            _purpose: scupper_sys::system::HelperPurpose,
+            _: &NetnsHandle,
+            r: &Request,
+        ) -> std::io::Result<Response> {
+            assert!(
+                r.probe.is_none(),
+                "check must never initiate recovery probes"
+            );
+            if self.fail_read.get() {
+                return Err(std::io::Error::other("session telemetry unavailable"));
+            }
+            Ok(Response::Samples(vec![self.sample.borrow().clone()]))
+        }
+    }
+    for runner in ["ubuntu-22.04", "ubuntu-24.04"] {
+        let handle = testing::handle().unwrap();
+        let root = Root::new(runner, &handle);
+        let site = site(runner);
+        let gateway = GatewayId("gw1".into());
+        let cfg = cfg(&site, &gateway, root.stamp);
+        let key = site.devices().values().next().unwrap().public_key();
+        let sys = Sessions {
+            inner: Script::new(runner),
+            fail_read: std::cell::Cell::new(false),
+            now: std::cell::Cell::new(1000),
+            sample: RefCell::new(Sample {
+                key,
+                handshake: (1000, 0),
+                rx: 1000,
+                tx: 2000,
+            }),
+        };
+        fresh(&sys.inner);
+        let writer = WriterLock::acquire(root.path.join("lock")).unwrap();
+        fs::remove_file(root.path.join("client-sessions.json")).unwrap();
+        client_sessions::link_down(
+            &sys,
+            &handle,
+            "wg0",
+            &root.path,
+            &root.path,
+            site.gateway(&gateway)
+                .unwrap()
+                .client_tunnel()
+                .identity()
+                .public_key
+                .as_str(),
+            &writer,
+            true,
+        )
+        .unwrap();
+        client_sessions::before_up(
+            &sys,
+            &handle,
+            "wg0",
+            &root.path,
+            &root.path,
+            site.gateway(&gateway)
+                .unwrap()
+                .client_tunnel()
+                .identity()
+                .public_key
+                .as_str(),
+            true,
+            &writer,
+        )
+        .unwrap();
+        let identity = site
+            .gateway(&gateway)
+            .unwrap()
+            .client_tunnel()
+            .identity()
+            .public_key
+            .as_str();
+        client_sessions::checkpoint_recovered(
+            &sys,
+            &handle,
+            "wg0",
+            &root.path,
+            &root.path,
+            identity,
+            &writer,
+            &[key],
+        )
+        .unwrap();
+        let deps = Dependencies {
+            system: &sys,
+            probe_exec: &sys.inner,
+            handle: Some(&handle),
+            run_root: &root.path,
+            state_root: &root.path,
+        };
+        let (report, obs) = check_v2::run_with_observations(&deps, &cfg);
+        assert_eq!(
+            report.unwrap().verdict,
+            Verdict::Degraded(Degraded::ClientSessionsUnknown)
+        );
+        assert!(
+            obs.routes.is_some(),
+            "pending sessions must not skip route evidence"
+        );
+        assert!(
+            obs.exit_probe.is_some(),
+            "pending sessions must not skip exit-IP evidence"
+        );
+        assert!(
+            obs.supervisor.is_some(),
+            "pending sessions must not skip supervisor evidence"
+        );
+        let saved_probe = sys.inner.probe.borrow().clone();
+        let mut probe: serde_json::Value = serde_json::from_str(&saved_probe).unwrap();
+        probe["result"]["ip"] = serde_json::json!("198.51.100.2");
+        *sys.inner.probe.borrow_mut() = probe.to_string();
+        assert_eq!(
+            check_v2::run_check_v2(&deps, &cfg)
+                .unwrap()
+                .verdict
+                .exit_code(),
+            2
+        );
+        *sys.inner.probe.borrow_mut() = saved_probe;
+        sys.sample.borrow_mut().handshake = (1000, 1);
+        sys.sample.borrow_mut().rx += 92;
+        assert_eq!(
+            check_v2::run_check_v2(&deps, &cfg).unwrap().verdict,
+            Verdict::Degraded(Degraded::ClientSessionsUnknown)
+        );
+        sys.sample.borrow_mut().rx += 32;
+        assert_eq!(
+            check_v2::run_check_v2(&deps, &cfg).unwrap().verdict,
+            Verdict::Degraded(Degraded::ClientSessionsUnknown)
+        );
+        for now in (1000..=1180).step_by(5) {
+            sys.now.set(now);
+            client_sessions::checkpoint_recovered(
+                &sys,
+                &handle,
+                "wg0",
+                &root.path,
+                &root.path,
+                identity,
+                &writer,
+                &[key],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            check_v2::run_check_v2(&deps, &cfg)
+                .unwrap()
+                .verdict
+                .exit_code(),
+            0
+        );
+        // Explicitly control test deadlines so disk speed is not the assertion.
+        let _confirmation = client_sessions::confirmation_testing::Control::new(&root.path);
+        // Round 9n: reset to a fresh zero baseline with an active obligation.
+        // Check alone sees the confirming residue; no sampler runs after it.
+        sys.sample.borrow_mut().rx += 32;
+        client_sessions::checkpoint_recovered(
+            &sys,
+            &handle,
+            "wg0",
+            &root.path,
+            &root.path,
+            identity,
+            &writer,
+            &[key],
+        )
+        .unwrap();
+        client_sessions::link_down(
+            &sys, &handle, "wg0", &root.path, &root.path, identity, &writer, true,
+        )
+        .unwrap();
+        {
+            let mut sample = sys.sample.borrow_mut();
+            sample.handshake = (0, 0);
+            sample.rx = 0;
+            sample.tx = 0;
+        }
+        client_sessions::before_up(
+            &sys, &handle, "wg0", &root.path, &root.path, identity, true, &writer,
+        )
+        .unwrap();
+        assert_eq!(
+            check_v2::run_check_v2(&deps, &cfg).unwrap().verdict,
+            Verdict::Degraded(Degraded::ClientSessionsReset)
+        );
+        // Keep independent exit health fresh while the client sampler stalls.
+        sys.inner.replace(
+            "scupper-wg-ex-ch1-latest-handshakes.txt",
+            &sys.inner
+                .text("scupper-wg-ex-ch1-latest-handshakes.txt")
+                .replace("\t1000", "\t1180"),
+        );
+        // The last sampler commit is at 1180; a late check cannot renew it.
+        sys.now.set(1194);
+        {
+            let mut sample = sys.sample.borrow_mut();
+            sample.handshake = (1180, 1);
+            sample.rx = 180 + 112 * 13; // 1636: unambiguous transport evidence
+            sample.tx = 2000;
+        }
+        assert_eq!(
+            check_v2::run_check_v2(&deps, &cfg)
+                .unwrap()
+                .verdict
+                .exit_code(),
+            0
+        );
+        let committed: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.path.join("client-sessions.json")).unwrap())
+                .unwrap();
+        sys.sample.borrow_mut().rx = 1748; // 92 * 19, with no intervening sampler
+        assert_eq!(
+            check_v2::run_check_v2(&deps, &cfg)
+                .unwrap()
+                .verdict
+                .exit_code(),
+            0,
+            "a confirmed client stays confirmed when traffic stops on an ambiguous residue"
+        );
+        assert_eq!(committed["renewed_at"], 1180);
+        assert_eq!(committed["written_at"], 1194);
+        assert_eq!(committed["peers"][0]["state"], "Recovered");
+        assert_eq!(committed["peers"][0]["observed"]["rx"], 1636);
+        let after: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.path.join("client-sessions.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            after["sequence"], committed["sequence"],
+            "no second commit needed"
+        );
+        sys.fail_read.set(true);
+        assert_eq!(
+            check_v2::run_check_v2(&deps, &cfg).unwrap().verdict,
+            Verdict::Degraded(Degraded::ClientSessionTelemetryUnknown)
+        );
+        let healthy_probe = sys.inner.probe.borrow().clone();
+        *sys.inner.probe.borrow_mut() = probe.to_string();
+        let (report, obs) = check_v2::run_with_observations(&deps, &cfg);
+        assert_eq!(
+            report.unwrap().verdict.exit_code(),
+            2,
+            "session telemetry failure cannot hide an exit-IP safety violation"
+        );
+        assert!(obs.routes.is_some());
+        assert!(obs.exit_probe.is_some());
+        *sys.inner.probe.borrow_mut() = healthy_probe;
+        sys.fail_read.set(false);
+        sys.now.set(1196);
+        let stalled = check_v2::run_check_v2(&deps, &cfg).unwrap().verdict;
+        assert_eq!(stalled, Verdict::Degraded(Degraded::ClientSessionsUnknown));
+        assert_eq!(
+            stalled.exit_code(),
+            3,
+            "confirmation cannot mask a sampler stall"
+        );
+        assert_eq!(
+            client_sessions::cached_reason(&root.path, 1196),
+            Some(scupper_proto::SessionReason::ClientSessionsUnknown)
+        );
+    }
+}

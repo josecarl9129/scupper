@@ -199,7 +199,7 @@ fn load_show_validate_history_diff_and_linear_rollback() {
     assert_eq!(
         h.run(&["config", "history"]).1,
         format!(
-            "version\tparent\tat\tactor\treason\tsha256\n1\t-\t{}\t\"local-operator\"\t\"initial import\"\t{}\n",
+            "version\tparent\tat\tactor\treason\tsha256\trestorability\n1\t-\t{}\t\"local-operator\"\t\"initial import\"\t{}\tkeys retained\n",
             meta.at,
             &meta.sha256[..12]
         )
@@ -714,23 +714,26 @@ impl scupper_sys::system::System for ProviderSystem<'_> {
     }
     fn run_in(
         &self,
+        purpose: scupper_sys::system::HelperPurpose,
         target: scupper_sys::system::ExecTarget<'_>,
         p: scupper_sys::system::Program,
         a: &[String],
         t: std::time::Duration,
     ) -> Result<scupper_sys::system::ExecOutput, scupper_sys::system::ExecError> {
-        self.0.run_in(target, p, a, t)
+        self.0.run_in(purpose, target, p, a, t)
     }
     fn run(
         &self,
+        purpose: scupper_sys::system::HelperPurpose,
         p: scupper_sys::system::Program,
         a: &[String],
         t: std::time::Duration,
     ) -> Result<scupper_sys::system::ExecOutput, scupper_sys::system::ExecError> {
-        self.0.run(p, a, t)
+        self.0.run(purpose, p, a, t)
     }
     fn run_with_stdin(
         &self,
+        _purpose: scupper_sys::system::HelperPurpose,
         _: scupper_sys::system::ExecTarget<'_>,
         p: scupper_sys::system::Program,
         a: &[String],
@@ -1507,7 +1510,8 @@ fn import_replacement_applies_over_existing_namespace_in_place() {
         hook: None,
         secret_owner: rustix::process::geteuid().as_raw(),
     };
-    assert!(boot::boot(&deps).succeeded());
+    let report = boot::boot(&deps);
+    assert!(report.succeeded(), "{report:?}");
     let before = parse_site(&h.store().read(1).unwrap().0).unwrap();
     let old = &before.gateways[&GatewayId("gw1".into())].exits[0];
     let source = ProviderFile::new();
@@ -1922,4 +1926,29 @@ fn socket_import_reset_preserves_disconnect_and_reports_post_commit_failure() {
         };
         assert_eq!(saved.selection, Selection::Disconnected);
     }
+}
+
+#[test]
+fn history_marks_destroyed_exit_keys_not_restorable() {
+    let h = Harness::new();
+    h.load();
+    h.save_state(1, scupper_sys::state::Selection::Auto);
+    let site = parse_site(&fs::read_to_string(h.input()).unwrap()).unwrap();
+    let key = &site.gateways.values().next().unwrap().exits[0].private_key_ref;
+    let path = h.path.join("etc/secrets/wg").join(key.name());
+    fs::remove_file(path).unwrap();
+    let before = h.snapshot();
+    let (code, out, err) = h.run(&["config", "history"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("not restorable (key destroyed)"), "{out}");
+    assert_eq!(h.snapshot(), before, "history must be read-only");
+    let public = h.store().read(1).unwrap();
+    let (code, out, err) = h.run(&["apply"]);
+    assert_ne!(code, 0, "{out}");
+    assert!(
+        out.contains("not restorable") || err.contains("not restorable"),
+        "{out} {err}"
+    );
+    assert_eq!(h.store().read(1).unwrap(), public);
+    assert_eq!(h.store().head().unwrap(), Some(1));
 }

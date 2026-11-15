@@ -1,2 +1,0 @@
-nat-anchor "com.apple/*" all
-rdr-anchor "com.apple/*" all

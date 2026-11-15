@@ -23,3 +23,22 @@ Three gateway units: `scupper-net` (oneshot `scupper boot`), `scupperd` (root, h
 - scupperd is deterministic and testable with a fake clock.
 - Edge authenticates tunnel principals (ADR 0007); scupperd authorizes them (ADR 0029).
 - `BindsTo=` ties edge to the namespace *unit*, not the namespace object; scupperd checks edge's namespace inode every tick and restarts edge after a rebuild.
+
+The fresh heartbeat and pending-verification checks are concurrent exceptions to
+single-threaded reconciliation. They can commit client session confirmations
+under the session writer lock, with a 500 ms deadline and epoch fences, but never
+write reconciler intent. A detached worker whose filesystem operation is blocked
+can keep that lock; sampling skips contention, lifecycle hooks remain bounded,
+and clean stop waits up to three seconds without invalidating on contention.
+Confirmation writes never renew sampler freshness or publish cached readiness.
+
+Daemon-only stop uses `KillMode=mixed`: systemd sends TERM only to the main PID.
+There is no daemon `ExecStop`; the signal handler requests synchronous graceful
+shutdown. The main process closes helper admission and drains/reaps all owned
+execs, including timeout reapers, before it exits. Unknown shutdown safety gets
+one two-second re-observation after draining; known unsafe or still unknown safety
+is contained at complete operation boundaries. `TimeoutStopSec=240s` budgets the
+current operation, collection/drain, re-observation, 120-second containment prefix,
+30-second final closure and final audit/session work (see DESIGN). systemd sends
+SIGKILL to remaining processes only at that final timeout, including the main PID
+if it is still waiting for an unreapable child.
