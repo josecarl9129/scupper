@@ -1267,6 +1267,16 @@ impl System for RealSystem {
 /// Scripted test support, available only with the `testing` feature.
 #[cfg(feature = "testing")]
 pub mod testing {
+    /// Wait for all currently tracked durable-write workers to release ownership.
+    #[must_use]
+    pub fn wait_storage_idle(timeout: std::time::Duration) -> bool {
+        super::wait_helpers(
+            &super::HELPERS,
+            std::time::Instant::now() + timeout,
+            |purpose| purpose == super::HelperPurpose::Storage,
+        )
+    }
+
     /// Whether an actual read helper is currently tracked in this process.
     #[must_use]
     pub fn observation_active() -> bool {
@@ -1558,6 +1568,20 @@ mod tests {
 
     fn args(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| (*arg).into()).collect()
+    }
+
+    #[cfg(feature = "testing")]
+    #[test]
+    fn storage_idle_wait_tracks_worker_after_caller_timeout() -> Result<(), Box<dyn Error>> {
+        let (release, blocked) = mpsc::sync_channel(1);
+        let result = storage_until(Instant::now(), move || {
+            blocked.recv().map_err(std::io::Error::other)
+        });
+        assert!(matches!(result, Err(error) if error.kind() == std::io::ErrorKind::TimedOut));
+        assert!(!testing::wait_storage_idle(Duration::ZERO));
+        release.send(())?;
+        assert!(testing::wait_storage_idle(Duration::from_secs(30)));
+        Ok(())
     }
 
     #[cfg(feature = "testing")]

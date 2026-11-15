@@ -2358,10 +2358,15 @@ impl<K: Kernel, S: StateStore, C: Fn() -> (MonoTime, u64)> Reconciler<K, S, C> {
                 });
                 self.kernel.invalidate_state();
                 let repair = self.repair_checkpoint(false);
-                let deadline = (self.kernel.now() + Duration::from_secs(3)).min(
-                    self.stop_deadline
-                        .unwrap_or_else(|| self.kernel.now() + Duration::from_secs(3)),
-                );
+                // Stop deadlines use the injectable planning clock; storage
+                // waits use the real monotonic clock. Transfer only a duration.
+                let budget = self
+                    .stop_deadline
+                    .map_or(Duration::from_secs(3), |deadline| {
+                        deadline.saturating_duration_since(self.kernel.now())
+                    })
+                    .min(Duration::from_secs(3));
+                let deadline = Instant::now() + budget;
                 self.store
                     .write_latch_until(guard, &state, &repair, &self.config.run_root, deadline)
                     .map(|()| {

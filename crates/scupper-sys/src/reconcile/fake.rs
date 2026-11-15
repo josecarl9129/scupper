@@ -131,6 +131,12 @@ impl FakeKernel {
     pub fn advance_stop_clock(&self, elapsed: Duration) {
         self.inner.borrow_mut().clock_offset += elapsed;
     }
+    /// Freeze the injectable stop clock at an explicit monotonic instant.
+    pub fn set_stop_clock(&self, now: Instant) {
+        let mut inner = self.inner.borrow_mut();
+        inner.clock_origin = now;
+        inner.clock_offset = Duration::ZERO;
+    }
     /// Inject a read-helper drain result and an optional completion boundary.
     pub fn drain_result(&self, result: bool) {
         self.inner.borrow_mut().drain_result = result;

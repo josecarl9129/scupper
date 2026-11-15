@@ -1,6 +1,6 @@
 //! Stateful reconciliation scenarios FS-1 through FS-13 and adversarial prefixes.
 #![cfg(feature = "testing")]
-#![allow(clippy::unwrap_used, clippy::panic)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #[path = "support/v2.rs"]
 mod support;
 use scupper_core::{
@@ -199,7 +199,29 @@ impl Rig {
 impl Drop for Rig {
     fn drop(&mut self) {
         self.machine.take();
-        fs::remove_dir_all(&self.root).unwrap();
+        let idle = scupper_sys::system::testing::wait_storage_idle(Duration::from_secs(30));
+        let mut last_error = None;
+        for _ in 0..50 {
+            match fs::remove_dir_all(&self.root) {
+                Ok(()) => {
+                    if !std::thread::panicking() {
+                        assert!(
+                            idle,
+                            "durable storage workers did not settle before cleanup"
+                        );
+                    }
+                    return;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+                Err(error) => last_error = Some(error),
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            std::thread::panicking(),
+            "rig root not removable: {}: {last_error:?}",
+            self.root.display()
+        );
     }
 }
 fn stamp() -> VersionStamp {
@@ -1246,14 +1268,74 @@ fn event_log_open_failure_falls_back_to_memory() {
 
 #[test]
 fn latch_persists_through_state_file_and_reconciler_restart() {
+    check_latch_persists(false);
+}
+
+#[test]
+fn latch_persists_with_stop_clock_frozen_far_in_the_past() {
+    check_latch_persists(true);
+}
+
+fn check_latch_persists(frozen_in_past: bool) {
+    use scupper_sys::{lock::WriterGuard, reconcile::StateStore, state::RepairState};
+    use std::{path::Path, time::Instant};
+
+    // Check the supplied budget as well as durability: waiting for a detached
+    // worker alone would hide the original immediately-expired deadline bug.
+    struct CheckedDeadline {
+        file: StateFile,
+        earliest_deadline: Instant,
+        calls: Rc<Cell<usize>>,
+    }
+    impl StateStore for CheckedDeadline {
+        fn read(&self) -> io::Result<State> {
+            StateStore::read(&self.file)
+        }
+        fn read_until(&self, deadline: Instant) -> io::Result<State> {
+            StateStore::read_until(&self.file, deadline)
+        }
+        fn begin_tick(&self) {
+            StateStore::begin_tick(&self.file);
+        }
+        fn write(&self, guard: &WriterGuard, state: &State) -> io::Result<()> {
+            self.file.write(guard, state)
+        }
+        fn write_latch_until(
+            &self,
+            guard: &WriterGuard,
+            state: &State,
+            repair: &RepairState,
+            run_root: &Path,
+            deadline: Instant,
+        ) -> io::Result<()> {
+            assert!(
+                deadline >= self.earliest_deadline,
+                "storage lost its three-second budget"
+            );
+            self.calls.set(self.calls.get() + 1);
+            self.file
+                .write_latch_until(guard, state, repair, run_root, deadline)
+        }
+    }
+
     let rig = Rig::new();
+    if frozen_in_past {
+        rig.kernel
+            .set_stop_clock(Instant::now().checked_sub(Duration::from_secs(60)).unwrap());
+    }
     let guard = WriterLock::acquire(&rig.root).unwrap();
     let file = StateFile::open(&rig.root, Some(&guard)).unwrap();
     file.write(&guard, &rig.store.state()).unwrap();
     drop(guard);
+    let calls = Rc::new(Cell::new(0));
+    let checked = CheckedDeadline {
+        file,
+        earliest_deadline: Instant::now() + Duration::from_secs(3),
+        calls: calls.clone(),
+    };
     let mut machine = Reconciler::new(
         rig.kernel.clone(),
-        file,
+        checked,
         rig.log.handle.clone(),
         rig.config(),
         rig.held.clone(),
@@ -1266,6 +1348,11 @@ fn latch_persists_through_state_file_and_reconciler_restart() {
     }
     assert!(machine.latch().is_some());
     drop(machine);
+    assert!(calls.get() > 0, "durable latch writer was exercised");
+    assert!(
+        scupper_sys::system::testing::wait_storage_idle(Duration::from_secs(30)),
+        "durable latch worker did not finish"
+    );
     let file = StateFile::open(&rig.root, None).unwrap();
     let scupper_sys::state::StateRead::Present(state) = file.read().unwrap() else {
         panic!("state missing");
@@ -2987,7 +3074,9 @@ fn repair_clear_retains_operator_context_and_actual_latch_reason() {
     );
     let disk = EventLog::open(&rig.root, GatewayId("gw1".into()), || UnixSeconds(1000)).unwrap();
     rig.log.handle.replay_into(&disk.handle).unwrap();
-    disk.handle.flush_blocking(Duration::from_secs(2)).unwrap();
+    disk.handle
+        .flush_blocking(Duration::from_secs(30))
+        .expect("journal flush");
     assert!(scupper_sys::events::read_since(&rig.root, 0, None).map(Result::unwrap).any(|event| matches!(&event.kind,
         scupper_proto::EventKind::AdminAction { reason: Some(reason), .. } if reason == "operator inspected gateway")));
 }
@@ -5625,7 +5714,9 @@ fn journal_snapshot(rig: &Rig) -> Vec<EventKind> {
         .join(format!("journal-{}", NEXT.fetch_add(1, Ordering::Relaxed)));
     let disk = EventLog::open(&root, GatewayId("gw1".into()), || UnixSeconds(1000)).unwrap();
     rig.log.handle.replay_into(&disk.handle).unwrap();
-    disk.handle.flush_blocking(Duration::from_secs(2)).unwrap();
+    disk.handle
+        .flush_blocking(Duration::from_secs(30))
+        .expect("journal flush");
     scupper_sys::events::read_since(&root, 0, None)
         .map(|event| event.unwrap().kind)
         .collect()

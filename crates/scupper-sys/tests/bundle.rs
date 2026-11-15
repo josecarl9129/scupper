@@ -27,7 +27,20 @@ impl Temp {
 }
 impl Drop for Temp {
     fn drop(&mut self) {
-        fs::remove_dir_all(&self.0).unwrap();
+        let mut last_error = None;
+        for _ in 0..50 {
+            match fs::remove_dir_all(&self.0) {
+                Ok(()) => return,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                Err(error) => last_error = Some(error),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(
+            std::thread::panicking(),
+            "bundle root not removable: {}: {last_error:?}",
+            self.0.display()
+        );
     }
 }
 fn digest(bytes: &[u8]) -> String {

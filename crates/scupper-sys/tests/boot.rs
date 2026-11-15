@@ -1762,7 +1762,7 @@ fn failed_apply_restores_version_without_drift_budget_or_latch_and_restart_boots
     )
     .unwrap();
     log.handle.replay_into(&disk.handle).unwrap();
-    disk.handle.flush_blocking(Duration::from_secs(2)).unwrap();
+    disk.handle.flush_blocking(Duration::from_secs(30)).unwrap();
     let events: Vec<_> = scupper_sys::events::read_since(&f.root.path, 0, None)
         .map(Result::unwrap)
         .collect();

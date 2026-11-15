@@ -795,7 +795,7 @@ mod tests {
             &state,
             &RepairState::default(),
             &root,
-            Instant::now() + Duration::from_secs(3),
+            Instant::now() + Duration::from_secs(30),
         )
         .unwrap();
         drop(read);
