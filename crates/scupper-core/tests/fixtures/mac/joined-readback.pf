@@ -1,0 +1,21 @@
+pass quick on lo0 all no state
+pass out quick on utun6 all flags S/SA keep state (if-bound)
+pass in quick on utun6 all flags S/SA keep state (if-bound)
+pass out quick on en0 inet proto udp from any to 198.51.100.7 port = 51820 keep state (if-bound)
+pass out quick on en0 inet proto tcp from any to 198.51.100.7 port = 22 flags S/SA keep state (if-bound)
+pass out quick on en0 inet proto udp from any port = 68 to 192.0.2.1 port = 67 no state
+pass in quick on en0 inet proto udp from 192.0.2.1 port = 67 to any port = 68 no state
+pass out quick on en0 inet6 proto ipv6-icmp from fe80::/10 to ff02::2 icmp6-type routersol no state
+pass in quick on en0 inet6 proto ipv6-icmp from fe80::/10 to fe80::/10 icmp6-type routeradv no state
+pass in quick on en0 inet6 proto ipv6-icmp from fe80::/10 to ff02::1 icmp6-type routeradv no state
+pass out quick on en0 inet6 proto ipv6-icmp from fe80::/10 to fe80::/10 icmp6-type neighbrsol no state
+pass out quick on en0 inet6 proto ipv6-icmp from fe80::/10 to ff02::1:ff00:0/104 icmp6-type neighbrsol no state
+pass in quick on en0 inet6 proto ipv6-icmp from fe80::/10 to fe80::/10 icmp6-type neighbrsol no state
+pass in quick on en0 inet6 proto ipv6-icmp from fe80::/10 to ff02::1:ff00:0/104 icmp6-type neighbrsol no state
+pass out quick on en0 inet6 proto ipv6-icmp from fe80::/10 to fe80::/10 icmp6-type neighbradv no state
+pass out quick on en0 inet6 proto ipv6-icmp from fe80::/10 to ff02::1 icmp6-type neighbradv no state
+pass in quick on en0 inet6 proto ipv6-icmp from fe80::/10 to fe80::/10 icmp6-type neighbradv no state
+pass in quick on en0 inet6 proto ipv6-icmp from fe80::/10 to ff02::1 icmp6-type neighbradv no state
+pass out quick on en0 inet6 proto ipv6-icmp from :: to ff02::1:ff00:0/104 icmp6-type neighbrsol no state
+pass in quick on en0 inet6 proto ipv6-icmp from :: to ff02::1:ff00:0/104 icmp6-type neighbrsol no state
+block drop quick all

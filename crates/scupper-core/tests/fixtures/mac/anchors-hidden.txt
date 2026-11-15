@@ -1,0 +1,5 @@
+_hidden
+  _hidden/nested
+com.apple
+  com.apple/100.synthetic
+  com.apple/scupper
