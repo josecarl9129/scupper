@@ -1,4 +1,4 @@
-//! Heartbeat wire controls, with a disposable TLS CA for blocked-GET trials.
+//! Heartbeat wire controls, with a disposable TLS CA for blocked-request trials.
 use super::{A, DaemonGuard, Duration, Group, Invocation, Path, Result, Signal, fail, fs};
 use scupper_core::config::{HeartbeatReport, SiteConfig};
 use scupper_proto::{EventKind, Reason};
@@ -137,6 +137,9 @@ impl DaemonGuard<'_> {
             .lab
             .artifacts
             .join(format!("{}-heartbeat.jsonl", self.case));
+        // Each case starts with fresh evidence, even if the artifacts directory
+        // was reused. Thus wait_heartbeat(0) cannot consume an older ClientHello.
+        fs::write(&log, b"")?;
         // Keep the listener alive through long session-recovery cases, including
         // their final injected control capture. Round up the remaining budget.
         let seconds = self
@@ -293,7 +296,13 @@ impl DaemonGuard<'_> {
         Ok(text
             .lines()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .filter(|v| v["hello"] == true)
+            .filter(|v| {
+                v["hello"] == true
+                    && v["peer"].as_str().is_some_and(|peer| {
+                        peer.parse::<std::net::SocketAddr>()
+                            .is_ok_and(|peer| peer.ip().to_string() == A.gwhost.peer)
+                    })
+            })
             .count())
     }
     fn wait_heartbeat_suffix(&mut self, root: &Path, suffix: &str) -> Result<()> {
@@ -308,6 +317,62 @@ impl DaemonGuard<'_> {
             })?;
         Ok(())
     }
+    // Success controls retain their 25 s delivery bound after the real check
+    // reaches 0. The existing recovery helper supplies traffic for both peers,
+    // waits at most 240 s and fails immediately on any non-session diagnosis.
+    pub(super) fn wait_heartbeat_ready(&mut self, root: &Path, phase: &str) -> Result<()> {
+        eprintln!(
+            "{} {phase}: waiting up to 240 s for check 0 / session history reconstruction after a start or observation gap before heartbeat success control",
+            self.case
+        );
+        self.expect_check(root, 0, None, phase)?;
+        // Reconstruction must not consume the subsequent fault-control budget.
+        self.lab.runner.phase = self
+            .lab
+            .runner
+            .phase
+            .max(std::time::Instant::now() + Duration::from_secs(300))
+            .min(self.lab.runner.whole);
+        Ok(())
+    }
+
+    fn assert_history_log(trace: &serde_json::Value) -> Result<()> {
+        if trace["suffix"] != "/log"
+            || trace["log_body"] != scupper_core::heartbeat::SESSION_RESET_LOG_BODY
+        {
+            return fail(
+                "history reconstruction heartbeat must be /log with the fixed session-readiness body",
+            );
+        }
+        Ok(())
+    }
+
+    fn wait_history_log(&mut self, root: &Path) -> Result<()> {
+        self.wait_heartbeat_suffix(root, "/log")?;
+        let text = fs::read_to_string(root.join("run/scupper/heartbeat-trace.jsonl"))?;
+        let trace: serde_json::Value = serde_json::from_str(
+            text.lines()
+                .next()
+                .ok_or("missing first history reconstruction request")?,
+        )?;
+        // The first request after boot must itself be /log; a later matching
+        // request must not hide an initial /3 caused by an offline peer.
+        Self::assert_history_log(&trace)
+    }
+
+    fn wait_initial_heartbeat(&mut self, root: &Path, case: &str) -> Result<()> {
+        if matches!(case, "L53" | "L53b") {
+            // Only daemon heartbeat targets this dedicated listener at ENDPOINT:443;
+            // exit probes use the provider path, and no client traffic runs yet.
+            // The sink count filters the host source; the trace proves /log's body.
+            self.wait_heartbeat(0)?;
+            self.wait_history_log(root)
+        } else {
+            self.wait_heartbeat_ready(root, "heartbeat-control")?;
+            self.wait_heartbeat(0)
+        }
+    }
+
     pub(super) fn wait_heartbeat(&mut self, before: usize) -> Result<()> {
         let start = std::time::Instant::now();
         while start.elapsed() < Duration::from_secs(25) {
@@ -376,6 +441,11 @@ impl DaemonGuard<'_> {
         {
             self.baseline_version = state.applied_version;
         }
+        // Deadline cases need a real request, not a success: status_code may
+        // truthfully send /log while history is being reconstructed after a start or observation gap.
+        if matches!(case, "L53" | "L53b") {
+            fs::write(root.join("run/scupper/heartbeat-status"), b"status")?;
+        }
         self.supervised_fixture(&root)?;
         self.lab.boot_gateway(&[], &format!("{case}-boot"))?;
         let mut sink = self.start_heartbeat_sink()?;
@@ -386,8 +456,7 @@ impl DaemonGuard<'_> {
         self.notify = Some(notify);
         self.lab
             .daemon_ready_tick(self.notify.as_ref().ok_or("missing notify")?)?;
-        self.wait_heartbeat(0)?;
-        self.expect_check(&root, 0, None, "heartbeat-control")?;
+        self.wait_initial_heartbeat(&root, case)?;
         if matches!(case, "L53" | "L53b") {
             sink.stop(Signal::TERM)?;
             self.control_stop(Signal::TERM)?;
@@ -466,7 +535,7 @@ impl DaemonGuard<'_> {
             )?,
         )?;
         Ok(format!(
-            "healthy ClientHello control; host tuple verified; {case} suppression/deadline controls passed"
+            "truthful heartbeat ClientHello control; host tuple verified; {case} suppression/deadline controls passed"
         ))
     }
     fn heartbeat_reports(&mut self, root: &Path) -> Result<()> {
@@ -497,6 +566,7 @@ impl DaemonGuard<'_> {
         if code != 0 {
             return fail("heartbeat reconnect failed");
         }
+        self.wait_heartbeat_ready(root, "heartbeat-reconnected")?;
         let before = self.heartbeat_count()?;
         self.wait_heartbeat_suffix(root, "/0")?;
         self.wait_heartbeat(before)?;
@@ -604,6 +674,7 @@ impl DaemonGuard<'_> {
         let trace = fs::read_to_string(root.join("run/scupper/heartbeat-trace.jsonl"))?;
         let last: serde_json::Value =
             serde_json::from_str(trace.lines().last().ok_or("late trace missing")?)?;
+        Self::assert_history_log(&last)?;
         let deadline = last["deadline_ns"]
             .as_u64()
             .ok_or("late deadline missing")?;
@@ -699,6 +770,7 @@ impl DaemonGuard<'_> {
         let trace = fs::read_to_string(run.join("heartbeat-trace.jsonl"))?;
         let last: serde_json::Value =
             serde_json::from_str(trace.lines().last().ok_or("heartbeat trace missing")?)?;
+        Self::assert_history_log(&last)?;
         let deadline = last["deadline_ns"]
             .as_u64()
             .ok_or("heartbeat deadline missing")?;

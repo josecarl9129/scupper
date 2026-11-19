@@ -616,15 +616,54 @@ pub struct Report {
     pub config_version: u64,
 }
 
+/// Sole client-session cause eligible for a neutral heartbeat log.
+/// Protection, exit verification and current telemetry have already passed in the
+/// report engine; verdict ordering and the warning allow-list enforce this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionReadinessLog {
+    /// Sessions reset, with only reset-related warnings.
+    ClientSessionsReset,
+    /// Valid current telemetry, with history rebuilding after a start or observation gap.
+    HistoryReconstructing,
+}
+
 impl Report {
-    /// True only for a client-session reset with no unrelated diagnosis.
-    /// The engine reaches this verdict only after protection and exit checks pass.
+    /// Precisely classify the sole readiness cause eligible for a neutral log.
+    /// Unknown telemetry, missing peers, unconfirmed expiry and unrelated warnings
+    /// never qualify. History reconstruction requires its explicit warning.
     #[must_use]
-    pub fn session_only_reset(&self) -> bool {
-        matches!(
-            self.verdict,
+    pub fn session_readiness_log(&self) -> Option<SessionReadinessLog> {
+        match self.verdict {
             Verdict::Degraded(Degraded::ClientSessionsReset)
-        ) && self.session_only()
+                if self.warnings.iter().all(|warning| {
+                    matches!(
+                        warning,
+                        Warning::ClientHandshakesStale
+                            | Warning::IdleClientSessionsReset
+                            | Warning::ClientSessionsPending
+                    )
+                }) =>
+            {
+                Some(SessionReadinessLog::ClientSessionsReset)
+            }
+            Verdict::Degraded(Degraded::ClientSessionsUnknown)
+                if self
+                    .warnings
+                    .contains(&Warning::ClientSessionHistoryUnavailable)
+                    && self.warnings.iter().all(|warning| {
+                        matches!(
+                            warning,
+                            Warning::ClientSessionHistoryUnavailable
+                                | Warning::ClientHandshakesStale
+                                | Warning::IdleClientSessionsReset
+                                | Warning::ClientSessionsPending
+                        )
+                    }) =>
+            {
+                Some(SessionReadinessLog::HistoryReconstructing)
+            }
+            _ => None,
+        }
     }
 
     /// True only when every diagnosis concerns client session readiness.

@@ -2119,12 +2119,23 @@ assertions retain their original requirements.
 client session readiness unknown.” Session-only classification examines every
 warning as well as the primary verdict; unrelated diagnoses disqualify it.
 Status retains the session reason even when an earlier stage wins. Heartbeat sends
-success only on 0. A fully verified session-only `ClientSessionsReset` (3) sends a
-neutral `/log` POST in `status_code` mode and nothing in `ok_only` mode. Both
-Unknown session causes and all other nonzero results retain ordinary reporting.
+success only on 0. A fully verified session-only 3 sends a neutral `/log` POST
+in `status_code` mode and nothing in `ok_only` mode only for reset or history
+reconstruction after a start or an observation gap, classified by
+`Report::session_readiness_log()`. Reconstruction requires `ClientSessionsUnknown`
+with the explicit `ClientSessionHistoryUnavailable` warning and permits only that
+warning plus `ClientHandshakesStale`, `IdleClientSessionsReset` and
+`ClientSessionsPending`. Reset permits the latter three warnings only.
+Protection and exit verification must pass, and telemetry must be valid and
+current; verdict ordering (`ClientSessionTelemetryUnknown` wins first) plus the
+warning allow-list enforce this. Missing peers, expired-unconfirmed sessions,
+telemetry Unknown and every other Unknown cause retain ordinary reporting.
 There is no local session grace: the monitor's period plus grace after the last
-success bounds an unrecovered reset, independently of restarts and repeated resets.
-Ordinary heartbeat cadence/freshness gates apply to log pings as well. See §13.
+success bounds the continuous absence of success across restarts and repeated
+resets; brief recoveries to 0 can reset that timeout repeatedly. Persistent runtime
+history faults are paged only by timeout; on-host `client-session-history-alert`
+events remain. Ordinary heartbeat cadence/freshness gates apply to log pings as
+well. See §13.
 
 
 Recovery uses the netlink handshake timespec, including nanoseconds, and receive
@@ -2704,17 +2715,40 @@ Covers "the gateway (or scupperd) is dead", which no on-host alert can.
   nothing (healthchecks-style services alert when pings stop).
   `report = "status_code"`: append the exit code (`<url>/<code>`, the
   healthchecks convention, where 0 = success and non-zero = failure), except
-  that a fresh session-only `Degraded::ClientSessionsReset` sends a POST to
-  `<url>/log` with plain-text body `code=3 reason=ClientSessionsReset`. All
-  protection and exit verification must have succeeded and every warning must
-  satisfy `Report::session_only()`. A log ping signals neither success nor failure,
-  clears no existing alert, and counts as a send for the interval. In `ok_only`
-  mode it is withheld. `ClientSessionsUnknown`, `ClientSessionTelemetryUnknown`
-  and every other nonzero cause retain the configured mode's usual behavior.
+  that a fresh session-only 3 classified by `Report::session_readiness_log()`
+  sends a POST to `<url>/log` with fixed plain-text body
+  `code=3 reason=ClientSessionsPending` and a trailing newline. The classification
+  is either `ClientSessionsReset` or `HistoryReconstructing`. Protection
+  and exit verification must have succeeded, and telemetry must be valid and
+  current; verdict ordering (`ClientSessionTelemetryUnknown` wins first) plus the
+  warning allow-list enforce this. Reset allows only `ClientHandshakesStale`,
+  `IdleClientSessionsReset` and `ClientSessionsPending` warnings. History
+  reconstruction after a start or an observation gap requires
+  `Degraded::ClientSessionsUnknown` with `ClientSessionHistoryUnavailable`,
+  allowing only that warning plus the three reset warnings. The sampler needs
+  approximately 180 s of complete samples to reconstruct history. It does not
+  distinguish a start from runtime stalls, missed cadence slots, writer lock
+  contention, quarantined records, open barriers or durable-write fallback;
+  no provenance state is added. No elapsed heartbeat time authorizes this
+  exemption. Missing peers, expired-unconfirmed sessions, telemetry Unknown,
+  any other Unknown cause and
+  any unrelated warning retain the configured mode's ordinary behavior.
+  A log ping signals neither success nor failure, clears no existing alert, and
+  counts as a send for the interval. In `ok_only` mode it is withheld.
   There is no local 600 s grace or escalation. The monitor alerts on its timeout
-  (period plus grace since the last success) if reset never recovers; daemon
-  restarts and repeated resets cannot extend that deadline. Old grace files are
-  removed along with their writer lock best-effort when checks first start;
+  (period plus grace since the last success) if session readiness never recovers;
+  daemon restarts and repeated resets that never reach 0 cannot extend that
+  deadline. The accepted trade-off is that a persistent runtime history fault,
+  including durable-write failure, is paged only by this timeout, not immediately;
+  the on-host `client-session-history-alert` event still fires. `ok_only` never
+  pages immediately anyway. The timeout bounds the continuous absence of success,
+  so brief recoveries to 0 can reset it repeatedly. A real serving failure visible
+  only as stale handshakes remains exit 0 after reconstruction under the unchanged
+  Protected-with-stale policy. Relative to 0.1.3, the reset exemption is narrower:
+  reset combined with peer-missing, expired-unconfirmed, telemetry-unavailable or
+  history-unavailable warnings now uses ordinary failure reporting, enforcing the
+  sole-cause rule. Old grace files are removed along with their writer lock
+  best-effort when checks first start;
   cleanup errors are ignored. Start with at least 10 minutes of monitor grace
   for ordinary sleep/wake recovery and tune to measured reset times. The monitor
   grace alone determines this allowance: more grace reduces transient pages but
@@ -4468,8 +4502,8 @@ R1's policy-rule and route inventories catch steady-state drift first.
 | L50 | crash after `Disconnected` is persisted and before the routes change | check 3 `DisconnectNotEffective`, never 4 while a route via an exit exists; then tightened | M2 |
 | L51 | deploy edge cases: two deploys at once; confirmation racing the rollback; a device revoked during the window; a deploy that changes a unit file; a build whose own check falsely reports 0 | second deploy refused; exactly one of confirm/rollback; revocation survives rollback; units restored; Mac-side checks refuse to confirm the false-0 build | M6 |
 | L52 | an extra main-table route via an exit in the netns | check 3 `RouteWrong`; removed | M2 |
-| L53 | heartbeat TLS handshake completes, GET is dropped, parent is killed | child alive near deadline, gone by deadline +1 s; no late TCP payload | M2 |
-| L53b | GET queued behind a drop, parent killed and child stopped; separate held GET released with <2 s remaining | no TCP payload after either original deadline; unconditional group kill/reap on every exit path | M2 |
+| L53 | heartbeat TLS handshake completes, neutral POST is dropped, parent is killed | child alive near deadline, gone by deadline +1 s; no late TCP payload | M2 |
+| L53b | `/log` POST in status_code mode queued behind a drop, parent killed and child stopped; separate held `/log` POST released with <2 s remaining | no TCP payload after either original deadline; unconditional group kill/reap on every exit path | M2 |
 | L54 | client queries `use-application-dns.net` (A, AAAA, HTTPS) | NXDOMAIN from the gateway; no upstream query for it on any exit | M4 |
 | L55 | gateway-generated ICMP errors about NATed client flows (undeliverable reply, frag-needed) | nothing with the exit address or client addresses on the uplink, checked after NAT | M1 (lab), M2 |
 

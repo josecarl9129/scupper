@@ -730,7 +730,7 @@ impl Runtime<'_> {
                             let _ = writeln!(
                                 file,
                                 "{}",
-                                serde_json::json!({"suffix":suffix,"deadline_ns":deadline_ns})
+                                serde_json::json!({"suffix":suffix,"deadline_ns":deadline_ns,"log_body":request.payload_body()})
                             );
                         }
                         while run_root.join("heartbeat-pause").exists()
@@ -1311,14 +1311,69 @@ mod tests {
         }
     }
 
-    fn queue_reset(state: &mut Heartbeat, at: Instant) {
-        queue(state, at, 3, true);
+    fn queue_report(
+        state: &mut Heartbeat,
+        at: Instant,
+        report: &scupper_core::verdict::v2::Report,
+    ) {
+        queue(state, at, report.verdict.exit_code(), true);
         let mut checked = state.checked().unwrap();
-        checked.outcome = Outcome::from(&reset_report());
-        checked.check_reason = HeartbeatVerdictReason::ClientSessionsReset;
+        checked.outcome = Outcome::from(report);
+        checked.check_reason = match report.verdict {
+            scupper_core::verdict::v2::Verdict::Protected { .. } => {
+                HeartbeatVerdictReason::Protected
+            }
+            scupper_core::verdict::v2::Verdict::Degraded(
+                scupper_core::verdict::v2::Degraded::ClientSessionsUnknown,
+            ) => HeartbeatVerdictReason::ClientSessionsUnknown,
+            _ => HeartbeatVerdictReason::ClientSessionsReset,
+        };
         let (send, receive) = mpsc::sync_channel(1);
         state.check = Some(receive);
         send.send(checked).unwrap();
+    }
+
+    fn queue_reset(state: &mut Heartbeat, at: Instant) {
+        queue_report(state, at, &reset_report());
+    }
+
+    fn history_report() -> scupper_core::verdict::v2::Report {
+        use scupper_core::verdict::v2::{Degraded, Verdict, Warning};
+        let mut report = reset_report();
+        report.verdict = Verdict::Degraded(Degraded::ClientSessionsUnknown);
+        report.warnings = vec![
+            Warning::ClientSessionHistoryUnavailable,
+            Warning::ClientSessionsPending,
+            Warning::ClientHandshakesStale,
+        ];
+        report
+    }
+
+    fn deliver_work(state: &mut Heartbeat, work: Option<Work>, now: Instant) -> Option<String> {
+        let Some(Work::Send { suffix, .. }) = work else {
+            return None;
+        };
+        let (send, receive) = mpsc::sync_channel(1);
+        state.sending = Some(receive);
+        send.send(Ok(Delivered::new(now, &suffix))).unwrap();
+        assert_eq!(state.collect(), None);
+        Some(suffix)
+    }
+
+    fn assert_history_delivery(
+        state: &mut Heartbeat,
+        now: Instant,
+        origin: Instant,
+        cfg: &scupper_core::config::HeartbeatSettings,
+    ) {
+        let work = state.iteration(now, origin, true, Some(context(cfg)));
+        let suffix = deliver_work(state, work, now);
+        if cfg.report == scupper_core::config::HeartbeatReport::StatusCode {
+            assert_eq!(suffix.as_deref(), Some("/log"));
+            assert_eq!(state.last_send, Some(now));
+        } else {
+            assert_eq!(suffix, None);
+        }
     }
 
     #[test]
@@ -1372,6 +1427,172 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn history_reconstruction_restart_loop_never_sends_success_or_moves_last_success() {
+        let origin = Instant::now();
+        for mode in ["ok_only", "status_code"] {
+            let cfg = settings(mode, 60);
+            for last_success in [None, Some(origin)] {
+                for restart_second in [60, 180, 7200, 86400] {
+                    let mut state = Heartbeat {
+                        last_success,
+                        ..Heartbeat::default()
+                    };
+                    // Restart before 180 s of complete history, indefinitely.
+                    for elapsed in [0, 60, 120] {
+                        let now = origin + Duration::from_secs(restart_second + elapsed);
+                        queue_report(&mut state, now, &history_report());
+                        assert_history_delivery(&mut state, now, origin, &cfg);
+                        assert_eq!(state.last_success, last_success);
+                        if mode == "ok_only" {
+                            assert_eq!(state.last_send, None);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    struct HistoryTelemetry(u64);
+    impl crate::system::System for HistoryTelemetry {
+        fn now_unix_secs(&self) -> u64 {
+            self.0
+        }
+        fn run(
+            &self,
+            _: crate::system::HelperPurpose,
+            _: crate::system::Program,
+            _: &[String],
+            _: Duration,
+        ) -> Result<crate::system::ExecOutput, crate::system::ExecError> {
+            panic!("no commands expected");
+        }
+        fn client_session_io(
+            &self,
+            _: crate::system::HelperPurpose,
+            _: &crate::netns::NetnsHandle,
+            _: &crate::client_sessions::Request,
+        ) -> std::io::Result<crate::client_sessions::Response> {
+            Ok(crate::client_sessions::Response::Samples(vec![
+                crate::client_sessions::Sample {
+                    key: [3; 32],
+                    handshake: (0, 0),
+                    rx: 0,
+                    tx: 0,
+                },
+            ]))
+        }
+    }
+
+    #[test]
+    fn persistent_history_fallback_never_sends_success_or_moves_last_success() {
+        use crate::{client_sessions, lock::WriterLock, netns::testing};
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/tmp")
+            .join(format!("heartbeat-history-fallback-{}", std::process::id()));
+        let guard = WriterLock::acquire(&root).unwrap();
+        client_sessions::provision(&root, "gateway", 1000, &guard).unwrap();
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("client-sessions.json")).unwrap())
+                .unwrap();
+        // Model the unavailable record written on a failed durable save. Keep
+        // that fallback on disk throughout the fake-clock run, beyond timeout.
+        record["never_served"] = false.into();
+        record["history"] = "Unavailable".into();
+        record["unknown_until"] = 1180.into();
+        record["gaps"] = serde_json::json!([{ "start":1000, "end":null }]);
+        let fallback = root.join("client-sessions-fallback");
+        let bytes = serde_json::to_vec(&record).unwrap();
+        std::fs::write(&fallback, &bytes).unwrap();
+        let held = testing::handle().unwrap();
+        let origin = Instant::now();
+        for mode in ["ok_only", "status_code"] {
+            let cfg = settings(mode, 60);
+            for last_success in [None, Some(origin)] {
+                let mut state = Heartbeat {
+                    last_success,
+                    ..Heartbeat::default()
+                };
+                for second in [60, 120, 180, 600, 3600, 86400] {
+                    let sessions = client_sessions::status(
+                        &HistoryTelemetry(1000 + second),
+                        &held,
+                        "wg0",
+                        &root,
+                        &root,
+                        "gateway",
+                        &[[3; 32]],
+                    )
+                    .unwrap();
+                    assert!(sessions.unknown && sessions.history_unavailable);
+                    assert!(!sessions.telemetry_unavailable && !sessions.peer_missing);
+                    let now = origin + Duration::from_secs(second);
+                    queue_report(&mut state, now, &history_report());
+                    assert_history_delivery(&mut state, now, origin, &cfg);
+                    assert_eq!(state.last_success, last_success);
+                    assert_eq!(std::fs::read(&fallback).unwrap(), bytes);
+                }
+            }
+        }
+        drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runtime_history_gap_logs_or_withholds_without_advancing_last_success() {
+        let origin = Instant::now();
+        for mode in ["ok_only", "status_code"] {
+            let cfg = settings(mode, 60);
+            let mut state = Heartbeat::default();
+            queue(&mut state, origin, 0, true);
+            let work = state.iteration(origin, origin, true, Some(context(&cfg)));
+            assert_eq!(
+                deliver_work(&mut state, work, origin).as_deref(),
+                Some(if mode == "ok_only" { "" } else { "/0" })
+            );
+            for second in [60, 120, 600, 3600] {
+                let now = origin + Duration::from_secs(second);
+                queue_report(&mut state, now, &history_report());
+                // M1(a): runtime gaps share the start exemption, with no provenance.
+                assert_history_delivery(&mut state, now, origin, &cfg);
+                assert_eq!(state.last_success, Some(origin));
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_to_zero_with_a_stale_peer_sends_success_under_existing_policy() {
+        use scupper_core::{
+            config::ExitId,
+            verdict::v2::{Verdict, Warning},
+        };
+        let origin = Instant::now();
+        for mode in ["ok_only", "status_code"] {
+            let cfg = settings(mode, 60);
+            let mut state = Heartbeat::default();
+            queue_report(&mut state, origin, &history_report());
+            assert_history_delivery(&mut state, origin, origin, &cfg);
+            assert_eq!(state.last_success, None);
+            let now = origin + Duration::from_secs(180);
+            let mut recovered = history_report();
+            recovered.verdict = Verdict::Protected {
+                exit: ExitId("exit".into()),
+                exit_ip: "203.0.113.1".parse().unwrap(),
+            };
+            recovered.warnings = vec![Warning::ClientHandshakesStale];
+            // Known limitation: stale handshakes alone stay Protected after
+            // reconstruction. Even brief recovery sends success and resets the
+            // monitor's timeout; this cannot detect every serving failure.
+            queue_report(&mut state, now, &recovered);
+            let work = state.iteration(now, origin, true, Some(context(&cfg)));
+            assert_eq!(
+                deliver_work(&mut state, work, now).as_deref(),
+                Some(if mode == "ok_only" { "" } else { "/0" })
+            );
+            assert_eq!(state.last_success, Some(now));
+        }
     }
 
     #[test]

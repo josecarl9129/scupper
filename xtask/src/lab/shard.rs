@@ -44,13 +44,13 @@ pub(super) fn catalog() -> Vec<Spec> {
     for id in super::daemon::CASES {
         let seconds = match id {
             "L3" | "L16" | "L9-host-link" => 240,
-            "L10" => 420,
-            "L9" => 900,
+            "L10" | "L9" => 900,
             "L9b" => 720,
             "L44" | "L50" | "L11" | "L53" | "L53b" => 180,
             "L43" => 150,
             "L20" => 120,
-            "heartbeat" | "alerts" => 300,
+            "heartbeat" => 540,
+            "alerts" => 300,
             _ => 60,
         };
         cases.push(Spec {
