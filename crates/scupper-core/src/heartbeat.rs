@@ -3,7 +3,7 @@
 use crate::{
     config::{HeartbeatReport, HeartbeatSettings},
     failover::MonoTime,
-    verdict::v2::Report,
+    verdict::v2::{Report, SessionReadinessLog},
 };
 use std::time::Duration;
 
@@ -11,14 +11,14 @@ use std::time::Duration;
 pub const DELIVERY_WINDOW: Duration = Duration::from_secs(30);
 
 /// Heartbeat classification derived from a verdict report.
-/// Only report classification can authorize a neutral session-reset log.
+/// Only report classification can authorize a neutral session-readiness log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Outcome(OutcomeKind);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutcomeKind {
     Code(u8),
-    SessionReset,
+    SessionReadiness(SessionReadinessLog),
 }
 
 impl Outcome {
@@ -34,15 +34,15 @@ impl Outcome {
     pub const fn code(self) -> u8 {
         match self.0 {
             OutcomeKind::Code(code) => code,
-            OutcomeKind::SessionReset => 3,
+            OutcomeKind::SessionReadiness(_) => 3,
         }
     }
 }
 
 impl From<&Report> for Outcome {
     fn from(report: &Report) -> Self {
-        if report.session_only_reset() {
-            Self(OutcomeKind::SessionReset)
+        if let Some(cause) = report.session_readiness_log() {
+            Self(OutcomeKind::SessionReadiness(cause))
         } else {
             Self::from_code(report.verdict.exit_code())
         }
@@ -96,8 +96,9 @@ pub enum Decision {
     Skip(SkipReason),
 }
 
-/// Value-free body for a neutral client-session reset ping.
-pub const SESSION_RESET_LOG_BODY: &str = "code=3 reason=ClientSessionsReset\n";
+/// Value-free body shared by neutral reset and history reconstruction pings.
+/// The constant retains its original name for the delivery protocol.
+pub const SESSION_RESET_LOG_BODY: &str = "code=3 reason=ClientSessionsPending\n";
 
 /// Decide without clock access or I/O. Last send means last attempt, including
 /// failures: retries belong to that attempt and cannot reset this interval.
@@ -128,7 +129,7 @@ pub fn decide(
     if last_send.is_some_and(|last| now < last || now.elapsed_since(last) < interval) {
         return Decision::Skip(SkipReason::Interval);
     }
-    if iteration.outcome.0 == OutcomeKind::SessionReset {
+    if matches!(iteration.outcome.0, OutcomeKind::SessionReadiness(_)) {
         return Decision::Log { deadline };
     }
     Decision::Send {
@@ -237,7 +238,8 @@ mod tests {
         );
     }
     #[test]
-    fn session_reset_decision_table() {
+    #[allow(clippy::too_many_lines)] // Cross verdicts, warning sets and both reporting modes in one table.
+    fn session_readiness_decision_table() {
         use crate::{
             config::ExitId,
             verdict::v2::{Degraded, FailClosed, NonEmpty, Report, Verdict, Violation, Warning},
@@ -259,6 +261,47 @@ mod tests {
                 for warnings in [
                     vec![],
                     vec![Warning::ClientHandshakesStale],
+                    vec![Warning::IdleClientSessionsReset],
+                    vec![
+                        Warning::ClientSessionHistoryUnavailable,
+                        Warning::ClientHandshakesStale,
+                    ],
+                    vec![
+                        Warning::ClientSessionHistoryUnavailable,
+                        Warning::IdleClientSessionsReset,
+                    ],
+                    vec![
+                        Warning::ClientSessionHistoryUnavailable,
+                        Warning::ClientHandshakesStale,
+                        Warning::ClientSessionPeerMissing,
+                    ],
+                    vec![
+                        Warning::ClientSessionHistoryUnavailable,
+                        Warning::ClientHandshakesStale,
+                        Warning::ClientSessionsExpiredUnconfirmed,
+                    ],
+                    vec![Warning::ClientSessionsPending],
+                    vec![Warning::ClientSessionHistoryUnavailable],
+                    vec![
+                        Warning::ClientSessionHistoryUnavailable,
+                        Warning::ClientSessionsPending,
+                    ],
+                    vec![
+                        Warning::ClientSessionHistoryUnavailable,
+                        Warning::ClientSessionPeerMissing,
+                    ],
+                    vec![
+                        Warning::ClientSessionHistoryUnavailable,
+                        Warning::ClientSessionTelemetryUnavailable,
+                    ],
+                    vec![
+                        Warning::ClientSessionHistoryUnavailable,
+                        Warning::ClientSessionsExpiredUnconfirmed,
+                    ],
+                    vec![
+                        Warning::ClientSessionHistoryUnavailable,
+                        Warning::DaemonDead,
+                    ],
                     vec![Warning::DaemonDead],
                     vec![Warning::DaemonStale],
                     vec![Warning::HardeningSysctl(
@@ -287,13 +330,31 @@ mod tests {
                         None,
                     );
                     let reset = matches!(verdict, Verdict::Degraded(Degraded::ClientSessionsReset))
-                        && report
-                            .warnings
-                            .iter()
-                            .all(|warning| matches!(warning, Warning::ClientHandshakesStale));
+                        && report.warnings.iter().all(|warning| {
+                            matches!(
+                                warning,
+                                Warning::ClientHandshakesStale
+                                    | Warning::IdleClientSessionsReset
+                                    | Warning::ClientSessionsPending
+                            )
+                        });
+                    let history =
+                        matches!(verdict, Verdict::Degraded(Degraded::ClientSessionsUnknown))
+                            && report
+                                .warnings
+                                .contains(&Warning::ClientSessionHistoryUnavailable)
+                            && report.warnings.iter().all(|warning| {
+                                matches!(
+                                    warning,
+                                    Warning::ClientSessionHistoryUnavailable
+                                        | Warning::ClientHandshakesStale
+                                        | Warning::IdleClientSessionsReset
+                                        | Warning::ClientSessionsPending
+                                )
+                            });
                     let expected = if mode == HeartbeatReport::OkOnly && code != 0 {
                         Decision::Skip(SkipReason::NotHealthy)
-                    } else if reset {
+                    } else if reset || history {
                         Decision::Log { deadline: at(130) }
                     } else {
                         Decision::Send {

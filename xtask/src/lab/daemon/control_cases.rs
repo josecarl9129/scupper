@@ -860,7 +860,11 @@ impl DaemonGuard<'_> {
         self.lab
             .daemon_ready_tick(self.notify.as_ref().ok_or("notify missing")?)?;
         self.lab.daemon_route_healthy(Duration::from_secs(30))?;
-        self.expect_check(&root, 0, None, "positive-control")?;
+        if case == "L10" {
+            self.wait_heartbeat_ready(&root, "positive-control")?;
+        } else {
+            self.expect_check(&root, 0, None, "positive-control")?;
+        }
         let stem = format!("control-{case}");
         self.lab.capture("wan", A.gwhost.wan_if, &stem)?;
         let mut markers = Vec::new();
@@ -923,7 +927,7 @@ impl DaemonGuard<'_> {
                     .ok_or("notify")?
                     .incomplete_tick(&root, false)?;
                 self.lab.runner.dwell(Duration::from_secs(3))?;
-                self.expect_check(&root, 0, None, "fresh-again")?;
+                self.wait_heartbeat_ready(&root, "fresh-again")?;
                 self.heartbeat_cadence_control()?;
                 self.notify
                     .as_ref()
@@ -974,7 +978,7 @@ impl DaemonGuard<'_> {
                         ))
                     },
                 )?;
-                self.expect_check(&root, 0, None, "continued")?;
+                self.wait_heartbeat_ready(&root, "continued")?;
                 self.wait_heartbeat(heartbeat_before)?;
                 self.heartbeat_cadence_control()?;
                 self.control_stop(Signal::KILL)?;
@@ -998,8 +1002,8 @@ impl DaemonGuard<'_> {
                 self.assert_heartbeat_quiet(Duration::from_secs(32), Duration::from_secs(5))?;
                 flow.stop(Signal::TERM)?;
                 self.control_restart(&root, "after-kill")?;
+                self.wait_heartbeat_ready(&root, "restarted")?;
                 self.wait_heartbeat(self.heartbeat_count()?)?;
-                self.expect_check(&root, 0, None, "restarted")?;
             }
             "L14" => {
                 let disconnected_seq = read_event_sequence(&root)?;

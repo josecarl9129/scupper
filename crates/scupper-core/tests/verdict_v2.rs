@@ -1928,19 +1928,38 @@ fn session_only_classification_checks_every_diagnosis_and_pending_is_secondary()
     ] {
         let reset = reason == Degraded::ClientSessionsReset;
         let mut report = report_with(&passing(), &config());
-        report.verdict = Verdict::Degraded(reason);
+        report.verdict = Verdict::Degraded(reason.clone());
         report.warnings = vec![
             Warning::ClientSessionHistoryUnavailable,
             Warning::ClientHandshakesStale,
         ];
         assert!(report.session_only());
-        assert_eq!(report.session_only_reset(), reset);
+        assert_ne!(
+            report.session_readiness_log(),
+            Some(SessionReadinessLog::ClientSessionsReset)
+        );
+        assert_eq!(
+            report.session_readiness_log(),
+            (reason == Degraded::ClientSessionsUnknown)
+                .then_some(SessionReadinessLog::HistoryReconstructing)
+        );
+        report.warnings = vec![
+            Warning::ClientHandshakesStale,
+            Warning::ClientSessionsPending,
+        ];
+        assert_eq!(
+            report.session_readiness_log(),
+            reset.then_some(SessionReadinessLog::ClientSessionsReset)
+        );
         report.warnings.push(Warning::DaemonDead);
         assert!(
             !report.session_only(),
             "secondary supervision diagnosis must disqualify session-only classification"
         );
-        assert!(!report.session_only_reset());
+        assert_ne!(
+            report.session_readiness_log(),
+            Some(SessionReadinessLog::ClientSessionsReset)
+        );
     }
     let mut obs = passing();
     forwarding(&mut obs).client_sessions.active_reset = true;
@@ -1954,4 +1973,299 @@ fn session_only_classification_checks_every_diagnosis_and_pending_is_secondary()
     let report = report_with(&obs, &config());
     assert!(report.warnings.contains(&Warning::ClientSessionsPending));
     assert!(!report.session_only());
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep the real-report cause table and both reporting modes together.
+fn heartbeat_readiness_classifies_real_reports_and_rejects_mixed_causes() {
+    use scupper_core::{
+        config::{HeartbeatReport, HeartbeatSettings},
+        failover::MonoTime,
+        heartbeat::{CompleteIteration, Decision, Outcome, SkipReason, decide},
+    };
+    let history = ClientSessions {
+        unknown: true,
+        history_unavailable: true,
+        ..ClientSessions::default()
+    };
+    let reset = ClientSessions {
+        active_reset: true,
+        ..ClientSessions::default()
+    };
+    let cases = [
+        (reset, Some(SessionReadinessLog::ClientSessionsReset)),
+        (
+            ClientSessions {
+                peer_missing: true,
+                ..reset
+            },
+            None,
+        ),
+        (
+            ClientSessions {
+                expired_unconfirmed: true,
+                ..reset
+            },
+            None,
+        ),
+        (
+            ClientSessions {
+                telemetry_unavailable: true,
+                ..reset
+            },
+            None,
+        ),
+        (history, Some(SessionReadinessLog::HistoryReconstructing)),
+        (
+            ClientSessions {
+                unknown: true,
+                ..ClientSessions::default()
+            },
+            None,
+        ),
+        (
+            ClientSessions {
+                telemetry_unavailable: true,
+                ..history
+            },
+            None,
+        ),
+        (
+            ClientSessions {
+                peer_missing: true,
+                ..history
+            },
+            None,
+        ),
+        (
+            ClientSessions {
+                expired_unconfirmed: true,
+                ..history
+            },
+            None,
+        ),
+        (
+            ClientSessions {
+                idle_reset: true,
+                ..history
+            },
+            Some(SessionReadinessLog::HistoryReconstructing),
+        ),
+        (
+            ClientSessions {
+                history_unavailable: true,
+                ..reset
+            },
+            None,
+        ),
+    ];
+    for (sessions, expected) in cases {
+        for (stale, unrelated_warning) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let mut obs = passing();
+            forwarding(&mut obs).client_sessions = sessions;
+            if stale {
+                forwarding(&mut obs)
+                    .client_handshakes
+                    .insert([2; 32], Handshake::Never);
+            }
+            if unrelated_warning {
+                forwarding(&mut obs)
+                    .hardening
+                    .push("net.ipv4.conf.all.accept_redirects".into());
+            }
+            let report = report(&obs);
+            let expected = if unrelated_warning { None } else { expected };
+            assert_eq!(
+                report.warnings.contains(&Warning::ClientHandshakesStale),
+                stale
+            );
+            if sessions.idle_reset {
+                assert!(report.warnings.contains(&Warning::IdleClientSessionsReset));
+            }
+            assert_eq!(report.session_readiness_log(), expected, "{report:?}");
+            for mode in [HeartbeatReport::OkOnly, HeartbeatReport::StatusCode] {
+                let settings: HeartbeatSettings = serde_json::from_value(serde_json::json!({
+                    "kind":"healthchecks", "url_ref":"check", "interval":"60s", "report":mode
+                }))
+                .unwrap();
+                let now = MonoTime(Duration::from_secs(100));
+                let result = decide(
+                    &settings,
+                    now,
+                    Some(CompleteIteration {
+                        at: now,
+                        full_fresh_check: true,
+                        outcome: Outcome::from(&report),
+                    }),
+                    None,
+                );
+                let deadline = now.after(Duration::from_secs(30));
+                assert_eq!(
+                    result,
+                    if mode == HeartbeatReport::OkOnly {
+                        Decision::Skip(SkipReason::NotHealthy)
+                    } else if expected.is_some() {
+                        Decision::Log { deadline }
+                    } else {
+                        Decision::Send {
+                            url_suffix: "/3".into(),
+                            deadline,
+                        }
+                    },
+                    "{mode:?} {report:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn heartbeat_history_and_stale_peers_never_override_safety_exit_or_telemetry_faults() {
+    use scupper_core::{
+        config::{HeartbeatReport, HeartbeatSettings},
+        failover::MonoTime,
+        heartbeat::{CompleteIteration, Decision, Outcome, decide},
+    };
+    let settings: HeartbeatSettings = serde_json::from_value(serde_json::json!({
+        "kind":"healthchecks", "url_ref":"check", "interval":"60s", "report":HeartbeatReport::StatusCode
+    })).unwrap();
+    for gap_and_stale in [false, true] {
+        for fault in 0..4 {
+            let mut obs = passing();
+            if gap_and_stale {
+                forwarding(&mut obs).client_sessions = ClientSessions {
+                    unknown: true,
+                    history_unavailable: true,
+                    ..ClientSessions::default()
+                };
+                forwarding(&mut obs)
+                    .client_handshakes
+                    .insert([2; 32], Handshake::Never);
+            }
+            let expected = match fault {
+                0 => {
+                    topology(&mut obs).ruleset = RulesetObs::Missing;
+                    Verdict::Unprotected(NonEmpty::new(Violation::RulesetMissing))
+                }
+                1 => {
+                    obs.exit_probe = Some(Err(ProbeError::Timeout));
+                    Verdict::Degraded(Degraded::ExitProbeFailed(ProbeError::Timeout))
+                }
+                2 => {
+                    forwarding(&mut obs).client_sessions.telemetry_unavailable = true;
+                    Verdict::Degraded(Degraded::ClientSessionTelemetryUnknown)
+                }
+                _ => {
+                    handshakes(&mut obs).insert(exit_id(), Handshake::Never);
+                    Verdict::FailClosed(FailClosed::NoHealthyExit)
+                }
+            };
+            let report = report(&obs);
+            assert_eq!(report.verdict, expected, "{gap_and_stale} {fault}");
+            assert_eq!(report.verdict.exit_code(), [2, 3, 3, 4][fault]);
+            assert_eq!(report.session_readiness_log(), None);
+            let now = MonoTime(Duration::from_secs(100));
+            assert_eq!(
+                decide(
+                    &settings,
+                    now,
+                    Some(CompleteIteration {
+                        at: now,
+                        full_fresh_check: true,
+                        outcome: Outcome::from(&report),
+                    }),
+                    None
+                ),
+                Decision::Send {
+                    url_suffix: format!("/{}", expected.exit_code()),
+                    deadline: now.after(Duration::from_secs(30)),
+                }
+            );
+        }
+        // Required observation errors have their own code 1 and cannot form a
+        // report that authorizes the exemption, even with supplied history gaps.
+        let mut obs = passing();
+        forwarding(&mut obs).client_sessions.unknown = gap_and_stale;
+        forwarding(&mut obs).client_sessions.history_unavailable = gap_and_stale;
+        if gap_and_stale {
+            forwarding(&mut obs)
+                .client_handshakes
+                .insert([2; 32], Handshake::Never);
+        }
+        obs.handshakes = Some(Err(ProbeError::Timeout));
+        let Next::Done(Err(error)) = next(&obs, &config(), NOW) else {
+            panic!("expected required telemetry error");
+        };
+        assert_eq!(error.stage, Stage::Handshakes);
+        assert_eq!(error.exit_code(), 1);
+    }
+}
+
+#[test]
+fn heartbeat_reconstructed_history_with_a_stale_peer_remains_protected() {
+    let mut obs = passing();
+    forwarding(&mut obs)
+        .client_handshakes
+        .insert([2; 32], Handshake::Never);
+    let report = report(&obs);
+    assert!(report.warnings.contains(&Warning::ClientHandshakesStale));
+    assert!(matches!(report.verdict, Verdict::Protected { .. }));
+    assert_eq!(report.verdict.exit_code(), 0);
+    assert_eq!(report.session_readiness_log(), None);
+    assert_eq!(scupper_core::heartbeat::Outcome::from(&report).code(), 0);
+}
+
+#[test]
+fn heartbeat_history_with_stale_peers_rejects_each_emitted_unrelated_warning() {
+    for diagnosis in 0..4 {
+        let mut obs = passing();
+        let mut cfg = config();
+        forwarding(&mut obs).client_sessions = ClientSessions {
+            unknown: true,
+            history_unavailable: true,
+            ..ClientSessions::default()
+        };
+        forwarding(&mut obs)
+            .client_handshakes
+            .insert([2; 32], Handshake::Never);
+        let warning = match diagnosis {
+            0 => {
+                handshakes(&mut obs).insert(exit_id(), Handshake::At { unix_secs: NOW + 1 });
+                Warning::ClockSkew
+            }
+            1 => {
+                let key = "net.ipv4.conf.all.accept_redirects".to_owned();
+                forwarding(&mut obs).hardening.push(key.clone());
+                Warning::HardeningSysctl(key)
+            }
+            2 => {
+                cfg.require_daemon = false;
+                obs.supervisor = Some(Supervisor::Dead);
+                Warning::DaemonDead
+            }
+            _ => {
+                cfg.require_daemon = false;
+                obs.supervisor = Some(Supervisor::Alive {
+                    netns: NETNS,
+                    iteration_age: Duration::from_secs(30),
+                });
+                Warning::DaemonStale
+            }
+        };
+        let report = report_with(&obs, &cfg);
+        assert_eq!(
+            report.verdict,
+            Verdict::Degraded(Degraded::ClientSessionsUnknown)
+        );
+        assert!(report.warnings.contains(&warning));
+        assert!(report.warnings.contains(&Warning::ClientHandshakesStale));
+        assert!(
+            report
+                .warnings
+                .contains(&Warning::ClientSessionHistoryUnavailable)
+        );
+        assert_eq!(report.session_readiness_log(), None, "{report:?}");
+    }
 }

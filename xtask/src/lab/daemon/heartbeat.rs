@@ -1,11 +1,66 @@
-//! Heartbeat wire controls, with a disposable TLS CA for blocked-GET trials.
+//! Heartbeat wire controls, with a disposable TLS CA for blocked-request trials.
 use super::{A, DaemonGuard, Duration, Group, Invocation, Path, Result, Signal, fail, fs};
+use crate::lab::check_v2::session_state_root;
 use scupper_core::config::{HeartbeatReport, SiteConfig};
 use scupper_proto::{EventKind, Reason};
 use std::fmt::Write as _;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 
 pub(super) const ENDPOINT: &str = "198.51.100.10";
+
+// Only L53/L53b call this, with the daemon stopped and boot's lab sampler gone.
+// Keep lock inodes intact; a lingering sampler/writer must fail setup, not race it.
+fn reset_heartbeat_history(root: &Path) -> Result<()> {
+    let run = root.join("run/scupper");
+    let _owner = scupper_sys::lock::WriterLock::try_acquire(run.join("client-sampler-owner"))?;
+    let _writer = scupper_sys::lock::WriterLock::try_acquire(run.join("client-session-writer"))?;
+    let files = [session_state_root(root).join("client-sessions.json")]
+        .into_iter()
+        .chain(
+            [
+                "client-sessions-fallback",
+                "client-session-readiness",
+                "client-session-invalidation",
+                "client-session-commit",
+                "client-session-opening",
+                "client-session-seal-obsolete",
+                "client-session-retiring",
+                "client-session-history-alert",
+            ]
+            .into_iter()
+            .map(|name| run.join(name)),
+        );
+    for path in files {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return fail(format!(
+                    "heartbeat first-start reset: remove {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn first_heartbeat_check(root: &Path, after: u64) -> Result<Option<EventKind>> {
+    let mut first = None;
+    for event in scupper_sys::events::read_since(&session_state_root(root), after, None) {
+        match event?.kind {
+            EventKind::DaemonStarted { .. } => first = None,
+            kind @ (EventKind::HeartbeatCheckVerdict { .. }
+            | EventKind::CheckVerdictChanged { .. })
+                if first.is_none() =>
+            {
+                first = Some(kind);
+            }
+            _ => {}
+        }
+    }
+    Ok(first)
+}
 
 fn check_account_failure(root: &Path) -> Result<()> {
     for event in scupper_sys::events::read_since(&root.join("var-lib/scupper"), 0, None) {
@@ -137,6 +192,9 @@ impl DaemonGuard<'_> {
             .lab
             .artifacts
             .join(format!("{}-heartbeat.jsonl", self.case));
+        // Each case starts with fresh evidence, even if the artifacts directory
+        // was reused. Thus wait_heartbeat(0) cannot consume an older ClientHello.
+        fs::write(&log, b"")?;
         // Keep the listener alive through long session-recovery cases, including
         // their final injected control capture. Round up the remaining budget.
         let seconds = self
@@ -293,7 +351,13 @@ impl DaemonGuard<'_> {
         Ok(text
             .lines()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .filter(|v| v["hello"] == true)
+            .filter(|v| {
+                v["hello"] == true
+                    && v["peer"].as_str().is_some_and(|peer| {
+                        peer.parse::<std::net::SocketAddr>()
+                            .is_ok_and(|peer| peer.ip().to_string() == A.gwhost.peer)
+                    })
+            })
             .count())
     }
     fn wait_heartbeat_suffix(&mut self, root: &Path, suffix: &str) -> Result<()> {
@@ -308,6 +372,88 @@ impl DaemonGuard<'_> {
             })?;
         Ok(())
     }
+    // Success controls retain their 25 s delivery bound after the real check
+    // reaches 0. The existing recovery helper supplies traffic for both peers,
+    // waits at most 240 s and fails immediately on any non-session diagnosis.
+    pub(super) fn wait_heartbeat_ready(&mut self, root: &Path, phase: &str) -> Result<()> {
+        eprintln!(
+            "{} {phase}: waiting up to 240 s for check 0 / session history reconstruction after a start or observation gap before heartbeat success control",
+            self.case
+        );
+        self.expect_check(root, 0, None, phase)?;
+        // Reconstruction must not consume the subsequent fault-control budget.
+        self.lab.runner.phase = self
+            .lab
+            .runner
+            .phase
+            .max(std::time::Instant::now() + Duration::from_secs(300))
+            .min(self.lab.runner.whole);
+        Ok(())
+    }
+
+    fn assert_history_log(trace: &serde_json::Value) -> Result<()> {
+        if trace["suffix"] != "/log"
+            || trace["log_body"] != scupper_core::heartbeat::SESSION_RESET_LOG_BODY
+        {
+            return fail(
+                "history reconstruction heartbeat must be /log with the fixed session-readiness body",
+            );
+        }
+        Ok(())
+    }
+
+    fn wait_history_log(&mut self, root: &Path, events_after: u64) -> Result<()> {
+        // Inspect the first request as soon as it exists. Waiting for any /log
+        // hides a wrong first suffix behind a 25 s timeout (or a later /log).
+        self.lab
+            .daemon_wait("first heartbeat request", Duration::from_secs(25), |_| {
+                check_account_failure(root)?;
+                Ok(!fs::read_to_string(root.join("run/scupper/heartbeat-trace.jsonl"))?.is_empty())
+            })?;
+        let text = fs::read_to_string(root.join("run/scupper/heartbeat-trace.jsonl"))?;
+        let trace: serde_json::Value = serde_json::from_str(
+            text.lines()
+                .next()
+                .ok_or("missing first history reconstruction request")?,
+        )?;
+        // The first request after boot must itself be /log; a later matching
+        // request must not hide an initial /3 caused by an offline peer.
+        if trace["suffix"] != "/log" {
+            let mut verdict = first_heartbeat_check(root, events_after)?;
+            // The trace and audit log have independent writers. Allow the audit
+            // worker a short flush window before obtaining a check diagnostic.
+            let until = std::time::Instant::now() + Duration::from_secs(2);
+            while verdict.is_none() && std::time::Instant::now() < until {
+                self.lab.runner.dwell(Duration::from_millis(25))?;
+                verdict = first_heartbeat_check(root, events_after)?;
+            }
+            let verdict = if let Some(verdict) = verdict {
+                format!("{verdict:?}")
+            } else {
+                let (code, report) = self.lab.check_result(&super::Lab::boot_binary()?, root)?;
+                format!("not persisted; check output: code={code}, report={report}")
+            };
+            return fail(format!(
+                "heartbeat first-start precondition: expected first suffix /log, actual first suffix {}; daemon first check verdict: {verdict}",
+                trace["suffix"]
+            ));
+        }
+        Self::assert_history_log(&trace)
+    }
+
+    fn wait_initial_heartbeat(&mut self, root: &Path, case: &str, events_after: u64) -> Result<()> {
+        if matches!(case, "L53" | "L53b") {
+            // Only daemon heartbeat targets this dedicated listener at ENDPOINT:443;
+            // exit probes use the provider path, and no client traffic runs yet.
+            // The sink count filters the host source; the trace proves /log's body.
+            self.wait_history_log(root, events_after)?;
+            self.wait_heartbeat(0)
+        } else {
+            self.wait_heartbeat_ready(root, "heartbeat-control")?;
+            self.wait_heartbeat(0)
+        }
+    }
+
     pub(super) fn wait_heartbeat(&mut self, before: usize) -> Result<()> {
         let start = std::time::Instant::now();
         while start.elapsed() < Duration::from_secs(25) {
@@ -369,6 +515,7 @@ impl DaemonGuard<'_> {
         }
         Ok(())
     }
+    #[allow(clippy::too_many_lines)] // Keep deadline trial ordering and evidence checks together.
     pub(super) fn run_heartbeat(&mut self, case: &str) -> Result<String> {
         let root = self.lab.prepare_check_v2()?;
         if let scupper_sys::state::StateRead::Present(state) =
@@ -376,18 +523,32 @@ impl DaemonGuard<'_> {
         {
             self.baseline_version = state.applied_version;
         }
+        // Deadline cases need a real request, not a success: status_code may
+        // truthfully send /log while history is being reconstructed after a start or observation gap.
+        if matches!(case, "L53" | "L53b") {
+            fs::write(root.join("run/scupper/heartbeat-status"), b"status")?;
+        }
         self.supervised_fixture(&root)?;
         self.lab.boot_gateway(&[], &format!("{case}-boot"))?;
         let mut sink = self.start_heartbeat_sink()?;
         let stem = format!("heartbeat-{case}");
         self.lab.capture("wan", A.gwhost.wan_if, &stem)?;
+        let mut events_after = 0;
+        if matches!(case, "L53" | "L53b") {
+            // prepare_check_v2 reuses durable state from earlier cases. Reset
+            // after boot has stopped its sampler, immediately before start.
+            reset_heartbeat_history(&root)?;
+            fs::write(root.join("run/scupper/heartbeat-trace.jsonl"), b"")?;
+            for event in scupper_sys::events::read_since(&session_state_root(&root), 0, None) {
+                events_after = event?.seq;
+            }
+        }
         let (child, notify) = self.lab.daemon_start(case, &root)?;
         self.child = Some(child);
         self.notify = Some(notify);
         self.lab
             .daemon_ready_tick(self.notify.as_ref().ok_or("missing notify")?)?;
-        self.wait_heartbeat(0)?;
-        self.expect_check(&root, 0, None, "heartbeat-control")?;
+        self.wait_initial_heartbeat(&root, case, events_after)?;
         if matches!(case, "L53" | "L53b") {
             sink.stop(Signal::TERM)?;
             self.control_stop(Signal::TERM)?;
@@ -418,6 +579,10 @@ impl DaemonGuard<'_> {
                 }
                 self.lab.capture("wan", A.gwhost.wan_if, &stem)?;
             }
+            // TLS setup and the L53b trial have separate waits; do not let their
+            // cumulative time consume the 180 s reconstruction precondition.
+            self.control_stop(Signal::TERM)?;
+            reset_heartbeat_history(&root)?;
             self.control_restart(&root, "tls-deadline")?;
             self.orphan_deadline(&root, case == "L53b")?;
         } else {
@@ -466,7 +631,7 @@ impl DaemonGuard<'_> {
             )?,
         )?;
         Ok(format!(
-            "healthy ClientHello control; host tuple verified; {case} suppression/deadline controls passed"
+            "truthful heartbeat ClientHello control; host tuple verified; {case} suppression/deadline controls passed"
         ))
     }
     fn heartbeat_reports(&mut self, root: &Path) -> Result<()> {
@@ -497,6 +662,7 @@ impl DaemonGuard<'_> {
         if code != 0 {
             return fail("heartbeat reconnect failed");
         }
+        self.wait_heartbeat_ready(root, "heartbeat-reconnected")?;
         let before = self.heartbeat_count()?;
         self.wait_heartbeat_suffix(root, "/0")?;
         self.wait_heartbeat(before)?;
@@ -584,6 +750,8 @@ impl DaemonGuard<'_> {
         let hold = root.join("heartbeat-request-pause");
         fs::write(&hold, b"wait for handshake")?;
         fs::set_permissions(&hold, fs::Permissions::from_mode(0o666))?;
+        self.control_stop(Signal::TERM)?;
+        reset_heartbeat_history(root)?;
         self.control_restart(root, "late-release")?;
         self.lab.daemon_wait(
             "late-release TLS handshake",
@@ -604,6 +772,7 @@ impl DaemonGuard<'_> {
         let trace = fs::read_to_string(root.join("run/scupper/heartbeat-trace.jsonl"))?;
         let last: serde_json::Value =
             serde_json::from_str(trace.lines().last().ok_or("late trace missing")?)?;
+        Self::assert_history_log(&last)?;
         let deadline = last["deadline_ns"]
             .as_u64()
             .ok_or("late deadline missing")?;
@@ -699,6 +868,7 @@ impl DaemonGuard<'_> {
         let trace = fs::read_to_string(run.join("heartbeat-trace.jsonl"))?;
         let last: serde_json::Value =
             serde_json::from_str(trace.lines().last().ok_or("heartbeat trace missing")?)?;
+        Self::assert_history_log(&last)?;
         let deadline = last["deadline_ns"]
             .as_u64()
             .ok_or("heartbeat deadline missing")?;
@@ -822,6 +992,108 @@ fn process_alive(pid: u32) -> Result<bool> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deadline_history_reset_removes_restoration_state_and_rejects_removal_errors() {
+        let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("heartbeat-history-reset-{}", std::process::id()));
+        let state = session_state_root(&root);
+        let run = root.join("run/scupper");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(&run).unwrap();
+        let record = br#"{"history":"Available","sequence":167,"never_served":false}"#;
+        fs::write(state.join("client-sessions.json"), record).unwrap();
+        for name in [
+            "client-sessions-fallback",
+            "client-session-readiness",
+            "client-session-invalidation",
+            "client-session-commit",
+            "client-session-opening",
+            "client-session-seal-obsolete",
+            "client-session-retiring",
+            "client-session-history-alert",
+        ] {
+            fs::write(run.join(name), record).unwrap();
+        }
+        fs::write(state.join("gateway-incarnation"), b"keep identity").unwrap();
+        fs::write(run.join("heartbeat-status"), b"status").unwrap();
+        reset_heartbeat_history(&root).unwrap();
+        reset_heartbeat_history(&root).unwrap();
+        assert!(!state.join("client-sessions.json").exists());
+        assert!(fs::read_dir(&run).unwrap().all(|entry| {
+            let name = entry.unwrap().file_name();
+            name == "client-sampler-owner"
+                || name == "client-session-writer"
+                || name == "heartbeat-status"
+        }));
+        assert_eq!(
+            fs::read(state.join("gateway-incarnation")).unwrap(),
+            b"keep identity"
+        );
+        let owner =
+            scupper_sys::lock::WriterLock::try_acquire(run.join("client-sampler-owner")).unwrap();
+        assert!(reset_heartbeat_history(&root).is_err());
+        drop(owner);
+        fs::create_dir(run.join("client-sessions-fallback")).unwrap();
+        let error = reset_heartbeat_history(&root).unwrap_err().to_string();
+        assert!(error.contains("heartbeat first-start reset"));
+        assert!(error.contains("client-sessions-fallback"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn first_heartbeat_check_uses_current_start_and_keeps_its_first_verdict() {
+        let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("heartbeat-first-check-{}", std::process::id()));
+        let events = session_state_root(&root).join("events");
+        fs::create_dir_all(&events).unwrap();
+        let record = |seq, kind, data| {
+            serde_json::json!({
+                "seq":seq,"at":1_794_355_510,"kind":kind,"data":data,
+                "actor":"Daemon","gateway":"gw1","config_version":8
+            })
+            .to_string()
+                + "\n"
+        };
+        let start = serde_json::json!({"version":{"major":0,"minor":1,"patch":0}});
+        let protected = serde_json::json!({
+            "from":"ObservationError","to":"Protected","reason":"Unknown"
+        });
+        let reconstructing = serde_json::json!({
+            "code":3,"reason":"ClientSessionsUnknown","action":"Log","count":1
+        });
+        let file = events.join("2026-11.jsonl");
+        fs::write(
+            &file,
+            record(1, "DaemonStarted", &start)
+                + &record(2, "CheckVerdictChanged", &protected)
+                + &record(3, "DaemonStarted", &start)
+                + &record(4, "HeartbeatCheckVerdict", &reconstructing)
+                + &record(5, "CheckVerdictChanged", &protected),
+        )
+        .unwrap();
+        assert!(matches!(
+            first_heartbeat_check(&root, 2).unwrap(),
+            Some(EventKind::HeartbeatCheckVerdict {
+                code: 3,
+                reason: scupper_proto::HeartbeatVerdictReason::ClientSessionsUnknown,
+                ..
+            })
+        ));
+        fs::write(
+            &file,
+            record(6, "DaemonStarted", &start) + &record(7, "CheckVerdictChanged", &protected),
+        )
+        .unwrap();
+        assert!(matches!(
+            first_heartbeat_check(&root, 5).unwrap(),
+            Some(EventKind::CheckVerdictChanged {
+                to: scupper_proto::VerdictCode::Protected,
+                ..
+            })
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn stopped_delivery_guard_drop_kills_group_and_reaps() {

@@ -276,7 +276,7 @@ fn log_suffix_and_body_preserve_secret_url_confinement() {
         );
         assert_eq!(
             decoded["payload"]["body"],
-            "code=3 reason=ClientSessionsReset\n"
+            "code=3 reason=ClientSessionsPending\n"
         );
         assert_eq!(decoded["payload"]["headers"], serde_json::json!({}));
         assert_eq!(

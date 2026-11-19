@@ -269,7 +269,7 @@ fn served_deadline(elapsed: Duration, budget: Duration, missing: &[String]) -> R
     Ok(())
 }
 
-fn session_state_root(root: &Path) -> PathBuf {
+pub(super) fn session_state_root(root: &Path) -> PathBuf {
     if root == Path::new("/") {
         root.join("var/lib/scupper")
     } else {

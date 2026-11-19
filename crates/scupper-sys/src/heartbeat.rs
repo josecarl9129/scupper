@@ -139,6 +139,13 @@ impl fmt::Debug for Request {
     }
 }
 impl Request {
+    /// Resolved body for the lab trace; status requests have no payload.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub(crate) fn payload_body(&self) -> Option<&str> {
+        self.payload.as_ref().map(|payload| payload.body.as_str())
+    }
+
     /// Construct with an absolute Linux monotonic sender deadline (best effort; no network arrival guarantee).
     /// # Errors
     /// Rejects invalid HTTPS URLs and deadlines more than 30 seconds away.
@@ -721,7 +728,7 @@ mod tests {
         assert!(decoded.valid_log());
         assert_eq!(
             decoded.payload.as_ref().unwrap().body,
-            "code=3 reason=ClientSessionsReset\n"
+            "code=3 reason=ClientSessionsPending\n"
         );
         let command = delivery_command(
             Path::new("scupper"),

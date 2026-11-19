@@ -41,7 +41,7 @@ require verified live identity, UP state and continuous counters before clearing
 
 Connect accepts protection/exit success with an honest session-only degraded
 verdict. The original heartbeat 600 s session-only grace is superseded by the
-2026-11-18 decision below. Status exposes the session reason. Five-second durable
+2026-11-19 decision below. Status exposes the session reason. Five-second durable
 renewals intentionally accept their fsync cost; root snapshot rollback remains
 undetectable. The check-only lab provisions explicitly and uses the product sampler.
 
@@ -90,24 +90,55 @@ indefinitely after a final stop. Reconsidering those tradeoffs is deferred; 9s
 preserves the existing gates and alert delivery behavior.
 
 
-## 2026-11-18: Neutral heartbeat logs for verified client-session resets
+## 2026-11-19: Neutral heartbeat logs for verified session readiness
 
-Supersedes the 2026-11-14 heartbeat grace decision. A fresh 0 sends success.
-Only a fresh `Degraded::ClientSessionsReset` with successful protection and exit
-verification and exclusively the warnings allowed by `Report::session_only()`
-uses a neutral `<url>/log` POST in `status_code` mode, with plain-text
-`code=3 reason=ClientSessionsReset`. It signals neither success nor failure.
-`ok_only` withholds every nonzero verdict. All other nonzero causes, including
-`ClientSessionsUnknown` and `ClientSessionTelemetryUnknown`, keep their ordinary
-status-code behavior. Never send `/0` for a degraded verdict (I3); `/3` immediately
-fails a healthchecks check and is unsuitable for this transient reset.
+Replaces the 2026-11-18 reset-only exemption and supersedes the 2026-11-14
+heartbeat grace decision. A fresh 0 sends success. A fresh session-only 3 uses
+`<url>/log` in `status_code` mode only when `Report::session_readiness_log()`
+classifies it as `ClientSessionsReset` or `HistoryReconstructing`.
+Protection and exit verification must pass, and telemetry must be valid and
+current; verdict ordering (`ClientSessionTelemetryUnknown` wins before session
+readiness) plus the warning allow-list enforce this. Reset allows only
+`ClientHandshakesStale`, `IdleClientSessionsReset` and `ClientSessionsPending`
+warnings. History reconstruction after a start or an observation gap requires
+`ClientSessionsUnknown` and the explicit `ClientSessionHistoryUnavailable`
+warning, allowing only that warning plus `ClientHandshakesStale`,
+`IdleClientSessionsReset` and `ClientSessionsPending`. The sampler needs roughly
+180 s of complete samples to reconstruct history. This is not a local heartbeat
+timer. Missing peers, expired-unconfirmed sessions, unknown/currently unavailable
+telemetry, other Unknown causes, and unrelated warnings never qualify.
+
+The sampler does not distinguish starts from runtime observation gaps (stalls,
+missed cadence slots, writer contention, quarantined records, open barriers or
+durable-write fallback). We accept the same exemption for both, without adding
+provenance state. A persistent runtime history fault, including durable-write
+failure, is paged only by the monitor timeout, not immediately by `/3`. The
+on-host `client-session-history-alert` event still fires. `ok_only` never pages
+immediately anyway. The timeout bounds the continuous absence of success;
+brief recoveries to 0 can reset it repeatedly. A real serving failure visible
+only as stale client handshakes remains exit 0 after reconstruction: the existing
+Protected-with-stale policy is unchanged.
+
+Compared with 0.1.3, the reset exemption is deliberately narrower to enforce the
+sole-cause rule. Reset combined with peer-missing, expired-unconfirmed,
+telemetry-unavailable or history-unavailable warnings now receives ordinary
+failure reporting (`/3` in `status_code`, withheld in `ok_only`).
+
+Both causes use the fixed plain-text body
+`code=3 reason=ClientSessionsPending` (with a trailing newline), which names their
+shared readiness condition without mislabeling history reconstruction as reset.
+It signals neither success nor failure. `ok_only` withholds every nonzero verdict.
+All other nonzero results retain their ordinary status-code behavior. Never
+send `/0` for a degraded verdict (I3); `/3` immediately fails a healthchecks check
+and would page on every restart if used for history reconstruction.
 
 There is no local reset grace, escalation timer, or durable grace update. Old
 grace files and their writer lock are deleted best-effort when heartbeat checks
-first start; corruption or cleanup failure cannot affect eligibility. The monitor's timeout (period plus
-grace since the last success) bounds an unrecovered reset, including across daemon
-restarts and repeated resets. A log ping consumes the ordinary send interval and
-retains the existing monotonic freshness/deadline gates. Start with a monitor
+first start; corruption or cleanup failure cannot affect eligibility. The monitor's
+timeout (period plus grace since the last success) bounds the continuous absence
+of success, including across daemon restarts and repeated resets that never reach
+0. A log ping consumes the ordinary send interval and retains the existing
+monotonic freshness/deadline gates. Start with a monitor
 grace of at least 10 minutes to cover ordinary sleep/wake resets, then tune it to
 observed recovery times: a longer grace avoids transient pages but delays dead
 or persistently reset gateway alerts. The monitor grace alone supplies this reset
