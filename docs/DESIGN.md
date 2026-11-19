@@ -2118,11 +2118,14 @@ assertions retain their original requirements.
 3. It returns the full actual verdict and prints, for example, “exit connected;
 client session readiness unknown.” Session-only classification examines every
 warning as well as the primary verdict; unrelated diagnoses disqualify it.
-Status retains the session reason even when an earlier stage wins. Heartbeat pings
-on 0, and on session-only 3 for less than 600 seconds after the first such 3 since
-the last 0. That grace is stored durably and survives restarts and intervening
-nonzero verdicts; only a fresh 0 resets it. Expired grace suppresses pings so the
-external monitor alerts. Ordinary heartbeat cadence/freshness gates still apply.
+Status retains the session reason even when an earlier stage wins. Heartbeat sends
+success only on 0. A fully verified session-only `ClientSessionsReset` (3) sends a
+neutral `/log` POST in `status_code` mode and nothing in `ok_only` mode. Both
+Unknown session causes and all other nonzero results retain ordinary reporting.
+There is no local session grace: the monitor's period plus grace after the last
+success bounds an unrecovered reset, independently of restarts and repeated resets.
+Ordinary heartbeat cadence/freshness gates apply to log pings as well. See §13.
+
 
 Recovery uses the netlink handshake timespec, including nanoseconds, and receive
 and transmit baselines from the current generation. Round 5's stronger receipt
@@ -2480,7 +2483,7 @@ from a hidden TTY prompt or one stdin line (at most 4 KiB, excluding the
 optional final newline). It uses the same validation as delivery, including
 the config HTTPS/no-userinfo check and the delivery parser: port 443 only,
 DNS-style hosts (no IPv6 literals), no fragments, and an ASCII request target
-of at most 2046 bytes, reserving two bytes for heartbeat verdict suffixes.
+of at most 2044 bytes, reserving four bytes for heartbeat verdict or `/log` suffixes.
 `scupper secret set telegram REF [--replace]` reads a hidden bot token followed by a visible chat id, or two stdin lines.
 Tokens have a decimal bot id, a colon and at least 35 URL-safe characters;
 chat ids are decimal with an optional leading minus, or `@channelname`
@@ -2700,7 +2703,22 @@ Covers "the gateway (or scupperd) is dead", which no on-host alert can.
 - `report = "ok_only"` (default): ping **only** when the verdict is 0; otherwise send
   nothing (healthchecks-style services alert when pings stop).
   `report = "status_code"`: append the exit code (`<url>/<code>`, the
-  healthchecks convention, where 0 = success and non-zero = failure).
+  healthchecks convention, where 0 = success and non-zero = failure), except
+  that a fresh session-only `Degraded::ClientSessionsReset` sends a POST to
+  `<url>/log` with plain-text body `code=3 reason=ClientSessionsReset`. All
+  protection and exit verification must have succeeded and every warning must
+  satisfy `Report::session_only()`. A log ping signals neither success nor failure,
+  clears no existing alert, and counts as a send for the interval. In `ok_only`
+  mode it is withheld. `ClientSessionsUnknown`, `ClientSessionTelemetryUnknown`
+  and every other nonzero cause retain the configured mode's usual behavior.
+  There is no local 600 s grace or escalation. The monitor alerts on its timeout
+  (period plus grace since the last success) if reset never recovers; daemon
+  restarts and repeated resets cannot extend that deadline. Old grace files are
+  removed along with their writer lock best-effort when checks first start;
+  cleanup errors are ignored. Start with at least 10 minutes of monitor grace
+  for ordinary sleep/wake recovery and tune to measured reset times. The monitor
+  grace alone determines this allowance: more grace reduces transient pages but
+  delays pages for a dead gateway or a reset that never recovers.
 - Truthful (I3): the ping is derived from a verdict at most one interval old;
   a dead or hung scupperd sends nothing because the watchdog-gated
   iteration never completes. Each delivery child gets a deadline (verdict
@@ -2746,13 +2764,46 @@ configured interval). The drain runs before the scheduler charges the boot attem
 Healthy verdicts rejected as stale emit the informational `HeartbeatSkipped`
 event with reason `Stale`, at most once per minute.
 
-Delivery uses HTTPS GET rather than HEAD. Child exit codes are 20 (HTTP
+Every accepted fresh nonzero check is recorded as `HeartbeatCheckVerdict` with
+its code, closed value-free reason, heartbeat action (`Success`, `Log`, `Status`,
+`Withheld`), and cumulative per-(code, reason) observation count, including
+suppressed observations. A fixed-size table debounces each key independently:
+its first observation emits immediately, and subsequent observations emit at most
+once per ten minutes, even across intervening reasons and recoveries. Recovery
+transitions emit `HeartbeatCheckRecovered`, with code 0, reason `Protected`, the
+action and a cumulative recovery-transition count, also at most once per ten
+minutes. A suppressed recovery remains pending and emits once, with suppressed
+transitions folded into its count, on the first healthy check at or after the
+previous recovery event plus ten minutes. A newly logged failure clears that
+pending recovery; a later recovery starts a new pending transition. Healthy
+checks used only to flush a pending recovery do not increment its count. Other
+consecutive zeros emit nothing. Tracking is per daemon process: `DaemonStarted`
+is the boundary, and failures spanning a restart do not promise a recovery event
+unless observed again after restart. The action describes only the emitting
+observation; intervening actions can differ. A log-class event waits for the
+delivery worker to report the first attempted request class, so the `/log` to
+`/3` fallback records `Status`, not `Log`. Preparation failure or timeout before
+an attempt records `Withheld`. This wait preserves heartbeat-event order without
+holding protection-verdict events. `Withheld` includes alerts-only
+checks with no heartbeat configured, delivery already running, and verdicts that
+miss their send window. These events go through the same bounded queue and
+retention rules as other audit events; they contain no addresses, raw diagnostics
+or monitor URL. Existing protection-verdict events continue to drive protection
+alerts, including fresh changes observed while a delivery is in flight.
+
+Delivery uses HTTPS GET for success/status pings and POST with
+`Content-Type: text/plain; charset=utf-8` for neutral log pings. Child exit codes are 20 (HTTP
 non-2xx or malformed response), 21 (deadline/timeout), 22 (internal/protocol),
 23 (identity), 24 (other TLS protocol failure), 25 (network transport), 26 (exec),
 27 (secret), 28 (TCP_INFO/RTO read failure), 29 (write refused by deadline/RTO
 rule), 30 (connection reset) and 31 (certificate/verification failure); 0 is
 success. Events and daemon stderr preserve these value-free failure categories.
-Status includes `heartbeat_last_success_age`. URL secret files accept exactly
+Status includes `heartbeat_last_success_age`, advanced only by delivered `/0` or
+bare healthy-only success pings, never by `/log` or nonzero status pings.
+Non-log child requests omit the new `log` flag, preserving the 0.1.2 wire format.
+Stored URLs retain the 0.1.2 two-byte suffix reserve; when a request target leaves
+insufficient space for `/log`, only that ping falls back to ordinary `/3`.
+URL secret files accept exactly
 one trailing newline, with no other whitespace trimming. Before reading any
 secret stdin bytes, the child disables core dumps, sets NoNewPrivs and becomes
 NotDumpable. After parsing the request and rejecting expired jobs, it checks all
@@ -4688,9 +4739,9 @@ before or together with the droplet. Unknown fields remain rejected rather than
 silently discarding diagnoses. The round-9b protocol test pins this compatibility
 boundary.
 
-The heartbeat grace record is durably rewritten for each full check, in addition
-to the sampler's fsync budget. A second result in the same wall-clock second is
-discarded and sends no ping. `checkpoint_before_shutdown` and the kernel's
+The obsolete heartbeat session-grace record is no longer read or durably
+rewritten. Heartbeat eligibility uses monotonic cadence and freshness gates;
+wall-clock seconds do not suppress fresh results. `checkpoint_before_shutdown` and the kernel's
 `checkpoint_client_activity` remain optional diagnostic hooks for embedders/tests;
 production shutdown uses the quiesced clean-stop sample instead. The lab's nft
 preflight deliberately treats syntax errors as hard failures: no current mutation

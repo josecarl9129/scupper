@@ -65,3 +65,17 @@ fn alert_child_rejects_expired_or_injected_requests_without_output() {
     assert_eq!(result.stdout, [] as [u8; 0]);
     assert_eq!(result.stderr, [] as [u8; 0]);
 }
+
+#[test]
+fn heartbeat_log_child_accepts_expired_log_without_output() {
+    let request =
+        scupper_sys::heartbeat::Request::log("https://heartbeat.invalid/private/log", 0).unwrap();
+    let result = child(&request.encode().unwrap());
+    assert_eq!(result.status.code(), Some(21));
+    assert_eq!(result.stdout, [] as [u8; 0]);
+    assert_eq!(result.stderr, [] as [u8; 0]);
+    let wrong_child = delivery(&request.encode().unwrap(), "alert");
+    assert_eq!(wrong_child.status.code(), Some(22));
+    assert_eq!(wrong_child.stdout, [] as [u8; 0]);
+    assert_eq!(wrong_child.stderr, [] as [u8; 0]);
+}

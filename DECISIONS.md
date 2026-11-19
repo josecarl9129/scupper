@@ -40,9 +40,8 @@ daemon restart with a live link uses normal freshness. Abandoned reset intents
 require verified live identity, UP state and continuous counters before clearing.
 
 Connect accepts protection/exit success with an honest session-only degraded
-verdict. Heartbeat accepts session-only 3 for a durable, nonrenewable 600 s grace
-since the first such 3 after the last 0; all diagnoses participate in classification.
-Only 0 resets grace. Status exposes the session reason. Five-second durable
+verdict. The original heartbeat 600 s session-only grace is superseded by the
+2026-11-18 decision below. Status exposes the session reason. Five-second durable
 renewals intentionally accept their fsync cost; root snapshot rollback remains
 undetectable. The check-only lab provisions explicitly and uses the product sampler.
 
@@ -89,3 +88,54 @@ this prevents a false resolve but delays recovery notification. Journaling stop
 alerts for the next process preserves them across restart but delays delivery
 indefinitely after a final stop. Reconsidering those tradeoffs is deferred; 9s
 preserves the existing gates and alert delivery behavior.
+
+
+## 2026-11-18: Neutral heartbeat logs for verified client-session resets
+
+Supersedes the 2026-11-14 heartbeat grace decision. A fresh 0 sends success.
+Only a fresh `Degraded::ClientSessionsReset` with successful protection and exit
+verification and exclusively the warnings allowed by `Report::session_only()`
+uses a neutral `<url>/log` POST in `status_code` mode, with plain-text
+`code=3 reason=ClientSessionsReset`. It signals neither success nor failure.
+`ok_only` withholds every nonzero verdict. All other nonzero causes, including
+`ClientSessionsUnknown` and `ClientSessionTelemetryUnknown`, keep their ordinary
+status-code behavior. Never send `/0` for a degraded verdict (I3); `/3` immediately
+fails a healthchecks check and is unsuitable for this transient reset.
+
+There is no local reset grace, escalation timer, or durable grace update. Old
+grace files and their writer lock are deleted best-effort when heartbeat checks
+first start; corruption or cleanup failure cannot affect eligibility. The monitor's timeout (period plus
+grace since the last success) bounds an unrecovered reset, including across daemon
+restarts and repeated resets. A log ping consumes the ordinary send interval and
+retains the existing monotonic freshness/deadline gates. Start with a monitor
+grace of at least 10 minutes to cover ordinary sleep/wake resets, then tune it to
+observed recovery times: a longer grace avoids transient pages but delays dead
+or persistently reset gateway alerts. The monitor grace alone supplies this reset
+allowance. Only delivered success-class pings advance local last-success status;
+`/log` and nonzero status deliveries do not. Stored URLs keep the 0.1.2 two-byte
+suffix reserve; if `/log` cannot fit, that ping falls back to ordinary `/3`.
+
+Fresh nonzero check results enter the bounded event log as
+`HeartbeatCheckVerdict` with code, a closed value-free reason, the
+heartbeat action (`Success`, `Log`, `Status`, `Withheld`), and a cumulative count
+per (code, reason) key, including suppressed observations. A fixed-size table
+allows each key to emit immediately on its first observation, then at most once
+per 600 seconds, even when other reasons or zero intervene. Recovery transitions
+emit `HeartbeatCheckRecovered` with their own cumulative transition count and
+the same 600-second debounce. A suppressed recovery is held until the first
+healthy check at or after the previous recovery event plus 600 seconds, and
+emits once with suppressed transitions included. A newly logged failure clears
+the pending recovery; a later recovery starts a new pending transition. Flush-only
+healthy checks do not increment the count; other consecutive zeros emit nothing.
+State is per daemon process:
+`DaemonStarted` is the boundary, and a failure spanning restart does not promise
+a recovery event unless observed again in the new process. The action describes
+only the emitting observation; intervening actions can differ. For a log decision,
+the worker reports the first attempted request class before the event is written:
+a `/log` to `/3` fallback records `Status`. Preparation failure or timeout before
+an attempt records `Withheld`. Waiting preserves heartbeat-event order without
+delaying protection-verdict events. `Withheld` also
+covers alerts-only checks with no heartbeat configured. Fresh protection changes
+are recorded even if a delivery is in flight. Events use the existing bounded
+asynchronous writer and retention limits, never raw diagnostics, addresses or the
+secret monitor URL.

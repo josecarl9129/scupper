@@ -7,77 +7,89 @@ use crate::{
 };
 use scupper_core::{
     failover::MonoTime,
-    heartbeat::{CompleteIteration, Decision, SkipReason, decide},
+    heartbeat::{CompleteIteration, Decision, Outcome, SkipReason, decide},
 };
-use scupper_proto::{Actor, EventKind, Reason};
+use scupper_proto::{Actor, EventKind, HeartbeatAction, HeartbeatVerdictReason, Reason};
 use std::{
     sync::mpsc::{self, Receiver},
     time::{Duration, Instant},
 };
 
-// This file lives in /var/lib, so restarting the daemon cannot renew grace.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Grace {
-    last: u64,
-    first_session: Option<u64>,
-}
-// Each full check durably rewrites grace (part of the fsync budget). A second
-// result in the same wall-clock second is discarded and sends no heartbeat.
-fn grace(root: &std::path::Path, at: u64, code: u8, session_only: bool) -> std::io::Result<bool> {
-    let _guard = crate::lock::WriterLock::try_acquire(root.join("heartbeat-grace-writer"))?;
-    let file = root.join("heartbeat-session-grace.json");
-    let mut state = match std::fs::read(&file) {
-        Ok(bytes) => serde_json::from_slice::<Grace>(&bytes).map_err(std::io::Error::other)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Grace {
-            last: 0,
-            first_session: None,
-        },
-        Err(error) => return Err(error),
-    };
-    if at <= state.last {
-        return Ok(false);
-    }
-    state.last = at;
-    let eligible = if code == 0 {
-        state.first_session = None;
-        true
-    } else if code == 3 && session_only {
-        at.saturating_sub(*state.first_session.get_or_insert(at)) < 600
-    } else {
-        false
-    };
-    crate::fs::durable_replace(
-        &crate::fs::RealFs,
-        &file,
-        &serde_json::to_vec(&state).map_err(std::io::Error::other)?,
-        0o600,
-        &|_| Ok(()),
-        &|_| Ok(()),
-    )?;
-    Ok(eligible && code == 3 && session_only)
-}
-
 // Detached checks retain only a completion handle; at most this many may live.
 const MAX_DETACHED_CHECKS: usize = 4;
+
+fn discard_legacy_grace(root: &std::path::Path) {
+    // Obsolete, even when corrupt or unreadable. Cleanup runs in the check
+    // worker, outside the watchdog; failure never gates a heartbeat.
+    let _ = std::fs::remove_file(root.join("heartbeat-session-grace.json"));
+    let _ = std::fs::remove_file(root.join("heartbeat-grace-writer"));
+}
 
 struct Checked {
     at: Instant,
     version: u64,
-    code: u8,
+    outcome: Outcome,
     reason: scupper_proto::ObjectKind,
     full_fresh_check: bool,
-    session_grace: bool,
+    check_reason: HeartbeatVerdictReason,
     namespace: (u64, u64),
+}
+
+const CHECK_DEBOUNCE: Duration = Duration::from_secs(600);
+// Count comes from the closed vocabulary; new reasons grow this fixed table
+// at compile time. Invalid codes never allocate new entries.
+const CHECK_REASON_SLOTS: usize = HeartbeatVerdictReason::COUNT;
+
+#[derive(Clone, Copy, Default)]
+struct CheckCounter {
+    last_event: Option<Instant>,
+    // Cumulative process-local observations, including suppressed observations.
+    count: u64,
+}
+impl CheckCounter {
+    fn observe(&mut self, now: Instant) -> Option<u64> {
+        self.count = self.count.saturating_add(1);
+        self.emit_due(now)
+    }
+    fn emit_due(&mut self, now: Instant) -> Option<u64> {
+        if self
+            .last_event
+            .is_some_and(|last| now.saturating_duration_since(last) < CHECK_DEBOUNCE)
+        {
+            return None;
+        }
+        self.last_event = Some(now);
+        Some(self.count)
+    }
+}
+struct CheckHistory {
+    keys: [[CheckCounter; CHECK_REASON_SLOTS]; 7],
+    recovery: CheckCounter,
+    failing: bool,
+    recovery_pending: bool,
+}
+impl Default for CheckHistory {
+    fn default() -> Self {
+        Self {
+            keys: [[CheckCounter::default(); CHECK_REASON_SLOTS]; 7],
+            recovery: CheckCounter::default(),
+            failing: false,
+            recovery_pending: false,
+        }
+    }
 }
 
 #[derive(Default)]
 pub(super) struct Heartbeat {
+    legacy_grace_cleanup_started: bool,
+    check_history: CheckHistory,
     check_at: Option<Instant>,
     verdict: Option<scupper_proto::VerdictCode>,
     pub(super) verdict_events: Vec<EventKind>,
     check: Option<Receiver<Checked>>,
-    sending: Option<Receiver<Result<Instant, Failure>>>,
+    sending: Option<Receiver<Result<Delivered, Failure>>>,
+    // Hold a log-class event until the worker resolves the actual request class.
+    pending_log_action: Option<Receiver<HeartbeatAction>>,
     sending_deadline: Option<Instant>,
     last_send: Option<Instant>,
     workers: Vec<std::thread::JoinHandle<()>>,
@@ -101,6 +113,52 @@ impl Heartbeat {
         }
         self.verdict = Some(to);
     }
+    fn record_check(&mut self, now: Instant, checked: &Checked, action: HeartbeatAction) {
+        if !checked.full_fresh_check {
+            return;
+        }
+        let code = checked.outcome.code();
+        if code == 0 {
+            let count = if std::mem::take(&mut self.check_history.failing) {
+                self.check_history.recovery_pending = true;
+                self.check_history.recovery.observe(now)
+            } else if self.check_history.recovery_pending {
+                self.check_history.recovery.emit_due(now)
+            } else {
+                None
+            };
+            if let Some(count) = count {
+                self.check_history.recovery_pending = false;
+                self.verdict_events
+                    .push(EventKind::HeartbeatCheckRecovered {
+                        code: 0,
+                        reason: HeartbeatVerdictReason::Protected,
+                        action,
+                        count,
+                    });
+            }
+            return;
+        }
+        self.check_history.failing = true;
+        let Some(counter) = self
+            .check_history
+            .keys
+            .get_mut(usize::from(code))
+            .and_then(|reasons| reasons.get_mut(checked.check_reason as usize))
+        else {
+            return;
+        };
+        if let Some(count) = counter.observe(now) {
+            self.check_history.recovery_pending = false;
+            self.verdict_events.push(EventKind::HeartbeatCheckVerdict {
+                code,
+                reason: checked.check_reason,
+                action,
+                count,
+            });
+        }
+    }
+
     pub(super) fn abandon_check(&mut self) {
         self.check = None;
         self.check_at = None;
@@ -129,38 +187,38 @@ impl Heartbeat {
                 // cadence slot. Schedule its check from the last attempt.
                 self.check_at = None;
             }
-            if checked.version == context.version
-                && checked.namespace == context.namespace
-                && self.sending.is_none()
-            {
+            if checked.version == context.version && checked.namespace == context.namespace {
                 if checked.full_fresh_check
                     && now.saturating_duration_since(checked.at) < Duration::from_secs(30)
                 {
-                    self.record_verdict(checked.code, checked.reason);
+                    self.record_verdict(checked.outcome.code(), checked.reason);
                 }
                 let mono = |at: Instant| MonoTime(at.saturating_duration_since(origin));
-                let decision =
-                    context
-                        .settings
-                        .map_or(Decision::Skip(SkipReason::NotHealthy), |settings| {
-                            // Reuse the healthy cadence/deadline gate during grace;
-                            // status-code deliveries below retain the actual 3.
-                            decide(
-                                settings,
-                                mono(now),
-                                Some(CompleteIteration {
-                                    at: mono(checked.at),
-                                    full_fresh_check: checked.full_fresh_check,
-                                    code: if checked.session_grace {
-                                        0
-                                    } else {
-                                        checked.code
-                                    },
-                                }),
-                                self.last_send.map(mono),
-                            )
-                        });
-                if checked.code == 0
+                let decision = context.settings.filter(|_| self.sending.is_none()).map_or(
+                    Decision::Skip(SkipReason::NotHealthy),
+                    |settings| {
+                        decide(
+                            settings,
+                            mono(now),
+                            Some(CompleteIteration {
+                                at: mono(checked.at),
+                                full_fresh_check: checked.full_fresh_check,
+                                outcome: checked.outcome,
+                            }),
+                            self.last_send.map(mono),
+                        )
+                    },
+                );
+                let action = match &decision {
+                    Decision::Log { .. } => HeartbeatAction::Log,
+                    Decision::Send { .. } if checked.outcome.code() == 0 => {
+                        HeartbeatAction::Success
+                    }
+                    Decision::Send { .. } => HeartbeatAction::Status,
+                    Decision::Skip(_) => HeartbeatAction::Withheld,
+                };
+                self.record_check(now, &checked, action);
+                if checked.outcome.code() == 0
                     && matches!(decision, Decision::Skip(SkipReason::Stale))
                     && self.last_stale.is_none_or(|at| {
                         now.saturating_duration_since(at) >= Duration::from_secs(60)
@@ -169,22 +227,19 @@ impl Heartbeat {
                     self.last_stale = Some(now);
                     return Some(Work::Stale);
                 }
-                if let Decision::Send {
-                    url_suffix,
-                    deadline,
-                } = decision
-                {
+                let delivery = match decision {
+                    Decision::Send {
+                        url_suffix,
+                        deadline,
+                    } => Some((url_suffix, deadline)),
+                    Decision::Log { deadline } => Some(("/log".into(), deadline)),
+                    Decision::Skip(_) => None,
+                };
+                if let Some((suffix, deadline)) = delivery {
                     self.last_send = Some(now);
                     self.sending_deadline = Some(origin + deadline.0);
                     return Some(Work::Send {
-                        suffix: if checked.session_grace
-                            && context.settings.is_some_and(|settings| {
-                                settings.report == scupper_core::config::HeartbeatReport::StatusCode
-                            }) {
-                            "/3".into()
-                        } else {
-                            url_suffix
-                        },
+                        suffix,
                         deadline: origin + deadline.0,
                     });
                 }
@@ -238,6 +293,7 @@ impl Heartbeat {
             self.detach_workers();
         }
         if send_stuck {
+            self.collect_log_action(true);
             self.sending = None;
             self.sending_deadline = None;
         }
@@ -267,8 +323,35 @@ impl Heartbeat {
         self.detached.append(&mut self.workers);
     }
     pub(super) fn report_events(&mut self, log: &crate::events::LogHandle, version: Option<u64>) {
-        for event in self.verdict_events.drain(..) {
-            let _ = log.emit(event, Actor::Daemon, version);
+        // Preserve heartbeat check ordering while resolving a possible /3
+        // fallback. Protection alerts must not wait for delivery preparation.
+        if self.pending_log_action.is_some() {
+            let mut held = false;
+            self.verdict_events.retain(|event| {
+                held |= matches!(
+                    event,
+                    EventKind::HeartbeatCheckVerdict {
+                        action: HeartbeatAction::Log,
+                        ..
+                    }
+                );
+                if held
+                    && matches!(
+                        event,
+                        EventKind::HeartbeatCheckVerdict { .. }
+                            | EventKind::HeartbeatCheckRecovered { .. }
+                    )
+                {
+                    true
+                } else {
+                    let _ = log.emit(event.clone(), Actor::Daemon, version);
+                    false
+                }
+            });
+        } else {
+            for event in self.verdict_events.drain(..) {
+                let _ = log.emit(event, Actor::Daemon, version);
+            }
         }
         for _ in 0..std::mem::take(&mut self.pending_detached) {
             let _ = log.emit(EventKind::HeartbeatCheckDetached {}, Actor::Daemon, version);
@@ -289,23 +372,98 @@ impl Heartbeat {
         }
     }
     fn collect(&mut self) -> Option<Failure> {
+        self.collect_log_action(false);
         let receive = self.sending.as_ref()?;
         match receive.try_recv() {
             Ok(result) => {
+                // The action is sent before the result; check again in case
+                // it arrived between the two nonblocking receives.
+                self.collect_log_action(true);
                 self.sending = None;
                 match result {
-                    Ok(at) => {
-                        self.last_success = Some(at);
+                    Ok(delivered) => {
+                        if delivered.success {
+                            self.last_success = Some(delivered.at);
+                        }
                         None
                     }
                     Err(reason) => Some(reason),
                 }
             }
             Err(mpsc::TryRecvError::Disconnected) => {
+                self.collect_log_action(true);
                 self.sending = None;
                 Some(Failure::Internal)
             }
             Err(mpsc::TryRecvError::Empty) => None,
+        }
+    }
+    fn collect_log_action(&mut self, finished: bool) {
+        let Some(receive) = &self.pending_log_action else {
+            return;
+        };
+        let action = match receive.try_recv() {
+            Ok(action) => action,
+            Err(mpsc::TryRecvError::Empty) if !finished => return,
+            Err(_) => HeartbeatAction::Withheld,
+        };
+        self.finish_log_action(action);
+    }
+    fn finish_log_action(&mut self, resolved: HeartbeatAction) {
+        if self.pending_log_action.take().is_some()
+            && let Some(EventKind::HeartbeatCheckVerdict { action, .. }) =
+                self.verdict_events.iter_mut().find(|event| {
+                    matches!(
+                        event,
+                        EventKind::HeartbeatCheckVerdict {
+                            action: HeartbeatAction::Log,
+                            ..
+                        }
+                    )
+                })
+        {
+            *action = resolved;
+        }
+    }
+    fn track_log_action(&mut self, suffix: &str) -> Option<mpsc::SyncSender<HeartbeatAction>> {
+        if suffix != "/log"
+            || !self.verdict_events.iter().any(|event| {
+                matches!(
+                    event,
+                    EventKind::HeartbeatCheckVerdict {
+                        action: HeartbeatAction::Log,
+                        ..
+                    }
+                )
+            })
+        {
+            return None;
+        }
+        let (send, receive) = mpsc::sync_channel(1);
+        self.pending_log_action = Some(receive);
+        Some(send)
+    }
+}
+
+fn resolved_request(
+    url: &heartbeat::SecretUrl,
+    deadline_ns: u64,
+) -> Result<(Request, HeartbeatAction), Failure> {
+    if url.is_log() {
+        Request::log(url.expose(), deadline_ns).map(|request| (request, HeartbeatAction::Log))
+    } else {
+        Request::new(url.expose(), deadline_ns).map(|request| (request, HeartbeatAction::Status))
+    }
+}
+struct Delivered {
+    at: Instant,
+    success: bool,
+}
+impl Delivered {
+    fn new(at: Instant, suffix: &str) -> Self {
+        Self {
+            at,
+            success: matches!(suffix, "" | "/0"),
         }
     }
 }
@@ -386,10 +544,6 @@ impl Runtime<'_> {
         let work = self
             .heartbeat
             .iteration(now, self.origin, complete, context);
-        self.heartbeat.report_events(
-            &self.audit.handle(),
-            self.running.as_ref().map(|(_, _, cfg)| cfg.stamp.version),
-        );
         match work {
             Some(Work::WorkerLimit) => {
                 let _ = self.audit.handle().emit(
@@ -424,6 +578,10 @@ impl Runtime<'_> {
             }
             None => {}
         }
+        self.heartbeat.report_events(
+            &self.audit.handle(),
+            self.running.as_ref().map(|(_, _, cfg)| cfg.stamp.version),
+        );
     }
     fn start_heartbeat_check(
         &mut self,
@@ -431,6 +589,8 @@ impl Runtime<'_> {
         held: std::sync::Arc<crate::netns::NetnsHandle>,
         config: crate::reconcile::Config,
     ) {
+        let cleanup_grace =
+            !std::mem::replace(&mut self.heartbeat.legacy_grace_cleanup_started, true);
         self.heartbeat.check_at = Some(now);
         let (send, receive) = mpsc::sync_channel(1);
         self.heartbeat.check = Some(receive);
@@ -442,6 +602,9 @@ impl Runtime<'_> {
         let result = std::thread::Builder::new()
             .name("scupper-heartbeat-check".into())
             .spawn(move || {
+                if cleanup_grace {
+                    discard_legacy_grace(&state_root);
+                }
                 let system =
                     RealSystem::default().with_canon_paths(binary.clone(), run_root.clone());
                 let deps = BootDeps {
@@ -474,29 +637,22 @@ impl Runtime<'_> {
                     .map_or(scupper_proto::ObjectKind::Unknown, |report| {
                         protection_reason(&report.verdict)
                     });
-                let code = result
+                let outcome = result.as_ref().map_or(Outcome::from_code(1), Outcome::from);
+                let check_reason = result
                     .as_ref()
-                    .map_or(1, |report| report.verdict.exit_code());
-                let session_grace = Instant::now() < deadline
-                    && result.as_ref().is_ok_and(|report| {
-                        grace(
-                            &state_root,
-                            report.at,
-                            report.verdict.exit_code(),
-                            report.session_only(),
-                        )
-                        .unwrap_or(false)
+                    .map_or(HeartbeatVerdictReason::ObservationError, |report| {
+                        HeartbeatVerdictReason::from(&report.verdict)
                     });
                 #[cfg(feature = "testing")]
-                let code = std::fs::read_to_string(run_root.join("heartbeat-test-code"))
+                let outcome = std::fs::read_to_string(run_root.join("heartbeat-test-code"))
                     .ok()
                     .and_then(|value| value.parse::<u8>().ok())
-                    .unwrap_or(code);
+                    .map_or(outcome, Outcome::from_code);
                 let _ = send.send(Checked {
                     at: now,
                     version: config.stamp.version,
-                    code,
-                    session_grace,
+                    outcome,
+                    check_reason,
                     reason,
                     full_fresh_check: Instant::now() < deadline,
                     namespace: held.identity(),
@@ -538,6 +694,7 @@ impl Runtime<'_> {
         );
         let (send, receive) = mpsc::sync_channel(1);
         self.heartbeat.sending = Some(receive);
+        let mut action_send = self.heartbeat.track_log_action(&suffix);
         let result = std::thread::Builder::new()
             .name("scupper-heartbeat-wait".into())
             .spawn(move || {
@@ -548,7 +705,7 @@ impl Runtime<'_> {
                     let group =
                         std::fs::read_to_string("/etc/group").map_err(|_| Failure::Account)?;
                     let identity = heartbeat::account(&passwd, &group)?;
-                    let request = Request::new(url.expose(), deadline_ns)?;
+                    let (request, action) = resolved_request(&url, deadline_ns)?;
                     #[cfg(feature = "testing")]
                     let request = {
                         let mut request = request;
@@ -582,12 +739,18 @@ impl Runtime<'_> {
                             std::thread::sleep(Duration::from_millis(10));
                         }
                     }
+                    // Record the first attempted request class, including /log
+                    // falling back to /3. No URL leaves the delivery worker.
+                    if let Some(send) = action_send.take() {
+                        let _ = send.send(action);
+                    }
                     heartbeat::attempt(&binary, &request, identity)
                 })
-                .map(|()| Instant::now());
+                .map(|()| Delivered::new(Instant::now(), &suffix));
                 let _ = send.send(result);
             });
         if result.is_err() {
+            self.heartbeat.finish_log_action(HeartbeatAction::Withheld);
             self.heartbeat.sending = None;
             self.heartbeat_failed(Failure::Internal);
         }
@@ -614,10 +777,10 @@ mod tests {
         state.check = Some(receive);
         send.send(Checked {
             at,
-            code,
+            outcome: Outcome::from_code(code),
             reason: scupper_proto::ObjectKind::Unknown,
             full_fresh_check: fresh,
-            session_grace: false,
+            check_reason: HeartbeatVerdictReason::ObservationError,
             version: 1,
             namespace: (2, 3),
         })
@@ -641,10 +804,17 @@ mod tests {
         state.iteration(now, now, true, Some(context()));
         assert!(matches!(
             state.verdict_events.as_slice(),
-            [EventKind::CheckVerdictChanged {
-                to: scupper_proto::VerdictCode::Unprotected,
-                ..
-            }]
+            [
+                EventKind::CheckVerdictChanged {
+                    to: scupper_proto::VerdictCode::Unprotected,
+                    ..
+                },
+                EventKind::HeartbeatCheckVerdict {
+                    code: 2,
+                    action: HeartbeatAction::Withheld,
+                    ..
+                }
+            ]
         ));
         assert_eq!(state.last_send, None);
         assert!(matches!(
@@ -920,9 +1090,9 @@ mod tests {
                         at,
                         version: 1,
                         reason: scupper_proto::ObjectKind::Unknown,
-                        code: 0,
+                        outcome: Outcome::from_code(0),
                         full_fresh_check: true,
-                        session_grace: false,
+                        check_reason: HeartbeatVerdictReason::ObservationError,
                         namespace: (2, 3),
                     })
                     .unwrap();
@@ -943,7 +1113,7 @@ mod tests {
                     sends.push(second);
                     let (send, receive) = mpsc::sync_channel(1);
                     state.sending = Some(receive);
-                    send.send(Ok(now)).unwrap();
+                    send.send(Ok(Delivered::new(now, "/0"))).unwrap();
                     assert_eq!(state.collect(), None);
                 }
                 Some(Work::Stale | Work::WorkerLimit) | None => {}
@@ -1091,7 +1261,8 @@ mod tests {
             Err(Failure::Http)
         });
         assert_eq!(attempts, 2);
-        send.send(result.map(|()| Instant::now())).unwrap();
+        send.send(result.map(|()| Delivered::new(Instant::now(), "/0")))
+            .unwrap();
         let reason = heartbeat.collect().unwrap();
         assert_eq!(
             failure_event(reason),
@@ -1108,30 +1279,10 @@ mod tests {
         let (send, receive) = mpsc::sync_channel(1);
         heartbeat.sending = Some(receive);
         let now = Instant::now();
-        send.send(Ok(now)).unwrap();
+        send.send(Ok(Delivered::new(now, "/0"))).unwrap();
         assert_eq!(heartbeat.collect(), None);
         assert_eq!(heartbeat.last_success, Some(now));
     }
-    #[test]
-    fn session_grace_persists_across_restarts_and_only_zero_resets_it() {
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/tmp")
-            .join(format!("session-grace-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        let _ = std::fs::remove_file(root.join("heartbeat-session-grace.json"));
-        assert!(grace(&root, 1000, 3, true).unwrap());
-        // Every call reloads disk, like a new daemon process.
-        assert!(grace(&root, 1599, 3, true).unwrap());
-        assert!(!grace(&root, 1600, 3, true).unwrap());
-        assert!(!grace(&root, 1700, 4, false).unwrap());
-        assert!(!grace(&root, 1800, 3, true).unwrap());
-        assert!(!grace(&root, 1700, 0, false).unwrap()); // late result cannot reset grace
-        assert!(!grace(&root, 1900, 0, false).unwrap()); // zero itself uses ordinary eligibility
-        assert!(grace(&root, 1901, 3, true).unwrap());
-        assert!(!grace(&root, 1902, 3, false).unwrap());
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
     #[test]
     fn degraded_without_grace_uses_the_configured_report_mode() {
         let now = Instant::now();
@@ -1149,48 +1300,589 @@ mod tests {
         }
     }
 
+    fn reset_report() -> scupper_core::verdict::v2::Report {
+        scupper_core::verdict::v2::Report {
+            verdict: scupper_core::verdict::v2::Verdict::Degraded(
+                scupper_core::verdict::v2::Degraded::ClientSessionsReset,
+            ),
+            warnings: vec![],
+            at: 0,
+            config_version: 1,
+        }
+    }
+
+    fn queue_reset(state: &mut Heartbeat, at: Instant) {
+        queue(state, at, 3, true);
+        let mut checked = state.checked().unwrap();
+        checked.outcome = Outcome::from(&reset_report());
+        checked.check_reason = HeartbeatVerdictReason::ClientSessionsReset;
+        let (send, receive) = mpsc::sync_channel(1);
+        state.check = Some(receive);
+        send.send(checked).unwrap();
+    }
+
     #[test]
-    fn session_grace_uses_ordinary_cadence_and_expiry_restores_report_mode() {
-        let now = Instant::now();
-        for mode in ["ok_only", "status_code"] {
-            let cfg = settings(mode, 60);
-            let mut state = Heartbeat::default();
-            let (send, receive) = mpsc::sync_channel(1);
-            state.check = Some(receive);
-            send.send(Checked {
-                at: now,
-                version: 1,
-                code: 3,
-                reason: scupper_proto::ObjectKind::Unknown,
-                full_fresh_check: true,
-                session_grace: true,
-                namespace: (2, 3),
-            })
-            .unwrap();
-            assert!(matches!(
-                state.iteration(now, now, true, Some(context(&cfg))),
-                Some(Work::Send { suffix, .. }) if suffix == if mode == "status_code" { "/3" } else { "" }
+    fn session_reset_logs_indefinitely_and_recovery_sends_zero_across_restarts() {
+        let origin = Instant::now();
+        let cfg = settings("status_code", 60);
+        let mut state = Heartbeat::default();
+        for second in [0, 60, 600, 1200, 3600] {
+            let now = origin + Duration::from_secs(second);
+            queue_reset(&mut state, now);
+            assert!(
+                matches!(state.iteration(now, origin, true, Some(context(&cfg))),
+                Some(Work::Send { suffix, .. }) if suffix == "/log")
+            );
+            assert_eq!(state.last_send, Some(now));
+            // Sending /log consumes the ordinary cadence slot.
+            queue_reset(&mut state, now + Duration::from_secs(1));
+            assert!(!matches!(
+                state.iteration(
+                    now + Duration::from_secs(1),
+                    origin,
+                    true,
+                    Some(context(&cfg))
+                ),
+                Some(Work::Send { .. })
             ));
-            state.sending_deadline = None;
-            let later = now + Duration::from_secs(60);
+            // A restart carries no grace epoch and does not change the decision.
+            let mut restarted = Heartbeat::default();
+            queue_reset(&mut restarted, now);
+            assert!(
+                matches!(restarted.iteration(now, origin, true, Some(context(&cfg))), Some(Work::Send { suffix, .. }) if suffix == "/log")
+            );
+        }
+        let recovered = origin + Duration::from_mins(61);
+        queue(&mut state, recovered, 0, true);
+        assert!(
+            matches!(state.iteration(recovered, origin, true, Some(context(&cfg))), Some(Work::Send { suffix, .. }) if suffix == "/0")
+        );
+        let ok = settings("ok_only", 60);
+        let mut state = Heartbeat::default();
+        queue_reset(&mut state, origin);
+        assert!(!matches!(
+            state.iteration(origin, origin, true, Some(context(&ok))),
+            Some(Work::Send { .. })
+        ));
+        assert!(state.last_send.is_none());
+        assert!(matches!(
+            state.verdict_events.last(),
+            Some(EventKind::HeartbeatCheckVerdict {
+                action: HeartbeatAction::Withheld,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn obsolete_grace_is_deleted_without_parsing_or_gating() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/tmp")
+            .join(format!("obsolete-grace-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("heartbeat-session-grace.json");
+        let lock = root.join("heartbeat-grace-writer");
+        for bytes in ["not JSON", r#"{"last":9999999999,"first_session":0}"#] {
+            std::fs::write(&path, bytes).unwrap();
+            std::fs::write(&lock, "obsolete").unwrap();
+            let mut state = Heartbeat::default();
+            discard_legacy_grace(&root);
+            assert!(!path.exists());
+            assert!(!lock.exists());
+            let now = Instant::now();
+            queue_reset(&mut state, now);
+            assert!(
+                matches!(state.iteration(now, now, true, Some(context(&settings("status_code", 60)))), Some(Work::Send { suffix, .. }) if suffix == "/log")
+            );
+        }
+        // Even a cleanup error is harmless.
+        std::fs::create_dir(&path).unwrap();
+        discard_legacy_grace(&root);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fresh_verdict_events_record_changes_repeats_and_recovery() {
+        let origin = Instant::now();
+        let cfg = settings("status_code", 10);
+        let mut state = Heartbeat::default();
+        for (second, code, reason, expected_len) in [
+            (0, 0, HeartbeatVerdictReason::Protected, 0),
+            (10, 0, HeartbeatVerdictReason::Protected, 0),
+            (20, 3, HeartbeatVerdictReason::ClientSessionsReset, 1),
+            (30, 3, HeartbeatVerdictReason::ClientSessionsReset, 1),
+            (619, 3, HeartbeatVerdictReason::ClientSessionsReset, 1),
+            (620, 3, HeartbeatVerdictReason::ClientSessionsReset, 2),
+            (621, 3, HeartbeatVerdictReason::ClientSessionsUnknown, 3),
+            (
+                622,
+                3,
+                HeartbeatVerdictReason::ClientSessionTelemetryUnknown,
+                4,
+            ),
+            (623, 1, HeartbeatVerdictReason::ObservationError, 5),
+            (624, 2, HeartbeatVerdictReason::RulesetDiffers, 6),
+            (625, 4, HeartbeatVerdictReason::NoHealthyExit, 7),
+            (626, 0, HeartbeatVerdictReason::Protected, 8),
+            (627, 0, HeartbeatVerdictReason::Protected, 8),
+        ] {
+            let now = origin + Duration::from_secs(second);
+            queue(&mut state, now, code, true);
+            let mut checked = state.checked().unwrap();
+            checked.check_reason = reason;
+            if reason == HeartbeatVerdictReason::ClientSessionsReset {
+                checked.outcome = Outcome::from(&reset_report());
+            }
             let (send, receive) = mpsc::sync_channel(1);
             state.check = Some(receive);
-            send.send(Checked {
-                at: later,
-                version: 1,
-                code: 3,
-                reason: scupper_proto::ObjectKind::Unknown,
-                full_fresh_check: true,
-                session_grace: false,
-                namespace: (2, 3),
+            send.send(checked).unwrap();
+            let _ = state.iteration(now, origin, true, Some(context(&cfg)));
+            let events: Vec<_> = state
+                .verdict_events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        EventKind::HeartbeatCheckVerdict { .. }
+                            | EventKind::HeartbeatCheckRecovered { .. }
+                    )
+                })
+                .collect();
+            assert_eq!(events.len(), expected_len, "at {second}");
+        }
+        let events: Vec<_> = state
+            .verdict_events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    EventKind::HeartbeatCheckVerdict { .. }
+                        | EventKind::HeartbeatCheckRecovered { .. }
+                )
             })
-            .unwrap();
-            let work = state.iteration(later, now, true, Some(context(&cfg)));
-            if mode == "status_code" {
-                assert!(matches!(work, Some(Work::Send { suffix, .. }) if suffix == "/3"));
-            } else {
-                assert!(!matches!(work, Some(Work::Send { .. })));
+            .collect();
+        assert!(matches!(
+            events[0],
+            EventKind::HeartbeatCheckVerdict {
+                code: 3,
+                count: 1,
+                action: HeartbeatAction::Log,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[1],
+            EventKind::HeartbeatCheckVerdict {
+                code: 3,
+                count: 4,
+                action: HeartbeatAction::Withheld,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[2],
+            EventKind::HeartbeatCheckVerdict {
+                reason: HeartbeatVerdictReason::ClientSessionsUnknown,
+                action: HeartbeatAction::Withheld,
+                count: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[7],
+            EventKind::HeartbeatCheckRecovered {
+                code: 0,
+                action: HeartbeatAction::Withheld,
+                ..
+            }
+        ));
+    }
+    #[test]
+    fn minimum_interval_flapping_debounces_each_key_and_recoveries() {
+        for reasons in [
+            [
+                HeartbeatVerdictReason::ClientSessionsReset,
+                HeartbeatVerdictReason::Protected,
+            ],
+            [
+                HeartbeatVerdictReason::ClientSessionsReset,
+                HeartbeatVerdictReason::ClientSessionsUnknown,
+            ],
+        ] {
+            let origin = Instant::now();
+            let cfg = settings("status_code", 10);
+            let mut state = Heartbeat::default();
+            for step in 0..360 {
+                let now = origin + Duration::from_secs(step * 10);
+                let reason = reasons[usize::try_from(step % 2).unwrap()];
+                queue(
+                    &mut state,
+                    now,
+                    if reason == HeartbeatVerdictReason::Protected {
+                        0
+                    } else {
+                        3
+                    },
+                    true,
+                );
+                let mut checked = state.checked().unwrap();
+                checked.check_reason = reason;
+                if reason == HeartbeatVerdictReason::ClientSessionsReset {
+                    checked.outcome = Outcome::from(&reset_report());
+                }
+                let (send, receive) = mpsc::sync_channel(1);
+                state.check = Some(receive);
+                send.send(checked).unwrap();
+                state.iteration(now, origin, true, Some(context(&cfg)));
+            }
+            let events: Vec<_> = state
+                .verdict_events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        EventKind::HeartbeatCheckVerdict { .. }
+                            | EventKind::HeartbeatCheckRecovered { .. }
+                    )
+                })
+                .collect();
+            // Two keys, six windows each, rather than 360 events/hour.
+            assert_eq!(events.len(), 12);
+            for (index, event) in events.iter().enumerate() {
+                let count = match event {
+                    EventKind::HeartbeatCheckVerdict { count, .. }
+                    | EventKind::HeartbeatCheckRecovered { count, .. } => *count,
+                    _ => unreachable!(),
+                };
+                // Each key recurs every 20 seconds. Suppressed observations,
+                // including recoveries, are folded into its next cumulative count.
+                assert_eq!(count, 1 + 30 * u64::try_from(index / 2).unwrap());
             }
         }
+    }
+
+    fn record_at(state: &mut Heartbeat, origin: Instant, second: u64, code: u8) {
+        let now = origin + Duration::from_secs(second);
+        queue(state, now, code, true);
+        let checked = state.checked().unwrap();
+        state.record_check(now, &checked, HeartbeatAction::Withheld);
+    }
+
+    #[test]
+    fn suppressed_recovery_flushes_once_on_first_healthy_check_after_window() {
+        let origin = Instant::now();
+        let mut state = Heartbeat::default();
+        for (second, code) in [(0, 3), (10, 0), (100, 4), (110, 0)] {
+            record_at(&mut state, origin, second, code);
+        }
+        assert!(state.check_history.recovery_pending);
+        assert_eq!(state.verdict_events.len(), 3);
+        // Stay healthy for eleven minutes after the suppressed recovery.
+        for second in (120..=770).step_by(10) {
+            record_at(&mut state, origin, second, 0);
+            assert_eq!(state.verdict_events.len(), if second < 610 { 3 } else { 4 });
+        }
+        assert!(!state.check_history.recovery_pending);
+        assert_eq!(state.check_history.recovery.count, 2);
+        assert_eq!(
+            state.check_history.recovery.last_event,
+            Some(origin + Duration::from_secs(610))
+        );
+        assert!(matches!(
+            state.verdict_events.last(),
+            Some(EventKind::HeartbeatCheckRecovered { count: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn logged_failure_cancels_pending_recovery_and_incomplete_zero_cannot_flush() {
+        let origin = Instant::now();
+        let mut state = Heartbeat::default();
+        for (second, code) in [(0, 3), (10, 0), (100, 4), (110, 0), (200, 1)] {
+            record_at(&mut state, origin, second, code);
+        }
+        assert!(!state.check_history.recovery_pending);
+        assert_eq!(state.verdict_events.len(), 4);
+        let now = origin + Duration::from_secs(610);
+        queue(&mut state, now, 0, false);
+        let checked = state.checked().unwrap();
+        state.record_check(now, &checked, HeartbeatAction::Withheld);
+        assert_eq!(state.verdict_events.len(), 4);
+        assert!(state.check_history.failing);
+        record_at(&mut state, origin, 620, 1);
+        assert!(matches!(
+            state.verdict_events.last(),
+            Some(EventKind::HeartbeatCheckVerdict { code: 1, .. })
+        ));
+        record_at(&mut state, origin, 630, 0);
+        assert!(matches!(
+            state.verdict_events.last(),
+            Some(EventKind::HeartbeatCheckRecovered { count: 3, .. })
+        ));
+    }
+
+    #[test]
+    fn suppressed_failure_preserves_pending_recovery_and_transition_count() {
+        let origin = Instant::now();
+        let mut state = Heartbeat::default();
+        for (second, code) in [(0, 3), (10, 0), (100, 4), (110, 0), (120, 4)] {
+            record_at(&mut state, origin, second, code);
+        }
+        assert!(state.check_history.recovery_pending);
+        assert_eq!(state.verdict_events.len(), 3);
+        record_at(&mut state, origin, 130, 0);
+        record_at(&mut state, origin, 609, 0);
+        assert_eq!(state.verdict_events.len(), 3);
+        record_at(&mut state, origin, 610, 0);
+        assert_eq!(state.verdict_events.len(), 4);
+        assert!(matches!(
+            state.verdict_events.last(),
+            Some(EventKind::HeartbeatCheckRecovered { count: 3, .. })
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Cover resolution boundaries and persisted audit ordering together.
+    fn resolved_log_fallback_records_status_and_preserves_check_order() {
+        use crate::events::{EventLog, read_since};
+        use scupper_core::config::{GatewayId, SecretKind, SecretName};
+        use scupper_proto::UnixSeconds;
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/tmp")
+            .join(format!("heartbeat-action-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("secrets/url")).unwrap();
+        for path in ["", "secrets", "secrets/url"] {
+            std::fs::set_permissions(root.join(path), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let reference = SecretName::new(SecretKind::Url, "test").unwrap();
+        let owner = rustix::process::geteuid().as_raw();
+        for target_len in [2044, 2045, 2046] {
+            let path = root.join("secrets/url/test");
+            let target = format!("/{}?q=x", "x".repeat(target_len - 5));
+            std::fs::write(&path, format!("https://fixture.invalid{target}")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let url = heartbeat::resolve(&root, &reference, "/log", owner).unwrap();
+            let (request, action) =
+                resolved_request(&url, heartbeat::monotonic_ns() + 5_000_000_000).unwrap();
+            let expected = if target_len == 2044 {
+                HeartbeatAction::Log
+            } else {
+                HeartbeatAction::Status
+            };
+            let encoded: serde_json::Value =
+                serde_json::from_slice(&request.encode().unwrap()).unwrap();
+            assert_eq!(action, expected);
+            assert_eq!(
+                encoded
+                    .get("log")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                target_len == 2044
+            );
+            assert!(
+                encoded["url"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(if target_len == 2044 {
+                        "/log?q=x"
+                    } else {
+                        "/3?q=x"
+                    })
+            );
+            let log_root = root.join(format!("events-{target_len}"));
+            let log =
+                EventLog::open(&log_root, GatewayId("gw1".into()), || UnixSeconds(1)).unwrap();
+            let now = Instant::now();
+            let mut state = Heartbeat::default();
+            queue_reset(&mut state, now);
+            let Some(Work::Send { suffix, .. }) =
+                state.iteration(now, now, true, Some(context(&settings("status_code", 10))))
+            else {
+                panic!("expected log delivery")
+            };
+            let action_send = state.track_log_action(&suffix).unwrap();
+            // Even if a later check is queued, the failure must precede recovery.
+            record_at(&mut state, now, 10, 0);
+            state.record_verdict(2, scupper_proto::ObjectKind::Ruleset);
+            state.report_events(&log.handle, Some(1));
+            log.handle.flush_blocking(Duration::from_secs(2)).unwrap();
+            let before: Vec<_> = read_since(&log_root, 0, None).map(Result::unwrap).collect();
+            assert!(!before.iter().any(|event| matches!(
+                event.kind,
+                EventKind::HeartbeatCheckVerdict { .. } | EventKind::HeartbeatCheckRecovered { .. }
+            )));
+            assert!(
+                before
+                    .iter()
+                    .any(|event| matches!(event.kind, EventKind::CheckVerdictChanged { .. }))
+            );
+            action_send.send(action).unwrap();
+            assert_eq!(state.collect(), None);
+            state.report_events(&log.handle, Some(1));
+            log.handle.flush_blocking(Duration::from_secs(2)).unwrap();
+            let events: Vec<_> = read_since(&log_root, 0, None)
+                .map(Result::unwrap)
+                .filter(|event| {
+                    matches!(
+                        event.kind,
+                        EventKind::HeartbeatCheckVerdict { .. }
+                            | EventKind::HeartbeatCheckRecovered { .. }
+                    )
+                })
+                .collect();
+            assert_eq!(events.len(), 2);
+            assert!(
+                matches!(events[0].kind, EventKind::HeartbeatCheckVerdict { action, count: 1, .. } if action == expected)
+            );
+            assert!(matches!(
+                events[1].kind,
+                EventKind::HeartbeatCheckRecovered { .. }
+            ));
+            assert!(state.last_success.is_none());
+            drop(log);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unresolved_log_action_is_withheld_on_worker_failure_or_timeout() {
+        let now = Instant::now();
+        for timeout in [false, true] {
+            let mut state = Heartbeat::default();
+            queue_reset(&mut state, now);
+            state.iteration(now, now, true, Some(context(&settings("status_code", 10))));
+            let action_send = state.track_log_action("/log").unwrap();
+            let (send, receive) = mpsc::sync_channel(1);
+            state.sending = Some(receive);
+            state.sending_deadline = Some(now);
+            if timeout {
+                assert_eq!(
+                    state.expire(now + Duration::from_secs(10)),
+                    Some(Failure::Deadline)
+                );
+            } else {
+                drop(action_send);
+                send.send(Err(Failure::Secret)).unwrap();
+                assert_eq!(state.collect(), Some(Failure::Secret));
+            }
+            assert!(state.pending_log_action.is_none());
+            assert!(matches!(
+                state.verdict_events.last(),
+                Some(EventKind::HeartbeatCheckVerdict {
+                    action: HeartbeatAction::Withheld,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn delivered_log_and_failure_status_do_not_advance_last_success() {
+        let origin = Instant::now();
+        let cfg = settings("status_code", 10);
+        let mut state = Heartbeat {
+            last_success: Some(origin),
+            ..Heartbeat::default()
+        };
+        for (step, reset, code) in [(1, true, 3), (2, false, 3), (3, false, 0)] {
+            let now = origin + Duration::from_secs(step * 10);
+            if reset {
+                queue_reset(&mut state, now);
+            } else {
+                queue(&mut state, now, code, true);
+            }
+            let Some(Work::Send { suffix, .. }) =
+                state.iteration(now, origin, true, Some(context(&cfg)))
+            else {
+                panic!("expected delivery");
+            };
+            assert_eq!(
+                suffix,
+                if reset {
+                    "/log"
+                } else if code == 0 {
+                    "/0"
+                } else {
+                    "/3"
+                }
+            );
+            let (send, receive) = mpsc::sync_channel(1);
+            state.sending = Some(receive);
+            send.send(Ok(Delivered::new(now, &suffix))).unwrap();
+            assert_eq!(state.collect(), None);
+            assert_eq!(
+                state.last_success,
+                Some(if code == 0 { now } else { origin })
+            );
+        }
+    }
+
+    #[test]
+    fn check_events_use_the_bounded_log_even_when_delivery_is_unavailable() {
+        use crate::events::{EventLog, read_since};
+        use scupper_core::config::GatewayId;
+        use scupper_proto::UnixSeconds;
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/tmp")
+            .join(format!("heartbeat-verdict-log-{}", std::process::id()));
+        let log = EventLog::open(&root, GatewayId("gw1".into()), || UnixSeconds(1)).unwrap();
+        let origin = Instant::now();
+        let cfg = settings("status_code", 60);
+        let mut state = Heartbeat::default();
+        // A delivery already in progress withholds this fresh failure but must
+        // not discard its audit event.
+        let (_send, receive) = mpsc::sync_channel(1);
+        state.sending = Some(receive);
+        queue_reset(&mut state, origin);
+        let _ = state.iteration(origin, origin, true, Some(context(&cfg)));
+        state.report_events(&log.handle, Some(1));
+        // An incomplete check does not recover the failure or emit an event.
+        queue(&mut state, origin, 0, false);
+        let _ = state.iteration(origin, origin, true, Some(context(&cfg)));
+        state.report_events(&log.handle, Some(1));
+        state.sending = None;
+        // Even a full fresh verdict that aged out of its delivery window is
+        // useful evidence; recovery is recorded as withheld.
+        queue(&mut state, origin, 0, true);
+        let _ = state.iteration(
+            origin + Duration::from_secs(30),
+            origin,
+            true,
+            Some(context(&cfg)),
+        );
+        state.report_events(&log.handle, Some(1));
+        log.handle.flush_blocking(Duration::from_secs(2)).unwrap();
+        let events: Vec<_> = read_since(&root, 0, None)
+            .map(Result::unwrap)
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    EventKind::HeartbeatCheckVerdict { .. }
+                        | EventKind::HeartbeatCheckRecovered { .. }
+                )
+            })
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0].kind,
+            EventKind::HeartbeatCheckVerdict {
+                code: 3,
+                action: HeartbeatAction::Withheld,
+                count: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[1].kind,
+            EventKind::HeartbeatCheckRecovered {
+                code: 0,
+                action: HeartbeatAction::Withheld,
+                ..
+            }
+        ));
+        drop(log);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

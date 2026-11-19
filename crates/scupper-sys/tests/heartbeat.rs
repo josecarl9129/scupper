@@ -251,3 +251,100 @@ fn bounded_secret_pipe_delivery_and_group_timeout() {
     std::thread::sleep(Duration::from_millis(1100));
     assert!(!temp.0.join("survived").exists());
 }
+
+#[test]
+fn log_suffix_and_body_preserve_secret_url_confinement() {
+    let temp = Temp::new();
+    let uid = rustix::process::geteuid().as_raw();
+    for base in [
+        "https://heartbeat.invalid/private",
+        "https://heartbeat.invalid/private/",
+    ] {
+        temp.write(&format!("{base}?key=secret\n"));
+        let url = resolve(&temp.0, &reference(), "/log", uid).unwrap();
+        assert_eq!(
+            url.expose(),
+            "https://heartbeat.invalid/private/log?key=secret"
+        );
+        let request = Request::log(url.expose(), monotonic_ns() + 1_000_000_000).unwrap();
+        let encoded = request.encode().unwrap();
+        let decoded: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded["url"], url.expose());
+        assert_eq!(
+            decoded["payload"]["content_type"],
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(
+            decoded["payload"]["body"],
+            "code=3 reason=ClientSessionsReset\n"
+        );
+        assert_eq!(decoded["payload"]["headers"], serde_json::json!({}));
+        assert_eq!(
+            Request::read(encoded.as_slice())
+                .unwrap()
+                .encode()
+                .unwrap()
+                .as_slice(),
+            encoded.as_slice()
+        );
+        assert!(!format!("{url:?} {request:?}").contains("private"));
+        assert!(!format!("{url:?} {request:?}").contains("secret"));
+    }
+    for suffix in ["/log/0", "/logs", "/log?secret", "/log\r\n"] {
+        assert!(matches!(
+            resolve(&temp.0, &reference(), suffix, uid),
+            Err(Failure::Internal)
+        ));
+    }
+}
+
+#[test]
+fn non_log_request_keeps_the_012_wire_format() {
+    let request = Request::new("https://heartbeat.invalid/check/0", 0).unwrap();
+    assert_eq!(
+        request.encode().unwrap().as_slice(),
+        br#"{"url":"https://heartbeat.invalid/check/0","deadline_ns":0,"form_credentials":false}"#
+    );
+    let payload = scupper_core::alerts::Payload {
+        content_type: "text/plain; charset=utf-8".into(),
+        headers: std::collections::BTreeMap::new(),
+        body: "test alert".into(),
+    };
+    let request = Request::alert("https://heartbeat.invalid/alert", 0, payload).unwrap();
+    assert_eq!(request.encode().unwrap().as_slice(), br#"{"url":"https://heartbeat.invalid/alert","deadline_ns":0,"payload":{"content_type":"text/plain; charset=utf-8","headers":{},"body":"test alert"},"form_credentials":false}"#);
+}
+
+#[test]
+fn stored_012_urls_remain_readable_with_log_falling_back_to_status() {
+    let temp = Temp::new();
+    let uid = rustix::process::geteuid().as_raw();
+    for target_len in [2044, 2045, 2046] {
+        // Include a query to exercise the actual request-target byte limit.
+        let path = format!("/{}?q=x", "x".repeat(target_len - 5));
+        let original = format!("https://heartbeat.invalid{path}");
+        temp.write(&original);
+        assert_eq!(
+            resolve(&temp.0, &reference(), "", uid).unwrap().expose(),
+            original
+        );
+        for suffix in ["/0", "/3", "/log"] {
+            let resolved = resolve(&temp.0, &reference(), suffix, uid).unwrap();
+            let selected = if suffix == "/log" && target_len > 2044 {
+                "/3"
+            } else {
+                suffix
+            };
+            assert_eq!(
+                resolved.expose(),
+                original.replace("?q=x", &format!("{selected}?q=x"))
+            );
+            assert_eq!(resolved.is_log(), selected == "/log");
+            let request = if resolved.is_log() {
+                Request::log(resolved.expose(), 0).unwrap()
+            } else {
+                Request::new(resolved.expose(), 0).unwrap()
+            };
+            assert!(Request::read(request.encode().unwrap().as_slice()).is_ok());
+        }
+    }
+}

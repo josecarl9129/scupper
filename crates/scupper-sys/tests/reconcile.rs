@@ -2143,7 +2143,7 @@ impl scupper_sys::daemon::DaemonDeps for DaemonRig<'_> {
         }
     }
     fn heartbeat(&mut self) {
-        use scupper_core::heartbeat::{CompleteIteration, Decision, SkipReason, decide};
+        use scupper_core::heartbeat::{CompleteIteration, Decision, Outcome, SkipReason, decide};
         self.heartbeat_calls += 1;
         assert!(self.complete_iterations > 0);
         let settings: scupper_core::config::HeartbeatSettings = serde_json::from_value(serde_json::json!({
@@ -2161,7 +2161,7 @@ impl scupper_sys::daemon::DaemonDeps for DaemonRig<'_> {
                 Some(CompleteIteration {
                     at: now,
                     full_fresh_check: true,
-                    code: 5
+                    outcome: Outcome::from_code(5)
                 }),
                 None
             ),
@@ -2174,7 +2174,7 @@ impl scupper_sys::daemon::DaemonDeps for DaemonRig<'_> {
                 Some(CompleteIteration {
                     at: now,
                     full_fresh_check: true,
-                    code: 0
+                    outcome: Outcome::from_code(0)
                 }),
                 None
             ),

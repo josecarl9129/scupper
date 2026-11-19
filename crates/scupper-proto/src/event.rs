@@ -186,6 +186,64 @@ vocabulary!(
     Unsupervised
 );
 vocabulary!(
+    HeartbeatAction,
+    "Heartbeat action authorized for this fresh verdict; delivery may still fail.",
+    Success,
+    Log,
+    Status,
+    Withheld
+);
+// Keep the fixed-size daemon debounce table tied to the closed vocabulary.
+macro_rules! heartbeat_reasons {
+    ($($reason:ident),+ $(,)?) => {
+        vocabulary!(HeartbeatVerdictReason,
+            "Fresh-check cause without addresses, identifiers or diagnostic text.",
+            $($reason),+);
+        impl HeartbeatVerdictReason {
+            /// Number of closed reasons, for bounded per-reason state.
+            pub const COUNT: usize = [$(Self::$reason),+].len();
+        }
+    };
+}
+heartbeat_reasons!(
+    Protected,
+    ObservationError,
+    HostWireguardOnClientPort,
+    ExtraRoute,
+    NetnsMissing,
+    NetnsWrongInode,
+    ForeignLink,
+    LinkKind,
+    PeerDiffers,
+    RulesetMissing,
+    RulesetDiffers,
+    ExtraPolicyRule,
+    TrafficControlHook,
+    ExitIpIsUplinkAddress,
+    ConfigMismatch,
+    FailoverStuck,
+    QuarantineNotEffective,
+    ForwardingDisabled,
+    DefaultRouteWrong,
+    RouteWrong,
+    DisconnectNotEffective,
+    ClientSideBroken,
+    ClientSessionsReset,
+    ClientSessionsUnknown,
+    ClientSessionTelemetryUnknown,
+    ExitProbeFailed,
+    ExitProbeImplausible,
+    CommonModeProbeFailure,
+    OperationInProgress,
+    DnsFailed,
+    AdminDisconnected,
+    NoHealthyExit,
+    PinnedExitDown,
+    FailoverPending,
+    Quarantined,
+    Unsupervised
+);
+vocabulary!(
     Command,
     "Administrative action alphabet.",
     Connect,
@@ -282,6 +340,8 @@ event_kinds! {
     HeartbeatFailed { reason: Reason = Reason::EdgeDead },
     HeartbeatSkipped { reason: Reason = Reason::Stale },
     HeartbeatCheckDetached {},
+    HeartbeatCheckVerdict { code: u8 = 3, reason: HeartbeatVerdictReason = HeartbeatVerdictReason::ClientSessionsReset, action: HeartbeatAction = HeartbeatAction::Log, count: u64 = 1 },
+    HeartbeatCheckRecovered { code: u8 = 0, reason: HeartbeatVerdictReason = HeartbeatVerdictReason::Protected, action: HeartbeatAction = HeartbeatAction::Success, #[serde(default)] count: u64 = 1 },
     PersistenceFailed { reason: Reason = Reason::EventWrite },
     Flapping {},
     MemoryReplay { dropped: u64 = 0, local_first: u64 = 1, local_last: u64 = 3, replayed: u64 = 3 },
@@ -304,6 +364,55 @@ pub struct Event {
     pub gateway: Identifier,
     /// Applied or relevant immutable configuration version, if established.
     pub config_version: Option<u64>,
+}
+
+impl From<&scupper_core::verdict::v2::Verdict> for HeartbeatVerdictReason {
+    fn from(verdict: &scupper_core::verdict::v2::Verdict) -> Self {
+        use scupper_core::verdict::v2::{Degraded as D, FailClosed as F, Verdict, Violation as V};
+        match verdict {
+            Verdict::Protected { .. } => Self::Protected,
+            Verdict::Unsupervised { .. } => Self::Unsupervised,
+            Verdict::Unprotected(violations) => match &violations.as_slice()[0] {
+                V::HostWireguardOnClientPort(_) => Self::HostWireguardOnClientPort,
+                V::ExtraRoute { .. } => Self::ExtraRoute,
+                V::NetnsMissing => Self::NetnsMissing,
+                V::NetnsWrongInode => Self::NetnsWrongInode,
+                V::ForeignLink(_) => Self::ForeignLink,
+                V::LinkKind(_) => Self::LinkKind,
+                V::PeerDiffers { .. } => Self::PeerDiffers,
+                V::RulesetMissing => Self::RulesetMissing,
+                V::RulesetDiffers { .. } => Self::RulesetDiffers,
+                V::ExtraPolicyRule(_) => Self::ExtraPolicyRule,
+                V::TrafficControlHook(_) => Self::TrafficControlHook,
+                V::ExitIpIsUplinkAddress(_) => Self::ExitIpIsUplinkAddress,
+                V::ConfigMismatch(_) => Self::ConfigMismatch,
+            },
+            Verdict::Degraded(reason) => match reason {
+                D::FailoverStuck { .. } => Self::FailoverStuck,
+                D::QuarantineNotEffective => Self::QuarantineNotEffective,
+                D::ForwardingDisabled => Self::ForwardingDisabled,
+                D::DefaultRouteWrong { .. } => Self::DefaultRouteWrong,
+                D::RouteWrong { .. } => Self::RouteWrong,
+                D::DisconnectNotEffective => Self::DisconnectNotEffective,
+                D::ClientSideBroken(_) => Self::ClientSideBroken,
+                D::ClientSessionsReset => Self::ClientSessionsReset,
+                D::ClientSessionsUnknown => Self::ClientSessionsUnknown,
+                D::ClientSessionTelemetryUnknown => Self::ClientSessionTelemetryUnknown,
+                D::ExitProbeFailed(_) => Self::ExitProbeFailed,
+                D::ExitProbeImplausible { .. } => Self::ExitProbeImplausible,
+                D::CommonModeProbeFailure => Self::CommonModeProbeFailure,
+                D::OperationInProgress { .. } => Self::OperationInProgress,
+                D::DnsFailed(_) => Self::DnsFailed,
+            },
+            Verdict::FailClosed(reason) => match reason {
+                F::AdminDisconnected => Self::AdminDisconnected,
+                F::NoHealthyExit => Self::NoHealthyExit,
+                F::PinnedExitDown(_) => Self::PinnedExitDown,
+                F::FailoverPending { .. } => Self::FailoverPending,
+                F::Quarantined { .. } => Self::Quarantined,
+            },
+        }
+    }
 }
 
 impl From<FailoverEvent> for EventKind {
@@ -475,5 +584,41 @@ mod read_failure_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_tests {
+    use super::*;
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn heartbeat_verdict_vocabulary_roundtrips_and_preserves_old_events() {
+        use scupper_core::verdict::v2::{Degraded, Verdict};
+        for reason in HeartbeatVerdictReason::NAMES {
+            for action in HeartbeatAction::NAMES {
+                let json = serde_json::json!({"kind":"HeartbeatCheckVerdict","data":{
+                    "code":3,"reason":reason,"action":action,"count":5
+                }});
+                let kind: EventKind = serde_json::from_value(json.clone()).unwrap();
+                assert_eq!(serde_json::to_value(&kind).unwrap(), json);
+            }
+        }
+        let verdict = Verdict::Degraded(Degraded::ExitProbeImplausible {
+            ip: "203.0.113.25".parse().unwrap(),
+        });
+        let reason = HeartbeatVerdictReason::from(&verdict);
+        assert_eq!(reason, HeartbeatVerdictReason::ExitProbeImplausible);
+        assert!(
+            !serde_json::to_string(&reason)
+                .unwrap()
+                .contains("203.0.113.25")
+        );
+        // Existing records remain unchanged.
+        let old = serde_json::json!({"kind":"HeartbeatFailed","data":{"reason":"HeartbeatHttp"}});
+        assert_eq!(
+            serde_json::to_value(serde_json::from_value::<EventKind>(old.clone()).unwrap())
+                .unwrap(),
+            old
+        );
     }
 }

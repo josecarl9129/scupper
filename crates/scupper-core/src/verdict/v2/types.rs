@@ -617,6 +617,16 @@ pub struct Report {
 }
 
 impl Report {
+    /// True only for a client-session reset with no unrelated diagnosis.
+    /// The engine reaches this verdict only after protection and exit checks pass.
+    #[must_use]
+    pub fn session_only_reset(&self) -> bool {
+        matches!(
+            self.verdict,
+            Verdict::Degraded(Degraded::ClientSessionsReset)
+        ) && self.session_only()
+    }
+
     /// True only when every diagnosis concerns client session readiness.
     #[must_use]
     pub fn session_only(&self) -> bool {

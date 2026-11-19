@@ -1,6 +1,6 @@
 //! Sender deadlines provide best-effort bounded staleness, not a network delivery guarantee.
 //! Host-namespace heartbeat delivery. The URL and absolute `CLOCK_MONOTONIC`
-//! deadline travel only over stdin. GET uses the existing rustls/webpki client,
+//! deadline travel only over stdin. GET and log POST use the existing rustls/webpki client,
 //! with no redirects, proxies, custom trust roots or response body logging.
 use crate::{
     probe,
@@ -83,17 +83,26 @@ impl Failure {
 }
 
 /// Resolved URL whose formatting is always redacted.
-pub struct SecretUrl(Zeroizing<String>);
+pub struct SecretUrl {
+    url: Zeroizing<String>,
+    log: bool,
+}
 impl fmt::Debug for SecretUrl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("SecretUrl([redacted])")
     }
 }
 impl SecretUrl {
+    /// Whether resolution selected a neutral log rather than a status fallback.
+    #[must_use]
+    pub fn is_log(&self) -> bool {
+        self.log
+    }
+
     /// Borrow only for constructing the secret stdin message.
     #[must_use]
     pub fn expose(&self) -> &str {
-        &self.0
+        &self.url
     }
 }
 
@@ -107,6 +116,8 @@ pub struct Request {
     payload: Option<scupper_core::alerts::Payload>,
     #[serde(default)]
     form_credentials: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    log: bool,
     #[cfg(feature = "testing")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) test_hold: Option<std::path::PathBuf>,
@@ -142,6 +153,7 @@ impl Request {
             deadline_ns,
             payload: None,
             form_credentials: false,
+            log: false,
             #[cfg(feature = "testing")]
             test_hold: None,
         })
@@ -161,6 +173,38 @@ impl Request {
         let request: Self = serde_json::from_slice(&bytes).map_err(|_| Failure::Internal)?;
         Self::new(&request.url, request.deadline_ns)?;
         if request.payload.as_ref().is_some_and(|p| !valid_payload(p)) {
+            return Err(Failure::Internal);
+        }
+        if request.log && !request.valid_log() {
+            return Err(Failure::Internal);
+        }
+        Ok(request)
+    }
+    fn valid_log(&self) -> bool {
+        !self.form_credentials
+            && self
+                .url
+                .strip_prefix("https://")
+                .and_then(|rest| rest.split('?').next())
+                .is_some_and(|base| base.contains('/') && base.ends_with("/log"))
+            && self.payload.as_ref().is_some_and(|payload| {
+                payload.content_type == "text/plain; charset=utf-8"
+                    && payload.headers.is_empty()
+                    && payload.body == scupper_core::heartbeat::SESSION_RESET_LOG_BODY
+            })
+    }
+    /// Construct a neutral healthchecks log POST with a fixed, value-free body.
+    /// # Errors
+    /// Rejects invalid URLs, non-log targets and invalid deadlines.
+    pub fn log(url: &str, deadline_ns: u64) -> Result<Self, Failure> {
+        let mut request = Self::new(url, deadline_ns)?;
+        request.log = true;
+        request.payload = Some(scupper_core::alerts::Payload {
+            content_type: "text/plain; charset=utf-8".into(),
+            headers: std::collections::BTreeMap::new(),
+            body: scupper_core::heartbeat::SESSION_RESET_LOG_BODY.into(),
+        });
+        if !request.valid_log() {
             return Err(Failure::Internal);
         }
         Ok(request)
@@ -264,7 +308,7 @@ pub fn monotonic_ns() -> u64 {
         .saturating_add(u64::try_from(time.tv_nsec).unwrap_or(0))
 }
 
-/// Reads stdin and performs exactly one HTTPS GET, as a nonroot exec child.
+/// Reads stdin and performs one HTTPS GET or neutral log POST as a nonroot child.
 /// # Errors
 /// All failures are closed, value-free categories.
 pub fn child(input: impl Read) -> Result<(), Failure> {
@@ -292,7 +336,7 @@ fn child_for(input: impl Read, alert: bool) -> Result<(), Failure> {
     rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
         .map_err(|_| Failure::Internal)?;
     let mut request = Request::read(input)?;
-    if request.payload.is_some() != alert {
+    if request.payload.is_some() != (alert || request.log) || (alert && request.log) {
         return Err(Failure::Internal);
     }
     request.prepare_credentials()?;
@@ -384,7 +428,7 @@ fn deliver(request: &Request) -> Result<(), Failure> {
         request.payload.as_ref(),
     )
     .map_err(|error| transport_failure(&error))?;
-    if request.payload.is_some() {
+    if request.payload.is_some() && !request.log {
         alert_status(&bytes)
     } else {
         status(&bytes)
@@ -512,7 +556,8 @@ pub fn account(passwd: &str, group: &str) -> Result<ProbeIdentity, Failure> {
     ProbeIdentity::parse_named(passwd, group, "scupper-alert").map_err(|_| Failure::Account)
 }
 
-/// Longest suffix appended to a stored URL by heartbeat delivery (`/0`..`/4`).
+/// Reserved suffix space for stored delivery URLs, unchanged from 0.1.2.
+/// A `/log` ping falls back to `/3` when the longer suffix will not fit.
 pub const MAX_SUFFIX_BYTES: usize = 2;
 
 /// Resolve a confined root-owned 0600 URL reference, and append a pure suffix.
@@ -530,11 +575,16 @@ pub fn resolve(
     if !crate::secrets::valid_delivery_url(url) {
         return Err(Failure::Secret);
     }
-    if suffix.len() > MAX_SUFFIX_BYTES
-        || (!suffix.is_empty() && !matches!(suffix, "/0" | "/1" | "/2" | "/3" | "/4"))
-    {
+    if !matches!(suffix, "" | "/0" | "/1" | "/2" | "/3" | "/4" | "/log") {
         return Err(Failure::Internal);
     }
+    // Preserve stored secrets accepted by 0.1.2. Only the neutral log
+    // exemption is lost for a request target with less than four bytes free.
+    let suffix = if suffix == "/log" && Url::validate_with_suffix(url, 4).is_err() {
+        "/3"
+    } else {
+        suffix
+    };
     let (base, query) = url
         .split_once('?')
         .map_or((url, None), |(base, query)| (base, Some(query)));
@@ -550,7 +600,11 @@ pub fn resolve(
         result.push('?');
         result.push_str(query);
     }
-    Ok(SecretUrl(result))
+    Url::validate(&result).map_err(|_| Failure::Internal)?;
+    Ok(SecretUrl {
+        url: result,
+        log: suffix == "/log",
+    })
 }
 
 /// One bounded host-namespace child attempt; all child stdout/stderr are discarded.
@@ -590,7 +644,7 @@ fn delivery_command(
     command
         .args([
             "deliver",
-            if request.payload.is_some() {
+            if request.payload.is_some() && !request.log {
                 "alert"
             } else {
                 "heartbeat"
@@ -655,6 +709,48 @@ pub fn retry_deadline(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn log_protocol_keeps_heartbeat_child_and_fixed_plain_text_post() {
+        let request = Request::log(
+            "https://fixture.invalid/private/log?key=secret",
+            monotonic_ns() + 5_000_000_000,
+        )
+        .unwrap();
+        let decoded = Request::read(request.encode().unwrap().as_slice()).unwrap();
+        assert!(decoded.log);
+        assert!(decoded.valid_log());
+        assert_eq!(
+            decoded.payload.as_ref().unwrap().body,
+            "code=3 reason=ClientSessionsReset\n"
+        );
+        let command = delivery_command(
+            Path::new("scupper"),
+            &decoded,
+            ProbeIdentity {
+                uid: 65534,
+                gid: 65534,
+            },
+        );
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args, ["deliver", "heartbeat"]);
+        assert!(!format!("{decoded:?} {command:?}").contains("private"));
+        assert!(!format!("{decoded:?} {command:?}").contains("secret"));
+        for target in [
+            "https://fixture.invalid/private/0",
+            "https://fixture.invalid/private/3",
+            "https://fixture.invalid/private?key=/log",
+            "https://log",
+        ] {
+            assert_eq!(Request::log(target, 0).unwrap_err(), Failure::Internal);
+        }
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&request.encode().unwrap()).unwrap();
+        json["payload"]["body"] = "untrusted details".into();
+        assert_eq!(
+            Request::read(serde_json::to_vec(&json).unwrap().as_slice()).unwrap_err(),
+            Failure::Internal
+        );
+    }
     #[test]
     fn distinct_failures_survive_child_exit_and_remain_value_free() {
         for failure in [

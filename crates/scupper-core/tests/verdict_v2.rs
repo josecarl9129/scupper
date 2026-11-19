@@ -1926,6 +1926,7 @@ fn session_only_classification_checks_every_diagnosis_and_pending_is_secondary()
         Degraded::ClientSessionsUnknown,
         Degraded::ClientSessionTelemetryUnknown,
     ] {
+        let reset = reason == Degraded::ClientSessionsReset;
         let mut report = report_with(&passing(), &config());
         report.verdict = Verdict::Degraded(reason);
         report.warnings = vec![
@@ -1933,11 +1934,13 @@ fn session_only_classification_checks_every_diagnosis_and_pending_is_secondary()
             Warning::ClientHandshakesStale,
         ];
         assert!(report.session_only());
+        assert_eq!(report.session_only_reset(), reset);
         report.warnings.push(Warning::DaemonDead);
         assert!(
             !report.session_only(),
-            "secondary supervision diagnosis must disqualify grace"
+            "secondary supervision diagnosis must disqualify session-only classification"
         );
+        assert!(!report.session_only_reset());
     }
     let mut obs = passing();
     forwarding(&mut obs).client_sessions.active_reset = true;
