@@ -16,3 +16,8 @@ cc 93c84ac1a0d468f24e4249eed39b32a73f98b7e99f62071bc7eb56eafcf05754 # shrinks to
 cc 7736ab2c87f510a1bbaf54e1e4a35464433e7b30a07486976ba046cd4a167241 # shrinks to recovering = true, initial_completions = 17, persistent_failure = false, fault_index = 0, disturbances = [6, 8]
 cc b4a5146cbcf514a3d6e020da39c6f89b5f8bf12fe0f5cba9d44edb2fdb59932d # CI macOS run 43538844256
 cc 0f11b3a3cd6d87b1c542c3ae824954384f95bbc63ba1784170519f0a274730d6 # shrinks to recovering = false, initial_completions = 18, persistent_failure = false, fault_index = 0, disturbances = [2, 2, 8]
+cc fa344364c525ad27f1a1aab6a67ff2d4c5b74894ec5b62730b45b911972f4758 # shrinks to tokens = {1, 2}, uncertain = 0, events = [2, 6]
+cc 406dffac7534263b4bdb0e04f4be245328fc2017d8f2a56f7a3ea7bc4671aa48 # shrinks to recovering = false, initial_completions = 0, persistent_failure = false, fault_index = 0, disturbances = [1, 1, 1]
+cc 98202762d06072813ddaa52fd9405664c9ed0a54b9646af52b4b7972f6292df1 # shrinks to tokens = {1}, uncertain = 0, events = [11, 7, 4, 11, 8, 2, 11, 8, 2, 11, 11, 11]
+cc f1057e33a476313f3f515c80dfbb929fe6cb948f2d4276f01c4a46b6e841d172 # shrinks to recovering = true, initial_completions = 0, persistent_failure = false, fault_index = 0, disturbances = []
+cc 147631d62851ba289a93e1ae622a5bb56af27514ff702ee493a97c52a98e4c92 # shrinks to recovering = true, initial_completions = 24, persistent_failure = false, fault_index = 0, disturbances = [1]

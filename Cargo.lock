@@ -434,6 +434,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "scupper-mac"
+version = "0.1.4"
+dependencies = [
+ "proptest",
+ "scupper-core",
+ "scupper-mac",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "scupper-proto"
 version = "0.1.4"
 dependencies = [

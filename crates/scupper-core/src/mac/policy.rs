@@ -137,6 +137,32 @@ pub enum Form {
     /// Current-generation tunnel passes.
     Joined,
 }
+/// Complete expected policy; lockdown needs no installation metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Policy<'a> {
+    /// Validated installation inputs and policy form.
+    Installed(&'a Inputs, Form),
+    /// Only host-local loopback traffic is allowed.
+    Lockdown,
+}
+/// Policy identity carried by baselines, proofs and held machines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// An installed policy form.
+    Installed(Form),
+    /// Input-free blocking policy.
+    Lockdown,
+}
+impl Policy<'_> {
+    /// Identity independent of the borrowed inputs.
+    #[must_use]
+    pub fn kind(self) -> Kind {
+        match self {
+            Self::Installed(_, form) => Kind::Installed(form),
+            Self::Lockdown => Kind::Lockdown,
+        }
+    }
+}
 /// pf source text, including a trailing newline and final default block.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AnchorText(String);
@@ -147,13 +173,19 @@ impl AnchorText {
         &self.0
     }
 }
+/// Conservative emergency policy when installation metadata cannot be validated.
+/// Only loopback is safe without endpoint, tunnel or LAN metadata.
+#[must_use]
+pub fn render_lockdown() -> AnchorText {
+    render(Policy::Lockdown)
+}
 /// Build the entire allow table. No LAN access or IPv6 underlay data rows exist.
 #[must_use]
-pub fn policy_table(inputs: &Inputs, form: Form) -> Vec<Pass> {
-    let mut loopback = Pass::all(Some("lo0".into()));
-    loopback.quick = true;
-    loopback.state = State::None;
-    let mut rows = vec![loopback];
+pub fn policy_table(policy: Policy<'_>) -> Vec<Pass> {
+    let mut rows = vec![loopback_pass()];
+    let Policy::Installed(inputs, form) = policy else {
+        return rows;
+    };
     if form == Form::Joined {
         for direction in [Direction::Out, Direction::In] {
             let mut row = Pass::all(Some(inputs.tunnel().name.to_string()));
@@ -251,8 +283,8 @@ pub fn policy_table(inputs: &Inputs, form: Form) -> Vec<Pass> {
     }
     rows
 }
-fn render(inputs: &Inputs, form: Form) -> AnchorText {
-    let mut text = policy_table(inputs, form)
+fn render(policy: Policy<'_>) -> AnchorText {
+    let mut text = policy_table(policy)
         .iter()
         .map(Pass::render)
         .collect::<Vec<_>>()
@@ -263,10 +295,17 @@ fn render(inputs: &Inputs, form: Form) -> AnchorText {
 /// Render the verified-enforcement prerequisite to any child mutation.
 #[must_use]
 pub fn render_pre_tunnel(inputs: &Inputs) -> AnchorText {
-    render(inputs, Form::PreTunnel)
+    render(Policy::Installed(inputs, Form::PreTunnel))
 }
 /// Render passes for the expected tunnel; identity must be verified separately.
 #[must_use]
 pub fn render_joined(inputs: &Inputs) -> AnchorText {
-    render(inputs, Form::Joined)
+    render(Policy::Installed(inputs, Form::Joined))
+}
+
+fn loopback_pass() -> Pass {
+    let mut loopback = Pass::all(Some("lo0".into()));
+    loopback.quick = true;
+    loopback.state = State::None;
+    loopback
 }

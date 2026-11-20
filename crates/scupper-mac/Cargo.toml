@@ -1,0 +1,25 @@
+[package]
+name = "scupper-mac"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+testing = []
+
+[dependencies]
+scupper-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+# Unit tests exercise the fake boundary under the ordinary cargo test command.
+scupper-mac = { path = ".", features = ["testing"] }

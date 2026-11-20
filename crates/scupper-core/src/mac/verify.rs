@@ -3,7 +3,7 @@
 use super::{
     Error, HopLimitPolicy, Inputs, Interface, PhysicalInterface, Tunnel,
     parse::{self, PfInfo, Resolver, Route, Rule, Rules, SkipFlags},
-    policy::{self, Form, State},
+    policy::{self, Form, Kind, Policy, State},
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -80,6 +80,8 @@ pub struct Context {
     pub policy_generation: u64,
     /// Incremented on invalidating lifecycle transitions.
     pub lifecycle_revision: u64,
+    /// Incremented only when a reference acquisition is recorded.
+    pub acquisition_revision: u64,
     /// Incremented whenever state cleanliness is lost.
     pub state_epoch: u64,
 }
@@ -109,12 +111,19 @@ pub struct Proof {
     expires_at: u64,
     context: Context,
     form: Form,
-    tunnel: Tunnel,
+    tunnel: Option<Tunnel>,
+    kind: Kind,
     baseline_hash: [u8; 32],
     states_clean_at: u64,
-    transport: Transport,
+    transport: Option<Transport>,
 }
 impl Proof {
+    /// Exact verified policy kind; cannot be changed by a consumer.
+    #[must_use]
+    pub fn kind(&self) -> Kind {
+        self.kind
+    }
+
     /// Oldest required observation start, never verification completion time.
     #[must_use]
     pub fn verified_at(&self) -> u64 {
@@ -137,8 +146,8 @@ impl Proof {
     }
     /// Observed child incarnation.
     #[must_use]
-    pub fn tunnel(&self) -> &Tunnel {
-        &self.tunnel
+    pub fn tunnel(&self) -> Option<&Tunnel> {
+        self.tunnel.as_ref()
     }
     /// Expected normalized read-back identity.
     #[must_use]
@@ -152,8 +161,8 @@ impl Proof {
     }
     /// Checked selected local address and complete endpoint-route identity.
     #[must_use]
-    pub fn transport(&self) -> &Transport {
-        &self.transport
+    pub fn transport(&self) -> Option<&Transport> {
+        self.transport.as_ref()
     }
     /// Expiry fixed by the verifier and checked by every consumer.
     #[must_use]
@@ -163,6 +172,7 @@ impl Proof {
 }
 /// Enforcement status; tunnel handshake health is deliberately absent.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)] // Proofs stay inline for the pure transition API.
 pub enum Verdict {
     /// Constructible only by successful complete verification.
     Protected(Proof),
@@ -501,12 +511,54 @@ fn walk_filter(
     stack.remove(path);
     Ok(())
 }
+/// Semantic mismatch in a planned anchor read-back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum MismatchKind {
+    /// No rules were returned.
+    #[error("empty anchor read-back")]
+    Empty,
+    /// The terminating quick block is absent.
+    #[error("missing final block")]
+    FinalBlock,
+    /// A non-pass statement precedes the final block.
+    #[error("unexpected anchor statement")]
+    Statement,
+    /// Expanded permissions differ from the planned policy.
+    #[error("anchor read-back policy mismatch")]
+    Policy,
+}
+/// Normalization feature that has not been qualified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum UnqualifiedKind {
+    /// Named ICMP printing.
+    #[error("unqualified ICMP normalization")]
+    Icmp,
+    /// Implicit state or TCP flags.
+    #[error("unqualified anchor state/flags")]
+    StateFlags,
+    /// Rule list expansion.
+    #[error("unqualified list expansion")]
+    ListExpansion,
+}
+/// Typed planned-capture failure; observation errors never become mismatches.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum CaptureError {
+    /// A parsed policy differs from the intended policy.
+    #[error("{0}")]
+    Mismatch(MismatchKind),
+    /// Interpretation requires an unqualified normalization feature.
+    #[error("{0}")]
+    Unqualified(UnqualifiedKind),
+    /// The read-back could not be parsed.
+    #[error("{0}")]
+    Parse(#[from] Error),
+}
 /// Immutable expected normalized read-back for one planned policy generation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Baseline {
     text: String,
     hash: [u8; 32],
-    inputs: Inputs,
+    inputs: Option<Inputs>,
     form: Form,
     normalization: Normalization,
 }
@@ -521,30 +573,41 @@ impl Baseline {
         inputs: &Inputs,
         form: Form,
         normalization: &Normalization,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, CaptureError> {
+        Self::capture_policy(readback, Policy::Installed(inputs, form), normalization)
+    }
+    /// Capture the exact read-back of either policy kind after a planned load.
+    ///
+    /// # Errors
+    /// Rejects incomplete or semantically different anchor rules.
+    pub fn capture_policy(
+        readback: &Rules,
+        policy: Policy<'_>,
+        normalization: &Normalization,
+    ) -> Result<Self, CaptureError> {
         if readback.uses_named_icmp() && !normalization.named_icmp {
-            return Err(Error("unqualified ICMP normalization"));
+            return Err(CaptureError::Unqualified(UnqualifiedKind::Icmp));
         }
         let mut actual = Vec::new();
         let Some((last, preceding)) = readback.rules().split_last() else {
-            return Err(Error("empty anchor read-back"));
+            return Err(CaptureError::Mismatch(MismatchKind::Empty));
         };
         if *last != (Rule::Block { quick: true }) {
-            return Err(Error("missing final block"));
+            return Err(CaptureError::Mismatch(MismatchKind::FinalBlock));
         }
         for rule in preceding {
             let Rule::Pass(pass) = rule else {
-                return Err(Error("unexpected anchor statement"));
+                return Err(CaptureError::Mismatch(MismatchKind::Statement));
             };
             if pass.state == State::Implicit
                 || (pass.tcp_flags
                     && (!normalization.implicit_tcp_flags || pass.state != State::IfBound))
             {
-                return Err(Error("unqualified anchor state/flags"));
+                return Err(CaptureError::Unqualified(UnqualifiedKind::StateFlags));
             }
             actual.extend(pass.expanded());
         }
-        let expected = policy::policy_table(inputs, form);
+        let expected = policy::policy_table(policy);
         if !normalization.expanded_lists {
             let passes: Vec<_> = preceding
                 .iter()
@@ -561,40 +624,65 @@ impl Baseline {
                 })
                 .collect();
             if passes != expected {
-                return Err(Error("unqualified list expansion"));
+                return Err(CaptureError::Unqualified(UnqualifiedKind::ListExpansion));
             }
         }
         let expected: Vec<_> = expected.iter().flat_map(policy::Pass::expanded).collect();
         if actual != expected {
-            return Err(Error("anchor read-back policy mismatch"));
+            return Err(CaptureError::Mismatch(MismatchKind::Policy));
         }
         let text = readback.normalized().to_owned();
         let hash = Sha256::digest(text.as_bytes()).into();
         Ok(Self {
             text,
             hash,
-            inputs: inputs.clone(),
-            form,
+            inputs: match policy {
+                Policy::Installed(inputs, _) => Some(inputs.clone()),
+                Policy::Lockdown => None,
+            },
+            form: match policy {
+                Policy::Installed(_, form) => form,
+                Policy::Lockdown => Form::PreTunnel,
+            },
             normalization: normalization.clone(),
         })
     }
     pub(super) fn interfaces(&self) -> BTreeSet<PhysicalInterface> {
-        self.inputs.physical().keys().cloned().collect()
+        self.inputs
+            .iter()
+            .flat_map(|i| i.physical().keys().cloned())
+            .collect()
     }
     pub(super) fn same_stateful_permissions(&self, other: &Self) -> bool {
         let stateful = |b: &Self| {
-            policy::policy_table(&b.inputs, b.form)
+            policy::policy_table(b.policy())
                 .into_iter()
                 .filter(|pass| pass.state != State::None)
                 .collect::<Vec<_>>()
         };
-        self.form == other.form
+        self.kind() == other.kind()
             && self.normalization == other.normalization
-            && self.inputs.selected() == other.inputs.selected()
-            && self.inputs.endpoint() == other.inputs.endpoint()
-            && self.inputs.tunnel() == other.inputs.tunnel()
-            && self.inputs.hop_limit() == other.inputs.hop_limit()
+            && match (&self.inputs, &other.inputs) {
+                (Some(a), Some(b)) => {
+                    a.selected() == b.selected()
+                        && a.endpoint() == b.endpoint()
+                        && a.tunnel() == b.tunnel()
+                        && a.hop_limit() == b.hop_limit()
+                }
+                (None, None) => true,
+                _ => false,
+            }
             && stateful(self) == stateful(other)
+    }
+    /// Exact expected policy kind.
+    #[must_use]
+    pub fn kind(&self) -> Kind {
+        self.policy().kind()
+    }
+    fn policy(&self) -> Policy<'_> {
+        self.inputs
+            .as_ref()
+            .map_or(Policy::Lockdown, |i| Policy::Installed(i, self.form))
     }
     /// Intended policy form, checked during planned capture.
     #[must_use]
@@ -764,13 +852,18 @@ fn check(o: &Observations, e: &Expected, now: u64) -> Result<Verdict, Reason> {
     if let StepOutcome::Failed(reason) = o.step {
         return Err(Reason::Observation(reason));
     }
+    let observed_at = match check_global(o, &e.qualification, Kind::Installed(e.form), now) {
+        Err(Reason::Observation("interface inventory race")) => {
+            return Ok(Verdict::Unknown {
+                since: o.started_at.values().min().copied().unwrap_or(now),
+            });
+        }
+        other => other?,
+    };
     let pf = read(&o.pf)?;
     let anchor = read(&o.anchor)?;
-    let main = read(&o.main)?;
-    let translation = read(&o.translation)?;
     let tree = read(&o.live_tree)?;
     let interfaces = read(&o.interfaces)?;
-    let skips = read(&o.skips)?;
     let dns = read(&o.dns)?;
     let route = read(&o.route)?;
     let local_address = *read(&o.local_address)?;
@@ -785,37 +878,7 @@ fn check(o: &Observations, e: &Expected, now: u64) -> Result<Verdict, Reason> {
     if dns.is_empty() {
         return Err(Reason::Observation("missing resolver evidence"));
     }
-    let required = required_reads(tree);
-    if o.started_at.keys().cloned().collect::<BTreeSet<_>>() != required {
-        return Err(Reason::Observation("missing required observation start"));
-    }
-    let observed_at = *o
-        .started_at
-        .values()
-        .min()
-        .ok_or(Reason::Observation("missing observation times"))?;
-    if o.started_at.values().any(|t| *t > now) {
-        return Err(Reason::Observation("observation from future"));
-    }
-    let before = o.started_at["inventory-before"];
-    let after = o.started_at["inventory-after"];
-    if before > after
-        || tree.before.names().iter().any(|name| {
-            ["filter", "nat"].iter().any(|kind| {
-                let time = o.started_at[&format!("{name}:{kind}")];
-                time < before || time > after
-            })
-        })
-    {
-        return Err(Reason::Observation("anchor collection order"));
-    }
     check_qualification(o, e)?;
-    if let Err(reason) = walk_path(main, translation, tree, interfaces, skips, &e.qualification) {
-        if reason == Reason::Observation("interface inventory race") {
-            return Ok(Verdict::Unknown { since: observed_at });
-        }
-        return Err(reason);
-    }
     if route.route_to != std::net::IpAddr::V4(e.inputs.endpoint().address()) {
         return Err(Reason::Observation("route lookup target mismatch"));
     }
@@ -862,7 +925,7 @@ fn check(o: &Observations, e: &Expected, now: u64) -> Result<Verdict, Reason> {
     if !pf.enabled {
         return Ok(Verdict::Repair(Action::EnableAndRejoin));
     }
-    if e.baseline.inputs != e.inputs
+    if e.baseline.inputs.as_ref() != Some(&e.inputs)
         || e.baseline.form != e.form
         || e.baseline.normalization != e.qualification.normalization
     {
@@ -870,16 +933,8 @@ fn check(o: &Observations, e: &Expected, now: u64) -> Result<Verdict, Reason> {
             "baseline belongs to different policy generation",
         ));
     }
-    let exact = anchor.as_ref().is_some_and(|rules| {
-        rules.normalized() == e.baseline.text
-            && <[u8; 32]>::from(Sha256::digest(rules.normalized().as_bytes())) == e.baseline.hash
-    });
-    if !exact {
-        return Ok(Verdict::Repair(Action::Rejoin));
-    }
-    let own_live = read(&tree.anchors[OWN].rules)?;
-    if own_live.normalized() != e.baseline.text {
-        return Ok(Verdict::Repair(Action::Rejoin));
+    if let Some(verdict) = check_anchor(anchor.as_ref(), tree, &e.baseline)? {
+        return Ok(verdict);
     }
     if e.form == Form::Joined {
         match &o.identity {
@@ -909,11 +964,11 @@ fn check(o: &Observations, e: &Expected, now: u64) -> Result<Verdict, Reason> {
         {
             return Err(Reason::Unsupported("unqualified physical service"));
         }
-        let same_stateful = policy::policy_table(inputs, e.form)
+        let same_stateful = policy::policy_table(Policy::Installed(inputs, e.form))
             .into_iter()
             .filter(|p| p.state != State::None)
             .collect::<Vec<_>>()
-            == policy::policy_table(&e.inputs, e.form)
+            == policy::policy_table(Policy::Installed(&e.inputs, e.form))
                 .into_iter()
                 .filter(|p| p.state != State::None)
                 .collect::<Vec<_>>();
@@ -939,11 +994,210 @@ fn check(o: &Observations, e: &Expected, now: u64) -> Result<Verdict, Reason> {
         expires_at: stale_at,
         context: e.context,
         form: e.form,
-        tunnel: e.inputs.tunnel().clone(),
+        tunnel: Some(e.inputs.tunnel().clone()),
+        kind: Kind::Installed(e.form),
         baseline_hash: e.baseline.hash(),
         states_clean_at: completed_at,
-        transport,
+        transport: Some(transport),
     }))
+}
+/// Input-free expected lockdown verification. Qualification comes from the
+/// platform's reviewed OS record, never from an unreadable installation record.
+pub struct LockdownExpected {
+    /// Observation identity captured before collection.
+    pub context: Context,
+    /// Planned exact lockdown read-back.
+    pub baseline: Baseline,
+    /// Reviewed firewall qualification.
+    pub qualification: Qualification,
+    /// Maximum age in the sleep-counting clock domain.
+    pub max_age: u64,
+}
+/// Check the effective blocking policy before enabling pf. This checks the
+/// qualified invocation path, anchor and observation age without requiring pf
+/// to be running or manufacturing a protection proof.
+///
+/// # Errors
+/// Rejects incomplete, stale, unreachable or mismatched policy observations.
+pub fn verify_lockdown_policy(
+    o: &Observations,
+    e: &LockdownExpected,
+    clock: &impl SleepCountingClock,
+) -> Result<(), Reason> {
+    let now = clock.now();
+    let observed_at = check_global_policy(o, &e.qualification, Kind::Lockdown, now)?;
+    if e.baseline.kind() != Kind::Lockdown
+        || e.baseline.normalization != e.qualification.normalization
+        || now > observed_at.saturating_add(e.max_age)
+    {
+        return Err(Reason::Observation("blocking policy unavailable"));
+    }
+    if check_anchor(read(&o.anchor)?.as_ref(), read(&o.live_tree)?, &e.baseline)?.is_some() {
+        return Err(Reason::Observation("blocking policy mismatch"));
+    }
+    Ok(())
+}
+/// Verify lockdown with all the same global checks as installed policies.
+#[must_use]
+pub fn verify_lockdown(
+    o: &Observations,
+    e: &LockdownExpected,
+    clock: &impl SleepCountingClock,
+) -> Verdict {
+    let now = clock.now();
+    let result = (|| {
+        let observed_at = match check_global(o, &e.qualification, Kind::Lockdown, now) {
+            Err(Reason::Observation("interface inventory race")) => {
+                return Ok(Verdict::Unknown {
+                    since: o.started_at.values().min().copied().unwrap_or(now),
+                });
+            }
+            other => other?,
+        };
+        if e.baseline.kind() != Kind::Lockdown
+            || e.baseline.normalization != e.qualification.normalization
+        {
+            return Err(Reason::Observation(
+                "baseline belongs to different policy generation",
+            ));
+        }
+        if !read(&o.pf)?.enabled {
+            return Ok(Verdict::Repair(Action::EnableAndRejoin));
+        }
+        if let Some(verdict) =
+            check_anchor(read(&o.anchor)?.as_ref(), read(&o.live_tree)?, &e.baseline)?
+        {
+            return Ok(verdict);
+        }
+        let expires_at = observed_at.saturating_add(e.max_age);
+        if now > expires_at || o.step == StepOutcome::Unavailable {
+            return Ok(Verdict::Unknown { since: expires_at });
+        }
+        let StateEvidence::Clean {
+            epoch,
+            completed_at,
+        } = o.states
+        else {
+            return Ok(Verdict::Unknown { since: observed_at });
+        };
+        if epoch != e.context.state_epoch || completed_at > observed_at {
+            return Ok(Verdict::Unknown { since: observed_at });
+        }
+        Ok(Verdict::Protected(Proof {
+            verified_at: observed_at,
+            completed_at: now,
+            expires_at,
+            context: e.context,
+            form: Form::PreTunnel,
+            kind: Kind::Lockdown,
+            tunnel: None,
+            transport: None,
+            baseline_hash: e.baseline.hash(),
+            states_clean_at: completed_at,
+        }))
+    })();
+    let completed = clock.now();
+    match result {
+        _ if completed < now => Verdict::NotProtected(Reason::Observation("clock regressed")),
+        Ok(Verdict::Protected(mut p)) if completed <= p.expires_at => {
+            p.completed_at = completed;
+            Verdict::Protected(p)
+        }
+        Ok(Verdict::Protected(p)) => Verdict::Unknown {
+            since: p.expires_at,
+        },
+        Ok(v) => v,
+        Err(r) => Verdict::NotProtected(r),
+    }
+}
+fn check_global(
+    o: &Observations,
+    qualification: &Qualification,
+    kind: Kind,
+    now: u64,
+) -> Result<u64, Reason> {
+    if let StepOutcome::Failed(reason) = o.step {
+        return Err(Reason::Observation(reason));
+    }
+    check_global_policy(o, qualification, kind, now)
+}
+
+// Static policy observations can guide pre-enable containment beside stale
+// writers. Only check_global's separate effect fence can publish a proof.
+fn check_global_policy(
+    o: &Observations,
+    qualification: &Qualification,
+    kind: Kind,
+    now: u64,
+) -> Result<u64, Reason> {
+    read(&o.pf)?;
+    read(&o.anchor)?;
+    let main = read(&o.main)?;
+    let translation = read(&o.translation)?;
+    let tree = read(&o.live_tree)?;
+    let interfaces = read(&o.interfaces)?;
+    let skips = read(&o.skips)?;
+    let required = if kind == Kind::Lockdown {
+        required_lockdown_reads(tree)
+    } else {
+        required_reads(tree)
+    };
+    if o.started_at.keys().cloned().collect::<BTreeSet<_>>() != required {
+        return Err(Reason::Observation("missing required observation start"));
+    }
+    let observed_at = *o
+        .started_at
+        .values()
+        .min()
+        .ok_or(Reason::Observation("missing observation times"))?;
+    if o.started_at.values().any(|t| *t > now) {
+        return Err(Reason::Observation("observation from future"));
+    }
+    let before = o.started_at["inventory-before"];
+    let after = o.started_at["inventory-after"];
+    if before > after
+        || tree.before.names().iter().any(|name| {
+            ["filter", "nat"].iter().any(|kind| {
+                let time = o.started_at[&format!("{name}:{kind}")];
+                time < before || time > after
+            })
+        })
+    {
+        return Err(Reason::Observation("anchor collection order"));
+    }
+    if o.os_build.is_empty() || o.os_build != qualification.os_build {
+        return Err(Reason::Unsupported("unqualified OS build"));
+    }
+    walk_path(main, translation, tree, interfaces, skips, qualification)?;
+    Ok(observed_at)
+}
+fn check_anchor(
+    anchor: Option<&Rules>,
+    tree: &LiveTree,
+    baseline: &Baseline,
+) -> Result<Option<Verdict>, Reason> {
+    let exact = anchor.as_ref().is_some_and(|rules| {
+        rules.normalized() == baseline.text
+            && <[u8; 32]>::from(Sha256::digest(rules.normalized().as_bytes())) == baseline.hash
+    });
+    if !exact {
+        return Ok(Some(Verdict::Repair(Action::Rejoin)));
+    }
+    let own_live = read(&tree.anchors[OWN].rules)?;
+    if own_live.normalized() != baseline.text {
+        return Ok(Some(Verdict::Repair(Action::Rejoin)));
+    }
+    Ok(None)
+}
+/// Capture an input-free lockdown baseline from the exact planned read-back.
+///
+/// # Errors
+/// Rejects any anchor other than the qualified lockdown policy.
+pub fn capture_lockdown_baseline(
+    text: &str,
+    normalization: &Normalization,
+) -> Result<Baseline, CaptureError> {
+    Baseline::capture_policy(&parse::pf_rules(text)?, Policy::Lockdown, normalization)
 }
 /// Required start-time keys, derived from the live tree rather than a caller's aggregate.
 #[must_use]
@@ -974,6 +1228,24 @@ pub fn required_reads(tree: &LiveTree) -> BTreeSet<String> {
     for name in tree.before.names() {
         reads.insert(format!("{name}:filter"));
         reads.insert(format!("{name}:nat"));
+    }
+    reads
+}
+/// Only actual global reads are required without installation metadata.
+#[must_use]
+pub fn required_lockdown_reads(tree: &LiveTree) -> BTreeSet<String> {
+    let mut reads = required_reads(tree);
+    for key in [
+        "dns",
+        "route",
+        "local-address",
+        "policy",
+        "identity",
+        "path",
+        "tools",
+        "hop-limit",
+    ] {
+        reads.remove(key);
     }
     reads
 }
@@ -1009,6 +1281,148 @@ pub fn capture_baseline(
     inputs: &Inputs,
     form: Form,
     normalization: &Normalization,
-) -> Result<Baseline, Error> {
+) -> Result<Baseline, CaptureError> {
     Baseline::capture(&parse::pf_rules(text)?, inputs, form, normalization)
+}
+
+#[cfg(test)]
+mod policy_kind_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use crate::mac::lifecycle::{Durable, Event, Machine, Step};
+    struct Clock;
+    impl SleepCountingClock for Clock {
+        fn now(&self) -> u64 {
+            100
+        }
+    }
+    fn capture_error(text: &str) -> CaptureError {
+        capture_lockdown_baseline(
+            text,
+            &Normalization {
+                expanded_lists: true,
+                named_icmp: true,
+                implicit_tcp_flags: true,
+            },
+        )
+        .unwrap_err()
+    }
+    #[test]
+    fn capture_empty_is_typed_mismatch() {
+        assert_eq!(
+            capture_error(""),
+            CaptureError::Mismatch(MismatchKind::Empty)
+        );
+    }
+    #[test]
+    fn capture_missing_final_block_is_typed_mismatch() {
+        assert_eq!(
+            capture_error("pass all\n"),
+            CaptureError::Mismatch(MismatchKind::FinalBlock)
+        );
+    }
+    #[test]
+    fn capture_unexpected_statement_is_typed_mismatch() {
+        assert_eq!(
+            capture_error("anchor \"foreign/target\" all\nblock drop quick all\n"),
+            CaptureError::Mismatch(MismatchKind::Statement)
+        );
+    }
+    #[test]
+    fn capture_extra_permission_is_typed_mismatch() {
+        let extra = policy::render_lockdown().as_str().replace(
+            "block drop quick all",
+            "pass out quick all keep state (if-bound)\nblock drop quick all",
+        );
+        assert_eq!(
+            capture_error(&extra),
+            CaptureError::Mismatch(MismatchKind::Policy)
+        );
+    }
+    #[test]
+    fn capture_parse_failure_is_not_a_semantic_mismatch() {
+        assert!(matches!(
+            capture_error("unknown output"),
+            CaptureError::Parse(_)
+        ));
+    }
+    #[test]
+    fn held_verify_requires_policy_kind_even_if_other_evidence_matches() {
+        let mut machine = Machine::restart_lockdown(Durable {
+            join_intended: true,
+            hold: true,
+            uncertain_acquires: vec![1, 2],
+            reference_sequence: 2,
+            ..Durable::default()
+        });
+        machine = machine
+            .transition(Event::Failed(Reason::Observation("reference debt")), &Clock)
+            .unwrap();
+        assert_eq!(machine.pending(), Some(Step::LoadPreTunnel));
+        machine = machine
+            .transition(Event::Completed(Step::LoadPreTunnel), &Clock)
+            .unwrap();
+        let normalization = Normalization {
+            expanded_lists: false,
+            named_icmp: false,
+            implicit_tcp_flags: false,
+        };
+        let baseline =
+            capture_lockdown_baseline(policy::render_lockdown().as_str(), &normalization).unwrap();
+        machine = machine
+            .transition(Event::ReadbackValidated(baseline.clone()), &Clock)
+            .unwrap();
+        machine = machine
+            .transition(
+                Event::StatesClean {
+                    epoch: machine.context().state_epoch,
+                    completed_at: 100,
+                },
+                &Clock,
+            )
+            .unwrap();
+        // Private-field fixture independently pins the kind guard. Its other
+        // fields intentionally match, so the baseline hash cannot hide a missing
+        // kind check. No production constructor can create this malformed proof.
+        let mut proof = Proof {
+            verified_at: 100,
+            completed_at: 100,
+            expires_at: 105,
+            context: machine.context(),
+            form: Form::PreTunnel,
+            kind: Kind::Installed(Form::PreTunnel),
+            tunnel: None,
+            transport: None,
+            baseline_hash: baseline.hash(),
+            states_clean_at: 100,
+        };
+        assert!(
+            machine
+                .transition(
+                    Event::Observed {
+                        context: machine.context(),
+                        form: Form::PreTunnel,
+                        verdict: Verdict::Protected(proof.clone())
+                    },
+                    &Clock
+                )
+                .is_err()
+        );
+        proof.kind = Kind::Lockdown;
+        let next = machine
+            .transition(
+                Event::Observed {
+                    context: machine.context(),
+                    form: Form::PreTunnel,
+                    verdict: Verdict::Protected(proof),
+                },
+                &Clock,
+            )
+            .unwrap();
+        assert!(next.blocking_verified_at(&Clock));
+        assert!(!matches!(
+            next.enforcement_at(&Clock),
+            Verdict::Protected(_)
+        ));
+    }
 }

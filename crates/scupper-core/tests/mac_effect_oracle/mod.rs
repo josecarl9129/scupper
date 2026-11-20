@@ -18,6 +18,7 @@ enum Effect {
     Joined,
     PfDisabled,
     Leave,
+    Hold,
     StaleRoundAccepted(bool),
 }
 
@@ -43,6 +44,7 @@ struct Oracle {
     voided: BTreeSet<u64>,
     uncertain: BTreeSet<u64>,
     leaving: bool,
+    held: bool,
     pf_enabled: bool,
     same_instant: usize,
     last_time: u64,
@@ -53,6 +55,14 @@ impl Oracle {
         self.serial += 1;
         match effect {
             Effect::Dispatch(step, now) => {
+                assert!(
+                    !self.held
+                        || !matches!(
+                            step,
+                            Step::CheckTools | Step::ReserveGeneration | Step::StartChild
+                        ),
+                    "held executor exposed the rejoin suffix"
+                );
                 if *now == self.last_time {
                     self.same_instant += 1;
                 } else {
@@ -75,6 +85,13 @@ impl Oracle {
                         ),
                         "fresh loss absorbed at executor boundary: {step:?}"
                     );
+                    if *step == Step::ReconcileReference {
+                        assert!(
+                            self.tokens.len() + self.uncertain.len() >= 2
+                                || !self.uncertain.is_empty(),
+                            "reconciliation preceded safety despite an available acquisition slot"
+                        );
+                    }
                     if *step != Step::ReconcileReference {
                         assert_eq!(
                             Some(*now),
@@ -87,6 +104,10 @@ impl Oracle {
                 }
                 match step {
                     Step::AcquireReference | Step::LoadPreTunnel => {
+                        assert!(
+                            !self.leaving,
+                            "idle/Leave must never acquire or load policy"
+                        );
                         if *step == Step::LoadPreTunnel {
                             assert!(!self.loaded, "overlapping repair prefixes");
                             self.loaded = true;
@@ -111,20 +132,17 @@ impl Oracle {
                         );
                     }
                     Step::ClearIntent => {
-                        assert!(
-                            self.tokens.is_empty(),
-                            "leaked token at ClearIntent: {self:?}"
-                        );
-                        assert!(
-                            self.uncertain.is_empty(),
-                            "uncertain acquisition lost at ClearIntent"
-                        );
+                        assert!(self.leaving, "ClearIntent outside Leave");
                     }
+                    Step::ReleaseReference => panic!("Leave must not plan ReleaseReference"),
                     _ => {}
                 }
             }
             Effect::Finish(step, now, success) => {
                 assert_eq!(self.in_flight.take(), Some(*step));
+                if *success && *step == Step::ClearIntent {
+                    self.held = false;
+                }
                 if !success && *step == Step::ReconcileReference {
                     self.reconcile_after = now + 1;
                 }
@@ -166,6 +184,9 @@ impl Oracle {
                 assert!(self.uncertain.insert(*sequence));
             }
             Effect::Resolve(sequences) => {
+                if !sequences.is_empty() {
+                    self.reconcile_after = 0;
+                }
                 for sequence in sequences {
                     self.uncertain.remove(sequence);
                 }
@@ -181,6 +202,9 @@ impl Oracle {
                 }
             }
             Effect::Void(tokens) => {
+                if !tokens.is_empty() {
+                    self.reconcile_after = 0;
+                }
                 for token in tokens {
                     assert!(self.tokens.remove(token), "void proof for unknown identity");
                     assert!(self.voided.insert(*token), "duplicate void proof");
@@ -210,7 +234,10 @@ impl Oracle {
                 self.rejoin_after = None;
                 self.queued = true;
             }
-            Effect::PfDisabled => self.pf_enabled = false,
+            Effect::PfDisabled => {
+                self.pf_enabled = false;
+                self.reconcile_after = 0;
+            }
             Effect::Joined => {
                 assert!(self.pf_enabled, "Joined while modeled pf is disabled");
                 self.attempts = 0;
@@ -219,7 +246,9 @@ impl Oracle {
             Effect::StaleRoundAccepted(accepted) => {
                 assert!(!accepted, "pre-acquire monitor round accepted");
             }
+            Effect::Hold => self.held = true,
             Effect::Leave => {
+                self.reconcile_after = 0;
                 self.leaving = true;
                 self.queued = false;
                 self.must_dispatch = false;
@@ -278,8 +307,75 @@ impl Executor {
         self.oracle.read(&effect);
         self.stream.push(effect);
     }
+    fn verdict(&self) -> Verdict {
+        self.machine.enforcement_at(&Clock(self.now()))
+    }
     fn transition(&mut self, event: Event) {
         self.machine = self.machine.transition(event, &Clock(self.now())).unwrap();
+        assert!(
+            self.oracle.pf_enabled || !matches!(self.verdict(), Verdict::Protected(_)),
+            "Protected accepted with modeled pf disabled"
+        );
+    }
+    fn reconcile(&mut self) -> Event {
+        let voided: Vec<_> = self
+            .oracle
+            .tokens
+            .intersection(&self.voidable)
+            .copied()
+            .collect();
+        self.emit(Effect::Void(voided.clone()));
+        for token in voided {
+            self.transition(Event::ReferenceSettled {
+                entry: ReferenceEntry::Token(token),
+                how: ReferenceSettlement::Void,
+            });
+        }
+        // The oracle supplies explicit evidence for every decidable entry.
+        let uncertain = self.machine.durable().uncertain_acquires.clone();
+        self.emit(Effect::Resolve(uncertain.clone()));
+        for sequence in uncertain {
+            self.transition(Event::ReferenceSettled {
+                entry: ReferenceEntry::Acquire(sequence),
+                how: ReferenceSettlement::Void,
+            });
+        }
+        if self.oracle.leaving {
+            assert!(
+                self.machine.connectivity_restored(),
+                "accounting ran before Left"
+            );
+            let tokens: Vec<_> = self.oracle.tokens.iter().copied().collect();
+            self.emit(Effect::Release(tokens.clone(), true));
+            for token in tokens {
+                self.transition(Event::ReferenceSettled {
+                    entry: ReferenceEntry::Token(token),
+                    how: ReferenceSettlement::Released,
+                });
+            }
+        } else if self.machine.durable().pf_reference.is_some() {
+            // Every token in this pure model was acquired in this boot. A fresh
+            // current token permits the normal predecessor release rule.
+            let predecessors = self.machine.durable().older_references.clone();
+            self.emit(Effect::Release(predecessors.clone(), false));
+            for token in predecessors {
+                self.transition(Event::ReferenceSettled {
+                    entry: ReferenceEntry::Token(token),
+                    how: ReferenceSettlement::Released,
+                });
+            }
+        }
+        let mut live = self
+            .machine
+            .durable()
+            .pf_reference
+            .into_iter()
+            .chain(self.machine.durable().older_references.iter().copied());
+        Event::ReferenceReconciled {
+            context: self.machine.context(),
+            current: live.next(),
+            predecessor: live.next(),
+        }
     }
     fn complete(&mut self, fail_verify: bool, fail_suffix: bool) -> bool {
         let Some(step) = self.machine.pending() else {
@@ -327,22 +423,7 @@ impl Executor {
             self.emit(Effect::Acquire(seq, self.token));
             event = Event::ReferenceAcquired(self.token);
         } else if step == Step::ReconcileReference {
-            let voided: Vec<_> = self
-                .oracle
-                .tokens
-                .intersection(&self.voidable)
-                .copied()
-                .collect();
-            self.emit(Effect::Void(voided));
-            let mut live = self.oracle.tokens.iter().copied();
-            event = Event::ReferenceReconciled {
-                context: self.machine.context(),
-                current: live.next(),
-                predecessor: live.next(),
-            };
-            self.emit(Effect::Resolve(
-                self.machine.durable().uncertain_acquires.clone(),
-            ));
+            event = self.reconcile();
         } else if step == Step::ReleaseReference {
             let tokens = self
                 .machine
@@ -363,7 +444,31 @@ impl Executor {
         {
             self.emit(Effect::Joined);
         }
+        let entries = (
+            self.machine.durable().pf_reference,
+            self.machine.durable().older_references.clone(),
+            self.machine.durable().uncertain_acquires.clone(),
+        );
         self.transition(event);
+        if step == Step::ClearIntent {
+            assert!(self.machine.connectivity_restored());
+            assert_eq!(
+                entries,
+                (
+                    self.machine.durable().pf_reference,
+                    self.machine.durable().older_references.clone(),
+                    self.machine.durable().uncertain_acquires.clone()
+                )
+            );
+        }
+        assert!(
+            self.oracle.pf_enabled
+                || !matches!(
+                    self.machine.enforcement_at(&Clock(now)),
+                    Verdict::Protected(_)
+                ),
+            "Protected accepted with modeled pf disabled"
+        );
         self.emit(Effect::Finish(step, now, !failed));
         true
     }
@@ -413,6 +518,7 @@ impl Executor {
         sequence
     }
     fn fail_reconciliation(&mut self) {
+        self.drain(Some(Step::ReconcileReference));
         assert_eq!(self.machine.pending(), Some(Step::ReconcileReference));
         self.emit(Effect::Dispatch(Step::ReconcileReference, self.now()));
         self.transition(Event::Failed(Reason::Observation("unresolved reference")));
@@ -622,12 +728,16 @@ proptest! {
         prop_assert!(u.machine.states_clean_at().is_some());
         u.emit(Effect::Leave);
         u.transition(Event::Leave);
-        // All independent cleanup completes at the same instant, before the debt timer.
-        for _ in 0..16 {
-            if !u.complete(false, false) { break; }
-        }
-        prop_assert!(u.stream.iter().any(|effect| matches!(effect, Effect::Finish(Step::RemoveAnchor, _, true))));
+        // Left completes before any reference accounting, even with an uncertain entry.
+        u.drain(Some(Step::ClearIntent));
+        prop_assert_eq!(&u.machine.durable().uncertain_acquires, &vec![sequence]);
+        let tokens = u.oracle.tokens.clone();
+        prop_assert!(u.complete(false, false));
+        prop_assert!(u.machine.connectivity_restored());
         prop_assert!(!u.machine.cleanup_confirmed());
+        prop_assert_eq!(&u.oracle.tokens, &tokens);
+        prop_assert_eq!(&u.machine.durable().uncertain_acquires, &vec![sequence]);
+        u.fail_reconciliation();
         for _ in 0..3 {
             let Some(Step::Backoff { until }) = u.machine.pending() else { panic!("missing debt cadence") };
             // Disturbances cannot bring reconciliation forward.
@@ -718,4 +828,93 @@ fn repeated_disables_reenable_pf_with_two_slots_and_account_for_proven_void_toke
     e.drain(None);
     e.assert_accounted();
     assert!(e.machine.cleanup_confirmed());
+}
+
+#[test]
+fn recovery_hold_effects_never_spawn_and_leave_without_waiting_for_references() {
+    let mut e = Executor::new();
+    e.machine = Machine::restart(Durable {
+        join_intended: true,
+        hold: true,
+        ..Durable::default()
+    });
+    e.emit(Effect::Hold);
+    e.drain(None);
+    for kind in 0..3 {
+        e.loss(Action::Rejoin);
+        e.drain(Some(Step::VerifyPreTunnel));
+        e.fail_verification(kind);
+        e.drain(None);
+        assert!(e.machine.blocking_verified_at(&Clock(e.now())));
+        assert!(!matches!(e.verdict(), Verdict::Protected(_)));
+    }
+    e.emit(Effect::Leave);
+    e.transition(Event::Leave);
+    e.drain(None);
+    assert!(e.machine.cleanup_confirmed());
+    assert!(!e.machine.durable().hold);
+    assert!(!e.stream.iter().any(|effect| matches!(
+        effect,
+        Effect::Dispatch(
+            Step::CheckTools | Step::ReserveGeneration | Step::StartChild,
+            _
+        )
+    )));
+}
+
+#[test]
+fn recovery_hold_disabled_pf_frees_both_uncertain_slots_and_restores_blocking() {
+    let mut e = Executor::new();
+    e.machine = Machine::restart(Durable {
+        join_intended: true,
+        hold: true,
+        uncertain_acquires: vec![1, 2],
+        reference_sequence: 2,
+        ..Durable::default()
+    });
+    e.emit(Effect::Hold);
+    e.oracle.uncertain.extend([1, 2]);
+    // Another product keeps pf enabled, so the restart's accounting attempt
+    // cannot decide either reservation. It fails without parking the prefix.
+    e.oracle.pf_enabled = true;
+    e.emit(Effect::Dispatch(Step::ReconcileReference, e.now()));
+    e.transition(Event::Failed(Reason::Observation("other product owns pf")));
+    e.emit(Effect::Finish(Step::ReconcileReference, e.now(), false));
+    let timer = Step::Backoff { until: e.now() + 1 };
+    e.drain(Some(timer));
+    assert!(e.machine.blocking_verified_at(&Clock(e.now())));
+    assert_eq!(e.machine.plan(), [timer, Step::ReconcileReference]);
+
+    // The last external reference disappears during the accounting Backoff.
+    let disabled_at = e.now();
+    e.emit(Effect::PfDisabled);
+    e.transition(observed(
+        &e.machine,
+        Form::PreTunnel,
+        Verdict::Repair(Action::EnableAndRejoin),
+    ));
+    assert_eq!(e.machine.pending(), Some(Step::ReconcileReference));
+    let start = e.stream.len();
+    e.drain(None);
+    let effects = &e.stream[start..];
+    assert!(
+        matches!(effects.first(), Some(Effect::Dispatch(Step::ReconcileReference, at)) if *at <= disabled_at + 1)
+    );
+    let dispatch = |target| {
+        effects
+            .iter()
+            .position(|effect| matches!(effect, Effect::Dispatch(step, _) if *step == target))
+            .unwrap()
+    };
+    assert!(dispatch(Step::ReconcileReference) < dispatch(Step::AcquireReference));
+    assert!(dispatch(Step::AcquireReference) < dispatch(Step::LoadPreTunnel));
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Resolve(entries) if entries == &[1, 2]))
+    );
+    assert!(e.oracle.pf_enabled);
+    assert_eq!(e.oracle.tokens.len(), 1);
+    assert!(e.oracle.uncertain.is_empty());
+    assert!(e.machine.blocking_verified_at(&Clock(e.now())));
 }

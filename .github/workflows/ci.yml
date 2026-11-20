@@ -182,6 +182,10 @@ jobs:
   macos:
     runs-on: macos-15
     timeout-minutes: 30
+    env:
+      CARGO_PROFILE_TEST_OPT_LEVEL: 1
+      CARGO_BUILD_JOBS: 2
+      RUST_TEST_THREADS: 2
     steps:
       - uses: actions/checkout@v4
         with:
@@ -191,9 +195,10 @@ jobs:
       - name: Format
         run: env -u CARGO_TARGET_TMPDIR cargo fmt --all -- --check
       - name: Clippy portable CLI and release tooling
-        run: env -u CARGO_TARGET_TMPDIR cargo clippy -p scupper -p scupper-core -p scupper-proto -p xtask --all-targets --locked -- -D warnings
+        run: env -u CARGO_TARGET_TMPDIR cargo clippy -p scupper -p scupper-core -p scupper-proto -p scupper-mac -p xtask --all-targets --locked -- -D warnings
       - name: Portable tests
-        run: env -u CARGO_TARGET_TMPDIR cargo test -p scupper -p scupper-core -p scupper-proto -p xtask --locked
+        timeout-minutes: 15
+        run: env -u CARGO_TARGET_TMPDIR cargo test -p scupper -p scupper-core -p scupper-proto -p scupper-mac -p xtask --locked
       - name: Build CLI archive
         run: env -u CARGO_TARGET_TMPDIR cargo xtask dist --target aarch64-apple-darwin
       - name: Verify version commands

@@ -5,8 +5,8 @@
 use proptest::prelude::*;
 use scupper_core::mac::{
     lifecycle::{
-        ClosingRetry, ConnectionStatus, Durable, Event, Machine, ReferenceIntent, Step,
-        TunnelHealth,
+        ClosingRetry, ConnectionStatus, Durable, Event, Machine, ReferenceEntry, ReferenceIntent,
+        ReferenceSettlement, Step, TunnelHealth,
     },
     parse::{self, Rule},
     policy::{self, Direction, Form, State},
@@ -270,7 +270,7 @@ fn section14_goldens_all_forms_and_dhcp_phases() {
 #[test]
 fn policy_table_is_exact_nd_and_bounded_underlay() {
     let inputs = inputs(false, true);
-    let table = policy::policy_table(&inputs, Form::Joined);
+    let table = policy::policy_table(policy::Policy::Installed(&inputs, Form::Joined));
     assert_eq!(table.len(), 17); // lo + 2 utun + 2 endpoint + 4 DHCP + 8 ND
     let nd: Vec<_> = table.iter().filter(|r| r.icmp6_type.is_some()).collect();
     assert_eq!(nd.len(), 8);
@@ -878,7 +878,7 @@ fn assert_protected(o: &Observations, e: &Expected, now: u64) {
     assert_eq!(proof.completed_at(), now);
     assert_eq!(proof.context(), e.context);
     assert_eq!(proof.form(), e.form);
-    assert_eq!(proof.tunnel(), e.inputs.tunnel());
+    assert_eq!(proof.tunnel(), Some(e.inputs.tunnel()));
     assert_eq!(proof.baseline_hash(), e.baseline.hash());
 }
 
@@ -1281,10 +1281,19 @@ fn complete_event(m: &Machine, generation: u64) -> Event {
         Step::AcquireReference => {
             Event::ReferenceAcquired(m.durable().pf_reference.unwrap_or(100) + 1)
         }
+        Step::ReconcileReference if !m.durable().uncertain_acquires.is_empty() => {
+            Event::Failed(Reason::Observation("unresolved acquisition debt"))
+        }
         Step::ReconcileReference => Event::ReferenceReconciled {
             context: m.context(),
-            current: m.durable().pf_reference,
-            predecessor: m.durable().older_references.first().copied(),
+            current: m
+                .durable()
+                .pf_reference
+                .or_else(|| m.durable().older_references.first().copied()),
+            predecessor: m
+                .durable()
+                .pf_reference
+                .and_then(|_| m.durable().older_references.first().copied()),
         },
         Step::ReserveGeneration => Event::GenerationReserved(tunnel(generation).generation),
         Step::StartChild => Event::ChildStarted(tunnel(generation)),
@@ -1327,9 +1336,10 @@ fn complete_event(m: &Machine, generation: u64) -> Event {
 }
 fn finish(mut m: Machine, generation: u64) -> Machine {
     for _ in 0..60 {
-        if m.pending().is_none() {
+        if m.pending().is_none() || m.connectivity_restored() {
             return m;
         }
+        m = settle_modeled_predecessors(m, 99);
         m = m
             .fixture_transition(complete_event(&m, generation))
             .unwrap();
@@ -1526,7 +1536,7 @@ fn leave_during_every_repair_boundary_suppresses_rejoin_and_ignores_verification
             .unwrap();
         assert_eq!(leaving.pending(), pending);
         leaving = finish(Machine::restart(leaving.durable().clone()), 3);
-        assert!(leaving.cleanup_confirmed());
+        assert!(leaving.connectivity_restored());
         m = m.fixture_transition(complete_event(&m, 2)).unwrap();
     }
 }
@@ -1556,14 +1566,13 @@ fn cleanup_attempts_every_owned_step_after_failures_and_remains_resumable() {
             Step::CleanupRoutes,
             Step::CleanupDns,
             Step::CleanupArtifacts,
-            Step::RemoveAnchor,
-            Step::ReleaseReference
+            Step::RemoveAnchor
         ]
     );
     assert_eq!(m.durable().pending_cleanup, attempted);
     assert_eq!(m.durable().cleanup_errors.len(), attempted.len());
     assert!(m.durable().pf_reference.is_some());
-    assert!(m.durable().leaving && !m.cleanup_confirmed());
+    assert!(m.durable().leaving && !m.connectivity_restored());
     assert!(
         m.fixture_transition(Event::Completed(Step::ClearIntent))
             .is_err()
@@ -1583,7 +1592,7 @@ fn cleanup_attempts_every_owned_step_after_failures_and_remains_resumable() {
     assert!(m.durable().leaving);
     m = Machine::restart(m.durable().clone());
     m = finish(m, 2);
-    assert!(m.cleanup_confirmed());
+    assert!(m.connectivity_restored());
     assert!(m.durable().pending_cleanup.is_empty() && m.durable().cleanup_errors.is_empty());
     let idle = Machine::restart(Durable::default())
         .fixture_transition(Event::Leave)
@@ -1592,7 +1601,7 @@ fn cleanup_attempts_every_owned_step_after_failures_and_remains_resumable() {
         .fixture_transition(Event::Completed(Step::PersistLeaving))
         .unwrap();
     assert_eq!(idle.pending(), Some(Step::ClearIntent));
-    assert!(finish(idle, 1).cleanup_confirmed());
+    assert!(finish(idle, 1).connectivity_restored());
 }
 #[test]
 fn failed_leaving_persistence_retries_without_conflicting_cleanup() {
@@ -1601,10 +1610,10 @@ fn failed_leaving_persistence_retries_without_conflicting_cleanup() {
         .fixture_transition(Event::Failed(Reason::Observation("journal unavailable")))
         .unwrap();
     assert!(!m.durable().leaving);
-    assert!(!m.cleanup_confirmed());
+    assert!(!m.connectivity_restored());
     let m = m.fixture_transition(Event::Leave).unwrap();
     assert_eq!(m.pending(), Some(Step::PersistLeaving));
-    assert!(finish(m, 2).cleanup_confirmed());
+    assert!(finish(m, 2).connectivity_restored());
 }
 #[test]
 fn negative_observations_during_configuration_invalidate_status_and_cancel_at_boundary() {
@@ -1844,6 +1853,8 @@ proptest! {
             };
             let proof = match &event { Event::Observed { verdict: Verdict::Protected(p), .. } => Some(p.clone()), _ => None };
             let gap = match &event {
+                // Ownership-only reconciliation failure does not change enforcement.
+                Event::Failed(_) if m.pending() == Some(Step::ReconcileReference) => None,
                 Event::Failed(_) | Event::Observed { verdict: Verdict::NotProtected(_), .. } => Some(now),
                 Event::InvalidateObservations { since } | Event::Observed { verdict: Verdict::Unknown { since }, .. } => Some(*since),
                 _ => None,
@@ -1867,7 +1878,7 @@ proptest! {
                 prop_assert_eq!(m.installed_form(), Some(p.form()));
                 prop_assert_eq!(checked_flush, Some((p.context().state_epoch, p.states_clean_at())));
                 prop_assert!(p.states_clean_at() >= last_gap, "flush {} predates gap {} at {}", p.states_clean_at(), last_gap, now);
-                if p.form() == Form::Joined { prop_assert_eq!(m.tunnel(), Some(p.tunnel())); }
+                if p.form() == Form::Joined { prop_assert_eq!(m.tunnel(), p.tunnel()); }
                 prop_assert!(!m.durable().leaving);
             }
             if m.durable().leaving {
@@ -2068,8 +2079,8 @@ fn cleanup_final_journal_failure_is_incomplete_and_does_not_spin() {
         .fixture_transition(Event::Failed(Reason::Observation("clear journal failed")))
         .unwrap();
     assert_eq!(m.pending(), None);
-    assert!(m.durable().leaving && !m.cleanup_confirmed());
-    assert!(finish(Machine::restart(m.durable().clone()), 2).cleanup_confirmed());
+    assert!(m.durable().leaving && !m.connectivity_restored());
+    assert!(finish(Machine::restart(m.durable().clone()), 2).connectivity_restored());
 }
 
 #[test]
@@ -2124,7 +2135,7 @@ fn a_leave_request_survives_restart_while_repair_is_still_settling() {
     assert_eq!(m.status_at(&Clock(102)), ConnectionStatus::Leaving);
     let restarted = Machine::restart(m.durable().clone());
     assert_eq!(restarted.pending(), Some(Step::PersistLeaving));
-    assert!(finish(restarted, 2).cleanup_confirmed());
+    assert!(finish(restarted, 2).connectivity_restored());
     assert_eq!(
         Reason::TranslationPresent.to_string(),
         "pf translation present"
@@ -2720,6 +2731,27 @@ fn checked_completion_at(m: &Machine, now: u64) -> Event {
     }
 }
 
+// Fair fixture executors have same-boot evidence for these modeled tokens.
+// Production summaries alone cannot discard them: send exact settlements first.
+fn settle_modeled_predecessors(mut m: Machine, now: u64) -> Machine {
+    if m.pending() == Some(Step::ReconcileReference)
+        && m.durable().pf_reference.is_some()
+        && m.durable().join_intended
+        && !m.durable().leave_requested
+        && !m.durable().leaving
+    {
+        for token in m.durable().older_references.clone() {
+            m = settled(
+                &m,
+                ReferenceEntry::Token(token),
+                ReferenceSettlement::Released,
+                now,
+            );
+        }
+    }
+    m
+}
+
 #[test]
 #[allow(clippy::too_many_lines)] // Exercise both recovery modes at every interrupted boundary.
 fn aborted_join_and_recover_resume_automatically_until_joined() {
@@ -2829,6 +2861,49 @@ fn aborted_join_and_recover_resume_automatically_until_joined() {
     }
 }
 
+#[test]
+fn recovered_reference_reconciliation_clears_its_error_after_joined() {
+    let mut m = Machine::restart(joined().durable().clone());
+    let mut now = 102;
+    if m.pending() == Some(Step::PersistIntent) {
+        m = property_transition(&m, Event::Completed(Step::PersistIntent), now);
+    }
+    for _ in 0..24 {
+        if m.pending().is_none() {
+            break;
+        }
+        now = executor_time(&m, now + 1);
+        m = settle_modeled_predecessors(m, now);
+        m = property_transition(&m, checked_completion_at(&m, now), now);
+    }
+    now = executor_time(&m, now + 1);
+    assert_eq!(m.pending(), Some(Step::ReconcileReference));
+    assert!(
+        matches!(m.enforcement_at(&Clock(now)), Verdict::Protected(p) if p.form() == Form::Joined)
+    );
+    m = property_transition(&m, Event::Failed(Reason::Observation("effect failed")), now);
+    assert_eq!(m.failure(), Some(&Reason::Observation("effect failed")));
+    assert!(m.durable().reference_error.is_some());
+    assert!(
+        matches!(m.enforcement_at(&Clock(now)), Verdict::Protected(p) if p.form() == Form::Joined)
+    );
+    for _ in 0..160 {
+        if m.pending().is_none() {
+            break;
+        }
+        now = executor_time(&m, now + 1);
+        m = settle_modeled_predecessors(m, now);
+        m = property_transition(&m, checked_completion_at(&m, now), now);
+    }
+    assert_eq!(m.pending(), None);
+    assert!(
+        matches!(m.enforcement_at(&Clock(now)), Verdict::Protected(p) if p.form() == Form::Joined)
+    );
+    assert_eq!(m.failure(), None);
+    assert!(m.durable().reference_error.is_none());
+    assert_eq!(m.durable().older_references, [] as [u64; 0]);
+}
+
 proptest! {
     #[test]
     fn join_intent_never_parks_pre_tunnel_and_fair_completion_reaches_joined(
@@ -2850,6 +2925,7 @@ proptest! {
         for _ in 0..initial_completions {
             if m.pending().is_none() { break; }
             now = executor_time(&m, now + 1);
+            m = settle_modeled_predecessors(m, now);
             m = property_transition(&m, checked_completion_at(&m, now), now);
         }
         for disturbance in disturbances {
@@ -2882,6 +2958,7 @@ proptest! {
         for _ in 0..100 {
             if m.pending().is_none() { break; }
             now = executor_time(&m, now + 1);
+            m = settle_modeled_predecessors(m, now);
             let event = if persistent_failure && m.pending() == Some(fault) {
                 Event::Failed(Reason::Observation("persistent executor failure"))
             } else {
@@ -2898,6 +2975,13 @@ proptest! {
         for _ in 0..60 {
             if m.pending().is_none() { break; }
             now = executor_time(&m, now + 1);
+            if m.pending() == Some(Step::ReconcileReference) {
+                // This fault model proves the synthetic lost acquire had no effect.
+                for sequence in m.durable().uncertain_acquires.clone() {
+                    m = settled(&m, ReferenceEntry::Acquire(sequence), ReferenceSettlement::Void, now);
+                }
+                m = settle_modeled_predecessors(m, now);
+            }
             m = property_transition(&m, checked_completion_at(&m, now), now);
         }
         prop_assert_eq!(m.pending(), None);
@@ -2909,10 +2993,11 @@ proptest! {
 // Zero-duration checked effects exercise the worst possible retry rate.
 fn drive_to(mut m: Machine, target: Option<Step>, now: &mut u64) -> Machine {
     for _ in 0..100 {
-        if m.pending() == target {
+        if m.pending() == target || target.is_none() && m.connectivity_restored() {
             return m;
         }
         *now = executor_time(&m, *now);
+        m = settle_modeled_predecessors(m, *now);
         m = m
             .transition(checked_completion_at(&m, *now), &Clock(*now))
             .unwrap();
@@ -3015,7 +3100,7 @@ fn leave_cancels_backoff_immediately_and_completed_leave_resets_retries() {
         Some(Step::PersistLeaving)
     );
     m = drive_to(m, None, &mut now);
-    assert!(m.cleanup_confirmed());
+    assert!(m.connectivity_restored());
     assert_eq!(m.failure(), None);
     m = m.transition(Event::Join, &Clock(now)).unwrap();
     m = drive_to(m, Some(Step::CheckTools), &mut now);
@@ -3181,8 +3266,11 @@ fn restart_preserves_retry_counter_and_waits_after_fresh_safety_prefix() {
     let (mut m, mut now) = capped_backoff();
     for _ in 0..3 {
         now += 1_000; // Restart is not clock zero and may occur after the old deadline.
-        m = Machine::restart(m.durable().clone());
-        assert_eq!(m.pending(), Some(Step::LoadPreTunnel));
+        let mut durable = m.durable().clone();
+        durable.pf_reference = None;
+        durable.older_references.clear();
+        m = Machine::restart(durable);
+        assert_eq!(m.pending(), Some(Step::AcquireReference));
         assert_eq!(m.durable().retry_attempts, 7);
         m = drive_to_backoff(m, &mut now);
         assert_eq!(m.pending(), Some(Step::Backoff { until: now + 60 }));
@@ -3718,7 +3806,7 @@ fn unknown_enforcement_does_not_replace_a_connection_failure_and_restart_drops_c
 }
 
 #[test]
-fn unresolved_reference_operations_reconcile_before_another_acquisition_and_leave_releases_all() {
+fn unresolved_reference_operations_reconcile_before_another_acquisition_and_leave_retains_all() {
     let mut now = 102;
     let m = Machine::restart(Durable::default())
         .transition(Event::Join, &Clock(now))
@@ -3754,6 +3842,7 @@ fn unresolved_reference_operations_reconcile_before_another_acquisition_and_leav
     );
     // Two potentially live tokens are retained; replans never take a third.
     let mut durable = joined().durable().clone();
+    durable.pf_reference = Some(501);
     durable.older_references = vec![500];
     durable.reference_intent = Some(ReferenceIntent::Release);
     let r = Machine::restart(durable);
@@ -3770,13 +3859,14 @@ fn unresolved_reference_operations_reconcile_before_another_acquisition_and_leav
     assert_eq!(r.pending(), Some(Step::LoadPreTunnel));
     assert_eq!(r.durable().older_references.len(), 1);
     r = drive_to(r, None, &mut now);
+    assert_eq!(r.durable().older_references, [] as [u64; 0]);
     r = r.transition(Event::Leave, &Clock(now)).unwrap();
-    r = drive_to(r, Some(Step::ReleaseReference), &mut now);
+    r = drive_to(r, Some(Step::ClearIntent), &mut now);
     assert_eq!(r.durable().pf_reference, Some(501));
-    assert_eq!(r.durable().older_references, vec![500]);
-    assert_eq!(r.durable().reference_intent, Some(ReferenceIntent::Release));
+    assert_eq!(r.durable().older_references, [] as [u64; 0]);
+    assert_eq!(r.durable().reference_intent, None);
     r = drive_to(r, None, &mut now);
-    assert!(r.cleanup_confirmed());
+    assert!(r.connectivity_restored());
 }
 
 #[test]
@@ -3936,13 +4026,22 @@ fn disable_during_in_flight_acquire_reconciles_ordering_before_reusing_the_token
     m = m
         .transition(Event::ReferenceAcquired(501), &Clock(now))
         .unwrap();
-    assert_eq!(m.pending(), Some(Step::ReconcileReference));
+    assert_eq!(m.pending(), Some(Step::LoadPreTunnel));
     assert_eq!(m.durable().pf_reference, Some(501)); // possibly live: never discard on guessed ordering
     assert_eq!(m.durable().reference_intent, None);
     assert!(m.durable().reference_needs_reconcile);
     let restarted = Machine::restart(m.durable().clone());
     assert_eq!(restarted.pending(), Some(Step::ReconcileReference));
     // Executor proves the acquisition preceded the stop, making this token void.
+    let restarted = restarted
+        .transition(
+            Event::ReferenceSettled {
+                entry: ReferenceEntry::Token(501),
+                how: ReferenceSettlement::Void,
+            },
+            &Clock(now),
+        )
+        .unwrap();
     let m = restarted
         .transition(
             Event::ReferenceReconciled {
@@ -3980,7 +4079,7 @@ fn disable_during_leave_retains_tokens_and_records_evidence_without_starting_rep
     );
     assert_eq!(next.durable().older_references, [] as [u64; 0]);
     let mut now = now;
-    assert!(drive_to(next, None, &mut now).cleanup_confirmed());
+    assert!(drive_to(next, None, &mut now).connectivity_restored());
 }
 
 #[test]
@@ -4164,10 +4263,10 @@ fn late_predecessor_during_disabled_replacement_keeps_both_acquisitions_and_the_
     assert_eq!(m.durable().older_references, [701]);
     assert!(m.durable().reference_needs_reconcile);
     m = m.transition(Event::Leave, &Clock(now)).unwrap();
-    m = drive_to(m, Some(Step::ReleaseReference), &mut now);
+    m = drive_to(m, Some(Step::ClearIntent), &mut now);
     assert_eq!(m.durable().pf_reference, Some(702));
     assert_eq!(m.durable().older_references, [701]);
-    assert!(drive_to(m, None, &mut now).cleanup_confirmed());
+    assert!(drive_to(m, None, &mut now).connectivity_restored());
 }
 
 #[test]
@@ -4190,7 +4289,8 @@ fn failed_reconcile_then_another_disable_never_exposes_an_unjournaled_acquire() 
     m = m
         .transition(Event::ReferenceAcquired(701), &Clock(now))
         .unwrap();
-    assert_eq!(m.pending(), Some(Step::ReconcileReference));
+    assert_eq!(m.pending(), Some(Step::LoadPreTunnel));
+    m = drive_to(m, Some(Step::ReconcileReference), &mut now);
     assert_eq!(m.durable().reference_intent, None);
     m = m
         .transition(
@@ -4198,7 +4298,7 @@ fn failed_reconcile_then_another_disable_never_exposes_an_unjournaled_acquire() 
             &Clock(now),
         )
         .unwrap();
-    assert_eq!(m.pending(), Some(Step::LoadPreTunnel));
+    assert_eq!(m.pending(), Some(Step::VerifyPreTunnel));
     m = m
         .transition(
             observed(
@@ -4208,9 +4308,6 @@ fn failed_reconcile_then_another_disable_never_exposes_an_unjournaled_acquire() 
             ),
             &Clock(now),
         )
-        .unwrap();
-    m = m
-        .transition(Event::Completed(Step::LoadPreTunnel), &Clock(now))
         .unwrap();
     assert_eq!(m.pending(), Some(Step::AcquireReference));
     assert_eq!(
@@ -4223,7 +4320,7 @@ fn failed_reconcile_then_another_disable_never_exposes_an_unjournaled_acquire() 
     assert_eq!(m.durable().pf_reference, Some(702));
     assert_eq!(m.durable().older_references, [701]);
     m = m.transition(Event::Leave, &Clock(now)).unwrap();
-    assert!(drive_to(m, None, &mut now).cleanup_confirmed());
+    assert!(drive_to(m, None, &mut now).connectivity_restored());
 }
 
 #[test]
@@ -4247,7 +4344,8 @@ fn reconcile_started_before_acquisition_completion_cannot_void_that_identity() {
     m = m
         .transition(Event::ReferenceAcquired(701), &Clock(now))
         .unwrap();
-    assert_eq!(m.pending(), Some(Step::ReconcileReference));
+    assert_eq!(m.pending(), Some(Step::LoadPreTunnel));
+    m = drive_to(m, Some(Step::ReconcileReference), &mut now);
     assert!(
         m.transition(
             Event::ReferenceReconciled {
@@ -4260,6 +4358,15 @@ fn reconcile_started_before_acquisition_completion_cannot_void_that_identity() {
         .is_err()
     );
     assert_eq!(m.durable().pf_reference, Some(701));
+    let m = m
+        .transition(
+            Event::ReferenceSettled {
+                entry: ReferenceEntry::Token(701),
+                how: ReferenceSettlement::Void,
+            },
+            &Clock(now),
+        )
+        .unwrap();
     let m = m
         .transition(
             Event::ReferenceReconciled {
@@ -4312,6 +4419,34 @@ fn first_prefix_and_replacement_disable_repair_at_the_very_next_effect_boundary(
             .unwrap();
         assert_eq!(m.pending(), Some(target));
         m = m.transition(completion, &Clock(now)).unwrap();
+        if m.pending() == Some(Step::ReconcileReference) {
+            for token in m
+                .durable()
+                .pf_reference
+                .into_iter()
+                .chain(m.durable().older_references.clone())
+            {
+                m = m
+                    .transition(
+                        Event::ReferenceSettled {
+                            entry: ReferenceEntry::Token(token),
+                            how: ReferenceSettlement::Void,
+                        },
+                        &Clock(now),
+                    )
+                    .unwrap();
+            }
+            m = m
+                .transition(
+                    Event::ReferenceReconciled {
+                        context: m.context(),
+                        current: None,
+                        predecessor: None,
+                    },
+                    &Clock(now),
+                )
+                .unwrap();
+        }
         assert_eq!(m.pending(), Some(Step::AcquireReference), "mode {mode}");
         assert_eq!(
             drive_to(m, None, &mut now).status_at(&Clock(now)),
@@ -4597,7 +4732,7 @@ fn setup_wake_and_rerender_do_not_increment_the_rejoin_failure_counter() {
 }
 
 #[test]
-fn late_acquire_resolving_the_last_debt_clears_the_reference_error() {
+fn late_acquire_keeps_reference_error_until_the_predecessor_is_settled() {
     let mut now = 102;
     let m = Machine::restart(Durable::default())
         .transition(Event::Join, &Clock(now))
@@ -4628,6 +4763,22 @@ fn late_acquire_resolving_the_last_debt_clears_the_reference_error() {
             &Clock(now),
         )
         .unwrap();
+    assert_eq!(m.durable().older_references, [702]);
+    assert!(m.durable().reference_error.is_some());
+    m = m
+        .transition(Event::InvalidateObservations { since: now }, &Clock(now))
+        .unwrap();
+    assert!(m.durable().reference_error.is_some());
+    assert!(
+        m.status_text_at(&Clock(now))
+            .contains("ownership cleanup debt")
+    );
+    m = settled(
+        &m,
+        ReferenceEntry::Token(702),
+        ReferenceSettlement::Released,
+        now,
+    );
     assert!(m.durable().reference_error.is_none());
     assert!(
         !m.status_text_at(&Clock(now))
@@ -4674,21 +4825,3233 @@ fn leave_persists_and_removes_the_anchor_before_reconciling_ownership_debt() {
     m = m
         .transition(Event::Completed(Step::RemoveAnchor), &Clock(now))
         .unwrap();
+    assert_eq!(m.pending(), Some(Step::ClearIntent));
+    m = m
+        .transition(Event::Completed(Step::ClearIntent), &Clock(now))
+        .unwrap();
+    assert!(m.connectivity_restored());
     assert_eq!(m.pending(), Some(Step::ReconcileReference));
 }
 
 #[test]
-fn leave_restart_after_anchor_removal_reconciles_before_exposing_release() {
+fn leave_restart_after_anchor_removal_clears_intent_before_reconciliation() {
     let m = Machine::restart(Durable {
         leaving: true,
         pf_reference: Some(701),
         reference_needs_reconcile: true,
-        pending_cleanup: vec![Step::ReleaseReference],
+        pending_cleanup: vec![],
         ..Durable::default()
     });
+    assert_eq!(m.pending(), Some(Step::ClearIntent));
+    assert_eq!(m.plan(), &[Step::ClearIntent]);
+}
+
+#[test]
+fn reconciliation_accepts_monitor_revision_but_retains_disable_debt() {
+    let mut now = 102;
+    let mut durable = joined().durable().clone();
+    durable.older_references = vec![77];
+    durable.reference_needs_reconcile = true;
+    let mut m = Machine::restart(durable);
     assert_eq!(m.pending(), Some(Step::ReconcileReference));
+    let captured = m.context();
+    m = m
+        .transition(
+            observed(
+                &m,
+                Form::PreTunnel,
+                Verdict::Repair(Action::EnableAndRejoin),
+            ),
+            &Clock(now),
+        )
+        .unwrap();
+    assert_ne!(m.context().lifecycle_revision, captured.lifecycle_revision);
+    let token = m.durable().pf_reference.unwrap();
+    m = m
+        .transition(
+            Event::ReferenceSettled {
+                entry: ReferenceEntry::Token(token),
+                how: ReferenceSettlement::Void,
+            },
+            &Clock(now),
+        )
+        .unwrap();
+    let captured = Context {
+        acquisition_revision: m.context().acquisition_revision,
+        ..captured
+    };
+    m = m
+        .transition(
+            Event::ReferenceReconciled {
+                context: captured,
+                current: Some(77),
+                predecessor: None,
+            },
+            &Clock(now),
+        )
+        .unwrap();
+    // The disable observed during reconciliation is still owed: a live token
+    // is not evidence that pf was re-enabled after the observed stop.
+    assert_eq!(m.pending(), Some(Step::AcquireReference));
+    assert!(matches!(
+        m.durable().reference_intent,
+        Some(ReferenceIntent::Acquire(_))
+    ));
+    m = m
+        .transition(checked_completion_at(&m, now), &Clock(now))
+        .unwrap();
+    assert_eq!(m.pending(), Some(Step::LoadPreTunnel));
+    assert_eq!(
+        drive_to(m, None, &mut now).status_at(&Clock(now)),
+        ConnectionStatus::Joined
+    );
+}
+#[test]
+fn fresh_disabled_acquire_runs_safety_before_reconciliation() {
+    let mut now = 102;
+    let mut m = Machine::restart(Durable::default())
+        .transition(Event::Join, &Clock(now))
+        .unwrap();
+    m = drive_to(m, Some(Step::AcquireReference), &mut now);
+    let mut order = vec![Step::AcquireReference];
+    m = m
+        .transition(
+            observed(
+                &m,
+                Form::PreTunnel,
+                Verdict::Repair(Action::EnableAndRejoin),
+            ),
+            &Clock(now),
+        )
+        .unwrap();
+    m = m
+        .transition(Event::ReferenceAcquired(700), &Clock(now))
+        .unwrap();
+    for _ in 0..10 {
+        let step = m.pending().unwrap();
+        order.push(step);
+        if step == Step::ReconcileReference {
+            break;
+        }
+        m = m
+            .transition(checked_completion_at(&m, now), &Clock(now))
+            .unwrap();
+    }
+    assert_eq!(
+        order,
+        vec![
+            Step::AcquireReference,
+            Step::LoadPreTunnel,
+            Step::VerifyPreTunnelLoad,
+            Step::FlushStates,
+            Step::ReconcileReference
+        ]
+    );
+}
+
+#[test]
+fn idle_states_clean_maintenance_acceptance_is_bounded_by_epoch_time_and_mode() {
+    let m = joined();
+    assert!(m.pending().is_none());
+    let epoch = m.context().state_epoch;
+    let refreshed = m
+        .transition(
+            Event::StatesClean {
+                epoch,
+                completed_at: 103,
+            },
+            &Clock(103),
+        )
+        .unwrap();
+    assert_eq!(refreshed.states_clean_at(), Some(103));
+    assert_eq!(refreshed.durable(), m.durable());
+    assert!(refreshed.pending().is_none());
+    for (epoch, completed_at, now) in [(epoch + 1, 103, 103), (epoch, 104, 103), (epoch, 0, 103)] {
+        assert!(
+            m.transition(
+                Event::StatesClean {
+                    epoch,
+                    completed_at
+                },
+                &Clock(now)
+            )
+            .is_err()
+        );
+    }
+    for event in [
+        Event::Leave,
+        Event::Repair(Action::Rejoin),
+        Event::InvalidateObservations { since: 103 },
+    ] {
+        let changed = m.transition(event, &Clock(103)).unwrap();
+        assert!(
+            changed
+                .transition(
+                    Event::StatesClean {
+                        epoch,
+                        completed_at: 103
+                    },
+                    &Clock(103)
+                )
+                .is_err()
+        );
+    }
+    let left = Machine::restart(Durable::default());
+    assert!(
+        left.transition(
+            Event::StatesClean {
+                epoch: left.context().state_epoch,
+                completed_at: 103
+            },
+            &Clock(103)
+        )
+        .is_err()
+    );
+}
+
+fn settled(m: &Machine, entry: ReferenceEntry, how: ReferenceSettlement, now: u64) -> Machine {
+    m.transition(Event::ReferenceSettled { entry, how }, &Clock(now))
+        .unwrap()
+}
+
+#[test]
+fn leave_preserves_every_reference_field_and_finishes_before_idle_accounting() {
+    let mut m = Machine::restart(Durable {
+        leaving: true,
+        leave_requested: true,
+        pf_reference: Some(71),
+        uncertain_acquires: vec![8],
+        reference_sequence: 8,
+        reference_needs_reconcile: true,
+        reference_error: Some(Reason::Observation("retained debt")),
+        pending_cleanup: vec![
+            Step::StopChild,
+            Step::CleanupRoutes,
+            Step::CleanupDns,
+            Step::CleanupArtifacts,
+            Step::RemoveAnchor,
+        ],
+        ..Durable::default()
+    });
+    let entries = m.durable().clone();
+    for step in [
+        Step::StopChild,
+        Step::CleanupRoutes,
+        Step::CleanupDns,
+        Step::CleanupArtifacts,
+        Step::RemoveAnchor,
+        Step::ClearIntent,
+    ] {
+        assert_eq!(m.pending(), Some(step));
+        assert!(!m.plan().contains(&Step::ReleaseReference));
+        assert!(!m.plan().contains(&Step::ReconcileReference));
+        m = m.transition(Event::Completed(step), &Clock(100)).unwrap();
+    }
+    assert!(m.connectivity_restored());
+    assert!(!m.cleanup_confirmed());
+    assert_eq!(m.status_at(&Clock(100)), ConnectionStatus::Idle);
+    assert_eq!(m.durable().pf_reference, entries.pf_reference);
+    assert_eq!(m.durable().uncertain_acquires, entries.uncertain_acquires);
+    assert_eq!(m.durable().reference_sequence, entries.reference_sequence);
+    assert_eq!(m.durable().reference_error, entries.reference_error);
+    assert_eq!(
+        m.durable().reference_needs_reconcile,
+        entries.reference_needs_reconcile
+    );
+    assert_eq!(m.pending(), Some(Step::ReconcileReference));
+    m = settled(
+        &m,
+        ReferenceEntry::Token(71),
+        ReferenceSettlement::Released,
+        100,
+    );
+    m = settled(
+        &m,
+        ReferenceEntry::Acquire(8),
+        ReferenceSettlement::Void,
+        100,
+    );
+    m = m.transition(complete_event(&m, 1), &Clock(100)).unwrap();
+    assert!(m.cleanup_confirmed());
+}
+
+#[test]
+fn idle_reference_reconciliation_retries_double_to_sixty_and_never_acquire() {
+    for durable in [
+        Durable {
+            pf_reference: Some(71),
+            ..Durable::default()
+        },
+        Durable {
+            older_references: vec![72],
+            ..Durable::default()
+        },
+        Durable {
+            uncertain_acquires: vec![8],
+            reference_sequence: 8,
+            ..Durable::default()
+        },
+    ] {
+        let mut m = Machine::restart(durable);
+        let mut now = 0;
+        for delay in [1, 2, 4, 8, 16, 32, 60, 60] {
+            assert_eq!(m.pending(), Some(Step::ReconcileReference));
+            assert!(!m.plan().contains(&Step::AcquireReference));
+            m = m
+                .transition(
+                    Event::Failed(Reason::Observation("not decidable")),
+                    &Clock(now),
+                )
+                .unwrap();
+            assert!(m.connectivity_restored());
+            assert_eq!(m.status_at(&Clock(now)), ConnectionStatus::Idle);
+            assert_eq!(m.pending(), Some(Step::Backoff { until: now + delay }));
+            assert!(
+                m.transition(Event::Completed(m.pending().unwrap()), &Clock(now))
+                    .is_err()
+            );
+            now += delay;
+            m = m
+                .transition(Event::Completed(m.pending().unwrap()), &Clock(now))
+                .unwrap();
+        }
+    }
+}
+
+#[test]
+fn joined_reference_reconciliation_retries_stay_at_one_second() {
+    let mut durable = joined().durable().clone();
+    durable.reference_needs_reconcile = true;
+    let mut m = Machine::restart(durable);
+    let mut now = 102;
+    for _ in 0..8 {
+        m = drive_to(m, Some(Step::ReconcileReference), &mut now);
+        m = m
+            .transition(
+                Event::Failed(Reason::Observation("not decidable")),
+                &Clock(now),
+            )
+            .unwrap();
+        let failed_at = now;
+        m = drive_to(m, Some(Step::ReconcileReference), &mut now);
+        assert_eq!(now, failed_at + 1);
+        assert_eq!(m.pending(), Some(Step::ReconcileReference));
+    }
+}
+
+#[test]
+fn settlement_removes_exactly_the_named_entry_for_every_disposition_and_mode() {
+    for how in [
+        ReferenceSettlement::Released,
+        ReferenceSettlement::Absent,
+        ReferenceSettlement::Void,
+    ] {
+        for leaving in [false, true] {
+            let base = Machine::restart(Durable {
+                pf_reference: Some(71),
+                older_references: vec![72],
+                leaving,
+                ..Durable::default()
+            });
+            for token in [71, 72] {
+                let before = base.context().acquisition_revision;
+                let m = settled(&base, ReferenceEntry::Token(token), how, 100);
+                assert_eq!(
+                    m.durable().pf_reference,
+                    if token == 71 { None } else { Some(71) }
+                );
+                assert_eq!(
+                    m.durable().older_references,
+                    if token == 72 { vec![] } else { vec![72] }
+                );
+                assert_eq!(m.context().acquisition_revision, before + 1);
+                assert_eq!(
+                    m.durable().verification_context.acquisition_revision,
+                    before + 1
+                );
+                assert!(
+                    m.transition(
+                        Event::ReferenceSettled {
+                            entry: ReferenceEntry::Token(token),
+                            how
+                        },
+                        &Clock(100)
+                    )
+                    .is_err()
+                );
+            }
+            let base = Machine::restart(Durable {
+                uncertain_acquires: vec![7, 8],
+                reference_sequence: 8,
+                leaving,
+                ..Durable::default()
+            });
+            for sequence in [7, 8] {
+                let m = settled(&base, ReferenceEntry::Acquire(sequence), how, 100);
+                assert_eq!(
+                    m.durable().uncertain_acquires,
+                    if sequence == 7 { vec![8] } else { vec![7] }
+                );
+                assert_eq!(
+                    m.context().acquisition_revision,
+                    base.context().acquisition_revision + 1
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn settlement_rejects_active_acquisition_and_does_not_confuse_token_and_sequence() {
+    let m = Machine::restart(Durable::default())
+        .transition(Event::Join, &Clock(100))
+        .unwrap();
+    let m = m
+        .transition(Event::Completed(Step::PersistIntent), &Clock(100))
+        .unwrap();
+    let Some(ReferenceIntent::Acquire(sequence)) = m.durable().reference_intent else {
+        panic!("missing reservation")
+    };
+    assert!(
+        m.transition(
+            Event::ReferenceSettled {
+                entry: ReferenceEntry::Token(sequence),
+                how: ReferenceSettlement::Absent,
+            },
+            &Clock(100)
+        )
+        .is_err()
+    );
+    assert!(
+        m.transition(
+            Event::ReferenceSettled {
+                entry: ReferenceEntry::Acquire(sequence),
+                how: ReferenceSettlement::Void,
+            },
+            &Clock(100)
+        )
+        .is_err()
+    );
+    let m = m
+        .transition(
+            Event::Failed(Reason::Observation("unknown acquire")),
+            &Clock(100),
+        )
+        .unwrap();
+    let m = settled(
+        &m,
+        ReferenceEntry::Acquire(sequence),
+        ReferenceSettlement::Void,
+        100,
+    );
+    assert_ne!(
+        m.durable().reference_intent,
+        Some(ReferenceIntent::Acquire(sequence))
+    );
+    assert!(m.plan().contains(&Step::AcquireReference));
+    assert_eq!(m.durable().uncertain_acquires, [] as [u64; 0]);
+}
+
+#[test]
+fn reference_error_clearing_preserves_other_errors_and_resurfaces_enforcement() {
+    let reference = Reason::Observation("reference failure");
+    let other = Reason::Observation("different failure");
+    let enforcement = Reason::Observation("enforcement failure");
+    for last in [reference.clone(), other.clone()] {
+        let mut m = Machine::restart(Durable {
+            reference_needs_reconcile: true,
+            reference_error: Some(reference.clone()),
+            last_error: Some(last.clone()),
+            enforcement_error: Some(enforcement.clone()),
+            ..Durable::default()
+        });
+        assert_eq!(m.pending(), Some(Step::ReconcileReference));
+        m = m
+            .transition(
+                Event::ReferenceReconciled {
+                    context: m.context(),
+                    current: None,
+                    predecessor: None,
+                },
+                &Clock(10),
+            )
+            .unwrap();
+        assert!(m.durable().reference_error.is_none());
+        assert_eq!(
+            m.failure(),
+            Some(if last == reference {
+                &enforcement
+            } else {
+                &other
+            })
+        );
+        assert_eq!(m.durable().enforcement_error, Some(enforcement.clone()));
+    }
+}
+
+#[test]
+fn settlement_invalidates_reconciliation_and_clears_only_the_last_debt_error() {
+    let mut m = Machine::restart(Durable {
+        pf_reference: Some(71),
+        uncertain_acquires: vec![8],
+        reference_sequence: 8,
+        reference_error: Some(Reason::Observation("debt")),
+        ..Durable::default()
+    });
+    let captured = m.context();
+    m = settled(
+        &m,
+        ReferenceEntry::Acquire(8),
+        ReferenceSettlement::Void,
+        10,
+    );
+    assert!(m.durable().reference_error.is_some());
+    assert!(
+        m.transition(
+            Event::ReferenceReconciled {
+                context: captured,
+                current: Some(71),
+                predecessor: None,
+            },
+            &Clock(10)
+        )
+        .is_err()
+    );
+    m = settled(
+        &m,
+        ReferenceEntry::Token(71),
+        ReferenceSettlement::Absent,
+        10,
+    );
+    assert!(m.durable().reference_error.is_none());
+    assert!(!m.durable().reference_needs_reconcile);
+    m = m.transition(complete_event(&m, 1), &Clock(10)).unwrap();
+    assert!(m.cleanup_confirmed());
+}
+
+#[test]
+fn reconciliation_requires_settlement_of_uncertainty_and_cannot_drop_or_invent_tokens() {
+    let m = Machine::restart(Durable {
+        pf_reference: Some(71),
+        uncertain_acquires: vec![8],
+        reference_sequence: 8,
+        ..Durable::default()
+    });
+    let reconcile = |m: &Machine, current| Event::ReferenceReconciled {
+        context: m.context(),
+        current,
+        predecessor: None,
+    };
+    assert!(m.transition(reconcile(&m, Some(71)), &Clock(10)).is_err());
+    let m = settled(
+        &m,
+        ReferenceEntry::Acquire(8),
+        ReferenceSettlement::Void,
+        10,
+    );
+    assert!(m.transition(reconcile(&m, None), &Clock(10)).is_err());
+    assert!(m.transition(reconcile(&m, Some(72)), &Clock(10)).is_err());
+    let m = m.transition(reconcile(&m, Some(71)), &Clock(10)).unwrap();
+    assert_eq!(m.pending(), Some(Step::Backoff { until: 11 }));
+}
+
+#[test]
+fn settling_last_joined_reference_requires_a_new_acquisition_and_resets_idle_delay() {
+    let mut durable = joined().durable().clone();
+    durable.reference_needs_reconcile = true;
+    let m = Machine::restart(durable);
+    let token = m.durable().pf_reference.unwrap();
+    let m = settled(
+        &m,
+        ReferenceEntry::Token(token),
+        ReferenceSettlement::Absent,
+        100,
+    );
+    let m = m.transition(complete_event(&m, 1), &Clock(100)).unwrap();
+    assert_eq!(m.pending(), Some(Step::AcquireReference));
+    let mut m = Machine::restart(Durable {
+        pf_reference: Some(71),
+        older_references: vec![72],
+        ..Durable::default()
+    });
+    m = m
+        .transition(Event::Failed(Reason::Observation("debt")), &Clock(0))
+        .unwrap();
+    m = m
+        .transition(Event::Completed(m.pending().unwrap()), &Clock(1))
+        .unwrap();
+    m = m
+        .transition(Event::Failed(Reason::Observation("debt")), &Clock(1))
+        .unwrap();
+    assert_eq!(m.pending(), Some(Step::Backoff { until: 3 }));
+    m = settled(
+        &m,
+        ReferenceEntry::Token(72),
+        ReferenceSettlement::Absent,
+        1,
+    );
+    assert_eq!(m.pending(), Some(Step::ReconcileReference));
+    m = m
+        .transition(Event::Failed(Reason::Observation("debt")), &Clock(3))
+        .unwrap();
+    assert_eq!(m.pending(), Some(Step::Backoff { until: 4 }));
+}
+
+proptest! {
+    #[test]
+    fn leave_completion_never_waits_on_reference_entries(
+        tokens in prop::collection::btree_set(1u64..1000, 0..=2),
+        uncertain in 0usize..=2,
+        leaving in any::<bool>(),
+    ) {
+        let tokens: Vec<_> = tokens.into_iter().collect();
+        let uncertain = uncertain.min(2 - tokens.len());
+        let mut m = Machine::restart(Durable {
+            join_intended: !leaving, leaving,
+            pf_reference: tokens.first().copied(), older_references: tokens.iter().skip(1).copied().collect(),
+            uncertain_acquires: (1..=u64::try_from(uncertain).unwrap()).collect(), reference_sequence: 2,
+            pending_cleanup: if leaving { vec![Step::StopChild, Step::CleanupRoutes, Step::CleanupDns, Step::CleanupArtifacts, Step::RemoveAnchor] } else { vec![] },
+            ..Durable::default()
+        });
+        if !leaving {
+            m = m.transition(Event::Leave, &Clock(100)).unwrap();
+            if m.pending() != Some(Step::PersistLeaving) {
+                m = m.transition(Event::Failed(Reason::Observation("cancel active boundary")), &Clock(100)).unwrap();
+            }
+            m = m.transition(Event::Completed(Step::PersistLeaving), &Clock(100)).unwrap();
+        }
+        let entries = (m.durable().pf_reference, m.durable().older_references.clone(), m.durable().uncertain_acquires.clone(), m.durable().reference_intent);
+        for _ in 0..6 {
+            let step = m.pending().unwrap();
+            prop_assert!(matches!(step, Step::StopChild | Step::CleanupRoutes | Step::CleanupDns | Step::CleanupArtifacts | Step::RemoveAnchor | Step::ClearIntent));
+            m = m.transition(Event::Completed(step), &Clock(100)).unwrap();
+            if m.connectivity_restored() { break; }
+        }
+        prop_assert!(m.connectivity_restored());
+        prop_assert_eq!(entries, (m.durable().pf_reference, m.durable().older_references.clone(), m.durable().uncertain_acquires.clone(), m.durable().reference_intent));
+    }
+
+    #[test]
+    fn lifecycle_events_preserve_reference_bound_and_require_a_held_token_for_protection(
+        tokens in prop::collection::btree_set(1u64..1000, 0..=2),
+        uncertain in 0usize..=2,
+        events in prop::collection::vec(0u8..13, 1..100),
+    ) {
+        let tokens: Vec<_> = tokens.into_iter().collect();
+        let uncertain = uncertain.min(2 - tokens.len());
+        let mut m = Machine::restart(Durable {
+            pf_reference: tokens.first().copied(), older_references: tokens.iter().skip(1).copied().collect(),
+            uncertain_acquires: (1..=u64::try_from(uncertain).unwrap()).collect(), reference_sequence: 2,
+            ..Durable::default()
+        });
+        let mut now = 0;
+        for kind in events {
+            now += 1;
+            assert_reference_invariants(&m, now);
+
+            let event = match (kind, m.pending()) {
+                (0, Some(Step::ReconcileReference)) => Event::Failed(Reason::Observation("undecidable")),
+                (1, Some(Step::Backoff { until })) => { now = now.max(until); Event::Completed(Step::Backoff { until }) },
+                (2, _) if m.durable().pf_reference.is_some() => Event::ReferenceSettled { entry: ReferenceEntry::Token(m.durable().pf_reference.unwrap()), how: ReferenceSettlement::Absent },
+                (3, _) if !m.durable().uncertain_acquires.is_empty() => Event::ReferenceSettled { entry: ReferenceEntry::Acquire(m.durable().uncertain_acquires[0]), how: ReferenceSettlement::Void },
+                (4, _) => observed(&m, Form::PreTunnel, Verdict::Repair(Action::EnableAndRejoin)),
+                (5, _) => observed(&m, Form::PreTunnel, Verdict::Unknown { since: now }),
+                (6, Some(Step::ReconcileReference)) => complete_event(&m, 1),
+                (7, _) => Event::Join,
+                (8, _) => Event::Leave,
+                (9, _) => Event::ChildDied,
+                (10, _) => observed(&m, Form::PreTunnel, Verdict::NotProtected(Reason::Observation("lost protection"))),
+                (11, Some(_)) => { now = executor_time(&m, now); checked_completion_at(&m, now) },
+                _ => Event::InvalidateObservations { since: now },
+            };
+            match m.transition(event, &Clock(now)) {
+                Ok(next) => m = next,
+                Err(_) if kind == 7 => {}, // Join is refused during another mutation.
+                Err(error) => panic!("unexpected event {kind} rejection: {error:?}; {m:?}"),
+            }
+        }
+        assert_reference_invariants(&m, now);
+    }
+}
+
+#[test]
+fn idle_empty_reconciliation_never_acquires() {
+    let m = Machine::restart(Durable {
+        pf_reference: Some(71),
+        ..Durable::default()
+    });
+    let m = settled(
+        &m,
+        ReferenceEntry::Token(71),
+        ReferenceSettlement::Released,
+        100,
+    );
+    let m = m.transition(complete_event(&m, 1), &Clock(100)).unwrap();
+    assert_eq!(m.pending(), None);
+    assert!(m.connectivity_restored());
+    assert!(m.cleanup_confirmed());
+    assert_eq!(m.durable().reference_intent, None);
+}
+
+#[test]
+fn idle_reference_retry_resets_on_disabled_transition_and_mode_changes() {
+    let mut m = Machine::restart(Durable {
+        pf_reference: Some(71),
+        ..Durable::default()
+    });
+    for now in [0, 1, 3] {
+        if matches!(m.pending(), Some(Step::Backoff { .. })) {
+            m = m
+                .transition(Event::Completed(m.pending().unwrap()), &Clock(now))
+                .unwrap();
+        }
+        m = m
+            .transition(
+                Event::Failed(Reason::Observation("undecidable")),
+                &Clock(now),
+            )
+            .unwrap();
+    }
+    assert_eq!(m.pending(), Some(Step::Backoff { until: 7 }));
+    let m = m
+        .transition(
+            observed(
+                &m,
+                Form::PreTunnel,
+                Verdict::Repair(Action::EnableAndRejoin),
+            ),
+            &Clock(3),
+        )
+        .unwrap();
+    assert_eq!(m.pending(), Some(Step::ReconcileReference));
+    assert!(!m.plan().contains(&Step::AcquireReference));
+    let m = m
+        .transition(Event::Failed(Reason::Observation("undecidable")), &Clock(3))
+        .unwrap();
+    assert_eq!(m.pending(), Some(Step::Backoff { until: 4 }));
+    let m = m.transition(Event::Join, &Clock(3)).unwrap();
+    assert_eq!(m.pending(), Some(Step::PersistIntent));
+    let m = m
+        .transition(Event::Completed(Step::PersistIntent), &Clock(3))
+        .unwrap();
+    let m = m.transition(Event::Leave, &Clock(3)).unwrap();
+    let m = m
+        .transition(
+            Event::Failed(Reason::Observation("cancel active boundary")),
+            &Clock(3),
+        )
+        .unwrap();
+    let mut now = 3;
+    let m = drive_to(m, None, &mut now);
+    assert!(m.connectivity_restored());
+    assert_eq!(m.pending(), Some(Step::ReconcileReference));
+    let m = m
+        .transition(
+            Event::Failed(Reason::Observation("undecidable")),
+            &Clock(now),
+        )
+        .unwrap();
+    assert_eq!(m.pending(), Some(Step::Backoff { until: now + 1 }));
+}
+
+#[test]
+fn left_retains_release_intent_and_both_tokens_until_exact_settlements() {
+    let m = Machine::restart(Durable {
+        leaving: true,
+        pf_reference: Some(71),
+        older_references: vec![72],
+        reference_intent: Some(ReferenceIntent::Release),
+        reference_sequence: 9,
+        reference_error: Some(Reason::Observation("release debt")),
+        ..Durable::default()
+    });
+    assert_eq!(m.pending(), Some(Step::ClearIntent));
+    let m = m
+        .transition(Event::Completed(Step::ClearIntent), &Clock(100))
+        .unwrap();
+    assert!(m.connectivity_restored());
+    assert!(!m.cleanup_confirmed());
+    assert_eq!(m.durable().pf_reference, Some(71));
+    assert_eq!(m.durable().older_references, vec![72]);
+    assert_eq!(m.durable().reference_intent, Some(ReferenceIntent::Release));
+    assert_eq!(m.durable().reference_sequence, 9);
+    assert_eq!(m.pending(), Some(Step::ReconcileReference));
+    assert!(!m.plan().contains(&Step::AcquireReference));
+    let m = settled(
+        &m,
+        ReferenceEntry::Token(71),
+        ReferenceSettlement::Released,
+        100,
+    );
+    assert!(m.durable().reference_error.is_some());
+    let m = settled(
+        &m,
+        ReferenceEntry::Token(72),
+        ReferenceSettlement::Absent,
+        100,
+    );
+    assert_eq!(m.durable().reference_intent, None);
+    assert!(m.durable().reference_error.is_none());
+    let m = m.transition(complete_event(&m, 1), &Clock(100)).unwrap();
+    assert!(m.cleanup_confirmed());
+}
+
+fn assert_reference_invariants(m: &Machine, now: u64) {
+    let slots = usize::from(m.durable().pf_reference.is_some())
+        + m.durable().older_references.len()
+        + m.durable().uncertain_acquires.len()
+        + usize::from(matches!(
+            m.durable().reference_intent,
+            Some(ReferenceIntent::Acquire(_))
+        ));
+    assert!(slots <= 2, "reference slots exceeded: {m:?}");
+    assert!(
+        !m.plan().contains(&Step::AcquireReference)
+            || m.durable().join_intended
+            || m.pending() == Some(Step::PersistIntent)
+    );
+    if m.durable().join_intended && m.durable().pf_reference.is_none() {
+        assert!(!matches!(
+            m.enforcement_at(&Clock(now)),
+            Verdict::Protected(_)
+        ));
+    }
+}
+
+#[test]
+fn join_during_idle_reconcile_waits_for_its_completion_even_on_failure() {
+    for outcome in 0..3 {
+        let mut m = Machine::restart(Durable {
+            pf_reference: Some(71),
+            ..Durable::default()
+        });
+        m = m.transition(Event::Join, &Clock(100)).unwrap();
+        assert_eq!(m.pending(), Some(Step::ReconcileReference));
+        assert!(!m.durable().join_intended);
+        assert_eq!(
+            m.status_at(&Clock(100)),
+            ConnectionStatus::JoiningRecovering
+        );
+        assert!(!m.connectivity_restored());
+        assert!(m.transition(Event::Join, &Clock(100)).is_err());
+        if outcome == 2 {
+            m = settled(
+                &m,
+                ReferenceEntry::Token(71),
+                ReferenceSettlement::Absent,
+                100,
+            );
+            assert_eq!(m.pending(), Some(Step::ReconcileReference));
+        }
+        let event = if outcome == 1 {
+            Event::Failed(Reason::Observation("idle reconcile failed"))
+        } else {
+            complete_event(&m, 1)
+        };
+        m = m.transition(event, &Clock(100)).unwrap();
+        assert_eq!(m.pending(), Some(Step::PersistIntent));
+        let m = finish(m, 1);
+        assert!(m.durable().join_intended);
+        assert!(matches!(
+            m.enforcement_at(&Clock(102)),
+            Verdict::Protected(_)
+        ));
+    }
+}
+
+#[test]
+fn joined_last_reference_settlement_invalidates_proof_even_if_summary_fails() {
+    for uncertain in [false, true] {
+        let mut now = 1000;
+        let mut m = Machine::restart(Durable::default())
+            .transition(Event::Join, &Clock(now))
+            .unwrap();
+        m = m
+            .transition(Event::Completed(Step::PersistIntent), &Clock(now))
+            .unwrap();
+        // Lose the first acquire, then hold a replacement while the debt retries.
+        m = m
+            .transition(
+                Event::Failed(Reason::Observation("lost acquire")),
+                &Clock(now),
+            )
+            .unwrap();
+        m = m
+            .transition(
+                Event::Failed(Reason::Observation("undecidable")),
+                &Clock(now),
+            )
+            .unwrap();
+        assert_eq!(m.pending(), Some(Step::AcquireReference));
+        m = m
+            .transition(Event::ReferenceAcquired(71), &Clock(now))
+            .unwrap();
+        for _ in 0..100 {
+            if matches!(m.enforcement_at(&Clock(now)), Verdict::Protected(p) if p.form() == Form::Joined)
+            {
+                break;
+            }
+            now = executor_time(&m, now);
+            let event = if m.pending() == Some(Step::ReconcileReference) {
+                Event::Failed(Reason::Observation("undecidable"))
+            } else {
+                checked_completion_at(&m, now)
+            };
+            m = m.transition(event, &Clock(now)).unwrap();
+        }
+        assert!(matches!(
+            m.enforcement_at(&Clock(now)),
+            Verdict::Protected(_)
+        ));
+        if let Some(Step::Backoff { until }) = m.pending() {
+            now = until;
+            m = m
+                .transition(Event::Completed(Step::Backoff { until }), &Clock(now))
+                .unwrap();
+        }
+        assert_eq!(m.pending(), Some(Step::ReconcileReference));
+        if !uncertain {
+            // This case has only the current held entry when settlement arrives.
+            m = settled(
+                &m,
+                ReferenceEntry::Acquire(1),
+                ReferenceSettlement::Void,
+                now,
+            );
+        }
+        assert!(matches!(
+            m.enforcement_at(&Clock(now)),
+            Verdict::Protected(_)
+        ));
+        m = settled(
+            &m,
+            ReferenceEntry::Token(71),
+            ReferenceSettlement::Absent,
+            now,
+        );
+        assert!(!matches!(
+            m.enforcement_at(&Clock(now)),
+            Verdict::Protected(_)
+        ));
+        assert_eq!(m.pending(), Some(Step::ReconcileReference));
+        m = m
+            .transition(
+                Event::Failed(Reason::Observation("summary failed")),
+                &Clock(now),
+            )
+            .unwrap();
+        assert!(!matches!(
+            m.enforcement_at(&Clock(now)),
+            Verdict::Protected(_)
+        ));
+        assert!(m.plan().contains(&Step::AcquireReference));
+        assert_reference_invariants(&m, now);
+    }
+}
+
+#[test]
+fn left_observations_preserve_reconcile_and_do_not_record_errors() {
+    // A failed PersistIntent leaves no join intent, even though closing had begun.
+    let left = Machine::restart(Durable::default())
+        .transition(Event::Join, &Clock(0))
+        .unwrap()
+        .transition(
+            Event::Failed(Reason::Observation("persist intent failed")),
+            &Clock(0),
+        )
+        .unwrap();
+    for verdict in [
+        Verdict::NotProtected(Reason::HookMissing),
+        Verdict::Unknown { since: 0 },
+        Verdict::Repair(Action::Rejoin),
+    ] {
+        let next = left
+            .transition(observed(&left, Form::PreTunnel, verdict), &Clock(0))
+            .unwrap();
+        assert_eq!(next.durable().last_error, left.durable().last_error);
+        assert_eq!(next.plan(), left.plan());
+    }
+    for backoff in [false, true] {
+        for verdict in [
+            Verdict::NotProtected(Reason::Observation("monitor")),
+            Verdict::Unknown { since: 1 },
+            Verdict::Repair(Action::Rejoin),
+        ] {
+            let mut m = Machine::restart(Durable {
+                pf_reference: Some(71),
+                ..Durable::default()
+            });
+            if backoff {
+                m = m
+                    .transition(
+                        Event::Failed(Reason::Observation("reference failure")),
+                        &Clock(0),
+                    )
+                    .unwrap();
+            }
+            let before = m.clone();
+            m = m
+                .transition(observed(&m, Form::PreTunnel, verdict), &Clock(0))
+                .unwrap();
+            assert_eq!(m.plan(), before.plan());
+            assert_eq!(m.durable().last_error, before.durable().last_error);
+            // A later completion must not be discarded by abort_requested.
+            let event = complete_event(&m, 1);
+            let m = m.transition(event, &Clock(1)).unwrap();
+            assert!(!m.plan().contains(&Step::AcquireReference));
+        }
+    }
+}
+
+#[test]
+fn repeated_disabled_observations_preserve_idle_exponential_delay() {
+    let mut m = Machine::restart(Durable {
+        pf_reference: Some(71),
+        ..Durable::default()
+    });
+    for now in [0, 1, 3, 7, 15, 31, 63] {
+        if let Some(Step::Backoff { until }) = m.pending() {
+            m = m
+                .transition(Event::Completed(Step::Backoff { until }), &Clock(now))
+                .unwrap();
+        }
+        let event = observed(
+            &m,
+            Form::PreTunnel,
+            Verdict::Repair(Action::EnableAndRejoin),
+        );
+        m = m.transition(event, &Clock(now)).unwrap();
+        m = m
+            .transition(
+                Event::Failed(Reason::Observation("undecidable")),
+                &Clock(now),
+            )
+            .unwrap();
+        let before = m.pending();
+        m = m
+            .transition(
+                observed(
+                    &m,
+                    Form::PreTunnel,
+                    Verdict::Repair(Action::EnableAndRejoin),
+                ),
+                &Clock(now),
+            )
+            .unwrap();
+        assert_eq!(m.pending(), before);
+    }
+    assert_eq!(m.pending(), Some(Step::Backoff { until: 123 }));
+}
+
+#[test]
+fn idle_reference_events_never_start_recovery() {
+    let left = Machine::restart(Durable::default())
+        .transition(
+            Event::Failed(Reason::Observation("idle failure")),
+            &Clock(0),
+        )
+        .unwrap();
+    assert_eq!(left.pending(), None);
+    assert_reference_invariants(&left, 0);
+    let joining = Machine::restart(Durable::default())
+        .transition(Event::Join, &Clock(0))
+        .unwrap();
+    let invalidated = joining
+        .transition(Event::InvalidateObservations { since: 0 }, &Clock(0))
+        .unwrap();
+    assert_eq!(
+        invalidated.plan(),
+        joining.plan(),
+        "not-yet-persisted Join must retain its plan"
+    );
+    for backoff in [false, true] {
+        for kind in 0..4 {
+            let mut m = Machine::restart(Durable {
+                pf_reference: Some(71),
+                ..Durable::default()
+            });
+            if backoff {
+                m = m
+                    .transition(Event::Failed(Reason::Observation("undecidable")), &Clock(0))
+                    .unwrap();
+            }
+            let plan = m.plan().to_vec();
+            if kind == 0 && !backoff {
+                // Wake and an Unknown monitor describe the same idle evidence gap.
+                // Neither may arm an abort of the reference effect in flight.
+                let unknown = m
+                    .transition(
+                        observed(&m, Form::PreTunnel, Verdict::Unknown { since: 0 }),
+                        &Clock(0),
+                    )
+                    .unwrap();
+                let wake = m
+                    .transition(Event::InvalidateObservations { since: 0 }, &Clock(0))
+                    .unwrap();
+                assert_eq!(wake, unknown);
+            }
+            let event = match kind {
+                0 => Event::InvalidateObservations { since: 0 },
+                1 => observed(&m, Form::PreTunnel, Verdict::Unknown { since: 0 }),
+                2 => observed(&m, Form::PreTunnel, Verdict::Repair(Action::Rejoin)),
+                _ => Event::Failed(Reason::Observation("reference failure")),
+            };
+            m = m.transition(event, &Clock(0)).unwrap();
+            assert_reference_invariants(&m, 0);
+            if kind < 3 {
+                assert_eq!(m.plan(), plan, "event {kind}, backoff {backoff}");
+            }
+            if kind == 0 && !backoff {
+                // Removing the in-flight invalidation guard must be observable at
+                // the completion too: abort_requested would discard this retry.
+                m = m
+                    .transition(Event::Failed(Reason::Observation("undecidable")), &Clock(0))
+                    .unwrap();
+                assert!(matches!(m.pending(), Some(Step::Backoff { .. })));
+            }
+        }
+    }
+}
+
+#[test]
+fn fresh_leave_cleanup_never_plans_reference_release() {
+    let mut m = joined().transition(Event::Leave, &Clock(102)).unwrap();
+    assert_eq!(m.pending(), Some(Step::PersistLeaving));
+    m = m
+        .transition(Event::Completed(Step::PersistLeaving), &Clock(102))
+        .unwrap();
     assert_eq!(
         m.plan(),
-        &[Step::ReconcileReference, Step::ReleaseReference]
+        &[
+            Step::StopChild,
+            Step::CleanupRoutes,
+            Step::CleanupDns,
+            Step::CleanupArtifacts,
+            Step::RemoveAnchor
+        ]
     );
+    assert!(
+        !m.durable()
+            .pending_cleanup
+            .contains(&Step::ReleaseReference)
+    );
+}
+
+#[test]
+fn join_from_left_with_two_entries_never_reserves_a_third_reference() {
+    for uncertain in [false, true] {
+        let mut m = Machine::restart(Durable {
+            pf_reference: Some(71),
+            older_references: if uncertain { vec![] } else { vec![72] },
+            uncertain_acquires: if uncertain { vec![8] } else { vec![] },
+            reference_sequence: 8,
+            ..Durable::default()
+        });
+        m = m.transition(Event::Join, &Clock(100)).unwrap();
+        assert_eq!(m.pending(), Some(Step::ReconcileReference));
+        m = m
+            .transition(
+                Event::Failed(Reason::Observation("undecidable")),
+                &Clock(100),
+            )
+            .unwrap();
+        assert_eq!(m.pending(), Some(Step::PersistIntent));
+        assert_reference_invariants(&m, 100);
+        m = m
+            .transition(Event::Completed(Step::PersistIntent), &Clock(100))
+            .unwrap();
+        assert_reference_invariants(&m, 100);
+        assert!(!m.plan().contains(&Step::AcquireReference));
+    }
+}
+
+#[test]
+fn settlement_during_leave_never_restarts_a_join_after_clear_intent() {
+    let mut m = joined()
+        .transition(Event::Repair(Action::Rejoin), &Clock(102))
+        .unwrap();
+    m = m.transition(Event::Leave, &Clock(102)).unwrap();
+    m = settled(
+        &m,
+        ReferenceEntry::Token(m.durable().pf_reference.unwrap()),
+        ReferenceSettlement::Absent,
+        102,
+    );
+    m = m
+        .transition(Event::Completed(Step::LoadPreTunnel), &Clock(102))
+        .unwrap();
+    m = m
+        .transition(Event::Completed(Step::PersistLeaving), &Clock(102))
+        .unwrap();
+    for step in [
+        Step::StopChild,
+        Step::CleanupRoutes,
+        Step::CleanupDns,
+        Step::CleanupArtifacts,
+        Step::RemoveAnchor,
+        Step::ClearIntent,
+    ] {
+        assert_eq!(m.pending(), Some(step));
+        m = m.transition(Event::Completed(step), &Clock(102)).unwrap();
+        assert_reference_invariants(&m, 102);
+    }
+    assert!(m.connectivity_restored());
+}
+
+#[test]
+fn leave_cancels_a_join_deferred_behind_idle_reconciliation() {
+    let mut m = Machine::restart(Durable {
+        pf_reference: Some(71),
+        ..Durable::default()
+    });
+    m = m.transition(Event::Join, &Clock(100)).unwrap();
+    m = m.transition(Event::Leave, &Clock(100)).unwrap();
+    assert_eq!(m.pending(), Some(Step::ReconcileReference));
+    m = m
+        .transition(
+            Event::Failed(Reason::Observation("undecidable")),
+            &Clock(100),
+        )
+        .unwrap();
+    assert_eq!(m.pending(), Some(Step::PersistLeaving));
+    let m = finish(m, 1);
+    assert!(m.connectivity_restored());
+    assert!(!m.durable().join_intended);
+    assert!(!m.plan().contains(&Step::PersistIntent));
+}
+
+// Follow-up A1: start Join at the maximum Left accounting delay. Inspect every
+// boundary instead of jumping across Backoff in finish().
+#[test]
+fn join_from_sixty_second_left_backoff_resets_reconciliation_delay() {
+    for needs_reconcile in [false, true] {
+        let mut m = Machine::restart(Durable {
+            pf_reference: needs_reconcile.then_some(71),
+            uncertain_acquires: if needs_reconcile { vec![] } else { vec![8] },
+            reference_sequence: 8,
+            reference_needs_reconcile: needs_reconcile,
+            ..Durable::default()
+        });
+        let mut now = 0;
+        for delay in [1, 2, 4, 8, 16, 32, 60] {
+            m = m
+                .transition(
+                    Event::Failed(Reason::Observation("undecidable")),
+                    &Clock(now),
+                )
+                .unwrap();
+            assert_eq!(m.pending(), Some(Step::Backoff { until: now + delay }));
+            if delay < 60 {
+                now += delay;
+                m = m
+                    .transition(Event::Completed(m.pending().unwrap()), &Clock(now))
+                    .unwrap();
+            }
+        }
+        m = m.transition(Event::Join, &Clock(now)).unwrap();
+        // Resetting a timer must not reinterpret a not-yet-dispatched reconcile
+        // as in flight; either accepted boundary remains serialized.
+        if m.pending() == Some(Step::ReconcileReference) {
+            m = m
+                .transition(
+                    Event::Failed(Reason::Observation("deferred reconcile")),
+                    &Clock(now),
+                )
+                .unwrap();
+        }
+        assert_eq!(m.pending(), Some(Step::PersistIntent));
+        for _ in 0..80 {
+            assert!(
+                m.plan()
+                    .iter()
+                    .all(|s| !matches!(s, Step::Backoff { until } if *until > now + 1)),
+                "{m:?}"
+            );
+            if matches!(m.enforcement_at(&Clock(now)), Verdict::Protected(p) if p.form() == Form::Joined)
+            {
+                assert_ne!(
+                    m.status_at(&Clock(now)),
+                    ConnectionStatus::Recovering { retry_in: 60 }
+                );
+                assert_eq!(m.status_at(&Clock(now)), ConnectionStatus::Joined);
+                break;
+            }
+            now = executor_time(&m, now);
+            m = m
+                .transition(checked_completion_at(&m, now), &Clock(now))
+                .unwrap();
+        }
+        assert!(
+            matches!(m.enforcement_at(&Clock(now)), Verdict::Protected(p) if p.form() == Form::Joined)
+        );
+    }
+}
+
+#[test]
+fn join_from_left_retained_reference_acquires_before_loading_policy() {
+    for durable in [
+        Durable {
+            pf_reference: Some(71),
+            ..Durable::default()
+        },
+        Durable {
+            older_references: vec![71],
+            ..Durable::default()
+        },
+        Durable {
+            uncertain_acquires: vec![8],
+            reference_sequence: 8,
+            ..Durable::default()
+        },
+    ] {
+        let mut m = Machine::restart(durable);
+        m = m.transition(Event::Join, &Clock(100)).unwrap();
+        m = m
+            .transition(
+                Event::Failed(Reason::Observation("retained entry unverified")),
+                &Clock(100),
+            )
+            .unwrap();
+        m = m
+            .transition(Event::Completed(Step::PersistIntent), &Clock(100))
+            .unwrap();
+        assert!(m.plan().contains(&Step::AcquireReference));
+        if m.pending() == Some(Step::ReconcileReference) {
+            m = m
+                .transition(
+                    Event::Failed(Reason::Observation("undecidable")),
+                    &Clock(100),
+                )
+                .unwrap();
+        }
+        assert_eq!(m.pending(), Some(Step::AcquireReference));
+        assert_reference_invariants(&m, 100);
+        m = m
+            .transition(Event::ReferenceAcquired(72), &Clock(100))
+            .unwrap();
+        assert_eq!(m.durable().pf_reference, Some(72));
+        assert_eq!(m.pending(), Some(Step::LoadPreTunnel));
+        assert_reference_invariants(&m, 100);
+    }
+}
+
+#[test]
+fn restart_strips_legacy_release_cleanup_and_records_the_error() {
+    let m = Machine::restart(Durable {
+        leaving: true,
+        pending_cleanup: vec![Step::StopChild, Step::ReleaseReference],
+        pf_reference: Some(71),
+        ..Durable::default()
+    });
+    assert!(
+        !m.durable()
+            .pending_cleanup
+            .contains(&Step::ReleaseReference)
+    );
+    assert!(
+        m.durable()
+            .cleanup_errors
+            .iter()
+            .any(|(s, _)| *s == Step::ReleaseReference)
+    );
+    let m = m
+        .transition(Event::Completed(Step::StopChild), &Clock(100))
+        .unwrap();
+    let m = m
+        .transition(Event::Completed(Step::ClearIntent), &Clock(100))
+        .unwrap();
+    assert!(m.connectivity_restored());
+    assert_eq!(m.durable().pf_reference, Some(71));
+}
+
+#[test]
+fn protected_observation_with_two_uncertain_entries_cannot_publish_protected() {
+    let mut m = Machine::restart(Durable {
+        join_intended: true,
+        uncertain_acquires: vec![7, 8],
+        reference_sequence: 8,
+        ..Durable::default()
+    });
+    let mut now = 100;
+    m = drive_to(m, Some(Step::VerifyPreTunnel), &mut now);
+    let event = checked_completion_at(&m, now);
+    assert!(matches!(
+        &event,
+        Event::Observed {
+            verdict: Verdict::Protected(_),
+            ..
+        }
+    ));
+    let m = m.transition(event, &Clock(now)).unwrap();
+    assert!(!matches!(
+        m.enforcement_at(&Clock(now)),
+        Verdict::Protected(_)
+    ));
+    assert_reference_invariants(&m, now);
+}
+
+proptest! {
+    #[test]
+    fn join_replaces_a_retained_entry_without_exceeding_two_slots(token in 1u64..1000, kind in 0u8..3) {
+        let m = Machine::restart(Durable {
+            pf_reference: (kind == 0).then_some(token),
+            older_references: if kind == 1 { vec![token] } else { vec![] },
+            uncertain_acquires: if kind == 2 { vec![1] } else { vec![] },
+            reference_sequence: 1,
+            ..Durable::default()
+        });
+        let m = m.transition(Event::Join, &Clock(100)).unwrap();
+        let m = m.transition(Event::Failed(Reason::Observation("unverified")), &Clock(100)).unwrap();
+        let m = m.transition(Event::Completed(Step::PersistIntent), &Clock(100)).unwrap();
+        prop_assert!(m.plan().contains(&Step::AcquireReference));
+        let m = if m.pending() == Some(Step::ReconcileReference) {
+            m.transition(Event::Failed(Reason::Observation("undecidable")), &Clock(100)).unwrap()
+        } else { m };
+        prop_assert_eq!(m.pending(), Some(Step::AcquireReference));
+        assert_reference_invariants(&m, 100);
+        let m = m.transition(Event::ReferenceAcquired(token + 1), &Clock(100)).unwrap();
+        assert_reference_invariants(&m, 100);
+    }
+}
+
+#[test]
+fn enabled_pf_read_rearms_disabled_transition_in_every_mode_even_with_unknown_verdict() {
+    for mode in 0..4 {
+        let mut m = Machine::restart(Durable {
+            join_intended: mode == 1 || mode == 3,
+            hold: mode == 3,
+            leaving: mode == 2,
+            pf_reference: Some(71),
+            ..Durable::default()
+        });
+        let read = |m: &Machine, enabled| {
+            if enabled {
+                Event::PfEnabledObserved {
+                    context: m.context(),
+                }
+            } else {
+                observed(m, Form::PreTunnel, Verdict::Repair(Action::EnableAndRejoin))
+            }
+        };
+        m = m.transition(read(&m, false), &Clock(0)).unwrap();
+        if mode == 0 {
+            m = m
+                .transition(Event::Failed(Reason::Observation("debt")), &Clock(0))
+                .unwrap();
+            assert_eq!(m.pending(), Some(Step::Backoff { until: 1 }));
+        }
+        m = m.transition(read(&m, true), &Clock(0)).unwrap();
+        m = m
+            .transition(
+                observed(&m, Form::PreTunnel, Verdict::Unknown { since: 0 }),
+                &Clock(0),
+            )
+            .unwrap();
+        m = m.transition(read(&m, false), &Clock(0)).unwrap();
+        if mode == 0 {
+            assert_eq!(m.pending(), Some(Step::ReconcileReference));
+            m = m
+                .transition(Event::Failed(Reason::Observation("debt")), &Clock(0))
+                .unwrap();
+            assert_eq!(m.pending(), Some(Step::Backoff { until: 1 }));
+        }
+        let before = m.clone();
+        assert!(
+            m.transition(
+                Event::PfEnabledObserved {
+                    context: Context::default(),
+                },
+                &Clock(0)
+            )
+            .is_err()
+        );
+        assert_eq!(m, before);
+    }
+}
+
+fn held() -> Machine {
+    let mut m = Machine::restart(Durable {
+        join_intended: true,
+        hold: true,
+        ..Durable::default()
+    });
+    let mut now = 100;
+    for _ in 0..30 {
+        if m.pending().is_none() {
+            assert!(m.blocking_verified_at(&Clock(now)));
+            return m;
+        }
+        now = executor_time(&m, now);
+        m = m
+            .transition(checked_completion_at(&m, now), &Clock(now))
+            .unwrap();
+    }
+    panic!("hold did not become idle: {m:?}");
+}
+
+// Canonical Recovery: another product holds pf enabled, so neither uncertain
+// acquisition can be decided. Accounting waits while blocking remains verified.
+fn recovery_held() -> Machine {
+    let mut m = Machine::restart(Durable {
+        join_intended: true,
+        hold: true,
+        uncertain_acquires: vec![1, 2],
+        reference_sequence: 2,
+        ..Durable::default()
+    });
+    m = m
+        .transition(
+            Event::Failed(Reason::Observation("other product owns pf")),
+            &Clock(100),
+        )
+        .unwrap();
+    for _ in 0..12 {
+        if matches!(m.pending(), Some(Step::Backoff { .. })) {
+            assert_eq!(
+                m.plan(),
+                [Step::Backoff { until: 101 }, Step::ReconcileReference]
+            );
+            assert!(m.blocking_verified_at(&Clock(100)));
+            return m;
+        }
+        m = m
+            .transition(checked_completion_at(&m, 100), &Clock(100))
+            .unwrap();
+    }
+    panic!("Recovery did not become idle-held: {m:?}");
+}
+
+#[test]
+fn held_disabled_pf_reconciles_full_slots_before_acquiring_and_verifying() {
+    let mut m = recovery_held();
+    // The other product releases its last reference while accounting is parked.
+    m = m
+        .transition(
+            observed(
+                &m,
+                Form::PreTunnel,
+                Verdict::Repair(Action::EnableAndRejoin),
+            ),
+            &Clock(100),
+        )
+        .unwrap();
+    assert_eq!(m.pending(), Some(Step::ReconcileReference));
+    assert!(!m.plan().contains(&Step::AcquireReference));
+    // The pf-disabled rule voids both uncertain acquisitions in this call.
+    for sequence in [1, 2] {
+        m = m
+            .transition(
+                Event::ReferenceSettled {
+                    entry: ReferenceEntry::Acquire(sequence),
+                    how: ReferenceSettlement::Void,
+                },
+                &Clock(100),
+            )
+            .unwrap();
+        assert_eq!(m.pending(), Some(Step::ReconcileReference));
+    }
+    m = m
+        .transition(
+            Event::ReferenceReconciled {
+                context: m.context(),
+                current: None,
+                predecessor: None,
+            },
+            &Clock(100),
+        )
+        .unwrap();
+    assert_eq!(m.pending(), Some(Step::AcquireReference));
+    assert_eq!(m.plan().get(1), Some(&Step::LoadPreTunnel));
+    let mut pf_enabled = false;
+    for _ in 0..12 {
+        let Some(step) = m.pending() else {
+            break;
+        };
+        assert!(!matches!(step, Step::Backoff { .. }));
+        if step == Step::AcquireReference {
+            pf_enabled = true;
+        }
+        if step == Step::VerifyPreTunnel {
+            assert!(pf_enabled);
+        }
+        m = m
+            .transition(checked_completion_at(&m, 100), &Clock(100))
+            .unwrap();
+    }
+    assert!(pf_enabled);
+    assert!(m.blocking_verified_at(&Clock(100)));
+    assert_eq!(m.durable().uncertain_acquires, [] as [u64; 0]);
+}
+
+#[test]
+fn held_fresh_prefix_loads_before_accounting_when_pf_does_not_need_enabling() {
+    let mut m = Machine::restart(Durable {
+        join_intended: true,
+        hold: true,
+        pf_reference: Some(702),
+        older_references: vec![701],
+        ..Durable::default()
+    });
+    m = m.transition(complete_event(&m, 1), &Clock(100)).unwrap();
+    for _ in 0..12 {
+        if matches!(m.pending(), Some(Step::Backoff { .. })) {
+            break;
+        }
+        m = m
+            .transition(checked_completion_at(&m, 100), &Clock(100))
+            .unwrap();
+    }
+    assert_eq!(
+        m.plan(),
+        [Step::Backoff { until: 101 }, Step::ReconcileReference]
+    );
+    // No acquisition is needed: these are held tokens, not uncertain acquires.
+    // Full slots still get an attempt in this prefix, after blocking is restored.
+    let mut m = m
+        .transition(Event::Repair(Action::Rejoin), &Clock(100))
+        .unwrap();
+    assert_eq!(
+        m.plan(),
+        [
+            Step::LoadPreTunnel,
+            Step::VerifyPreTunnelLoad,
+            Step::FlushStates,
+            Step::VerifyPreTunnel,
+            Step::ReconcileReference,
+        ]
+    );
+    for _ in 0..4 {
+        m = m
+            .transition(checked_completion_at(&m, 100), &Clock(100))
+            .unwrap();
+    }
+    assert_eq!(m.pending(), Some(Step::ReconcileReference));
+}
+
+#[test]
+fn held_lost_anchor_loads_before_failed_accounting_with_both_slots_uncertain() {
+    let mut m = recovery_held()
+        .transition(
+            Event::Repair(Action::Rerender {
+                form: Form::PreTunnel,
+            }),
+            &Clock(100),
+        )
+        .unwrap();
+    assert_eq!(m.pending(), Some(Step::LoadPreTunnel));
+    for _ in 0..4 {
+        m = m
+            .transition(checked_completion_at(&m, 100), &Clock(100))
+            .unwrap();
+    }
+    assert!(m.blocking_verified_at(&Clock(100)));
+    assert_eq!(m.pending(), Some(Step::ReconcileReference));
+    m = m
+        .transition(
+            Event::Failed(Reason::Observation("still undecidable")),
+            &Clock(100),
+        )
+        .unwrap();
+    assert!(m.blocking_verified_at(&Clock(100)));
+}
+
+proptest! {
+    #[test]
+    fn under_hold_disabled_pf_reconciles_before_the_next_closing_prefix_completes(
+        direct in any::<bool>(), elapsed in 0u64..=1,
+        reference_state in 0u8..3, cleanup in 0u8..3, mid_prefix in any::<bool>(),
+        reconcile_failures in 0usize..=2,
+    ) {
+        let initially_free_slot = reference_state != 0;
+        let mut m = if cleanup > 0 {
+            held_route_cleanup_retry(initially_free_slot)
+        } else if reference_state == 2 {
+            Machine::restart(Durable {
+                join_intended: true,
+                hold: true,
+                uncertain_acquires: vec![1],
+                pf_reference: None,
+                reference_sequence: 1,
+                ..Durable::default()
+            })
+        } else if initially_free_slot {
+            held()
+        } else {
+            recovery_held()
+        };
+        let mut now = 100;
+        if cleanup == 2 {
+            now = executor_time(&m, now);
+            m = m.transition(checked_completion_at(&m, now), &Clock(now)).unwrap();
+            prop_assert_eq!(m.pending(), Some(Step::CleanupRoutes));
+        }
+        if mid_prefix {
+            m = m.transition(Event::Repair(Action::Rejoin), &Clock(now)).unwrap();
+            for _ in 0..12 {
+                if m.pending() == Some(Step::LoadPreTunnel) { break; }
+                now = executor_time(&m, now);
+                m = m.transition(checked_completion_at(&m, now), &Clock(now)).unwrap();
+            }
+            prop_assert_eq!(m.pending(), Some(Step::LoadPreTunnel));
+            m = m.transition(checked_completion_at(&m, now), &Clock(now)).unwrap();
+            prop_assert_eq!(m.pending(), Some(Step::VerifyPreTunnelLoad));
+        }
+        let free_slot = usize::from(m.durable().pf_reference.is_some())
+            + m.durable().older_references.len() + m.durable().uncertain_acquires.len() < 2;
+        let event = if direct { Event::Repair(Action::EnableAndRejoin) }
+            else { observed(&m, Form::PreTunnel, Verdict::Repair(Action::EnableAndRejoin)) };
+        m = m.transition(event, &Clock(now)).unwrap();
+        let mut failures = 0;
+        let mut reconciled = false;
+        let mut pf_enabled = false;
+        let mut acquisition_verified = false;
+        let mut reconcile_dispatched = false;
+        let mut prefix_attempts = 0;
+        let mut plans_since_progress = vec![];
+        let mut dispatched = vec![];
+        while !(reconciled && pf_enabled && m.blocking_verified_at(&Clock(now))) {
+            now = executor_time(&m, now + elapsed);
+            prop_assert!(m.pending().is_some(), "closing prefix became idle before convergence");
+            let step = m.pending().unwrap();
+            dispatched.push(step);
+            // Each attempt must advance, verify, or consume an injected failure.
+            // This rejects a stuck queue without a loose boundary/time budget.
+            prop_assert!(!plans_since_progress.iter().any(|(context, plan)|
+                *context == m.context() && plan == m.plan()),
+                "no progress at {:?}", m.plan());
+            plans_since_progress.push((m.context(), m.plan().to_vec()));
+            assert_no_held_accounting_wait(&m);
+            if step == Step::VerifyPreTunnel {
+                prop_assert!(free_slot || reconcile_dispatched,
+                    "full references must reconcile before the first post-disable verification");
+                prefix_attempts += 1;
+                prop_assert!(prefix_attempts <= reconcile_failures + 1,
+                    "convergence exceeded failures + 1 prefix attempts: {dispatched:?}");
+                plans_since_progress.clear();
+            }
+            let event = if step == Step::ReconcileReference {
+                reconcile_dispatched = true;
+                if failures < reconcile_failures {
+                    failures += 1;
+                    plans_since_progress.clear();
+                    Event::Failed(Reason::Observation("injected undecidable reconcile"))
+                } else {
+                    // After the injected failures, obtain checked evidence. With
+                    // disabled pf, void uncertain entries and recorded tokens;
+                    // once enabled and verified, release retained predecessors.
+                    for sequence in m.durable().uncertain_acquires.clone() {
+                        m = settled(&m, ReferenceEntry::Acquire(sequence), ReferenceSettlement::Void, now);
+                    }
+                    if pf_enabled {
+                        for token in m.durable().older_references.clone() {
+                            prop_assert!(acquisition_verified);
+                            m = settled(&m, ReferenceEntry::Token(token), ReferenceSettlement::Released, now);
+                        }
+                    } else {
+                        let tokens: Vec<_> = m.durable().pf_reference.into_iter()
+                            .chain(m.durable().older_references.iter().copied()).collect();
+                        for token in tokens {
+                            m = settled(&m, ReferenceEntry::Token(token), ReferenceSettlement::Void, now);
+                        }
+                    }
+                    reconciled = true;
+                    Event::ReferenceReconciled { context: m.context(), current: m.durable().pf_reference, predecessor: None }
+                }
+            } else if step == Step::VerifyPreTunnel && !pf_enabled {
+                observed(&m, Form::PreTunnel, Verdict::Repair(Action::EnableAndRejoin))
+            } else {
+                if step == Step::AcquireReference {
+                    pf_enabled = true;
+                    acquisition_verified = false;
+                }
+                checked_completion_at(&m, now)
+            };
+            m = m.transition(event, &Clock(now)).unwrap();
+            acquisition_verified |= step == Step::VerifyPreTunnel && m.blocking_verified_at(&Clock(now));
+            assert_reference_invariants(&m, now);
+        }
+        prop_assert_eq!(failures, reconcile_failures);
+        prop_assert!(prefix_attempts > 0 && prefix_attempts <= failures + 1);
+        prop_assert!(reconciled, "accounting starved across held prefix attempts");
+        prop_assert!(m.blocking_verified_at(&Clock(now)));
+    }
+}
+
+#[test]
+fn hold_restart_plans_accounting_prefix_and_cleanup_without_a_rejoin_suffix() {
+    for uncertain in 0..=2 {
+        let m = Machine::restart(Durable {
+            join_intended: true,
+            hold: true,
+            uncertain_acquires: (1..=uncertain).collect(),
+            reference_sequence: 2,
+            retry_attempts: 7,
+            ..Durable::default()
+        });
+        let mut expected = vec![];
+        if uncertain == 2 {
+            expected.push(Step::ReconcileReference);
+        }
+        if uncertain < 2 {
+            expected.push(Step::AcquireReference);
+        }
+        expected.extend([
+            Step::LoadPreTunnel,
+            Step::VerifyPreTunnelLoad,
+            Step::FlushStates,
+            Step::VerifyPreTunnel,
+        ]);
+        if uncertain == 1 {
+            expected.push(Step::ReconcileReference);
+        }
+        expected.extend([
+            Step::StopChild,
+            Step::CleanupRoutes,
+            Step::CleanupDns,
+            Step::CleanupArtifacts,
+        ]);
+        assert_eq!(m.plan(), expected);
+        assert!(m.durable().hold);
+        assert!(!m.blocking_verified_at(&Clock(100)));
+    }
+    let m = held();
+    assert_eq!(m.pending(), None);
+    assert_eq!(m.tunnel(), None);
+    assert_eq!(
+        m.enforcement_at(&Clock(100)),
+        Verdict::NotProtected(Reason::Observation("state untrusted: run leave"))
+    );
+    assert!(m.status_text_at(&Clock(100)).contains("blocking verified"));
+    let restarted = Machine::restart(m.durable().clone());
+    assert!(restarted.durable().hold);
+    assert!(!restarted.blocking_verified_at(&Clock(100)));
+}
+
+#[test]
+fn idle_hold_refreshes_pre_tunnel_proof_without_planning_an_effect() {
+    let m = held();
+    let (o, e) = machine_fixture(&m, Form::PreTunnel, 1, 101);
+    let verdict = verify::verify(&o, &e, &Clock(101));
+    assert!(matches!(verdict, Verdict::Protected(_)));
+    let m = m
+        .transition(observed(&m, Form::PreTunnel, verdict), &Clock(101))
+        .unwrap();
+    assert_eq!(m.plan(), []);
+    assert!(m.blocking_verified_at(&Clock(101)));
+    assert!(!matches!(
+        m.enforcement_at(&Clock(101)),
+        Verdict::Protected(_)
+    ));
+    assert!(!m.blocking_verified_at(&Clock(1000)));
+    assert!(!m.status_text_at(&Clock(1000)).contains("blocking verified"));
+}
+
+#[test]
+fn idle_hold_repairs_losses_and_disabled_pf_with_only_the_closing_prefix() {
+    let base = held();
+    for event in [
+        Event::Repair(Action::Rejoin),
+        Event::Repair(Action::RecreateChild),
+        Event::Repair(Action::Rerender {
+            form: Form::PreTunnel,
+        }),
+        observed(
+            &base,
+            Form::PreTunnel,
+            Verdict::NotProtected(Reason::HookMissing),
+        ),
+        observed(
+            &base,
+            Form::PreTunnel,
+            Verdict::Repair(Action::EnableAndRejoin),
+        ),
+    ] {
+        let mut m = base.transition(event, &Clock(101)).unwrap();
+        let mut expected = vec![];
+        if m.plan().contains(&Step::AcquireReference) {
+            expected.push(Step::AcquireReference);
+        }
+        expected.extend([
+            Step::LoadPreTunnel,
+            Step::VerifyPreTunnelLoad,
+            Step::FlushStates,
+            Step::VerifyPreTunnel,
+        ]);
+        assert_eq!(m.plan(), expected);
+        // Failed closing work retries after exactly one second.
+        if m.pending() == Some(Step::AcquireReference) {
+            m = m
+                .transition(checked_completion_at(&m, 101), &Clock(101))
+                .unwrap();
+        }
+        m = m
+            .transition(
+                Event::Failed(Reason::Observation("load failed")),
+                &Clock(101),
+            )
+            .unwrap();
+        // The failed load keeps its own deadline; accounting follows the
+        // verification because no acquisition is needed to restore blocking.
+        assert_eq!(m.pending(), Some(Step::Backoff { until: 102 }));
+        assert_eq!(m.plan().get(1), Some(&Step::LoadPreTunnel));
+        assert!(!m.plan().contains(&Step::StopChild));
+    }
+}
+
+#[test]
+fn idle_hold_gap_expiry_and_wake_flush_then_verify_and_reload_only_on_drift() {
+    let base = held();
+    for event in [
+        Event::InvalidateObservations { since: 101 },
+        observed(&base, Form::PreTunnel, Verdict::Unknown { since: 101 }),
+        Event::ChildDied, // at a later time, expiry is noticed even on an ignored event
+    ] {
+        let now = if matches!(event, Event::ChildDied) {
+            1000
+        } else {
+            101
+        };
+        let mut m = base.transition(event, &Clock(now)).unwrap();
+        assert_eq!(m.plan(), [Step::FlushStates, Step::VerifyPreTunnel]);
+        m = m
+            .transition(checked_completion_at(&m, now), &Clock(now))
+            .unwrap();
+        let clean = m
+            .transition(checked_completion_at(&m, now), &Clock(now))
+            .unwrap();
+        assert_eq!(clean.plan(), []);
+        assert!(clean.blocking_verified_at(&Clock(now)));
+        m = m
+            .transition(
+                observed(&m, Form::PreTunnel, Verdict::Repair(Action::Rejoin)),
+                &Clock(now),
+            )
+            .unwrap();
+        assert_eq!(m.pending(), Some(Step::LoadPreTunnel));
+        assert!(m.plan().contains(&Step::VerifyPreTunnelLoad));
+        assert!(!m.plan().contains(&Step::StopChild));
+    }
+}
+
+#[test]
+fn hold_ignores_child_died_without_changing_the_idle_machine() {
+    let m = held();
+    assert_eq!(m.transition(Event::ChildDied, &Clock(100)).unwrap(), m);
+}
+
+#[test]
+fn join_is_refused_under_hold_at_restart_idle_and_during_leave() {
+    let idle = held();
+    for m in [
+        Machine::restart(idle.durable().clone()),
+        idle.clone(),
+        idle.transition(Event::Leave, &Clock(100)).unwrap(),
+    ] {
+        let before = m.clone();
+        assert!(m.transition(Event::Join, &Clock(100)).is_err());
+        assert_eq!(m, before);
+    }
+}
+
+#[test]
+fn leave_under_hold_finishes_without_accounting_and_clear_intent_clears_both_flags() {
+    for initial in [
+        held(),
+        Machine::restart(Durable {
+            join_intended: true,
+            hold: true,
+            uncertain_acquires: vec![1, 2],
+            reference_sequence: 2,
+            ..Durable::default()
+        }),
+    ] {
+        let mut m = initial.transition(Event::Leave, &Clock(100)).unwrap();
+        if m.pending() != Some(Step::PersistLeaving) {
+            m = m
+                .transition(
+                    Event::Failed(Reason::Observation("settle cancelled head")),
+                    &Clock(100),
+                )
+                .unwrap();
+        }
+        m = m
+            .transition(Event::Completed(Step::PersistLeaving), &Clock(100))
+            .unwrap();
+        assert!(m.durable().hold);
+        for step in [
+            Step::StopChild,
+            Step::CleanupRoutes,
+            Step::CleanupDns,
+            Step::CleanupArtifacts,
+            Step::RemoveAnchor,
+            Step::ClearIntent,
+        ] {
+            assert_eq!(m.pending(), Some(step));
+            m = m.transition(Event::Completed(step), &Clock(100)).unwrap();
+        }
+        assert!(!m.durable().hold);
+        assert!(!m.durable().join_intended);
+        assert!(m.connectivity_restored());
+        assert!(m.transition(Event::Join, &Clock(100)).is_ok());
+    }
+}
+
+#[test]
+fn hold_reconcile_failure_never_parks_the_closing_prefix() {
+    for uncertain in 0..=2 {
+        let mut m = Machine::restart(Durable {
+            join_intended: true,
+            hold: true,
+            pf_reference: (uncertain == 0).then_some(71),
+            uncertain_acquires: (1..=uncertain).collect(),
+            reference_sequence: 2,
+            reference_needs_reconcile: true,
+            ..Durable::default()
+        });
+        let mut failed = false;
+        for _ in 0..16 {
+            let step = m.pending().unwrap();
+            if matches!(step, Step::Backoff { .. }) {
+                break;
+            }
+            let event = if step == Step::ReconcileReference {
+                assert!(!failed);
+                failed = true;
+                Event::Failed(Reason::Observation("undecidable"))
+            } else {
+                checked_completion_at(&m, 100)
+            };
+            m = m.transition(event, &Clock(100)).unwrap();
+        }
+        assert!(failed);
+        assert!(m.blocking_verified_at(&Clock(100)));
+        assert_eq!(
+            m.plan(),
+            [Step::Backoff { until: 101 }, Step::ReconcileReference]
+        );
+        // Fresh proofs also refresh while idle accounting is waiting.
+        let (o, e) = machine_fixture(&m, Form::PreTunnel, 1, 100);
+        let refreshed = m
+            .transition(
+                observed(&m, Form::PreTunnel, verify::verify(&o, &e, &Clock(100))),
+                &Clock(100),
+            )
+            .unwrap();
+        assert_eq!(refreshed.plan(), m.plan());
+        // A wake cancels the accounting timer and runs only flush/verify.
+        m = m
+            .transition(Event::InvalidateObservations { since: 100 }, &Clock(100))
+            .unwrap();
+        assert_eq!(m.plan(), [Step::FlushStates, Step::VerifyPreTunnel]);
+    }
+}
+
+proptest! {
+    #[test]
+    fn hold_never_plans_check_tools_reserve_generation_or_start_child(
+        tokens in prop::collection::btree_set(1u64..1000, 0..=2),
+        uncertain in 0usize..=2,
+        events in prop::collection::vec((0u8..15, 0u64..4), 1..100),
+    ) {
+        let tokens: Vec<_> = tokens.into_iter().collect();
+        let uncertain = uncertain.min(2 - tokens.len());
+        let mut m = Machine::restart(Durable {
+            join_intended: true, hold: true,
+            pf_reference: tokens.first().copied(), older_references: tokens.iter().skip(1).copied().collect(),
+            uncertain_acquires: (1..=u64::try_from(uncertain).unwrap()).collect(), reference_sequence: 2,
+            ..Durable::default()
+        });
+        let mut now = 100;
+        for (kind, elapsed) in events {
+            now += elapsed;
+            if m.durable().hold {
+                prop_assert!(!m.plan().iter().any(|s| matches!(s, Step::CheckTools | Step::ReserveGeneration | Step::StartChild)));
+                prop_assert!(!matches!(m.enforcement_at(&Clock(now)), Verdict::Protected(_)));
+            }
+            assert_reference_invariants(&m, now);
+            let event = match kind {
+                0 => Event::Join,
+                1 => Event::Leave,
+                2 => Event::ChildDied,
+                3 => Event::Repair(Action::EnableAndRejoin),
+                4 => Event::Repair(Action::Rerender { form: Form::PreTunnel }),
+                5 => Event::InvalidateObservations { since: now },
+                6 => observed(&m, Form::PreTunnel, Verdict::NotProtected(Reason::HookMissing)),
+                7 => observed(&m, Form::PreTunnel, Verdict::Unknown { since: now }),
+                8 => Event::Failed(Reason::Observation("injected hold failure")),
+                9 => { m = Machine::restart(m.durable().clone()); continue; },
+                10 => Event::PfEnabledObserved { context: m.context() },
+                11 if m.durable().pf_reference.is_some() => Event::ReferenceSettled { entry: ReferenceEntry::Token(m.durable().pf_reference.unwrap()), how: ReferenceSettlement::Absent },
+                _ if m.pending().is_some() => { now = executor_time(&m, now); checked_completion_at(&m, now) },
+                _ => {
+                    let (o, e) = machine_fixture(&m, Form::PreTunnel, 1, now);
+                    observed(&m, Form::PreTunnel, verify::verify(&o, &e, &Clock(now)))
+                },
+            };
+            if let Ok(next) = m.transition(event, &Clock(now)) { m = next; }
+        }
+        if m.durable().hold {
+            prop_assert!(!m.plan().iter().any(|s| matches!(s, Step::CheckTools | Step::ReserveGeneration | Step::StartChild)));
+        }
+        assert_reference_invariants(&m, now);
+    }
+}
+
+#[test]
+fn held_maintenance_refreshes_cleanliness_without_changing_durable_state() {
+    let m = held();
+    let durable = m.durable().clone();
+    let m = m
+        .transition(
+            Event::StatesClean {
+                epoch: m.context().state_epoch,
+                completed_at: 101,
+            },
+            &Clock(101),
+        )
+        .unwrap();
+    assert_eq!(m.durable(), &durable);
+    assert_eq!(m.states_clean_at(), Some(101));
+    assert!(m.blocking_verified_at(&Clock(101)));
+    assert_eq!(m.plan(), []);
+}
+
+#[test]
+fn held_expiry_during_background_reconciliation_queues_flush_after_its_boundary() {
+    let mut m = Machine::restart(Durable {
+        join_intended: true,
+        hold: true,
+        uncertain_acquires: vec![1, 2],
+        reference_sequence: 2,
+        ..Durable::default()
+    });
+    m = m
+        .transition(
+            Event::Failed(Reason::Observation("undecidable")),
+            &Clock(100),
+        )
+        .unwrap();
+    for _ in 0..8 {
+        if matches!(m.pending(), Some(Step::Backoff { .. })) {
+            break;
+        }
+        m = m
+            .transition(checked_completion_at(&m, 100), &Clock(100))
+            .unwrap();
+    }
+    assert_eq!(
+        m.plan(),
+        [Step::Backoff { until: 101 }, Step::ReconcileReference]
+    );
+    let expired = m.transition(Event::ChildDied, &Clock(1000)).unwrap();
+    assert_eq!(expired.plan(), [Step::FlushStates, Step::VerifyPreTunnel]);
+    m = m
+        .transition(Event::Completed(Step::Backoff { until: 101 }), &Clock(101))
+        .unwrap();
+    assert_eq!(m.pending(), Some(Step::ReconcileReference));
+    // Its result is in flight when the old proof expires.
+    m = m.transition(Event::ChildDied, &Clock(1000)).unwrap();
+    assert_eq!(
+        m.plan(),
+        [
+            Step::ReconcileReference,
+            Step::FlushStates,
+            Step::VerifyPreTunnel
+        ]
+    );
+    m = m
+        .transition(
+            Event::Failed(Reason::Observation("still undecidable")),
+            &Clock(1000),
+        )
+        .unwrap();
+    assert_eq!(m.plan(), [Step::FlushStates, Step::VerifyPreTunnel]);
+}
+
+#[test]
+fn recovery_hold_accepts_every_repair_with_accounting_waiting_or_in_flight() {
+    for in_flight in [false, true] {
+        let mut base = recovery_held();
+        if in_flight {
+            base = base
+                .transition(Event::Completed(Step::Backoff { until: 101 }), &Clock(101))
+                .unwrap();
+        }
+        for action in [
+            Action::Rejoin,
+            Action::EnableAndRejoin,
+            Action::RecreateChild,
+            Action::Rerender {
+                form: Form::PreTunnel,
+            },
+            Action::Rerender { form: Form::Joined },
+        ] {
+            let mut m = base.transition(Event::Repair(action), &Clock(101)).unwrap();
+            if in_flight {
+                assert_eq!(m.plan(), [Step::ReconcileReference]);
+                m = m
+                    .transition(
+                        Event::Failed(Reason::Observation("in-flight accounting")),
+                        &Clock(101),
+                    )
+                    .unwrap();
+            }
+            if action == Action::EnableAndRejoin {
+                assert_eq!(m.pending(), Some(Step::ReconcileReference));
+                m = m
+                    .transition(
+                        Event::Failed(Reason::Observation("undecidable")),
+                        &Clock(101),
+                    )
+                    .unwrap();
+            } else {
+                assert_eq!(m.pending(), Some(Step::LoadPreTunnel));
+                assert_eq!(m.plan().last(), Some(&Step::ReconcileReference));
+            }
+            for _ in 0..4 {
+                m = m
+                    .transition(checked_completion_at(&m, 101), &Clock(101))
+                    .unwrap();
+            }
+            if m.pending() == Some(Step::ReconcileReference) {
+                m = m
+                    .transition(
+                        Event::Failed(Reason::Observation("undecidable")),
+                        &Clock(101),
+                    )
+                    .unwrap();
+            }
+            assert!(m.blocking_verified_at(&Clock(101)));
+            assert_eq!(
+                m.plan(),
+                [Step::Backoff { until: 102 }, Step::ReconcileReference]
+            );
+        }
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Repeat every table row at both accounting boundaries.
+fn recovery_hold_table_refresh_maintenance_losses_gaps_child_join_and_leave() {
+    for in_flight in [false, true] {
+        let mut base = recovery_held();
+        if in_flight {
+            base = base
+                .transition(Event::Completed(Step::Backoff { until: 101 }), &Clock(101))
+                .unwrap();
+        }
+        // Refresh and the ten-second maintenance receipt preserve queued debt.
+        let durable = base.durable().clone();
+        let clean = base
+            .transition(
+                Event::StatesClean {
+                    epoch: base.context().state_epoch,
+                    completed_at: 101,
+                },
+                &Clock(101),
+            )
+            .unwrap();
+        assert_eq!(clean.durable(), &durable);
+        assert_eq!(clean.plan(), base.plan());
+        assert_eq!(clean.states_clean_at(), Some(101));
+        let (o, e) = machine_fixture(&clean, Form::PreTunnel, 1, 101);
+        let refreshed = clean
+            .transition(
+                observed(&clean, Form::PreTunnel, verify::verify(&o, &e, &Clock(101))),
+                &Clock(101),
+            )
+            .unwrap();
+        assert!(refreshed.blocking_verified_at(&Clock(101)));
+        assert_eq!(refreshed.plan(), base.plan());
+        assert_eq!(
+            base.transition(Event::ChildDied, &Clock(100)).unwrap(),
+            base
+        );
+        assert!(base.transition(Event::Join, &Clock(101)).is_err());
+
+        for verdict in [
+            Verdict::NotProtected(Reason::HookMissing),
+            Verdict::Repair(Action::EnableAndRejoin),
+        ] {
+            let mut m = base
+                .transition(observed(&base, Form::PreTunnel, verdict), &Clock(101))
+                .unwrap();
+            // Only a dispatched call or debt blocking enable runs first.
+            for _ in 0..2 {
+                if m.pending() != Some(Step::ReconcileReference) {
+                    break;
+                }
+                m = m
+                    .transition(
+                        Event::Failed(Reason::Observation("undecidable")),
+                        &Clock(101),
+                    )
+                    .unwrap();
+            }
+            assert_eq!(m.pending(), Some(Step::LoadPreTunnel));
+            assert!(!m.plan().contains(&Step::StopChild));
+        }
+        for event in [
+            Event::InvalidateObservations { since: 101 },
+            observed(&base, Form::PreTunnel, Verdict::Unknown { since: 101 }),
+            Event::ChildDied,
+        ] {
+            let now = if matches!(event, Event::ChildDied) {
+                1000
+            } else {
+                101
+            };
+            let mut m = base.transition(event, &Clock(now)).unwrap();
+            if in_flight {
+                assert_eq!(m.pending(), Some(Step::ReconcileReference));
+                m = m
+                    .transition(
+                        Event::Failed(Reason::Observation("undecidable")),
+                        &Clock(now),
+                    )
+                    .unwrap();
+            }
+            assert_eq!(m.plan(), [Step::FlushStates, Step::VerifyPreTunnel]);
+            for _ in 0..2 {
+                m = m
+                    .transition(checked_completion_at(&m, now), &Clock(now))
+                    .unwrap();
+            }
+            assert!(m.blocking_verified_at(&Clock(now)));
+            assert!(m.plan().contains(&Step::ReconcileReference));
+        }
+        let mut m = base.transition(Event::Leave, &Clock(101)).unwrap();
+        if in_flight {
+            m = m
+                .transition(
+                    Event::Failed(Reason::Observation("cancelled accounting")),
+                    &Clock(101),
+                )
+                .unwrap();
+        }
+        assert_eq!(m.pending(), Some(Step::PersistLeaving));
+        m = m
+            .transition(Event::Completed(Step::PersistLeaving), &Clock(101))
+            .unwrap();
+        assert!(m.transition(Event::Join, &Clock(101)).is_err());
+        for step in [
+            Step::StopChild,
+            Step::CleanupRoutes,
+            Step::CleanupDns,
+            Step::CleanupArtifacts,
+            Step::RemoveAnchor,
+            Step::ClearIntent,
+        ] {
+            assert_eq!(m.pending(), Some(step));
+            m = m.transition(Event::Completed(step), &Clock(101)).unwrap();
+        }
+        assert!(!m.durable().hold);
+        assert!(!m.durable().join_intended);
+        assert_eq!(m.durable().uncertain_acquires, [1, 2]);
+        assert!(m.connectivity_restored());
+    }
+}
+
+#[test]
+fn held_cleanup_failure_retries_only_that_step_and_does_not_starve_accounting() {
+    for failed_step in [
+        Step::StopChild,
+        Step::CleanupRoutes,
+        Step::CleanupDns,
+        Step::CleanupArtifacts,
+    ] {
+        let mut m = Machine::restart(Durable {
+            join_intended: true,
+            hold: true,
+            uncertain_acquires: vec![1, 2],
+            reference_sequence: 2,
+            ..Durable::default()
+        });
+        let mut loads = 0;
+        let mut flushes = 0;
+        let mut accounting = 0;
+        let mut failures = Vec::new();
+        for now in 100..=340 {
+            if now > 100 {
+                // Normal monitoring keeps the proof fresh; lifecycle cleanup
+                // must not cause additional anchor loads or all-state flushes.
+                let (o, e) = machine_fixture(&m, Form::PreTunnel, 1, now);
+                m = m
+                    .transition(
+                        observed(&m, Form::PreTunnel, verify::verify(&o, &e, &Clock(now))),
+                        &Clock(now),
+                    )
+                    .unwrap();
+            }
+            for _ in 0..20 {
+                let Some(step) = m.pending() else {
+                    break;
+                };
+                if matches!(step, Step::Backoff { until } if until > now) {
+                    break;
+                }
+                let event = if step == failed_step {
+                    failures.push(now);
+                    Event::Failed(Reason::Observation("endpoint unknown"))
+                } else if step == Step::ReconcileReference {
+                    accounting += 1;
+                    Event::Failed(Reason::Observation("other product owns pf"))
+                } else {
+                    loads += usize::from(step == Step::LoadPreTunnel);
+                    flushes += usize::from(step == Step::FlushStates);
+                    checked_completion_at(&m, now)
+                };
+                m = m.transition(event, &Clock(now)).unwrap();
+            }
+            assert!(m.blocking_verified_at(&Clock(now)));
+            assert!(
+                m.durable()
+                    .cleanup_errors
+                    .contains(&(failed_step, Reason::Observation("endpoint unknown")))
+            );
+            assert_eq!(
+                m.status_at(&Clock(now)),
+                ConnectionStatus::NotProtected {
+                    reason: "state untrusted: run leave",
+                    blocking_verified: true,
+                }
+            );
+        }
+        assert_eq!((loads, flushes), (1, 1));
+        assert_eq!(failures, [100, 101, 103, 107, 115, 131, 163, 223, 283]);
+        assert!(accounting >= 230, "accounting was starved: {accounting}");
+        // A successful independent retry clears only this error.
+        let now = 343;
+        let (o, e) = machine_fixture(&m, Form::PreTunnel, 1, now);
+        m = m
+            .transition(
+                observed(&m, Form::PreTunnel, verify::verify(&o, &e, &Clock(now))),
+                &Clock(now),
+            )
+            .unwrap();
+        for _ in 0..8 {
+            if m.pending() == Some(failed_step) {
+                break;
+            }
+            let event = if m.pending() == Some(Step::ReconcileReference) {
+                Event::Failed(Reason::Observation("still undecidable"))
+            } else {
+                checked_completion_at(&m, now)
+            };
+            m = m.transition(event, &Clock(now)).unwrap();
+        }
+        assert_eq!(m.pending(), Some(failed_step));
+        m = m
+            .transition(Event::Completed(failed_step), &Clock(now))
+            .unwrap();
+        assert!(
+            !m.durable()
+                .cleanup_errors
+                .iter()
+                .any(|(step, _)| *step == failed_step)
+        );
+    }
+}
+
+#[test]
+fn held_status_never_promises_rejoining_and_reports_only_fresh_blocking() {
+    for m in [
+        held(),
+        recovery_held(),
+        Machine::restart(recovery_held().durable().clone()),
+    ] {
+        for now in [100, 1000] {
+            assert_eq!(
+                m.status_at(&Clock(now)),
+                ConnectionStatus::NotProtected {
+                    reason: "state untrusted: run leave",
+                    blocking_verified: m.blocking_verified_at(&Clock(now)),
+                }
+            );
+            assert_eq!(
+                m.enforcement_at(&Clock(now)),
+                Verdict::NotProtected(Reason::Observation("state untrusted: run leave"))
+            );
+        }
+    }
+    // Even an invalid directly constructed core snapshot never flushes Left.
+    let m = Machine::restart(Durable {
+        hold: true,
+        ..Durable::default()
+    });
+    assert_eq!(
+        m.transition(Event::ChildDied, &Clock(100)).unwrap().plan(),
+        []
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Cover predecessor scheduling, refresh, timed recheck and exact settlement.
+fn fresh_join_verification_schedules_retained_predecessor_for_exact_settlement() {
+    let mut m = Machine::restart(Durable {
+        pf_reference: Some(701),
+        ..Durable::default()
+    });
+    m = m.transition(Event::Join, &Clock(100)).unwrap();
+    // Settle the idle accounting call first; retain its token as current.
+    m = m
+        .transition(checked_completion_at(&m, 100), &Clock(100))
+        .unwrap();
+    while m.pending() != Some(Step::VerifyJoined) {
+        // Releasing the retained token is permitted only after the fresh
+        // acquisition has a full Joined proof, never during its setup prefix.
+        assert!(!m.plan().contains(&Step::ReconcileReference));
+        m = m
+            .transition(checked_completion_at(&m, 100), &Clock(100))
+            .unwrap();
+    }
+    assert_eq!(m.durable().pf_reference, Some(702));
+    assert_eq!(m.durable().older_references, [701]);
+    assert!(!m.plan().contains(&Step::ReconcileReference));
+    m = m
+        .transition(checked_completion_at(&m, 100), &Clock(100))
+        .unwrap();
+    assert_eq!(m.pending(), Some(Step::ReconcileReference));
+    for in_flight in [false, true] {
+        let background = if in_flight {
+            m.clone()
+        } else {
+            m.transition(
+                Event::Failed(Reason::Observation("predecessor undecidable")),
+                &Clock(100),
+            )
+            .unwrap()
+        };
+        let (o, e) = machine_fixture(&background, Form::Joined, 1, 101);
+        let refreshed = background
+            .transition(
+                observed(
+                    &background,
+                    Form::Joined,
+                    verify::verify(&o, &e, &Clock(101)),
+                ),
+                &Clock(101),
+            )
+            .unwrap();
+        assert_eq!(refreshed.plan(), background.plan());
+        assert_eq!(refreshed.durable().older_references, [701]);
+        assert_eq!(
+            refreshed.durable().reference_error,
+            background.durable().reference_error
+        );
+        assert_eq!(refreshed.status_at(&Clock(101)), ConnectionStatus::Joined);
+    }
+    // A summary is never authority to release an identity. The executor must
+    // obtain same-boot release evidence and send its exact settlement first.
+    let mut recheck = m
+        .transition(
+            Event::Failed(Reason::Observation("late predecessor result")),
+            &Clock(106),
+        )
+        .unwrap();
+    assert_eq!(recheck.plan(), [Step::FlushStates, Step::VerifyJoined]);
+    recheck = recheck
+        .transition(checked_completion_at(&recheck, 107), &Clock(107))
+        .unwrap();
+    assert_eq!(recheck.plan(), [Step::VerifyJoined]);
+    recheck = recheck
+        .transition(checked_completion_at(&recheck, 108), &Clock(108))
+        .unwrap();
+    assert_eq!(recheck.pending(), Some(Step::ReconcileReference));
+    assert_eq!(recheck.status_at(&Clock(108)), ConnectionStatus::Joined);
+    assert!(
+        m.transition(
+            Event::ReferenceReconciled {
+                context: m.context(),
+                current: Some(702),
+                predecessor: None
+            },
+            &Clock(100)
+        )
+        .is_err()
+    );
+    m = m
+        .transition(
+            Event::ReferenceSettled {
+                entry: ReferenceEntry::Token(701),
+                how: ReferenceSettlement::Released,
+            },
+            &Clock(100),
+        )
+        .unwrap();
+    m = m
+        .transition(
+            Event::ReferenceReconciled {
+                context: m.context(),
+                current: Some(702),
+                predecessor: None,
+            },
+            &Clock(100),
+        )
+        .unwrap();
+    assert_eq!(m.durable().older_references, [] as [u64; 0]);
+    assert_eq!(m.durable().pf_reference, Some(702));
+    assert!(!m.plan().contains(&Step::ReconcileReference));
+    assert_eq!(m.pending(), None);
+}
+
+// K2 fixture: a verified held prefix whose route cleanup failed independently.
+// Both uncertain acquisitions remain undecidable, so accounting must coexist
+// with the cleanup retry instead of being dropped from its queue.
+fn held_route_cleanup_retry(free_slot: bool) -> Machine {
+    let mut m = Machine::restart(Durable {
+        join_intended: true,
+        hold: true,
+        uncertain_acquires: if free_slot { vec![] } else { vec![1, 2] },
+        reference_sequence: 2,
+        ..Durable::default()
+    });
+    for _ in 0..20 {
+        if matches!(m.pending(), Some(Step::Backoff { .. })) {
+            assert!(m.blocking_verified_at(&Clock(100)));
+            assert!(m.plan().contains(&Step::CleanupRoutes));
+            return m;
+        }
+        let event = match m.pending().unwrap() {
+            Step::CleanupRoutes => Event::Failed(Reason::Observation("route cleanup failed")),
+            Step::ReconcileReference => {
+                Event::Failed(Reason::Observation("accounting undecidable"))
+            }
+            _ => checked_completion_at(&m, 100),
+        };
+        m = m.transition(event, &Clock(100)).unwrap();
+    }
+    panic!("cleanup retry did not become background: {m:?}");
+}
+
+#[test]
+fn held_cleanup_retry_results_keep_their_head_across_every_invalidation() {
+    let base = held_route_cleanup_retry(false);
+    assert!(base.plan().contains(&Step::ReconcileReference));
+    let base = base
+        .transition(checked_completion_at(&base, 101), &Clock(101))
+        .unwrap();
+    assert_eq!(base.pending(), Some(Step::CleanupRoutes));
+    for event in [
+        Event::InvalidateObservations { since: 101 },
+        observed(&base, Form::PreTunnel, Verdict::Unknown { since: 101 }),
+    ] {
+        for failed in [false, true] {
+            let mut m = base.transition(event.clone(), &Clock(101)).unwrap();
+            assert_eq!(m.pending(), Some(Step::CleanupRoutes));
+            let result = if failed {
+                Event::Failed(Reason::Observation("retry failed"))
+            } else {
+                Event::Completed(Step::CleanupRoutes)
+            };
+            m = m.transition(result, &Clock(101)).unwrap();
+            assert_eq!(m.plan(), [Step::FlushStates, Step::VerifyPreTunnel]);
+            assert!(!m.plan().contains(&Step::LoadPreTunnel));
+            let errors = &m.durable().cleanup_errors;
+            if failed {
+                assert!(
+                    errors.contains(&(Step::CleanupRoutes, Reason::Observation("retry failed")))
+                );
+                assert!(!errors.iter().any(|(step, _)| *step == Step::FlushStates));
+            } else {
+                assert!(!errors.iter().any(|(step, _)| *step == Step::CleanupRoutes));
+            }
+        }
+    }
+}
+
+#[test]
+fn held_cleanup_retry_results_preserve_separately_requested_repairs() {
+    let base = held_route_cleanup_retry(false);
+    let base = base
+        .transition(checked_completion_at(&base, 101), &Clock(101))
+        .unwrap();
+    assert_eq!(base.pending(), Some(Step::CleanupRoutes));
+    for verdict in [
+        Verdict::Repair(Action::Rerender {
+            form: Form::PreTunnel,
+        }),
+        Verdict::NotProtected(Reason::HookMissing),
+        Verdict::Repair(Action::EnableAndRejoin),
+    ] {
+        for failed in [false, true] {
+            let event = observed(&base, Form::PreTunnel, verdict.clone());
+            let mut m = base.transition(event, &Clock(101)).unwrap();
+            assert_eq!(m.pending(), Some(Step::CleanupRoutes));
+            let result = if failed {
+                Event::Failed(Reason::Observation("retry failed"))
+            } else {
+                Event::Completed(Step::CleanupRoutes)
+            };
+            m = m.transition(result, &Clock(101)).unwrap();
+            let expected = if verdict == Verdict::Repair(Action::EnableAndRejoin) {
+                Step::ReconcileReference
+            } else {
+                Step::LoadPreTunnel
+            };
+            assert_eq!(m.pending(), Some(expected), "{verdict:?}, failed={failed}");
+            let errors = &m.durable().cleanup_errors;
+            if failed {
+                assert!(
+                    errors.contains(&(Step::CleanupRoutes, Reason::Observation("retry failed")))
+                );
+                assert!(!errors.iter().any(|(step, _)| *step == Step::FlushStates || *step == Step::LoadPreTunnel));
+            } else {
+                assert!(!errors.iter().any(|(step, _)| *step == Step::CleanupRoutes));
+            }
+        }
+    }
+}
+
+#[test]
+fn held_one_free_slot_acquires_before_accounting_and_reconciles_in_the_same_prefix() {
+    let mut m = Machine::restart(Durable {
+        join_intended: true,
+        hold: true,
+        uncertain_acquires: vec![1],
+        reference_sequence: 1,
+        ..Durable::default()
+    });
+    // A disabled observation arriving with acquisition in flight must not put
+    // ownership accounting ahead of that dispatched enabling operation.
+    m = m
+        .transition(Event::Repair(Action::EnableAndRejoin), &Clock(100))
+        .unwrap();
+    assert_eq!(m.pending(), Some(Step::AcquireReference));
+    let mut acquired = false;
+    let mut verified = false;
+    for _ in 0..20 {
+        let step = m.pending().unwrap();
+        assert!(!matches!(step, Step::Backoff { .. }));
+        if step == Step::ReconcileReference {
+            assert!(acquired && verified);
+            return;
+        }
+        acquired |= step == Step::AcquireReference;
+        verified |= step == Step::VerifyPreTunnel;
+        m = m
+            .transition(checked_completion_at(&m, 100), &Clock(100))
+            .unwrap();
+    }
+    panic!("accounting did not follow verification in the held prefix");
+}
+
+#[test]
+fn joined_retained_predecessor_accepts_maintenance_and_handshake_for_over_sixty_seconds() {
+    let mut m = Machine::restart(Durable {
+        pf_reference: Some(701),
+        ..Durable::default()
+    });
+    let mut now = 100;
+    m = m.transition(Event::Join, &Clock(now)).unwrap();
+    // The Left reconciliation was already dispatched. It and every subsequent
+    // accounting call fail; no fixture settles the predecessor behind our back.
+    m = m
+        .transition(
+            Event::Failed(Reason::Observation("retained predecessor")),
+            &Clock(now + 1),
+        )
+        .unwrap();
+    now += 1;
+    for _ in 0..80 {
+        if m.status_at(&Clock(now)) == ConnectionStatus::Joined {
+            break;
+        }
+        now = executor_time(&m, now + 1);
+        let event = if m.pending() == Some(Step::ReconcileReference) {
+            Event::Failed(Reason::Observation("retained predecessor"))
+        } else {
+            checked_completion_at(&m, now)
+        };
+        m = m.transition(event, &Clock(now)).unwrap();
+    }
+    assert_eq!(m.status_at(&Clock(now)), ConnectionStatus::Joined);
+    assert_eq!(m.durable().older_references, [701]);
+    let start = now;
+    for cycle in 0..20 {
+        now += 1;
+        m = m
+            .transition(
+                Event::StatesClean {
+                    epoch: m.context().state_epoch,
+                    completed_at: now,
+                },
+                &Clock(now),
+            )
+            .unwrap();
+        assert_eq!(m.status_at(&Clock(now)), ConnectionStatus::Joined);
+        now += 1;
+        let generation = m.tunnel().unwrap().generation;
+        let (o, e) = machine_fixture(&m, Form::Joined, generation.value(), now);
+        m = m
+            .transition(
+                observed(&m, Form::Joined, verify::verify(&o, &e, &Clock(now))),
+                &Clock(now),
+            )
+            .unwrap();
+        assert_eq!(m.status_at(&Clock(now)), ConnectionStatus::Joined);
+        now += 1;
+        let fresh = cycle % 2 == 0;
+        m = m
+            .transition(Event::Handshake { generation, fresh }, &Clock(now))
+            .unwrap();
+        assert_eq!(
+            m.tunnel_health(),
+            &if fresh {
+                TunnelHealth::Healthy
+            } else {
+                TunnelHealth::AwaitingHandshake
+            }
+        );
+        assert_eq!(m.status_at(&Clock(now)), ConnectionStatus::Joined);
+        now = executor_time(&m, now + 1);
+        let event = if m.pending() == Some(Step::ReconcileReference) {
+            Event::Failed(Reason::Observation("retained predecessor"))
+        } else {
+            assert!(matches!(m.pending(), Some(Step::Backoff { .. })));
+            checked_completion_at(&m, now)
+        };
+        m = m.transition(event, &Clock(now)).unwrap();
+        assert_eq!(m.status_at(&Clock(now)), ConnectionStatus::Joined);
+        assert_eq!(m.durable().older_references, [701]);
+    }
+    assert!(now - start >= 60);
+}
+
+#[test]
+fn held_cleanup_retry_preserves_queued_accounting_and_clears_its_last_error_on_success() {
+    let mut m = held_route_cleanup_retry(false);
+    assert!(m.plan().contains(&Step::ReconcileReference));
+    m = m
+        .transition(checked_completion_at(&m, 101), &Clock(101))
+        .unwrap();
+    assert_eq!(m.pending(), Some(Step::CleanupRoutes));
+    assert!(m.plan().contains(&Step::ReconcileReference));
+    assert_eq!(
+        m.durable().last_error,
+        Some(Reason::Observation("route cleanup failed"))
+    );
+    m = m
+        .transition(Event::Completed(Step::CleanupRoutes), &Clock(101))
+        .unwrap();
+    assert_eq!(m.durable().last_error, None);
+    assert!(m.plan().contains(&Step::ReconcileReference));
+    assert!(
+        !m.durable()
+            .cleanup_errors
+            .iter()
+            .any(|(step, _)| *step == Step::CleanupRoutes)
+    );
+}
+
+#[test]
+fn invalidation_preserves_predecessor_reference_and_cleanup_errors() {
+    let error = Reason::Observation("predecessor release unknown");
+    let mut m = Machine::restart(Durable {
+        join_intended: true,
+        hold: true,
+        pf_reference: Some(702),
+        older_references: vec![701],
+        reference_error: Some(error.clone()),
+        cleanup_errors: vec![(Step::ReconcileReference, error.clone())],
+        ..Durable::default()
+    });
+    for _ in 0..16 {
+        if matches!(m.pending(), Some(Step::Backoff { .. })) {
+            break;
+        }
+        m = m
+            .transition(checked_completion_at(&m, 100), &Clock(100))
+            .unwrap();
+    }
+    assert!(m.blocking_verified_at(&Clock(100)));
+    assert_eq!(m.pending(), Some(Step::Backoff { until: 101 }));
+    m = m
+        .transition(Event::InvalidateObservations { since: 100 }, &Clock(100))
+        .unwrap();
+    assert_eq!(m.durable().older_references, [701]);
+    assert_eq!(m.durable().reference_error, Some(error.clone()));
+    assert!(
+        m.durable()
+            .cleanup_errors
+            .contains(&(Step::ReconcileReference, error))
+    );
+    assert!(
+        m.status_text_at(&Clock(100))
+            .contains("ownership cleanup debt")
+    );
+}
+
+#[test]
+fn held_accounting_backoff_never_precedes_safety_steps_except_a_closing_wait() {
+    let mut m = recovery_held()
+        .transition(Event::Repair(Action::EnableAndRejoin), &Clock(100))
+        .unwrap();
+    for sequence in [1, 2] {
+        m = settled(
+            &m,
+            ReferenceEntry::Acquire(sequence),
+            ReferenceSettlement::Void,
+            100,
+        );
+    }
+    // A failed reconciliation with newly free slots queues a fresh acquisition,
+    // while its accounting deadline is still in the future.
+    m = m
+        .transition(
+            Event::Failed(Reason::Observation("summary timed out")),
+            &Clock(100),
+        )
+        .unwrap();
+    assert_eq!(m.pending(), Some(Step::AcquireReference));
+    m = m
+        .transition(Event::Repair(Action::EnableAndRejoin), &Clock(100))
+        .unwrap();
+    for _ in 0..20 {
+        let Some(step) = m.pending() else {
+            break;
+        };
+        if matches!(step, Step::Backoff { .. }) && !m.plan().contains(&Step::VerifyPreTunnel) {
+            break;
+        }
+        assert_no_held_accounting_wait(&m);
+        let now = executor_time(&m, 100);
+        let event = if step == Step::ReconcileReference {
+            Event::Failed(Reason::Observation("accounting still pending"))
+        } else {
+            checked_completion_at(&m, now)
+        };
+        m = m.transition(event, &Clock(now)).unwrap();
+    }
+    // The separate closing-action timer remains valid and retains its target.
+    let m = held()
+        .transition(Event::Repair(Action::Rejoin), &Clock(100))
+        .unwrap();
+    let m = m
+        .transition(
+            Event::Failed(Reason::Observation("load failed")),
+            &Clock(100),
+        )
+        .unwrap();
+    assert_eq!(m.pending(), Some(Step::Backoff { until: 101 }));
+    assert_no_held_accounting_wait(&m);
+}
+
+fn assert_no_held_accounting_wait(m: &Machine) {
+    for (index, step) in m.plan().iter().enumerate() {
+        if let Step::Backoff { until } = step {
+            for target in &m.plan()[index + 1..] {
+                if matches!(
+                    target,
+                    Step::LoadPreTunnel
+                        | Step::VerifyPreTunnelLoad
+                        | Step::FlushStates
+                        | Step::VerifyPreTunnel
+                ) {
+                    let retry = m.closing_retry().unwrap_or_else(|| {
+                        panic!("accounting wait ahead of {target:?}: {:?}", m.plan())
+                    });
+                    assert_eq!(*until, retry.until);
+                    assert_eq!(m.plan()[index + 1], retry.target);
+                }
+            }
+        }
+    }
+}
+
+fn lockdown_fixture(m: Option<&Machine>, now: u64) -> (Observations, verify::LockdownExpected) {
+    let (mut o, e) = setup(Form::PreTunnel);
+    let text = policy::render_lockdown();
+    let rules = parse::pf_rules(text.as_str()).unwrap();
+    o.anchor = Ok(Some(rules.clone()));
+    o.live_tree
+        .as_mut()
+        .unwrap()
+        .anchors
+        .get_mut("com.apple/scupper")
+        .unwrap()
+        .rules = Ok(rules);
+    let context = m.map_or(Context::default(), Machine::context);
+    o.started_at.retain(|key, _| {
+        verify::required_lockdown_reads(o.live_tree.as_ref().unwrap()).contains(key)
+    });
+    for t in o.started_at.values_mut() {
+        *t = now;
+    }
+    o.states = StateEvidence::Clean {
+        epoch: context.state_epoch,
+        completed_at: m.and_then(Machine::states_clean_at).unwrap_or(now),
+    };
+    // These are deliberately absent: lockdown proves no endpoint or tunnel facts.
+    o.policy_inputs = Err(Error("no install"));
+    o.route = Err(Error("no endpoint"));
+    o.local_address = Err(Error("no local address"));
+    o.dns = Err(Error("no DNS expectation"));
+    (
+        o,
+        verify::LockdownExpected {
+            context,
+            baseline: verify::capture_lockdown_baseline(
+                text.as_str(),
+                &e.qualification.normalization,
+            )
+            .unwrap(),
+            qualification: e.qualification,
+            max_age: 5,
+        },
+    )
+}
+
+#[test]
+fn lockdown_golden_and_global_verification() {
+    assert_eq!(
+        policy::render_lockdown().as_str(),
+        "pass quick on lo0 all no state\nblock drop quick all\n"
+    );
+    assert_eq!(policy::policy_table(policy::Policy::Lockdown).len(), 1);
+    let (o, e) = lockdown_fixture(None, 100);
+    assert!(
+        matches!(verify::verify_lockdown(&o, &e, &Clock(100)), Verdict::Protected(ref p)
+        if p.kind() == policy::Kind::Lockdown && p.tunnel().is_none() && p.transport().is_none())
+    );
+    for attack in 0..7 {
+        let mut changed = o.clone();
+        match attack {
+            0 => changed.main = parse::pf_rules("pass quick all\nanchor \"com.apple/*\"\n"),
+            1 => {
+                changed
+                    .skips
+                    .as_mut()
+                    .unwrap()
+                    .insert("en0".parse().unwrap(), true);
+            }
+            2 => changed.states = StateEvidence::Unproven,
+            3 => changed.pf = Ok(parse::PfInfo { enabled: false }),
+            4 => {
+                changed.anchor = Ok(Some(
+                    parse::pf_rules("pass quick on lo0 all no state\n").unwrap(),
+                ));
+            }
+            5 => {
+                changed.translation =
+                    parse::translation("nat on en0 from any to any -> 192.0.2.1\n");
+            }
+            _ => {
+                changed.started_at.remove("skips");
+            }
+        }
+        assert!(
+            !matches!(
+                verify::verify_lockdown(&changed, &e, &Clock(100)),
+                Verdict::Protected(_)
+            ),
+            "attack {attack}"
+        );
+    }
+    assert!(matches!(
+        verify::verify_lockdown(&o, &e, &Clock(106)),
+        Verdict::Unknown { .. }
+    ));
+    assert!(verify::capture_lockdown_baseline("block drop quick all\n", &normalization()).is_err());
+    assert!(verify::capture_lockdown_baseline(PRE, &normalization()).is_err());
+}
+
+#[test]
+fn capture_named_icmp_is_typed_unqualified() {
+    let mut n = normalization();
+    n.named_icmp = false;
+    assert_eq!(
+        verify::capture_lockdown_baseline("pass out quick inet6 proto ipv6-icmp all icmp6-type routersol no state\nblock drop quick all\n", &n).unwrap_err(),
+        verify::CaptureError::Unqualified(verify::UnqualifiedKind::Icmp)
+    );
+}
+
+#[test]
+fn capture_list_expansion_is_typed_unqualified() {
+    let mut n = normalization();
+    n.expanded_lists = false;
+    assert_eq!(
+        verify::capture_lockdown_baseline(
+            "pass out quick all keep state (if-bound)\nblock drop quick all\n",
+            &n
+        )
+        .unwrap_err(),
+        verify::CaptureError::Unqualified(verify::UnqualifiedKind::ListExpansion)
+    );
+}
+
+#[test]
+fn hold_rejects_both_policy_mismatches_and_lockdown_never_joins() {
+    for lockdown in [false, true] {
+        let durable = Durable {
+            join_intended: true,
+            hold: true,
+            uncertain_acquires: vec![1, 2],
+            reference_sequence: 2,
+            ..Durable::default()
+        };
+        let mut m = if lockdown {
+            Machine::restart_lockdown(durable)
+        } else {
+            Machine::restart(durable)
+        };
+        for _ in 0..12 {
+            if m.pending() == Some(Step::VerifyPreTunnelLoad) {
+                break;
+            }
+            let event = if m.pending() == Some(Step::ReconcileReference) {
+                Event::Failed(Reason::Observation("ownership unresolved"))
+            } else {
+                checked_completion_at(&m, 100)
+            };
+            m = m.transition(event, &Clock(100)).unwrap();
+        }
+        assert_eq!(m.pending(), Some(Step::VerifyPreTunnelLoad));
+        let (_, lockdown_expected) = lockdown_fixture(Some(&m), 100);
+        let (_, installed) = machine_fixture(&m, Form::PreTunnel, 1, 100);
+        let wrong = if lockdown {
+            installed.baseline.clone()
+        } else {
+            lockdown_expected.baseline.clone()
+        };
+        assert!(
+            m.transition(Event::ReadbackValidated(wrong), &Clock(100))
+                .is_err()
+        );
+        let right = if lockdown {
+            lockdown_expected.baseline.clone()
+        } else {
+            installed.baseline.clone()
+        };
+        m = m
+            .transition(Event::ReadbackValidated(right), &Clock(100))
+            .unwrap();
+        m = m
+            .transition(
+                Event::StatesClean {
+                    epoch: m.context().state_epoch,
+                    completed_at: 100,
+                },
+                &Clock(100),
+            )
+            .unwrap();
+        assert_eq!(m.pending(), Some(Step::VerifyPreTunnel));
+        let (o, e) = lockdown_fixture(Some(&m), 100);
+        let lockdown_proof = verify::verify_lockdown(&o, &e, &Clock(100));
+        let (o, e) = machine_fixture(&m, Form::PreTunnel, 1, 100);
+        let pre_proof = verify::verify(&o, &e, &Clock(100));
+        let wrong = if lockdown {
+            pre_proof.clone()
+        } else {
+            lockdown_proof.clone()
+        };
+        assert!(
+            m.transition(observed(&m, Form::PreTunnel, wrong), &Clock(100))
+                .is_err()
+        );
+        assert!(
+            m.transition(
+                observed(&m, Form::Joined, lockdown_proof.clone()),
+                &Clock(100)
+            )
+            .is_err()
+        );
+        let right = if lockdown { lockdown_proof } else { pre_proof };
+        m = m
+            .transition(observed(&m, Form::PreTunnel, right), &Clock(100))
+            .unwrap();
+        assert!(!matches!(
+            m.enforcement_at(&Clock(100)),
+            Verdict::Protected(_)
+        ));
+        assert!(m.blocking_verified_at(&Clock(100)));
+        assert!(!m.blocking_verified_at(&Clock(106)));
+        assert!(!m.plan().contains(&Step::CheckTools));
+    }
+}
+
+#[test]
+fn lockdown_rejects_preceding_and_nested_anchor_pass_even_if_qualified() {
+    for nested in [false, true] {
+        let (mut o, mut e) = lockdown_fixture(None, 100);
+        let path = "com.apple/100.synthetic";
+        let quick = parse::pf_rules("pass quick all\n").unwrap();
+        if nested {
+            let inner = format!("{path}/inner");
+            let tree = o.live_tree.as_mut().unwrap();
+            tree.anchors.get_mut(path).unwrap().rules = parse::pf_rules("anchor \"inner\"\n");
+            tree.anchors.insert(
+                inner.clone(),
+                AnchorObservation {
+                    rules: Ok(quick.clone()),
+                    translation: parse::translation(""),
+                },
+            );
+            let inventory = tree.anchors.keys().cloned().collect::<Vec<_>>().join("\n");
+            tree.before = parse::anchor_list(&inventory).unwrap();
+            tree.after = tree.before.clone();
+            e.qualification
+                .siblings
+                .insert(path.into(), parse::pf_rules("anchor \"inner\"\n").unwrap());
+            e.qualification.siblings.insert(inner.clone(), quick);
+            e.qualification
+                .anchor_translation
+                .insert(inner, parse::translation("").unwrap());
+        } else {
+            o.live_tree
+                .as_mut()
+                .unwrap()
+                .anchors
+                .get_mut(path)
+                .unwrap()
+                .rules = Ok(quick.clone());
+            e.qualification.siblings.insert(path.into(), quick);
+        }
+        o.started_at = verify::required_lockdown_reads(o.live_tree.as_ref().unwrap())
+            .into_iter()
+            .map(|read| (read, 100))
+            .collect();
+        assert_eq!(
+            verify::verify_lockdown(&o, &e, &Clock(100)),
+            Verdict::NotProtected(Reason::QuickPass)
+        );
+    }
+}
+
+#[test]
+fn lockdown_proof_cannot_satisfy_joined_or_a_new_observation_context() {
+    let mut machine = Machine::restart(Durable::default())
+        .transition(Event::Join, &Clock(100))
+        .unwrap();
+    for _ in 0..40 {
+        if machine.pending() == Some(Step::VerifyJoined) {
+            break;
+        }
+        machine = machine
+            .transition(checked_completion_at(&machine, 100), &Clock(100))
+            .unwrap();
+    }
+    assert_eq!(machine.pending(), Some(Step::VerifyJoined));
+    let (observations, expected) = lockdown_fixture(Some(&machine), 100);
+    let proof = verify::verify_lockdown(&observations, &expected, &Clock(100));
+    assert!(matches!(proof, Verdict::Protected(_)));
+    assert!(
+        machine
+            .transition(observed(&machine, Form::Joined, proof.clone()), &Clock(100))
+            .is_err()
+    );
+    let changed = machine
+        .transition(Event::InvalidateObservations { since: 100 }, &Clock(100))
+        .unwrap();
+    assert_ne!(changed.context(), machine.context());
+    // The outstanding verifier completion is consumed as a cancellation
+    // boundary; it must not refresh enforcement in the newer context.
+    let changed = changed
+        .transition(observed(&changed, Form::PreTunnel, proof), &Clock(100))
+        .unwrap();
+    assert!(!matches!(
+        changed.enforcement_at(&Clock(100)),
+        Verdict::Protected(_)
+    ));
+    assert!(!changed.blocking_verified_at(&Clock(100)));
 }

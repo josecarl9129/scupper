@@ -2900,8 +2900,13 @@ On qualified configurations, the effective pf policy blocks traffic outside the
 documented exceptions. Checks target 1 s and 5 s intervals while the helper runs.
 Detected failures trigger repair attempts or a NotProtected status. Detection and
 recovery have no guaranteed maximum duration; transient changes and states
-admitted during them may escape detection. Boot before helper enforcement is
-unprotected. pf filters IP traffic through the network stack; BPF or raw-frame
+admitted during them may escape detection. Drift between checks is an accepted
+residual: status can remain Protected until detection or proof expiry. On the Mac, protection from the first
+packet at boot is not guaranteed: early helper/anchor load is best effort, and
+the boot gap is an accepted residual measured in 5a2c native qualification and the
+5a4 lab qualification. First-packet protection requires an optional separate default-deny network device in front of the Mac (the user's choice, not the scupper gateway); a Network Extension backend is the roadmap.
+The gateway boot requirement is unchanged. pf filters IP traffic through the
+network stack; BPF or raw-frame
 injection is outside this claim. Bridged VM, vmnet and Internet Sharing paths
 require separate qualification before their traffic is covered.
 
@@ -2920,6 +2925,11 @@ outside WireGuard.
 
 ### Components and ownership
 
+This section consolidates the resource-model implementation. It supersedes the
+earlier resource-model specification's whole-group ordinary sweep, unchanged
+anchor/no emergency loop, emergency refusal without reservation, and
+Recovery-creates-files wording; the rules below describe the current engine.
+
 `scupper-mac` owns the Mac integration; anchor rendering, observation parsers,
 and the verifier are pure in `scupper-core`. scupper's own code has no unsafe
 code; the pinned `wireguard-go` dependency uses unsafe internally. The helper
@@ -2928,23 +2938,37 @@ uses absolute paths to macOS system tools (`pfctl`, `ifconfig`, `ipconfig`,
 (including rejection of newline injection), bounded output and deadlines.
 No shell script runs as root.
 
+The `engine` module serializes requests, core transitions, effects and status.
+The pure `scupper-core::mac::lifecycle::Machine` plans ordinary work and owns
+reference accounting. `snapshot.rs` encodes its durable state and matching
+reference evidence. The `Platform` trait supplies typed storage, process, tool,
+network and observation operations. `platform/fake.rs` implements that boundary
+with a separate kernel model and injected faults; it answers observable queries,
+not ownership or protection oracles. A native macOS adapter is still 5a2c work.
+Tool deadlines, checked full synchronization, complete enumeration and lock-file
+validation are adapter contracts, not yet qualified macOS behavior.
+
 The root LaunchDaemon `net.scupper.helper` owns pf, the persisted join intent,
 the supervised tunnel child, UAPI, addresses, routes, DNS and MTU. Its launchd
-job uses `RunAtLoad` and `KeepAlive`. It parses no gateway HTTP/JSON (M6a
-adds only the fixed-origin release download below), reads no user configuration
+job must use `RunAtLoad` and unconditional `KeepAlive = true`, including restart
+after successful exit (5a3; see the carried requirements below). It parses no
+gateway HTTP/JSON (M6a adds only the fixed-origin release download below), reads no user configuration
 and resolves no user secret backends. Its configuration and state live under
 `/Library/Application Support/net.scupper/` in root-owned 0700 directories;
-private-key files are 0600. The helper and pinned `wireguard-go` are installed
-in `bin/` under that directory (root:wheel, 0755, all parents root-owned and
+private-key files are 0600. The packaging layout places the helper and pinned
+`wireguard-go` in `bin/` under that directory (root:wheel, 0755, all parents root-owned and
 not group- or world-writable), with recorded sha256 hashes. They run by absolute
-path with a fixed minimal environment.
+path with a fixed minimal environment. The current engine child pin is
+`/opt/scupper/wireguard-go`; aligning this with the packaged layout is 5a3 work.
 
 The macOS release includes `wireguard-go` built in CI from a pinned upstream tag
 with a pinned Go toolchain; its sha256 is in the release checksums. The helper
 starts `wireguard-go -f utun` with a kernel-assigned interface number as its
-foreground, supervised child. The mechanism for proving current-generation
-utun identity, startup readiness and rejection of stale name-files/UAPI sockets
-is **to be fixed in 5a2**; an interface name alone is not sufficient. It replaces
+foreground, supervised child. The engine reserves the child generation durably,
+requires a confirmed sweep before spawn, and checks supervised identity before
+loading joined policy. The
+platform supplies current-generation readiness, UAPI and utun evidence; an
+interface name alone is not sufficient (5a2c: to be qualified). It replaces
 `wg` and `wg-quick` by configuring the WireGuard UAPI socket (`set=1` key/value
 protocol), with bounded framing, deadlines, read-back and no key logging. It
 configures `10.99.0.2/32`, `fd00:99::2/128`, the peer's allowed IPs
@@ -2984,13 +3008,149 @@ affects enforcement or clears the durable error. The full user agent, auto-join,
 gateway-aware notifications, enrolment and bundle copies belong to M5b.
 Unattended provisioning/upgrades belong to M6a (see below).
 
+The authoritative snapshot has two fixed 16 KiB physical copies, A and B. It
+contains core `Durable`, two reference-evidence slots, endpoint, owner uid,
+previous helper incarnation, an eight-record request replay window and an
+optional internal error. It contains no durable child, anchor, DNS, route or
+dispatch records. Collection and reason bounds are checked during decoding;
+checksums cover the header and body, and canonical encoding and zero padding are
+validated. Sequence, reference, generation and request counters must be below
+`2^62`. An unrepresentable state, encoding failure or exhausted commit sequence
+enters Stuck; bounds never authorize dropping reference evidence.
+
+A commit writes the same bytes to A, then B, and completes only after both
+checked file syncs succeed. Ordinary intent, generation and acquisition
+reservations must commit before dependent effects. Numeric release additionally
+commits its evidence pre-mark. Re-observable work may continue while completion
+persistence lags. Unchanged snapshots are not written: plain observations and
+successful maintenance flushes update volatile evidence. Retrying blocked storage
+rewrites both copies even if the in-memory snapshot compares equal. Fixed size
+bounds logical storage, not APFS copy-on-write space requirements.
+
+Startup classifies each copy as valid (`V`), checksum-valid but semantically
+invalid (`I`), unknown format (`X`), torn (`T`), missing (`M`) or unreadable (`U`).
+Unreadable copies get three attempts, normally five seconds each, with 100 ms
+pauses. The A-first protocol makes classification asymmetric:
+
+| A | B | Selection and storage action |
+|---|---|---|
+| V(g) | V(g), identical bytes | Trust A. |
+| V(g) | V or I with lower sequence; T, M, U or X | Trust A; repair B from A. |
+| T, M or U | V(g) | Trust B; repair A from B. |
+| Any other pair | Any | Recovery write. This includes newer B, equal-sequence disagreement, and I or X in A. |
+
+Pair repair exclusively creates a missing mate, with preallocation and checked
+file and directory syncs; otherwise it rewrites the mate. Recovery replaces the
+pair with a held join intent and two uncertain acquisition entries. It retains
+the best checksum-valid helper identity, preferring valid snapshots, and uses
+install owner/endpoint and the current known boot when available. Its sequence
+is one above the greatest checksum-valid sequence, or one if none is usable or
+the next value would exhaust the counter. Torn and unknown-format headers confer
+no sequence authority. Unknown-format bytes may be overwritten by Recovery.
+
+Ordinary startup takes the instance lock, probes both copies read-only within a
+shared one-second budget, reads the install record, classifies the full copies,
+checks launchd/process-group ownership, creates the control socket, repairs or
+writes Recovery, closes the start fence, and commits the new helper incarnation
+before ordinary D-class work. Uncertain probe intent can trigger stateless Lockdown before these gates.
+Install reads have a five-second total budget; an unavailable record stays
+unavailable for this process. Failed repair/commit enters PersistBlocked after
+startup can proceed; native fence closure still permits N-class safety work.
+
+Recovery writes never create a file. If either copy is missing and no valid
+copy exists, the helper stays PersistBlocked until setup re-establishes the pair.
+Only both missing copies set the enforcement reason `storage missing: reinstall`;
+other such pairs report `storage failing`. Recovery holds, so text instead reads
+`state untrusted: run leave` (or `containment attempted; safety unproven`); the
+reinstall instruction is only in the enforcement field. Leave can clean up after
+startup gates close, but cannot commit durable success. Only pair repair creates
+a missing mate. There is no fresh-install inference or Recovery path that creates
+both files; setup must establish the pair safely.
+
+| Resource | Ownership and removal |
+|---|---|
+| pf references | Core entries plus evidence; settle only by the reference protocol below. |
+| Anchor | Fixed `com.apple/scupper`; Leave removes it after emergency writers are drained. |
+| DNS | Fixed `State:/Network/Service/com.scupper.tunnel/DNS`; remove and read back absence. |
+| Tunnel processes | Pinned path, executable vnode identity (including hard links), or exact in-memory pid/start records; recheck start time before signalling. Sweep confirms absence with complete enumeration. Recheck and kill are not atomic: PID reuse between them is an accepted residual, except for own unreaped children. |
+| Routes | Remove the configured endpoint's static host route; split routes disappear with the owned tunnel and are checked independently. A pre-existing host route to the endpoint is treated as ours and is not restored; routes to unrelated destinations are preserved. |
+| Artifacts | Remove managed generation name files, child sockets and partial/temporary files; retain the lifetime lock and control socket. Require a complete empty managed inventory before Left; unknown entries prove no absence. No durable per-artifact inventory. |
+
+The start fence covers eligible members of the previous helper group and older
+launchd-orphaned pinned tools and tunnel processes. It excludes self, checks for
+pgid reuse and known boot changes, and requires a second complete enumeration.
+With no recoverable previous helper, an older unowned orphan with an unreadable
+path or tunnel binary name can withhold closure without establishing ownership.
+Ordinary sweeps kill owned processes individually, preserving unrelated group
+peers. Unknown ownership or incomplete enumeration names survivors and prevents
+spawn and Left publication. The start fence kills launchd-orphaned (`ppid 1`)
+pinned tools older than this helper, whatever their owner; a foreign launchd job
+running a pinned tool directly can therefore be killed (accepted residual).
+With unknown boot identity, a reused previous group whose leader has exited can
+also be killed. Attribution is a qualification assumption, not proof.
+
 ### pf policy and DHCP/ND lifecycle
 
 The helper owns only `com.apple/scupper`, reached through the stock
 `anchor "com.apple/*"`. It never edits `/etc/pf.conf` or rebuilds the main
-ruleset. It enables pf with `pfctl -E` and records its reference token in
-`/var/run/scupper/pf.token`; leave releases only its own reference with
-`pfctl -X <token>`, never `pfctl -d`.
+ruleset. Ordinary enablement uses `pfctl -E`; numeric release uses
+`pfctl -X <token>`, never global `pfctl -d`.
+
+The reference protocol replaces resource history. At every ordinary commit the
+evidence keys must exactly match the core's token and acquisition entries, in
+canonical order. A mismatch enters Stuck. At most two entries fit the snapshot;
+an ambiguous acquisition occupies its slot until evidence settles it.
+
+| Operation | Durable reservation | Outcome |
+|---|---|---|
+| Acquire | Core `Acquire(sequence)` plus known boot evidence, committed before `-E` | A nonzero token and one complete reference read matching its token/pfctl pid yield `ReferenceAcquiredFor` and a pid/timestamp fingerprint. Without that read the acquisition remains uncertain. Definite `NotStarted` is failed then settled Void only with freeing fences closed; otherwise it remains uncertain. Other failures remain uncertain. |
+| Release | Set `release_unknown = true` and commit before `-X` | Confirmed success settles Released; the adapter's qualified invalid-token result settles Absent. Every other outcome retains the token and pre-mark. |
+
+Apart from confirmed release, a definite never-started acquisition (settled only
+with freeing fences closed), and a reservation whose effect was never dispatched,
+entries are freed only by this evidence:
+
+1. Two known boot-session ids differ. Unknown on either side proves nothing;
+   a boot timestamp is never substituted for `kern.bootsessionuuid`.
+2. A complete post-fence reference enumeration lacks the token. Absence frees a
+   numeric token even with `release_unknown`; it cannot free an unknown acquisition.
+3. A complete post-fence pf-info read reports Disabled, **and** the per-release
+   qualification enables the pf-disable invalidation assumption ([X]): disabling
+   pf invalidates all references. This switch defaults off. Only this qualified
+   rule frees every entry.
+
+A complete read requires successful exit, bounded untruncated output and every
+line parsed. Reference enumeration must also prove completeness at the ioctl
+boundary: XNU can silently truncate and omit the oldest tokens; parsed text and
+exit zero alone are insufficient. Reconciliation requires committed helper
+identity, closed startup and tool fences, and no unconfirmed sweep before taking
+freeing reads. Independent emergency accounting may settle absent tokens from a
+complete enumeration with start/tool fences closed; it does not require the
+helper commit or the no-unconfirmed-sweep gate. Startup also settles known boot
+changes before constructing the restart plan.
+
+Numeric release requires a held token, no `release_unknown`, two known equal
+boot ids, and presence in the complete post-fence enumeration. When fingerprints
+are qualified, pid and timestamp must match too. While join is intended, retain
+the current token, or the first predecessor if no current token exists. Foreign
+references are never released. Without qualified fingerprints, same-boot external
+release and token-number reuse remains a residual ownership risk.
+
+Settlements reach the core as typed `ReferenceSettled` events before committing.
+Each changes acquisition revision; an active acquisition is first completed or
+failed before settlement. Reconciliation captures its summary context
+**after** the final settlement, then schedules fresh verification. Incomplete
+reads and uncertain acquisitions cannot become an authoritative summary. Reference
+errors remain separate from enforcement errors and never gate connectivity
+cleanup. A token marked `release_unknown` is never numerically released again;
+token absence cannot free an `Acquire` entry. Two retained entries can prevent
+ordinary counted acquisition until valid freeing evidence arrives. New ordinary
+and emergency counted acquisitions require a known current boot, checked before
+reservation and again before effect; later reads never fill unknown provenance.
+Recovery entries recorded with unknown boot can remain unresolved across every
+later known boot and reboot until qualified [X] freeing or safe setup reset.
+The anonymous enable fallback below attempts to restore filtering without
+settling entries or granting Join or protection.
 
 These rendered examples select physical interface `en0`, endpoint
 `198.51.100.7:51820`, lease server `192.0.2.1`, and current-generation tunnel
@@ -3205,9 +3365,9 @@ Non-atomic capture/read-back cannot exclude a transient foreign mutation.
 
 | Observed state | Result and action |
 |---|---|
-| Fresh, complete qualified observations; pf enabled, required hook and exact anchor present, no bypass, expected tunnel generation (if joined) | `Protected` for the verified pre-tunnel or joined policy; report tunnel health separately. With join intent, pre-tunnel protection means "joining/recovering", never a finished join. Retain any durable failure until `Protected(Joined)`. |
+| Fresh, complete qualified observations; pf enabled, required hook and exact anchor present, no bypass, expected tunnel generation (if joined) | `Protected` for the verified pre-tunnel or joined policy; report tunnel health separately. With join intent, pre-tunnel protection means "joining/recovering", never a finished join. Retain the durable failure and retry count until `Protected(Joined)`; any accepted proof clears the enforcement error; reference errors settle independently. |
 | Anchor missing/different | `Repair(load+verify pre-tunnel, kill all states, full verify, rejoin)`; every step must succeed before advancing. |
-| pf disabled | `Repair(pfctl -E, load+verify pre-tunnel, kill all states, full verify, rejoin)`; record the new reference token. |
+| pf disabled | Reserve before counted `pfctl -E`, then load/read back pre-tunnel policy, flush states, fully verify and rejoin. When reservation is unavailable, attempt Lockdown preparation then plain `pfctl -e` as described below; retain NotProtected until full verification. Disabled-pf freeing requires the qualified rule above. |
 | Required main-ruleset hook missing | `NotProtected("Required pf hook missing; responsible process unknown")`; nothing of ours is evaluated: scupper's policy is not evaluated, and only routing still prefers the tunnel. Treat this as unprotected; persist error and notify. Never rebuild another owner's main ruleset. |
 | Earlier quick pass or sibling quick pass that could match our traffic, or skip flag on any non-loopback interface | `NotProtected(reason)`; for bypassed traffic, nothing of ours is evaluated; only routing still prefers the tunnel. Treat this as unprotected; report and notify; do not edit someone else's rules. |
 | Unqualified OS/surrounding configuration or unsupported construct | `NotProtected("unsupported pf configuration: …")`; no automatic rejoin through an unverified path. |
@@ -3222,10 +3382,12 @@ Non-atomic capture/read-back cannot exclude a transient foreign mutation.
 Cheap checks target 1 s (normalized read-back hash against the stored baseline,
 pf enabled, hook present); a full walk targets 5 s. `route -n monitor` events
 and wake notifications also trigger
-checks. The stale-observation threshold and timeout-to-status mapping are to be
-fixed in 5a2; neither target interval is a maximum detection or recovery time.
+checks through serialized monitor events; the native event sources remain 5a2c
+work. Default `max_age` is 15 sleep-counting seconds, command deadline 5 seconds,
+and maintenance state-flush cadence 10 seconds. These are provisional platform
+inputs; neither target interval is a maximum detection or recovery time.
 
-**Helper notes for 5a2:** schedule verification rounds well inside `max_age`,
+Schedule verification rounds well inside `max_age`,
 allowing time for collection and publication before the previous proof expires.
 A late round forces a full state flush, dropping admitted connections even if
 the policy is unchanged.
@@ -3235,15 +3397,17 @@ errors belong to lifecycle status, not verifier inputs that would deadlock
 recovery. Status keeps persisted join intent, observed enforcement and tunnel
 health separate; a handshake never verifies enforcement.
 
-Only the full verifier constructs a `Protected` proof. Bind it to the intended
+Only the full verifier (`verify` or `verify_lockdown`) constructs a `Protected`
+proof. Bind it to the intended
 policy generation and normalized baseline hash, supervised child generation,
-lifecycle revision and state-cleanliness epoch. Invalidate these identities on
+lifecycle revision, acquisition revision and state-cleanliness epoch. Invalidate these identities on
 leave, repair, replacement, child transitions, failures and evidence gaps; discard
 results from an earlier identity, including across restart. `verified_at` is the
 oldest **start** time of every required observation, derived from individually
 recorded read starts; `completed_at` is separate. Use an injected monotonic clock
 whose elapsed time includes suspension (or explicitly invalidate on wake).
-Expire proofs at the status consumer even if the helper's loop stops. Cheap
+Expire proofs at the status consumer even if the helper's loop stops; the
+proof is valid through its inclusive expiry and stale afterward. Cheap
 checks cannot refresh full-walk timestamps; persisted success is historical only.
 After a `NotProtected`/`Unknown` period or missed full-verification window,
 require a checked state-flush-done observation or qualified exhaustive state
@@ -3270,223 +3434,234 @@ before the new flush plan; leave still wins at every boundary.
 
 ### Serialized join, leave and repair
 
-One state machine serializes join, leave, repair, network-change handling and,
-in M6a, update activation. No socket request, monitor event or child callback
-may run a competing mutation. Its durable phases distinguish intent,
-pre-tunnel enforcement, child generation, joined enforcement, leaving, and
-failure; restart reconciles observed state rather than trusting a phase label.
-A durable `leaving` phase takes precedence over persisted join intent: restart
-completes the authorized leave, with checked cleanup, rather than rejoining.
-All-state flushing uses `pfctl -F states` with a checked outcome, including
-states admitted during a detected gap.
+One engine queue carries requests, monitor events, timers and completions. The
+default capacity is 64. Overflow discards coalescible observations, invalidates
+proofs and reports backpressure without dropping caller-owned requests or effect
+results; the caller retains refused input. Dispatch ids are volatile and stale
+completions never reach the core. A rejected matching completion becomes Failed;
+if that fallback is rejected, enter Stuck rather than restarting the reducer.
 
-1. **Join:** persist intent; acquire a pf reference if necessary; load and read
-   back pre-tunnel policy; kill all states; verify enforcement. Check installed
-   tool ownership/hashes only after pre-tunnel enforcement. If verification or
-   integrity fails, retain intent and available blocking, report the error and
-   stop before starting a child.
-2. Durably reserve a never-reused child generation before spawning it. Start a
-   new foreground child and configure UAPI, addresses, MTU, endpoint
-   host route, split routes and DNS; check the outcome after each step. Read
-   back the current-generation utun identity before rendering its passes.
-3. Load the joined anchor and fully verify it. Report `Protected` only from
-   successful enforcement observations; report joined/healthy only after the
-   tunnel also has a fresh handshake. A tunnel failure does not imply leave.
-4. **Repair/planned teardown:** load and verify pre-tunnel policy, kill all
-   states, then release the old interface and clean up owned routes/DNS. Rejoin
-   only after verified enforcement, using a new child generation. If pf was
-   observed disabled, all held XNU enable tokens are void: drop them without
-   release and acquire a new reference. Replans with a valid reference reuse it.
-   Record failed steps and current enforcement separately; unsupported surrounding rules or
-   hook loss require operator action, not a main-ruleset reload.
-5. **Leave/uninstall:** accept an authorized leave even during repair. Immediately
-   suppress automatic rejoin and invalidate outstanding verification/repair
-   results. Persist the authorized cancellation request before acknowledging it,
-   even while an existing subprocess settles; restart must finish leave rather
-   than resume repair after that request. Settle an already-running mutating subprocess at its checked boundary;
-   durably record `Leaving`, cancel join intent, and persist the complete pending
-   owned-cleanup journal before cleanup. Leave is never gated on obtaining
-   `Protected`, OS qualification, or installing pre-tunnel policy. Stop and reap
-   the owned child; independently attempt owned routes, DNS, sockets/generation
-   artifacts, anchor removal and every owned PF-reference release, even after
-   earlier cleanup failures. Each operation is bounded and serialized. Report
-   success only when **all** cleanup is confirmed; otherwise report every failed
-   or unknown outcome, retain unresolved tokens and resumable pending-cleanup
-   records, and retry on restart or another leave request. A failed durable leaving
-   write is reported and must be retried before teardown; suppress rejoin in the
-   running process meanwhile. Clear the leaving journal last. Uninstall may
-   remove helper/recovery metadata only after confirmed cleanup; partial cleanup
-   is an incomplete uninstall with a usable recovery path. With no intent or owned
-   installation, leave acquires no PF reference and installs no enforcement.
+Request ids are nonzero and below `2^62`. The snapshot retains eight replay
+records, including completion and Join cancellation states. Join admission
+reserves a slot for Leave, allowing at most seven unsettled/queued Joins. Settled
+records are evicted oldest first. Leave can evict pending replay history rather
+than refuse connectivity cleanup, and records queued Joins as cancelled. An id
+retried after eviction can act again. An unfinished admitted Join is replayed on
+restart when desired Left and no internal error prevents it. Join waits behind
+an idle reconciliation until its summary finishes; Leave preempts it.
 
-On startup, a durable leaving phase completes leave first. Otherwise, with
-persisted join intent, the helper loads and verifies pre-tunnel enforcement
-and kills states before installed-tool checks or tunnel recovery. Without join
-intent it installs no enforcement. While join is intended and leave is not
-pending, child death or helper restart requires pre-tunnel policy and a state
-flush first, then recreation;
-never adopt a surviving utun, name-file or socket from a previous generation.
-The death-to-utun-reuse race remains a limitation: a name alone is not identity,
-and reuse or traffic before detection may escape observation. Interface-bound
-states and state flushing must be qualified (V-20), not assumed to eliminate
-that race.
+| Mode or durable state | Behavior |
+|---|---|
+| Starting | Leave requests are queued until ownership, the control socket and the start fence are established; Join is refused until Normal admission. Resolve startup storage and commit this helper. Stateless containment can precede these gates. |
+| Normal | Run the core plan, with checked effects and current-context observations. |
+| Recovery hold | Durable `hold`, not a separate dispatch mode. Run the blocking prefix and owned cleanup, with no CheckTools/rejoin/spawn suffix. Refuse Join until Leave clears hold. Readable install uses installed pre-tunnel policy; unreadable install uses input-free Lockdown. |
+| PersistBlocked | Retry commits; D-class dependent work waits, N-class safety and Leave continue after Starting. Mask Protected and Join success. No ordinary counted acquisition without a committed reservation; use anonymous enable when needed. Never StartChild without its committed generation and a confirmed sweep. |
+| Stuck | Freeze the core reducer and retain matching queued acquisition results. Independent emergency accounting may reserve, record or settle its entries by complete post-fence token absence; Stuck Leave commits the union. Reap and observe; maintain fresh blocking or run independent Lockdown when join is intended. Only Leave can initiate cleanup. No in-process restart-resync. |
 
-The pf-only interference contract is **detect and restore, with honest status**.
-A root process can disable pf before the helper observes it; monitoring cannot
-promise uninterrupted blocking against that process. Repair command completion
-is not a proof of effective filtering. Every observed `Repair`, including
-`Rerender`, invalidates the previous proof immediately. Status is Unknown/unverified
-until a fresh full proof is accepted, including during a deliberate retry wait.
-Enabling, loading or flushing failures can leave traffic exposed; the cadence
-below is a scheduling bound, not a packet-level guarantee.
+A persisted internal error restarts under hold when Joined or Leaving was
+committed; a Left snapshot stays Left and retains the error until explicit
+Leave. A failed launchd-parent/process-group invariant exits without shared-state
+writes or Leave authority. Probe containment may already have loaded; status
+reports that it is not maintained. Correct ownership and restart to remove
+probe-only containment once trusted Left is established. While misconfigured, an
+administrator may remove only the fixed helper anchor with
+`pfctl -a com.apple/scupper -F all`; pf remains enabled.
 
-Automatic recovery retries use the injected sleep-counting clock, in seconds.
-Every Recover immediately acquires any required reference, loads and reads back
-pre-tunnel policy, flushes states, verifies enforcement, and stops/cleans up the
-old child. The rejoin suffix waits immediately before `CheckTools`: 1 s, then 2,
-4, 8, 16, 32, and at most 60 s. Only a failed rejoin attempt increments the durable
-counter, once for its first CheckTools, DNS, child, configuration or joined-check
-failure. Replanning closing work does not increment it. The first deadline starts
-at prefix completion; a replan retains the original deadline, with
-`next_eligible = max(original_deadline, prefix_done)`. An expired delay is satisfied,
-not restarted, and no zero-delay Backoff is inserted.
+1. **Join:** commit intent, reserve/acquire any needed reference, load and
+   semantically read back pre-tunnel policy, flush all states and fully verify.
+   Check installed tools only after enforcement. Reserve the next child
+   generation durably and confirm a process sweep before spawning. Configure
+   UAPI, addresses, MTU, endpoint/split routes and DNS with read-backs; verify
+   identity, load/read back joined policy and fully verify. Enforcement and
+   tunnel health remain separate; a handshake never creates Protected.
+2. **Repair:** restore pre-tunnel policy, read back, flush and verify before
+   cleanup and recreation. Reconcile references where necessary; qualification
+   or hook failure never authorizes rebuilding the main ruleset. A planned DHCP
+   replacement can retain the child and valid state cleanliness. After a gap,
+   unchanged policy still needs a checked flush and fresh full verification.
+3. **Leave acceptance:** in every mode after Starting, preempt queued Joins,
+   revoke containment and invalidate both protection caches before cancellation,
+   replay bookkeeping or storage waits. Only a newly admitted Join rearms
+   containment. Cancel waits and rejoin/repair; feed Leave
+   at the serialized boundary and settle an actual in-flight effect with its
+   dispatch identity. If merging emergency accounting must wait for that effect,
+   retain the accepted request and revocation and retry feeding Leave. While
+   Starting persists, Leave is queued; with a structurally unavailable instance
+   lock there is no socket and requests are refused. Leave cannot run in those
+   cases; the administrator escape is the fixed-anchor flush above. It does not
+   persist Leave and continuing containment can reload the anchor. PersistLeaving
+   records the authorized cleanup. If its commit fails, advance in memory and
+   retry durability while cleanup proceeds. A crash can resume the previous
+   committed desired mode; no durable Leave acknowledgement has been given.
+4. **Leave cleanup:** sweep/stop the child, clean routes, DNS and artifacts,
+   then remove the anchor. Attempt later steps despite earlier failures. There
+   is no pre-tunnel prefix, state flush or reference-release step. Leave does
+   not wait for reference settlement, capacity, qualification, storage success
+   or a verified block to start cleanup after the admission and in-flight
+   accounting gates above. Tool fences can still prevent safe anchor removal and
+   final verification.
+5. **ClearIntent and publication:** independently read back an absent/empty
+   anchor, absent DNS key, complete owned-process absence, a complete empty
+   managed-artifact inventory, no owned split route and no endpoint host route.
+   Check startup/tool fence closure before and after reads; establish process
+   absence before accepting artifacts. Recreated artifacts trigger removal and
+   a fresh verification attempt. Failures name the remaining item and retry.
+   An undeletable artifact or unknown managed entry can indefinitely block Left
+   and re-Join; status stays `leaving: artifacts`. A terminal operator workflow
+   remains 5a3 work. If the endpoint is unknown, publish the distinct text
+   `left (endpoint route not checked)` and `endpoint_unknown` status field,
+   never plain `left`; only a later process with readable install data can
+   remove that caveat.
+   Successful verification clears intent and hold; failed persistence reports
+   `left (not durable)` and keeps retrying. Reference entries survive into Left;
+   idle reconciliation only releases/frees permitted entries and never acquires.
+   Left covers this helper's restrictions and routing, not other products' rules;
+   pf may remain enabled. Uninstall requires all these checks, the instance lock
+   and confirmed child absence; report remaining pf accounting before deleting
+   storage, as specified in the carried requirements.
 
-If a closing action fails, earlier closing actions run immediately and only the
-failed action waits until `failed_at + 1`. An uncertain acquire instead occupies
-an ownership slot: its one allowed replacement runs immediately, followed by
-anchor loading and state flushing, with verification paced at one second. `ClosingRetry` records that failure time,
-immutable deadline and target explicitly. Any Repair at `VerifyPreTunnel` **or**
-`VerifyJoined` is a failed closing verification: recover via immediate enable if
-needed, load/read-back and flush, then wait until `observation_time + 1` immediately
-before `VerifyPreTunnel`. This also caps persistent Rerender replacement loops.
-Unknown at VerifyPreTunnel and other failed closing verifications have the same
-one-second cadence. VerifyJoined Unknown uses the bounded same-attempt retries
-below before declaring failure. The first repair effect is exposed at the observation
-instant; kernel completion still depends on executor scheduling and successful effects.
+The mutation fence records unreaped tools by pid and family. Tool deadlines
+include cancellation and reap (at most two seconds for reap within the remaining
+budget). An open fence blocks other ordinary mutations in that family, all
+freeing evidence and Left publication. Leave's cleanup may proceed through the
+family gate, but anchor removal drains emergency writers and checks quiescence.
+Closing the UAPI socket cancels in-process writes; the subsequent child sweep
+removes their target. Storage has an independent single-writer fence: a timed-out
+write remains outstanding and no new write starts until it returns. Late writes
+can leave a conservative reservation whose ordinary effect was not exposed.
+The late-write superset property assumes a single helper writer ([W]), this
+storage fence and reserve-before-effect. Whole snapshots are not monotone: a
+late write can restore an earlier, more restrictive intent, including Joined
+after nondurable Leave. An unreapable kernel operation violates the
+tool-termination assumption; status names it and no packet-level recovery bound
+follows.
 
-At most one closing prefix is in flight, with at most one rerun queued. A new
-loss is evidence from a monitor round that **started after the last repair prefix
-completed** (the acquire/load/read-back/state-flush repair work). Completion
-publishes a new observation context even in the same clock
-second. Earlier rounds are covered by that repair and absorbed or rejected as
-stale. Every fresh uncovered pf disable or missing/altered anchor dispatches repair
-at the next executor boundary: immediately when idle, otherwise when the current
-effect settles, including during the first Join/Recover prefix, after restart, or
-during Replace. With no completed prefix, every context-matching loss is uncovered;
-there is no initial absorption period. Multiple losses before that boundary queue
-exactly one rerun. There is no one-rerun-per-second limit; another fresh round after
-completion can require another immediate
-repair. The finite same-instant transition budget is a test-oracle bound on
-executor-only drains and resets on each monitor round. Production repair frequency
-is bounded by collecting distinct completed monitor rounds: each rerun requires
-fresh context-matching evidence, with its round started after the last completed
-repair; stale rounds cannot cause another rerun. There is no production 128-step
-budget or fixed per-second repair cap.
+There is a narrow containment exception to the ordinary fence: pinned,
+fixed-argument Lockdown loads, token-free `pfctl -e`, verification and
+state-only flushes may run before quiescence. No anchor/rule flush, `-E`, numeric
+release or tunnel spawn shares that exception. Lock contention exits without
+further calls. Structural lock failure instead probes intent read-only, uses
+stateless containment and retries the lock every 1–5 seconds; it creates no
+socket, counted reference or snapshot and does no general sweep. Leave is
+unavailable in this lockless fallback; the fixed-anchor flush above is the
+administrator escape. Guarded cancellation can target only exact own tool
+children. After acquiring the lock, drain those
+tools and resume full startup. The lock lives outside removable state and is
+held until process exit; the native filesystem/fd rules remain adapter contracts.
 
-No disturbance moves an existing verification or rejoin deadline. Repeated failed
-verification without a new uncovered loss retains the one-second verification
-cadence. Unknown evidence during a closing wait queues fresh state flushing without
-reloading an unchanged pre-tunnel anchor. Evidence during interface setup that is
-merely Unknown invalidates cleanliness; it does not itself establish new enforcement
-loss or abort a child attempt. Queue a checked flush before LoadJoined, or before
-VerifyJoined if loading has already begun. VerifyJoined Unknown retries within the
-same child attempt at a one-second cadence, with a fresh flush before each retry.
-There are at most three retries after the initial check (three seconds of scheduled
-waiting, plus collection/effect duration); the fourth Unknown fails the attempt
-once. Unknown during those waits retains the deadline and child. Wake and benign
-Rerender during setup can restart closing work but do not grow the failure counter.
-A real suffix loss re-enters the same closing queue,
-counts that aborted attempt once, and derives the next rejoin deadline only after
-the new prefix completes. Replans of the same attempt preserve its deadline.
-Generation-less child death is ignored when no child exists for the attempt.
+Independent emergency containment does not require a healthy reducer. When join
+is intended, pf is observed disabled (or no confirmed helper enable reference is
+held), and a counted `-E` cannot be reserved because storage is failing, both
+slots are occupied or current boot identity is unknown, the helper runs plain
+`pfctl -e` after best-effort Lockdown preparation. When disabled, preparation
+attempts load/read-back, invocation verification and state flushing in the same
+step; failure never gates enablement. Only trusted pfctl, tool capacity and
+containment authority gate the command. Failed anonymous enable retries every
+second independently of flush backoff while no ordinary pre-tunnel load is pending; a
+pending load blocked by an unreaped own pfctl also defers it (see the tool-termination
+assumption). This cadence is not a leakage bound.
+Already-enabled pf skips pre-enable preparation. A healthy fenced known-boot
+helper reserves a counted reference when ownership is missing instead of taking
+an anonymous reference. Full policy, invocation, state-cleanliness, freshness
+and fence verification remain necessary for protection; neither enablement nor
+attempted containment is a proof. Hold, PersistBlocked and Stuck remain masked.
 
-Reference ownership has two slots total, counting known token identities and
-uncertain acquisitions. Persist a sequenced acquire intent before exposing the
-kernel effect. An observed disable never rewrites that intent. Record the disable
-revision separately, and persist ownership reconciliation debt separately from the
-Acquire/Release transaction slot. The Acquire intent stays intact until its own
-completion is recorded, or its unresolved sequence is transferred to an uncertain
-slot. A late predecessor result neither settles nor changes the head of an active
-replacement acquire. Every successful completion is recorded by identity, including
-late completion after cancellation, Leave or restart; it invalidates observation
-context without discarding the result. A token acquired while pf was observed
-disabled remains journaled and accounted until release or checked proof of voidness.
-Reconciliation captures context at observation start and may only void tokens using
-completed evidence started after their acquisition completions; stale context is
-rejected even within the same second. A negative monitor observation is never a
-checked release: retain every known token until checked release/reconciliation accounts for
-it. Never release the last required reference before its replacement is held.
-An uncertain acquisition occupies one slot and permits exactly one replacement;
-two occupied slots prevent a third acquire. Reconciliation can prove the disposition
-of all outstanding transactions and which (at most two) tokens remain owned.
-Executor obligation: report a token as current/predecessor only if it is live, and
-prove the disposition of every omitted identity. XNU DIOCSTOP invalidates pf tokens;
-5a2 must qualify that behavior and the observation/ordering checks on supported OS
-builds. A post-acquire observation of disabled pf can prove prior tokens void; an
-earlier observation cannot. With two occupied slots, that proof frees space for
-another enable acquisition; repeated disables must not strand pf disabled behind
-two tokens incorrectly reported as live. If reconciliation frees a slot after the
-prefix flush has already completed, rerun acquire/load/read-back/flush in order;
-do not insert a bare acquire directly before verification.
+The token-free `-e` takes pf's single anonymous enable reference. Token release
+cannot remove it; pf stays enabled until reboot or a foreign `pfctl -d`, also
+after Left. It does not accumulate, and the helper never runs global disable.
+The platform contract maps DIOCSTART success and EEXIST to Started and
+AlreadyRunning (native mapping qualified in 5a2c); both confirm anonymous enablement, independently of protection verification.
+A foreign disable/enable pair entirely between polls can leave this confirmation
+stale; a later foreign last-token release can disable pf until the next check.
+The platform does not yet expose pf's enabled-since identity. This is an accepted
+drift-between-checks residual.
 
-Reconciliation has its own one-second retry deadline, which disturbances cannot
-bypass. Failure is journaled separately from enforcement evidence and visible in
-status, without hiding the traffic-blocked recovery text. Clear the reference
-error as soon as its debt disappears, including through late acquisition results.
-It cannot park pre-tunnel anchor loading, state flushing or independent Leave
-cleanup. PersistLeaving has priority over reconciliation; during Leave place
-reconciliation after RemoveAnchor, also after restart. Leave stops the child and
-attempts routes, DNS, artifacts and anchor removal regardless of unresolved ownership; only release and ClearIntent depend
-on resolving the debt. Retain that debt and its errors in the journal, retry it
-once per second, and release every remaining identity before clearing intent.
-With the anchor removed, pf remaining enabled for unresolved ownership does not
-block the user's traffic. Leave does not require successful verification or
-reconciliation to attempt independent cleanup. Actual kernel reconciliation and
-effect timeouts remain 5a2 integration/qualification work. Also deferred to 5a2:
-automatic retries for failed non-reference Leave cleanup and failed ClearIntent.
-Currently those failures retain the resumable journal but require another Leave or
-helper restart; a failed RemoveAnchor can keep blocking traffic until then.
+With closed fences and known boot, the independent emergency path first attempts
+a committed reference reservation. Under failing persistence in Stuck it permits **one
+unreserved counted acquisition per incarnation** (PersistBlocked uses only the
+anonymous enable), consumed before exposure and
+restored only for definite NotStarted. Otherwise it uses token-free `-e`, also
+at the accounting cap or with incomplete pf-info. Lost unreserved `-E` tokens
+can accumulate across crashes, at most one per incarnation until reboot; the
+ordinary two-entry snapshot is not a cross-incarnation bound. Anonymous enable
+neither consumes a slot nor settles existing accounting. Enablement may activate
+other products' rules. Stateless commands can race stale writers and are
+reasserted on the one-second cadence; no blocking claim is made until the start
+fence closes over earlier writers and own tools are reaped. The interval is not
+a leakage bound. An identical recent pre-fence Lockdown load may satisfy the
+ordinary load, but a fresh post-fence read-back and full verification are still
+required.
 
-The executor property oracle computes ownership, round coverage, verification
-cadence and exponential rejoin eligibility from dispatched effects and their
-outcomes, without reading lifecycle retry/deadline fields. It includes zero and
-sub-second clock advances, multiple losses during an in-flight prefix, whole
-prefixes completed between disturbances, covered/delayed rounds, losses during the
-first prefix after Join/restart and Replace, failed joined-path reconciliation,
-and late predecessor results during an in-flight replacement acquire. It models
-live and proven-void tokens independently, and checks that an uncovered loss or
-failed attempt exposes Acquire/Load at the next executor boundary and instant,
-independently of suffix deadline arithmetic. Mutation checks include an extra
-prefix wait with the suffix wait retained, intent overwriting, and initial loss
-absorption. Stale-round rejection is separately asserted as the mandated context
-contract; it is not described as an independent external-effect observation.
-The shared tracked proptest regression file is deliberate: each property replays
-all seeds, including seeds originating from other properties.
+After flush failures grow the independent backoff, stale states admitted before
+a disable can survive re-enable under Lockdown, even after the flush fault heals,
+while the next retry waits up to 60 seconds. Continued flush failure has no
+recovery bound. This accepted residual withholds Protected and emergency-verified
+blocking while state cleanliness is unproven.
 
-Persist retry history with intent before exposing effects. It saturates at the cap
-and survives crashes; only accepted Protected(Joined) or completed leave resets it.
-Restart trusts no persisted proof or monotonic timestamp: it clears cleanup times,
-expiries and verification evidence, increments operation context, and rebases any
-persisted Unknown `since` to zero. This is conservative across both same-boot
-restart and reboot; a new prefix establishes evidence in the current clock domain.
+Stuck retains a current verified policy while fresh; definite loss/drift or
+sustained missing proof causes Lockdown. Its independent global verifier can
+set `emergency_blocking_verified`, but Stuck enforcement stays
+`NotProtected(Observation("internal"))`. Leave revokes emergency work before
+cancelling/reaping writers, runs the fixed cleanup and ClearIntent checks, then
+commits Left preserving the reference-evidence union and returns `Exit0`.
+Snapshot evidence wins for shared keys; missing metadata grants no numeric
+release authority, and a mismatch marks all tokens `release_unknown`. An
+unencodable union stays only in this process as `left (not durable)`, without
+Exit0 or numeric release. It cannot shrink here: Stuck runs no reconciliation.
+A crash restarts from the last committed snapshot, which contains every reserved
+obligation; only unreserved emergency acquisitions can be lost (accepted). The
+next helper start attempts reconciliation. Ambiguous releases and uncertain
+acquisitions can remain until a known boot change or qualified [X]; unknown-boot
+acquisitions cannot use boot change at all. pf may stay enabled until settlement,
+and anonymous enable persists independently. The engine returns an outcome;
+the service driver must exit and launchd must restart it.
 
-A fresh Protected(PreTunnel) monitor proof during the rejoin Backoff refreshes
-enforcement, prior expiry and last_verified without advancing the plan, clearing
-connection errors or changing the counter. It must match the current configuration,
-policy and operation context, follow the latest invalidation, remain unexpired at
-acceptance, cover the effective rules and carry current cleanup after every recorded
-gap. A post-gap proof never retroactively validates pre-gap cleanup. Status is
-`recovering` plus Protected(PreTunnel), with text **traffic blocked; tunnel recovering**.
-Connection errors and enforcement evidence are separate durable fields: the latest
-Unknown stays visible even after a DNS error. Rerender is benign only for a planned
-replacement while a valid proof holds; an actual verification mismatch is recorded.
+Retries use the injected sleep-counting clock; Backoff is interruptible idle
+scheduling, never a sleeping subprocess:
 
-Backoff is interruptible idle scheduling, never an in-flight subprocess. Early
-completion is rejected. Leave discards either wait immediately, persists cancellation
-and follows ordinary owned cleanup, without waiting for successful verification.
-When disturbances clear, checked effects and timers alone reach Protected(Joined).
-Bounded subprocess duration/output, executor queues, journal history and shutdown
-waits remain 5a2 work.
+| Work | Retry policy |
+|---|---|
+| Ordinary closing prefix | Failed closing action waits one second; preceding closing work and fresh uncovered losses run at the next boundary. At most one prefix and one rerun are pending. |
+| Rejoin suffix | Failed attempts delay CheckTools by 1, 2, 4, … 60 s after prefix completion. Replans retain the deadline. Persist the saturated attempt count; joined verification or Leave resets it. |
+| VerifyJoined Unknown | Up to three same-child retries after the initial check, one second apart, each with a fresh flush; then fail the attempt once. |
+| Leave and failed ClearIntent | Automatically retry failed cleanup at 1, 2, 4, … 60 s; an Unknown can retry immediately once the tool fence closes. Stuck fixed cleanup also retries automatically. |
+| References | One second while join is intended; otherwise double to 60 s. Settlements, known boot changes and a transition to disabled reset eligibility. Repeated disabled observations do not postpone it. |
+| Storage | 1, 2, 4, … 60 s; successful commit resets the delay. Safety-relevant waits are sliced to maintain containment without restarting the outstanding operation. |
+| Emergency | Anonymous enable retries every second independently of preparation/flush failures. One-second attempt cadence; initial load failures/known absence use one second. After an own load, uncertain/drifting read-back, unverified flushes and failed acquisition attempts have independent doubling delays up to 60 s; positive raw drift overrides reload backoff. Storage-frame repairs retain pending reload/flush work on one-second gates. |
+
+Cheap checks target one second, full walks five seconds, and maintenance flushes
+ten seconds while join is intended in Normal/hold/PersistBlocked. The scheduler
+runs them at idle/Backoff or relevant blocked-D boundaries; active steps have
+checked observations of their own. Cheap checks cover pf, hook/anchor presence,
+baseline hash, and current child/endpoint route where a tunnel exists; positive
+checks never refresh proof age. Full reads can invalidate blocked speculative
+commits, so storage recovery cannot resurrect an earlier proof. Leaving and
+Left run reconciliation rather than protection monitors. Stuck runs its separate
+one-second cheap/five-second full observation path. Emergency pfctl dispatch
+stops with two own unreaped pfctl children, including read-only children.
+
+Publication is independent of retained accounting `{held, uncertain,
+release_unknown}`. Protected requires a current fresh full proof. Joined proof
+acceptance marks JoinDone; request success queries require a committed done
+record and Normal mode. Pre-tunnel proofs report progress only.
+Hold, PersistBlocked, Stuck, Starting/uncommitted helper, overflow, open fences
+and survivors mask Protected.
+Status text includes `state untrusted: run leave`, `containment attempted;
+safety unproven`, `leaving: <item>`, `left`, and the two qualified Left texts
+above. Observation reasons display with `verification failure: `. PersistBlocked's
+enforcement reason is `storage failing`, `storage failing; pf reference cannot
+be reserved` when still observed disabled, or `storage missing: reinstall` when
+both copies are missing. The latter is only an enforcement field: Recovery hold
+makes text read `state untrusted: run leave`, or attempted containment takes
+precedence. Stuck's enforcement reason is `internal`; its text follows the same
+containment/untrusted precedence. Open startup uses `engine: start fence open`,
+open tools/survivors use `engine: mutation fence or survivors`, and overflow uses
+`queue overflow`. Cleanup progress takes text priority. Normal pre-tunnel rejoin
+Backoff with fresh proof reports `traffic blocked; tunnel recovering`. Core
+Protected/progress text appends `; pf ownership cleanup debt: <Debug reason>`
+when a reference error remains; renaming and readable reason formatting are
+carried below. Separate blocking fields carry inclusive expiries; status
+consumers must expire them even if the engine stops.
 
 ### Addresses, routes, DNS and MTU
 
@@ -3512,7 +3687,7 @@ and reads back the MTU. Override validation details and exact multi-uplink
 selection rules are to be fixed in 5a2 and qualified before support is claimed.
 
 The helper owns exactly one Dynamic Store DNS key:
-`State:/Network/Service/net.scupper/DNS`. Its dictionary contract is:
+`State:/Network/Service/com.scupper.tunnel/DNS`. Its dictionary contract is:
 
 | Field/behavior | Specification |
 |---|---|
@@ -3526,8 +3701,10 @@ leave or crash recovery before recreating it for persisted join intent
 (unless a durable leave is pending); it never overwrites another service's
 resolver.
 Whether removal restores the underlying system resolver configuration is a
-5a2 qualification item, including configd and supplemental-resolver behavior;
-it is not assumed. Effective resolver read-back and network-change
+5a2c qualification item, including configd and supplemental-resolver behavior;
+it is not assumed. Qualify whether configd can apply a queued scutil DNS change
+after scutil is reaped; if so, supply a stronger adapter fence before the final
+absence read-back can publish Left. Effective resolver read-back and network-change
 reconciliation test functionality; pf continues to block LAN DNS even if
 resolver selection fails.
 
@@ -3708,7 +3885,7 @@ Slices and required evidence:
 |---|---|---|
 | 5a0 | This specification and ADR amendments, reviewed before 5a1. | Consistency review. |
 | 5a1 | Pure anchor renderer, parsers, qualified evaluation-path walker and verifier. | Semantic rule/verifier table tests, properties and mutation tests; render → load → read back once → store normalized text/hash → compare later reads, with semantically reviewed per-OS normalization goldens and stock-sibling assessments. |
-| 5a2 | launchd helper, supervision/UAPI, address/route/DNS/MTU lifecycle, repairs, crash-safe state and socket authorization; fix the open details above. | Fake-System fault injection after every privileged step. |
+| 5a2 | launchd helper, supervision/UAPI, address/route/DNS/MTU lifecycle, repairs, crash-safe state and socket authorization; fix the open details above. | `Platform` fake fault injection after every privileged step; native adapter contracts and qualification in 5a2c. |
 | 5a3 | `setup`, `join`, `leave`, `status`, `uninstall`. | Interrupted setup/refresh/uninstall tests; unattended updates remain M6a. |
 | 5a4 | Safe `selftest` and separate lab qualification. | Continuous numbered canaries and positive controls on every enabled link/family; pre-NAT capture before boot, individual/compound faults, exclusions and gap distributions. |
 
@@ -3718,6 +3895,73 @@ gates**, tied to the exact OS build and helper/wireguard-go artifact hashes.
 Unsupported or unqualified combinations cannot report `Protected`. Record the
 ND hop-limit decision per OS, DHCP exceptions, state behavior, real-hardware
 results and measured gaps with each qualification record.
+
+### Requirements carried to 5a2c and 5a3
+
+These are adapter/packaging requirements, not implemented installer guarantees.
+
+- **Boot (5a2c/5a3):** load the helper and anchor as early as macOS allows, on a
+  best-effort basis. Measure the boot gap in 5a2c native qualification and the 5a4 lab
+  qualification and retain it as a residual; there is no Mac first-packet
+  guarantee. That requires an optional separate default-deny network device in front of the Mac (the user's choice, not the scupper gateway);
+  a Network Extension backend is the roadmap. The gateway boot requirement is
+  unchanged. Lockless/emergency Lockdown is recovery, not continuous protection.
+- **Setup, refresh and repair (5a3):** never overwrite existing snapshots while
+  a helper or child may live. After `launchctl bootout` prevents KeepAlive
+  restart, take the instance lock before storage access and confirm child
+  absence. Setup never overwrites a checksum-valid or unknown-format copy;
+  refresh/upgrade retain snapshots. Create only missing copies: both missing
+  require a fresh pair; one missing follows pair-repair rules. Use exclusive
+  creation, preallocation and checked file/directory syncs. Recovery never
+  creates missing files. Both missing set `storage missing: reinstall` only in
+  the enforcement field; one missing with no valid mate remains `storage
+  failing`. Safe reset of unresolved accounting requires the same checked
+  cleanup and reporting as uninstall, not silent replacement of evidence.
+- **Uninstall (5a3):** require full Leave/ClearIntent checks, including complete
+  managed-artifact absence, and confirmed child absence. Boot out the launchd
+  job and take the instance lock before storage access/removal; re-establish
+  the checks under that lock. Report remaining pf reference counts and
+  uncertainties with "pf may stay enabled until reboot", then delete storage.
+  Deletion loses later release capability; the helper never runs `pfctl -d`.
+- **Supervisor/service driver (5a3):** install unconditional `KeepAlive = true`,
+  not `SuccessfulExit = false`. Stuck Leave returns Exit0 after committed Left
+  with no anchor, while accounting and anonymous enable can keep pf enabled.
+  The next start attempts reconciliation; ambiguous releases and uncertain
+  acquisitions may remain until known boot change or qualified [X], and
+  unknown-boot acquisitions cannot use boot change. Anonymous enable persists
+  independently until reboot or foreign global disable. Qualify launchd respawn
+  throttling after Exit0. Shutdown or SIGTERM must not be interpreted as Leave.
+- **Status/operator workflow (5a3):** surface `storage missing: reinstall` from
+  the enforcement field despite untrusted/containment text precedence. Map
+  `endpoint_unknown` to a distinct CLI exit or state, including nondurable Left.
+  Replace the `pf ownership cleanup debt` suffix and Debug reason formatting
+  with readable accounting terminology. Define a terminal managed-path
+  diagnostic and recovery workflow for an undeletable/unknown artifact; today
+  `leaving: artifacts` can block Left and re-Join indefinitely.
+- **Packaging/adapter (5a2c/5a3):** implement and qualify the native `Platform`
+  adapter; align the child pin `/opt/scupper/wireguard-go` with the packaged
+  `bin/` layout. Use the single DNS key
+  `State:/Network/Service/com.scupper.tunnel/DNS` throughout packaging.
+- **Endpoint changes (5a3):** change the configured endpoint only after verified
+  Leave, or retain the old endpoint in the snapshot until its host route is
+  verified absent. A pre-existing static route to the endpoint is treated as
+  owned and is not restored.
+
+Native qualification must cover these cases on each supported macOS release;
+the deterministic fake cannot establish them:
+
+| Native case (5a2c) | Required evidence |
+|---|---|
+| `-e`, owned/foreign last-token `-X`, helper restart, repeated `-e` | One anonymous enable reference, no accumulation or token release capability; pf stays enabled after token release and Left. Counted accounting remains independent. |
+| DIOCSTART EEXIST while pf already runs | The anonymous effect is established and maps to AlreadyRunning on every such outcome; no repeated enable/flush loop or protection claim from the outcome alone. |
+| Foreign `-d` and reboot | Anonymous enable disappears and old counted tokens are invalidated. Qualify the pf-disable invalidation assumption ([X], rule 3) per release, leaving it off otherwise. |
+| Reference ioctl sizing, exact buffer boundaries and concurrent token churn | Prove completeness despite silent `DIOCGETSTARTERS` truncation/oldest-token omission; use a buffer larger than the sized result and require returned size below capacity, retrying otherwise, or an equivalent qualified method. Handle `ENOENT` as complete empty. Exit zero and parsed text alone do not suffice. Qualify pid/timestamp fingerprints before requiring them for numeric release. |
+| Boot-session UUID at startup, reservation and commit waits | Reliable `kern.bootsessionuuid` reads; unknown current boot prevents counted reservation/effect. Never substitute boot time or fill an unknown reservation boot from a later read. Unknown-boot Recovery entries remain unresolved until qualified freeing or safe setup reset. |
+| Process/tool fence | Qualify `proc_pidpath`, complete process enumeration including size races, vnode identity, start/group rechecks, guarded signalling, cancellation, deadlines/reaping and launchd group cleanup. Recheck/kill PID reuse, unknown-boot group reuse and foreign pinned-orphan selection remain accepted residuals. Own unreaped children are exempt from PID reuse. |
+| Queued configd DNS mutation after scutil reaping | Prove no later application after final read-back, or provide a stronger adapter fence before Left. Also qualify underlying/supplemental resolver restoration. |
+| Instance lock and APFS ENOSPC | Validate lifetime-lock filesystem/fd rules and single writer; measure write/full-sync behavior under ENOSPC. Fixed physical sizes do not guarantee future write success. |
+| Between-check drift and enabled-since identity | Measure detection/recovery gaps, including foreign disable/enable entirely between polls followed by last-token release. The platform currently exposes enabled/disabled without enabled-since identity; anonymous confirmation can be stale until a later check. Qualify consistent failure handling between cheap checks and pf-info reads. |
+| Flush failures followed by disable/re-enable | Record stale-state survival after re-enable even once the flush fault heals: the next retry can wait up to 60 seconds. Continued flush failure has no recovery bound; never publish protection with unproven cleanliness. |
 
 ---
 
@@ -4575,8 +4819,8 @@ still execute after a client hangs up because they only tighten policy.
 | Device token leaked (any process of the Mac user can read it) | from the device's tunnel address: the operational API (status, connect/disconnect, exit selection, low-risk config); no device, exit or alert changes (ADR 0029) | events carry the `Device` actor | rotate over SSH |
 | Edge compromised (for example through a DNS parsing bug) | can assert device principals for the operational set, observe and stop client DNS; cannot make high-risk changes, reach the uplink or host proxy sockets | – | unprivileged, no keys, minimal filesystem view; splitting DNS and API into two processes is an R2 option |
 | Mac tunnel down while joined | qualified, verified pf policy blocks outside documented exceptions (§14) | helper child/UAPI/handshake checks; full agent context in M5b | retain intent and available blocking; recreate child only after verified pre-tunnel enforcement |
-| Mac agent or helper crash/suspension | agent (M5b): no auto-join/full notifications; helper: no new verification; existing pf state persists but may change independently | launchd KeepAlive for death; stale observations → `Unknown` | helper restart loads/verifies pre-tunnel policy and kills states before tool checks or child recreation; never adopt an old utun (§14) |
-| macOS reloads pf.conf or disables pf | protection may be lost; repeated fresh observed losses trigger repair at executor boundaries, with one prefix in flight and one queued; no maximum detection/recovery duration (§14) | cheap/full checks target 1 s/5 s; missed transients possible; V-05 gap distributions | checked repair for anchor loss/pf disable; missing hook or unsupported surrounding rules → `NotProtected`, durable error and notification; never rebuild the main ruleset |
+| Mac agent or helper crash/suspension | agent (M5b): no auto-join/full notifications; helper: no new verification; existing pf state persists but may change independently | unconditional launchd `KeepAlive = true`, including successful exit; stale observations → `Unknown` | helper restart loads/verifies pre-tunnel policy and kills states before tool checks or child recreation; never adopt an old utun (§14) |
+| macOS reloads pf.conf or disables pf | protection may be lost; repeated fresh observed losses trigger repair at engine boundaries, with one prefix in flight and one queued; no maximum detection/recovery duration (§14) | cheap/full checks target 1 s/5 s; missed transients possible; V-05 gap distributions | checked repair for anchor loss/pf disable; missing hook or unsupported surrounding rules → `NotProtected`, durable error and notification; never rebuild the main ruleset |
 | Mac reboot while joined | boot before helper enforcement is unprotected | persisted join intent; V-05 measurements | helper loads/verifies pre-tunnel policy and kills states before tool checks, then recreates the tunnel (§14) |
 | Deployed binary or config breaks the tunnel, API or check | no confirmation arrives | rollback timer | gateway restores previous binary and revision itself, fail-closed; `DeployRolledBack` alert |
 | Crash or reboot during a pending deploy | timer owned by systemd; guard unit at boot | `pending.json` | rollback at deadline, before the boot procedure if needed |
@@ -4596,7 +4840,7 @@ Each milestone ends tested and deployable.
 | **M3 Exits** | Two exits; full failover machine (sticky, pin, prefer, optional auto failback); hot standby (after V-09) or cold; `exit list/show/use/auto/test/import`. | L21-L27, L47, L48 green; V-09, V-10, V-25 recorded; cold-standby outage measured against its 30-60 s target; real failover on the gateway by blocking one exit's endpoint: switch ≤ 20 s, event and alert delivered. |
 | **M4 DNS + IPv6** | Edge with forwarder; `dns_redirect`, 853 rejects, `nonglobal` sets; dual-stack model, v6 fail-closed path; v6 exit only after V-11. | L28-L34, L42, L45, L49, L54 green; Mac resolves via 10.99.0.1; an opportunistic DoT client falls back to 53 and a strict DoT client fails without sending plaintext DNS; v6 on v4-only exit gets ICMPv6 unreachable; V-11, V-12, V-26 recorded. |
 | **M5 API + Mac** | Delivered in M5a (qualified pf enforcement) and M5b (Tunnel API and user agent). | Both submilestones pass; V-06 recorded; CLI works identically via local, API and SSH. |
-| **M5a Mac pf** | §14 slices 5a0–5a4: specification first, renderer/verifier, launchd helper and pinned supervised tunnel driver, UAPI/address/route/DNS/MTU lifecycle, `setup/join/leave/status/uninstall/selftest`, durable failure reporting and minimal notification. | Semantic/property/mutation tests, Fake-System faults after each privileged step, interrupted setup/refresh/uninstall tests; safe selftest with positive controls; V-05/V-20/V-21 release gates passed per OS build and artifact with pre-NAT VM capture, scripted hardware Wi-Fi/sleep results and measured gap distributions. No recovery bound claimed. |
+| **M5a Mac pf** | §14 slices 5a0–5a4: specification first, renderer/verifier, launchd helper and pinned supervised tunnel driver, UAPI/address/route/DNS/MTU lifecycle, `setup/join/leave/status/uninstall/selftest`, durable failure reporting and minimal notification. | Semantic/property/mutation tests, `Platform` fake faults after each privileged step, interrupted setup/refresh/uninstall tests; safe selftest with positive controls; V-05/V-20/V-21 release gates passed per OS build and artifact with pre-NAT VM capture, scripted hardware Wi-Fi/sleep results and measured gap distributions. No recovery bound claimed. |
 | **M5b API + Mac agent** | Routine admin via tunnel API/auth, CLI transports and `/metrics`; public SSH becomes an explicit, expiring break-glass switch with state removal on close/expiry (§14); user agent, auto-join, full notifications, enrolment and bundle copies. | L35 and auth tests green; agent failure and network-change matrix (§14); enrolment/bundle recovery verified; transport parity with the switch open for SSH, including high-risk changes/deploy; expiry/close removes admitted SSH states. |
 | **M6 Installer + release** | `install` hardening (`--check`, preflight incl. host firewall, idempotence tests); confirm-or-rollback `deploy`, `upgrade`, guard unit; `gateway create --provider digitalocean` with operator-side secret references; distribution (Linux install script, user-CLI Homebrew tap, artefacts for x86_64/aarch64 Linux musl and aarch64 macOS with `SHA256SUMS`; privileged Mac path in §14); timed rebuild rehearsal; VM reboot test; reproducible-build check. | L36-L39, L51 green; V-18, V-27 recorded; second `install` run is a no-op; a broken deploy rolls back by itself, including one that changes a unit file and one whose own check falsely reports 0; `gateway create` + `deploy` + `mac enroll` reach `check` = 0 on a fresh VM (DigitalOcean client also green against the fake API in CI); rebuild ≤ ~10 min in rehearsal; two builds bit-identical. |
 | **M6a Unattended provision + upgrade** | Unattended Mac operations after setup. Helper accepts only a release identifier; downloads from fixed GitHub URL over TLS into root staging, verifies itself, activates atomically with durable rollback record; serialized with join/leave/repair (§14). | No caller-staged privileged executables/archives/checksums accepted; interrupted download/activation/reboot and rollback fault tests; verified pre-tunnel enforcement maintained throughout activation when joined; qualification gates remain tied to OS build and artifact. |

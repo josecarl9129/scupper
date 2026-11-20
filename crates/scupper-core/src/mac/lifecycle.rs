@@ -76,16 +76,15 @@ pub enum Step {
     RemoveAnchor,
     /// Confirm every recorded owned reference released; retain unresolved tokens on failure.
     ReleaseReference,
-    /// Clear journal only after all owned cleanup is confirmed.
+    /// Clear Leave intent after connectivity cleanup, retaining reference accounting.
     ClearIntent,
 }
-const CLEANUP: [Step; 6] = [
+const CLEANUP: [Step; 5] = [
     Step::StopChild,
     Step::CleanupRoutes,
     Step::CleanupDns,
     Step::CleanupArtifacts,
     Step::RemoveAnchor,
-    Step::ReleaseReference,
 ];
 /// Tunnel health is independent of firewall enforcement.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,6 +108,13 @@ pub enum ConnectionStatus {
         /// Seconds remaining in the sleep-counting clock domain.
         retry_in: u64,
     },
+    /// Recovery hold cannot claim protection or promise an automatic rejoin.
+    NotProtected {
+        /// Explanation for the user.
+        reason: &'static str,
+        /// The latest pre-tunnel blocking proof is still fresh.
+        blocking_verified: bool,
+    },
     /// Fresh joined enforcement with a supervised child; handshake health is separate.
     Joined,
     /// Authorized leave or its cleanup is pending.
@@ -122,6 +128,16 @@ impl std::fmt::Display for ConnectionStatus {
             Self::Joined => f.write_str("joined"),
             Self::Leaving => f.write_str("leaving"),
             Self::Recovering { retry_in } => write!(f, "recovering (retry in {retry_in}s)"),
+            Self::NotProtected {
+                reason,
+                blocking_verified,
+            } => {
+                f.write_str(reason)?;
+                if *blocking_verified {
+                    f.write_str("; blocking verified")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -132,6 +148,24 @@ pub enum ReferenceIntent {
     Acquire(u64),
     /// Checked release of all recorded tokens.
     Release,
+}
+/// Exact identity of one accounted pf reference or acquisition reservation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReferenceEntry {
+    /// A held kernel enable token.
+    Token(u64),
+    /// An active or uncertain acquisition sequence.
+    Acquire(u64),
+}
+/// Checked evidence allowing one accounting entry to be removed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReferenceSettlement {
+    /// A confirmed release.
+    Released,
+    /// Complete evidence proves the entry absent.
+    Absent,
+    /// The acquisition had no effect, or its reference has been invalidated.
+    Void,
 }
 /// A closing or joined-verification failure has one immutable retry deadline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,6 +185,9 @@ pub struct Durable {
     pub verification_context: Context,
     /// Join intent; durably cancelled by `PersistLeaving`.
     pub join_intended: bool,
+    /// Recovery refuses Join and keeps only pre-tunnel enforcement until Leave.
+    /// Retained through Leaving; `ClearIntent` clears both hold and join intent.
+    pub hold: bool,
     /// Failed rejoin attempts, saturated at the 60-second delay cap.
     /// Persist with intent before exposing the next effect, including across restart.
     pub retry_attempts: u8,
@@ -182,6 +219,7 @@ pub struct Durable {
     /// Per-step unresolved cleanup failures, retained until confirmed success.
     pub cleanup_errors: Vec<(Step, Reason)>,
     /// Durable failure retained through pre-tunnel recovery until Joined or completed leave.
+    /// A resolved reference/cleanup error clears its matching last error independently.
     /// Never fed back into the verifier.
     pub last_error: Option<Reason>,
 }
@@ -201,6 +239,12 @@ pub enum Event {
         /// Start of the gap.
         since: u64,
     },
+    /// A complete read shows pf enabled, independent of the full verdict.
+    /// Executors send this even when another read makes that verdict Unknown.
+    PfEnabledObserved {
+        /// Context captured before the read.
+        context: Context,
+    },
     /// Ordinary checked effect completion.
     Completed(Step),
     /// Acquire and persist the active transaction; use `ReferenceAcquiredFor` for late results.
@@ -212,10 +256,21 @@ pub enum Event {
         /// Successfully acquired kernel token.
         token: u64,
     },
-    /// Checked reconciliation: all unresolved effects are known and these tokens remain owned.
-    /// An executor unable to resolve a lost acquire outcome must fail, never guess.
+    /// Settle exactly one held or uncertain entry. An active acquisition must
+    /// first resolve through its own completion (or Failed, then settlement).
+    ReferenceSettled {
+        /// Exact token or acquisition sequence whose disposition is known.
+        entry: ReferenceEntry,
+        /// Checked disposition supplied by the executor.
+        how: ReferenceSettlement,
+    },
+    /// Checked reconciliation after exact settlements; these tokens remain owned.
+    /// Unresolved acquisitions require Failed, never a guessed summary.
     ReferenceReconciled {
-        /// Captured before reconciliation; must follow every recorded acquisition.
+        /// Recaptured after the last settlement of this reference step. The
+        /// acquisition revision fences acquisitions/settlements outside that step.
+        /// Executors must emit settlements only from the in-flight reference step,
+        /// never during verification (where they would stale its proof).
         context: Context,
         /// Checked valid current token. If validity/outcome cannot be established,
         /// reconciliation fails and retains every possibly live token and intent.
@@ -286,20 +341,34 @@ struct Closing {
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct References {
+    // Repeated disabled observations must not restart idle exponential backoff.
+    observed_pf_disabled: bool,
     // Revision at which pf was observed disabled; never a reference intent.
     pf_disabled_seen: Option<u64>,
     needed: bool,
     retry_at: u64,
+    retry_delay: u64,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HoldCleanupRetry {
+    step: Step,
+    until: u64,
+    delay: u64,
 }
 /// Pure serialized lifecycle. The executor must persist returned journal changes
 /// before exposing the next effect; subprocesses are bounded and settled at boundaries.
+/// A deferred Join is in-memory: the executor must replay an unfinished Join after
+/// restart and acknowledge it only after `PersistIntent` completes.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // Independent cancellation and initial hold cleanup facts.
 pub struct Machine {
     durable: Durable,
     pending: Vec<Step>,
     effect_since: u64,
     operation: Option<Operation>,
     leave_requested: bool,
+    // An idle reference step already in flight must settle before PersistIntent.
+    join_requested: bool,
     abort_requested: bool,
     deferred_repair: Option<Action>,
     baseline: Option<Baseline>,
@@ -323,11 +392,24 @@ pub struct Machine {
     references: References,
     settling_flush: Option<u64>,
     joined_unknown_retries: u8,
+    // A held restart sweeps old resources once, before becoming idle-held.
+    hold_policy: super::policy::Kind,
+    hold_cleanup: bool,
+    hold_cleanup_retries: Vec<HoldCleanupRetry>,
 }
 impl Machine {
     /// Restart never restores successful evidence. Authorized cleanup wins over join.
     #[must_use]
     pub fn restart(mut durable: Durable) -> Self {
+        if durable.pending_cleanup.contains(&Step::ReleaseReference) {
+            durable
+                .pending_cleanup
+                .retain(|step| *step != Step::ReleaseReference);
+            durable.cleanup_errors.push((
+                Step::ReleaseReference,
+                Reason::Observation("legacy reference release removed from cleanup"),
+            ));
+        }
         // Migrate the enforcement-only reasons used by the earlier journal.
         if durable.enforcement_error.is_none()
             && matches!(
@@ -354,12 +436,14 @@ impl Machine {
             .enforcement_error
             .clone()
             .map_or(Verdict::NeverVerified, Verdict::NotProtected);
+        let hold_cleanup = durable.hold && durable.join_intended;
         let mut m = Self {
             durable,
             pending: Vec::new(),
             effect_since: 0,
             operation: None,
             leave_requested: false,
+            join_requested: false,
             abort_requested: false,
             deferred_repair: None,
             baseline: None,
@@ -382,6 +466,9 @@ impl Machine {
             references: References::default(),
             settling_flush: None,
             joined_unknown_retries: 0,
+            hold_policy: super::policy::Kind::Installed(Form::PreTunnel),
+            hold_cleanup,
+            hold_cleanup_retries: Vec::new(),
         };
         m.context = m.durable.verification_context;
         m.invalidate(true);
@@ -391,9 +478,11 @@ impl Machine {
             m.operation = Some(Operation::Leave);
             m.pending = vec![Step::PersistLeaving];
         } else if m.durable.join_intended {
+            m.references.needed = true;
             m.begin(Operation::Recover, false, 0);
         }
         if m.operation != Some(Operation::Leave)
+            && !m.durable.hold
             && (m.reference_debt() || m.durable.reference_intent.is_some())
             && !matches!(
                 m.pending(),
@@ -402,11 +491,28 @@ impl Machine {
         {
             m.pending.insert(0, Step::ReconcileReference);
         }
-        if m.operation == Some(Operation::Leave) {
-            m.schedule_reference(0);
-        }
+        m.schedule_reference(0);
         m.prepare_reference();
         m
+    }
+    /// Restart a held machine with an input-free lockdown expectation.
+    /// The expected kind is process-local and recomputed from installation trust
+    /// on every restart. Leave is the only transition that clears the hold.
+    #[must_use]
+    pub fn restart_lockdown(mut durable: Durable) -> Self {
+        durable.hold = true;
+        let mut machine = Self::restart(durable);
+        machine.hold_policy = super::policy::Kind::Lockdown;
+        machine
+    }
+    /// Exact policy required by the closing prefix.
+    #[must_use]
+    pub fn pre_tunnel_policy(&self) -> super::policy::Kind {
+        if self.durable.hold {
+            self.hold_policy
+        } else {
+            super::policy::Kind::Installed(Form::PreTunnel)
+        }
     }
     /// Next effect, with at most one in flight.
     #[must_use]
@@ -477,27 +583,43 @@ impl Machine {
     /// Expiry is derived at the consumer even if no monitor event arrives.
     #[must_use]
     pub fn enforcement_at(&self, clock: &impl SleepCountingClock) -> Verdict {
-        self.enforcement.at(clock)
+        if self.durable.hold {
+            Verdict::NotProtected(Reason::Observation("state untrusted: run leave"))
+        } else {
+            self.enforcement.at(clock)
+        }
+    }
+    /// Fresh pre-tunnel blocking evidence, independent of hold's Protected mask.
+    #[must_use]
+    pub fn blocking_verified_at(&self, clock: &impl SleepCountingClock) -> bool {
+        matches!(self.enforcement.at(clock), Verdict::Protected(proof) if proof.form() == Form::PreTunnel)
     }
     /// Consumer-facing progress; pre-tunnel protection never means a finished join.
     #[must_use]
     pub fn status_at(&self, clock: &impl SleepCountingClock) -> ConnectionStatus {
         if self.durable.leaving || self.durable.leave_requested || self.leave_requested {
             ConnectionStatus::Leaving
-        } else if let Some(Step::Backoff { until }) = self.pending() {
+        } else if self.durable.hold {
+            ConnectionStatus::NotProtected {
+                reason: "state untrusted: run leave",
+                blocking_verified: self.blocking_verified_at(clock),
+            }
+        } else if self.durable.join_intended
+            && self.tunnel.is_some()
+            && matches!(self.enforcement_at(clock), Verdict::Protected(p) if p.form() == Form::Joined)
+        {
+            ConnectionStatus::Joined
+        } else if let Some(Step::Backoff { until }) = self.pending()
+            && self.durable.join_intended
+        {
             ConnectionStatus::Recovering {
                 retry_in: until.saturating_sub(clock.now()),
             }
         } else if self.durable.join_intended
+            || self.join_requested
             || matches!(self.operation, Some(Operation::Join | Operation::Recover))
         {
-            if self.tunnel.is_some()
-                && matches!(self.enforcement_at(clock), Verdict::Protected(p) if p.form() == Form::Joined)
-            {
-                ConnectionStatus::Joined
-            } else {
-                ConnectionStatus::JoiningRecovering
-            }
+            ConnectionStatus::JoiningRecovering
         } else {
             ConnectionStatus::Idle
         }
@@ -520,19 +642,45 @@ impl Machine {
     /// Whether all cleanup has been confirmed; uninstall may delete recovery data only then.
     #[must_use]
     pub fn cleanup_confirmed(&self) -> bool {
-        !self.durable.leaving
-            && !self.durable.leave_requested
-            && !self.leave_requested
-            && !self.durable.join_intended
+        self.connectivity_restored()
             && self.pending.is_empty()
-            && self.durable.pending_cleanup.is_empty()
             && self.durable.pf_reference.is_none()
             && self.durable.older_references.is_empty()
             && self.durable.reference_intent.is_none()
             && !self.durable.reference_needs_reconcile
             && self.durable.uncertain_acquires.is_empty()
+    }
+    /// Whether Leave restored connectivity, independently of reference accounting.
+    #[must_use]
+    pub fn connectivity_restored(&self) -> bool {
+        !self.durable.leaving
+            && !self.durable.leave_requested
+            && !self.leave_requested
+            && !self.join_requested
+            && !self.durable.join_intended
+            && !self.durable.hold
+            && self
+                .pending
+                .iter()
+                .all(|s| matches!(s, Step::ReconcileReference | Step::Backoff { .. }))
+            && self.durable.pending_cleanup.is_empty()
             && self.tunnel.is_none()
             && self.installed_form.is_none()
+    }
+    /// Defer a planned acquisition before its reservation is exposed, when the
+    /// executor cannot identify the current boot. Existing ledger entries must
+    /// never use this operation; it provides no evidence about an ioctl.
+    /// Returns unchanged unless an acquisition is at the head of the plan.
+    #[must_use]
+    pub fn defer_unstarted_acquisition(&self, clock: &impl SleepCountingClock) -> Self {
+        let mut next = self.clone();
+        if next.pending() == Some(Step::AcquireReference) {
+            next.durable.reference_intent = None;
+            next.references.needed = true;
+            next.reference_retry(clock.now());
+            next.advance(clock.now());
+        }
+        next
     }
     /// Atomic transition using the same sleep-counting clock as verification.
     /// Invalid results cannot mutate the source; expired cleanliness schedules repair.
@@ -548,6 +696,7 @@ impl Machine {
         {
             next.mark_gap(expiry);
         }
+        next.observe_disabled(&event);
         if next.coalesce(&event, now) {
             if next.pending() != self.pending() {
                 next.effect_since = now;
@@ -589,8 +738,12 @@ impl Machine {
             next.pending = vec![Step::PersistLeaving];
             next.operation = Some(Operation::Leave);
             next.leave_requested = false;
+            next.join_requested = false;
             next.abort_requested = false;
             next.deferred_repair = None;
+        } else if next.join_requested && boundary {
+            next.join_requested = false;
+            next.begin(Operation::Join, true, now);
         } else if boundary && let Some(action) = next.deferred_repair.take() {
             next.pending.clear();
             next.operation = None;
@@ -601,8 +754,11 @@ impl Machine {
             next.operation = None;
             next.abort_requested = false;
         }
-        if boundary
+        if (boundary
+            || next.pending().is_none()
+            || matches!(next.pending(), Some(Step::Backoff { .. })))
             && next.closing.rerun.is_some()
+            && next.durable.join_intended
             && !next.durable.leaving
             && !next.durable.leave_requested
             && next.operation != Some(Operation::Leave)
@@ -610,18 +766,52 @@ impl Machine {
             next.rerun_closing(now);
         }
         next.schedule_state_recheck(now);
-        if boundary || next.pending() != self.pending() {
-            next.effect_since = now;
-        }
         if boundary
             || self.pending().is_none()
             || matches!(self.pending(), Some(Step::Backoff { .. }))
         {
             next.schedule_reference(now);
         }
+        // Merge cleanup into the background accounting queue, so either retry
+        // may share its timer without discarding the other kind of debt.
+        next.schedule_hold_cleanup(now);
+        if boundary || next.pending() != self.pending() {
+            next.effect_since = now;
+        }
         next.clear_reference_error();
         next.prepare_reference();
         Ok(next)
+    }
+    fn observe_disabled(&mut self, event: &Event) {
+        let disabled = match event {
+            Event::Repair(Action::EnableAndRejoin) => true,
+            Event::Observed {
+                context,
+                verdict: Verdict::Repair(Action::EnableAndRejoin),
+                ..
+            } => *context == self.context,
+            _ => false,
+        };
+        if matches!(event,
+            Event::PfEnabledObserved { context }
+                | Event::Observed { context, verdict: Verdict::Protected(_), .. }
+                if *context == self.context)
+        {
+            self.references.observed_pf_disabled = false;
+        }
+        if disabled {
+            if !self.references.observed_pf_disabled {
+                if self.durable.hold {
+                    // Preserve the waiting/in-flight distinction until the
+                    // held repair decides whether to preempt background work.
+                    self.references.retry_at = 0;
+                    self.references.retry_delay = 0;
+                } else {
+                    self.reset_reference_retry();
+                }
+            }
+            self.references.observed_pf_disabled = true;
+        }
     }
     fn prepare_reference(&mut self) {
         if self.durable.reference_intent.is_none() {
@@ -647,7 +837,12 @@ impl Machine {
         );
     }
     fn clear_reference_error(&mut self) {
-        if !self.reference_debt() {
+        if !self.reference_debt() && self.durable.older_references.is_empty() {
+            if self.durable.reference_error.is_some()
+                && self.durable.last_error == self.durable.reference_error
+            {
+                self.durable.last_error = self.durable.enforcement_error.clone();
+            }
             self.durable.reference_error = None;
             self.durable
                 .cleanup_errors
@@ -660,35 +855,146 @@ impl Machine {
             + self.durable.uncertain_acquires.len()
     }
     fn reference_debt(&self) -> bool {
-        self.durable.reference_needs_reconcile
+        (!self.durable.join_intended && self.reference_slots() > 0)
+            || !self.durable.older_references.is_empty()
+                && matches!(&self.enforcement, Verdict::Protected(proof)
+                    if proof.form() == Form::Joined || self.durable.hold && !self.closing.active)
+            || self.durable.reference_needs_reconcile
             || !self.durable.uncertain_acquires.is_empty()
             || self.durable.reference_intent == Some(ReferenceIntent::Release)
                 && self.pending() != Some(Step::ReleaseReference)
             || self.references.needed && self.reference_slots() >= 2
     }
+    fn reference_retry(&mut self, now: u64) {
+        self.references.retry_delay = if self.durable.join_intended {
+            1
+        } else {
+            self.references.retry_delay.saturating_mul(2).clamp(1, 60)
+        };
+        self.references.retry_at = now.saturating_add(self.references.retry_delay);
+    }
+    fn reset_reference_retry(&mut self) {
+        self.references.retry_at = 0;
+        self.references.retry_delay = 0;
+        if matches!(self.pending(), Some(Step::Backoff { .. }))
+            && self.pending.get(1) == Some(&Step::ReconcileReference)
+        {
+            self.pending.remove(0);
+        }
+    }
+    fn settle_reference(&mut self, entry: ReferenceEntry, now: u64) -> Result<(), Error> {
+        let exists = match entry {
+            ReferenceEntry::Token(token) => {
+                if self.durable.pf_reference == Some(token) {
+                    self.durable.pf_reference = None;
+                    true
+                } else if let Some(index) = self
+                    .durable
+                    .older_references
+                    .iter()
+                    .position(|t| *t == token)
+                {
+                    self.durable.older_references.remove(index);
+                    true
+                } else {
+                    false
+                }
+            }
+            ReferenceEntry::Acquire(sequence) => {
+                if self.durable.reference_intent == Some(ReferenceIntent::Acquire(sequence)) {
+                    return Err(Error("cannot settle active acquisition"));
+                } else if let Some(index) = self
+                    .durable
+                    .uncertain_acquires
+                    .iter()
+                    .position(|s| *s == sequence)
+                {
+                    self.durable.uncertain_acquires.remove(index);
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+        if !exists {
+            return Err(Error("unknown reference settlement entry"));
+        }
+        self.context.acquisition_revision += 1;
+        self.durable.verification_context = self.context;
+        self.reset_reference_retry();
+        if self.durable.join_intended && self.durable.pf_reference.is_none() {
+            self.references.needed = true;
+            self.invalidate(false);
+            self.invalidated_at = now;
+            if self.reference_slots() < 2 && !self.pending.contains(&Step::AcquireReference) {
+                self.closing.rerun = Some(ClosingRerun::Repair(Action::EnableAndRejoin));
+            }
+        }
+        if self.reference_slots() == 0
+            && !matches!(
+                self.durable.reference_intent,
+                Some(ReferenceIntent::Acquire(_))
+            )
+        {
+            self.durable.reference_intent = None;
+            self.durable.reference_needs_reconcile = false;
+        }
+        self.clear_reference_error();
+        Ok(())
+    }
     fn schedule_reference(&mut self, now: u64) {
+        // Joined predecessor cleanup is background work. Finish a cleanliness
+        // recheck before retrying it; accounting must not displace VerifyJoined
+        // at each boundary and expire the proof it is meant to preserve.
+        if self.operation == Some(Operation::Recheck)
+            && !self.references.needed
+            && self.durable.uncertain_acquires.is_empty()
+            && !self.durable.reference_needs_reconcile
+            && self.durable.reference_intent != Some(ReferenceIntent::Release)
+        {
+            return;
+        }
+        // Held accounting is background work: never insert it or its timer
+        // between the closing prefix's load, flush and verification steps.
+        if self.durable.hold
+            && !self.pending.is_empty()
+            && (!self.held_background() || !matches!(self.pending(), Some(Step::Backoff { .. })))
+        {
+            return;
+        }
         if !self.reference_debt()
+            || self.pending.contains(&Step::ReconcileReference)
             || matches!(
                 self.pending(),
-                Some(Step::PersistLeaving | Step::ReconcileReference)
+                Some(Step::PersistIntent | Step::PersistLeaving | Step::ReconcileReference)
             )
             || (self.pending() == Some(Step::AcquireReference)
                 && matches!(
                     self.durable.reference_intent,
                     Some(ReferenceIntent::Acquire(_))
                 ))
-            || (self.operation == Some(Operation::Leave)
-                && self.pending.iter().any(|s| {
-                    matches!(
-                        s,
-                        Step::StopChild
-                            | Step::CleanupRoutes
-                            | Step::CleanupDns
-                            | Step::CleanupArtifacts
-                            | Step::RemoveAnchor
-                    )
-                }))
+            || self.operation == Some(Operation::Leave)
+            || self.durable.leaving
+            || self.durable.leave_requested
         {
+            return;
+        }
+        // An available acquisition slot lets safety run before ownership cleanup.
+        if self.reference_slots() < 2
+            && self.durable.reference_needs_reconcile
+            && let Some(index) = self.pending.iter().position(|s| *s == Step::FlushStates)
+        {
+            if !self.pending.contains(&Step::ReconcileReference) {
+                self.pending.insert(index + 1, Step::ReconcileReference);
+                if now < self.references.retry_at {
+                    self.pending.insert(
+                        index + 1,
+                        Step::Backoff {
+                            until: self.references.retry_at,
+                        },
+                    );
+                }
+            }
             return;
         }
         // This timer belongs to ownership debt, not the closing/rejoin retry.
@@ -707,8 +1013,61 @@ impl Machine {
             );
         }
     }
+    fn is_hold_cleanup(step: Step) -> bool {
+        matches!(
+            step,
+            Step::StopChild | Step::CleanupRoutes | Step::CleanupDns | Step::CleanupArtifacts
+        )
+    }
+    fn background_only(&self) -> bool {
+        self.operation.is_none()
+            && self.pending.iter().all(|step| {
+                matches!(step, Step::Backoff { .. } | Step::ReconcileReference)
+                    || self.durable.hold && Self::is_hold_cleanup(*step)
+            })
+    }
+    fn held_background(&self) -> bool {
+        self.durable.hold && !self.closing.active && self.background_only()
+    }
+    fn schedule_hold_cleanup(&mut self, now: u64) {
+        if !self.held_background()
+            || !self.durable.join_intended
+            || self.durable.leaving
+            || self.durable.leave_requested
+            || self.leave_requested
+            || self.deferred_repair.is_some()
+            || self
+                .pending()
+                .is_some_and(|step| !matches!(step, Step::Backoff { .. }))
+        {
+            return;
+        }
+        let Some(retry) = self
+            .hold_cleanup_retries
+            .iter()
+            .min_by_key(|retry| retry.until)
+        else {
+            return;
+        };
+        if self.pending().is_none()
+            || matches!(self.pending(), Some(Step::Backoff { until }) if retry.until <= until)
+        {
+            // Background work can share the idle timer. Never put a cleanup wait
+            // into the closing prefix, or interrupt an in-flight accounting call.
+            if self.pending.contains(&retry.step) {
+                return;
+            }
+            self.pending.insert(0, retry.step);
+            if now < retry.until {
+                self.pending.insert(0, Step::Backoff { until: retry.until });
+            }
+        }
+    }
     fn require_reference(&mut self) {
-        if self.pending() == Some(Step::AcquireReference) {
+        if matches!(
+            self.pending(),
+            Some(Step::AcquireReference | Step::ReconcileReference)
+        ) {
             self.references.pf_disabled_seen = Some(self.context.lifecycle_revision);
         }
         // Negative observations are not checked releases. Keep every identity.
@@ -733,6 +1092,7 @@ impl Machine {
         if (!self.closing.active
             && !matches!(self.operation, Some(Operation::Join | Operation::Recover)))
             || self.operation == Some(Operation::Leave)
+            || (!self.durable.join_intended && self.operation != Some(Operation::Join))
             || self.leave_requested
             || self.durable.leave_requested
             || matches!(
@@ -897,7 +1257,7 @@ impl Machine {
             && self
                 .baseline
                 .as_ref()
-                .is_some_and(|b| b.form() == Form::PreTunnel)
+                .is_some_and(|b| b.kind() == self.pre_tunnel_policy())
         {
             self.pending
                 .retain(|step| !matches!(step, Step::LoadPreTunnel | Step::VerifyPreTunnelLoad));
@@ -912,6 +1272,20 @@ impl Machine {
         self.gap_after = Some(self.gap_after.map_or(since, |old| old.max(since)));
     }
     fn schedule_state_recheck(&mut self, now: u64) {
+        if self.durable.hold
+            && self.durable.join_intended
+            && !self.closing.active
+            && self.operation.is_none()
+            && !self.durable.leaving
+            && !self.durable.leave_requested
+            && !self.leave_requested
+            && (self.states_clean_at.is_none()
+                || self
+                    .gap_after
+                    .is_some_and(|gap| self.states_clean_at.is_none_or(|at| at < gap)))
+        {
+            self.recheck_hold();
+        }
         // Even an otherwise harmless event can be the first notice of expiry.
         // A rejoin wait may retain only cleanup that still covers every gap.
         if matches!(self.pending(), Some(Step::Backoff { .. }))
@@ -933,6 +1307,23 @@ impl Machine {
             && !self.leave_requested
             && self.operation != Some(Operation::Leave)
         {
+            if self.durable.hold {
+                if self.installed_form != Some(Form::PreTunnel)
+                    || self
+                        .baseline
+                        .as_ref()
+                        .is_none_or(|b| b.kind() != self.pre_tunnel_policy())
+                {
+                    self.begin(Operation::Recover, false, now);
+                } else if self.states_clean_at.is_none()
+                    || self
+                        .gap_after
+                        .is_some_and(|gap| self.states_clean_at.is_none_or(|at| at < gap))
+                {
+                    self.recheck_hold();
+                }
+                return;
+            }
             if self.installed_form != Some(Form::Joined)
                 || self.tunnel.is_none()
                 || self
@@ -948,6 +1339,23 @@ impl Machine {
             {
                 self.operation = Some(Operation::Recheck);
                 self.pending = vec![Step::FlushStates, Step::VerifyJoined];
+            }
+        }
+    }
+    fn recheck_hold(&mut self) {
+        debug_assert!(self.durable.hold && self.durable.join_intended);
+        self.operation = Some(Operation::Recheck);
+        self.closing.active = true;
+        let in_flight = self
+            .pending()
+            .filter(|step| !matches!(step, Step::Backoff { .. }));
+        self.pending = vec![Step::FlushStates, Step::VerifyPreTunnel];
+        if let Some(step) = in_flight {
+            self.pending.insert(0, step);
+            // The dispatched result still belongs to this head. Keep any
+            // separately requested repair for the boundary after its result.
+            if Self::is_hold_cleanup(step) {
+                self.abort_requested = false;
             }
         }
     }
@@ -983,11 +1391,15 @@ impl Machine {
         self.abort_requested = false;
         self.deferred_repair = None;
         self.references.pf_disabled_seen = None;
-        self.rejoin_delay = if op == Operation::Recover && self.durable.retry_attempts > 0 {
-            Some((1u64 << (self.durable.retry_attempts.min(7) - 1)).min(60))
-        } else {
-            None
-        };
+        if op == Operation::Join && self.reference_slots() > 0 && self.reference_slots() < 2 {
+            self.references.needed = true;
+        }
+        self.rejoin_delay =
+            if !self.durable.hold && op == Operation::Recover && self.durable.retry_attempts > 0 {
+                Some((1u64 << (self.durable.retry_attempts.min(7) - 1)).min(60))
+            } else {
+                None
+            };
         self.closing.active = true;
         self.settling_flush = None;
         self.joined_unknown_retries = 0;
@@ -995,6 +1407,10 @@ impl Machine {
         self.closing.unknown = false;
         if persist {
             self.pending.push(Step::PersistIntent);
+        }
+        // Only debt that blocks enabling pf may precede the safety prefix.
+        if self.durable.hold && self.references.needed && self.reference_slots() >= 2 {
+            self.pending.push(Step::ReconcileReference);
         }
         if (self.durable.pf_reference.is_none() || self.references.needed)
             && self.reference_slots() < 2
@@ -1008,13 +1424,25 @@ impl Machine {
             Step::FlushStates,
             Step::VerifyPreTunnel,
         ]);
-        if op == Operation::Recover {
+        // Otherwise accounting follows verification in the same held prefix,
+        // without a timer, so repeated safety repairs cannot starve it.
+        if self.durable.hold
+            && !self.pending.contains(&Step::ReconcileReference)
+            && (self.reference_slots() >= 2
+                || self.reference_debt() && now >= self.references.retry_at)
+        {
+            self.pending.push(Step::ReconcileReference);
+        }
+        if op == Operation::Recover && (!self.durable.hold || self.hold_cleanup) {
             self.pending.extend([
                 Step::StopChild,
                 Step::CleanupRoutes,
                 Step::CleanupDns,
                 Step::CleanupArtifacts,
             ]);
+        }
+        if self.durable.hold {
+            return;
         }
         if let Some(delay) = self.rejoin_delay {
             self.pending.push(Step::Backoff {
@@ -1104,6 +1532,11 @@ impl Machine {
             }
         }
         if self.pending.is_empty() {
+            if self.durable.hold && self.operation != Some(Operation::Leave) {
+                self.closing.active = false;
+                self.closing.retry = None;
+                self.hold_cleanup = false;
+            }
             if self.operation == Some(Operation::Leave)
                 && self.durable.pending_cleanup.is_empty()
                 && self.durable.leaving
@@ -1163,6 +1596,7 @@ impl Machine {
             self.references.needed = false;
         }
         // A late result cannot cancel a newer request to enable pf.
+        self.context.acquisition_revision += 1;
         self.invalidate(false); // acquisition invalidates every round started before it
         self.invalidated_at = now;
         if active && self.references.pf_disabled_seen.take().is_some() {
@@ -1174,6 +1608,28 @@ impl Machine {
         self.clear_reference_error();
         debug_assert!(self.reference_slots() <= 2);
         Ok(())
+    }
+    fn retry_hold_cleanup(&mut self, step: Step, reason: Reason, now: u64) {
+        self.durable.cleanup_errors.retain(|(s, _)| *s != step);
+        self.durable.cleanup_errors.push((step, reason.clone()));
+        self.durable.last_error = Some(reason);
+        if let Some(retry) = self
+            .hold_cleanup_retries
+            .iter_mut()
+            .find(|retry| retry.step == step)
+        {
+            retry.delay = retry.delay.saturating_mul(2).clamp(1, 60);
+            retry.until = now.saturating_add(retry.delay);
+        } else {
+            self.hold_cleanup_retries.push(HoldCleanupRetry {
+                step,
+                until: now.saturating_add(1),
+                delay: 1,
+            });
+        }
+        // Cleanup failure says nothing about enforcement. Advance exactly as
+        // Leave does, preserving the proof and attempting independent work.
+        self.advance(now);
     }
     fn fail(&mut self, reason: Reason, now: u64) {
         if self.pending() == Some(Step::ReconcileReference) {
@@ -1187,8 +1643,15 @@ impl Machine {
                     .cleanup_errors
                     .push((Step::ReconcileReference, reason));
             }
-            self.references.retry_at = now.saturating_add(1);
-            self.pending.remove(0);
+            self.reference_retry(now);
+            self.advance(now);
+            return;
+        }
+        if self.durable.hold
+            && self.operation != Some(Operation::Leave)
+            && let Some(step) = self.pending().filter(|step| Self::is_hold_cleanup(*step))
+        {
+            self.retry_hold_cleanup(step, reason, now);
             return;
         }
         if self.pending() == Some(Step::AcquireReference)
@@ -1201,7 +1664,8 @@ impl Machine {
         // A failed joined Recheck flush instead starts LoadPreTunnel immediately.
         let was_waiting = matches!(self.pending(), Some(Step::Backoff { .. }));
         let closing_retry = self.pending().filter(|step| {
-            matches!(self.operation, Some(Operation::Join | Operation::Recover))
+            (matches!(self.operation, Some(Operation::Join | Operation::Recover))
+                || self.durable.hold && self.operation == Some(Operation::Recheck))
                 && matches!(
                     step,
                     Step::AcquireReference
@@ -1273,8 +1737,11 @@ impl Machine {
     fn apply(&mut self, event: Event, now: u64) -> Result<(), Error> {
         match event {
             Event::Leave => {
+                let waiting = matches!(self.pending(), Some(Step::Backoff { .. }));
+                self.reset_reference_retry();
                 self.references.pf_disabled_seen = None;
                 self.references.needed = false;
+                self.join_requested = false;
                 self.durable.leave_requested = true;
                 if self.durable.leaving {
                     if self.pending.is_empty() {
@@ -1286,7 +1753,7 @@ impl Machine {
                 self.operation = Some(Operation::Leave);
                 self.closing.active = false;
                 self.closing.rerun = None;
-                if self.pending.is_empty() || matches!(self.pending(), Some(Step::Backoff { .. })) {
+                if waiting || self.pending.is_empty() {
                     self.pending = vec![Step::PersistLeaving];
                     self.abort_requested = false;
                     self.deferred_repair = None;
@@ -1296,24 +1763,54 @@ impl Machine {
                 }
             }
             Event::Join => {
-                if !self.pending.is_empty()
+                if self
+                    .pending
+                    .iter()
+                    .any(|s| !matches!(s, Step::ReconcileReference | Step::Backoff { .. }))
+                    || self.durable.hold
                     || self.durable.leaving
                     || self.durable.join_intended
+                    || self.join_requested
                     || self.leave_requested
                     || self.operation == Some(Operation::Leave)
                 {
                     return Err(Error("join already intended or mutation pending"));
                 }
-                self.begin(Operation::Join, true, now);
+                let reconciling = self.pending() == Some(Step::ReconcileReference);
+                self.reset_reference_retry();
+                if self.reference_slots() > 0 && self.reference_slots() < 2 {
+                    self.references.needed = true;
+                }
+                if reconciling {
+                    self.pending.truncate(1);
+                    self.join_requested = true;
+                } else {
+                    self.begin(Operation::Join, true, now);
+                }
             }
             Event::Repair(action) => {
-                if !self.pending.is_empty()
+                if (!self.pending.is_empty() && !self.held_background())
                     || !self.durable.join_intended
                     || self.durable.leaving
                     || self.leave_requested
                     || self.operation == Some(Operation::Leave)
                 {
                     return Err(Error("repair without available join intent"));
+                }
+                if self.durable.hold {
+                    if action == Action::EnableAndRejoin {
+                        self.require_reference();
+                    }
+                    if self
+                        .pending()
+                        .is_some_and(|step| !matches!(step, Step::Backoff { .. }))
+                    {
+                        self.pending.truncate(1);
+                        self.deferred_repair = Some(action);
+                    } else {
+                        self.begin(Operation::Recover, false, now);
+                    }
+                    return Ok(());
                 }
                 if let Action::Rerender { form } = action {
                     if !matches!(self.enforcement.at(&Now(now)), Verdict::Protected(_)) {
@@ -1359,6 +1856,9 @@ impl Machine {
                 }
             }
             Event::ChildDied => {
+                if self.durable.hold {
+                    return Ok(());
+                }
                 if self.tunnel.is_none() {
                     return Ok(());
                 }
@@ -1389,6 +1889,7 @@ impl Machine {
             Event::InvalidateObservations { since } => {
                 self.invalidate(true);
                 if self.pending().is_some()
+                    && self.durable.join_intended
                     && !matches!(self.pending(), Some(Step::Backoff { .. }))
                     && self.operation != Some(Operation::Leave)
                     && !self.leave_requested
@@ -1401,17 +1902,27 @@ impl Machine {
                 }
                 self.mark_gap(since);
                 if matches!(self.pending(), Some(Step::Backoff { .. }))
+                    && self.durable.join_intended
                     && self.operation != Some(Operation::Leave)
                     && !self.leave_requested
                     && !self.durable.leaving
                     && !self.durable.leave_requested
                 {
-                    self.begin(Operation::Recover, false, now);
-                    self.closing_wait(Step::VerifyPreTunnel, now);
+                    if self.durable.hold && !self.closing.active {
+                        self.recheck_hold();
+                    } else {
+                        self.begin(Operation::Recover, false, now);
+                        self.closing_wait(Step::VerifyPreTunnel, now);
+                    }
                 }
                 self.durable.enforcement_error = Some(Reason::Unknown { since });
                 self.enforcement = Verdict::Unknown { since };
                 self.invalidated_at = now;
+            }
+            Event::PfEnabledObserved { context } => {
+                if context != self.context {
+                    return Err(Error("stale pf observation"));
+                }
             }
             Event::Completed(step) => {
                 if self.pending() != Some(step) {
@@ -1438,8 +1949,12 @@ impl Machine {
                     Step::Backoff { until } if now < until => {
                         return Err(Error("retry backoff has not elapsed"));
                     }
-                    Step::PersistIntent => self.durable.join_intended = true,
+                    Step::PersistIntent => {
+                        self.durable.join_intended = true;
+                        self.reset_reference_retry();
+                    }
                     Step::PersistLeaving => {
+                        self.reset_reference_retry();
                         let had_intent = self.durable.join_intended;
                         self.durable.leaving = true;
                         self.durable.join_intended = false;
@@ -1479,26 +1994,20 @@ impl Machine {
                         self.invalidate(true);
                     }
                     Step::ReleaseReference => {
-                        if !self.durable.uncertain_acquires.is_empty() {
-                            return Err(Error("unresolved acquisition debt"));
-                        }
-                        self.durable.pf_reference = None;
-                        self.durable.older_references.clear();
-                        self.durable.reference_intent = None;
+                        return Err(Error("reference release requires exact settlements"));
                     }
                     Step::ClearIntent => {
-                        if !self.durable.pending_cleanup.is_empty()
-                            || self.reference_debt()
-                            || self.durable.pf_reference.is_some()
-                            || !self.durable.older_references.is_empty()
-                        {
+                        if !self.durable.pending_cleanup.is_empty() {
                             return Err(Error("cleanup unconfirmed"));
                         }
+                        self.reset_reference_retry();
                         self.durable.leaving = false;
                         self.durable.leave_requested = false;
                         self.durable.join_intended = false;
+                        self.durable.hold = false;
+                        self.hold_cleanup = false;
+                        self.hold_cleanup_retries.clear();
                         self.durable.cleanup_errors.clear();
-                        self.durable.reference_error = None;
                         self.durable.last_error = None;
                         self.durable.enforcement_error = None;
                         self.durable.retry_attempts = 0;
@@ -1508,6 +2017,15 @@ impl Machine {
                 }
                 if self.durable.leaving {
                     self.durable.pending_cleanup.retain(|s| *s != step);
+                    self.durable.cleanup_errors.retain(|(s, _)| *s != step);
+                }
+                if self.durable.hold && Self::is_hold_cleanup(step) {
+                    if self.durable.cleanup_errors.iter().any(|(failed, reason)| {
+                        *failed == step && self.durable.last_error.as_ref() == Some(reason)
+                    }) {
+                        self.durable.last_error = None;
+                    }
+                    self.hold_cleanup_retries.retain(|retry| retry.step != step);
                     self.durable.cleanup_errors.retain(|(s, _)| *s != step);
                 }
                 self.advance(now);
@@ -1521,31 +2039,58 @@ impl Machine {
             Event::ReferenceAcquiredFor { sequence, token } => {
                 self.record_acquisition(sequence, token, now)?;
             }
+            Event::ReferenceSettled { entry, how: _ } => {
+                self.settle_reference(entry, now)?;
+            }
             Event::ReferenceReconciled {
                 context,
                 current,
                 predecessor,
             } => {
                 if self.pending() != Some(Step::ReconcileReference)
-                    || context != self.context
+                    || context.acquisition_revision != self.context.acquisition_revision
                     || current == Some(0)
                     || predecessor == Some(0)
                     || predecessor.is_some() && (current.is_none() || current == predecessor)
+                    || !self.durable.uncertain_acquires.is_empty()
+                    || matches!(
+                        self.durable.reference_intent,
+                        Some(ReferenceIntent::Acquire(_))
+                    )
+                    || current
+                        .into_iter()
+                        .chain(predecessor)
+                        .collect::<BTreeSet<_>>()
+                        != self
+                            .durable
+                            .pf_reference
+                            .into_iter()
+                            .chain(self.durable.older_references.iter().copied())
+                            .collect::<BTreeSet<_>>()
                 {
                     return Err(Error("invalid reference reconciliation"));
                 }
-                // Typed evidence confirms the disposition of *all* other slots.
+                // Every removal must already have arrived as ReferenceSettled.
                 self.durable.pf_reference = current;
                 self.durable.older_references = predecessor.into_iter().collect();
-                self.durable.uncertain_acquires.clear();
                 self.durable.reference_intent = None;
-                self.durable.reference_error = None;
                 self.durable.reference_needs_reconcile = false;
-                self.references.needed = current.is_none();
-                self.durable
-                    .cleanup_errors
-                    .retain(|(s, _)| *s != Step::ReconcileReference);
-                self.pending.remove(0);
+                let disable_seen = self.references.pf_disabled_seen.take().is_some();
+                self.references.needed = self.durable.join_intended
+                    && (current.is_none()
+                        || disable_seen
+                        || (self.operation == Some(Operation::Join) || self.durable.hold)
+                            && self.references.needed
+                            && self.pending.contains(&Step::AcquireReference));
+                // A successful inventory that still retains a predecessor has
+                // not resolved its cleanup error.
+                self.clear_reference_error();
+                self.advance(now);
+                if self.reference_slots() > 0
+                    && (!self.durable.join_intended || !self.durable.older_references.is_empty())
+                {
+                    self.reference_retry(now);
+                }
                 if current.is_some() && !self.references.needed {
                     if let Some(index) = self
                         .pending
@@ -1608,11 +2153,19 @@ impl Machine {
                 self.advance(now);
             }
             Event::ReadbackValidated(baseline) => {
-                let form = baseline.form();
                 let valid = match self.pending() {
-                    Some(Step::VerifyPreTunnelLoad) => form == Form::PreTunnel,
-                    Some(Step::VerifyJoinedLoad) => form == Form::Joined,
-                    Some(Step::VerifyReplacement(expected)) => form == expected,
+                    Some(Step::VerifyPreTunnelLoad) => baseline.kind() == self.pre_tunnel_policy(),
+                    Some(Step::VerifyJoinedLoad) => {
+                        baseline.kind() == super::policy::Kind::Installed(Form::Joined)
+                    }
+                    Some(Step::VerifyReplacement(expected)) => {
+                        baseline.kind()
+                            == if expected == Form::PreTunnel {
+                                self.pre_tunnel_policy()
+                            } else {
+                                super::policy::Kind::Installed(expected)
+                            }
+                    }
                     _ => false,
                 };
                 if !valid {
@@ -1643,7 +2196,21 @@ impl Machine {
                 epoch,
                 completed_at,
             } => {
-                if self.pending() != Some(Step::FlushStates) {
+                // Successful periodic ownerless maintenance can refresh cleanliness
+                // while idle. It cannot satisfy a pending lifecycle effect or cross
+                // a gap, epoch, Leave, or deferred repair boundary.
+                let maintenance = self.background_only()
+                    && self.operation.is_none()
+                    && (self.installed_form == Some(Form::Joined)
+                        || self.durable.hold && self.installed_form == Some(Form::PreTunnel))
+                    && self.durable.join_intended
+                    && !self.durable.leaving
+                    && !self.durable.leave_requested
+                    && !self.leave_requested
+                    && !self.abort_requested
+                    && self.deferred_repair.is_none()
+                    && self.gap_after.is_none();
+                if self.pending() != Some(Step::FlushStates) && !maintenance {
                     return Err(Error("unexpected state-clean observation"));
                 }
                 if !self.leave_requested && !self.abort_requested && self.deferred_repair.is_none()
@@ -1667,7 +2234,9 @@ impl Machine {
                         self.invalidate(false);
                     }
                 }
-                self.advance(now);
+                if !maintenance {
+                    self.advance(now);
+                }
             }
             Event::InterfaceStatesRemoved {
                 interfaces,
@@ -1694,18 +2263,29 @@ impl Machine {
                 }
                 match verdict {
                     Verdict::Protected(proof) => {
+                        self.references.observed_pf_disabled = false;
                         let expected_step = if form == Form::Joined {
                             Step::VerifyJoined
                         } else {
                             Step::VerifyPreTunnel
                         };
-                        let refresh = form == Form::PreTunnel
-                            && matches!(self.pending(), Some(Step::Backoff { .. }))
-                            && self.pending.get(1) == Some(&Step::CheckTools);
+                        let refresh = (form == Form::PreTunnel
+                            && (matches!(self.pending(), Some(Step::Backoff { .. }))
+                                && self.pending.get(1) == Some(&Step::CheckTools)
+                                || self.background_only()))
+                            || form == Form::Joined
+                                && !self.pending.is_empty()
+                                && self.background_only();
                         if (self.pending().is_some()
                             && self.pending() != Some(expected_step)
                             && !refresh)
                             || self.installed_form != Some(form)
+                            || proof.kind()
+                                != if form == Form::PreTunnel {
+                                    self.pre_tunnel_policy()
+                                } else {
+                                    super::policy::Kind::Installed(Form::Joined)
+                                }
                             || proof.form() != form
                             || proof.context() != self.context
                             || self.baseline.as_ref().map(Baseline::hash)
@@ -1717,16 +2297,22 @@ impl Machine {
                             || self.durable.leaving
                             || self.leave_requested
                             || (form == Form::Joined
-                                && self.tunnel.as_ref() != Some(proof.tunnel()))
+                                && (self.tunnel.is_none()
+                                    || self.tunnel.as_ref() != proof.tunnel()))
                         {
                             return Err(Error("stale or unsolicited protected proof"));
+                        }
+                        if self.durable.pf_reference.is_none() && !self.durable.hold {
+                            self.references.needed = true;
+                            self.fail(Reason::Observation("unresolved acquisition debt"), now);
+                            return Ok(());
                         }
                         if (matches!(
                             self.operation,
                             Some(Operation::Replace | Operation::Recheck)
                         ) || self.operation.is_none()
                             || refresh)
-                            && (self.transport.as_ref() != Some(proof.transport())
+                            && (self.transport.as_ref() != proof.transport()
                                 || self
                                     .interface_states_removed_at
                                     .is_some_and(|at| proof.verified_at() < at))
@@ -1769,10 +2355,15 @@ impl Machine {
                             return Ok(());
                         }
                         self.prior_expiry = Some(proof.expires_at());
-                        self.transport = Some(proof.transport().clone());
+                        self.transport = proof.transport().cloned();
                         self.last_verified = Some(proof.verified_at());
                         self.gap_after = None;
                         self.durable.enforcement_error = None;
+                        if self.durable.hold {
+                            // A full held proof establishes that pf is enabled,
+                            // even when another owner holds its only live token.
+                            self.references.needed = false;
+                        }
                         if form == Form::Joined || refresh {
                             self.closing.active = false;
                             self.closing.retry = None;
@@ -1789,6 +2380,9 @@ impl Machine {
                         }
                     }
                     Verdict::NotProtected(reason) => {
+                        if !self.durable.join_intended {
+                            return Ok(());
+                        }
                         self.durable.enforcement_error = Some(reason.clone());
                         if self.operation == Some(Operation::Leave) || self.leave_requested {
                             self.enforcement = Verdict::NotProtected(reason.clone());
@@ -1806,14 +2400,14 @@ impl Machine {
                             self.durable.last_error = Some(reason);
                             self.pending.truncate(1);
                             self.abort_requested = true;
-                            self.deferred_repair = None;
+                            self.deferred_repair = self.durable.hold.then_some(Action::Rejoin);
                         } else {
                             self.fail(reason, now);
                         }
                     }
                     Verdict::Unknown { since } => {
                         self.durable.enforcement_error = Some(Reason::Unknown { since });
-                        if self.durable.last_error.is_none() {
+                        if self.durable.join_intended && self.durable.last_error.is_none() {
                             self.durable.last_error = Some(Reason::Unknown { since });
                         }
                         self.invalidate(true);
@@ -1821,13 +2415,18 @@ impl Machine {
                         self.mark_gap(since);
                         self.enforcement = Verdict::Unknown { since };
                         if self.operation != Some(Operation::Leave)
+                            && self.durable.join_intended
                             && !self.leave_requested
                             && !self.durable.leaving
                             && !self.durable.leave_requested
                         {
                             if matches!(self.pending(), Some(Step::Backoff { .. })) {
-                                self.begin(Operation::Recover, false, now);
-                                self.closing_wait(Step::VerifyPreTunnel, now);
+                                if self.durable.hold && !self.closing.active {
+                                    self.recheck_hold();
+                                } else {
+                                    self.begin(Operation::Recover, false, now);
+                                    self.closing_wait(Step::VerifyPreTunnel, now);
+                                }
                             } else if self.pending() == Some(Step::VerifyJoined)
                                 && matches!(
                                     self.operation,
@@ -1865,6 +2464,7 @@ impl Machine {
                         if self.operation == Some(Operation::Leave)
                             || self.leave_requested
                             || self.durable.leave_requested
+                            || !self.durable.join_intended
                         {
                             self.durable.enforcement_error = Some(Reason::Repair(action));
                             self.enforcement = Verdict::Unknown { since: now };
@@ -1891,12 +2491,15 @@ impl Machine {
                             self.mark_gap(now);
                         }
                         if verification || matches!(self.pending(), Some(Step::Backoff { .. })) {
+                            let held_background = self.held_background();
                             if self.pending() == Some(Step::VerifyJoined) {
                                 self.note_rejoin_failure();
                             }
                             self.closing.retry = None;
                             self.begin(Operation::Recover, false, now);
-                            self.closing_wait(Step::VerifyPreTunnel, now);
+                            if !held_background {
+                                self.closing_wait(Step::VerifyPreTunnel, now);
+                            }
                         } else if self.pending().is_some() {
                             self.invalidate(true);
                             self.pending.truncate(1);
@@ -1912,7 +2515,7 @@ impl Machine {
                 }
             }
             Event::Handshake { generation, fresh } => {
-                if self.pending.is_empty()
+                if self.background_only()
                     && self
                         .tunnel
                         .as_ref()
@@ -1935,5 +2538,80 @@ struct Now(u64);
 impl SleepCountingClock for Now {
     fn now(&self) -> u64 {
         self.0
+    }
+}
+
+#[cfg(test)]
+mod expected_policy_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use crate::mac::{policy, verify};
+
+    fn lockdown_baseline() -> Baseline {
+        verify::capture_lockdown_baseline(
+            policy::render_lockdown().as_str(),
+            &verify::Normalization {
+                expanded_lists: false,
+                named_icmp: false,
+                implicit_tcp_flags: false,
+            },
+        )
+        .unwrap()
+    }
+
+    fn held_with_stale_lockdown_baseline() -> Machine {
+        let mut machine = Machine::restart(Durable {
+            hold: true,
+            join_intended: true,
+            pf_reference: Some(1),
+            ..Durable::default()
+        });
+        machine.pending.clear();
+        machine.operation = None;
+        machine.closing.active = false;
+        machine.references.needed = false;
+        machine.installed_form = Some(Form::PreTunnel);
+        machine.baseline = Some(lockdown_baseline());
+        machine.states_clean_at = Some(100);
+        machine
+    }
+
+    #[test]
+    fn held_state_recheck_and_flush_rerun_require_expected_policy_kind() {
+        let mut machine = held_with_stale_lockdown_baseline();
+        assert_eq!(
+            machine.pre_tunnel_policy(),
+            policy::Kind::Installed(Form::PreTunnel)
+        );
+        machine.schedule_state_recheck(100);
+        assert!(machine.plan().contains(&Step::LoadPreTunnel));
+        let mut machine = held_with_stale_lockdown_baseline();
+        machine.closing.rerun = Some(ClosingRerun::Flush);
+        machine.rerun_closing(100);
+        assert!(machine.plan().contains(&Step::LoadPreTunnel));
+    }
+
+    #[test]
+    fn held_replacement_readback_requires_expected_policy_kind() {
+        let mut installed = held_with_stale_lockdown_baseline();
+        installed.pending = vec![Step::VerifyReplacement(Form::PreTunnel)];
+        assert!(
+            installed
+                .transition(Event::ReadbackValidated(lockdown_baseline()), &Now(100))
+                .is_err()
+        );
+        let mut lockdown = Machine::restart_lockdown(Durable {
+            hold: true,
+            join_intended: true,
+            pf_reference: Some(1),
+            ..Durable::default()
+        });
+        lockdown.pending = vec![Step::VerifyReplacement(Form::PreTunnel)];
+        lockdown.baseline = Some(lockdown_baseline());
+        assert!(
+            lockdown
+                .transition(Event::ReadbackValidated(lockdown_baseline()), &Now(100))
+                .is_ok()
+        );
     }
 }
