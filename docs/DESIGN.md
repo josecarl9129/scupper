@@ -1802,6 +1802,12 @@ A full-screen TUI stays R2+.
 | 4 | failing closed: no healthy exit, pinned exit down, admin disconnected, failover in progress | `FailClosed` | M1 |
 | 5 | data path verified as for 0, but scupperd is not alive (no failover, repairs, alerts, heartbeat) | `Unsupervised` | M2 |
 
+Exit 0 means the gateway side is verified and there is no unrecovered reset
+obligation. It does not mean clients are served. An upstream drop of the
+WireGuard UDP port, a lost gateway→client path, sleeping devices, and clients
+that never recover after their lease all give 0 with warnings. Client
+reachability is covered by the Mac's own check.
+
 Scripts that page on any non-zero code page on 5; that is intended.
 
 A down or positively absent client link cannot return 0 or 5. It returns 3
@@ -2160,6 +2166,16 @@ a gateway response (92 bytes) mixed with a client initiation (148 bytes) totals
 response are lost. The accepted client-initiated-handshake evidence can therefore
 precede recovery by the client's next retry (up to about 5 seconds); it is not an
 end-to-end canary. Latched recovery is never inferred from elapsed time.
+
+L1 is in the same family as N3. The Unknown-peer shortcut accepts repeated
+148-byte client initiations under the same handshake. It grants a lease and
+costs the idle warning. The exit-code effect is conservative: the lease makes
+a later reset report 3. Modulus rules cannot classify aggregated counter deltas.
+Removing this shortcut would remove leases, so changing it must be deliberate.
+
+L3: discarded history reports a never-recovered client as idle rather than
+expired-unconfirmed. Reconstruction never gives 0 earlier than intact history:
+all leases in the lost record end inside the 180-second reconstruction window.
 
 Confirmation is monotone within an uninterrupted recovery epoch: the same gateway
 incarnation, namespace, device incarnation, peer identity, generation and reset

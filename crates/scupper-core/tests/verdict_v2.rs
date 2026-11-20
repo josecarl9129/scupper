@@ -656,6 +656,76 @@ fn client_handshakes_stale_is_warning_only() {
         );
     }
 }
+
+#[test]
+fn exit_zero_policy_does_not_require_clients_to_be_served() {
+    let cases = [
+        (
+            "idle_reset_and_stale_handshake_remain_exit_zero",
+            ClientSessions {
+                idle_reset: true,
+                ..ClientSessions::default()
+            },
+            vec![Handshake::Never],
+            vec![
+                Warning::IdleClientSessionsReset,
+                Warning::ClientHandshakesStale,
+            ],
+        ),
+        (
+            "expired_unconfirmed_remains_exit_zero",
+            ClientSessions {
+                expired_unconfirmed: true,
+                ..ClientSessions::default()
+            },
+            vec![current()],
+            vec![Warning::ClientSessionsExpiredUnconfirmed],
+        ),
+        (
+            "every_peer_stale_including_never_remains_exit_zero",
+            ClientSessions::default(),
+            vec![
+                Handshake::At {
+                    unix_secs: NOW - 181,
+                },
+                Handshake::Never,
+            ],
+            vec![Warning::ClientHandshakesStale],
+        ),
+    ];
+    for (name, sessions, handshakes, warnings) in cases {
+        let mut cfg = config();
+        let mut obs = passing();
+        let mut peers = cfg.peers["wg0"].clone();
+        for index in 1..handshakes.len() {
+            let mut peer = peers[0].clone();
+            peer.public_key = [3; 32];
+            peer.allowed_ips = vec!["10.99.0.3/32".parse().unwrap()];
+            peers.insert(index, peer);
+        }
+        cfg.peers.insert("wg0".into(), peers.clone());
+        topology(&mut obs).peers.insert("wg0".into(), peers.clone());
+        let f = forwarding(&mut obs);
+        f.client_sessions = sessions;
+        f.client_handshakes = peers
+            .iter()
+            .zip(handshakes)
+            .map(|(peer, handshake)| (peer.public_key, handshake))
+            .collect();
+        let result = report_with(&obs, &cfg);
+        assert_eq!(
+            result.verdict,
+            Verdict::Protected {
+                exit: exit_id(),
+                exit_ip: PUBLIC
+            },
+            "{name}"
+        );
+        assert_eq!(result.verdict.exit_code(), 0, "{name}");
+        assert_eq!(result.warnings, warnings, "{name}");
+    }
+}
+
 #[test]
 fn daemon_dead_is_optional_warning() {
     let mut cfg = config();

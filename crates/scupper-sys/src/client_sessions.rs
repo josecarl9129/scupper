@@ -3743,6 +3743,412 @@ mod tests {
         assert!(rig.status().unknown);
         assert_eq!(rig.state().unknown_until, Some(1080));
     }
+
+    fn session_verdict_config() -> &'static scupper_core::verdict::v2::HealthConfigV2 {
+        use scupper_core::{
+            config::{parse_site, validate},
+            verdict::v2::{HealthConfigV2, NetnsIdentity},
+        };
+        static CONFIG: std::sync::OnceLock<HealthConfigV2> = std::sync::OnceLock::new();
+        CONFIG.get_or_init(|| {
+            let site = validate(
+                parse_site(include_str!(
+                    "../../scupper-core/tests/fixtures/site-m2.toml"
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+            HealthConfigV2::new(
+                &site,
+                &GatewayId("gw1".into()),
+                NetnsIdentity {
+                    device: 7,
+                    inode: 42,
+                },
+                vec!["198.51.100.7".parse().unwrap()],
+                7,
+            )
+            .unwrap()
+        })
+    }
+
+    // Supply verified gateway stages so these assertions exercise the real exit
+    // policy as well as the sampler's independently published readiness cache.
+    fn session_verdict(sessions: ClientSessions, now: u64) -> scupper_core::verdict::v2::Verdict {
+        use scupper_core::{
+            parse::{Handshake, UdpSocket},
+            render::RouteTarget,
+            verdict::v2::*,
+        };
+        let cfg = session_verdict_config();
+        let route = RouteAnswer::Dev(cfg.exit_iface.ifname().clone());
+        let obs = Observations {
+            topology: Some(Ok(TopologyObs {
+                host_wireguard_on_client_port: vec![],
+                errors: vec![],
+                links_complete: true,
+                addresses_complete: true,
+                netns: NetnsObs::Present {
+                    device: 7,
+                    inode: 42,
+                },
+                links: cfg
+                    .links
+                    .iter()
+                    .map(|(name, addresses)| LinkObs {
+                        name: name.clone(),
+                        kind: Some("wireguard".into()),
+                        up: true,
+                        addresses: addresses.clone(),
+                    })
+                    .collect(),
+                peers: cfg.peers.clone(),
+                ruleset: RulesetObs::Exact,
+                extra_rules: vec![],
+                tc_hooks: vec![],
+            })),
+            defaults: Some(Ok(DefaultRoutes {
+                violations: vec![],
+                v4: route.clone().into(),
+                v6: DefaultRouteObs::Unreachable,
+                extra: vec![],
+            })),
+            active: RouteTarget::Exit(cfg.exit_iface.clone()),
+            handshakes: Some(Ok(BTreeMap::from([(
+                cfg.exit.clone(),
+                Handshake::At { unix_secs: now },
+            )]))),
+            forwarding: Some(Ok(Forwarding {
+                client_sessions: sessions,
+                client_v4: 1,
+                v4: 1,
+                v6: 0,
+                netns_sockets: vec![],
+                hardening: vec![],
+                quarantine: None,
+                client_public_key: Some(cfg.client_public_key),
+                listen_port: cfg.listen_port,
+                host_sockets: vec![UdpSocket {
+                    local: (Ipv4Addr::UNSPECIFIED, cfg.listen_port).into(),
+                    inode: 99,
+                }],
+                client_handshakes: cfg.peers[&cfg.client_iface]
+                    .iter()
+                    .map(|peer| (peer.public_key, Handshake::Never))
+                    .collect(),
+            })),
+            routes: Some(
+                cfg.route_sources
+                    .iter()
+                    .map(|source| {
+                        (
+                            *source,
+                            RouteObs {
+                                v4: Ok(route.clone()),
+                                v6: Ok(RouteAnswer::Unreachable),
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+            exit_probe: Some(Ok("203.0.113.77".parse().unwrap())),
+            supervisor: Some(Supervisor::Alive {
+                netns: cfg.expected_netns,
+                iteration_age: Duration::from_secs(1),
+            }),
+            ..Observations::default()
+        };
+        let Next::Done(Ok(report)) = next(&obs, cfg, now) else {
+            panic!("incomplete gateway fixture");
+        };
+        report.verdict
+    }
+
+    fn checkpoint_keys(rig: &Rig, keys: &[[u8; 32]]) {
+        checkpoint_recovered(
+            &rig.sys, &rig.held, "wg0", &rig.root, &rig.root, ID, &rig.guard, keys,
+        )
+        .unwrap();
+    }
+
+    fn assert_session_outcome(rig: &Rig, keys: &[[u8; 32]], expected: ClientSessions) -> u8 {
+        use scupper_core::verdict::v2::{Degraded, Verdict};
+        use scupper_proto::SessionReason;
+        let now = rig.sys.now.get();
+        let actual = status(&rig.sys, &rig.held, "wg0", &rig.root, &rig.root, ID, keys).unwrap();
+        assert_eq!(actual, expected, "status at {now}");
+        let (reason, verdict) = if expected.unknown {
+            (
+                Some(SessionReason::ClientSessionsUnknown),
+                Verdict::Degraded(Degraded::ClientSessionsUnknown),
+            )
+        } else if expected.active_reset {
+            (
+                Some(SessionReason::ClientSessionsReset),
+                Verdict::Degraded(Degraded::ClientSessionsReset),
+            )
+        } else {
+            (
+                None,
+                Verdict::Protected {
+                    exit: scupper_core::config::ExitId("ch1".into()),
+                    exit_ip: "203.0.113.77".parse().unwrap(),
+                },
+            )
+        };
+        assert_eq!(cached_reason(&rig.root, now), reason, "cache at {now}");
+        let actual_verdict = session_verdict(actual, now);
+        assert_eq!(actual_verdict, verdict, "verdict at {now}");
+        let exit = actual_verdict.exit_code();
+        assert_eq!(
+            exit,
+            if expected.unknown || expected.active_reset {
+                3
+            } else {
+                0
+            },
+            "exit at {now}"
+        );
+        exit
+    }
+
+    #[derive(Clone, Copy)]
+    enum RestartHistory {
+        Corrupt,
+        Missing,
+        NamespaceChange,
+    }
+    impl RestartHistory {
+        fn apply(self, rig: &Rig) {
+            match self {
+                Self::Corrupt => {
+                    std::fs::write(path(&rig.root), b"torn").unwrap();
+                }
+                Self::Missing => {
+                    std::fs::remove_file(path(&rig.root)).unwrap();
+                }
+                Self::NamespaceChange => {
+                    let mut record = rig.state();
+                    record.namespace = (99, 99);
+                    save(&rig.root, &record, &rig.guard).unwrap();
+                    assert!(valid(&record, ID, rig.sys.now.get()));
+                }
+            }
+        }
+    }
+
+    fn authenticated_then_reset(keys: &[[u8; 32]]) -> Rig {
+        let rig = Rig::new();
+        for key in &keys[1..] {
+            rig.sys.extra.borrow_mut().push(Sample {
+                key: *key,
+                ..rig.sys.sample.borrow().clone()
+            });
+        }
+        rig.up();
+        rig.sys.now.set(1001);
+        {
+            let mut sample = rig.sys.sample.borrow_mut();
+            sample.handshake = (1001, 1);
+            sample.rx = 124;
+            sample.tx = 148;
+            for extra in rig.sys.extra.borrow_mut().iter_mut() {
+                *extra = Sample {
+                    key: extra.key,
+                    ..sample.clone()
+                };
+            }
+        }
+        checkpoint_keys(&rig, keys);
+        assert_eq!(rig.state().peers.len(), keys.len());
+        assert!(
+            rig.state()
+                .peers
+                .iter()
+                .all(|peer| peer.state == SessionState::Recovered)
+        );
+        rig.down();
+        rig.up();
+        assert_eq!(rig.state().peers.len(), keys.len());
+        assert!(rig.state().peers.iter().all(|peer| {
+            peer.state == SessionState::RequiredPending && peer.lease_until == Some(1181)
+        }));
+        rig
+    }
+
+    fn reconstruction_vs_intact(history: RestartHistory, two_peers: bool) {
+        let keys = if two_peers {
+            vec![[3; 32], [4; 32]]
+        } else {
+            vec![[3; 32]]
+        };
+        let intact = authenticated_then_reset(&keys);
+        let restarted = authenticated_then_reset(&keys);
+        let lease_until = 1181;
+        let restart = 1016;
+        let reconstruction_end = restart + 180;
+        let reconstructing = !matches!(history, RestartHistory::NamespaceChange);
+        // Five-second samples span both sides of the restart. Add exact boundary
+        // samples at lease_until - 1 / lease_until and reconstruction 179 / 180.
+        let mut times: std::collections::BTreeSet<_> = (1001..=1206).step_by(5).collect();
+        times.extend([
+            lease_until - 1,
+            lease_until,
+            reconstruction_end - 1,
+            reconstruction_end,
+        ]);
+        for now in times {
+            for rig in [&intact, &restarted] {
+                rig.sys.now.set(now);
+                if two_peers && now == restart + 5 {
+                    // Only the first peer confirms with a newer handshake and
+                    // transport receipt. The second retains its reset obligation.
+                    let mut sample = rig.sys.sample.borrow_mut();
+                    sample.handshake = (now, 1);
+                    sample.rx += 124;
+                    sample.tx += 148;
+                }
+            }
+            if now == restart {
+                history.apply(&restarted);
+            }
+            for rig in [&intact, &restarted] {
+                checkpoint_keys(rig, &keys);
+            }
+            if reconstructing && now == restart {
+                let record = restarted.state();
+                assert_eq!(record.unknown_until, Some(reconstruction_end));
+                assert_eq!(record.gaps[0].end, Some(restart));
+            }
+            let intact_expected = ClientSessions {
+                active_reset: now < lease_until,
+                idle_reset: now >= lease_until,
+                expired_unconfirmed: now >= lease_until,
+                ..ClientSessions::default()
+            };
+            let restarted_expected = if reconstructing && now >= restart {
+                ClientSessions {
+                    unknown: now < reconstruction_end,
+                    history_unavailable: now < reconstruction_end,
+                    idle_reset: true,
+                    ..ClientSessions::default()
+                }
+            } else {
+                intact_expected
+            };
+            let intact_exit = assert_session_outcome(&intact, &keys, intact_expected);
+            let restarted_exit = assert_session_outcome(&restarted, &keys, restarted_expected);
+            assert!(
+                intact_exit != 3 || restarted_exit == 3,
+                "one-way readiness at {now}"
+            );
+            for (rig, lost) in [
+                (&intact, false),
+                (&restarted, reconstructing && now >= restart),
+            ] {
+                let record = rig.state();
+                assert_eq!(record.peers.len(), keys.len());
+                for peer in &record.peers {
+                    let recovered = two_peers && peer.baseline.key == [3; 32] && now >= restart + 5;
+                    let expected_state = if recovered {
+                        SessionState::Recovered
+                    } else if lost {
+                        SessionState::Unknown
+                    } else if now < lease_until {
+                        SessionState::RequiredPending
+                    } else {
+                        SessionState::ExpiredUnconfirmed
+                    };
+                    assert_eq!(
+                        peer.state, expected_state,
+                        "peer {:?} at {now}",
+                        peer.baseline.key
+                    );
+                    assert_eq!(
+                        peer.lease_until,
+                        if recovered {
+                            Some(restart + 5 + 180)
+                        } else if lost {
+                            None
+                        } else {
+                            Some(lease_until)
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reconstruction_from_corrupt_history_never_returns_zero_before_intact() {
+        reconstruction_vs_intact(RestartHistory::Corrupt, false);
+    }
+
+    #[test]
+    fn reconstruction_from_missing_history_never_returns_zero_before_intact() {
+        reconstruction_vs_intact(RestartHistory::Missing, false);
+    }
+
+    #[test]
+    fn valid_history_across_namespace_change_keeps_original_deadline() {
+        reconstruction_vs_intact(RestartHistory::NamespaceChange, false);
+    }
+
+    #[test]
+    fn reconstruction_one_recovered_peer_cannot_mask_another_peer() {
+        for history in [
+            RestartHistory::Corrupt,
+            RestartHistory::Missing,
+            RestartHistory::NamespaceChange,
+        ] {
+            reconstruction_vs_intact(history, true);
+        }
+    }
+
+    #[test]
+    fn reconstruction_same_handshake_client_initiations_grant_a_lease() {
+        let rig = Rig::new();
+        rig.up();
+        rig.authenticate();
+        std::fs::write(path(&rig.root), b"torn").unwrap();
+        rig.checkpoint();
+        let baseline = rig.state().peers[0].clone();
+        assert_eq!(baseline.state, SessionState::Unknown);
+        assert_eq!(baseline.lease_until, None);
+        // L1 is the documented residual in the same family as N3 (DESIGN §12).
+        // Changing it must be deliberate: modulus rules cannot classify
+        // aggregated counter deltas, and removing the shortcut removes leases.
+        for now in (1006..=1181).step_by(5) {
+            rig.sys.now.set(now);
+            rig.sys.sample.borrow_mut().rx += 148;
+            rig.checkpoint();
+            let peer = rig.state().peers.remove(0);
+            assert_eq!(peer.observed.handshake, baseline.observed.handshake);
+            assert_eq!(peer.state, SessionState::Recovered);
+            assert_eq!(peer.last_authenticated, Some(now));
+            assert_eq!(peer.lease_until, Some(now + 180));
+            // The idle warning stays absent even when reconstruction completes.
+            assert_session_outcome(
+                &rig,
+                &[[3; 32]],
+                ClientSessions {
+                    unknown: now < 1181,
+                    history_unavailable: now < 1181,
+                    ..ClientSessions::default()
+                },
+            );
+        }
+        rig.down();
+        rig.up();
+        assert_session_outcome(
+            &rig,
+            &[[3; 32]],
+            ClientSessions {
+                active_reset: true,
+                ..ClientSessions::default()
+            },
+        );
+    }
     #[test]
     fn reset_time_is_saved_before_a_timeout_and_offline_peers_expire() {
         let rig = Rig::new();
