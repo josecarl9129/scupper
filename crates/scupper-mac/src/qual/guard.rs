@@ -1,0 +1,258 @@
+use serde::{Deserialize, Serialize};
+
+pub(super) const MAX_ARM_SECONDS: u64 = 18 * 60;
+
+/// The portable part of the accident guard. Inputs are observations, not trusted
+/// authentication: a local administrator can spoof them.
+pub(super) fn check_environment(
+    github_actions: &str,
+    runner_environment: &str,
+    root: bool,
+    disposable: bool,
+) -> Result<(), &'static str> {
+    if github_actions != "true" || runner_environment != "github-hosted" || !root || !disposable {
+        return Err(
+            "requires GITHUB_ACTIONS=true, RUNNER_ENVIRONMENT=github-hosted, euid 0 and --disposable-runner (accident guard, not a security property)",
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(super) struct Ack {
+    pub pid: u32,
+    pub start: String,
+    pub pgid: u32,
+    pub ppid: u32,
+    pub armed_at: u64,
+    pub fire_at: u64,
+    pub boot_session: String,
+}
+
+impl Ack {
+    pub fn fresh(&self, now: u64, boot_session: &str) -> bool {
+        self.pid > 1
+            && self.pgid == self.pid
+            && self.ppid == 1
+            && !self.start.is_empty()
+            && self.armed_at <= now
+            && now < self.fire_at
+            && self.fire_at - self.armed_at <= MAX_ARM_SECONDS
+            && self.boot_session == boot_session
+    }
+}
+
+// A header-only or unknown response is not proof of zero references. Keep raw
+// evidence so a newly encountered tool format can be reviewed without rerunning.
+pub(super) fn no_foreign_references(stdout: &str, stderr: &str) -> bool {
+    let lines: Vec<_> = stdout
+        .lines()
+        .chain(stderr.lines())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    lines.contains(&"No pf starter references held")
+        && lines.iter().all(|line| {
+            matches!(
+                *line,
+                "No pf starter references held"
+                    | "No ALTQ support in kernel"
+                    | "ALTQ related functions disabled"
+            )
+        })
+}
+
+pub(super) fn preflight_conditions(
+    observations: &std::collections::BTreeMap<String, super::Evidence>,
+    binary_is_arm64: bool,
+) -> Vec<String> {
+    let mut inconclusive = Vec::new();
+    for (name, evidence) in observations {
+        // On native Apple Silicon this optional OID may be absent. Record the
+        // exact error and permit only that specific absence, never other errors.
+        let absent_translation_oid = name == "translated"
+            && evidence.exit_code == Some(1)
+            && evidence.stderr.contains("unknown oid")
+            && !evidence.timed_out
+            && !evidence.truncated;
+        if !evidence.complete() && !absent_translation_oid {
+            inconclusive.push(format!(
+                "{name}: command failed, timed out or was truncated"
+            ));
+        }
+    }
+    if observations
+        .get("pf-references")
+        .is_none_or(|refs| !no_foreign_references(&refs.stdout, &refs.stderr))
+    {
+        inconclusive.push("foreign pf references present or reference text not recognized".into());
+    }
+    if observations
+        .get("pf-anchors")
+        .is_some_and(|e| e.stdout.contains("com.apple/scupper"))
+        || observations.get("pf-apple-anchors").is_some_and(|e| {
+            e.stdout
+                .lines()
+                .any(|line| line.trim().trim_matches('"') == "scupper")
+        })
+    {
+        inconclusive.push("existing com.apple/scupper anchor".into());
+    }
+    match observations.get("translated") {
+        Some(e) if e.stdout.trim() == "1" => inconclusive.push("sysctl.proc_translated=1".into()),
+        Some(e) if e.complete() && e.stdout.trim() == "0" => {}
+        Some(e)
+            if e.exit_code == Some(1)
+                && e.stderr.contains("unknown oid")
+                && !e.timed_out
+                && !e.truncated => {}
+        _ => inconclusive.push("translation status not established".into()),
+    }
+    if !binary_is_arm64
+        || observations
+            .get("binary-arch")
+            .is_none_or(|e| e.stdout.trim() != "arm64")
+    {
+        inconclusive.push("qualification binary is not native arm64".into());
+    }
+    if observations
+        .get("machine")
+        .is_none_or(|e| e.stdout.trim() != "arm64")
+    {
+        inconclusive.push("hw.machine is not arm64".into());
+    }
+    inconclusive
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn observation(stdout: &str) -> super::super::Evidence {
+        super::super::Evidence {
+            command: Vec::new(),
+            stdin: None,
+            pid: None,
+            exit_code: Some(0),
+            started_unix_ms: 0,
+            elapsed_ms: 0,
+            timed_out: false,
+            truncated: false,
+            stdout: stdout.into(),
+            stderr: String::new(),
+        }
+    }
+
+    #[test]
+    fn preflight_classifies_environment_without_network_mutation() {
+        let mut observations = std::collections::BTreeMap::from([
+            (
+                "pf-references".into(),
+                observation("No pf starter references held"),
+            ),
+            ("pf-anchors".into(), observation("com.apple")),
+            ("pf-apple-anchors".into(), observation("")),
+            ("translated".into(), observation("0")),
+            ("binary-arch".into(), observation("arm64")),
+            ("machine".into(), observation("arm64")),
+        ]);
+        assert_eq!(
+            preflight_conditions(&observations, true),
+            Vec::<String>::new()
+        );
+        assert_ne!(
+            preflight_conditions(&observations, false),
+            Vec::<String>::new()
+        );
+        for (key, value, reason) in [
+            ("pf-references", "TOKENS: foreign", "foreign pf"),
+            (
+                "pf-anchors",
+                "com.apple/scupper",
+                "existing com.apple/scupper",
+            ),
+            (
+                "pf-apple-anchors",
+                "  scupper",
+                "existing com.apple/scupper",
+            ),
+            ("translated", "1", "proc_translated=1"),
+            ("binary-arch", "x86_64", "not native arm64"),
+        ] {
+            let old = observations
+                .insert(key.into(), observation(value))
+                .expect("fixture key");
+            assert!(
+                preflight_conditions(&observations, true)
+                    .iter()
+                    .any(|text| text.contains(reason))
+            );
+            observations.insert(key.into(), old);
+        }
+        observations
+            .get_mut("translated")
+            .expect("fixture key")
+            .exit_code = Some(1);
+        observations
+            .get_mut("translated")
+            .expect("fixture key")
+            .stderr = "sysctl: unknown oid 'sysctl.proc_translated'".into();
+        assert_eq!(
+            preflight_conditions(&observations, true),
+            Vec::<String>::new()
+        );
+        observations
+            .get_mut("translated")
+            .expect("fixture key")
+            .stderr = "permission denied".into();
+        assert_ne!(
+            preflight_conditions(&observations, true),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn guard_checks_every_condition_and_ack_cannot_cross_boots_or_expire() {
+        assert!(check_environment("true", "github-hosted", true, true).is_ok());
+        for values in [
+            ("false", "github-hosted", true, true),
+            ("true", "self-hosted", true, true),
+            ("true", "github-hosted", false, true),
+            ("true", "github-hosted", true, false),
+        ] {
+            assert!(check_environment(values.0, values.1, values.2, values.3).is_err());
+        }
+        let ack = Ack {
+            pid: 42,
+            start: "recorded start".into(),
+            pgid: 42,
+            ppid: 1,
+            armed_at: 100,
+            fire_at: 200,
+            boot_session: "boot".into(),
+        };
+        assert!(ack.fresh(150, "boot"));
+        assert!(!ack.fresh(99, "boot"));
+        assert!(!ack.fresh(200, "boot"));
+        assert!(!ack.fresh(150, "another boot"));
+        let invalid = Ack {
+            fire_at: 100 + MAX_ARM_SECONDS + 1,
+            ..ack
+        };
+        assert!(!invalid.fresh(150, "boot"));
+    }
+
+    #[test]
+    fn unknown_or_nonempty_references_never_establish_clean_preflight() {
+        assert!(no_foreign_references(
+            "",
+            "No ALTQ support in kernel\nALTQ related functions disabled\nNo pf starter references held\n"
+        ));
+        assert!(!no_foreign_references("TOKENS:\n", ""));
+        assert!(!no_foreign_references(
+            "TOKENS: foreign token\n",
+            "No pf starter references held"
+        ));
+        assert!(!no_foreign_references("", "permission denied"));
+    }
+}

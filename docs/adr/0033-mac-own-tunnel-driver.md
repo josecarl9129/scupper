@@ -90,7 +90,8 @@ M5a establishes the tunnel driver and user-run setup first.
   enforcement when joined and rolls back on failure. The user agent is not a
   trusted privileged staging source.
 - wireguard-go uses `unsafe` internally; the no-unsafe rule covers scupper's
-  own code only.
+  own code only (amended by ADR [0034](0034-darwin-ffi-boundary.md):
+  Darwin FFI is confined to `scupper-darwin::sys`).
 
 ## Alternatives considered
 

@@ -2931,8 +2931,10 @@ anchor/no emergency loop, emergency refusal without reservation, and
 Recovery-creates-files wording; the rules below describe the current engine.
 
 `scupper-mac` owns the Mac integration; anchor rendering, observation parsers,
-and the verifier are pure in `scupper-core`. scupper's own code has no unsafe
-code; the pinned `wireguard-go` dependency uses unsafe internally. The helper
+and the verifier are pure in `scupper-core`. scupper's own code forbids unsafe
+code except in the private `sys` module of `scupper-darwin`, which provides a
+typed, owned Darwin FFI boundary (amended by ADR [0034](adr/0034-darwin-ffi-boundary.md)).
+The pinned `wireguard-go` dependency uses unsafe internally. The helper
 uses absolute paths to macOS system tools (`pfctl`, `ifconfig`, `ipconfig`,
 `route`, `scutil`, `launchctl`, `sudo`, `osascript`), typed validated inputs
 (including rejection of newline injection), bounded output and deadlines.

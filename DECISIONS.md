@@ -1274,3 +1274,22 @@ Carried to 5a2c/5a3 (DESIGN §14 has the native qualification rows):
   boot change or qualified [X]; unknown-boot acquisitions cannot use boot change.
   Anonymous enable persists independently. Qualify launchd respawn throttling
   after Exit0; shutdown/SIGTERM must not be treated as Leave.
+
+
+## 2026-11-20 — Confined Darwin FFI boundary
+
+Accept [ADR 0034](docs/adr/0034-darwin-ffi-boundary.md): first-party unsafe code
+is permitted only in the private `sys` module of `scupper-darwin`, behind typed,
+owned results and strict unsafe lints. Other crates retain `forbid(unsafe_code)`.
+Packed and variable-length data is decoded by safe portable code. SDK ABI
+observations, cross-target checking and native qualification are separate gates.
+
+## 2026-11-20 — Supported macOS releases and qualification venue
+
+Support and qualify macOS 15 and 26 on Apple Silicon using the pinned
+`macos-15` and `macos-26` GitHub runner labels. macOS 14 is unsupported; its
+GitHub runner image was retired on 2026-11-02. Never select `macos-latest` for
+qualification. Runner evidence applies only to the exact observed build and
+architecture; it does not automatically qualify another Mac. With the owner's
+consent and timing, later on-device qualification may collect a separate record
+under the dead-man restore, using inert test anchors for non-network groups.

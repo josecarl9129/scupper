@@ -434,11 +434,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "scupper-darwin"
+version = "0.1.4"
+dependencies = [
+ "libc",
+ "rustix",
+]
+
+[[package]]
 name = "scupper-mac"
 version = "0.1.4"
 dependencies = [
  "proptest",
+ "rustix",
  "scupper-core",
+ "scupper-darwin",
  "scupper-mac",
  "serde",
  "serde_json",

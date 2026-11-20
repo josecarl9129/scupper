@@ -8,6 +8,7 @@ publish.workspace = true
 
 [features]
 testing = []
+qualification = ["testing"]
 
 [dependencies]
 scupper-core.workspace = true
@@ -15,6 +16,10 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 sha2.workspace = true
+rustix.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+scupper-darwin = { version = "0.1.4", path = "../scupper-darwin" }
 
 [lints]
 workspace = true
@@ -23,3 +28,8 @@ workspace = true
 proptest.workspace = true
 # Unit tests exercise the fake boundary under the ordinary cargo test command.
 scupper-mac = { path = ".", features = ["testing"] }
+
+[[bin]]
+name = "scupper-mac-qual"
+path = "src/bin/scupper-mac-qual.rs"
+required-features = ["qualification"]

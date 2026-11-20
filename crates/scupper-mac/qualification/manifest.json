@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "cell_budget_minutes": 30,
+  "overhead_minutes": 12,
+  "cases": [
+    {
+      "id": "Q-SMOKE",
+      "group": "smoke",
+      "minimum_iterations": 1000,
+      "budget_minutes": 3,
+      "supported_assumptions": []
+    },
+    {
+      "id": "Q-CAPTURE",
+      "group": "smoke",
+      "minimum_iterations": 1,
+      "budget_minutes": 1,
+      "supported_assumptions": []
+    }
+  ]
+}

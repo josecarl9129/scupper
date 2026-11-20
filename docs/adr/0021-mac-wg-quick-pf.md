@@ -8,7 +8,7 @@ are specified by DESIGN §14.
 
 ## Context
 
-The Mac needs a tunnel, a kill switch while joined and auto-join on untrusted networks, preferably without FFI or unsafe code.
+The Mac needs a tunnel, a kill switch while joined and auto-join on untrusted networks, preferably without FFI or unsafe code (amended by ADR [0034](0034-darwin-ffi-boundary.md)).
 
 ## Decision
 
@@ -23,7 +23,7 @@ The minimal root helper drives its own pinned, supervised `wireguard-go -f` chil
 
 ## Consequences
 
-- Exec-based system integration and a bounded UAPI client; scupper has no unsafe code, while wireguard-go uses unsafe internally.
+- Exec-based system integration and a bounded UAPI client; the original rule that scupper has no unsafe code is amended by ADR [0034](0034-darwin-ffi-boundary.md), confining Darwin FFI to `scupper-darwin`; wireguard-go uses unsafe internally.
 - On qualified configurations, effective pf policy blocks traffic outside documented exceptions. Checks target 1 s/5 s while the helper runs, with no guaranteed maximum detection/recovery duration; transient changes or admitted states may escape detection. Stale observations yield `Unknown`; status shows the last full verification time. Boot before enforcement is unprotected; V-05 reports gap distributions, not a bound (DESIGN §14).
 - M5b moves routine admin to the tunnel API and makes public SSH an explicit,
   expiring break-glass switch. High-risk changes and deploy/rollback still use

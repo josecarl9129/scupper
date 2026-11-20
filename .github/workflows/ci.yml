@@ -20,8 +20,8 @@ env:
   CARGO_DENY_VERSION: "0.20.2"
 
 jobs:
-  # On lab/** branches only the leak lab and the no-feature build run; the full gate runs locally before every
-  # lab push and again in CI on main.
+  # Lab branches also run native qualification; the full gate runs locally
+  # before every lab push and again in CI on main.
   gate:
     name: fmt, clippy, test, doc, deny
     if: ${{ !startsWith(github.ref, 'refs/heads/lab/') }}
@@ -56,6 +56,11 @@ jobs:
 
       - name: Clippy
         run: timeout 600 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Darwin cross-target lint
+        run: |
+          rustup target add aarch64-apple-darwin
+          timeout 600 cargo clippy --target aarch64-apple-darwin -p scupper-darwin -p scupper-mac --all-targets --all-features --locked -- -D warnings
 
       - name: Test
         run: timeout 600 cargo test --workspace --all-features --locked
@@ -214,6 +219,89 @@ jobs:
           path: |
             dist/scupper-*-aarch64-apple-darwin.tar.gz
             dist/SHA256SUMS
+          retention-days: 14
+          if-no-files-found: error
+
+  macos-native:
+    if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/heads/lab/') || startsWith(github.head_ref, 'lab/') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-26]
+        group: [smoke]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 2
+      RUST_TEST_THREADS: 2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Cache cargo and native target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            target
+          key: native-${{ matrix.runner }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+      - name: Build qualification harness as runner user
+        timeout-minutes: 8
+        run: |
+          mkdir -p qual-out
+          rustc -Vv | tee qual-out/rustc.txt
+          env -u CARGO_TARGET_TMPDIR cargo build -p scupper-mac --bin scupper-mac-qual --features qualification --locked 2>&1 | tee qual-out/build.log
+      - name: Compile SDK ABI probe
+        timeout-minutes: 2
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -v crates/scupper-darwin/probe/abi.c -lproc -o qual-out/abi-probe 2>&1 | tee qual-out/abi-build.log
+          qual-out/abi-probe | tee qual-out/abi-sdk.json
+      - name: Preflight
+        timeout-minutes: 3
+        run: sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,ImageOS,ImageVersion,RUNNER_NAME,GITHUB_RUN_ID,GITHUB_SHA target/debug/scupper-mac-qual preflight --out qual-out --disposable-runner
+      - name: Arm independent launchd restore
+        timeout-minutes: 1
+        run: sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT target/debug/scupper-mac-qual arm --after 1080 --out qual-out --disposable-runner
+      - name: Run smoke qualification
+        timeout-minutes: 6
+        run: sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,ImageOS,ImageVersion,RUNNER_NAME,GITHUB_RUN_ID,GITHUB_SHA target/debug/scupper-mac-qual run --group ${{ matrix.group }} --out qual-out --disposable-runner
+      - name: Restore and stop dead-man
+        if: always()
+        timeout-minutes: 3
+        run: |
+          mkdir -p qual-out
+          restore_status=0
+          if [ -f qual-out/preflight.json ] && [ -x target/debug/scupper-mac-qual ]; then
+            sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT target/debug/scupper-mac-qual restore --out qual-out --disposable-runner || restore_status=$?
+          fi
+          # The bootstrap owns no network resources; restore is a checked no-op.
+          # Keep bootout diagnostics even when bootstrap never succeeded.
+          sudo launchctl print system/net.scupper.qual.restore > qual-out/deadman-final-status.log 2>&1 || true
+          sudo launchctl bootout system/net.scupper.qual.restore > qual-out/deadman-bootout.log 2>&1 || cat qual-out/deadman-bootout.log
+          if sudo launchctl print system/net.scupper.qual.restore > qual-out/deadman-after-bootout.log 2>&1; then
+            cat qual-out/deadman-after-bootout.log
+            restore_status=1
+          fi
+          sudo find qual-out -type d -exec chmod a+rx {} +
+          sudo find qual-out -type f -exec chmod a+r {} +
+          exit "$restore_status"
+      - name: Check artifact redaction
+        if: always()
+        run: sudo python3 crates/scupper-mac/qualification/check-artifacts.py qual-out
+      - name: Summarize verdicts
+        if: always()
+        env:
+          QUAL_RUNNER: ${{ matrix.runner }}
+          QUAL_GROUP: ${{ matrix.group }}
+        run: python3 crates/scupper-mac/qualification/check-artifacts.py qual-out --summary
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-native-${{ matrix.runner }}-${{ matrix.group }}
+          path: qual-out
           retention-days: 14
           if-no-files-found: error
 

@@ -4,8 +4,11 @@
 //! release of the Mac helper.
 #![forbid(unsafe_code)]
 
+pub mod decode;
 pub mod engine;
 pub mod platform;
+#[cfg(feature = "qualification")]
+pub mod qual;
 pub mod snapshot;
 
 pub use engine::{Completion, Engine, Mode, Outcome, QueueEvent, Request, RequestKind, Status};

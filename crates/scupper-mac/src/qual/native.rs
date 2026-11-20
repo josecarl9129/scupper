@@ -1,0 +1,735 @@
+use std::{
+    collections::BTreeMap,
+    error::Error,
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    thread,
+    time::{Duration, Instant},
+};
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+use super::{
+    CaseResult, Evidence, Manifest, Verdict,
+    command::{command, unix_seconds},
+    guard::{Ack, MAX_ARM_SECONDS, check_environment, preflight_conditions},
+    redact,
+};
+
+type Result<T> = std::result::Result<T, Box<dyn Error>>;
+const LABEL: &str = "net.scupper.qual.restore";
+const SERVICE: &str = "system/net.scupper.qual.restore";
+const TOOL_BUDGET: Duration = Duration::from_secs(8);
+
+struct Options {
+    action: String,
+    out: PathBuf,
+    group: String,
+    after: u64,
+    disposable: bool,
+}
+
+impl Options {
+    fn parse(args: &[String]) -> Result<Self> {
+        let mut args = args.iter();
+        let action = args.next().ok_or("usage: scupper-mac-qual <preflight|arm|run|restore|capture> --out DIR --disposable-runner")?.clone();
+        let mut options = Self {
+            action,
+            out: PathBuf::from("qual-out"),
+            group: "smoke".into(),
+            after: MAX_ARM_SECONDS,
+            disposable: false,
+        };
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--disposable-runner" => options.disposable = true,
+                "--out" => {
+                    options.out = PathBuf::from(args.next().ok_or("--out requires a directory")?);
+                }
+                "--group" => options
+                    .group
+                    .clone_from(args.next().ok_or("--group requires a value")?),
+                "--after" => {
+                    options.after = args.next().ok_or("--after requires seconds")?.parse()?;
+                }
+                _ => return Err(format!("unknown argument: {arg}").into()),
+            }
+        }
+        if !matches!(
+            options.action.as_str(),
+            "preflight" | "arm" | "run" | "restore" | "capture" | "deadman"
+        ) {
+            return Err("unknown subcommand".into());
+        }
+        if options.group != "smoke" || options.after == 0 || options.after > MAX_ARM_SECONDS {
+            return Err("only group smoke is implemented; --after must be 1..1080 seconds".into());
+        }
+        Ok(options)
+    }
+}
+
+pub(super) fn dispatch(args: &[String]) -> Result<()> {
+    let mut options = Options::parse(args)?;
+    check_environment(
+        &std::env::var("GITHUB_ACTIONS").unwrap_or_default(),
+        &std::env::var("RUNNER_ENVIRONMENT").unwrap_or_default(),
+        rustix::process::geteuid().is_root(),
+        options.disposable,
+    )?;
+    fs::create_dir_all(&options.out)?;
+    options.out = options.out.canonicalize()?;
+    match options.action.as_str() {
+        "preflight" => preflight(&options.out),
+        "arm" => arm(&options),
+        "run" => {
+            require_ack(&options.out)?;
+            let own = process_identity(&options.out, std::process::id())?;
+            write_json(
+                &options.out,
+                "writers.json",
+                &vec![Writer {
+                    pid: own.pid,
+                    start: own.start,
+                }],
+            )?;
+            let result = run_smoke(&options.out);
+            write_json(&options.out, "writers.json", &Vec::<Writer>::new())?;
+            result
+        }
+        "capture" => {
+            require_ack(&options.out)?;
+            capture(&options.out).map(|_| ())
+        }
+        "restore" => restore(&options.out, Instant::now() + Duration::from_secs(90)).map(|_| ()),
+        "deadman" => deadman(&options),
+        _ => Err("unknown subcommand".into()),
+    }
+}
+
+fn clean_value(value: &mut Value) {
+    match value {
+        Value::String(text) => *text = redact(text),
+        Value::Array(values) => values.iter_mut().for_each(clean_value),
+        Value::Object(values) => values.values_mut().for_each(clean_value),
+        _ => (),
+    }
+}
+
+fn write_json(out: &Path, name: &str, value: &impl Serialize) -> Result<()> {
+    let mut value = serde_json::to_value(value)?;
+    clean_value(&mut value);
+    let path = out.join(name);
+    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+    fs::write(&temp, serde_json::to_vec_pretty(&value)?)?;
+    fs::rename(temp, path)?;
+    Ok(())
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+    Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+
+fn unique(prefix: &str) -> String {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{prefix}-{}-{}-{}",
+        unix_seconds(),
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn invoke_before(program: &str, args: &[&str], deadline: Instant) -> Evidence {
+    command(
+        program,
+        args,
+        None,
+        TOOL_BUDGET.min(deadline.saturating_duration_since(Instant::now())),
+    )
+}
+
+fn invoke(program: &str, args: &[&str]) -> Evidence {
+    command(program, args, None, TOOL_BUDGET)
+}
+
+#[derive(Serialize, Deserialize)]
+struct Snapshot {
+    at: u64,
+    image: BTreeMap<String, String>,
+    observations: BTreeMap<String, Evidence>,
+    inconclusive: Vec<String>,
+}
+
+fn snapshot(out: &Path, phase: &str, deadline: Instant) -> Result<Snapshot> {
+    let mut observations = BTreeMap::new();
+    for (name, program, args) in [
+        ("pf-info", "/sbin/pfctl", vec!["-s", "info"]),
+        ("pf-references", "/sbin/pfctl", vec!["-s", "References"]),
+        ("pf-rules", "/sbin/pfctl", vec!["-sr"]),
+        ("pf-anchors", "/sbin/pfctl", vec!["-vv", "-sA"]),
+        (
+            "pf-apple-anchors",
+            "/sbin/pfctl",
+            vec!["-a", "com.apple", "-s", "Anchors"],
+        ),
+        ("pf-nat", "/sbin/pfctl", vec!["-s", "nat"]),
+        ("routes", "/usr/sbin/netstat", vec!["-rn"]),
+        ("interfaces", "/sbin/ifconfig", vec!["-a"]),
+        (
+            "osversion",
+            "/usr/sbin/sysctl",
+            vec!["-n", "kern.osversion"],
+        ),
+        ("kernel-uuid", "/usr/sbin/sysctl", vec!["-n", "kern.uuid"]),
+        ("machine", "/usr/sbin/sysctl", vec!["-n", "hw.machine"]),
+        (
+            "translated",
+            "/usr/sbin/sysctl",
+            vec!["-n", "sysctl.proc_translated"],
+        ),
+        ("sdk", "/usr/bin/xcrun", vec!["--show-sdk-version"]),
+        (
+            "tool-sha256",
+            "/usr/bin/shasum",
+            vec![
+                "-a",
+                "256",
+                "/sbin/pfctl",
+                "/usr/sbin/scutil",
+                "/sbin/route",
+                "/sbin/ifconfig",
+            ],
+        ),
+    ] {
+        let evidence = invoke_before(program, &args, deadline);
+        write_json(out, &format!("{phase}-{name}.json"), &evidence)?;
+        observations.insert(name.into(), evidence);
+    }
+    let binary = std::env::current_exe()?;
+    observations.insert(
+        "binary-arch".into(),
+        invoke_before(
+            "/usr/bin/lipo",
+            &["-archs", binary.to_str().ok_or("non-UTF8 executable path")?],
+            deadline,
+        ),
+    );
+    observations.insert(
+        "scutil-keys".into(),
+        command(
+            "/usr/sbin/scutil",
+            &[],
+            Some("list\nquit\n"),
+            TOOL_BUDGET.min(deadline.saturating_duration_since(Instant::now())),
+        ),
+    );
+    for name in ["binary-arch", "scutil-keys"] {
+        write_json(out, &format!("{phase}-{name}.json"), &observations[name])?;
+    }
+    let inconclusive = preflight_conditions(&observations, cfg!(target_arch = "aarch64"));
+    let image = [
+        "ImageOS",
+        "ImageVersion",
+        "RUNNER_NAME",
+        "GITHUB_RUN_ID",
+        "GITHUB_SHA",
+    ]
+    .into_iter()
+    .map(|key| (key.into(), std::env::var(key).unwrap_or_default()))
+    .collect();
+    Ok(Snapshot {
+        at: unix_seconds(),
+        image,
+        observations,
+        inconclusive,
+    })
+}
+
+fn preflight(out: &Path) -> Result<()> {
+    if out.join("preflight.json").exists() {
+        return Err(
+            "preflight already exists; use a new artifact directory for a new campaign".into(),
+        );
+    }
+    let snapshot = snapshot(out, "preflight", Instant::now() + Duration::from_secs(90))?;
+    write_json(out, "preflight.json", &snapshot)?;
+    write_json(out, "writers.json", &Vec::<Writer>::new())?;
+    write_json(out, "manifest.json", &Manifest::bundled()?)?;
+    if !snapshot.inconclusive.is_empty() {
+        eprintln!(
+            "inconclusive preflight: {}",
+            snapshot.inconclusive.join("; ")
+        );
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct ProcessIdentity {
+    pid: u32,
+    ppid: u32,
+    pgid: u32,
+    start: String,
+}
+
+fn lookup_identity(out: &Path, pid: u32) -> Result<Option<ProcessIdentity>> {
+    let probe = out.join("abi-probe");
+    let evidence = invoke(
+        probe.to_str().ok_or("non-UTF8 probe path")?,
+        &["--process-identity", &pid.to_string()],
+    );
+    // Preserve each lookup, including failed or short kernel reads.
+    write_json(
+        out,
+        &format!("{}.json", unique(&format!("identity-{pid}"))),
+        &evidence,
+    )?;
+    if evidence.exit_code == Some(3) && !evidence.timed_out && !evidence.truncated {
+        let error: Value = serde_json::from_str(&evidence.stdout)?;
+        if error["error"].as_i64() == Some(i64::from(rustix::io::Errno::SRCH.raw_os_error())) {
+            return Ok(None);
+        }
+    }
+    if !evidence.complete() {
+        return Err(format!(
+            "cannot establish microsecond process identity for pid {pid}; see identity evidence"
+        )
+        .into());
+    }
+    let identity: ProcessIdentity = serde_json::from_str(&evidence.stdout)?;
+    if identity.pid != pid || identity.start.is_empty() {
+        return Err("process identity probe returned a mismatched or empty identity".into());
+    }
+    Ok(Some(identity))
+}
+
+fn process_identity(out: &Path, pid: u32) -> Result<ProcessIdentity> {
+    lookup_identity(out, pid)?.ok_or_else(|| format!("process {pid} is absent").into())
+}
+
+fn require_ack(out: &Path) -> Result<Ack> {
+    let ack: Ack = read_json(&out.join("ack.json"))
+        .map_err(|error| format!("fresh dead-man acknowledgement required: {error}"))?;
+    let boot = scupper_darwin::sysctl_string("kern.bootsessionuuid")?;
+    if !ack.fresh(unix_seconds(), &boot) || process_identity(out, ack.pid)?.start != ack.start {
+        return Err(
+            "dead-man acknowledgement is stale, expired or has a different process/boot identity"
+                .into(),
+        );
+    }
+    if process_identity(out, std::process::id())?.pgid == ack.pgid {
+        return Err("dead-man shares the controller process group".into());
+    }
+    let job = invoke("/bin/launchctl", &["print", SERVICE]);
+    write_json(out, "deadman-status.json", &job)?;
+    if !job.complete()
+        || !job
+            .stdout
+            .lines()
+            .any(|line| line.trim() == format!("pid = {}", ack.pid))
+    {
+        return Err("acknowledged dead-man pid is not the running launchd service".into());
+    }
+    Ok(ack)
+}
+
+fn xml(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn arm(options: &Options) -> Result<()> {
+    let _: Snapshot = read_json(&options.out.join("preflight.json"))?;
+    if options.out.join("ack.json").exists() {
+        return Err("dead-man already armed; use a fresh campaign directory".into());
+    }
+    let exe = xml(std::env::current_exe()?
+        .to_str()
+        .ok_or("non-UTF8 executable path")?);
+    let out = xml(options.out.to_str().ok_or("non-UTF8 artifact path")?);
+    // launchd starts the worker independently of the controller's process group.
+    // RunAtLoad, no KeepAlive: a successful restore must not restart it.
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>{LABEL}</string>
+<key>ProgramArguments</key><array><string>{exe}</string><string>deadman</string><string>--after</string><string>{after}</string><string>--out</string><string>{out}</string><string>--disposable-runner</string></array>
+<key>RunAtLoad</key><true/>
+<key>AbandonProcessGroup</key><false/>
+<key>EnvironmentVariables</key><dict><key>GITHUB_ACTIONS</key><string>true</string><key>RUNNER_ENVIRONMENT</key><string>github-hosted</string></dict>
+<key>StandardOutPath</key><string>{out}/deadman.stdout.log</string>
+<key>StandardErrorPath</key><string>{out}/deadman.stderr.log</string>
+</dict></plist>
+"#,
+        after = options.after
+    );
+    let path = options.out.join("restore.plist");
+    fs::write(&path, plist)?;
+    let bootstrap = invoke(
+        "/bin/launchctl",
+        &[
+            "bootstrap",
+            "system",
+            path.to_str().ok_or("non-UTF8 plist path")?,
+        ],
+    );
+    write_json(&options.out, "deadman-bootstrap.json", &bootstrap)?;
+    if !bootstrap.complete() {
+        arm_diagnostics(&options.out)?;
+        return Err(
+            "launchctl bootstrap failed; see deadman-bootstrap.json and deadman diagnostics".into(),
+        );
+    }
+    let wait = Instant::now();
+    while wait.elapsed() < Duration::from_secs(10) {
+        if options.out.join("ack.json").exists() {
+            require_ack(&options.out)?;
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    arm_diagnostics(&options.out)?;
+    Err("launchd dead-man did not acknowledge within 10 seconds; see worker logs and bootstrap evidence".into())
+}
+
+fn arm_diagnostics(out: &Path) -> Result<()> {
+    write_json(
+        out,
+        "deadman-failed-status.json",
+        &invoke("/bin/launchctl", &["print", SERVICE]),
+    )?;
+    let plist = out.join("restore.plist");
+    write_json(
+        out,
+        "deadman-plist-lint.json",
+        &invoke(
+            "/usr/bin/plutil",
+            &["-lint", plist.to_str().ok_or("non-UTF8 plist path")?],
+        ),
+    )?;
+    write_json(
+        out,
+        "deadman-launchd-log.json",
+        &invoke(
+            "/usr/bin/log",
+            &[
+                "show",
+                "--style",
+                "compact",
+                "--last",
+                "2m",
+                "--predicate",
+                r#"process == "launchd" AND eventMessage CONTAINS "net.scupper.qual.restore""#,
+            ],
+        ),
+    )
+}
+
+fn deadman(options: &Options) -> Result<()> {
+    let identity = process_identity(&options.out, std::process::id())?;
+    if identity.ppid != 1 || identity.pgid != identity.pid {
+        return Err("dead-man must be a launchd child and process group leader".into());
+    }
+    let armed_at = unix_seconds();
+    let ack = Ack {
+        pid: std::process::id(),
+        start: identity.start,
+        pgid: identity.pgid,
+        ppid: identity.ppid,
+        armed_at,
+        fire_at: armed_at + options.after,
+        boot_session: scupper_darwin::sysctl_string("kern.bootsessionuuid")?,
+    };
+    // Acknowledgement is written by the running launchd worker, never by arm.
+    write_json(&options.out, "ack.json", &ack)?;
+    let deadline = Instant::now() + Duration::from_secs(options.after);
+    while Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(100));
+    }
+    restore(&options.out, Instant::now() + Duration::from_secs(90)).map(|_| ())
+}
+
+#[derive(Serialize, Deserialize)]
+struct Writer {
+    pid: u32,
+    start: String,
+}
+
+fn stop_writers(out: &Path) -> Result<Vec<Evidence>> {
+    let writers: Vec<Writer> = read_json(&out.join("writers.json"))?;
+    let mut stopped = Vec::new();
+    for writer in writers {
+        // An in-process smoke restore excludes its own controller. An external
+        // restore/dead-man stops that controller before inspecting post-state.
+        if writer.pid == std::process::id() {
+            continue;
+        }
+        let Some(identity) = lookup_identity(out, writer.pid)? else {
+            continue;
+        };
+        if identity.start != writer.start {
+            continue;
+        }
+        let kill = invoke("/bin/kill", &["-KILL", &writer.pid.to_string()]);
+        let complete = kill.complete();
+        stopped.push(kill);
+        write_json(out, "writer-stop.json", &stopped)?;
+        let wait = Instant::now();
+        loop {
+            if lookup_identity(out, writer.pid)?.is_none_or(|live| live.start != writer.start) {
+                break;
+            }
+            if wait.elapsed() >= Duration::from_secs(2) {
+                return Err(
+                    "matching harness writer survived stop deadline; see writer-stop.json".into(),
+                );
+            }
+            if !complete {
+                return Err(
+                    "failed to stop a matching harness writer; see writer-stop.json".into(),
+                );
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    Ok(stopped)
+}
+
+#[derive(Serialize, Deserialize)]
+struct Restore {
+    already_restored: bool,
+    network_mutations: Vec<String>,
+    writer_stop_evidence: Vec<Evidence>,
+    changed_observations: Vec<String>,
+    post_state: Snapshot,
+}
+
+fn restore(out: &Path, deadline: Instant) -> Result<Restore> {
+    let before: Snapshot = read_json(&out.join("preflight.json"))?;
+    let stopped = stop_writers(out)?;
+    // No pf flush/enable/disable, route deletion or DNS removal is appropriate
+    // here: the bootstrap owns none of those resources, even if foreign state drifted.
+    let post = snapshot(out, &unique("post"), deadline)?;
+    let changed = before
+        .observations
+        .iter()
+        .filter_map(|(name, old)| {
+            post.observations
+                .get(name)
+                .filter(|new| {
+                    old.stdout != new.stdout
+                        || old.stderr != new.stderr
+                        || old.exit_code != new.exit_code
+                })
+                .map(|_| name.clone())
+        })
+        .collect();
+    let result = Restore {
+        already_restored: out.join("restored.json").exists(),
+        network_mutations: Vec::new(),
+        writer_stop_evidence: stopped,
+        changed_observations: changed,
+        post_state: post,
+    };
+    write_json(out, &format!("{}.json", unique("restore")), &result)?;
+    write_json(out, "restored.json", &result)?;
+    Ok(result)
+}
+
+fn save_case(out: &Path, result: &CaseResult) -> Result<()> {
+    write_json(out, &format!("{}.json", result.case), result)?;
+    eprintln!(
+        "{}: {:?}: {}",
+        result.case,
+        result.verdict,
+        redact(&result.detail)
+    );
+    Ok(())
+}
+
+fn capture(out: &Path) -> Result<CaseResult> {
+    let snapshot = snapshot(
+        out,
+        &unique("capture"),
+        Instant::now() + Duration::from_secs(60),
+    )?;
+    let verdict = if snapshot.inconclusive.is_empty() {
+        Verdict::AssumptionHolds
+    } else {
+        Verdict::Inconclusive
+    };
+    write_json(out, "capture.json", &snapshot)?;
+    let result = CaseResult {
+        case: "Q-CAPTURE".into(),
+        verdict,
+        iterations: 1,
+        detail: if snapshot.inconclusive.is_empty() {
+            "raw text inventory and system-tool SHA256s captured".into()
+        } else {
+            snapshot.inconclusive.join("; ")
+        },
+        evidence: snapshot.observations.into_values().collect(),
+    };
+    save_case(out, &result)?;
+    Ok(result)
+}
+
+fn valid_uuid(text: &str) -> bool {
+    text.len() == 36
+        && text.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+fn run_smoke(out: &Path) -> Result<()> {
+    let manifest = Manifest::bundled()?;
+    if !manifest.budgets_fit() {
+        return Err("manifest exceeds harness budget".into());
+    }
+    let baseline: Snapshot = read_json(&out.join("preflight.json"))?;
+    let started = Instant::now();
+    let mut result = CaseResult {
+        case: "Q-SMOKE".into(), verdict: Verdict::AssumptionHolds, iterations: 0,
+        detail: "ABI layout evidence, guard refusal, independent dead-man ack, restore idempotence and 1000 stable boot UUID reads; no native assumptions promoted".into(),
+        evidence: Vec::new(),
+    };
+    let smoke = smoke_checks(out, &mut result, started);
+    if let Err(error) = smoke {
+        result.verdict = Verdict::ContractViolation;
+        result.detail = error.to_string();
+    } else if !baseline.inconclusive.is_empty() {
+        result.verdict = Verdict::Inconclusive;
+        result.detail = baseline.inconclusive.join("; ");
+    }
+    save_case(out, &result)?;
+    let captured = capture(out)?;
+    write_json(out, "verdicts.json", &json!([&result, &captured]))?;
+    if result.verdict == Verdict::ContractViolation {
+        return Err("Q-SMOKE contract violation; see case evidence".into());
+    }
+    Ok(())
+}
+
+fn smoke_checks(out: &Path, result: &mut CaseResult, started: Instant) -> Result<()> {
+    let probe = out.join("abi-probe");
+    let abi = invoke(probe.to_str().ok_or("non-UTF8 probe path")?, &[]);
+    let complete = abi.complete();
+    let parsed = serde_json::from_str::<Value>(&abi.stdout);
+    result.evidence.push(abi);
+    if !complete {
+        return Err("SDK ABI probe failed; see command evidence".into());
+    }
+    let abi = parsed?;
+    for name in [
+        "kinfo_proc",
+        "proc_bsdinfo",
+        "proc_fdinfo",
+        "socket_fdinfo",
+        "rt_msghdr2",
+        "kern_ctl_info",
+        "vnode_info_path",
+    ] {
+        if abi[name]["size"].as_u64().is_none_or(|size| size == 0)
+            || !abi[name]["fields"].is_object()
+        {
+            return Err(format!("ABI probe missing size/fields for {name}").into());
+        }
+    }
+    write_json(out, "abi.json", &abi)?;
+    let exe = std::env::current_exe()?;
+    let refused = invoke(
+        exe.to_str().ok_or("non-UTF8 executable path")?,
+        &[
+            "preflight",
+            "--out",
+            out.to_str().ok_or("non-UTF8 artifact path")?,
+        ],
+    );
+    let guard_works = refused.exit_code == Some(1)
+        && refused.stderr.contains("--disposable-runner")
+        && !refused.timed_out
+        && !refused.truncated;
+    result.evidence.push(refused);
+    if !guard_works {
+        return Err(
+            "missing --disposable-runner did not produce the required guard refusal".into(),
+        );
+    }
+    let ack = require_ack(out)?;
+    write_json(out, "smoke-ack.json", &ack)?;
+    let deadline = started + Duration::from_secs(180);
+    let first = restore(out, deadline)?;
+    write_json(out, "smoke-restore-first.json", &first)?;
+    let second = restore(out, deadline)?;
+    write_json(out, "smoke-restore-second.json", &second)?;
+    if !second.already_restored
+        || !first.network_mutations.is_empty()
+        || !second.network_mutations.is_empty()
+    {
+        return Err("the bootstrap restoration was not an idempotent network no-op".into());
+    }
+    if !first.post_state.inconclusive.is_empty() || !second.post_state.inconclusive.is_empty() {
+        result.verdict = Verdict::Inconclusive;
+        result.detail = format!(
+            "restore observation incomplete: first={:?}; second={:?}",
+            first.post_state.inconclusive, second.post_state.inconclusive
+        );
+    }
+    boot_reads(out, result, started)
+}
+
+fn boot_reads(out: &Path, result: &mut CaseResult, started: Instant) -> Result<()> {
+    let boot = scupper_darwin::sysctl_string("kern.bootsessionuuid")?;
+    if !valid_uuid(&boot) {
+        return Err("kern.bootsessionuuid is not a valid UUID".into());
+    }
+    let mut reads = Vec::with_capacity(1000);
+    let mut journal = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(out.join("boot-reads.jsonl"))?;
+    for iteration in 0..1000 {
+        if started.elapsed() >= Duration::from_secs(180) {
+            return Err("Q-SMOKE exceeded its three-minute case deadline".into());
+        }
+        writeln!(
+            journal,
+            "{}",
+            json!({"iteration": iteration, "event": "started", "elapsed_ms": started.elapsed().as_millis()})
+        )?;
+        let value = scupper_darwin::sysctl_string("kern.bootsessionuuid");
+        let observation = json!({"iteration": iteration, "elapsed_ms": started.elapsed().as_millis(), "result": value.as_ref().map(String::as_str).map_err(ToString::to_string)});
+        writeln!(journal, "{observation}")?;
+        reads.push(observation);
+        if value? != boot {
+            return Err("boot-session UUID changed within the smoke case".into());
+        }
+        result.iterations += 1;
+    }
+    write_json(out, "boot-reads.json", &reads)?;
+    write_json(
+        out,
+        "sysctl-strings.json",
+        &json!({
+            "kern.bootsessionuuid": boot,
+            "kern.osversion": scupper_darwin::sysctl_string("kern.osversion").map_err(|error| error.to_string()),
+            "kern.uuid": scupper_darwin::sysctl_string("kern.uuid").map_err(|error| error.to_string()),
+            "hw.machine": scupper_darwin::sysctl_string("hw.machine").map_err(|error| error.to_string()),
+            // This OID is an integer, not a string: its raw command result (and
+            // expected ENOENT on native arm64) lives in preflight/capture.
+            "sysctl.proc_translated": "see preflight.json and capture.json"
+        }),
+    )?;
+    Ok(())
+}
