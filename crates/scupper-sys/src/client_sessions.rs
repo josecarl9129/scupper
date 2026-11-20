@@ -2903,7 +2903,10 @@ mod tests {
             }
         }
         fn up(&self) {
-            before_up(
+            self.up_until(Instant::now() + SAMPLE_INTERVAL);
+        }
+        fn up_until(&self, deadline: Instant) {
+            before_up_until(
                 &self.sys,
                 &self.held,
                 "wg0",
@@ -2912,6 +2915,8 @@ mod tests {
                 ID,
                 true,
                 &self.guard,
+                deadline,
+                false,
             )
             .unwrap();
         }
@@ -5101,14 +5106,15 @@ mod tests {
     #[test]
     fn stalled_tracking_never_ages_into_ready_even_with_recovered_counters() {
         let rig = Rig::new();
-        rig.up();
+        // This test advances the sample clock, not the lifecycle I/O deadline.
+        rig.up_until(Instant::now() + Duration::from_secs(30));
         rig.authenticate();
         rig.sys.now.set(1016);
         assert!(!rig.status().unknown, "15 seconds is within cadence slack");
         for now in [1017, 1300, 5000] {
             rig.sys.now.set(now);
             assert!(rig.status().unknown);
-            rig.up();
+            rig.up_until(Instant::now() + Duration::from_secs(30));
             assert!(rig.status().unknown);
         }
         rig.checkpoint();

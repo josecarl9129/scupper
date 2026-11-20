@@ -55,13 +55,13 @@ fn records(dir: &TempDir) -> Vec<Event> {
         .collect::<io::Result<Vec<_>>>()
         .unwrap()
 }
-fn wait_for(mut condition: impl FnMut() -> bool) {
+fn wait_for(condition: impl FnMut() -> bool) {
+    wait_for_with_timeout(condition, Duration::from_secs(5));
+}
+fn wait_for_with_timeout(mut condition: impl FnMut() -> bool, timeout: Duration) {
     let start = Instant::now();
     while !condition() {
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "condition timed out"
-        );
+        assert!(start.elapsed() < timeout, "condition timed out");
         thread::sleep(Duration::from_millis(1));
     }
 }
@@ -799,10 +799,15 @@ fn checkpoints_wait_for_a_hundred_records_unless_explicitly_flushed() {
     for _ in 0..99 {
         emit(&handle);
     }
-    wait_for(|| handle.committed_seq() == 99);
+    // Writer scheduling and fsync latency are not part of the checkpoint policy.
+    let timeout = Duration::from_secs(30);
+    wait_for_with_timeout(|| handle.committed_seq() == 99, timeout);
     assert_eq!(fs::read_to_string(dir.0.join("events/seq")).unwrap(), "0\n");
     emit(&handle);
-    wait_for(|| fs::read_to_string(dir.0.join("events/seq")).is_ok_and(|text| text == "100\n"));
+    wait_for_with_timeout(
+        || fs::read_to_string(dir.0.join("events/seq")).is_ok_and(|text| text == "100\n"),
+        timeout,
+    );
     drop(log);
 }
 

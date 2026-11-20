@@ -2830,9 +2830,12 @@ checks used only to flush a pending recovery do not increment its count. Other
 consecutive zeros emit nothing. Tracking is per daemon process: `DaemonStarted`
 is the boundary, and failures spanning a restart do not promise a recovery event
 unless observed again after restart. The action describes only the emitting
-observation; intervening actions can differ. A log-class event waits for the
-delivery worker to report the first attempted request class, so the `/log` to
-`/3` fallback records `Status`, not `Log`. Preparation failure or timeout before
+observation; intervening actions can differ. `Log` decisions record the class
+actually attempted, or `Withheld` if nothing was attempted, while `Status` and
+`Success` record the class decided even when preparation fails and nothing is
+sent. A log-class event waits for the delivery worker to report the first
+attempted request class, so the `/log` to `/3` fallback records `Status`, not
+`Log`. Preparation failure or timeout before
 an attempt records `Withheld`. This wait preserves heartbeat-event order without
 holding protection-verdict events. `Withheld` includes alerts-only
 checks with no heartbeat configured, delivery already running, and verdicts that

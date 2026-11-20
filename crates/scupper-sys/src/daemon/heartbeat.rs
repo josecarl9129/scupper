@@ -90,6 +90,8 @@ pub(super) struct Heartbeat {
     sending: Option<Receiver<Result<Delivered, Failure>>>,
     // Hold a log-class event until the worker resolves the actual request class.
     pending_log_action: Option<Receiver<HeartbeatAction>>,
+    #[cfg(all(test, feature = "testing"))]
+    worker_identity: Option<crate::probe_child::ProbeIdentity>,
     sending_deadline: Option<Instant>,
     last_send: Option<Instant>,
     workers: Vec<std::thread::JoinHandle<()>>,
@@ -398,7 +400,7 @@ impl Heartbeat {
             Err(mpsc::TryRecvError::Empty) => None,
         }
     }
-    fn collect_log_action(&mut self, finished: bool) {
+    pub(super) fn collect_log_action(&mut self, finished: bool) {
         let Some(receive) = &self.pending_log_action else {
             return;
         };
@@ -695,16 +697,24 @@ impl Runtime<'_> {
         let (send, receive) = mpsc::sync_channel(1);
         self.heartbeat.sending = Some(receive);
         let mut action_send = self.heartbeat.track_log_action(&suffix);
+        #[cfg(all(test, feature = "testing"))]
+        let worker_identity = self.heartbeat.worker_identity;
         let result = std::thread::Builder::new()
             .name("scupper-heartbeat-wait".into())
             .spawn(move || {
                 let result = heartbeat::retry_deadline(deadline_ns, || {
                     let url = heartbeat::resolve(&config_root, &reference, &suffix, owner)?;
-                    let passwd =
-                        std::fs::read_to_string("/etc/passwd").map_err(|_| Failure::Account)?;
-                    let group =
-                        std::fs::read_to_string("/etc/group").map_err(|_| Failure::Account)?;
-                    let identity = heartbeat::account(&passwd, &group)?;
+                    let identity = || {
+                        let passwd =
+                            std::fs::read_to_string("/etc/passwd").map_err(|_| Failure::Account)?;
+                        let group =
+                            std::fs::read_to_string("/etc/group").map_err(|_| Failure::Account)?;
+                        heartbeat::account(&passwd, &group)
+                    };
+                    #[cfg(all(test, feature = "testing"))]
+                    let identity = worker_identity.map_or_else(identity, Ok)?;
+                    #[cfg(not(all(test, feature = "testing")))]
+                    let identity = identity()?;
                     let (request, action) = resolved_request(&url, deadline_ns)?;
                     #[cfg(feature = "testing")]
                     let request = {
@@ -1787,6 +1797,305 @@ mod tests {
         queue(state, now, code, true);
         let checked = state.checked().unwrap();
         state.record_check(now, &checked, HeartbeatAction::Withheld);
+    }
+
+    #[test]
+    fn healthy_tail_always_leaves_a_recovery_after_random_check_sequences() {
+        let origin = Instant::now();
+        let mut seed = 0x6a09_e667_f3bc_c909_u64;
+        for sequence in 0..1024 {
+            let mut state = Heartbeat::default();
+            // Include a failure in every sequence so the property is non-vacuous.
+            record_at(&mut state, origin, 0, 3);
+            for step in 1..=360 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                record_at(
+                    &mut state,
+                    origin,
+                    step * 10,
+                    [0, 3, 4][(seed % 3) as usize],
+                );
+            }
+            for step in 361..=423 {
+                record_at(&mut state, origin, step * 10, 0);
+            }
+            assert!(
+                matches!(
+                    state.verdict_events.last(),
+                    Some(EventKind::HeartbeatCheckRecovered { .. })
+                ),
+                "sequence {sequence} ended on a failure after 620 seconds of health"
+            );
+        }
+    }
+
+    #[cfg(feature = "testing")]
+    fn audit_options(label: &str) -> super::super::Options {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/tmp")
+            .join(format!("heartbeat-{label}-{}", std::process::id()));
+        for child in ["state", "config", "run"] {
+            std::fs::create_dir_all(root.join(child)).unwrap();
+        }
+        super::super::Options {
+            state_root: root.join("state"),
+            config_root: root.join("config"),
+            run_root: root.join("run"),
+            probe_binary: root.join("missing-probe"),
+        }
+    }
+
+    #[cfg(feature = "testing")]
+    fn audit_runtime<'a>(
+        options: &'a super::super::Options,
+        system: &'a RealSystem,
+    ) -> Runtime<'a> {
+        use super::super::{Config, EventLog, Reconciler, StateFile, testing};
+        use scupper_core::{
+            config::{GatewayId, parse_site, validate},
+            render::VersionStamp,
+            verdict::v2::{HealthConfigV2, NetnsIdentity},
+        };
+        let deps = BootDeps {
+            system,
+            namespace: &GatewayNamespace,
+            state_root: &options.state_root,
+            config_root: &options.config_root,
+            run_root: &options.run_root,
+            hook: None,
+            secret_owner: rustix::process::geteuid().as_raw(),
+        };
+        let mut runtime = testing::runtime_shell(deps, options).unwrap();
+        runtime.audit.opened = EventLog::open(&options.state_root, GatewayId("gw1".into()), || {
+            scupper_proto::UnixSeconds(1)
+        })
+        .unwrap();
+        let config = || Config {
+            site: validate(
+                parse_site(include_str!(
+                    "../../../scupper-core/tests/fixtures/site-m2.toml"
+                ))
+                .unwrap(),
+            )
+            .unwrap(),
+            gateway: GatewayId("gw1".into()),
+            stamp: VersionStamp {
+                version: 7,
+                sha256: [0; 32],
+            },
+            fingerprint: [7; 32],
+            run_root: options.run_root.clone(),
+            lock_wait: Duration::ZERO,
+        };
+        let cfg = config();
+        let held = std::sync::Arc::new(crate::netns::testing::handle().unwrap());
+        let (device, inode) = held.identity();
+        let health = HealthConfigV2::new(
+            &cfg.site,
+            &cfg.gateway,
+            NetnsIdentity { device, inode },
+            vec!["203.0.113.1".parse().unwrap()],
+            7,
+        )
+        .unwrap();
+        let kernel = crate::reconcile::RealKernel::new(
+            deps,
+            held.clone(),
+            &cfg,
+            health,
+            options.run_root.join("netns"),
+            None,
+        )
+        .unwrap();
+        let clock: Box<dyn Fn() -> (MonoTime, u64)> = Box::new(|| (MonoTime(Duration::ZERO), 1));
+        let machine = Reconciler::with_state(
+            kernel,
+            StateFile::open(&options.state_root, None).unwrap(),
+            runtime.audit.handle(),
+            config(),
+            held.clone(),
+            clock,
+            crate::state::State {
+                applied_version: Some(7),
+                ..crate::state::State::default()
+            },
+        )
+        .unwrap();
+        runtime.running = Some((machine, held, cfg));
+        runtime
+    }
+
+    #[cfg(feature = "testing")]
+    fn assert_shutdown_pending_log_action(reported: bool) {
+        use super::super::DaemonDeps;
+        let options = audit_options(if reported {
+            "shutdown-status"
+        } else {
+            "shutdown-withheld"
+        });
+        let system = RealSystem::default();
+        let mut runtime = audit_runtime(&options, &system);
+        let now = Instant::now();
+        queue_reset(&mut runtime.heartbeat, now);
+        runtime
+            .heartbeat
+            .iteration(now, now, true, Some(context(&settings("status_code", 10))));
+        let sender = runtime.heartbeat.track_log_action("/log").unwrap();
+        record_at(&mut runtime.heartbeat, now, 10, 0);
+        record_at(&mut runtime.heartbeat, now, 20, 4);
+        runtime
+            .heartbeat
+            .record_verdict(2, scupper_proto::ObjectKind::Ruleset);
+        runtime
+            .heartbeat
+            .report_events(&runtime.audit.handle(), Some(7));
+        runtime
+            .audit
+            .handle()
+            .flush_blocking(Duration::from_secs(30))
+            .unwrap();
+        let persisted = || {
+            crate::events::read_since(&options.state_root, 0, None)
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+        };
+        let before = persisted();
+        assert!(
+            before
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::CheckVerdictChanged { .. }))
+        );
+        assert!(!before.iter().any(|event| matches!(
+            event.kind,
+            EventKind::HeartbeatCheckVerdict { .. } | EventKind::HeartbeatCheckRecovered { .. }
+        )));
+        if reported {
+            sender.send(HeartbeatAction::Status).unwrap();
+        }
+        // Keep the sender alive: shutdown must resolve even an unreported action.
+        runtime.shutdown();
+        assert!(runtime.heartbeat.pending_log_action.is_none());
+        let events: Vec<_> = persisted()
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    EventKind::HeartbeatCheckVerdict { .. }
+                        | EventKind::HeartbeatCheckRecovered { .. }
+                )
+            })
+            .collect();
+        assert_eq!(events.len(), 3);
+        let expected = if reported {
+            HeartbeatAction::Status
+        } else {
+            HeartbeatAction::Withheld
+        };
+        assert!(
+            matches!(events[0].kind, EventKind::HeartbeatCheckVerdict { code: 3, action, .. } if action == expected)
+        );
+        assert!(matches!(
+            events[1].kind,
+            EventKind::HeartbeatCheckRecovered { .. }
+        ));
+        assert!(matches!(
+            events[2].kind,
+            EventKind::HeartbeatCheckVerdict { code: 4, .. }
+        ));
+        assert!(events.iter().all(|event| event.config_version == Some(7)));
+        drop(sender);
+        drop(runtime);
+        std::fs::remove_dir_all(options.state_root.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "testing")]
+    fn shutdown_flushes_unreported_log_action_as_withheld_in_check_order() {
+        assert_shutdown_pending_log_action(false);
+    }
+
+    #[test]
+    #[cfg(feature = "testing")]
+    fn shutdown_flushes_reported_log_action_as_status_in_check_order() {
+        assert_shutdown_pending_log_action(true);
+    }
+
+    #[test]
+    #[cfg(feature = "testing")]
+    fn launch_heartbeat_worker_reports_log_and_status_fallback_to_audit() {
+        use super::super::DaemonDeps;
+        use scupper_core::config::{SecretKind, SecretName};
+        use std::os::unix::fs::PermissionsExt;
+        let options = audit_options("worker-action");
+        std::fs::create_dir_all(options.config_root.join("secrets/url")).unwrap();
+        for path in ["", "secrets", "secrets/url"] {
+            std::fs::set_permissions(
+                options.config_root.join(path),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+        }
+        let system = RealSystem::default();
+        for target_len in [2044, 2045, 2046] {
+            let path = options.config_root.join("secrets/url/test");
+            let target = format!("/{}?q=x", "x".repeat(target_len - 5));
+            std::fs::write(&path, format!("https://fixture.invalid{target}")).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let mut runtime = audit_runtime(&options, &system);
+            // Only account lookup is injected; request resolution and the action
+            // channel run in the real worker. The absent binary prevents network I/O.
+            runtime.heartbeat.worker_identity = Some(crate::probe_child::ProbeIdentity {
+                uid: 65534,
+                gid: 65534,
+            });
+            let now = Instant::now();
+            queue_reset(&mut runtime.heartbeat, now);
+            runtime.heartbeat.iteration(
+                now,
+                now,
+                true,
+                Some(context(&settings("status_code", 10))),
+            );
+            runtime.launch_heartbeat(
+                SecretName::new(SecretKind::Url, "test").unwrap(),
+                "/log".into(),
+                now + Duration::from_secs(30),
+            );
+            assert!(matches!(
+                runtime
+                    .heartbeat
+                    .sending
+                    .take()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(30))
+                    .unwrap(),
+                Err(Failure::Exec)
+            ));
+            // Receive the completion before shutdown so this checks the worker's
+            // report even when its send attempt fails.
+            runtime.heartbeat.collect_log_action(true);
+            runtime
+                .heartbeat
+                .report_events(&runtime.audit.handle(), Some(7));
+            runtime.shutdown();
+            let events: Vec<_> = crate::events::read_since(&options.state_root, 0, None)
+                .map(Result::unwrap)
+                .filter(|event| matches!(event.kind, EventKind::HeartbeatCheckVerdict { .. }))
+                .collect();
+            let expected = if target_len == 2044 {
+                HeartbeatAction::Log
+            } else {
+                HeartbeatAction::Status
+            };
+            assert!(
+                matches!(events.last().unwrap().kind, EventKind::HeartbeatCheckVerdict { action, .. } if action == expected),
+                "target length {target_len}"
+            );
+            drop(runtime);
+        }
+        std::fs::remove_dir_all(options.state_root.parent().unwrap()).unwrap();
     }
 
     #[test]

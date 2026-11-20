@@ -1123,6 +1123,11 @@ impl DaemonDeps for Runtime<'_> {
     }
     fn shutdown(&mut self) {
         self.alerts.stop();
+        self.heartbeat.collect_log_action(true);
+        self.heartbeat.report_events(
+            &self.audit.handle(),
+            self.running.as_ref().map(|(_, _, cfg)| cfg.stamp.version),
+        );
         self.running.take();
         if let Err(error) = self.audit.shutdown() {
             eprintln!("scupperd: event flush: {error}");
@@ -2427,7 +2432,10 @@ pub mod testing {
         Ok(runtime)
     }
 
-    fn runtime_shell<'a>(deps: BootDeps<'a>, options: &'a Options) -> io::Result<Runtime<'a>> {
+    pub(super) fn runtime_shell<'a>(
+        deps: BootDeps<'a>,
+        options: &'a Options,
+    ) -> io::Result<Runtime<'a>> {
         let origin = Instant::now();
         let gateway = GatewayId("gw1".into());
         let audit =
