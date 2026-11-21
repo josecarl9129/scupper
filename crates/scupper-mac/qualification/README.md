@@ -46,18 +46,33 @@ Every mutating child waits on an exec grant until its identity/resource intent
 is durably journaled. A parent dying before granting closes the pipe, so the
 sentinel exits and closes inherited fds. A completed pf acquisition also journals
 its token. Recovery handles death before that token append using the earlier
-pfctl acquisition pid/time intent and a bounded raw token inventory. A partial
+pfctl acquisition pid/time intent and a bounded raw token inventory. Recovery
+uses the ioctl inventory when complete, then falls back to the
+`pfctl -s References` PID/process/token/elapsed-age table. If both inventories fail, it
+still attempts `pfctl -X` for every durably recorded token and continues the
+remaining cleanup, retaining the named inventory failure. A partial
 final journal append is preserved separately before truncation, after writers
 stop. There remains a pid-reuse window between identity lookup and signalling;
 these fixture checks do not make `kill` atomic.
 
-After each probe, restore runs twice. The second must perform no network or
-writer-stop actions. Both post-states must match preflight for pf enablement,
+Each probe has its own `scope-NAME/` directory and resource journal. After each
+probe, scoped restore runs twice, including after execution or classification
+failure. The cell retains each failure and continues with the next probe. Final
+restore and comparison run after all selected probes; final and dead-man recovery
+visit every scope after stopping all writers. The second restore must perform no
+network or writer-stop actions. Both post-states must match preflight for pf enablement,
 references, anchors/rules/NAT, keys, routes and interfaces. Route counters and
-expiry, pf uptime/counters and scutil list indices are retained raw but are not
-configuration equality fields. Missing observations or configuration drift cause
+expiry, link-layer/cloned route cache entries, pf uptime/counters and scutil list
+indices are retained raw but are not configuration equality fields. Network
+gateways and tunnel/harness routes remain comparison fields. Missing observations
+or configuration drift cause
 `contract_violation`. Restore never removes a foreign token or guesses a disk
 number. No R2 probe loads any pf rules or anchors.
+
+`DIOCGETSTARTERS` uses Darwin `_IOWR('D', 5, 16)` (`0xC0104405`), with
+84-byte packed token records and a 16-byte request. An O_RDONLY EACCES or any
+ENODEV is a probe contract violation. Zero-capacity size queries are separate
+from copy observations and have their own `Q-REFS-size-query` artifact.
 
 Each C program emits one JSON event stream. The harness retains bounded,
 redacted stdout/stderr and writes a `measurement` aggregate plus separate named

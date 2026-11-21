@@ -703,7 +703,49 @@ fn restore(out: &Path, deadline: Instant) -> Result<Restore> {
     let before: Snapshot = read_json(&out.join("preflight.json"))?;
     let stopped = stop_writers(out, deadline)?;
     let _lock = resources::restore_lock(out, deadline)?;
-    let (actions, mut violations) = resources::undo(out, &before, deadline)?;
+    let mut actions = Vec::new();
+    let mut violations = Vec::new();
+    let mut stopped = stopped;
+    // Stop every scoped writer before any network cleanup, including when the
+    // dead-man interrupts a probe between its exec grant and token append.
+    let mut scopes = Vec::new();
+    for name in super::probe::NAMES {
+        let scope = out.join(format!("scope-{name}"));
+        if !scope.join("preflight.json").exists() {
+            continue;
+        }
+        protected_path(&scope, true)?;
+        match stop_writers(&scope, deadline) {
+            Ok(evidence) => stopped.extend(evidence),
+            Err(error) => violations.push(format!("{name}: stop writers: {error}")),
+        }
+        scopes.push((name, scope));
+    }
+    // Final/dead-man recovery visits all independent journals. An inventory
+    // failure in one scope cannot suppress cleanup in another scope.
+    for (name, scope) in scopes
+        .into_iter()
+        .chain(std::iter::once(("campaign", out.to_path_buf())))
+    {
+        let _scope_lock = if scope == out {
+            None
+        } else {
+            Some(resources::restore_lock(&scope, deadline)?)
+        };
+        // Release scoped references before restoring the campaign's PF state.
+        // A scoped restore (with no children) still restores its own PF state.
+        match resources::undo(&scope, &before, deadline, scope == out) {
+            Ok((undo, problems)) => {
+                actions.extend(undo);
+                violations.extend(
+                    problems
+                        .into_iter()
+                        .map(|problem| format!("{name}: {problem}")),
+                );
+            }
+            Err(error) => violations.push(format!("{name}: restore: {error}")),
+        }
+    }
     let post = snapshot(out, &unique("post"), deadline)?;
     let changed = restore_check::state_diff(&before.observations, &post.observations);
     violations.extend(changed.iter().cloned());
@@ -989,17 +1031,19 @@ fn run_probes(out: &Path, group: &str) -> Result<()> {
     if !manifest.budgets_fit() {
         return Err("manifest exceeds harness budget".into());
     }
-    let started = Instant::now();
-    for name in super::probe::NAMES {
-        if (name == "dns-default") != (group == "probe-hijack") {
-            continue;
-        }
-        if started.elapsed() > Duration::from_mins(16) {
-            return Err("probe cell deadline exhausted".into());
-        }
-        run_probe(out, name)?;
+    let failures = super::probe::run_all(
+        super::probe::NAMES
+            .into_iter()
+            .filter(|name| (*name == "dns-default") == (group == "probe-hijack")),
+        |name| run_probe(out, name),
+        || probe_restore_checks(out, "final", Instant::now() + Duration::from_secs(90)),
+    );
+    write_json(out, "probe-cell-failures.json", &failures)?;
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("probe cell failures: {}", failures.join("; ")).into())
     }
-    Ok(())
 }
 
 fn run_probe(out: &Path, name: &str) -> Result<()> {
@@ -1007,34 +1051,60 @@ fn run_probe(out: &Path, name: &str) -> Result<()> {
     if !super::probe::NAMES.contains(&name) {
         return Err("unknown probe".into());
     }
-    if out
-        .join(format!("Q-PROBE-{}.json", name.to_ascii_uppercase()))
-        .exists()
-    {
+    let case = format!("Q-PROBE-{}", name.to_ascii_uppercase());
+    if out.join(format!("{case}.json")).exists() {
         return Err("probe already recorded; use a fresh evidence directory for a rerun".into());
     }
-    require_ack(out)?;
-    let before: Snapshot = read_json(&out.join("preflight.json"))?;
-    let problems = probe_prerequisites(&before);
-    let bin = std::env::current_exe()?.with_file_name(format!("probe-{name}"));
-    protected_path(&bin, false)?;
-    let wg = std::env::current_exe()?.with_file_name("wireguard-go");
-    if matches!(name, "proc-identity" | "utun-handoff") {
-        protected_path(&wg, false)?;
-    }
     let mut result = CaseResult {
-        case: format!("Q-PROBE-{}", name.to_ascii_uppercase()),
+        case,
         binary_sha256: executable_sha256()?,
         verdict: Verdict::Inconclusive,
         iterations: 0,
         detail: "prerequisite unavailable".into(),
         evidence: Vec::new(),
     };
+    let scope = out.join(format!("scope-{name}"));
+    if let Err(error) = measure_probe(out, &scope, name, &mut result) {
+        result.verdict = Verdict::ContractViolation;
+        result.detail = format!("probe failed: {error}");
+    }
+    let save_error = save_case(out, &result).err();
+    // Restore even when execution, output decoding or classification failed.
+    if scope.join("preflight.json").exists() {
+        let deadline = started + Duration::from_secs(if name == "dns-default" { 60 } else { 120 });
+        if let Err(error) = probe_restore_checks(&scope, name, deadline) {
+            result.verdict = Verdict::ContractViolation;
+            result.detail = format!("{}; probe restore failed: {error}", result.detail);
+        }
+    }
+    if let Some(error) = save_error {
+        result.verdict = Verdict::ContractViolation;
+        result.detail = format!("{}; saving probe evidence failed: {error}", result.detail);
+    }
+    save_case(out, &result)?;
+    if result.verdict == Verdict::ContractViolation {
+        return Err(result.detail.into());
+    }
+    Ok(())
+}
+
+fn measure_probe(out: &Path, scope: &Path, name: &str, result: &mut CaseResult) -> Result<()> {
+    require_ack(out)?;
+    let before: Snapshot = read_json(&out.join("preflight.json"))?;
+    let problems = probe_prerequisites(&before);
     if !problems.is_empty() {
         result.detail = problems.join("; ");
-        save_case(out, &result)?;
         return Ok(());
     }
+    let bin = std::env::current_exe()?.with_file_name(format!("probe-{name}"));
+    protected_path(&bin, false)?;
+    let wg = std::env::current_exe()?.with_file_name("wireguard-go");
+    if matches!(name, "proc-identity" | "utun-handoff") {
+        protected_path(&wg, false)?;
+    }
+    fs::DirBuilder::new().mode(0o700).create(scope)?;
+    write_json(scope, "writers.json", &Vec::<Writer>::new())?;
+    write_json(scope, "preflight.json", &before)?;
     write_json(
         out,
         &format!("probe-identity-{name}.json"),
@@ -1044,7 +1114,7 @@ fn run_probe(out: &Path, name: &str) -> Result<()> {
         }),
     )?;
     let args = [
-        out.to_str().ok_or("invalid output path")?,
+        scope.to_str().ok_or("invalid output path")?,
         wg.to_str().ok_or("invalid wireguard path")?,
     ];
     let count = if matches!(name, "proc-identity" | "utun-handoff") {
@@ -1058,19 +1128,9 @@ fn run_probe(out: &Path, name: &str) -> Result<()> {
         None,
         Duration::from_secs(if name == "dns-default" { 10 } else { 90 }),
     );
-    classify_probe(out, name, &evidence, &mut result)?;
+    let classification = classify_probe(out, name, &evidence, result);
     result.evidence.push(evidence);
-    save_case(out, &result)?;
-    // Clean up after each probe, also after timeout. Check idempotence on real
-    // mutations before allowing another probe to start.
-    let deadline = started + Duration::from_secs(if name == "dns-default" { 60 } else { 120 });
-    if let Err(error) = probe_restore_checks(out, name, deadline) {
-        result.verdict = Verdict::ContractViolation;
-        result.detail = format!("probe restore failed: {error}");
-        save_case(out, &result)?;
-        return Err(error);
-    }
-    Ok(())
+    classification
 }
 
 fn classify_probe(
@@ -1080,6 +1140,10 @@ fn classify_probe(
     result: &mut CaseResult,
 ) -> Result<()> {
     let parsed = serde_json::from_str::<Value>(&evidence.stdout);
+    let pf_violation = matches!(name, "pf-starters" | "pf-eexist")
+        && parsed
+            .as_ref()
+            .is_ok_and(super::probe::pf_contract_violation);
     if evidence.complete() {
         if let Ok(value) = &parsed {
             if let Ok(questions) = super::probe::questions(value) {
@@ -1087,6 +1151,11 @@ fn classify_probe(
                 result.iterations = 1;
                 result.detail = "raw C capability measurement; no assumption promotion; question verdicts are separate artifacts".into();
                 for (id, verdict, iterations) in questions {
+                    let verdict = if pf_violation && id == "Q-REFS-readonly" {
+                        Verdict::ContractViolation
+                    } else {
+                        verdict
+                    };
                     save_case(
                         out,
                         &CaseResult {
@@ -1103,8 +1172,13 @@ fn classify_probe(
                     )?;
                 }
                 if name == "pf-starters" {
+                    let (verdict, iterations) = super::probe::pf_size_query(value);
+                    save_case(out, &CaseResult {
+                        case: "Q-REFS-size-query".into(), binary_sha256: executable_sha256()?, verdict, iterations,
+                        detail: "zero-capacity size queries recorded separately from token copies; returned allocation size must contain whole records".into(), evidence: Vec::new(),
+                    })?;
                     save_case(out, &CaseResult { case: "Q-REFS-layout".into(), binary_sha256: executable_sha256()?, verdict: super::probe::pf_layout(value), iterations: super::probe::pf_read_count(value),
-                        detail: "84-byte stride, 16-byte request, ioctl number and all size/order observations compared with whole-record newest-first copy-loop hypothesis".into(), evidence: Vec::new() })?;
+                        detail: "84-byte stride, 16-byte request, ioctl number and nonzero-capacity size/order observations compared with whole-record newest-first copy-loop hypothesis".into(), evidence: Vec::new() })?;
                 }
             } else {
                 result.detail = "malformed question output; never qualifies".into();
@@ -1115,6 +1189,12 @@ fn classify_probe(
     } else {
         result.detail =
             "probe failed, exceeded its internal deadline, or produced incomplete output".into();
+    }
+    if pf_violation {
+        result.verdict = Verdict::ContractViolation;
+        result.detail =
+            "pf probe ABI contract violation: O_RDONLY EACCES or ENODEV; see raw observations"
+                .into();
     }
     Ok(())
 }

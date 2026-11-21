@@ -63,7 +63,9 @@ else:
     binaries = ["abi-probe", "wireguard-go", "scratch-sleep", "renamed-sleep", "hard-sleep", "storage.dmg"]
     binaries += ["probe-" + name for name in ["pf-starters", "pf-eexist", "proc-identity", "utun-handoff", "storage", "sc-session", "dns-keys", "dns-default"]]
     for name in binaries:
-        (root / name).unlink(missing_ok=True)
+        for path in root.rglob(name):
+            if path.is_file() or path.is_symlink():
+                path.unlink()
     bad = []
     for path in sorted(root.rglob("*")):
         if path.is_file() and unsafe_text(path.read_bytes()):

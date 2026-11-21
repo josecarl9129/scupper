@@ -15,7 +15,8 @@ struct qual_tokens {
     struct qual_token *pgt_tokens;
   } __attribute__((aligned(8)));
 };
-#define QUAL_GETSTARTERS _IOWR('D', 91, struct qual_tokens)
+#define QUAL_GETSTARTERS _IOWR('D', 5, struct qual_tokens)
+_Static_assert(QUAL_GETSTARTERS == 0xC0104405UL, "pf starters ioctl");
 _Static_assert(sizeof(struct qual_token) == 84, "pf token stride");
 _Static_assert(sizeof(struct qual_tokens) == 16, "pf request size");
 static inline int pf_open(void) {
@@ -36,9 +37,10 @@ static inline int token_read(int fd, int capacity, const char *label) {
   int rc = ioctl(fd, QUAL_GETSTARTERS, &p);
   int e = errno;
   event(label);
-  printf(",\"capacity\":%d,\"returned_size\":%d,\"rc\":%d,\"errno\":%d,"
+  printf(",\"operation\":\"%s\",\"capacity\":%d,\"returned_size\":%d,"
+         "\"rc\":%d,\"errno\":%d,"
          "\"tokens\":[",
-         capacity, p.size, rc, e);
+         capacity == 0 ? "size-query" : "copy", capacity, p.size, rc, e);
   bool first = true;
   /* Only inspect whole slots within the caller's buffer. Sentinel detection
      records copies even if a failing ioctl did not copy its size field out. */

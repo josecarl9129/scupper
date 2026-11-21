@@ -64,9 +64,76 @@ pub(super) fn pf_read_count(value: &Value) -> u32 {
     })
 }
 
+// Darwin errno values are part of the measured ABI, not the build host's libc.
+pub(super) fn pf_contract_violation(value: &Value) -> bool {
+    let mut readonly = true;
+    value["events"].as_array().is_some_and(|events| {
+        events.iter().any(|event| {
+            if event["event"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("open"))
+            {
+                readonly = event["mode"] == "rdonly";
+            }
+            event["errno"] == 19
+                || (readonly && (event["rc"] == -1 || event["fd"] == -1) && event["errno"] == 13)
+        })
+    })
+}
+
+pub(super) fn pf_size_query(value: &Value) -> (Verdict, u32) {
+    let Some(events) = value["events"].as_array() else {
+        return (Verdict::Inconclusive, 0);
+    };
+    let mut count = 0;
+    for event in events.iter().filter(|e| e["event"] == "size-query") {
+        if event["rc"] != 0 {
+            return (Verdict::Inconclusive, count);
+        }
+        count += 1;
+        if event["capacity"] != 0
+            || !event["returned_size"]
+                .as_u64()
+                .is_some_and(|size| size > 0 && size % 84 == 0)
+            || !event["tokens"].as_array().is_some_and(Vec::is_empty)
+        {
+            return (Verdict::AssumptionRefuted, count);
+        }
+    }
+    (
+        if count == 4 {
+            Verdict::AssumptionHolds
+        } else {
+            Verdict::Inconclusive
+        },
+        count,
+    )
+}
+
+// Run every independent experiment and always execute the final recovery check.
+pub(super) fn run_all<E: std::fmt::Display>(
+    names: impl IntoIterator<Item = &'static str>,
+    mut run: impl FnMut(&str) -> Result<(), E>,
+    final_restore: impl FnOnce() -> Result<(), E>,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    for name in names {
+        if let Err(error) = run(name) {
+            failures.push(format!("{name}: {error}"));
+        }
+    }
+    if let Err(error) = final_restore() {
+        failures.push(format!("final restore: {error}"));
+    }
+    failures
+}
+
 // Q-REFS tests the observed copy loop, including the deliberately unaligned
 // capacities. This is measurement validation, not an adapter completeness rule.
 pub(super) fn pf_layout(value: &Value) -> Verdict {
+    if pf_contract_violation(value) {
+        return Verdict::ContractViolation;
+    }
     let Some(events) = value["events"].as_array() else {
         return Verdict::Inconclusive;
     };
@@ -75,7 +142,7 @@ pub(super) fn pf_layout(value: &Value) -> Verdict {
     };
     if layout["token_size"] != 84
         || layout["request_size"] != 16
-        || layout["ioctl"] != 0xc010_445b_u64
+        || layout["ioctl"] != 0xc010_4405_u64
     {
         return Verdict::AssumptionRefuted;
     }
@@ -113,27 +180,24 @@ pub(super) fn pf_layout(value: &Value) -> Verdict {
         let Some(tokens) = event["tokens"].as_array() else {
             return Verdict::Inconclusive;
         };
-        let expected = if capacity == 0 {
-            order.len()
-        } else {
-            order
-                .len()
-                .min(usize::try_from(capacity / 84).unwrap_or(usize::MAX))
-        };
+        if capacity == 0 {
+            return Verdict::AssumptionRefuted;
+        }
+        let expected = order
+            .len()
+            .min(usize::try_from(capacity / 84).unwrap_or(usize::MAX));
         let returned = u64::try_from(expected)
             .unwrap_or(u64::MAX)
             .saturating_mul(84);
         if event["returned_size"] != returned
-            || (capacity != 0
-                && (tokens.len() != expected
-                    || tokens.iter().zip(&order).any(|(a, b)| a["token"] != *b)))
-            || (capacity == 0 && !tokens.is_empty())
+            || tokens.len() != expected
+            || tokens.iter().zip(&order).any(|(a, b)| a["token"] != *b)
         {
             return Verdict::AssumptionRefuted;
         }
         reads += 1;
     }
-    if reads == 32 {
+    if reads == 28 {
         Verdict::AssumptionHolds
     } else {
         Verdict::Inconclusive
@@ -182,7 +246,7 @@ mod tests {
     #[test]
     fn truncated_copy_and_wrong_order_refute_the_layout_hypothesis() {
         let mut events = vec![
-            json!({"event":"layout", "token_size":84, "request_size":16, "ioctl":0xc010_445b_u64}),
+            json!({"event":"layout", "token_size":84, "request_size":16, "ioctl":0xc010_4405_u64}),
         ];
         for n in [1_u64, 2, 3, 8] {
             for c in [0, 83, 84, 85, 167, 168, n * 84, n * 84 + 84] {
@@ -190,18 +254,76 @@ mod tests {
                     json!({"event":"series", "acquisition_order":(1..=n).collect::<Vec<_>>()}),
                 );
                 let count = n.min(c / 84);
-                events.push(json!({"event":"getstarters", "capacity":c, "rc":0, "returned_size":if c==0 {n*84} else {count*84}, "tokens":(1..=n).rev().take(usize::try_from(count).unwrap_or(0)).map(|t| json!({"token":t})).collect::<Vec<_>>()}));
+                events.push(json!({"event":if c == 0 { "size-query" } else { "getstarters" }, "capacity":c, "rc":0, "returned_size":if c==0 {n*84} else {count*84}, "tokens":(1..=n).rev().take(usize::try_from(count).unwrap_or(0)).map(|t| json!({"token":t})).collect::<Vec<_>>()}));
             }
         }
         let good = json!({"events":events});
         assert_eq!(pf_layout(&good), Verdict::AssumptionHolds);
-        assert_eq!(pf_read_count(&good), 32);
+        assert_eq!(pf_size_query(&good), (Verdict::AssumptionHolds, 4));
+        assert_eq!(pf_read_count(&good), 28);
         let mut bad = good.clone();
         bad["events"][8]["tokens"][0]["token"] = json!(999);
         assert_eq!(pf_layout(&bad), Verdict::AssumptionRefuted);
+        let mut query_bad = good.clone();
+        query_bad["events"][2]["returned_size"] = json!(1);
+        assert_eq!(pf_layout(&query_bad), Verdict::AssumptionHolds);
+        assert_eq!(pf_size_query(&query_bad), (Verdict::AssumptionRefuted, 1));
         let mut short = good;
         short["events"].as_array_mut().map(Vec::pop);
         assert_eq!(pf_layout(&short), Verdict::Inconclusive);
-        assert_eq!(pf_read_count(&short), 31);
+        assert_eq!(pf_read_count(&short), 27);
+    }
+    #[test]
+    fn wrong_command_and_readonly_denial_are_harness_failures() {
+        for mode in ["rdonly", "rdwr"] {
+            for errno in [1, 2, 13, 19] {
+                let value = json!({"events":[
+                    {"event":"open", "mode":mode, "errno":0},
+                    {"event":"empty", "rc":-1, "errno":errno}
+                ]});
+                let violation = errno == 19 || (mode == "rdonly" && errno == 13);
+                assert_eq!(pf_contract_violation(&value), violation);
+                assert_eq!(
+                    pf_layout(&value),
+                    if violation {
+                        Verdict::ContractViolation
+                    } else {
+                        Verdict::Inconclusive
+                    }
+                );
+            }
+        }
+        assert!(pf_contract_violation(
+            &json!({"events":[{"event":"open", "mode":"rdonly", "errno":19}]})
+        ));
+    }
+
+    #[test]
+    fn failed_probe_does_not_skip_later_probes_or_final_restore() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let failures = run_all(
+            ["one", "two", "three"],
+            |name| {
+                calls.borrow_mut().push(name.to_owned());
+                if name == "two" {
+                    Ok(())
+                } else {
+                    Err("inventory unavailable")
+                }
+            },
+            || {
+                calls.borrow_mut().push("restore".into());
+                Err("post-state mismatch")
+            },
+        );
+        assert_eq!(*calls.borrow(), ["one", "two", "three", "restore"]);
+        assert_eq!(
+            failures,
+            [
+                "one: inventory unavailable",
+                "three: inventory unavailable",
+                "final restore: post-state mismatch"
+            ]
+        );
     }
 }

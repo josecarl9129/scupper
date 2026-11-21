@@ -42,6 +42,133 @@ pub(super) fn owns_token(
         })
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct Token {
+    pub value: u64,
+    pub pid: u64,
+    pub timestamp: u64,
+}
+
+pub(super) fn ioctl_tokens(value: &serde_json::Value) -> Result<Vec<Token>, &'static str> {
+    let inventory = value["events"]
+        .as_array()
+        .and_then(|events| events.iter().find(|e| e["event"] == "inventory"))
+        .ok_or("missing token inventory")?;
+    if inventory["rc"] == -1 && inventory["errno"] == 2 {
+        return Ok(Vec::new());
+    }
+    let size = inventory["returned_size"]
+        .as_u64()
+        .ok_or("invalid inventory size")?;
+    if inventory["rc"] != 0 || size % 84 != 0 || size > 84 * 127 {
+        return Err("incomplete ioctl token inventory");
+    }
+    let tokens = inventory["tokens"]
+        .as_array()
+        .ok_or("missing recovery tokens")?;
+    if tokens.len() != usize::try_from(size / 84).unwrap_or(usize::MAX) {
+        return Err("recovery token count mismatch");
+    }
+    tokens
+        .iter()
+        .map(|token| {
+            Ok(Token {
+                value: token["token"]
+                    .as_u64()
+                    .filter(|n| *n != 0)
+                    .ok_or("invalid token value")?,
+                pid: token["pid"].as_u64().ok_or("invalid token pid")?,
+                timestamp: token["timestamp"]
+                    .as_u64()
+                    .ok_or("invalid token timestamp")?,
+            })
+        })
+        .collect()
+}
+
+// pfctl prints an elapsed age; reconstruct wall time for the acquisition-intent
+// check. Exact journaled token values remain authoritative regardless of age.
+pub(super) fn text_tokens(text: &str, now: u64) -> Result<Vec<Token>, &'static str> {
+    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    if lines.next() != Some("TOKENS:")
+        || !lines.next().is_some_and(|line| {
+            line.split_whitespace()
+                .eq(["PID", "Process", "Name", "TOKEN", "TIMESTAMP"])
+        })
+    {
+        return Err("unrecognized pfctl References header");
+    }
+    let mut tokens = Vec::new();
+    for line in lines {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() < 6 || fields[fields.len() - 2] != "days" {
+            return Err("malformed pfctl References row");
+        }
+        let parse = |s: &str| {
+            s.parse::<u64>()
+                .map_err(|_| "invalid pfctl References number")
+        };
+        let pid = parse(fields[0])?;
+        let value = parse(fields[fields.len() - 4])?;
+        let days = parse(fields[fields.len() - 3])?;
+        let clock = fields[fields.len() - 1]
+            .split(':')
+            .map(parse)
+            .collect::<Result<Vec<_>, _>>()?;
+        if clock.len() != 3
+            || clock[0] >= 24
+            || clock[1] >= 60
+            || clock[2] >= 60
+            || pid == 0
+            || value == 0
+            || tokens.iter().any(|t: &Token| t.value == value)
+        {
+            return Err("invalid pfctl References row");
+        }
+        let age = days
+            .checked_mul(86400)
+            .and_then(|age| age.checked_add(clock[0] * 3600 + clock[1] * 60 + clock[2]))
+            .ok_or("pfctl token age overflow")?;
+        tokens.push(Token {
+            value,
+            pid,
+            timestamp: now.saturating_sub(age),
+        });
+    }
+    Ok(tokens)
+}
+
+// Inventory failure must not prevent release attempts for durably known tokens.
+pub(super) fn recovery_tokens(
+    entries: &[Entry],
+    inventory: Result<Vec<Token>, String>,
+    now: u64,
+) -> (Vec<u64>, Vec<String>) {
+    let mut release = std::collections::BTreeSet::new();
+    let mut failures = Vec::new();
+    match inventory {
+        Ok(tokens) => {
+            for token in tokens {
+                if owns_token(entries, token.value, token.pid, token.timestamp, now) {
+                    release.insert(token.value);
+                } else {
+                    failures.push("unowned token appeared during fixture; not released".into());
+                }
+            }
+        }
+        Err(error) => {
+            failures.push(format!("token recovery inventory failed: {error}"));
+            release.extend(
+                entries
+                    .iter()
+                    .filter(|e| e.kind == "token" && e.token != 0)
+                    .map(|e| e.token),
+            );
+        }
+    }
+    (release.into_iter().collect(), failures)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,5 +198,84 @@ mod tests {
         assert!(!owns_token(&entries, 8, 42, 122, 120));
         assert!(!owns_token(&entries, 0, 42, 100, 120));
         Ok(())
+    }
+    #[test]
+    fn references_text_recovers_tokens_with_process_names_and_elapsed_age()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let text = "TOKENS:\nPID      Process Name                 TOKEN                    TIMESTAMP\n14576    pfctl                        7056986734673252366      0 days 00:00:00\n42       process with spaces          8                        1 days 01:02:03\n";
+        let tokens = text_tokens(text, 100_000)?;
+        assert_eq!(
+            text_tokens(
+                &text.replace("7056986734673252366", "18446744073709551615"),
+                100_000
+            )?[0]
+                .value,
+            u64::MAX
+        );
+        assert_eq!(
+            tokens,
+            [
+                Token {
+                    value: 7_056_986_734_673_252_366,
+                    pid: 14576,
+                    timestamp: 100_000
+                },
+                Token {
+                    value: 8,
+                    pid: 42,
+                    timestamp: 9_877
+                }
+            ]
+        );
+        assert!(text_tokens("TOKENS:\n", 100).is_err());
+        assert!(text_tokens(&text.replace("00:00:00", "00:60:00"), 100).is_err());
+        assert!(text_tokens(&text.replace("7056986734673252366", "overflow"), 100).is_err());
+        let entries = committed("{\"kind\":\"pf-acquire\",\"pid\":14576,\"at\":100000}\n")?;
+        let (release, failures) = recovery_tokens(&entries, Ok(tokens), 100_000);
+        assert_eq!(release, [7_056_986_734_673_252_366]);
+        assert_eq!(failures.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn inventory_failure_still_releases_known_tokens_and_names_the_problem()
+    -> Result<(), serde_json::Error> {
+        let entries = committed(
+            "{\"kind\":\"token\",\"token\":7}\n{\"kind\":\"token\",\"token\":7}\n{\"kind\":\"token\",\"token\":9}\n",
+        )?;
+        let (release, failures) =
+            recovery_tokens(&entries, Err("ioctl ENODEV; text unavailable".into()), 120);
+        assert_eq!(release, [7, 9]);
+        assert_eq!(
+            failures,
+            ["token recovery inventory failed: ioctl ENODEV; text unavailable"]
+        );
+        assert_eq!(
+            recovery_tokens(&entries, Ok(Vec::new()), 120),
+            (Vec::new(), Vec::new())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ioctl_inventory_requires_complete_whole_records() {
+        use serde_json::json;
+        assert_eq!(
+            ioctl_tokens(&json!({"events":[{"event":"inventory", "rc":-1, "errno":2}]})),
+            Ok(Vec::new())
+        );
+        for (size, rc) in [(84, -1), (83, 0), (84, 0), (84 * 128, 0)] {
+            assert!(ioctl_tokens(&json!({"events":[{"event":"inventory", "rc":rc, "returned_size":size,"tokens":[]}]})).is_err());
+        }
+        assert_eq!(
+            ioctl_tokens(
+                &json!({"events":[{"event":"inventory", "rc":0, "returned_size":84,"tokens":[{"token":7,"pid":42,"timestamp":100}]}]})
+            ),
+            Ok(vec![Token {
+                value: 7,
+                pid: 42,
+                timestamp: 100
+            }])
+        );
     }
 }

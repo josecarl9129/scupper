@@ -130,7 +130,7 @@ fn normalized(name: &str, text: &str) -> Vec<String> {
         .lines()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|line| {
+        .filter_map(|line| {
             if name == "routes" {
                 // netstat's Refs/Use/Expire are counters/timers. Preserve destination,
                 // gateway, flags and interface regardless of optional counter columns.
@@ -144,13 +144,33 @@ fn normalized(name: &str, text: &str) -> Vec<String> {
                     && !line.ends_with(':')
                     && let Some(index) = netif.filter(|index| *index < fields.len())
                 {
-                    return format!(
-                        "{} {} {} {}",
-                        fields[0], fields[1], fields[2], fields[index]
-                    );
+                    let gateway = fields[1];
+                    let flags = fields[2];
+                    let interface = fields[index];
+                    let link_gateway = gateway.starts_with("link#")
+                        || (gateway.split(':').count() == 6
+                            && gateway.split(':').all(|part| {
+                                !part.is_empty()
+                                    && part.len() <= 2
+                                    && part.bytes().all(|b| b.is_ascii_hexdigit())
+                            }));
+                    // Cache entries may appear/disappear between inventories.
+                    // Keep all fixture/tunnel routes and network gateways.
+                    let network_gateway = gateway
+                        .split('%')
+                        .next()
+                        .is_some_and(|gateway| gateway.parse::<std::net::IpAddr>().is_ok());
+                    if !network_gateway
+                        && !interface.starts_with("utun")
+                        && !interface.contains("scupper")
+                        && (flags.contains('L') || (flags.contains('W') && link_gateway))
+                    {
+                        return None;
+                    }
+                    return Some(format!("{} {} {} {}", fields[0], gateway, flags, interface));
                 }
             }
-            line.to_owned()
+            Some(line.to_owned())
         })
         .collect();
     lines.sort();
@@ -243,6 +263,49 @@ mod tests {
         let mut malformed = observation();
         malformed.stdout = "Could not communicate with configd".into();
         assert!(!valid_key_list(&malformed));
+    }
+
+    #[test]
+    fn route_cache_expiry_and_aging_are_ignored_but_network_changes_are_detected() {
+        let header = "Destination Gateway Flags Netif Expire\n";
+        let arp = "192.168.64.1 12:34:56:78:9a:bc UHLWIir en0 1192\n";
+        let aged_arp = "192.168.64.1 12:34:56:78:9a:bc UHLWIir en0 1169\n";
+        let mdns = "224.0.0.251 1:0:5e:0:0:fb UHmLWI en0\n";
+        let route = "default 192.168.64.1 UGSc en0 1192\n";
+        assert_eq!(
+            normalized("routes", &format!("{header}{arp}{mdns}{route}")),
+            normalized("routes", &format!("{header}{aged_arp}{route}"))
+        );
+        assert_eq!(
+            normalized("routes", &format!("{header}{route}")),
+            normalized(
+                "routes",
+                &format!("{header}{}", route.replace("1192", "1169"))
+            )
+        );
+        for extra in [
+            "192.0.2/24 192.168.64.1 UGS en0",
+            "192.0.2.1 192.168.64.1 UHW en0",
+            "192.0.2.1 192.168.64.1 UHLW en0",
+            "192.0.2/24 link#20 US utun7",
+            "192.0.2.1 link#20 UHLW utun7",
+            "192.0.2.1 link#21 UHLW scupper0",
+            "2001:db8::/64 fe80::1%en0 UGS en0",
+        ] {
+            let baseline = format!("{header}{route}");
+            let added = format!("{baseline}{extra}\n");
+            assert_ne!(
+                normalized("routes", &baseline),
+                normalized("routes", &added),
+                "{extra}"
+            );
+            let changed = added.replace("192.168.64.1", "192.168.64.2");
+            assert_ne!(normalized("routes", &added), normalized("routes", &changed));
+        }
+        assert_eq!(
+            normalized("routes", &format!("{header}192.0.2.1 link#4 UHW en0\n")),
+            normalized("routes", header)
+        );
     }
 
     #[test]

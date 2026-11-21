@@ -86,6 +86,15 @@ class ArtifactTests(unittest.TestCase):
         for name in ["probe-pf-starters", "probe-dns-default", "wireguard-go", "storage.dmg"]:
             self.assertFalse((self.root / name).exists())
 
+    def test_scoped_recovery_exports_only_text(self):
+        scope = self.root / "scope-storage"
+        scope.mkdir()
+        for name in ["storage.dmg", "scratch-sleep", "renamed-sleep", "hard-sleep"]:
+            (scope / name).write_bytes(b"fixture binary")
+        (scope / "resources.jsonl").write_text('{"kind":"image","path":"fixture"}\n')
+        self.assertEqual(self.check().returncode, 0)
+        self.assertEqual([path.name for path in scope.iterdir()], ["resources.jsonl"])
+
     def test_unicode_escaped_assignments_inside_embedded_json_are_quarantined(self):
         escaped = '{"reply":"private\\u005fkey\\u003dfixture-escaped"}'
         self.write_json("escaped.json", {"stdout": escaped})

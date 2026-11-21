@@ -61,7 +61,8 @@ int main(int argc, char **argv) {
       for (int i = 0; i < n; ++i)
         printf("%s%" PRIu64, i ? "," : "", tokens[i]);
       fputs("]}", stdout);
-      (void)token_read(fd, caps[c], "getstarters");
+      (void)token_read(fd, caps[c],
+                       caps[c] == 0 ? "size-query" : "getstarters");
     }
     for (int i = 0; i < n; ++i) {
       if (!release(tokens[i])) {

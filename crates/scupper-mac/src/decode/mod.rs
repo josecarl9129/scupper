@@ -21,6 +21,6 @@ pub const fn iowr(group: u8, number: u8, size: u32) -> u32 {
 mod tests {
     #[test]
     fn darwin_get_starters_is_not_the_host_ioctl_encoding() {
-        assert_eq!(super::iowr(b'D', 91, 16), 0xC010_445B);
+        assert_eq!(super::iowr(b'D', 5, 16), 0xC010_4405);
     }
 }

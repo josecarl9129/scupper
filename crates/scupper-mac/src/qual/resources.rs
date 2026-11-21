@@ -79,7 +79,7 @@ fn action(
     write_json(out, &format!("{}.json", unique("undo")), &evidence)
 }
 
-fn live_tokens(out: &Path, deadline: Instant) -> Result<Vec<Value>> {
+fn ioctl_inventory(out: &Path, deadline: Instant) -> Result<Vec<journal::Token>> {
     let bin = std::env::current_exe()?.with_file_name("probe-pf-starters");
     protected_path(&bin, false)?;
     let evidence = invoke_before(
@@ -93,29 +93,31 @@ fn live_tokens(out: &Path, deadline: Instant) -> Result<Vec<Value>> {
         &evidence,
     )?;
     if !evidence.complete() {
-        return Err("cannot inventory pf tokens for recovery".into());
+        return Err("cannot execute ioctl token inventory".into());
     }
     let value: Value = serde_json::from_str(&evidence.stdout)?;
-    let inventory = value["events"]
-        .as_array()
-        .and_then(|events| events.iter().find(|e| e["event"] == "inventory"))
-        .ok_or("missing token inventory")?;
-    if inventory["rc"] == -1 && inventory["errno"] == 2 {
+    Ok(journal::ioctl_tokens(&value)?)
+}
+
+fn live_tokens(out: &Path, deadline: Instant) -> Result<Vec<journal::Token>> {
+    let ioctl_error = match ioctl_inventory(out, deadline) {
+        Ok(tokens) => return Ok(tokens),
+        Err(error) => error.to_string(),
+    };
+    let evidence = invoke_before("/sbin/pfctl", &["-s", "References"], deadline);
+    write_json(
+        out,
+        &format!("{}.json", unique("token-inventory-fallback")),
+        &json!({"ioctl_problem": ioctl_error, "pfctl": evidence}),
+    )?;
+    if !evidence.complete() {
+        return Err(format!("ioctl: {ioctl_error}; pfctl References unavailable").into());
+    }
+    if super::super::guard::no_foreign_references(&evidence.stdout, &evidence.stderr) {
         return Ok(Vec::new());
     }
-    let size = inventory["returned_size"]
-        .as_u64()
-        .ok_or("invalid inventory size")?;
-    if inventory["rc"] != 0 || size % 84 != 0 || size > 84 * 127 {
-        return Err("incomplete token recovery inventory".into());
-    }
-    let tokens = inventory["tokens"]
-        .as_array()
-        .ok_or("missing recovery tokens")?;
-    if u64::try_from(tokens.len())? * 84 != size {
-        return Err("recovery token count mismatch".into());
-    }
-    Ok(tokens.clone())
+    journal::text_tokens(&evidence.stdout, unix_seconds())
+        .map_err(|error| format!("ioctl: {ioctl_error}; pfctl References: {error}").into())
 }
 
 fn attached_devices(out: &Path, paths: &[&str], deadline: Instant) -> Result<Vec<String>> {
@@ -168,6 +170,7 @@ pub(super) fn undo(
     out: &Path,
     before: &Snapshot,
     deadline: Instant,
+    restore_pf_state: bool,
 ) -> Result<(Vec<String>, Vec<String>)> {
     repair_tail(out)?;
     let entries = entries(out)?;
@@ -196,7 +199,7 @@ pub(super) fn undo(
             )?;
         }
     }
-    if restore_check::pf_status(&before.observations) == Some(false) {
+    if restore_pf_state && restore_check::pf_status(&before.observations) == Some(false) {
         let info = invoke_before("/sbin/pfctl", &["-s", "info"], deadline);
         let current = BTreeMap::from([("pf-info".into(), info)]);
         if restore_check::pf_status(&current) == Some(true) {
@@ -273,35 +276,22 @@ fn undo_tokens(
     actions: &mut Vec<String>,
     failures: &mut Vec<String>,
 ) -> Result<()> {
-    if entries.iter().any(|e| e.kind == "pf-acquire") {
-        match live_tokens(out, deadline) {
-            Ok(tokens) => {
-                for token in tokens {
-                    let Some(value) = token["token"].as_u64() else {
-                        failures.push("invalid live token".into());
-                        continue;
-                    };
-                    let owned = token["pid"]
-                        .as_u64()
-                        .zip(token["timestamp"].as_u64())
-                        .is_some_and(|(pid, timestamp)| {
-                            journal::owns_token(entries, value, pid, timestamp, unix_seconds())
-                        });
-                    if owned {
-                        action(
-                            out,
-                            "/sbin/pfctl",
-                            &["-X", &value.to_string()],
-                            deadline,
-                            actions,
-                            failures,
-                        )?;
-                    } else {
-                        failures.push("unowned token appeared during fixture; not released".into());
-                    }
-                }
-            }
-            Err(error) => failures.push(error.to_string()),
+    if entries
+        .iter()
+        .any(|e| matches!(e.kind.as_str(), "pf-acquire" | "token"))
+    {
+        let inventory = live_tokens(out, deadline).map_err(|error| error.to_string());
+        let (tokens, problems) = journal::recovery_tokens(entries, inventory, unix_seconds());
+        failures.extend(problems);
+        for value in tokens {
+            action(
+                out,
+                "/sbin/pfctl",
+                &["-X", &value.to_string()],
+                deadline,
+                actions,
+                failures,
+            )?;
         }
     }
     Ok(())
