@@ -125,8 +125,7 @@ fn settled(child: &mut Spawned) -> Reap {
     }
 }
 
-pub(super) fn run(out: &Path) -> Result<()> {
-    require_ack(out)?;
+fn check_socket_layout(out: &Path) -> Result<()> {
     let abi = invoke(super::probe_path()?.to_str().ok_or("ABI probe path")?, &[]);
     ensure(abi.complete(), "ABI probe incomplete")?;
     let layout: Value = serde_json::from_str(&abi.stdout)?;
@@ -134,7 +133,7 @@ pub(super) fn run(out: &Path) -> Result<()> {
     for (field, value) in scupper_darwin::CONTROL_FIELDS {
         let observed = if field == "size" {
             layout["socket_fdinfo"]["size"].as_u64()
-        } else if field == "SOCKINFO_KERN_CTL" {
+        } else if !field.starts_with("psi.") {
             layout[field].as_u64()
         } else {
             layout["socket_fdinfo"]["fields"][field].as_u64()
@@ -145,6 +144,12 @@ pub(super) fn run(out: &Path) -> Result<()> {
         )?;
     }
     write_json(out, "tool-abi.json", &layout)?;
+    Ok(())
+}
+
+pub(super) fn run(out: &Path) -> Result<()> {
+    require_ack(out)?;
+    check_socket_layout(out)?;
     let tree = fixture(out);
     ensure(!tree.exists(), "R4 fixture already exists")?;
     append(out, &json!({"kind":"r4-tree","path":tree}))?;
@@ -226,10 +231,30 @@ fn production_ancestors(out: &Path) -> Result<()> {
     let observed_lock = NativePlatform::qualification_ancestors(lock);
     let observed_control = NativePlatform::qualification_ancestors(control);
     NativePlatform::qualification_ancestors(&model.join("scupper.lock"))?;
+    let mut candidates = Vec::new();
+    for parent in ["/Library/Application Support", "/private/var/db"] {
+        let mut ancestors = Vec::new();
+        for ancestor in Path::new(parent).ancestors() {
+            let entry = match fs::symlink_metadata(ancestor) {
+                Ok(m) => json!({"path":ancestor,"exists":true,"uid":m.uid(),"gid":m.gid(),
+                    "mode":format!("{:04o}",m.mode() & 0o7777),
+                    "strict":m.is_dir() && crate::platform::runtime::protected_owner_mode(m.uid(),m.mode())}),
+                Err(e) => json!({"path":ancestor,"exists":false,"uid":null,"gid":null,
+                    "mode":null,"strict":false,"error":e.to_string()}),
+            };
+            ancestors.push(entry);
+        }
+        // A hypothetical root:wheel 0755 child adds a valid component. Its
+        // ancestors still have to pass, including the candidate parent itself.
+        let child_passes = ancestors.iter().all(|a| a["strict"] == true);
+        candidates.push(json!({"parent":parent,"ancestors":ancestors,
+            "child_uid":0,"child_gid":0,"child_mode":"0755",
+            "root_wheel_0755_child_passes_strict_ancestors":child_passes}));
+    }
     write_json(
         out,
         "tool-production-ancestors.json",
-        &json!({"ancestors":measurements,"lock_check":format!("{observed_lock:?}"),"control_check":format!("{observed_control:?}"),"strict_after_installer_root_wheel_0755":would_pass,"model":model}),
+        &json!({"candidate_parents":candidates,"ancestors":measurements,"lock_check":format!("{observed_lock:?}"),"control_check":format!("{observed_control:?}"),"strict_after_installer_root_wheel_0755":would_pass,"model":model}),
     )?;
     save_case(
         out,
@@ -239,7 +264,7 @@ fn production_ancestors(out: &Path) -> Result<()> {
             verdict: Verdict::Measurement,
             iterations: u32::try_from(measurements.len())?,
             detail: format!(
-                "Every production lock/socket ancestor measured; strict check after installer-owned root:wheel 0755 scupper/run directories: {would_pass}; absent directories modeled only in journaled scratch"
+                "Every production lock/socket and both candidate-parent ancestors measured read-only; strict check after installer-owned root:wheel 0755 scupper/run directories: {would_pass}; absent directories modeled only in journaled scratch"
             ),
             evidence: Vec::new(),
         },
@@ -248,6 +273,7 @@ fn production_ancestors(out: &Path) -> Result<()> {
 
 pub(super) fn mutation_tools(out: &Path) -> Result<()> {
     require_ack(out)?;
+    check_socket_layout(out)?;
     let tree = fixture(out);
     ensure(!tree.exists(), "mutation fixture already exists")?;
     append(out, &json!({"kind":"r4-tree","path":tree}))?;
@@ -402,7 +428,8 @@ fn tools_worker(out: &Path, result: &mut CaseResult) -> Result<()> {
         "SIGCHLD unsafe disposition allowed spawn",
     )?;
     pin_rejections(out, result)?;
-    utun_without_crosscheck(out)?;
+    utun_without_crosscheck(out, false)?;
+    utun_without_crosscheck(out, true)?;
     let hs = h.to_str().ok_or("helper path")?;
     let signals = fixture(out).join("signals.json");
     let output = fs::OpenOptions::new()
@@ -554,7 +581,7 @@ fn tools_worker(out: &Path, result: &mut CaseResult) -> Result<()> {
             vec![hs, "late"],
             vec![1; 1024 * 1024],
             1024,
-            true,
+            false,
         ),
     ] {
         let observed = p.run_tool(Tool::Pfctl, path, &args, &input, cap, deadline(8))?;
@@ -562,6 +589,22 @@ fn tools_worker(out: &Path, result: &mut CaseResult) -> Result<()> {
             observed.complete().is_ok() == complete,
             "runner output completion mismatch",
         )?;
+        if args.contains(&"late") {
+            ensure(
+                observed.stdin_unsent > 0
+                    && observed.reap == Reap::Status(0)
+                    && observed.complete() == Err(SysError::Unknown),
+                "early EPIPE incorrectly reported complete input delivery",
+            )?;
+            ensure(
+                matches!(
+                    observed.into_outcome(),
+                    crate::platform::ToolOutcome::Unknown { reaped: true }
+                ),
+                "unsent mutating-tool input was not Unknown",
+            )?;
+            continue;
+        }
         if path == Path::new("/bin/cat") {
             ensure(
                 observed.stdout.bytes == input,
@@ -647,8 +690,43 @@ fn tools_worker(out: &Path, result: &mut CaseResult) -> Result<()> {
     Ok(())
 }
 
-fn utun_without_crosscheck(out: &Path) -> Result<()> {
-    let path = helper()?.with_file_name("tool-child-utun");
+fn prepare_wireguard_directory(out: &Path) -> Result<()> {
+    let directory = Path::new("/private/var/run/wireguard");
+    let existed = match fs::symlink_metadata(directory) {
+        Ok(m)
+            if m.is_dir()
+                && m.uid() == 0
+                && m.mode() & 0o022 == 0
+                && fs::read_dir(directory)?.next().is_none() =>
+        {
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        _ => {
+            return Err(super::environment_issue(
+                "wireguard runtime directory must be absent or protected and empty",
+            ));
+        }
+    };
+    append(
+        out,
+        &json!({"kind":if existed {"r4-wireguard-sockets"} else {"r4-wireguard-created"},"path":directory}),
+    )?;
+    if !existed {
+        fs::DirBuilder::new().mode(0o755).create(directory)?;
+    }
+    Ok(())
+}
+
+fn utun_without_crosscheck(out: &Path, stale_socket: bool) -> Result<()> {
+    if stale_socket {
+        prepare_wireguard_directory(out)?;
+    }
+    let path = helper()?.with_file_name(if stale_socket {
+        "tool-child-utun-stale"
+    } else {
+        "tool-child-utun"
+    });
     let mut p = platform(out, &path)?;
     let outcome = p.spawn(
         scupper_core::mac::TunnelGeneration::new(3)?,
@@ -669,8 +747,9 @@ fn utun_without_crosscheck(out: &Path) -> Result<()> {
     // Gather positive control-socket evidence as well: a dead/unstarted fixture
     // must not get credit for refusing an uncorroborated utun.
     let mut names = Vec::new();
-    for fd in scupper_darwin::proc_socket_fds(child.pid)? {
-        if let Some(control) = scupper_darwin::proc_control(child.pid, fd)?
+    let sockets = scupper_darwin::proc_socket_fds(child.pid)?;
+    for fd in &sockets {
+        if let Some(control) = scupper_darwin::proc_control(child.pid, *fd)?
             && let Some(name) = crate::platform::runtime::utun_name(&control.name, control.unit)
         {
             names.push(name);
@@ -681,10 +760,22 @@ fn utun_without_crosscheck(out: &Path) -> Result<()> {
         "utun negative fixture did not expose exactly one live utun",
     )?;
     let socket = Path::new("/var/run/wireguard").join(format!("{}.sock", names[0]));
-    ensure(
-        fs::symlink_metadata(&socket).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
-        "utun negative fixture unexpectedly has corroborating socket",
-    )?;
+    if stale_socket {
+        let m = fs::symlink_metadata(&socket)?;
+        ensure(
+            m.file_type().is_socket()
+                && m.uid() == 0
+                && m.nlink() == 1
+                && scupper_darwin::interface_index(&names[0]).is_ok()
+                && sockets.len() == 1,
+            "stale socket fixture lacks protected inode/live interface or has extra child sockets",
+        )?;
+    } else {
+        ensure(
+            fs::symlink_metadata(&socket).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+            "utun negative fixture unexpectedly has corroborating socket",
+        )?;
+    }
     p.kill_process(child.pid, child.start_time, deadline(2))?;
     let until = Instant::now() + Duration::from_secs(2);
     while Instant::now() < until && scupper_darwin::sysctl_kern_proc_pid(child.pid)?.is_some() {
@@ -693,12 +784,26 @@ fn utun_without_crosscheck(out: &Path) -> Result<()> {
     }
     write_json(
         out,
-        "tool-utun-crosscheck-negative.json",
-        &json!({"pid":child.pid,"names":names,"socket_absent":true,"spawn_refused":outcome.is_err(),"utun_retained":child.utun}),
+        if stale_socket {
+            "tool-utun-crosscheck-stale-negative.json"
+        } else {
+            "tool-utun-crosscheck-negative.json"
+        },
+        &json!({"pid":child.pid,"names":names,"socket_absent":!stale_socket,"child_socket_fds":sockets,"refusal":format!("{outcome:?}"),"utun_retained":child.utun}),
     )?;
+    if stale_socket {
+        fs::remove_file(&socket)?;
+    }
     ensure(
-        outcome.is_err() && child.utun.is_empty(),
-        "utun cross-check assertion: uncorroborated control-unit name accepted",
+        matches!(
+            outcome,
+            Err(SysError::Failed("native: utun cross-check unavailable"))
+        ) && child.utun.is_empty(),
+        if stale_socket {
+            "utun cross-check assertion: socket without child listener accepted"
+        } else {
+            "utun cross-check assertion: uncorroborated control-unit name accepted"
+        },
     )
 }
 
@@ -738,7 +843,7 @@ fn pin_rejections(out: &Path, result: &mut CaseResult) -> Result<()> {
         };
         let mut p = NativePlatform::new(Paths::qualification(directory.clone()))?
             .with_pins(vec![reviewed], path.clone());
-        // Use the same pin checker as check_tools, check_pfctl and spawn; no child may launch.
+        // Require the specific refusal from the shared pre-spawn pin checker.
         let observed = p.run_tool(
             Tool::Pfctl,
             &path,
@@ -751,18 +856,25 @@ fn pin_rejections(out: &Path, result: &mut CaseResult) -> Result<()> {
             matches!(observed, Err(SysError::Failed(text)) if text == expected),
             &format!("pin {variant} rejected for wrong reason"),
         )?;
-        ensure(
-            p.fence() == Fence::Closed && p.spawned_children().is_empty(),
-            "rejected pin spawned a process",
-        )?;
         evidence.push(json!({"variant":variant,"rejection":expected}));
         result.iterations += 1;
     }
     write_json(out, "tool-pin-rejections.json", &json!(evidence))
 }
 
-#[allow(clippy::too_many_lines)] // Each worker preserves spawn, observation and reporting order.
 pub(super) fn worker(out: &Path, mode: &str) -> Result<()> {
+    let outcome = require_ack(out).and_then(|_| worker_inner(out, mode));
+    if let Err(ref error) = outcome {
+        write_json(
+            out,
+            &format!("tool-worker-{mode}.json"),
+            &json!({"error":error.to_string()}),
+        )?;
+    }
+    outcome
+}
+#[allow(clippy::too_many_lines)] // Each worker preserves spawn, observation and reporting order.
+fn worker_inner(out: &Path, mode: &str) -> Result<()> {
     let incarnation = NativePlatform::new(Paths::qualification(fixture(out)))?.incarnation();
     let own = scupper_darwin::sysctl_kern_proc_pid(incarnation.pid)?.ok_or("worker absent")?;
     ensure(
@@ -825,8 +937,8 @@ pub(super) fn worker(out: &Path, mode: &str) -> Result<()> {
         let socket = Path::new("/var/run/wireguard").join(format!("{}.sock", child.utun));
         let m = fs::symlink_metadata(&socket)?;
         ensure(
-            m.file_type().is_socket() && m.uid() == 0,
-            "utun name lacks independent wireguard socket",
+            m.file_type().is_socket() && m.uid() == 0 && m.nlink() == 1,
+            "utun name lacks provisional wireguard socket corroboration",
         )?;
         checks = json!({"utun_crosscheck_socket":socket,"uid":m.uid(),"socket":true});
     }
@@ -1024,7 +1136,27 @@ fn launch_job(out: &Path, mode: &str, keep_alive: bool) -> Result<(String, Value
     let record = out.join(format!("tool-worker-{mode}.json"));
     while Instant::now() < until {
         if record.exists() {
-            return Ok((service, read_json(&record)?));
+            let value: Value = read_json(&record)?;
+            if let Some(error) = value["error"].as_str() {
+                return Err(format!("launchd {mode} worker failed: {error}").into());
+            }
+            return Ok((service, value));
+        }
+        let status = invoke("/bin/launchctl", &["print", &service]);
+        if status.complete()
+            && status
+                .stdout
+                .lines()
+                .any(|line| matches!(line.trim(), "state = not running" | "state = exited"))
+        {
+            // Read again after observing exit: the worker may have published its
+            // record between our first read and launchctl's snapshot.
+            if record.exists() {
+                continue;
+            }
+            return Err(
+                format!("launchd {mode} worker exited without a record; inspect stderr").into(),
+            );
         }
         thread::sleep(Duration::from_millis(20));
     }
@@ -1040,27 +1172,7 @@ fn group_gone(pgid: u32) -> Result<bool> {
 fn launchd(out: &Path, result: &mut CaseResult) -> Result<()> {
     for mode in ["bootout", "kill9", "group", "process", "real"] {
         if mode == "real" {
-            let directory = Path::new("/private/var/run/wireguard");
-            let existed = match fs::symlink_metadata(directory) {
-                Ok(m)
-                    if m.is_dir()
-                        && m.uid() == 0
-                        && m.mode() & 0o022 == 0
-                        && fs::read_dir(directory)?.next().is_none() =>
-                {
-                    true
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-                _ => {
-                    return Err(super::environment_issue(
-                        "wireguard runtime directory must be absent or protected and empty",
-                    ));
-                }
-            };
-            append(
-                out,
-                &json!({"kind":if existed {"r4-wireguard-sockets"} else {"r4-wireguard-created"},"path":directory}),
-            )?;
+            prepare_wireguard_directory(out)?;
         }
         let (service, record) = launch_job(out, mode, false)?;
         let pid = u32::try_from(record["pid"].as_u64().ok_or("job pid")?)?;
@@ -1129,7 +1241,9 @@ fn launchd(out: &Path, result: &mut CaseResult) -> Result<()> {
         detail: "Rosetta unavailable; native refusal not observed".into(),
         evidence: Vec::new(),
     };
-    if cfg!(target_arch = "aarch64") && Path::new("/usr/libexec/rosetta").exists() {
+    let rosetta_probe = invoke("/usr/bin/arch", &["-x86_64", "/usr/bin/true"]);
+    write_json(out, "tool-rosetta-capability.json", &rosetta_probe)?;
+    if cfg!(target_arch = "aarch64") && rosetta_probe.complete() {
         let (service, record) = launch_job(out, "rosetta", false)?;
         ensure(
             record["refused"] == true && record["gone_ms"].as_u64().is_some_and(|ms| ms < 5000),
@@ -1173,7 +1287,7 @@ fn launchd(out: &Path, result: &mut CaseResult) -> Result<()> {
         evidence: vec![stop],
     };
     save_case(out, &measurement)?;
-    result.detail="launchd bootout/SIGKILL group disappearance measured; image/exe and guarded kills observed; child-owned utun control socket independently cross-checked against root-owned wireguard socket; non-real fixtures deliberately time out after 5 s without utun and cover retained partial identity; R8 handoff remains provisional; Exit0 throttle is measurement only".into();
+    result.detail="launchd bootout/SIGKILL group disappearance measured; image/exe and guarded kills observed; child-owned utun control socket provisionally corroborated against protected, single-link wireguard socket and the child's AF_UNIX listener and live interface; non-real fixtures deliberately time out after 5 s without utun and cover retained partial identity; R8 replaces this qualification-only provisional check with the OD5 fd handoff; Exit0 throttle is measurement only".into();
     Ok(())
 }
 

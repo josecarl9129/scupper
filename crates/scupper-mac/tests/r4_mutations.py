@@ -7,6 +7,8 @@ import subprocess
 ROOT = Path(__file__).resolve().parents[3]
 SOURCE = ROOT / "crates/scupper-mac/src/platform/runtime.rs"
 LOGS = ROOT / "target/r4-validation"
+# The utun cross-check is exercised by native wiring mutants; mutating the
+# portable boolean passthrough cannot establish that the wiring is used.
 MUTANTS = [
     ("accept-self-dup", "    source >= 0 && target >= 0 && source != target\n}",
      "    source >= 0 && target >= 0\n}", "self_dup_is_rejected"),
@@ -21,7 +23,6 @@ MUTANTS = [
     ("accept-two-links", " && nlink == 1", "", "lock_rejects_extra_links_and_permissions"),
     ("omit-partial-image", "child.image = observed.image.or(retained);", "",
      "wrong_start_prevents_signal_and_partial_spawn_keeps_image"),
-    ("omit-utun-crosscheck", "if !protected_socket {", "if false && !protected_socket {", "utun_requires_independent_evidence"),
 ]
 
 def run(test):

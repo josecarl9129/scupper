@@ -178,10 +178,10 @@ pub fn pin_identity(meta: &PinMetadata, exe: super::ExeId) -> bool {
 pub fn pin_digest(actual: [u8; 32], reviewed: [u8; 32]) -> bool {
     actual == reviewed
 }
-/// A control-unit inference needs independent evidence from wireguard-go's socket.
+/// A control-unit inference needs provisional corroboration from the child's listening wireguard socket.
 ///
 /// # Errors
-/// Missing or unprotected independent evidence cannot authorize a utun name.
+/// Missing or unprotected corroborating evidence cannot authorize a utun name.
 pub fn utun_crosscheck(protected_socket: bool) -> Result<(), SysError> {
     if !protected_socket {
         return Err(SysError::Failed("native: utun cross-check unavailable"));
@@ -411,7 +411,7 @@ mod tests {
         assert!(valid_fd_action(10, 3));
     }
     #[test]
-    fn utun_requires_independent_evidence() {
+    fn utun_requires_corroborating_evidence() {
         assert!(utun_crosscheck(true).is_ok());
         assert!(utun_crosscheck(false).is_err());
     }
@@ -491,7 +491,7 @@ mod tests {
                 if item.file_type()?.is_dir() {
                     if !["target", "dev", ".git"]
                         .iter()
-                        .any(|name| item.file_name() == *name)
+                        .any(|name| item.path() == root.join(name))
                     {
                         pending.push(item.path());
                     }

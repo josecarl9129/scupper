@@ -85,8 +85,9 @@ int main(int argc, char **argv) {
     printf(","); BEGIN(proc_fdinfo);
     FIELD(proc_fdinfo, proc_fd); NEXT_FIELD(proc_fdinfo, proc_fdtype); END();
     printf(","); BEGIN(socket_fdinfo);
-    FIELD(socket_fdinfo, pfi); NEXT_FIELD(socket_fdinfo, psi); NEXT_FIELD(socket_fdinfo, psi.soi_kind); NEXT_FIELD(socket_fdinfo, psi.soi_proto.pri_kern_ctl); NEXT_FIELD(socket_fdinfo, psi.soi_proto.pri_kern_ctl.kcsi_unit); NEXT_FIELD(socket_fdinfo, psi.soi_proto.pri_kern_ctl.kcsi_name); END();
+    FIELD(socket_fdinfo, pfi); NEXT_FIELD(socket_fdinfo, psi); NEXT_FIELD(socket_fdinfo, psi.soi_kind); NEXT_FIELD(socket_fdinfo, psi.soi_type); NEXT_FIELD(socket_fdinfo, psi.soi_family); NEXT_FIELD(socket_fdinfo, psi.soi_options); NEXT_FIELD(socket_fdinfo, psi.soi_proto.pri_un.unsi_addr); NEXT_FIELD(socket_fdinfo, psi.soi_proto.pri_un.unsi_addr.ua_sun.sun_path); NEXT_FIELD(socket_fdinfo, psi.soi_proto.pri_kern_ctl); NEXT_FIELD(socket_fdinfo, psi.soi_proto.pri_kern_ctl.kcsi_unit); NEXT_FIELD(socket_fdinfo, psi.soi_proto.pri_kern_ctl.kcsi_name); END();
     printf(",\"SOCKINFO_KERN_CTL\":%d", SOCKINFO_KERN_CTL);
+    printf(",\"SOCKINFO_UN\":%d,\"PROX_FDTYPE_SOCKET\":%d,\"SO_ACCEPTCONN\":%d,\"UNIX_PATH_LEN\":%zu", SOCKINFO_UN, PROX_FDTYPE_SOCKET, SO_ACCEPTCONN, sizeof(((struct sockaddr_un *)0)->sun_path));
     printf(","); BEGIN(rt_msghdr2);
     FIELD(rt_msghdr2, rtm_msglen); NEXT_FIELD(rt_msghdr2, rtm_version);
     NEXT_FIELD(rt_msghdr2, rtm_addrs); NEXT_FIELD(rt_msghdr2, rtm_index); END();

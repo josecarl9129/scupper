@@ -234,9 +234,10 @@ jobs:
       fail-fast: false
       matrix:
         runner: [macos-15, macos-26]
-        group: [smoke, base, tool, probe, probe-hijack]
+        group: [smoke, base, tool, tool-mutants, probe, probe-hijack]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    # Native mutants: review estimate scaled to five experiments plus margin.
+    timeout-minutes: ${{ matrix.group == 'tool-mutants' && 60 || 30 }}
     continue-on-error: ${{ matrix.group == 'probe-hijack' }}
     env:
       CARGO_BUILD_JOBS: 2
@@ -313,12 +314,13 @@ jobs:
           cc -std=c11 -Wall -Wextra -Werror -arch arm64 -DIMAGE_VARIANT=2 crates/scupper-darwin/probe/base-image.c -o qual-out/base-image-b
           shasum -a 256 qual-out/base-image-a qual-out/base-image-b | tee qual-out/base-image-sha256.txt
       - name: Compile R4 harmless tool helper
-        if: matrix.group == 'tool'
+        if: matrix.group == 'tool' || matrix.group == 'tool-mutants'
         run: |
           cc -std=c11 -Wall -Wextra -Werror crates/scupper-darwin/probe/tool-child.c -o qual-out/tool-child
           cc -std=c11 -Wall -Wextra -Werror -arch x86_64 crates/scupper-darwin/probe/tool-child.c -o qual-out/tool-child-x86_64
           cc -std=c11 -Wall -Wextra -Werror -DCREATE_UTUN_NO_SOCKET crates/scupper-darwin/probe/tool-child.c -o qual-out/tool-child-utun
-          shasum -a 256 qual-out/tool-child qual-out/tool-child-x86_64 qual-out/tool-child-utun | tee qual-out/tool-sha256.txt
+          cc -std=c11 -Wall -Wextra -Werror -DCREATE_UTUN_NO_SOCKET -DCREATE_UTUN_STALE_SOCKET crates/scupper-darwin/probe/tool-child.c -o qual-out/tool-child-utun-stale
+          shasum -a 256 qual-out/tool-child qual-out/tool-child-x86_64 qual-out/tool-child-utun qual-out/tool-child-utun-stale | tee qual-out/tool-sha256.txt
       - name: Compile capability probes with full diagnostics
         if: matrix.group == 'probe' || matrix.group == 'probe-hijack'
         timeout-minutes: 2
@@ -337,7 +339,7 @@ jobs:
           /usr/bin/sudo /usr/bin/install -d -o root -g wheel -m 0700 /private/var/db/scupper-qual
           /usr/bin/sudo /usr/bin/install -o root -g wheel -m 0755 target/debug/scupper-mac-qual /private/var/db/scupper-qual/scupper-mac-qual
           /usr/bin/sudo /usr/bin/install -o root -g wheel -m 0755 qual-out/abi-probe /private/var/db/scupper-qual/abi-probe
-          for binary in qual-out/probe-* qual-out/wireguard-go qual-out/base-churn qual-out/base-image-a qual-out/base-image-b qual-out/tool-child qual-out/tool-child-x86_64 qual-out/tool-child-utun; do
+          for binary in qual-out/probe-* qual-out/wireguard-go qual-out/base-churn qual-out/base-image-a qual-out/base-image-b qual-out/tool-child qual-out/tool-child-x86_64 qual-out/tool-child-utun qual-out/tool-child-utun-stale; do
             if [ -f "$binary" ]; then
               /usr/bin/sudo /usr/bin/install -o root -g wheel -m 0755 "$binary" "/private/var/db/scupper-qual/$(basename "$binary")"
               /usr/bin/sudo /usr/bin/shasum -a 256 "/private/var/db/scupper-qual/$(basename "$binary")" >> qual-out/executed-capability-sha256.txt
@@ -347,19 +349,22 @@ jobs:
           /usr/bin/sudo /usr/bin/shasum -a 256 /private/var/db/scupper-qual/abi-probe | tee qual-out/executed-probe-sha256.txt
           test "$(cut -d ' ' -f 1 qual-out/built-harness-sha256.txt)" = "$(cut -d ' ' -f 1 qual-out/executed-harness-sha256.txt)"
       - name: Kill native R4 spawn mutants and confirm restored baseline
-        if: matrix.group == 'tool'
-        timeout-minutes: 8
+        if: matrix.group == 'tool-mutants'
+        timeout-minutes: 18
         run: python3 crates/scupper-mac/tests/r4_native_mutations.py
       - name: Preflight
+        if: matrix.group != 'tool-mutants'
         timeout-minutes: 3
         run: /usr/bin/sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,ImageOS,ImageVersion,RUNNER_NAME,GITHUB_RUN_ID,GITHUB_SHA /private/var/db/scupper-qual/scupper-mac-qual preflight --out /private/var/db/scupper-qual/evidence --disposable-runner
       - name: Arm independent launchd restore
+        if: matrix.group != 'tool-mutants'
         timeout-minutes: 1
         run: |
           after=1080
           # Independent recovery covers the harness and its restore captures.
           /usr/bin/sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT /private/var/db/scupper-qual/scupper-mac-qual arm --after "$after" --out /private/var/db/scupper-qual/evidence --disposable-runner
       - name: Run qualification cell
+        if: matrix.group != 'tool-mutants'
         timeout-minutes: ${{ matrix.group == 'tool' && 10 || 18 }}
         run: /usr/bin/sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,ImageOS,ImageVersion,RUNNER_NAME,GITHUB_RUN_ID,GITHUB_SHA /private/var/db/scupper-qual/scupper-mac-qual run --group ${{ matrix.group }} --out /private/var/db/scupper-qual/evidence --disposable-runner
       - name: Restore and stop dead-man
@@ -376,7 +381,9 @@ jobs:
           fi
           # Redirections are opened by the runner, never by a privileged process.
           /usr/bin/sudo /bin/launchctl print system/net.scupper.qual.restore > qual-out/deadman-final-status.log 2>&1 || true
-          /usr/bin/sudo /bin/launchctl bootout system/net.scupper.qual.restore > qual-out/deadman-bootout.log 2>&1 || cat qual-out/deadman-bootout.log
+          if [ "$restore_status" -eq 0 ]; then
+            /usr/bin/sudo /bin/launchctl bootout system/net.scupper.qual.restore > qual-out/deadman-bootout.log 2>&1 || cat qual-out/deadman-bootout.log
+          fi
           if /usr/bin/sudo /bin/launchctl print system/net.scupper.qual.restore > qual-out/deadman-after-bootout.log 2>&1; then
             cat qual-out/deadman-after-bootout.log
             restore_status=1

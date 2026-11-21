@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Native R4 mutation assertions, on disposable root-staged macOS runners only.
 
-Run as the runner user after staging /private/var/db/scupper-qual, before arming
-its ordinary dead-man. Each experiment has its own preflight, binary identity,
+Run as the runner user after staging /private/var/db/scupper-qual, in the dedicated tool-mutants CI group. Each experiment has its own preflight, binary identity,
 fsynced resource journal and independently armed restore. Never run cargo as root.
 """
 from pathlib import Path
@@ -10,6 +9,7 @@ import json
 import os
 import platform
 import subprocess
+import time
 
 ROOT = Path(__file__).resolve().parents[3]
 SOURCE = ROOT / "crates/scupper-darwin/src/sys.rs"
@@ -27,6 +27,10 @@ MUTANTS = [
      "if crate::platform::runtime::utun_crosscheck(protected_socket).is_err() {",
      "if false && crate::platform::runtime::utun_crosscheck(protected_socket).is_err() {",
      "utun cross-check assertion: uncorroborated control-unit name accepted"),
+    ("accept-socket-without-child-listener", NATIVE,
+     "let child_listening = listeners.len() == 1 && listeners[0] == socket;",
+     "let child_listening = true;",
+     "utun cross-check assertion: socket without child listener accepted"),
 ]
 
 
@@ -40,6 +44,7 @@ def privileged(args, *, check=True):
 
 
 def experiment(name, expected):
+    started = time.monotonic()
     build = command(["cargo", "build", "-p", "scupper-mac", "--bin",
                      "scupper-mac-qual", "--features", "qualification", "--locked"])
     (LOGS / f"{name}-build.log").write_text(build.stdout + build.stderr)
@@ -48,21 +53,23 @@ def experiment(name, expected):
     assert privileged(["/bin/test", "-e", str(stage)], check=False).returncode != 0
     assert privileged(["/bin/test", "-L", str(stage)], check=False).returncode != 0
     privileged(["/usr/bin/install", "-d", "-o", "root", "-g", "wheel", "-m", "0700", str(stage)])
-    for binary in [ROOT / "target/debug/scupper-mac-qual", STAGE / "abi-probe", STAGE / "tool-child", STAGE / "tool-child-utun"]:
+    for binary in [ROOT / "target/debug/scupper-mac-qual", STAGE / "abi-probe", STAGE / "tool-child", STAGE / "tool-child-utun", STAGE / "tool-child-utun-stale"]:
         privileged(["/usr/bin/install", "-o", "root", "-g", "wheel", "-m", "0755", str(binary), str(stage / binary.name)])
     executable = str(stage / "scupper-mac-qual")
     out = stage / "evidence"
     args = ["--out", str(out), "--disposable-runner"]
     try:
         privileged([executable, "preflight", *args])
-        privileged([executable, "arm", "--after", "180", *args])
+        privileged([executable, "arm", "--after", "600", *args])
         result = privileged([executable, "r4-tools", *args], check=False)
         stderr = privileged(["/bin/cat", str(out / "tool-worker-tools.stderr.log")], check=False)
-        (LOGS / f"{name}-assertion.log").write_text(result.stdout + result.stderr + stderr.stdout)
+        failure = privileged(["/bin/cat", str(out / "tool-worker-tools.json")], check=False)
+        (LOGS / f"{name}-assertion.log").write_text(result.stdout + result.stderr + stderr.stdout + failure.stdout)
         if expected is None:
             assert result.returncode == 0, result.stderr + stderr.stdout
         else:
-            assert result.returncode != 0 and expected in stderr.stdout, (name, result.stderr, stderr.stdout)
+            record = json.loads(failure.stdout)
+            assert result.returncode != 0 and expected in record.get("error", ""), (name, result.stderr, record)
             if name == "omit-cloexec-default":
                 # Each path must independently detect BOTH deliberately inheritable
                 # descriptors. Do not credit an earlier raw-spawn failure alone.
@@ -76,8 +83,14 @@ def experiment(name, expected):
     finally:
         restored = privileged([executable, "restore", *args], check=False)
         (LOGS / f"{name}-restore.log").write_text(restored.stdout + restored.stderr)
-        privileged(["/bin/launchctl", "bootout", "system/net.scupper.qual.restore"], check=False)
+        elapsed = time.monotonic() - started
+        (LOGS / f"{name}-timing.json").write_text(json.dumps({"experiment": name, "wall_seconds": elapsed}) + "\n")
+        print(f"TIMING {name}: {elapsed:.3f} s (build/preflight/arm/assertion/restore)", flush=True)
+        # Preserve independent recovery until restore has succeeded.
         assert restored.returncode == 0, restored.stdout + restored.stderr
+        service = f"system/net.scupper.qual.restore-mutation-{name}"
+        privileged(["/bin/launchctl", "bootout", service], check=False)
+        assert privileged(["/bin/launchctl", "print", service], check=False).returncode != 0
         # Retain protected experiment evidence for inspection; only the
         # journaled fixture tree is removed by restore, never recursive shell rm.
 

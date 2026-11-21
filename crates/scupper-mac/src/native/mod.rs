@@ -33,7 +33,23 @@ use std::{
     os::unix::{fs::OpenOptionsExt, net::UnixListener},
 };
 
+// provisional; final layout decided in 5a3, see Q-LOCK ancestor measurement
+const PROVISIONAL_RUN: &str = "/private/var/db/scupper/run";
+
 const UNIMPLEMENTED: SysError = SysError::Failed("native: not implemented");
+
+// R8 replaces this qualification-only provisional check with the OD5 handoff.
+fn corroborating_socket(name: &str, listeners: &[PathBuf]) -> bool {
+    let socket = Path::new("/var/run/wireguard").join(format!("{name}.sock"));
+    let directory = std::fs::symlink_metadata("/var/run/wireguard")
+        .is_ok_and(|m| m.is_dir() && m.uid() == 0 && m.mode() & 0o022 == 0);
+    let child_listening = listeners.len() == 1 && listeners[0] == socket;
+    directory
+        && child_listening
+        && scupper_darwin::interface_index(name).is_ok()
+        && std::fs::symlink_metadata(&socket)
+            .is_ok_and(|m| m.file_type().is_socket() && m.uid() == 0 && m.nlink() == 1)
+}
 
 /// Fixed native filesystem namespace; future methods derive their paths here.
 #[derive(Clone, Debug)]
@@ -48,8 +64,8 @@ impl Paths {
     pub fn production() -> Self {
         Self {
             root: PathBuf::from("/private/var/db/scupper"),
-            lock: PathBuf::from("/private/var/db/scupper/run/scupper.lock"),
-            control: PathBuf::from("/private/var/db/scupper/run/scupper.sock"),
+            lock: Path::new(PROVISIONAL_RUN).join("scupper.lock"),
+            control: Path::new(PROVISIONAL_RUN).join("scupper.sock"),
         }
     }
     /// Scratch namespace available only to qualification builds.
@@ -334,7 +350,8 @@ impl NativePlatform {
         }
         self.observe_child_utun(index, deadline)
     }
-    // R8: replaced by the OD5 utun fd handoff (see CHILD_LAUNCH).
+    // Qualification-only provisional corroboration; R8 replaces it with the OD5
+    // utun fd handoff (see CHILD_LAUNCH).
     fn observe_child_utun(&mut self, index: usize, deadline: Deadline) -> Result<Child, SysError> {
         let pid = self.records.history[index].pid;
         let version = scupper_darwin::proc_identifier(pid)
@@ -347,8 +364,16 @@ impl NativePlatform {
         {
             return Err(SysError::Failed("native: child exec changed"));
         }
+        let mut crosscheck_missing = false;
         loop {
-            self.expired(deadline)?;
+            if let Err(error) = self.expired(deadline) {
+                return Err(if crosscheck_missing {
+                    SysError::Failed("native: utun cross-check unavailable")
+                } else {
+                    error
+                });
+            }
+            let mut listeners = Vec::new();
             let mut names = BTreeSet::new();
             let owned = self
                 .records
@@ -360,6 +385,12 @@ impl NativePlatform {
                 .socket_fds()
                 .map_err(|_| SysError::Failed("native: child fd inventory"))?
             {
+                if let Some(path) = owned
+                    .unix_listener(fd)
+                    .map_err(|_| SysError::Failed("native: utun cross-check unavailable"))?
+                {
+                    listeners.push(path);
+                }
                 if let Some(control) = owned
                     .control_socket(fd)
                     .map_err(|_| SysError::Failed("native: child socket observation incomplete"))?
@@ -404,10 +435,9 @@ impl NativePlatform {
                 if after != version {
                     return Err(SysError::Failed("native: child exec changed"));
                 }
-                let socket = Path::new("/var/run/wireguard").join(format!("{name}.sock"));
-                let protected_socket = std::fs::symlink_metadata(socket)
-                    .is_ok_and(|m| m.file_type().is_socket() && m.uid() == 0);
+                let protected_socket = corroborating_socket(&name, &listeners);
                 if crate::platform::runtime::utun_crosscheck(protected_socket).is_err() {
+                    crosscheck_missing = true;
                     self.pause(Duration::from_millis(10), deadline);
                     continue;
                 }
@@ -888,7 +918,11 @@ impl Platform for NativePlatform {
         self.check_pin(&child, deadline)
     }
     fn check_pfctl(&mut self, deadline: Deadline) -> Result<(), SysError> {
-        self.check_pin(Path::new(crate::engine::PINNED_TOOLS[0]), deadline)
+        let pfctl = crate::engine::PINNED_TOOLS
+            .iter()
+            .find(|path| **path == crate::engine::PFCTL)
+            .ok_or(SysError::Failed("native: pfctl pin missing"))?;
+        self.check_pin(Path::new(pfctl), deadline)
     }
     fn spawned_children(&self) -> &[Child] {
         &self.records.history

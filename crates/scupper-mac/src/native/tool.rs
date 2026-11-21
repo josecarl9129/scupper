@@ -29,6 +29,8 @@ pub struct ToolResult {
     pub timed_out: bool,
     /// A pipe or poll operation failed.
     pub io_failed: bool,
+    /// Bytes of caller input that were not delivered, including early EPIPE.
+    pub stdin_unsent: usize,
     /// Time spent between SIGKILL and the final reap poll.
     pub kill_reap_ms: Option<u128>,
     /// Actual fence snapshot immediately before the timeout kill.
@@ -46,6 +48,9 @@ impl ToolResult {
         if self.timed_out {
             return Err(SysError::TimedOut);
         }
+        if self.stdin_unsent != 0 {
+            return Err(SysError::Unknown);
+        }
         crate::platform::runtime::complete_output(
             self.reap,
             self.stdout.truncated || self.stderr.truncated,
@@ -58,7 +63,11 @@ impl ToolResult {
     pub fn into_outcome(self) -> crate::platform::ToolOutcome<Vec<u8>> {
         crate::platform::runtime::tool_outcome(
             self.reap,
-            self.timed_out || self.io_failed || self.stdout.truncated || self.stderr.truncated,
+            self.timed_out
+                || self.io_failed
+                || self.stdin_unsent != 0
+                || self.stdout.truncated
+                || self.stderr.truncated,
             self.stdout.bytes,
         )
     }
@@ -145,6 +154,7 @@ pub(super) fn run(
         stderr: Output::default(),
         timed_out: false,
         io_failed: false,
+        stdin_unsent: input.len(),
         kill_reap_ms: None,
         fence_at_kill: None,
     };
@@ -203,6 +213,7 @@ pub(super) fn run(
         };
         pump(&mut streams, ready, input, &mut sent, &mut result, cap);
     }
+    result.stdin_unsent = input.len() - sent;
     if result.reap.settled() {
         records.tools.remove(index);
     }
@@ -236,7 +247,6 @@ fn pump(
                 Ok(n) => *sent += n,
                 Err(Errno::AGAIN | Errno::INTR) => {}
                 Err(Errno::PIPE) => {
-                    *sent = input.len();
                     streams[i] = None;
                 }
                 Err(_) => {
@@ -266,5 +276,30 @@ fn pump(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_exit_with_unsent_input_is_incomplete_and_unknown() {
+        let result = ToolResult {
+            pid: 42,
+            reap: Reap::Status(0),
+            stdout: Output::default(),
+            stderr: Output::default(),
+            timed_out: false,
+            io_failed: false,
+            stdin_unsent: 8192,
+            kill_reap_ms: None,
+            fence_at_kill: None,
+        };
+        assert_eq!(result.complete(), Err(SysError::Unknown));
+        assert_eq!(
+            result.into_outcome(),
+            crate::platform::ToolOutcome::Unknown { reaped: true }
+        );
     }
 }

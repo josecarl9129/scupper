@@ -714,6 +714,13 @@ impl Spawned {
     pub fn control_socket(&self, fd: i32) -> Result<Option<ControlSocket>, Errno> {
         read_control(self.pid(), fd)
     }
+    /// Observe an `AF_UNIX` stream listener through this owned-child capability.
+    ///
+    /// # Errors
+    /// Incomplete socket records or malformed bound addresses fail closed.
+    pub fn unix_listener(&self, fd: i32) -> Result<Option<std::path::PathBuf>, Errno> {
+        read_unix_listener(self.pid(), fd)
+    }
     /// Poll only this own spawn record. No wildcard wait or arbitrary-pid API.
     ///
     /// # Errors
@@ -956,10 +963,12 @@ pub fn proc_fds(pid: u32) -> Result<Vec<i32>, Errno> {
 ///
 /// # Errors
 /// Same bounded libproc errors as `proc_fds`.
+// XNU proc_info.h; compared against the SDK ABI probe.
+const PROX_FDTYPE_SOCKET: u32 = 2;
 fn socket_fds(pid: u32) -> Result<Vec<i32>, Errno> {
     Ok(proc_fd_records(pid)?
         .into_iter()
-        .filter(|(_, kind)| *kind == 2)
+        .filter(|(_, kind)| *kind == PROX_FDTYPE_SOCKET)
         .map(|(fd, _)| fd)
         .collect())
 }
@@ -1099,14 +1108,23 @@ pub fn spawn_signal_probe(
 // Unconsumed bytes are initialized opaque storage, never exposed.
 #[repr(C, align(8))]
 struct SocketFdInfo {
-    prefix: [u8; 256],
+    prefix: [u8; 176],
+    socket_type: i32,
+    protocol: i32,
+    family: i32,
+    options: i16,
+    buffer_fields: [u8; 66],
     kind: i32,
     reserved: [u8; 4],
-    control_prefix: [u8; 20],
-    unit: u32,
-    name: [u8; 96],
-    tail: [u8; 408],
+    protocol_fields: [u8; 528],
 }
+// XNU socket_fdinfo union offsets, pinned against the SDK in CONTROL_FIELDS.
+const CONTROL_UNIT: usize = 20;
+const CONTROL_NAME: usize = 24;
+const UNIX_ADDR: usize = 16;
+const UNIX_PATH: usize = UNIX_ADDR + 2;
+const UNIX_PATH_LEN: usize = 104;
+const SOCKINFO_UN: i32 = 3;
 /// Owned selected control fields; name decoding is the portable caller's job.
 #[derive(Clone, Debug)]
 pub struct ControlSocket {
@@ -1125,19 +1143,34 @@ fn read_control(pid: u32, fd: i32) -> Result<Option<ControlSocket>, Errno> {
     if pid <= 1 || fd < 0 {
         return Err(Errno::INVAL);
     }
+    let record = read_socket(pid, fd)?;
+    if record.kind != 6 {
+        return Ok(None);
+    }
+    let mut name = [0; 96];
+    name.copy_from_slice(&record.protocol_fields[CONTROL_NAME..CONTROL_NAME + 96]);
+    let unit = u32::from_ne_bytes(
+        record.protocol_fields[CONTROL_UNIT..CONTROL_NAME]
+            .try_into()
+            .map_err(|_| Errno::INVAL)?,
+    );
+    Ok(Some(ControlSocket { name, unit }))
+}
+fn read_socket(pid: i32, fd: i32) -> Result<SocketFdInfo, Errno> {
     let mut record = SocketFdInfo {
-        prefix: [0; 256],
+        prefix: [0; 176],
+        socket_type: 0,
+        protocol: 0,
+        family: 0,
+        options: 0,
+        buffer_fields: [0; 66],
         kind: 0,
         reserved: [0; 4],
-        control_prefix: [0; 20],
-        unit: 0,
-        name: [0; 96],
-        tail: [0; 408],
+        protocol_fields: [0; 528],
     };
     // SAFETY: aligned initialized SDK-sized storage provides exactly 792 bytes
     // for synchronous read-only libproc. All field bit patterns are valid. No
-    // pointers or opaque bytes escape; only selected control fields are read
-    // after checking the full returned length and the kind discriminant.
+    // pointers escape; fields are read only after checking the full reply size.
     let returned = unsafe { libc::proc_pidfdinfo(pid, fd, 3, (&raw mut record).cast(), 792) };
     if returned <= 0 {
         return Err(last_errno());
@@ -1145,31 +1178,91 @@ fn read_control(pid: u32, fd: i32) -> Result<Option<ControlSocket>, Errno> {
     if returned != 792 {
         return Err(Errno::INVAL);
     }
-    if record.kind != 6 {
+    Ok(record)
+}
+fn read_unix_listener(pid: u32, fd: i32) -> Result<Option<std::path::PathBuf>, Errno> {
+    use std::os::unix::ffi::OsStrExt;
+    let pid = i32::try_from(pid).map_err(|_| Errno::INVAL)?;
+    if pid <= 1 || fd < 0 {
+        return Err(Errno::INVAL);
+    }
+    let record = read_socket(pid, fd)?;
+    if record.kind != SOCKINFO_UN
+        || record.family != libc::AF_UNIX
+        || record.socket_type != libc::SOCK_STREAM
+        || i32::from(record.options) & libc::SO_ACCEPTCONN == 0
+    {
         return Ok(None);
     }
-    Ok(Some(ControlSocket {
-        name: record.name,
-        unit: record.unit,
-    }))
+    let addr = &record.protocol_fields;
+    let length = usize::from(addr[UNIX_ADDR]);
+    if addr[UNIX_ADDR + 1] != u8::try_from(libc::AF_UNIX).map_err(|_| Errno::INVAL)?
+        || !(3..=UNIX_PATH_LEN + 2).contains(&length)
+    {
+        return Err(Errno::INVAL);
+    }
+    let path = &addr[UNIX_PATH..UNIX_PATH + UNIX_PATH_LEN];
+    let end = path.iter().position(|b| *b == 0).ok_or(Errno::INVAL)?;
+    // sun_len may exclude the NUL, but must cover every pathname byte.
+    if end == 0 || end > length - 2 || path[0] != b'/' {
+        return Err(Errno::INVAL);
+    }
+    Ok(Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+        &path[..end],
+    ))))
+}
+/// Resolve a live interface name; zero or an invalid C string fails closed.
+///
+/// # Errors
+/// Returns errno when the interface does not exist.
+pub fn interface_index(name: &str) -> Result<u32, Errno> {
+    let name = std::ffi::CString::new(name).map_err(|_| Errno::INVAL)?;
+    // SAFETY: live NUL-terminated name, read-only synchronous lookup.
+    let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+    if index == 0 {
+        Err(last_errno())
+    } else {
+        Ok(index)
+    }
 }
 /// Socket/control layout compared to the SDK probe in every tool cell.
-pub const CONTROL_FIELDS: [(&str, usize); 6] = [
+pub const CONTROL_FIELDS: [(&str, usize); 15] = [
     ("size", std::mem::size_of::<SocketFdInfo>()),
     ("psi.soi_kind", std::mem::offset_of!(SocketFdInfo, kind)),
     (
+        "psi.soi_type",
+        std::mem::offset_of!(SocketFdInfo, socket_type),
+    ),
+    ("psi.soi_family", std::mem::offset_of!(SocketFdInfo, family)),
+    (
+        "psi.soi_options",
+        std::mem::offset_of!(SocketFdInfo, options),
+    ),
+    (
         "psi.soi_proto.pri_kern_ctl",
-        std::mem::offset_of!(SocketFdInfo, control_prefix),
+        std::mem::offset_of!(SocketFdInfo, protocol_fields),
     ),
     (
         "psi.soi_proto.pri_kern_ctl.kcsi_unit",
-        std::mem::offset_of!(SocketFdInfo, unit),
+        std::mem::offset_of!(SocketFdInfo, protocol_fields) + CONTROL_UNIT,
     ),
     (
         "psi.soi_proto.pri_kern_ctl.kcsi_name",
-        std::mem::offset_of!(SocketFdInfo, name),
+        std::mem::offset_of!(SocketFdInfo, protocol_fields) + CONTROL_NAME,
+    ),
+    (
+        "psi.soi_proto.pri_un.unsi_addr",
+        std::mem::offset_of!(SocketFdInfo, protocol_fields) + UNIX_ADDR,
+    ),
+    (
+        "psi.soi_proto.pri_un.unsi_addr.ua_sun.sun_path",
+        std::mem::offset_of!(SocketFdInfo, protocol_fields) + UNIX_PATH,
     ),
     ("SOCKINFO_KERN_CTL", 6),
+    ("SOCKINFO_UN", SOCKINFO_UN as usize),
+    ("PROX_FDTYPE_SOCKET", PROX_FDTYPE_SOCKET as usize),
+    ("SO_ACCEPTCONN", libc::SO_ACCEPTCONN as usize),
+    ("UNIX_PATH_LEN", UNIX_PATH_LEN),
 ];
 const _: () = assert!(std::mem::size_of::<SocketFdInfo>() == 792);
 

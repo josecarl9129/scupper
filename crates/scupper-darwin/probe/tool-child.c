@@ -12,6 +12,8 @@
 #include <sys/ioctl.h>
 #include <sys/kern_control.h>
 #include <sys/sys_domain.h>
+#include <sys/un.h>
+#include <net/if.h>
 #endif
 
 int main(int argc, char **argv) {
@@ -87,8 +89,24 @@ int main(int argc, char **argv) {
         address.sc_id = info.ctl_id;
         address.sc_unit = 0;
         if (connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0) return 13;
-        /* Deliberately never publish /var/run/wireguard/<name>.sock. The native
-         * adapter must refuse this unit-derived name without independent proof.
+#ifdef CREATE_UTUN_STALE_SOCKET
+        char name[IFNAMSIZ] = {0};
+        socklen_t size = sizeof(name);
+        if (getsockopt(fd, SYSPROTO_CONTROL, 2 /* UTUN_OPT_IFNAME */, name, &size) != 0) return 14;
+        struct sockaddr_un address_un = {0};
+        address_un.sun_family = AF_UNIX;
+        address_un.sun_len = sizeof(address_un);
+        if (snprintf(address_un.sun_path, sizeof(address_un.sun_path),
+                     "/var/run/wireguard/%s.sock", name) >= (int)sizeof(address_un.sun_path)) return 15;
+        int listener = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (listener < 0 || bind(listener, (struct sockaddr *)&address_un, sizeof(address_un)) != 0) return 16;
+        /* Bind without ever listening: even a fleeting listen/close interval
+         * could legitimately satisfy a concurrent observation. Leave a root-
+         * owned, single-link stale inode and a live utun. Journaled by R4. */
+        close(listener);
+#endif
+        /* Neither fixture keeps a UAPI listener. The native adapter must refuse
+         * this unit-derived name without provisional listener corroboration.
          * Closing/killing this journaled child destroys its kernel interface. */
         sleep(110);
         close(fd);

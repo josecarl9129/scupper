@@ -46,12 +46,9 @@ mod tests;
 
 /// Foreground child pin; setup qualification must verify its ownership and hash.
 pub const CHILD_PATH: &str = "/opt/scupper/wireguard-go";
-pub(crate) const PINNED_TOOLS: [&str; 4] = [
-    "/sbin/pfctl",
-    "/sbin/route",
-    "/usr/sbin/scutil",
-    "/sbin/ifconfig",
-];
+pub(crate) const PFCTL: &str = "/sbin/pfctl";
+pub(crate) const PINNED_TOOLS: [&str; 4] =
+    [PFCTL, "/sbin/route", "/usr/sbin/scutil", "/sbin/ifconfig"];
 
 /// Dispatch state, independent of reference accounting and held policy kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

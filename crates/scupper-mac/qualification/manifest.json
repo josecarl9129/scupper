@@ -121,6 +121,19 @@
       "minimum_iterations": 1,
       "budget_minutes": 1,
       "supported_assumptions": []
+    },
+    {
+      "id": "Q-TOOL-NATIVE-MUTANTS",
+      "group": "tool-mutants",
+      "minimum_iterations": 5,
+      "budget_minutes": 18,
+      "supported_assumptions": []
     }
-  ]
+  ],
+  "group_budgets": {
+    "tool-mutants": {
+      "cell_budget_minutes": 60,
+      "overhead_minutes": 36
+    }
+  }
 }

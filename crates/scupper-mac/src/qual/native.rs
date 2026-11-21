@@ -25,7 +25,20 @@ use super::{
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 const LABEL: &str = "net.scupper.qual.restore";
-const SERVICE: &str = "system/net.scupper.qual.restore";
+// Mutation campaigns have a separate recovery service for each experiment.
+fn restore_service(out: &Path) -> String {
+    let experiment = out
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|n| n.to_str())
+        .filter(|n| {
+            n.starts_with("mutation-") && n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        });
+    experiment.map_or_else(
+        || format!("system/{LABEL}"),
+        |name| format!("system/{LABEL}-{name}"),
+    )
+}
 #[path = "base.rs"]
 mod base;
 #[path = "resources.rs"]
@@ -196,10 +209,7 @@ pub(super) fn dispatch(args: &[String]) -> Result<()> {
         }
         "restore" => restore_checked(&options.out),
         "deadman" => deadman(&options),
-        "r4-worker" => {
-            require_ack(&options.out)?;
-            tool::worker(&options.out, options.name.as_deref().unwrap_or("hold"))
-        }
+        "r4-worker" => tool::worker(&options.out, options.name.as_deref().unwrap_or("hold")),
         "r4-tools" => tool::mutation_tools(&options.out),
         "r4-lock" => {
             require_ack(&options.out)?;
@@ -516,7 +526,7 @@ fn require_ack(out: &Path) -> Result<Ack> {
     if process_identity(out, std::process::id())?.pgid == ack.pgid {
         return Err("dead-man shares the controller process group".into());
     }
-    let job = invoke("/bin/launchctl", &["print", SERVICE]);
+    let job = invoke("/bin/launchctl", &["print", &restore_service(out)]);
     write_json(out, "deadman-status.json", &job)?;
     if !job.complete()
         || !job
@@ -546,13 +556,17 @@ fn arm(options: &Options) -> Result<()> {
         .to_str()
         .ok_or("non-UTF8 executable path")?);
     let out = xml(options.out.to_str().ok_or("non-UTF8 artifact path")?);
+    let service = restore_service(&options.out);
+    let label = service
+        .strip_prefix("system/")
+        .ok_or("restore service domain")?;
     // launchd starts the worker independently of the controller's process group.
     // RunAtLoad, no KeepAlive: a successful restore must not restart it.
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-<key>Label</key><string>{LABEL}</string>
+<key>Label</key><string>{label}</string>
 <key>ProgramArguments</key><array><string>{exe}</string><string>deadman</string><string>--after</string><string>{after}</string><string>--out</string><string>{out}</string><string>--disposable-runner</string></array>
 <key>RunAtLoad</key><true/>
 <key>AbandonProcessGroup</key><false/>
@@ -608,7 +622,7 @@ fn arm_diagnostics(out: &Path) -> Result<()> {
     write_json(
         out,
         "deadman-failed-status.json",
-        &invoke("/bin/launchctl", &["print", SERVICE]),
+        &invoke("/bin/launchctl", &["print", &restore_service(out)]),
     )?;
     let plist = out.join("restore.plist");
     write_json(

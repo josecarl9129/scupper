@@ -93,8 +93,20 @@ pub struct Manifest {
     pub cell_budget_minutes: u32,
     /// Reserved checkout, build and restore budget.
     pub overhead_minutes: u32,
+    /// Separate CI budgets for groups that do not run in the ordinary cell.
+    #[serde(default)]
+    pub group_budgets: BTreeMap<String, GroupBudget>,
     /// Cases currently implemented.
     pub cases: Vec<Case>,
+}
+
+/// Dedicated CI group budget, including its own setup and recovery margin.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct GroupBudget {
+    /// Entire job timeout.
+    pub cell_budget_minutes: u32,
+    /// Setup and recovery reservation outside the experiments.
+    pub overhead_minutes: u32,
 }
 
 impl Manifest {
@@ -117,7 +129,18 @@ impl Manifest {
             *groups.entry(&case.group).or_default() += u64::from(case.budget_minutes);
         }
         !groups.is_empty()
-            && groups.values().all(|minutes| {
+            && groups.iter().all(|(group, minutes)| {
+                let available = if let Some(budget) = self.group_budgets.get(*group) {
+                    let Some(value) = budget
+                        .cell_budget_minutes
+                        .checked_sub(budget.overhead_minutes)
+                    else {
+                        return false;
+                    };
+                    value
+                } else {
+                    available
+                };
                 minutes * 110 <= u64::from(available) * 100
                     && minutes * 60 + MAX_FINAL_RESTORE_SECONDS <= u64::from(available) * 60
             })
@@ -155,7 +178,7 @@ mod tests {
         assert!(manifest.budgets_fit());
         assert_eq!(manifest.cell_budget_minutes - manifest.overhead_minutes, 18);
         assert_eq!(MAX_FINAL_RESTORE_SECONDS, 240);
-        assert_eq!(manifest.cases.len(), 17);
+        assert_eq!(manifest.cases.len(), 18);
         let tools: Vec<_> = manifest
             .cases
             .iter()
@@ -187,6 +210,53 @@ mod tests {
         let mut over = manifest;
         over.cases[0].budget_minutes = 18;
         assert!(!over.budgets_fit());
+        Ok(())
+    }
+
+    #[test]
+    fn native_mutants_have_an_isolated_ci_budget() -> Result<(), Box<dyn std::error::Error>> {
+        let manifest = Manifest::bundled()?;
+        let budget = manifest
+            .group_budgets
+            .get("tool-mutants")
+            .ok_or("mutation budget")?;
+        let experiment = manifest
+            .cases
+            .iter()
+            .find(|c| c.group == "tool-mutants")
+            .ok_or("mutation case")?;
+        assert_eq!(experiment.minimum_iterations, 5);
+        let workflow = include_str!("../../../../.github/workflows/ci.yml");
+        let native = workflow
+            .split("  macos-native:")
+            .nth(1)
+            .ok_or("native CI job")?;
+        assert!(native.contains("runner: [macos-15, macos-26]"));
+        assert!(native.contains("group: [smoke, base, tool, tool-mutants, probe, probe-hijack]"));
+        assert!(native.contains(&format!(
+            "matrix.group == 'tool-mutants' && {} || 30",
+            budget.cell_budget_minutes
+        )));
+        assert!(native.contains("continue-on-error: ${{ matrix.group == 'probe-hijack' }}"));
+        let step = native
+            .split("- name: Kill native R4")
+            .nth(1)
+            .ok_or("mutant step")?
+            .split("- name: Preflight")
+            .next()
+            .ok_or("step boundary")?;
+        assert!(step.contains("if: matrix.group == 'tool-mutants'"));
+        assert!(step.contains(&format!("timeout-minutes: {}", experiment.budget_minutes)));
+        let mut insufficient = Manifest::bundled()?;
+        insufficient
+            .group_budgets
+            .get_mut("tool-mutants")
+            .ok_or("mutation budget")?
+            .cell_budget_minutes = budget.overhead_minutes + experiment.budget_minutes;
+        assert!(
+            !insufficient.budgets_fit(),
+            "mutants need recovery margin too"
+        );
         Ok(())
     }
 

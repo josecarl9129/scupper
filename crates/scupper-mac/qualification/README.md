@@ -142,3 +142,31 @@ actual scheduling/IPC delays remain visible. The bounded command capture is
 1 MiB per stream to hold this census without truncation. PF starter series now
 include n=64, and pf-eexist records a deliberately stale release against an
 otherwise harness-owned live token, including reissued-value effects and text.
+
+R4 native mutation experiments run only in the `tool-mutants` matrix group on
+both runners, with `continue-on-error: false`. Its job timeout is 60 minutes;
+the mutation step has 18 minutes. The manifest reserves 36 minutes outside the
+experiments for setup, builds, lint/tests and recovery. The review estimated
+6–10 minutes for four experiments; scaling to five gives 7.5–12.5 minutes before
+crediting the removed 45-second failure polls. Eighteen minutes adds margin;
+the first runner timings must be used to revise this provisional budget.
+Each experiment logs build/preflight/arm/assertion/restore wall time, has its own
+restore service, and stops that service only after successful restore. The
+ordinary `tool` cell has its own fresh preflight and never runs these mutants.
+
+The utun cross-check is qualification-only provisional corroboration. It requires
+a protected root-owned runtime directory, a root-owned single-link socket, a live
+interface index and exactly one matching AF_UNIX stream listener in the owned
+child's fd table. SDK layout evidence includes the UNIX bound address and
+SO_ACCEPTCONN option. Absent and stale socket fixtures require the specific
+cross-check refusal. R8 replaces this with the OD5 fd handoff; no production
+assumption is promoted here. The portable boolean-passthrough utun mutant was
+dropped because only native wiring mutations exercise these observations.
+
+Q-LOCK also records every ancestor of both `/Library/Application Support` and
+`/private/var/db` and whether a hypothetical root:wheel 0755 child beneath each
+would pass the strict ancestor check. These are read-only measurements; modeled
+directories are created only inside the journaled scratch tree. The provisional
+run path does not settle the 5a3 layout, user traversal or reset/removal policy.
+The existing `macos` job's `Clippy portable CLI and release tooling` step already
+runs clippy without features, including the adapter and its Darwin dependency.
