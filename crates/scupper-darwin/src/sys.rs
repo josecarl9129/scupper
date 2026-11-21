@@ -358,6 +358,11 @@ pub fn proc_pidpath(pid: u32) -> Result<std::path::PathBuf, Errno> {
 
 /// Size and consumed offsets of XNU's API `proc_uniqidentifierinfo` (flavor 17).
 pub const IDENTIFIER_SIZE: usize = 56;
+const IDENTIFIER_SIZE_C: c_int = 56;
+const _: () = {
+    assert!(IDENTIFIER_SIZE <= c_int::MAX as usize);
+    assert!(IDENTIFIER_SIZE == IDENTIFIER_SIZE_C as usize);
+};
 /// Identifier field offsets, checked against the C probe and portable decoder.
 pub const IDENTIFIER_FIELDS: [(&str, usize); 3] = [
     ("p_uuid", std::mem::offset_of!(UniqueIdentifier, uuid)),
@@ -390,7 +395,6 @@ const _: () = {
 ///
 /// # Errors
 /// Rejects every short/long reply and invalid pid; preserves syscall errno.
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)] // SDK-pinned size 56 fits c_int.
 pub fn proc_identifier(pid: u32) -> Result<[u8; IDENTIFIER_SIZE], Errno> {
     let pid = i32::try_from(pid).map_err(|_| Errno::INVAL)?;
     if pid <= 0 {
@@ -400,19 +404,12 @@ pub fn proc_identifier(pid: u32) -> Result<[u8; IDENTIFIER_SIZE], Errno> {
     // SAFETY: the exclusive, initialized 56-byte buffer lives through this
     // synchronous call; proc_pidinfo copies bytes and requires no alignment.
     // Flavor 17 is read-only. Only a full-sized success exposes these bytes.
-    let returned = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            17,
-            0,
-            bytes.as_mut_ptr().cast(),
-            IDENTIFIER_SIZE as c_int,
-        )
-    };
+    let returned =
+        unsafe { libc::proc_pidinfo(pid, 17, 0, bytes.as_mut_ptr().cast(), IDENTIFIER_SIZE_C) };
     if returned <= 0 {
         return Err(last_errno());
     }
-    if returned != IDENTIFIER_SIZE as c_int {
+    if returned != IDENTIFIER_SIZE_C {
         return Err(Errno::INVAL);
     }
     Ok(bytes)

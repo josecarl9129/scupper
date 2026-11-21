@@ -1618,6 +1618,7 @@ fn image_history_requires_consistent_readable_copies() {
             panic!("expected lifecycle trust");
         };
         assert!(!snapshot.image_history.known);
+        assert_eq!(snapshot.image_history.boot, None);
         assert!(snapshot.image_history.uuids.contains(&[1; 16]));
     }
     let StartDecision::Trust { snapshot, .. } = decide(valid(), valid()) else {
@@ -1649,4 +1650,30 @@ fn image_initial_is_known_empty_only_with_installers_proven_boot() {
     let unknown = Snapshot::initial(Some(501), None);
     assert!(!unknown.image_history.known);
     assert_eq!(unknown.image_history.boot, None);
+}
+
+#[test]
+fn image_same_history_different_sequence_is_known() {
+    let mut s = Snapshot::initial(Some(501), Some(boot()));
+    s.image_history.record([1; 16]);
+    let mut older = s.clone();
+    older.owner_uid = Some(502); // Lifecycle bytes need not agree either.
+    let StartDecision::Trust { snapshot, .. } = decide(class(3, &s), class(2, &older)) else {
+        panic!("expected newer A lifecycle trust");
+    };
+    assert!(snapshot.image_history.known_on(Some(&boot())));
+    assert_eq!(snapshot.image_history, s.image_history);
+}
+
+#[test]
+fn image_different_histories_are_unknown_without_epoch() {
+    let older = Snapshot::initial(Some(501), Some(boot()));
+    let mut newer = older.clone();
+    newer.image_history.record([2; 16]);
+    let StartDecision::Trust { snapshot, .. } = decide(class(3, &newer), class(2, &older)) else {
+        panic!("expected newer A lifecycle trust");
+    };
+    assert!(!snapshot.image_history.known);
+    assert_eq!(snapshot.image_history.boot, None);
+    assert!(snapshot.image_history.uuids.contains(&[2; 16]));
 }

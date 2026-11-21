@@ -111,7 +111,7 @@ pub fn macho_uuid(bytes: &[u8]) -> Result<[u8; 16], SysError> {
 }
 
 /// Bounded random-access parser: headers/table, then at most 1 MiB of load
-/// commands per native slice. The reader checks its deadline before each read.
+/// commands across all native slices. The reader checks its deadline before each read.
 /// All native arm64 slices must agree; no subtype preference is inferred.
 ///
 /// # Errors
@@ -126,6 +126,7 @@ pub fn read_macho_uuid(
         offset: u64,
         size: u64,
         expected: Option<(u32, u32)>,
+        remaining_commands: &mut usize,
     ) -> Result<[u8; 16], SysError> {
         if size < 32 {
             return Err(INVALID);
@@ -137,19 +138,21 @@ pub fn read_macho_uuid(
             return Err(INVALID);
         }
         let commands = usize::try_from(word(&header, 20, false)?).map_err(|_| INVALID)?;
-        if commands > 1024 * 1024 || 32 + commands as u64 > size {
+        if commands > *remaining_commands || 32 + commands as u64 > size {
             return Err(INVALID);
         }
+        *remaining_commands -= commands;
         header.extend(read(offset.checked_add(32).ok_or(INVALID)?, commands)?);
         thin(&header)
     }
+    let mut remaining_commands = 1024 * 1024;
     if file_size < 8 {
         return Err(INVALID);
     }
     let header = read(0, 8)?;
     let magic = word(&header, 0, true)?;
     if !matches!(magic, 0xcafe_babe | 0xcafe_babf) {
-        return read_thin(&mut read, 0, file_size, None);
+        return read_thin(&mut read, 0, file_size, None, &mut remaining_commands);
     }
     let count = usize::try_from(word(&header, 4, true)?).map_err(|_| INVALID)?;
     let stride = if magic == 0xcafe_babf { 32 } else { 20 };
@@ -193,7 +196,13 @@ pub fn read_macho_uuid(
     }
     let mut uuid = None;
     for (offset, size, cpu, subtype) in slices {
-        let value = read_thin(&mut read, offset, size, Some((cpu, subtype)))?;
+        let value = read_thin(
+            &mut read,
+            offset,
+            size,
+            Some((cpu, subtype)),
+            &mut remaining_commands,
+        )?;
         if uuid.is_some_and(|previous| previous != value) {
             return Err(INVALID);
         }
@@ -320,6 +329,53 @@ mod tests {
             }),
             Err(SysError::TimedOut)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn fat_load_command_budget_is_shared_across_slices() -> Result<(), SysError> {
+        for extra in [0_u32, 8] {
+            let mut bytes = vec![0; 48];
+            bytes[..4].copy_from_slice(&0xcafe_babe_u32.to_be_bytes());
+            bytes[4..8].copy_from_slice(&2_u32.to_be_bytes());
+            let mut command_ranges = Vec::new();
+            for index in 0..2_u32 {
+                let commands = 512 * 1024 + index * extra;
+                let offset = u32::try_from(bytes.len()).map_err(|_| INVALID)?;
+                let at = 8 + usize::try_from(index).map_err(|_| INVALID)? * 20;
+                for (delta, value) in [
+                    (0, 0x0100_000c_u32),
+                    (4, index * 2),
+                    (8, offset),
+                    (12, 32 + commands),
+                ] {
+                    bytes[at + delta..at + delta + 4].copy_from_slice(&value.to_be_bytes());
+                }
+                let mut slice = minimal([3; 16], index * 2);
+                slice[16..20].copy_from_slice(&2_u32.to_le_bytes());
+                slice[20..24].copy_from_slice(&commands.to_le_bytes());
+                slice.resize(32 + usize::try_from(commands).map_err(|_| INVALID)?, 0);
+                slice[56..60].copy_from_slice(&0x19_u32.to_le_bytes());
+                slice[60..64].copy_from_slice(&(commands - 24).to_le_bytes());
+                command_ranges.push((u64::from(offset) + 32, commands as usize));
+                bytes.extend(slice);
+            }
+            let mut commands_read = 0;
+            let result = read_macho_uuid(bytes.len() as u64, |offset, length| {
+                if command_ranges.contains(&(offset, length)) {
+                    commands_read += length;
+                }
+                let at = usize::try_from(offset).map_err(|_| INVALID)?;
+                Ok(bytes[at..at + length].to_vec())
+            });
+            if extra == 0 {
+                assert_eq!(result?, [3; 16]);
+                assert_eq!(commands_read, 1024 * 1024);
+            } else {
+                assert!(result.is_err());
+                assert_eq!(commands_read, 512 * 1024);
+            }
+        }
         Ok(())
     }
 

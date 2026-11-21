@@ -250,7 +250,20 @@ fn processes(out: &Path, platform: &mut NativePlatform, result: &mut CaseResult)
     file.sync_all()?;
     fs::File::open(out)?.sync_all()?;
     write_json(out, "base-initial-snapshot.json", &initial)?;
-    let history = initial.image_history;
+    let crate::snapshot::CopyClass::V {
+        snapshot: decoded, ..
+    } = crate::snapshot::classify_copy(crate::snapshot::CopyRead::Bytes(fs::read(
+        out.join("base-initial-snapshot.bin"),
+    )?))
+    else {
+        return Err("written initial snapshot failed engine decoding".into());
+    };
+    if !decoded.image_history.known_on(boot.as_ref()) {
+        return Err(environment_issue(
+            "initial history lacks proven current boot",
+        ));
+    }
+    let history = decoded.image_history;
     let child_path = std::env::current_exe()?.with_file_name("wireguard-go");
     let mut pin_results = Vec::new();
     let mut pins = Vec::new();

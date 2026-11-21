@@ -35,6 +35,12 @@ pub(super) fn census_classification(
     if history.uuids.contains(&image.uuid) {
         return "withheld: equals history".into();
     }
+    if proc.name.is_none() {
+        return "withheld: name unknown".into();
+    }
+    if !history.known_on(boot) {
+        return "withheld: history unknown".into();
+    }
     "withheld: name".into()
 }
 
@@ -243,6 +249,16 @@ mod tests {
         history.record([3; 16]);
         assert_eq!(label(&proc, &history), "withheld: equals history");
         history = ImageHistory::empty_for_boot(boot.clone());
+        proc.name = None;
+        assert_eq!(label(&proc, &history), "withheld: name unknown");
+        // The production caller requires known history; release builds still
+        // explain uncertainty if that precondition is ever violated.
+        if !cfg!(debug_assertions) {
+            history.known = false;
+            proc.name = Some("foreign".into());
+            assert_eq!(label(&proc, &history), "withheld: history unknown");
+            history.known = true;
+        }
         proc.name = Some("wireguard-go".into());
         assert_eq!(label(&proc, &history), "withheld: name");
         proc.image.as_mut().ok_or("image absent")?.uuid = [2; 16];

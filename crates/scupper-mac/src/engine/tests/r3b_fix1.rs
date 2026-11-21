@@ -177,6 +177,9 @@ fn torn_pair_uses_current_epoch_not_surviving_old_epoch() {
         } else if disagreement != 0 {
             if disagreement == 1 {
                 s.image_history.record([3; 16]);
+            } else {
+                // A boot reset disagrees even when both UUID sets are empty.
+                s.image_history = ImageHistory::empty_for_boot(p.boot.clone().unwrap());
             }
             p.copies[0].durable = Some(snapshot::encode(2, &s).unwrap());
         } else {
@@ -385,6 +388,8 @@ fn failed_spawn_history_commit_blocks_before_another_inventory() {
         Err(SysError::Failed("image history write failed"))
     );
     assert_eq!(e.mode, Mode::PersistBlocked);
+    assert!(e.last_sweep.is_some());
+    assert!(!e.freeing_allowed());
     assert!(e.snapshot.image_history.uuids.contains(&[99; 16]));
     assert!(!e.committed.image_history.uuids.contains(&[99; 16]));
     let spawn = e
@@ -394,4 +399,78 @@ fn failed_spawn_history_commit_blocks_before_another_inventory() {
         .position(|c| *c == Call::Spawn)
         .unwrap();
     assert!(!e.platform.calls[spawn + 1..].contains(&Call::Processes));
+}
+
+#[test]
+fn unreadable_boot_start_refuses_spawn_and_never_resets_history_on_readable_restart() {
+    let mut s = initial();
+    s.image_history = ImageHistory::empty_for_boot(older_boot());
+    s.image_history.record([44; 16]);
+    s.machine.previous_generation = Some(1);
+    let mut p = fixture(&s);
+    let current_boot = p.boot.clone();
+    p.mutate(Mutation::BootIdUnavailable);
+    let mut e = Engine::start(p).unwrap();
+    assert!(!e.snapshot.image_history.known);
+    assert_eq!(e.snapshot.image_history.boot, None);
+    assert_eq!(e.start_fence, StartFence::Closed);
+    e.platform.calls.clear();
+    assert_eq!(
+        e.execute(Step::StartChild),
+        Err(SysError::Failed("spawn boot unknown"))
+    );
+    assert!(!e.platform.calls.contains(&Call::Spawn));
+    assert!(!e.platform.calls.contains(&Call::Write(Copy::A)));
+    assert!(!e.platform.calls.contains(&Call::Write(Copy::B)));
+    let mut p = e.into_platform();
+    p.boot = current_boot.clone();
+    p.restart();
+    let mut e = Engine::start(p).unwrap();
+    assert!(!e.snapshot.image_history.known);
+    assert_eq!(e.snapshot.image_history.boot, current_boot);
+    assert!(e.snapshot.image_history.uuids.contains(&[44; 16]));
+    assert_eq!(
+        read_snapshot(&mut e.platform, Copy::A).image_history,
+        e.snapshot.image_history
+    );
+}
+
+#[test]
+fn readable_boot_before_spawn_records_current_epoch_and_restart_keeps_uuid() {
+    let mut s = initial();
+    s.image_history = ImageHistory::empty_for_boot(older_boot());
+    s.image_history.record([44; 16]);
+    s.machine.previous_generation = Some(1);
+    let mut p = fixture(&s);
+    let current_boot = p.boot.clone();
+    p.mutate(Mutation::BootIdUnavailable);
+    let mut e = Engine::start(p).unwrap();
+    e.platform.boot = current_boot.clone();
+    assert!(e.execute(Step::StartChild).is_ok());
+    let uuid = e.child.as_ref().unwrap().image.unwrap().uuid;
+    assert!(!e.committed.image_history.known);
+    assert_eq!(e.committed.image_history.boot, current_boot);
+    assert!(e.committed.image_history.uuids.contains(&uuid));
+    assert!(e.committed.image_history.uuids.contains(&[44; 16]));
+    let mut p = e.into_platform();
+    p.restart();
+    let mut e = Engine::start(p).unwrap();
+    assert!(!e.snapshot.image_history.known);
+    assert_eq!(e.snapshot.image_history.boot, current_boot);
+    assert!(e.snapshot.image_history.uuids.contains(&uuid));
+    assert_eq!(
+        read_snapshot(&mut e.platform, Copy::B).image_history,
+        e.snapshot.image_history
+    );
+}
+
+#[test]
+fn initial_in_a_only_withholds_foreign_pathless_process_for_5a3() {
+    let mut p = fixture(&initial());
+    p.mutate(Mutation::MissingCopy(Copy::B));
+    foreign(&mut p, false);
+    let e = Engine::start(p).unwrap();
+    assert!(!e.snapshot.image_history.known);
+    assert_eq!(e.snapshot.image_history.boot, e.platform.boot);
+    withheld(&e);
 }

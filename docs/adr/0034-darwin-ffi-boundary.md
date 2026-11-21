@@ -99,38 +99,51 @@ with the PID. UUID equality never selects or signals a process. A foreign
 pathless process sharing a recorded or pinned build UUID blocks until it exits.
 A translated foreign process is compared by its own main-image UUID only.
 
-Snapshot family/format 2 adds boot-scoped spawned-image history, bounded to eight
-distinct UUIDs. Missing, unreadable, corrupt and format-1 history is unknown,
-never empty. Overflow marks the boot unknown and never evicts a UUID silently.
-An independently proven fresh installation may write `Snapshot::initial(owner_uid,
-boot)` as known-empty for a proven boot. Only the installer may write it, after
-proving no existing storage or install record; durable initialisation completes
+Snapshot family/format 2 adds boot-scoped spawned-image history, bounded to
+eight distinct UUIDs. Missing, unreadable, corrupt and format-1 history is
+unknown, never empty. Overflow marks the boot unknown and never evicts a UUID
+silently. An independently proven fresh installation may write
+`Snapshot::initial(owner_uid, boot)` as known-empty for a proven boot. Only the
+installer may write it, after proving no existing storage or install record; it
+writes both copies with identical bytes, and durable initialisation completes
 before enabling the helper. Retries preserve existing state and never overwrite
 it with `initial`. Owned children exec `/opt/scupper/wireguard-go`, `p_comm`
 cannot be changed by the process, and wireguard-go never execs: the name guard
 is a load-bearing backstop if the fresh-install proof or a mismatch-history
 commit fails.
 
-After Recovery, a torn pre-spawn commit (disagreeing or unreadable copies), or
-a format-1 upgrade, history is unknown on the currently observed boot (the
+After Recovery, a torn pre-spawn commit (disagreeing or unreadable copies), or a
+format-1 upgrade, history is unknown on the currently observed boot (the
 uncertainty epoch). Sweeps stay Incomplete until reboot while any foreign
-pathless process exists; there is no same-boot reset. An unreadable boot leaves
-no epoch. A helper record's boot cannot supply this epoch: Recovery can prefer
-an older valid copy's helper, so that provenance can roll back. Only a later
-different proven boot resets unknown history to known-empty. On rollback, a
-format-1 helper reads v2 copies as invalid and enters Recovery (L10).
-Unavailable or disagreeing copies revoke history certainty even when the lifecycle start table can trust one
-copy. Current tool pins also participate in negative comparisons during ordinary
+pathless process exists; there is no same-boot reset. An unreadable boot revokes
+certainty and clears the epoch; a later readable boot establishes an unknown
+epoch without resetting history. StartChild refuses to spawn while the boot is
+unreadable, before the pre-spawn history commit. A helper record's boot cannot
+supply this epoch: Recovery can prefer an older valid copy's helper, so that
+provenance can roll back. Only a later different proven boot resets unknown
+history to known-empty. On rollback, a format-1 helper reads v2 copies as
+invalid and enters Recovery (L10). Unavailable copies or unequal image histories
+revoke history certainty and clear the epoch even when the lifecycle start table
+can trust one copy. Equal image histories in two valid copies retain certainty
+at any sequences: a spawn happens only after a full A+B commit containing its
+UUID, histories only grow within a boot, and a boot reset makes them unequal, so
+equal histories at different sequences contain every spawned UUID of their boot.
+Current tool pins also participate in negative comparisons during ordinary
 sweeps and Leave; they gain no new ownership matches. Before spawn the engine
 commits the pin UUID; write failure forbids spawn. An unexpected post-spawn UUID
 is recorded durably, the exact child is killed, and spawn fails. A failed commit
 enters the normal PersistBlocked/Stuck path; an unconfirmed kill retains the
 child and requires a sweep. Failed or timed-out spawn also re-reads the child
-pin and durably records a changed UUID (or revokes certainty if unreadable)
-before trusting another sweep. Pin reads use O_NONBLOCK, O_NOFOLLOW and bounded
-preads: fat header/table, each native slice header, then at most 1 MiB of load
-commands, checking the deadline between reads. Fat arm64 slices must still agree;
-no implicit arm64e subtype preference is introduced. R4 must report
-the child's observed main-image identity and reject translated (Rosetta) owned
-children via `proc_translated`/`P_TRANSLATED`. The read-only pin parser supports
-thin arm64/arm64e and accepts fat files only when all native arm64 slices agree.
+pin and durably records the pin UUID as it is at re-read time (or revokes
+certainty if unreadable) before trusting another sweep. An intermediate pin
+replacement racing the spawn is covered only by the name guard. If this history
+commit fails, the last sweep is marked Incomplete before returning. Pin reads
+use O_NONBLOCK, O_NOFOLLOW and bounded preads: fat header/table, each native
+slice header, then at most 1 MiB of load commands total across all slices,
+checking the deadline between reads. A single blocking pread on a hung volume
+can outlast the deadline; pins are root-owned and local. Fat arm64 slices must
+still agree; no implicit arm64e subtype preference is introduced. R4 must report
+the child's observed main-image identity even on partial failure and reject
+translated (Rosetta) owned children via `proc_translated`/`P_TRANSLATED`. The
+read-only pin parser supports thin arm64/arm64e and accepts fat files only when
+all native arm64 slices agree.

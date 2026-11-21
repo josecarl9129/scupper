@@ -338,7 +338,7 @@ impl ImageHistory {
         }
     }
     /// Only a proven different boot resets history. An unknown lookup revokes
-    /// certainty while retaining the previous boot for a later reboot proof.
+    /// certainty and clears the epoch; the next readable boot cannot prove a reset.
     pub fn observe_boot(&mut self, boot: Option<BootId>) {
         if let Some(boot) = boot {
             if self.boot.as_ref().is_some_and(|old| *old != boot) {
@@ -348,6 +348,7 @@ impl ImageHistory {
             }
         } else {
             self.known = false;
+            self.boot = None;
         }
     }
     /// Add before spawning, and after unexpected observed images. Never evict a
@@ -391,9 +392,10 @@ pub struct Snapshot {
 impl Snapshot {
     /// Left state for an independently proven fresh installation.
     /// Only the installer may write this, after independently proving no existing
-    /// storage or install record. Durable initialisation must complete before the
-    /// helper is enabled. A retry preserves existing state and never overwrites it
-    /// with `initial`. A known boot establishes known-empty image history.
+    /// storage or install record. It writes both copies with identical bytes.
+    /// Durable initialisation must complete before the helper is enabled. A retry
+    /// preserves existing state and never overwrites it with `initial`. A known
+    /// boot establishes known-empty image history.
     /// The backstop is load-bearing: owned children exec /opt/scupper/wireguard-go,
     /// `p_comm` cannot be changed by the process, and wireguard-go never execs;
     /// the wireguard-go name guard therefore withholds an owned orphan even if
@@ -731,9 +733,12 @@ pub fn decide(a: CopyClass, b: CopyClass) -> StartDecision {
     // A single surviving copy still drives the lifecycle start table, but
     // absence from its history cannot certify a foreign build if the other
     // copy is missing, unreadable, corrupt or disagrees.
+    // Spawn requires a full A+B commit containing its UUID. Histories only
+    // grow within a boot, and a boot reset makes them unequal, so equal
+    // histories at any sequences contain every spawned UUID of their boot.
     let consistent_history = matches!((&a, &b),
-        (CopyClass::V {seq: a_seq, bytes: a_bytes, ..}, CopyClass::V {seq: b_seq, bytes: b_bytes, ..})
-            if a_seq == b_seq && a_bytes == b_bytes);
+        (CopyClass::V {snapshot: a, ..}, CopyClass::V {snapshot: b, ..})
+            if a.image_history == b.image_history);
     match (&a, &b) {
         (
             CopyClass::V {

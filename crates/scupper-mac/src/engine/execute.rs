@@ -124,9 +124,11 @@ impl<P: Platform> Engine<P> {
                 let uuid = self
                     .platform
                     .image_uuid(std::path::Path::new(CHILD_PATH), d)?;
-                self.snapshot
-                    .image_history
-                    .observe_boot(self.platform.boot_id());
+                let boot = self
+                    .platform
+                    .boot_id()
+                    .ok_or(SysError::Failed("spawn boot unknown"))?;
+                self.snapshot.image_history.observe_boot(Some(boot));
                 self.snapshot.image_history.record(uuid);
                 if !self.commit_if_changed() {
                     return Err(SysError::Failed("image history write failed"));
@@ -136,7 +138,8 @@ impl<P: Platform> Engine<P> {
                     Ok(child) => child,
                     Err(error) => {
                         // An exec may have raced a pin replacement even if spawn
-                        // failed or timed out. Preserve both builds before a sweep.
+                        // failed or timed out. Record the pin at re-read time;
+                        // only the name guard covers intermediate replacements.
                         let d = self.deadline();
                         match self
                             .platform
@@ -146,6 +149,9 @@ impl<P: Platform> Engine<P> {
                             Err(_) => self.snapshot.image_history.known = false,
                         }
                         if !self.commit_if_changed() {
+                            self.last_sweep = Some(crate::platform::Sweep::Incomplete(
+                                SysError::Failed("spawn failed; sweep required").into(),
+                            ));
                             return Err(SysError::Failed("image history write failed"));
                         }
                         self.confirm_sweep();
