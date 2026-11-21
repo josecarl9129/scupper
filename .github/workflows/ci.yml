@@ -234,7 +234,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [macos-15, macos-26]
-        group: [smoke, base, probe, probe-hijack]
+        group: [smoke, base, tool, probe, probe-hijack]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     continue-on-error: ${{ matrix.group == 'probe-hijack' }}
@@ -306,11 +306,17 @@ jobs:
         run: |
           cc -std=c11 -Wall -Wextra -Werror -v crates/scupper-darwin/probe/abi.c -o qual-out/abi-probe 2>&1 | tee qual-out/abi-build.log
           qual-out/abi-probe | tee qual-out/abi-sdk.json
+          shasum -a 256 qual-out/abi-probe | tee qual-out/built-abi-sha256.txt
           cc -std=c11 -Wall -Wextra -Werror crates/scupper-darwin/probe/base-churn.c -o qual-out/base-churn
           shasum -a 256 qual-out/base-churn | tee qual-out/base-churn-sha256.txt
           cc -std=c11 -Wall -Wextra -Werror -arch arm64 -DIMAGE_VARIANT=1 crates/scupper-darwin/probe/base-image.c -o qual-out/base-image-a
           cc -std=c11 -Wall -Wextra -Werror -arch arm64 -DIMAGE_VARIANT=2 crates/scupper-darwin/probe/base-image.c -o qual-out/base-image-b
           shasum -a 256 qual-out/base-image-a qual-out/base-image-b | tee qual-out/base-image-sha256.txt
+      - name: Compile R4 harmless tool helper
+        if: matrix.group == 'tool'
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror crates/scupper-darwin/probe/tool-child.c -o qual-out/tool-child
+          shasum -a 256 qual-out/tool-child | tee qual-out/tool-sha256.txt
       - name: Compile capability probes with full diagnostics
         if: matrix.group == 'probe' || matrix.group == 'probe-hijack'
         timeout-minutes: 2
@@ -329,7 +335,7 @@ jobs:
           /usr/bin/sudo /usr/bin/install -d -o root -g wheel -m 0700 /private/var/db/scupper-qual
           /usr/bin/sudo /usr/bin/install -o root -g wheel -m 0755 target/debug/scupper-mac-qual /private/var/db/scupper-qual/scupper-mac-qual
           /usr/bin/sudo /usr/bin/install -o root -g wheel -m 0755 qual-out/abi-probe /private/var/db/scupper-qual/abi-probe
-          for binary in qual-out/probe-* qual-out/wireguard-go qual-out/base-churn qual-out/base-image-a qual-out/base-image-b; do
+          for binary in qual-out/probe-* qual-out/wireguard-go qual-out/base-churn qual-out/base-image-a qual-out/base-image-b qual-out/tool-child; do
             if [ -f "$binary" ]; then
               /usr/bin/sudo /usr/bin/install -o root -g wheel -m 0755 "$binary" "/private/var/db/scupper-qual/$(basename "$binary")"
               /usr/bin/sudo /usr/bin/shasum -a 256 "/private/var/db/scupper-qual/$(basename "$binary")" >> qual-out/executed-capability-sha256.txt
@@ -348,7 +354,7 @@ jobs:
           # Independent recovery covers the harness and its restore captures.
           /usr/bin/sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT /private/var/db/scupper-qual/scupper-mac-qual arm --after "$after" --out /private/var/db/scupper-qual/evidence --disposable-runner
       - name: Run qualification cell
-        timeout-minutes: 18
+        timeout-minutes: ${{ matrix.group == 'tool' && 10 || 18 }}
         run: /usr/bin/sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,ImageOS,ImageVersion,RUNNER_NAME,GITHUB_RUN_ID,GITHUB_SHA /private/var/db/scupper-qual/scupper-mac-qual run --group ${{ matrix.group }} --out /private/var/db/scupper-qual/evidence --disposable-runner
       - name: Restore and stop dead-man
         if: always()

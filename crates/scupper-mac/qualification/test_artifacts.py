@@ -21,6 +21,8 @@ class ArtifactTests(unittest.TestCase):
         self.write_json("preflight.json", {"binary_sha256": SHA256})
         for name in ["built-harness-sha256.txt", "executed-harness-sha256.txt"]:
             (self.root / name).write_text(f"{SHA256}  harness\n")
+        for name in ["built-abi-sha256.txt", "executed-probe-sha256.txt"]:
+            (self.root / name).write_text(f"{SHA256}  abi-probe\n")
         self.result = {"case": "Q-SMOKE", "binary_sha256": SHA256,
                        "verdict": "assumption_holds", "iterations": 1000,
                        "detail": "fixture"}
@@ -203,6 +205,22 @@ class ArtifactTests(unittest.TestCase):
         (self.root / "base-image-sha256.txt").write_text(f"{SHA256}  /fixture/base-image-a\n")
         self.assertEqual(self.check().returncode, 0)
         (self.root / "base-image-sha256.txt").write_text(f"{'b' * 64}  /fixture/base-image-a\n")
+        self.assertEqual(self.check().returncode, 1)
+
+    def test_abi_probe_built_hash_is_required_and_matches_stage(self):
+        (self.root / "built-abi-sha256.txt").unlink()
+        self.assertEqual(self.check().returncode, 1)
+        (self.root / "built-abi-sha256.txt").write_text(f"{'b' * 64}  abi-probe\n")
+        self.assertEqual(self.check().returncode, 1)
+
+    def test_tool_helper_manifest_is_required_and_checked(self):
+        (self.root / "executed-capability-sha256.txt").write_text(f"{SHA256}  /fixture/tool-child\n")
+        self.assertEqual(self.check().returncode, 1)
+        (self.root / "tool-sha256.txt").write_text(f"{SHA256}  qual-out/tool-child\n")
+        self.write_json("Q-SMOKE.json", self.result)
+        self.write_json("verdicts.json", [self.result])
+        self.assertEqual(self.check().returncode, 0)
+        (self.root / "tool-sha256.txt").write_text(f"{'b' * 64}  qual-out/tool-child\n")
         self.assertEqual(self.check().returncode, 1)
 
 

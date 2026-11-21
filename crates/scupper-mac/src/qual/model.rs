@@ -155,7 +155,20 @@ mod tests {
         assert!(manifest.budgets_fit());
         assert_eq!(manifest.cell_budget_minutes - manifest.overhead_minutes, 18);
         assert_eq!(MAX_FINAL_RESTORE_SECONDS, 240);
-        assert_eq!(manifest.cases.len(), 14);
+        assert_eq!(manifest.cases.len(), 17);
+        let tools: Vec<_> = manifest
+            .cases
+            .iter()
+            .filter(|case| case.group == "tool")
+            .collect();
+        assert_eq!(
+            tools
+                .iter()
+                .map(|case| case.id.as_str())
+                .collect::<Vec<_>>(),
+            ["Q-TOOL", "Q-LAUNCHD", "Q-LOCK"]
+        );
+        assert!(tools.iter().map(|case| case.budget_minutes).sum::<u32>() * 110 <= 1000);
         assert!(
             manifest
                 .cases

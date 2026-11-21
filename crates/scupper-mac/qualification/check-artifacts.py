@@ -92,6 +92,10 @@ else:
             preflight = json.loads((root / "preflight.json").read_text())["binary_sha256"]
             if not re.fullmatch(r"[0-9a-f]{64}", built) or built != executed or built != preflight:
                 identity_errors.append("built, staged and preflight harness SHA256s differ")
+            built_abi = (root / "built-abi-sha256.txt").read_text().split()[0]
+            staged_abi = (root / "executed-probe-sha256.txt").read_text().split()[0]
+            if not re.fullmatch(r"[0-9a-f]{64}", built_abi) or built_abi != staged_abi:
+                identity_errors.append("built and staged ABI probe hashes differ")
             verdicts = [json.loads(path.read_text()) for path in sorted(root.glob("Q-*.json"))]
             if (root / "verdicts.json").exists():
                 verdicts.extend(json.loads((root / "verdicts.json").read_text()))
@@ -113,7 +117,7 @@ else:
         return values
 
     identities = sorted(root.glob("probe-identity-*.json"))
-    qproc_patterns = ["Q-PROC*", "base-proc*", "proc-churn.json", "base-oracle.json",
+    qproc_patterns = ["Q-TOOL*", "Q-LAUNCHD*", "Q-LOCK*", "tool-*.json", "Q-PROC*", "base-proc*", "proc-churn.json", "base-oracle.json",
                       "oracle-*.log", "base-stopped*", "base-unlinked*", "base-paths.json",
                       "base-image*.json", "base-pin-images.json", "base-initial-snapshot.*",
                       "path-oracle.log", "pathless-census.json"]
@@ -121,7 +125,7 @@ else:
             or any(any(root.glob(pattern)) for pattern in qproc_patterns)
             or any((root / name).exists() for name in [
                 "built-capability-sha256.txt", "wireguard-sha256.txt",
-                "base-churn-sha256.txt", "base-image-sha256.txt"])):
+                "base-churn-sha256.txt", "base-image-sha256.txt", "tool-sha256.txt"])):
         try:
             built_probes = {}
             for name in ["built-capability-sha256.txt", "wireguard-sha256.txt"]:
@@ -134,6 +138,9 @@ else:
             base_images = root / "base-image-sha256.txt"
             if base_images.exists():
                 built_probes.update(hash_map(base_images))
+            tool_helpers = root / "tool-sha256.txt"
+            if tool_helpers.exists():
+                built_probes.update(hash_map(tool_helpers))
             staged_probes = hash_map(root / "executed-capability-sha256.txt")
             if built_probes != staged_probes:
                 identity_errors.append("built and staged capability hashes differ")

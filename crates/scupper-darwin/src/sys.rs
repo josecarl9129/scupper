@@ -89,7 +89,8 @@ pub const KINFO_PROC_SIZE: usize = 648;
 struct KinfoProc {
     start_sec: i64,
     start_usec: i32,
-    pad_start: [u8; 24],
+    pad_start: [u8; 20],
+    flags: i32,
     stat: u8,
     pad_stat: [u8; 3],
     pid: i32,
@@ -139,7 +140,8 @@ impl KinfoProc {
         Self {
             start_sec: 0,
             start_usec: 0,
-            pad_start: [0; 24],
+            pad_start: [0; 20],
+            flags: 0,
             stat: 0,
             pad_stat: [0; 3],
             pid: 0,
@@ -158,6 +160,7 @@ impl KinfoProc {
             ppid: self.ppid,
             pgid: self.pgid,
             stat: self.stat,
+            translated: self.flags & P_TRANSLATED != 0,
             start: (self.start_sec, self.start_usec),
             comm: self.comm,
         }
@@ -167,6 +170,8 @@ impl KinfoProc {
 /// Owned process fields; never includes SDK padding or pointers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KProc {
+    /// Kernel `P_TRANSLATED` flag (owned children must be native).
+    pub translated: bool,
     /// Process id.
     pub pid: i32,
     /// Parent id.
@@ -626,3 +631,503 @@ mod process_tests {
         Ok(())
     }
 }
+
+/// XNU sys/proc.h `P_TRANSLATED`; pinned by the SDK probe.
+pub const P_TRANSLATED: i32 = 0x0002_0000;
+const _: () = assert!(std::mem::offset_of!(KinfoProc, flags) == 32);
+
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+
+/// Fixed environment for every native spawn; never inherits the caller's env.
+pub const SPAWN_ENV: [&str; 2] = ["PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL=C"];
+/// Explicit fd handoff, borrowed until synchronous spawn returns.
+pub struct FdAction<'a> {
+    /// Open source descriptor.
+    pub source: BorrowedFd<'a>,
+    /// Descriptor in the executed child. Self-dup2 is rejected.
+    pub target: i32,
+}
+
+struct Attributes(libc::posix_spawnattr_t);
+impl Drop for Attributes {
+    fn drop(&mut self) {
+        // SAFETY: this object was successfully initialized, is exclusively owned,
+        // and is destroyed exactly once after the synchronous spawn returned.
+        if unsafe { libc::posix_spawnattr_destroy(&raw mut self.0) } != 0 {
+            std::process::abort();
+        }
+    }
+}
+struct Actions(libc::posix_spawn_file_actions_t);
+impl Drop for Actions {
+    fn drop(&mut self) {
+        // SAFETY: successfully initialized exclusive object, destroyed once; no
+        // foreign call retains this pointer after synchronous posix_spawn.
+        if unsafe { libc::posix_spawn_file_actions_destroy(&raw mut self.0) } != 0 {
+            std::process::abort();
+        }
+    }
+}
+fn spawn_errno(rc: i32) -> Result<(), Errno> {
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(Errno::from_raw_os_error(rc))
+    }
+}
+
+/// Owned exact-child reap capability. Only `spawn` can construct one. Never
+/// waits in Drop; the adapter retains unsettled records in its separate lists.
+#[derive(Debug)]
+pub struct Spawned {
+    pid: i32,
+    outcome: Wait,
+}
+/// Exact-PID nonblocking reap evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wait {
+    /// No status returned; the child may still run.
+    Pending,
+    /// Actual wait status (zero means successful exit).
+    Status(i32),
+    /// ECHILD from the reap syscall.
+    NoChild,
+}
+impl Spawned {
+    /// PID recorded by `posix_spawn`, without another syscall.
+    #[must_use]
+    pub fn pid(&self) -> u32 {
+        // Construction checked this positive pid; never use a narrowing cast.
+        u32::try_from(self.pid).unwrap_or_else(|_| std::process::abort())
+    }
+    /// Poll only this own spawn record. No wildcard wait or arbitrary-pid API.
+    ///
+    /// # Errors
+    /// Other syscall errors leave the record unsettled.
+    pub fn try_reap(&mut self) -> Result<Wait, Errno> {
+        if self.outcome != Wait::Pending {
+            return Ok(self.outcome);
+        }
+        let mut status = 0;
+        // SAFETY: pid is positive and comes exclusively from our own successful
+        // spawn. status is aligned, initialized and live for this nonblocking
+        // call. Its bytes are consumed only when this exact pid is returned.
+        let rc = unsafe { libc::waitpid(self.pid, &raw mut status, libc::WNOHANG) };
+        self.outcome = if rc == self.pid {
+            Wait::Status(status)
+        } else if rc == 0 {
+            Wait::Pending
+        } else if rc == -1 && last_errno() == Errno::CHILD {
+            Wait::NoChild
+        } else {
+            return Err(last_errno());
+        };
+        Ok(self.outcome)
+    }
+    /// Kill this unreaped own child. Exclusive borrow serializes kill and reap.
+    ///
+    /// # Errors
+    /// Preserves kill errno; a settled child is never signalled again.
+    pub fn kill(&mut self) -> Result<(), Errno> {
+        if self.outcome != Wait::Pending {
+            return Ok(());
+        }
+        signal_kill(self.pid, false)
+    }
+}
+
+/// Synchronous absolute-path spawn with fixed environment and signal isolation.
+/// Does not change process groups. Every attr/action errno is checked directly.
+///
+/// # Errors
+/// Rejects relative/dot paths, interior NULs, empty argv, invalid/duplicate fd
+/// targets and self-dup2. On success the PID is immediately owned by the result.
+pub fn spawn(
+    path: &std::path::Path,
+    argv: &[&str],
+    fds: &[FdAction<'_>],
+) -> Result<Spawned, Errno> {
+    spawn_inner(path, argv, &SPAWN_ENV, fds)
+}
+
+/// A reviewed, compile-time argv/environment pair for a foreground executable.
+/// Tool launches always use the separate fixed `SPAWN_ENV` environment.
+pub struct Launch {
+    /// Fixed argument vector, including argv[0].
+    pub argv: &'static [&'static str],
+    /// Fixed environment; no caller environment is inherited.
+    pub env: &'static [&'static str],
+}
+/// Spawn a foreground executable with its reviewed fixed launch definition.
+///
+/// # Errors
+/// Same validation and owned-child semantics as `spawn`.
+pub fn spawn_launch(
+    path: &std::path::Path,
+    launch: &Launch,
+    fds: &[FdAction<'_>],
+) -> Result<Spawned, Errno> {
+    spawn_inner(path, launch.argv, launch.env, fds)
+}
+fn spawn_inner(
+    path: &std::path::Path,
+    argv: &[&str],
+    environment: &[&str],
+    fds: &[FdAction<'_>],
+) -> Result<Spawned, Errno> {
+    use std::os::unix::ffi::OsStrExt;
+    if !path.is_absolute()
+        || path.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+        || argv.is_empty()
+    {
+        return Err(Errno::INVAL);
+    }
+    for (i, action) in fds.iter().enumerate() {
+        if action.target < 0
+            || action.source.as_raw_fd() == action.target
+            || fds[..i].iter().any(|a| a.target == action.target)
+        {
+            return Err(Errno::INVAL);
+        }
+        // No earlier action may clobber a later action's source.
+        if fds[..i]
+            .iter()
+            .any(|a| a.target == action.source.as_raw_fd())
+        {
+            return Err(Errno::INVAL);
+        }
+    }
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| Errno::INVAL)?;
+    let argv = argv
+        .iter()
+        .map(|s| CString::new(*s).map_err(|_| Errno::INVAL))
+        .collect::<Result<Vec<_>, _>>()?;
+    let env = environment
+        .iter()
+        .map(|s| CString::new(*s).map_err(|_| Errno::INVAL))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut argument_pointers: Vec<_> = argv
+        .iter()
+        .map(|s| s.as_ptr().cast_mut())
+        .chain(std::iter::once(std::ptr::null_mut()))
+        .collect();
+    let mut envp: Vec<_> = env
+        .iter()
+        .map(|s| s.as_ptr().cast_mut())
+        .chain(std::iter::once(std::ptr::null_mut()))
+        .collect();
+    let mut attr = std::mem::MaybeUninit::uninit();
+    // SAFETY: attr points to aligned writable storage for the SDK object. It is
+    // read only after successful init; on failure no initialized resource exists.
+    spawn_errno(unsafe { libc::posix_spawnattr_init(attr.as_mut_ptr()) })?;
+    // SAFETY: successful init above fully initialized this opaque SDK object.
+    let mut attr = Attributes(unsafe { attr.assume_init() });
+    let mut actions = std::mem::MaybeUninit::uninit();
+    // SAFETY: exclusive aligned writable SDK storage, used only on init success.
+    spawn_errno(unsafe { libc::posix_spawn_file_actions_init(actions.as_mut_ptr()) })?;
+    // SAFETY: init succeeded. RAII destroys the object on every later error.
+    let mut actions = Actions(unsafe { actions.assume_init() });
+    let mut full = 0;
+    let mut empty = 0;
+    // SAFETY: aligned, initialized sigset storage, live through the call.
+    if unsafe { libc::sigfillset(&raw mut full) } != 0 {
+        return Err(last_errno());
+    }
+    // SAFETY: aligned, initialized sigset storage, live through the call.
+    if unsafe { libc::sigemptyset(&raw mut empty) } != 0 {
+        return Err(last_errno());
+    }
+    let flags = i16::try_from(
+        libc::POSIX_SPAWN_SETSIGDEF
+            | libc::POSIX_SPAWN_SETSIGMASK
+            | libc::POSIX_SPAWN_CLOEXEC_DEFAULT,
+    )
+    .map_err(|_| Errno::INVAL)?;
+    // SAFETY: initialized exclusive attr; flags are the required SDK bits only.
+    spawn_errno(unsafe { libc::posix_spawnattr_setflags(&raw mut attr.0, flags) })?;
+    // SAFETY: initialized attr and full signal set live through synchronous copy.
+    spawn_errno(unsafe { libc::posix_spawnattr_setsigdefault(&raw mut attr.0, &raw const full) })?;
+    // SAFETY: initialized attr and empty signal set live through synchronous copy.
+    spawn_errno(unsafe { libc::posix_spawnattr_setsigmask(&raw mut attr.0, &raw const empty) })?;
+    for fd in fds {
+        // SAFETY: initialized action object; borrowed live fd and validated distinct
+        // nonnegative target. posix_spawn consumes actions before borrows expire.
+        spawn_errno(unsafe {
+            libc::posix_spawn_file_actions_adddup2(
+                &raw mut actions.0,
+                fd.source.as_raw_fd(),
+                fd.target,
+            )
+        })?;
+    }
+    let mut pid = 0;
+    // SAFETY: pid is aligned initialized output; path/argv/envp are live NUL-
+    // terminated owned C strings and null-terminated pointer arrays. Initialized
+    // attr/actions and borrowed fds live until this synchronous call returns.
+    // No buffers or SDK pointers escape. Failure returns the direct errno.
+    spawn_errno(unsafe {
+        libc::posix_spawn(
+            &raw mut pid,
+            path.as_ptr(),
+            &raw const actions.0,
+            &raw const attr.0,
+            argument_pointers.as_mut_ptr(),
+            envp.as_mut_ptr(),
+        )
+    })?;
+    if pid <= 1 {
+        std::process::abort();
+    }
+    Ok(Spawned {
+        pid,
+        outcome: Wait::Pending,
+    })
+}
+
+/// Duplicate an owned fd above the standard descriptor range. Used for pipe
+/// sources so even a helper with closed stdio never generates self-dup2.
+///
+/// # Errors
+/// Preserves `F_DUPFD_CLOEXEC` failure; the original fd is always closed by RAII.
+pub fn high_fd(fd: OwnedFd) -> Result<OwnedFd, Errno> {
+    rustix::io::fcntl_dupfd_cloexec(fd, 10)
+}
+
+/// Send SIGKILL; callers must guard and immediately recheck PID/start/group.
+///
+/// # Errors
+/// Rejects special pids/groups and preserves the kill errno.
+pub fn signal_kill(pid: i32, group: bool) -> Result<(), Errno> {
+    if pid <= 1 {
+        return Err(Errno::INVAL);
+    }
+    let rc = if group {
+        // SAFETY: positive validated group id, no pointers. The adapter rechecked
+        // identity immediately before entering this function and serializes reap.
+        unsafe { libc::killpg(pid, libc::SIGKILL) }
+    } else {
+        // SAFETY: positive validated pid, no pointers. Own-child callers hold the
+        // exclusive spawn record, others accept the documented PID reuse window.
+        unsafe { libc::kill(pid, libc::SIGKILL) }
+    };
+    if rc == 0 { Ok(()) } else { Err(last_errno()) }
+}
+
+/// List a live child's descriptors using `PROC_PIDLISTFDS` (flavor 1), with bounded
+/// size-race retries. The caller brackets identity separately.
+///
+/// # Errors
+/// Invalid pids, lengths, churn and syscall failure prove no fd-table result.
+pub fn proc_fds(pid: u32) -> Result<Vec<i32>, Errno> {
+    let pid = i32::try_from(pid).map_err(|_| Errno::INVAL)?;
+    if pid <= 1 {
+        return Err(Errno::INVAL);
+    }
+    for _ in 0..8 {
+        let mut records = vec![
+            libc::proc_fdinfo {
+                proc_fd: 0,
+                proc_fdtype: 0
+            };
+            4096
+        ];
+        let bytes =
+            i32::try_from(std::mem::size_of_val(records.as_slice())).map_err(|_| Errno::INVAL)?;
+        // SAFETY: initialized aligned records provide exactly bytes writable
+        // storage for synchronous read-only libproc. No contents used on failure;
+        // successful returned length is checked against capacity and stride.
+        let rc = unsafe { libc::proc_pidinfo(pid, 1, 0, records.as_mut_ptr().cast(), bytes) };
+        if rc <= 0 {
+            return Err(last_errno());
+        }
+        if rc == bytes {
+            continue;
+        }
+        let n = usize::try_from(rc).map_err(|_| Errno::INVAL)?;
+        if rc > bytes || n % std::mem::size_of::<libc::proc_fdinfo>() != 0 {
+            return Err(Errno::INVAL);
+        }
+        return Ok(records[..n / std::mem::size_of::<libc::proc_fdinfo>()]
+            .iter()
+            .map(|r| r.proc_fd)
+            .collect());
+    }
+    Err(Errno::NOMEM)
+}
+
+/// Set nonblocking mode on a parent pipe end and suppress SIGPIPE on writes.
+///
+/// # Errors
+/// Returns fcntl errno; the caller retains ownership on every path.
+pub fn nonblocking_pipe(fd: BorrowedFd<'_>, writer: bool) -> Result<(), Errno> {
+    let flags = rustix::fs::fcntl_getfl(fd)?;
+    rustix::fs::fcntl_setfl(fd, flags | rustix::fs::OFlags::NONBLOCK)?;
+    if writer {
+        // SAFETY: borrowed live pipe descriptor; integer-only fcntl command sets
+        // Darwin's per-fd SIGPIPE suppression, without changing process signals.
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETNOSIGPIPE, 1) } == -1 {
+            return Err(last_errno());
+        }
+    }
+    Ok(())
+}
+
+/// Poll parent stdin/stdout/stderr pipe ends, including hangup/error readiness.
+///
+/// # Errors
+/// EINTR is returned for retry within the caller's deadline, never swallowed.
+pub fn poll_pipes(
+    fds: [Option<BorrowedFd<'_>>; 3],
+    timeout: std::time::Duration,
+) -> Result<[bool; 3], Errno> {
+    let mut pollfds = std::array::from_fn::<_, 3, _>(|i| libc::pollfd {
+        fd: fds[i].map_or(-1, |fd| fd.as_raw_fd()),
+        events: if i == 0 { libc::POLLOUT } else { libc::POLLIN },
+        revents: 0,
+    });
+    let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+    // SAFETY: exclusive initialized three-element array provides exactly nfds
+    // entries for this synchronous bounded call. All nonnegative fds are borrowed
+    // live until return. revents is used only on success; no pointers escape.
+    let rc = unsafe { libc::poll(pollfds.as_mut_ptr(), 3, millis) };
+    if rc < 0 {
+        Err(last_errno())
+    } else {
+        Ok(pollfds.map(|p| p.revents != 0))
+    }
+}
+
+/// Qualification spawn with a deliberately blocked SIGUSR1 and ignored SIGTERM
+/// in the parent, restored on every return. Call only from the serialized harness.
+///
+/// # Errors
+/// Returns signal setup/restore or spawn errno. A restore failure aborts rather
+/// than leave the helper with an unreported changed signal environment.
+pub fn spawn_signal_probe(
+    path: &std::path::Path,
+    argv: &[&str],
+    fds: &[FdAction<'_>],
+) -> Result<Spawned, Errno> {
+    let mut mask = 0;
+    let mut previous = 0;
+    // SAFETY: aligned initialized signal set writable for this call only.
+    if unsafe { libc::sigemptyset(&raw mut mask) } != 0 {
+        return Err(last_errno());
+    }
+    // SAFETY: exclusive initialized set and valid catchable signal number.
+    if unsafe { libc::sigaddset(&raw mut mask, libc::SIGUSR1) } != 0 {
+        return Err(last_errno());
+    }
+    // SAFETY: live initialized input/output sets, synchronous thread-only mask
+    // change. pthread_sigmask returns errno directly, unlike sigprocmask.
+    spawn_errno(unsafe {
+        libc::pthread_sigmask(libc::SIG_BLOCK, &raw const mask, &raw mut previous)
+    })?;
+    // SAFETY: valid signal and SDK constant disposition; no Rust callback or
+    // pointer is installed. Previous disposition is restored below.
+    let old = unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) };
+    let result = if old == libc::SIG_ERR {
+        Err(last_errno())
+    } else {
+        spawn(path, argv, fds)
+    };
+    if old != libc::SIG_ERR {
+        // SAFETY: old is the exact disposition returned by signal above.
+        if unsafe { libc::signal(libc::SIGTERM, old) } == libc::SIG_ERR {
+            std::process::abort();
+        }
+    }
+    // SAFETY: previous was initialized by successful pthread_sigmask. The null
+    // output asks for no old value; the exclusive calling thread restores itself.
+    if unsafe {
+        libc::pthread_sigmask(libc::SIG_SETMASK, &raw const previous, std::ptr::null_mut())
+    } != 0
+    {
+        std::process::abort();
+    }
+    result
+}
+
+// SDK socket_fdinfo consumed prefix/control union, from XNU bsd/sys/proc_info.h.
+// https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/proc_info.h
+// Unconsumed bytes are initialized opaque storage, never exposed.
+#[repr(C, align(8))]
+struct SocketFdInfo {
+    prefix: [u8; 256],
+    kind: i32,
+    reserved: [u8; 4],
+    control_prefix: [u8; 20],
+    unit: u32,
+    name: [u8; 96],
+    tail: [u8; 408],
+}
+/// Owned selected control fields; name decoding is the portable caller's job.
+#[derive(Clone, Debug)]
+pub struct ControlSocket {
+    /// Kernel control name, including its bounded NUL terminator.
+    pub name: [u8; 96],
+    /// Kernel control unit (the utun numeric name suffix plus one).
+    pub unit: u32,
+}
+/// Read one socket's kernel-control fields from a supervised child's fd.
+///
+/// # Errors
+/// Preserves libproc errors (including non-socket fd), rejects short replies.
+/// A non-control socket returns None; the caller must bracket process identity.
+pub fn proc_control(pid: u32, fd: i32) -> Result<Option<ControlSocket>, Errno> {
+    let pid = i32::try_from(pid).map_err(|_| Errno::INVAL)?;
+    if pid <= 1 || fd < 0 {
+        return Err(Errno::INVAL);
+    }
+    let mut record = SocketFdInfo {
+        prefix: [0; 256],
+        kind: 0,
+        reserved: [0; 4],
+        control_prefix: [0; 20],
+        unit: 0,
+        name: [0; 96],
+        tail: [0; 408],
+    };
+    // SAFETY: aligned initialized SDK-sized storage provides exactly 792 bytes
+    // for synchronous read-only libproc. All field bit patterns are valid. No
+    // pointers or opaque bytes escape; only selected control fields are read
+    // after checking the full returned length and the kind discriminant.
+    let returned = unsafe { libc::proc_pidfdinfo(pid, fd, 3, (&raw mut record).cast(), 792) };
+    if returned <= 0 {
+        return Err(last_errno());
+    }
+    if returned != 792 {
+        return Err(Errno::INVAL);
+    }
+    if record.kind != 6 {
+        return Ok(None);
+    }
+    Ok(Some(ControlSocket {
+        name: record.name,
+        unit: record.unit,
+    }))
+}
+/// Socket/control layout compared to the SDK probe in every tool cell.
+pub const CONTROL_FIELDS: [(&str, usize); 6] = [
+    ("size", std::mem::size_of::<SocketFdInfo>()),
+    ("psi.soi_kind", std::mem::offset_of!(SocketFdInfo, kind)),
+    (
+        "psi.soi_proto.pri_kern_ctl",
+        std::mem::offset_of!(SocketFdInfo, control_prefix),
+    ),
+    (
+        "psi.soi_proto.pri_kern_ctl.kcsi_unit",
+        std::mem::offset_of!(SocketFdInfo, unit),
+    ),
+    (
+        "psi.soi_proto.pri_kern_ctl.kcsi_name",
+        std::mem::offset_of!(SocketFdInfo, name),
+    ),
+    ("SOCKINFO_KERN_CTL", 6),
+];
+const _: () = assert!(std::mem::size_of::<SocketFdInfo>() == 792);

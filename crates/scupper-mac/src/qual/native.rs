@@ -30,6 +30,8 @@ const SERVICE: &str = "system/net.scupper.qual.restore";
 mod base;
 #[path = "resources.rs"]
 mod resources;
+#[path = "tool.rs"]
+mod tool;
 
 const TOOL_BUDGET: Duration = Duration::from_secs(8);
 const SNAPSHOT_BUDGET: Duration = Duration::from_secs(90);
@@ -75,18 +77,26 @@ impl Options {
         }
         if !matches!(
             options.action.as_str(),
-            "preflight" | "arm" | "run" | "restore" | "capture" | "deadman" | "probe"
+            "preflight"
+                | "arm"
+                | "run"
+                | "restore"
+                | "capture"
+                | "deadman"
+                | "probe"
+                | "r4-worker"
+                | "r4-lock"
         ) {
             return Err("unknown subcommand".into());
         }
         if !matches!(
             options.group.as_str(),
-            "smoke" | "base" | "probe" | "probe-hijack"
+            "smoke" | "base" | "tool" | "probe" | "probe-hijack"
         ) || options.after == 0
             || options.after > MAX_ARM_SECONDS
         {
             return Err(
-                "group must be smoke/base/probe/probe-hijack; --after must be 1..1080 seconds"
+                "group must be smoke/base/tool/probe/probe-hijack; --after must be 1..1080 seconds"
                     .into(),
             );
         }
@@ -169,6 +179,8 @@ pub(super) fn dispatch(args: &[String]) -> Result<()> {
                 run_probe(&options.out, options.name.as_deref().ok_or("missing name")?)
             } else if options.group == "smoke" {
                 run_smoke(&options.out)
+            } else if options.group == "tool" {
+                tool::run(&options.out)
             } else if options.group == "base" {
                 base::run(&options.out)
             } else {
@@ -183,6 +195,14 @@ pub(super) fn dispatch(args: &[String]) -> Result<()> {
         }
         "restore" => restore_checked(&options.out),
         "deadman" => deadman(&options),
+        "r4-worker" => {
+            require_ack(&options.out)?;
+            tool::worker(&options.out, options.name.as_deref().unwrap_or("hold"))
+        }
+        "r4-lock" => {
+            require_ack(&options.out)?;
+            tool::lock_contender(&options.out)
+        }
         _ => Err("unknown subcommand".into()),
     }
 }
@@ -652,6 +672,9 @@ fn stop_writers(out: &Path, deadline: Instant) -> Result<Vec<Evidence>> {
         resources::writers(out, true)?,
         deadline,
     )?);
+    // Bootstrap exec gates are journaled as probes. Stop them before bootout,
+    // then stop the ordinary workers after restartable jobs are disabled.
+    tool::stop_jobs(out, deadline)?;
     stopped.extend(stop_writer_list(
         out,
         resources::writers(out, false)?,
@@ -1024,6 +1047,12 @@ fn smoke_checks(out: &Path, result: &mut CaseResult, started: Instant) -> Result
 }
 
 fn compare_process_layout(abi: &Value) -> Result<()> {
+    if abi["P_TRANSLATED"].as_i64() != Some(i64::from(scupper_darwin::P_TRANSLATED))
+        || abi["kinfo_proc"]["fields"]["kp_proc.p_flag"].as_u64() != Some(32)
+    {
+        return Err("P_TRANSLATED/flags ABI mismatch".into());
+    }
+
     super::base_check::compare_process_layout(
         abi,
         &scupper_darwin::KINFO_PROC_FIELDS,

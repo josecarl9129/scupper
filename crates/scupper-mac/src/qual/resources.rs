@@ -74,7 +74,7 @@ fn writers_quiescent(out: &Path) -> Result<bool> {
         .all(|writer| writer.pid == std::process::id() || state.writers.contains(writer)))
 }
 
-fn entries(out: &Path) -> Result<Vec<Entry>> {
+pub(super) fn entries(out: &Path) -> Result<Vec<Entry>> {
     let path = out.join("resources.jsonl");
     if !path.exists() {
         return Ok(Vec::new());
@@ -253,6 +253,7 @@ pub(super) fn undo(
     let entries: Vec<_> = pending.iter().map(|(_, e)| e.clone()).collect();
     let mut actions = Vec::new();
     let mut failures = Vec::new();
+    super::tool::restore(out, &entries, deadline, &mut actions, &mut failures)?;
     undo_tokens(out, &entries, deadline, &mut actions, &mut failures)?;
     // No R2 probe loads rules. Flush only explicitly journaled fixture anchors,
     // and never flush a hooked parent or a foreign anchor discovered by name.
@@ -436,6 +437,17 @@ pub(super) fn complete_from_snapshot(out: &Path, post: &Snapshot, deadline: Inst
                                 line.split_whitespace().take(2).eq(["inet", "127.0.0.53"])
                             })
                     })
+            }
+            "r4-wireguard-created" => fs::symlink_metadata(&entry.path)
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+            "r4-wireguard-sockets" => {
+                fs::read_dir(&entry.path).is_ok_and(|mut entries| entries.next().is_none())
+            }
+            "r4-tree" => fs::symlink_metadata(&entry.path)
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+            "r4-job" => {
+                let status = invoke_before("/bin/launchctl", &["print", &entry.path], deadline);
+                status.exit_code == Some(113) && !status.timed_out && !status.truncated
             }
             "socket" => fs::symlink_metadata(&entry.path)
                 .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),

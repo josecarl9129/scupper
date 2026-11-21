@@ -7,9 +7,12 @@ mod sys;
 
 #[cfg(target_os = "macos")]
 pub use sys::{
-    IDENTIFIER_FIELDS, IDENTIFIER_SIZE, KINFO_PROC_FIELDS, KINFO_PROC_SIZE, KProc, MAXCOMLEN,
-    NOW_CLOCK_ID, ProcError, UPTIME_CLOCK_ID, monotonic_raw, proc_identifier, proc_pidpath,
-    proc_uid, sysctl_kern_proc_all, sysctl_kern_proc_pid, sysctl_string, uptime_raw,
+    CONTROL_FIELDS, ControlSocket, FdAction, IDENTIFIER_FIELDS, IDENTIFIER_SIZE, KINFO_PROC_FIELDS,
+    KINFO_PROC_SIZE, KProc, Launch, MAXCOMLEN, NOW_CLOCK_ID, P_TRANSLATED, ProcError, SPAWN_ENV,
+    Spawned, UPTIME_CLOCK_ID, Wait, high_fd, monotonic_raw, nonblocking_pipe, poll_pipes,
+    proc_control, proc_fds, proc_identifier, proc_pidpath, proc_uid, signal_kill, spawn,
+    spawn_launch, spawn_signal_probe, sysctl_kern_proc_all, sysctl_kern_proc_pid, sysctl_string,
+    uptime_raw,
 };
 
 #[cfg(all(test, target_os = "macos"))]

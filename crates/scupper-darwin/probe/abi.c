@@ -71,9 +71,9 @@ int main(int argc, char **argv) {
     NEXT_FIELD(kinfo_proc, kp_proc.p_starttime);
     NEXT_FIELD(kinfo_proc, kp_proc.p_starttime.tv_sec);
     NEXT_FIELD(kinfo_proc, kp_proc.p_starttime.tv_usec);
-    NEXT_FIELD(kinfo_proc, kp_proc.p_comm);
+    NEXT_FIELD(kinfo_proc, kp_proc.p_comm); NEXT_FIELD(kinfo_proc, kp_proc.p_flag);
     NEXT_FIELD(kinfo_proc, kp_eproc.e_ppid); NEXT_FIELD(kinfo_proc, kp_eproc.e_pgid); END();
-    printf(",\"MAXCOMLEN\":%d", MAXCOMLEN);
+    printf(",\"MAXCOMLEN\":%d,\"P_TRANSLATED\":%d", MAXCOMLEN, P_TRANSLATED);
     printf(","); BEGIN(proc_bsdinfo);
     FIELD(proc_bsdinfo, pbi_uid); NEXT_FIELD(proc_bsdinfo, pbi_pid); NEXT_FIELD(proc_bsdinfo, pbi_ppid);
     NEXT_FIELD(proc_bsdinfo, pbi_pgid); NEXT_FIELD(proc_bsdinfo, pbi_comm);
@@ -85,7 +85,8 @@ int main(int argc, char **argv) {
     printf(","); BEGIN(proc_fdinfo);
     FIELD(proc_fdinfo, proc_fd); NEXT_FIELD(proc_fdinfo, proc_fdtype); END();
     printf(","); BEGIN(socket_fdinfo);
-    FIELD(socket_fdinfo, pfi); NEXT_FIELD(socket_fdinfo, psi); END();
+    FIELD(socket_fdinfo, pfi); NEXT_FIELD(socket_fdinfo, psi); NEXT_FIELD(socket_fdinfo, psi.soi_kind); NEXT_FIELD(socket_fdinfo, psi.soi_proto.pri_kern_ctl); NEXT_FIELD(socket_fdinfo, psi.soi_proto.pri_kern_ctl.kcsi_unit); NEXT_FIELD(socket_fdinfo, psi.soi_proto.pri_kern_ctl.kcsi_name); END();
+    printf(",\"SOCKINFO_KERN_CTL\":%d", SOCKINFO_KERN_CTL);
     printf(","); BEGIN(rt_msghdr2);
     FIELD(rt_msghdr2, rtm_msglen); NEXT_FIELD(rt_msghdr2, rtm_version);
     NEXT_FIELD(rt_msghdr2, rtm_addrs); NEXT_FIELD(rt_msghdr2, rtm_index); END();
