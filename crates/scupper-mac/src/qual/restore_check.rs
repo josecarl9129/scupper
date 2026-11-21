@@ -29,7 +29,8 @@ pub(super) struct Comparison {
 }
 
 // Compare the second restore against an actual no-op, not just a marker file.
-// Dynamic counters, timing and foreign routes/interfaces are intentionally absent.
+// Compare normalized policy, names, addresses and routes; counters and timings
+// are observations, not restorable configuration.
 pub(super) fn compare(first: &RestoreEffects<'_>, second: &RestoreEffects<'_>) -> Comparison {
     let mut result = Comparison {
         violations: Vec::new(),
@@ -40,10 +41,10 @@ pub(super) fn compare(first: &RestoreEffects<'_>, second: &RestoreEffects<'_>) -
             .violations
             .push("second restore did not observe the first restore marker".into());
     }
-    if !first.network_mutations.is_empty() || !second.network_mutations.is_empty() {
+    if !second.network_mutations.is_empty() {
         result
             .violations
-            .push("bootstrap restore performed network actions".into());
+            .push("second restore performed network actions".into());
     }
     if second.writer_stop_count != 0 {
         result
@@ -68,6 +69,122 @@ pub(super) fn compare(first: &RestoreEffects<'_>, second: &RestoreEffects<'_>) -
     result
 }
 
+/// Observations that must be complete before a mutating probe may run.
+pub(super) const REQUIRED: [&str; 10] = [
+    "pf-info",
+    "pf-references",
+    "pf-rules",
+    "pf-anchors",
+    "pf-apple-anchors",
+    "pf-nat",
+    "scutil-keys",
+    "routes",
+    "interfaces",
+    "machine",
+];
+
+pub(super) fn pf_status(observations: &BTreeMap<String, Evidence>) -> Option<bool> {
+    let info = observations.get("pf-info")?;
+    if !info.complete() {
+        return None;
+    }
+    match info
+        .stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("Status: "))?
+        .split_whitespace()
+        .next()?
+    {
+        "Enabled" => Some(true),
+        "Disabled" => Some(false),
+        _ => None,
+    }
+}
+
+pub(super) fn key_list(text: &str) -> Vec<String> {
+    let mut keys: Vec<_> = text
+        .lines()
+        .filter_map(|line| line.split_once(" = ").map(|(_, key)| key.trim().to_owned()))
+        .collect();
+    keys.sort();
+    keys
+}
+
+pub(super) fn valid_key_list(evidence: &Evidence) -> bool {
+    evidence.complete()
+        && evidence.stdout.lines().map(str::trim).all(|line| {
+            line.is_empty()
+                || (line.starts_with("subKey [")
+                    && line
+                        .split_once("] = ")
+                        .is_some_and(|(_, key)| !key.is_empty()))
+        })
+}
+
+fn normalized(name: &str, text: &str) -> Vec<String> {
+    if name == "scutil-keys" {
+        return key_list(text);
+    }
+    let mut netif = None;
+    let mut lines: Vec<_> = text
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|line| {
+            if name == "routes" {
+                // netstat's Refs/Use/Expire are counters/timers. Preserve destination,
+                // gateway, flags and interface regardless of optional counter columns.
+                let fields: Vec<_> = line.split_whitespace().collect();
+                if line.starts_with("Destination") {
+                    netif = fields.iter().position(|field| *field == "Netif");
+                }
+                if fields.len() >= 4
+                    && !line.starts_with("Destination")
+                    && !line.starts_with("Routing")
+                    && !line.ends_with(':')
+                    && let Some(index) = netif.filter(|index| *index < fields.len())
+                {
+                    return format!(
+                        "{} {} {} {}",
+                        fields[0], fields[1], fields[2], fields[index]
+                    );
+                }
+            }
+            line.to_owned()
+        })
+        .collect();
+    lines.sort();
+    lines
+}
+
+pub(super) fn state_diff(
+    before: &BTreeMap<String, Evidence>,
+    after: &BTreeMap<String, Evidence>,
+) -> Vec<String> {
+    let mut changes = Vec::new();
+    if !before.get("scutil-keys").is_some_and(valid_key_list)
+        || !after.get("scutil-keys").is_some_and(valid_key_list)
+    {
+        changes.push("scutil key inventory malformed or unavailable".into());
+    }
+    if pf_status(before).is_none() || pf_status(before) != pf_status(after) {
+        changes.push("pf enable status differs or unavailable".into());
+    }
+    for name in REQUIRED.into_iter().filter(|name| *name != "pf-info") {
+        match (before.get(name), after.get(name)) {
+            (Some(a), Some(b)) if a.complete() && b.complete() => {
+                if normalized(name, &a.stdout) != normalized(name, &b.stdout)
+                    || a.stderr != b.stderr
+                {
+                    changes.push(format!("{name}: post-state differs from preflight"));
+                }
+            }
+            _ => changes.push(format!("{name}: baseline or post-state unavailable")),
+        }
+    }
+    changes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,6 +205,47 @@ mod tests {
     }
 
     #[test]
+    fn restore_requires_complete_equal_configuration_and_ignores_route_counters() {
+        let mut before: BTreeMap<_, _> = REQUIRED
+            .into_iter()
+            .map(|name| (name.into(), observation()))
+            .collect();
+        if let Some(e) = before.get_mut("pf-info") {
+            e.stdout = "Status: Disabled for 00:01".into();
+        }
+        if let Some(e) = before.get_mut("scutil-keys") {
+            e.stdout = "subKey [0] = State:/one\nsubKey [1] = State:/two\n".into();
+        }
+        if let Some(e) = before.get_mut("routes") {
+            e.stdout = "Destination Gateway Flags Refs Use Netif Expire\ndefault 192.0.2.1 UGSc 4 100 en0 50\n".into();
+        }
+        let mut after = before.clone();
+        if let Some(e) = after.get_mut("pf-info") {
+            e.stdout = "Status: Disabled for 00:02".into();
+        }
+        if let Some(e) = after.get_mut("scutil-keys") {
+            e.stdout = "subKey [9] = State:/two\nsubKey [3] = State:/one\n".into();
+        }
+        if let Some(e) = after.get_mut("routes") {
+            e.stdout = "Destination Gateway Flags Refs Use Netif Expire\ndefault 192.0.2.1 UGSc 8 900 en0 49\n".into();
+        }
+        assert_eq!(state_diff(&before, &after), Vec::<String>::new());
+        for name in REQUIRED {
+            let mut changed = after.clone();
+            if let Some(e) = changed.get_mut(name) {
+                e.stdout = "changed".into();
+            }
+            assert!(!state_diff(&before, &changed).is_empty(), "{name}");
+            let mut missing = after.clone();
+            missing.remove(name);
+            assert!(!state_diff(&before, &missing).is_empty(), "{name}");
+        }
+        let mut malformed = observation();
+        malformed.stdout = "Could not communicate with configd".into();
+        assert!(!valid_key_list(&malformed));
+    }
+
+    #[test]
     fn second_restore_requires_no_actions_and_equal_static_observations() {
         let observations: BTreeMap<_, _> = STATIC_OBSERVATIONS
             .into_iter()
@@ -95,7 +253,7 @@ mod tests {
             .collect();
         let first = RestoreEffects {
             already_restored: false,
-            network_mutations: &[],
+            network_mutations: &["fixture cleanup".into()],
             writer_stop_count: 1,
             observations: &observations,
         };

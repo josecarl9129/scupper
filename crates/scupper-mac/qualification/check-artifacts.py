@@ -7,6 +7,36 @@ import re
 import sys
 
 root = Path(sys.argv[1])
+
+ASSIGNMENT = re.compile(r"(?:private_key|preshared_key)=", re.I)
+
+
+def contains_assignment(value, depth=0):
+    """Inspect decoded JSON as well as its serialized/embedded text."""
+    if depth > 8:
+        return False
+    if isinstance(value, str):
+        if ASSIGNMENT.search(value):
+            return True
+        try:
+            nested = json.loads(value)
+        except (ValueError, TypeError):
+            return False
+        return contains_assignment(nested, depth + 1) if nested != value else False
+    if isinstance(value, dict):
+        return any(contains_assignment(k, depth + 1) or contains_assignment(v, depth + 1)
+                   for k, v in value.items())
+    if isinstance(value, list):
+        return any(contains_assignment(v, depth + 1) for v in value)
+    return False
+
+
+def unsafe_text(data):
+    text = data.decode("utf-8", errors="replace")
+    if contains_assignment(text):
+        return True
+    return any(contains_assignment(line) for line in text.splitlines())
+
 # Native executables contain the redactor's literals; only text is publishable
 # evidence. Do not upload executables as part of the qualification record.
 if "--summary" in sys.argv:
@@ -30,10 +60,13 @@ if "--summary" in sys.argv:
 else:
     # The probe is needed until run completes. Remove it before artifact upload;
     # layout JSON and compiler evidence are retained.
-    (root / "abi-probe").unlink(missing_ok=True)
+    binaries = ["abi-probe", "wireguard-go", "scratch-sleep", "renamed-sleep", "hard-sleep", "storage.dmg"]
+    binaries += ["probe-" + name for name in ["pf-starters", "pf-eexist", "proc-identity", "utun-handoff", "storage", "sc-session", "dns-keys", "dns-default"]]
+    for name in binaries:
+        (root / name).unlink(missing_ok=True)
     bad = []
     for path in sorted(root.rglob("*")):
-        if path.is_file() and re.search(rb"(?:private_key|preshared_key)=", path.read_bytes(), re.I):
+        if path.is_file() and unsafe_text(path.read_bytes()):
             bad.append(str(path))
             # Do not let always-upload publish a file that fails the check.
             path.write_text("[artifact quarantined: unredacted key assignment]\n")
@@ -57,6 +90,32 @@ else:
             identity_errors.append(f"missing or invalid executable identity evidence: {error}")
     elif list(root.glob("Q-*.json")) or (root / "verdicts.json").exists():
         identity_errors.append("verdicts exist without preflight executable identity evidence")
+    def hash_map(path):
+        values = {}
+        for line in path.read_text().splitlines():
+            digest, filename = line.split(maxsplit=1)
+            name = Path(filename.strip()).name
+            if not re.fullmatch(r"[0-9a-f]{64}", digest) or name in values:
+                raise ValueError("invalid or duplicate capability hash")
+            values[name] = digest
+        return values
+
+    identities = sorted(root.glob("probe-identity-*.json"))
+    if identities:
+        try:
+            built_probes = hash_map(root / "built-capability-sha256.txt")
+            built_probes.update(hash_map(root / "wireguard-sha256.txt"))
+            staged_probes = hash_map(root / "executed-capability-sha256.txt")
+            if built_probes != staged_probes:
+                identity_errors.append("built and staged capability hashes differ")
+            for path in identities:
+                entry = json.loads(path.read_text())
+                if entry["sha256"] != staged_probes.get("probe-" + entry["name"]):
+                    identity_errors.append("executed probe hash differs from stage")
+                if entry.get("wireguard_sha256") is not None and entry["wireguard_sha256"] != staged_probes.get("wireguard-go"):
+                    identity_errors.append("executed wireguard-go hash differs from stage")
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            identity_errors.append(f"invalid capability identity evidence: {error}")
     if identity_errors:
         # Always-upload must never publish a stale verdict as valid evidence.
         for path in [*root.glob("Q-*.json"), root / "verdicts.json"]:

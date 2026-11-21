@@ -14,6 +14,8 @@ pub enum Verdict {
     AssumptionRefuted,
     /// Missing or unsuitable environment; never qualifies a build.
     Inconclusive,
+    /// Raw capability measurement; never supports qualification.
+    Measurement,
 }
 
 /// Bounded, redacted raw command evidence.
@@ -149,7 +151,7 @@ mod tests {
         let manifest = Manifest::bundled()?;
         assert!(manifest.budgets_fit());
         assert_eq!(manifest.cell_budget_minutes - manifest.overhead_minutes, 18);
-        assert_eq!(manifest.cases.len(), 2);
+        assert_eq!(manifest.cases.len(), 10);
         assert!(
             manifest
                 .cases
@@ -191,6 +193,7 @@ mod tests {
             (Verdict::AssumptionHolds, "assumption_holds"),
             (Verdict::AssumptionRefuted, "assumption_refuted"),
             (Verdict::Inconclusive, "inconclusive"),
+            (Verdict::Measurement, "measurement"),
         ] {
             assert_eq!(serde_json::to_string(&verdict)?, format!("\"{expected}\""));
         }

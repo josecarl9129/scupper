@@ -39,8 +39,8 @@ static int process_identity(const char *text) {
                 number, size, sizeof(info), strerror(error));
         return 3;
     }
-    printf("{\"pid\":%u,\"ppid\":%u,\"pgid\":%u,\"start\":\"%" PRIu64 ":%" PRIu64 "\"}\n",
-           info.pbi_pid, info.pbi_ppid, info.pbi_pgid,
+    printf("{\"pid\":%u,\"ppid\":%u,\"pgid\":%u,\"status\":%u,\"start\":\"%" PRIu64 ":%" PRIu64 "\"}\n",
+           info.pbi_pid, info.pbi_ppid, info.pbi_pgid, info.pbi_status,
            (uint64_t)info.pbi_start_tvsec, (uint64_t)info.pbi_start_tvusec);
     return ferror(stdout) ? 1 : 0;
 }

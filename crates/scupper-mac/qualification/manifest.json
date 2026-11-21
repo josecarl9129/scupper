@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "cell_budget_minutes": 30,
   "overhead_minutes": 12,
   "cases": [
@@ -13,6 +13,62 @@
     {
       "id": "Q-CAPTURE",
       "group": "smoke",
+      "minimum_iterations": 1,
+      "budget_minutes": 1,
+      "supported_assumptions": []
+    },
+    {
+      "id": "Q-PROBE-PF-STARTERS",
+      "group": "probe",
+      "minimum_iterations": 1,
+      "budget_minutes": 2,
+      "supported_assumptions": []
+    },
+    {
+      "id": "Q-PROBE-PF-EEXIST",
+      "group": "probe",
+      "minimum_iterations": 1,
+      "budget_minutes": 2,
+      "supported_assumptions": []
+    },
+    {
+      "id": "Q-PROBE-PROC-IDENTITY",
+      "group": "probe",
+      "minimum_iterations": 1,
+      "budget_minutes": 2,
+      "supported_assumptions": []
+    },
+    {
+      "id": "Q-PROBE-UTUN-HANDOFF",
+      "group": "probe",
+      "minimum_iterations": 1,
+      "budget_minutes": 2,
+      "supported_assumptions": []
+    },
+    {
+      "id": "Q-PROBE-STORAGE",
+      "group": "probe",
+      "minimum_iterations": 1,
+      "budget_minutes": 2,
+      "supported_assumptions": []
+    },
+    {
+      "id": "Q-PROBE-SC-SESSION",
+      "group": "probe",
+      "minimum_iterations": 1,
+      "budget_minutes": 2,
+      "supported_assumptions": []
+    },
+    {
+      "id": "Q-PROBE-DNS-KEYS",
+      "group": "probe",
+      "minimum_iterations": 1,
+      "budget_minutes": 2,
+      "supported_assumptions": []
+    },
+    {
+      "id": "Q-PROBE-DNS-DEFAULT",
+      "group": "probe-hijack",
       "minimum_iterations": 1,
       "budget_minutes": 1,
       "supported_assumptions": []

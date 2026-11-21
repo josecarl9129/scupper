@@ -3,12 +3,16 @@
 //! Environment checks are an accident guard, not a security property. The
 //! bootstrap commands preflight/arm cannot require the acknowledgement they
 //! create; run/capture require a fresh acknowledgement from a separate launchd
-//! job. Restore remains available after expiry. This bootstrap has no network
-//! writers: it never loads pf rules or changes DNS, routes or pf enablement.
+//! job. Restore remains available after expiry. Capability probes mutate only
+//! journaled fixture resources; they never qualify a production adapter.
 
 #[cfg(any(target_os = "macos", test))]
 mod guard;
+#[cfg(any(target_os = "macos", test))]
+mod journal;
 mod model;
+#[cfg(any(target_os = "macos", test))]
+mod probe;
 #[cfg(any(target_os = "macos", test))]
 mod restore_check;
 pub use model::{Case, CaseResult, Evidence, Manifest, Verdict, redact};

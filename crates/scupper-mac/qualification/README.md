@@ -1,105 +1,80 @@
-# Native macOS qualification bootstrap
+# Native macOS qualification
 
-Build `scupper-mac-qual` with `--features qualification`. The only implemented
-group is `smoke`. It observes pf, network configuration and system identity;
-it never loads pf rules, acquires references, changes pf enablement, or changes
-routes or DNS. It does not qualify production enforcement.
+Build `scupper-mac-qual` with `--features qualification`. The `smoke`, `probe`,
+and isolated `probe-hijack` groups run only on disposable Apple Silicon
+GitHub-hosted macOS 15 and 26 runners. None qualifies production enforcement.
+The capability experiments are self-contained C programs in [`probes/`](probes/).
 
-The supported qualification targets are Apple Silicon macOS 15 and 26, using
-pinned GitHub-hosted runner labels. Environment variables, root and the
-`--disposable-runner` flag form an **accident guard, not a security property**.
-They are spoofable and do not authorize execution on another machine.
+Root, `GITHUB_ACTIONS=true`, `RUNNER_ENVIRONMENT=github-hosted`, and
+`--disposable-runner` are an **accident guard, not authentication**. The workflow
+builds as the runner user, then installs the harness, SDK ABI probe, capability
+probes and pinned wireguard-go as root-owned executables under the fresh,
+root-owned `0700` directory `/private/var/db/scupper-qual`. Privileged invocations
+always execute these staged copies. Protected paths reject symlinks and writable
+ancestors. A fixture APFS mountpoint is allowed to have filesystem-selected
+metadata; its parent remains protected and recovery matches its image path.
 
-The harness must not run where the invoking user lacks root privileges.
-The workflow builds the Rust binary and `crates/scupper-darwin/probe/abi.c` as
-the runner user, removes any cached harness executable before building, and
-records its SHA256. Before any privileged harness invocation, it installs both
-executables as `root:wheel`, mode `0755`, under the fresh root-owned `0700`
-directory `/private/var/db/scupper-qual`. Every sudo invocation and launchd
-worker runs that harness copy; the probe is resolved beside it. All commands use
-one absolute `--out DIR` under a protected root-owned parent (CI uses
-`/private/var/db/scupper-qual/evidence`). The harness checks ownership, modes,
-regular file/directory types and every ancestor with `lstat`, rejecting symlinks
-and paths writable by other users before it creates or loads evidence. The
-output directory is created with mode `0700`; `arm` writes the plist there as
-`root:wheel`, explicitly mode `0644`. For manual preparation, use root's system
-`install -d -o root -g wheel -m 0700` for a fresh staging directory and
-`install -o root -g wheel -m 0755` for each executable; never sudo a binary
-from a user-writable checkout.
+Use one fresh absolute `--out DIR` under that protected directory:
 
-The command sequence is:
+1. `preflight --out DIR --disposable-runner` saves pf status, references, rules,
+   anchors, SystemConfiguration keys, routes, interfaces, system identity and
+   tool digests. Foreign pf references, a pre-existing production anchor,
+   translation or an unsupported architecture make the campaign inconclusive.
+   Mutating probes additionally require complete restorable baseline inventories
+   and no pre-existing harness keys. Missing translation OIDs are accepted only
+   for the exact native-arm64 unknown-OID response.
+2. `arm --after 1080 --out DIR --disposable-runner` starts the independent
+   `system/net.scupper.qual.restore` launchd worker. It acknowledges its own pid,
+   microsecond start, process group, parent, boot session and monotonic deadline.
+   A live, independent worker must acknowledge before any experiment starts.
+3. `run --group smoke|probe|probe-hijack --out DIR --disposable-runner` runs the
+   selected cell. Alternatively, `probe --name pf-starters --out DIR
+   --disposable-runner` runs one experiment. `dns-default` additionally requires
+   `--group probe-hijack`. Each named probe may run only once in an evidence
+   directory; reruns use a new directory. `capture` remains a guarded read-only
+   inventory command.
+4. `restore --out DIR --disposable-runner` remains available after ack expiry.
+   It serializes recovery, stops the controller and probe processes, then their
+   children, checking each pid against its microsecond start before signalling.
+   Zombies are treated as stopped writers. It releases live journaled pf tokens,
+   flushes journaled fixture anchors, restores initial Disabled pf state with
+   `pfctl -d` if necessary, removes fixture keys, closes utuns by killing their
+   holders, detaches fixture disk images, and removes owned loopback aliases and
+   stale UAPI sockets. It saves a post-state diff and `Q-RESTORE.json`.
 
-1. `preflight --out DIR --disposable-runner` records read-only state. Foreign
-   references, an existing `com.apple/scupper` anchor, translation, a non-arm64
-   binary, and failed or unknown safety observations make the campaign inconclusive.
-   Optional SDK, tool-hash and scutil inventory failures remain diagnostic.
-   Missing `sysctl.proc_translated` is permitted only for its specific unknown-OID
-   response on native arm64; the raw error is retained.
-2. `arm --after 1080 --out DIR --disposable-runner` bootstraps the independent
-   `system/net.scupper.qual.restore` launchd service. The worker acknowledges its
-   own pid, microsecond start identity, group, parent, boot session and fire time.
-   Freshness uses a monotonic clock bound to that boot; wall-clock times are
-   retained only for evidence, so clock corrections cannot expire a valid ack.
-   The ABI probe's harness-only identity mode supplies these start identities;
-   it is not a production process adapter.
-3. `run --group smoke --out DIR --disposable-runner` requires a live, unexpired
-   acknowledgement. It captures SDK ABI JSON, verifies guard refusal, exercises
-   restore twice, and records 1000 equal valid boot-session UUID reads.
-   `capture --out DIR --disposable-runner` can also collect the read-only
-   inventory separately while the acknowledgement remains fresh.
-4. `restore --out DIR --disposable-runner` remains available after expiry. It
-   first checks registered controllers by pid and microsecond start before
-   signalling them, then records post-state and a diff against preflight.
-   There is still a pid-reuse window between that identity check and `kill`
-   (the N4 limitation); the identity check does not make signalling atomic.
-   In-process smoke restore excludes its own controller. There are no network
-   writers or owned network resources in this bootstrap, so both restores are
-   network no-ops; the second must record `already_restored: true`, no writer-stop
-   actions, and no changes to the first restore's available static observations
-   (`pf-rules`, `pf-anchors`, `pf-apple-anchors`, `pf-nat`, `tool-sha256`,
-   `osversion`, `kernel-uuid`, `machine`). Unexpected actions or static drift
-   produce `contract_violation` with a named diff in
-   `smoke-restore-comparison.json`. Unavailable observations are listed there;
-   incomplete pf observations make smoke inconclusive, while optional inventory
-   failures remain diagnostic. No foreign drift is undone. Future mutation groups must add their resource restoration
-   and child-writer registration before they can run.
+Every mutating child waits on an exec grant until its identity/resource intent
+is durably journaled. A parent dying before granting closes the pipe, so the
+sentinel exits and closes inherited fds. A completed pf acquisition also journals
+its token. Recovery handles death before that token append using the earlier
+pfctl acquisition pid/time intent and a bounded raw token inventory. A partial
+final journal append is preserved separately before truncation, after writers
+stop. There remains a pid-reuse window between identity lookup and signalling;
+these fixture checks do not make `kill` atomic.
 
-Preflight and arm necessarily cannot require the acknowledgement they create;
-restore must also remain usable after it expires. They still require every
-other accident-guard condition. The worker is an independent launchd child and
-group leader, so cleanup of the controller's group cannot remove the timer.
-The workflow always restores again, records launchd status, and boots out the
-worker before exporting evidence. Root only reads protected evidence into a
-pipe; an unprivileged process writes the artifact copy in `qual-out`. Redaction
-and executable-identity checks run without sudo on that copy before upload.
+After each probe, restore runs twice. The second must perform no network or
+writer-stop actions. Both post-states must match preflight for pf enablement,
+references, anchors/rules/NAT, keys, routes and interfaces. Route counters and
+expiry, pf uptime/counters and scutil list indices are retained raw but are not
+configuration equality fields. Missing observations or configuration drift cause
+`contract_violation`. Restore never removes a foreign token or guesses a disk
+number. No R2 probe loads any pf rules or anchors.
 
-Each case writes a verdict JSON. Only `contract_violation` fails qualification;
-`assumption_refuted` and `inconclusive` preserve evidence without qualifying a
-build. Environment tool failures and the shared smoke deadline expiring are
-`inconclusive`; restore comparison failures remain `contract_violation`.
-There are no automatic retries or record promotions. The manifest's case
-budgets plus ten percent must fit the 18-minute harness allocation inside a
-30-minute cell.
+Each C program emits one JSON event stream. The harness retains bounded,
+redacted stdout/stderr and writes a `measurement` aggregate plus separate named
+hypothesis verdicts. `assumption_refuted` and `inconclusive` retain evidence and
+pass the cell; `contract_violation` fails it. Measurements and these R2 manifest
+entries cannot promote an assumption. There are no automatic retries.
 
-Evidence includes exact executable/arguments/stdin, pid, exit code, timestamps,
-elapsed time, timeout/truncation flags, and redacted stdout/stderr (256 KiB cap
-per pipe). Pipes keep draining after the cap. Command observations are saved as
-they complete. `boot-reads.jsonl` includes each attempted read before the syscall,
-so a stalled read is identifiable even if the cell is interrupted. Restore
-snapshots include dynamic state; differences in counters or foreign network
-state are recorded, not attributed to this harness.
+The manifest reserves 12 of each 30-minute cell's minutes for setup and restore.
+Seven non-hijack probes have two-minute budgets: 14 minutes plus 10% fits the
+18-minute harness allocation. The hijack cell has a one-minute budget including
+recovery, with a nine-second C lifetime and a ten-second outer command deadline.
+Its temporary SystemConfiguration session also removes the hijack keys on death.
+The cell is `continue-on-error` on both pinned runners; its independent dead-man
+is armed for ten seconds instead of the normal 1080.
 
-The artifacts include `preflight.json`, `ack.json`, `deadman-*.json` and logs,
-`abi.json`, SDK/compiler logs, `smoke-restore-{first,second}.json`,
-`restore-*.json`, `smoke-restore-comparison.json`, `boot-reads.json{,l}`,
-`sysctl-strings.json`, `capture.json`,
-`Q-SMOKE.json`, `Q-CAPTURE.json` and `verdicts.json`. ABI comparisons against Rust
-layout constants are deferred until those bindings exist. Tool hashes, runner
-image metadata, architecture and translation evidence are retained. Preflight
-records the executed harness SHA256 alongside `GITHUB_SHA`, every verdict
-references that hash, and subsequent commands refuse a changed executable.
-The checker requires built, staged, preflight and verdict hashes to agree and
-quarantines mismatched verdicts. Native `scupper-darwin` tests exercise valid,
-missing, interior-NUL and integer OIDs; the native job also lints that crate.
-The artifact checker rejects and quarantines files containing UAPI key assignments before
-upload; it removes the temporary probe executable after final restore.
+Compiler output is retained in full on native build failures. Artifact checks
+remove executables/images and quarantine any remaining UAPI key assignments.
+They bind the harness and executed capability binaries to their built and staged
+SHA256s. The always-step restores again, stops the dead-man, then exports evidence
+through an unprivileged writer, excluding disk images and mount contents.

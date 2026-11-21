@@ -25,6 +25,9 @@ use super::{
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 const LABEL: &str = "net.scupper.qual.restore";
 const SERVICE: &str = "system/net.scupper.qual.restore";
+#[path = "resources.rs"]
+mod resources;
+
 const TOOL_BUDGET: Duration = Duration::from_secs(8);
 
 struct Options {
@@ -32,6 +35,7 @@ struct Options {
     out: PathBuf,
     group: String,
     after: u64,
+    name: Option<String>,
     disposable: bool,
 }
 
@@ -45,6 +49,7 @@ impl Options {
             group: "smoke".into(),
             after: MAX_ARM_SECONDS,
             disposable: false,
+            name: None,
         };
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -55,6 +60,9 @@ impl Options {
                 "--group" => options
                     .group
                     .clone_from(args.next().ok_or("--group requires a value")?),
+                "--name" => {
+                    options.name = Some(args.next().ok_or("--name requires a probe")?.clone());
+                }
                 "--after" => {
                     options.after = args.next().ok_or("--after requires seconds")?.parse()?;
                 }
@@ -63,12 +71,31 @@ impl Options {
         }
         if !matches!(
             options.action.as_str(),
-            "preflight" | "arm" | "run" | "restore" | "capture" | "deadman"
+            "preflight" | "arm" | "run" | "restore" | "capture" | "deadman" | "probe"
         ) {
             return Err("unknown subcommand".into());
         }
-        if options.group != "smoke" || options.after == 0 || options.after > MAX_ARM_SECONDS {
-            return Err("only group smoke is implemented; --after must be 1..1080 seconds".into());
+        if !matches!(options.group.as_str(), "smoke" | "probe" | "probe-hijack")
+            || options.after == 0
+            || options.after > MAX_ARM_SECONDS
+        {
+            return Err(
+                "group must be smoke/probe/probe-hijack; --after must be 1..1080 seconds".into(),
+            );
+        }
+        if options.action == "probe"
+            && !options
+                .name
+                .as_deref()
+                .is_some_and(|name| super::probe::NAMES.contains(&name))
+        {
+            return Err("probe requires a known --name".into());
+        }
+        if options.action == "probe"
+            && options.name.as_deref() == Some("dns-default")
+            && options.group != "probe-hijack"
+        {
+            return Err("dns-default requires --group probe-hijack".into());
         }
         Ok(options)
     }
@@ -100,7 +127,13 @@ pub(super) fn dispatch(args: &[String]) -> Result<()> {
     protected_path(&options.out, true)?;
     options.out = options.out.canonicalize()?;
     for entry in fs::read_dir(&options.out)? {
-        protected_path(&entry?.path(), false)?;
+        let entry = entry?;
+        // A mounted APFS root has filesystem-selected ownership/mode. Validate
+        // its protected mountpoint parent, then detach by journaled image path.
+        if entry.file_name() == "storage-mount" && entry.file_type()?.is_dir() {
+            continue;
+        }
+        protected_path(&entry.path(), entry.file_type()?.is_dir())?;
     }
     if options.out.join("preflight.json").exists() {
         let baseline: Snapshot = read_json(&options.out.join("preflight.json"))?;
@@ -111,7 +144,7 @@ pub(super) fn dispatch(args: &[String]) -> Result<()> {
     match options.action.as_str() {
         "preflight" => preflight(&options.out),
         "arm" => arm(&options),
-        "run" => {
+        "run" | "probe" => {
             require_ack(&options.out)?;
             let own = process_identity(&options.out, std::process::id())?;
             write_json(
@@ -122,7 +155,13 @@ pub(super) fn dispatch(args: &[String]) -> Result<()> {
                     start: own.start,
                 }],
             )?;
-            let result = run_smoke(&options.out);
+            let result = if options.action == "probe" {
+                run_probe(&options.out, options.name.as_deref().ok_or("missing name")?)
+            } else if options.group == "smoke" {
+                run_smoke(&options.out)
+            } else {
+                run_probes(&options.out, &options.group)
+            };
             write_json(&options.out, "writers.json", &Vec::<Writer>::new())?;
             result
         }
@@ -130,7 +169,7 @@ pub(super) fn dispatch(args: &[String]) -> Result<()> {
             require_ack(&options.out)?;
             capture(&options.out).map(|_| ())
         }
-        "restore" => restore(&options.out, Instant::now() + Duration::from_secs(90)).map(|_| ()),
+        "restore" => restore_checked(&options.out),
         "deadman" => deadman(&options),
         _ => Err("unknown subcommand".into()),
     }
@@ -370,13 +409,23 @@ struct ProcessIdentity {
     ppid: u32,
     pgid: u32,
     start: String,
+    status: u32,
 }
 
 fn lookup_identity(out: &Path, pid: u32) -> Result<Option<ProcessIdentity>> {
+    lookup_identity_before(out, pid, Instant::now() + TOOL_BUDGET)
+}
+
+fn lookup_identity_before(
+    out: &Path,
+    pid: u32,
+    deadline: Instant,
+) -> Result<Option<ProcessIdentity>> {
     let probe = probe_path()?;
-    let evidence = invoke(
+    let evidence = invoke_before(
         probe.to_str().ok_or("non-UTF8 probe path")?,
         &["--process-identity", &pid.to_string()],
+        deadline,
     );
     // Preserve each lookup, including failed or short kernel reads.
     write_json(
@@ -566,7 +615,7 @@ fn deadman(options: &Options) -> Result<()> {
     while Instant::now() < deadline {
         thread::sleep(Duration::from_millis(100));
     }
-    restore(&options.out, Instant::now() + Duration::from_secs(90)).map(|_| ())
+    restore_checked(&options.out)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -575,8 +624,31 @@ struct Writer {
     start: String,
 }
 
-fn stop_writers(out: &Path) -> Result<Vec<Evidence>> {
-    let writers: Vec<Writer> = read_json(&out.join("writers.json"))?;
+fn stop_writers(out: &Path, deadline: Instant) -> Result<Vec<Evidence>> {
+    let controllers: Vec<Writer> = read_json(&out.join("writers.json"))?;
+    let mut stopped = stop_writer_list(out, controllers, deadline)?;
+    // Stop probe controllers before the final child census. Their exec gates
+    // close on death, so an uncommitted child cannot become a late writer.
+    stopped.extend(stop_writer_list(
+        out,
+        resources::writers(out, true)?,
+        deadline,
+    )?);
+    stopped.extend(stop_writer_list(
+        out,
+        resources::writers(out, false)?,
+        deadline,
+    )?);
+    Ok(stopped)
+}
+
+fn stop_writer_list(
+    out: &Path,
+    mut writers: Vec<Writer>,
+    deadline: Instant,
+) -> Result<Vec<Evidence>> {
+    writers.sort_by_key(|writer| writer.pid);
+    writers.dedup_by(|a, b| a.pid == b.pid && a.start == b.start);
     let mut stopped = Vec::new();
     for writer in writers {
         // An in-process smoke restore excludes its own controller. An external
@@ -584,22 +656,24 @@ fn stop_writers(out: &Path) -> Result<Vec<Evidence>> {
         if writer.pid == std::process::id() {
             continue;
         }
-        let Some(identity) = lookup_identity(out, writer.pid)? else {
+        let Some(identity) = lookup_identity_before(out, writer.pid, deadline)? else {
             continue;
         };
-        if identity.start != writer.start {
+        if identity.start != writer.start || identity.status == 5 {
             continue;
         }
-        let kill = invoke("/bin/kill", &["-KILL", &writer.pid.to_string()]);
+        let kill = invoke_before("/bin/kill", &["-KILL", &writer.pid.to_string()], deadline);
         let complete = kill.complete();
         stopped.push(kill);
         write_json(out, "writer-stop.json", &stopped)?;
         let wait = Instant::now();
         loop {
-            if lookup_identity(out, writer.pid)?.is_none_or(|live| live.start != writer.start) {
+            if lookup_identity_before(out, writer.pid, deadline)?
+                .is_none_or(|live| live.start != writer.start || live.status == 5)
+            {
                 break;
             }
-            if wait.elapsed() >= Duration::from_secs(2) {
+            if wait.elapsed() >= Duration::from_secs(2) || Instant::now() >= deadline {
                 return Err(
                     "matching harness writer survived stop deadline; see writer-stop.json".into(),
                 );
@@ -622,34 +696,24 @@ struct Restore {
     writer_stop_evidence: Vec<Evidence>,
     changed_observations: Vec<String>,
     post_state: Snapshot,
+    violations: Vec<String>,
 }
 
 fn restore(out: &Path, deadline: Instant) -> Result<Restore> {
     let before: Snapshot = read_json(&out.join("preflight.json"))?;
-    let stopped = stop_writers(out)?;
-    // No pf flush/enable/disable, route deletion or DNS removal is appropriate
-    // here: the bootstrap owns none of those resources, even if foreign state drifted.
+    let stopped = stop_writers(out, deadline)?;
+    let _lock = resources::restore_lock(out, deadline)?;
+    let (actions, mut violations) = resources::undo(out, &before, deadline)?;
     let post = snapshot(out, &unique("post"), deadline)?;
-    let changed = before
-        .observations
-        .iter()
-        .filter_map(|(name, old)| {
-            post.observations
-                .get(name)
-                .filter(|new| {
-                    old.stdout != new.stdout
-                        || old.stderr != new.stderr
-                        || old.exit_code != new.exit_code
-                })
-                .map(|_| name.clone())
-        })
-        .collect();
+    let changed = restore_check::state_diff(&before.observations, &post.observations);
+    violations.extend(changed.iter().cloned());
     let result = Restore {
         already_restored: out.join("restored.json").exists(),
-        network_mutations: Vec::new(),
+        network_mutations: actions,
         writer_stop_evidence: stopped,
         changed_observations: changed,
         post_state: post,
+        violations,
     };
     write_json(out, &format!("{}.json", unique("restore")), &result)?;
     write_json(out, "restored.json", &result)?;
@@ -883,5 +947,232 @@ fn boot_reads(out: &Path, result: &mut CaseResult, started: Instant) -> Result<(
             "sysctl.proc_translated": "see preflight.json and capture.json"
         }),
     )?;
+    Ok(())
+}
+
+fn restore_checked(out: &Path) -> Result<()> {
+    let result = restore(out, Instant::now() + Duration::from_secs(90))?;
+    let prior = out.join("Q-RESTORE.json");
+    let earlier_violation =
+        prior.exists() && read_json::<CaseResult>(&prior)?.verdict == Verdict::ContractViolation;
+    let violation = !result.violations.is_empty() || earlier_violation;
+    save_case(
+        out,
+        &CaseResult {
+            case: "Q-RESTORE".into(),
+            binary_sha256: executable_sha256()?,
+            verdict: if violation {
+                Verdict::ContractViolation
+            } else {
+                Verdict::AssumptionHolds
+            },
+            iterations: 1,
+            detail: if violation {
+                format!(
+                    "earlier_violation={earlier_violation}; {}",
+                    result.violations.join("; ")
+                )
+            } else {
+                "restored journaled resources; required post-state equals preflight".into()
+            },
+            evidence: Vec::new(),
+        },
+    )?;
+    if violation {
+        return Err("restore post-state contract violation; see Q-RESTORE.json".into());
+    }
+    Ok(())
+}
+
+fn run_probes(out: &Path, group: &str) -> Result<()> {
+    let manifest = Manifest::bundled()?;
+    if !manifest.budgets_fit() {
+        return Err("manifest exceeds harness budget".into());
+    }
+    let started = Instant::now();
+    for name in super::probe::NAMES {
+        if (name == "dns-default") != (group == "probe-hijack") {
+            continue;
+        }
+        if started.elapsed() > Duration::from_mins(16) {
+            return Err("probe cell deadline exhausted".into());
+        }
+        run_probe(out, name)?;
+    }
+    Ok(())
+}
+
+fn run_probe(out: &Path, name: &str) -> Result<()> {
+    let started = Instant::now();
+    if !super::probe::NAMES.contains(&name) {
+        return Err("unknown probe".into());
+    }
+    if out
+        .join(format!("Q-PROBE-{}.json", name.to_ascii_uppercase()))
+        .exists()
+    {
+        return Err("probe already recorded; use a fresh evidence directory for a rerun".into());
+    }
+    require_ack(out)?;
+    let before: Snapshot = read_json(&out.join("preflight.json"))?;
+    let problems = probe_prerequisites(&before);
+    let bin = std::env::current_exe()?.with_file_name(format!("probe-{name}"));
+    protected_path(&bin, false)?;
+    let wg = std::env::current_exe()?.with_file_name("wireguard-go");
+    if matches!(name, "proc-identity" | "utun-handoff") {
+        protected_path(&wg, false)?;
+    }
+    let mut result = CaseResult {
+        case: format!("Q-PROBE-{}", name.to_ascii_uppercase()),
+        binary_sha256: executable_sha256()?,
+        verdict: Verdict::Inconclusive,
+        iterations: 0,
+        detail: "prerequisite unavailable".into(),
+        evidence: Vec::new(),
+    };
+    if !problems.is_empty() {
+        result.detail = problems.join("; ");
+        save_case(out, &result)?;
+        return Ok(());
+    }
+    write_json(
+        out,
+        &format!("probe-identity-{name}.json"),
+        &json!({
+            "name": name, "sha256": format!("{:x}", Sha256::digest(fs::read(&bin)?)),
+            "wireguard_sha256": if matches!(name, "proc-identity" | "utun-handoff") { Some(format!("{:x}", Sha256::digest(fs::read(&wg)?))) } else { None },
+        }),
+    )?;
+    let args = [
+        out.to_str().ok_or("invalid output path")?,
+        wg.to_str().ok_or("invalid wireguard path")?,
+    ];
+    let count = if matches!(name, "proc-identity" | "utun-handoff") {
+        2
+    } else {
+        1
+    };
+    let evidence = command(
+        bin.to_str().ok_or("invalid probe path")?,
+        &args[..count],
+        None,
+        Duration::from_secs(if name == "dns-default" { 10 } else { 90 }),
+    );
+    classify_probe(out, name, &evidence, &mut result)?;
+    result.evidence.push(evidence);
+    save_case(out, &result)?;
+    // Clean up after each probe, also after timeout. Check idempotence on real
+    // mutations before allowing another probe to start.
+    let deadline = started + Duration::from_secs(if name == "dns-default" { 60 } else { 120 });
+    if let Err(error) = probe_restore_checks(out, name, deadline) {
+        result.verdict = Verdict::ContractViolation;
+        result.detail = format!("probe restore failed: {error}");
+        save_case(out, &result)?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn classify_probe(
+    out: &Path,
+    name: &str,
+    evidence: &Evidence,
+    result: &mut CaseResult,
+) -> Result<()> {
+    let parsed = serde_json::from_str::<Value>(&evidence.stdout);
+    if evidence.complete() {
+        if let Ok(value) = &parsed {
+            if let Ok(questions) = super::probe::questions(value) {
+                result.verdict = Verdict::Measurement;
+                result.iterations = 1;
+                result.detail = "raw C capability measurement; no assumption promotion; question verdicts are separate artifacts".into();
+                for (id, verdict, iterations) in questions {
+                    save_case(
+                        out,
+                        &CaseResult {
+                            case: id,
+                            binary_sha256: executable_sha256()?,
+                            verdict,
+                            iterations,
+                            detail: format!(
+                                "bounded hypothesis tested by {name}; see {}.json for raw observations; does not qualify a build",
+                                result.case
+                            ),
+                            evidence: Vec::new(),
+                        },
+                    )?;
+                }
+                if name == "pf-starters" {
+                    save_case(out, &CaseResult { case: "Q-REFS-layout".into(), binary_sha256: executable_sha256()?, verdict: super::probe::pf_layout(value), iterations: super::probe::pf_read_count(value),
+                        detail: "84-byte stride, 16-byte request, ioctl number and all size/order observations compared with whole-record newest-first copy-loop hypothesis".into(), evidence: Vec::new() })?;
+                }
+            } else {
+                result.detail = "malformed question output; never qualifies".into();
+            }
+        } else {
+            result.detail = "probe did not emit one complete JSON object".into();
+        }
+    } else {
+        result.detail =
+            "probe failed, exceeded its internal deadline, or produced incomplete output".into();
+    }
+    Ok(())
+}
+
+fn probe_prerequisites(before: &Snapshot) -> Vec<String> {
+    let mut problems = before.inconclusive.clone();
+    for key in restore_check::REQUIRED {
+        if before.observations.get(key).is_none_or(|e| !e.complete()) {
+            problems.push(format!("missing complete preflight {key}"));
+        }
+    }
+    if restore_check::pf_status(&before.observations).is_none() {
+        problems.push("unknown preflight pf status".into());
+    }
+    if !before
+        .observations
+        .get("scutil-keys")
+        .is_some_and(restore_check::valid_key_list)
+    {
+        problems.push("unrecognized scutil key inventory".into());
+    }
+    if before.observations.get("scutil-keys").is_some_and(|e| {
+        restore_check::key_list(&e.stdout)
+            .iter()
+            .any(|key| key.starts_with("State:/Network/Service/scupper-qual-"))
+    }) {
+        problems.push("pre-existing harness SystemConfiguration key".into());
+    }
+    problems
+}
+
+fn probe_restore_checks(out: &Path, name: &str, deadline: Instant) -> Result<()> {
+    let first = restore(out, deadline)?;
+    let second = restore(out, deadline)?;
+    let comparison = restore_check::compare(
+        &RestoreEffects {
+            already_restored: first.already_restored,
+            network_mutations: &first.network_mutations,
+            writer_stop_count: first.writer_stop_evidence.len(),
+            observations: &first.post_state.observations,
+        },
+        &RestoreEffects {
+            already_restored: second.already_restored,
+            network_mutations: &second.network_mutations,
+            writer_stop_count: second.writer_stop_evidence.len(),
+            observations: &second.post_state.observations,
+        },
+    );
+    write_json(out, &format!("restore-{name}-comparison.json"), &comparison)?;
+    if !first.violations.is_empty()
+        || !second.violations.is_empty()
+        || !comparison.violations.is_empty()
+    {
+        return Err(format!(
+            "restore contract violation: {:?}; {:?}; {:?}",
+            first.violations, second.violations, comparison.violations
+        )
+        .into());
+    }
     Ok(())
 }

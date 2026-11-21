@@ -77,6 +77,33 @@ class ArtifactTests(unittest.TestCase):
         self.assertFalse((self.root / "abi-probe").exists())
         self.assertNotIn("fixture-only", (self.root / "command.json").read_text())
 
+    def test_nested_probe_output_is_redacted_and_all_executables_are_removed(self):
+        for name in ["probe-pf-starters", "probe-dns-default", "wireguard-go", "storage.dmg"]:
+            (self.root / name).write_bytes(b"fixture executable")
+        self.write_json("probe.json", {"stdout": '{"reply":"trace: preshared_key=fixture-shared"}'})
+        self.assertEqual(self.check().returncode, 1)
+        self.assertNotIn("fixture-shared", (self.root / "probe.json").read_text())
+        for name in ["probe-pf-starters", "probe-dns-default", "wireguard-go", "storage.dmg"]:
+            self.assertFalse((self.root / name).exists())
+
+    def test_unicode_escaped_assignments_inside_embedded_json_are_quarantined(self):
+        escaped = '{"reply":"private\\u005fkey\\u003dfixture-escaped"}'
+        self.write_json("escaped.json", {"stdout": escaped})
+        self.assertEqual(self.check().returncode, 1)
+        self.assertNotIn("fixture-escaped", (self.root / "escaped.json").read_text())
+
+    def test_capability_evidence_must_match_the_built_staged_and_executed_hashes(self):
+        for name in ["built-capability-sha256.txt", "executed-capability-sha256.txt"]:
+            (self.root / name).write_text(f"{SHA256}  /fixture/probe-pf-starters\n")
+        (self.root / "wireguard-sha256.txt").write_text(f"{SHA256}  /fixture/wireguard-go\n")
+        with (self.root / "executed-capability-sha256.txt").open("a") as staged:
+            staged.write(f"{SHA256}  /fixture/wireguard-go\n")
+        self.write_json("probe-identity-pf-starters.json", {"name":"pf-starters", "sha256":SHA256})
+        self.assertEqual(self.check().returncode, 0)
+        self.write_json("probe-identity-pf-starters.json", {"name":"pf-starters", "sha256":"b" * 64})
+        self.assertEqual(self.check().returncode, 1)
+        self.assertIn("quarantined", (self.root / "Q-SMOKE.json").read_text())
+
 
 if __name__ == "__main__":
     unittest.main()
