@@ -223,6 +223,20 @@ class ArtifactTests(unittest.TestCase):
         (self.root / "tool-sha256.txt").write_text(f"{'b' * 64}  qual-out/tool-child\n")
         self.assertEqual(self.check().returncode, 1)
 
+    def test_rosetta_helper_digest_is_required_and_matches_stage(self):
+        (self.root / "executed-capability-sha256.txt").write_text(
+            f"{SHA256}  /fixture/tool-child\n{'c' * 64}  /fixture/tool-child-x86_64\n")
+        (self.root / "tool-sha256.txt").write_text(f"{SHA256}  qual-out/tool-child\n")
+        self.assertEqual(self.check().returncode, 1)
+        (self.root / "tool-sha256.txt").write_text(
+            f"{SHA256}  qual-out/tool-child\n{'c' * 64}  qual-out/tool-child-x86_64\n")
+        self.write_json("Q-SMOKE.json", self.result)
+        self.write_json("verdicts.json", [self.result])
+        self.assertEqual(self.check().returncode, 0)
+        (self.root / "tool-sha256.txt").write_text(
+            f"{SHA256}  qual-out/tool-child\n{'d' * 64}  qual-out/tool-child-x86_64\n")
+        self.assertEqual(self.check().returncode, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -6,7 +6,8 @@ use super::{
 use crate::{
     native::{NativePlatform, Paths, TrustedExecutable},
     platform::{
-        Deadline, ExeId, Fence, InstanceLockError, KillOutcome, Platform, SpawnAttributes, Tool,
+        Deadline, ExeId, Fence, InstanceLockError, KillOutcome, Platform, SpawnAttributes,
+        SysError, Tool,
         runtime::{Reap, Records},
     },
     snapshot::StartTime,
@@ -17,8 +18,10 @@ use sha2::{Digest, Sha256};
 use std::{
     io::Write,
     os::{
-        fd::{AsFd, OwnedFd},
-        unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt, symlink},
+        fd::{AsFd, AsRawFd, OwnedFd},
+        unix::fs::{
+            DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt, symlink,
+        },
     },
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -54,7 +57,7 @@ fn pin(path: &Path) -> Result<TrustedExecutable> {
 }
 fn platform(out: &Path, child: &Path) -> Result<NativePlatform> {
     Ok(
-        NativePlatform::new(Paths::qualification(fixture(out).join("valid")))
+        NativePlatform::new(Paths::qualification(fixture(out).join("valid")))?
             .with_pins(vec![pin(child)?], child.into()),
     )
 }
@@ -185,7 +188,92 @@ pub(super) fn run(out: &Path) -> Result<()> {
     write_json(out, "verdicts.json", &results)?;
     ensure(!failed, "R4 qualification contract violation")
 }
+// Model absent installer directories only inside the journaled qualification tree.
+// Never create or relax a production ancestor from the helper/qualification code.
+fn production_ancestors(out: &Path) -> Result<()> {
+    let production = Paths::production();
+    let lock = production.lock_path();
+    let control = production.control_path();
+    let model = fixture(out).join("production-run-model");
+    fs::DirBuilder::new().mode(0o755).create(&model)?;
+    fs::set_permissions(&model, fs::Permissions::from_mode(0o755))?;
+    rustix::fs::chown(
+        &model,
+        Some(rustix::fs::Uid::ROOT),
+        Some(rustix::fs::Gid::ROOT),
+    )?;
+    let model_meta = fs::symlink_metadata(&model)?;
+    let mut measurements = Vec::new();
+    let mut would_pass = true;
+    for ancestor in lock.parent().ok_or("production parent")?.ancestors() {
+        match fs::symlink_metadata(ancestor) {
+            Ok(m) => {
+                let strict =
+                    m.is_dir() && crate::platform::runtime::protected_owner_mode(m.uid(), m.mode());
+                would_pass &= strict;
+                measurements.push(json!({"path":ancestor,"uid":m.uid(),"gid":m.gid(),"mode":format!("{:04o}",m.mode() & 0o7777),"strict":strict,"exists":true}));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Only the installer-owned scupper/run chain may be modeled.
+                let planned =
+                    ancestor == production.root() || ancestor == lock.parent().ok_or("parent")?;
+                would_pass &= planned;
+                measurements.push(json!({"path":ancestor,"exists":false,"uid":null,"gid":null,"mode":null,"installer_model":planned,"model_uid":model_meta.uid(),"model_gid":model_meta.gid(),"model_mode":format!("{:04o}", model_meta.mode() & 0o7777)}));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let observed_lock = NativePlatform::qualification_ancestors(lock);
+    let observed_control = NativePlatform::qualification_ancestors(control);
+    NativePlatform::qualification_ancestors(&model.join("scupper.lock"))?;
+    write_json(
+        out,
+        "tool-production-ancestors.json",
+        &json!({"ancestors":measurements,"lock_check":format!("{observed_lock:?}"),"control_check":format!("{observed_control:?}"),"strict_after_installer_root_wheel_0755":would_pass,"model":model}),
+    )?;
+    save_case(
+        out,
+        &CaseResult {
+            case: "Q-LOCK-PRODUCTION-ANCESTORS".into(),
+            binary_sha256: executable_sha256()?,
+            verdict: Verdict::Measurement,
+            iterations: u32::try_from(measurements.len())?,
+            detail: format!(
+                "Every production lock/socket ancestor measured; strict check after installer-owned root:wheel 0755 scupper/run directories: {would_pass}; absent directories modeled only in journaled scratch"
+            ),
+            evidence: Vec::new(),
+        },
+    )
+}
+
+pub(super) fn mutation_tools(out: &Path) -> Result<()> {
+    require_ack(out)?;
+    let tree = fixture(out);
+    ensure(!tree.exists(), "mutation fixture already exists")?;
+    append(out, &json!({"kind":"r4-tree","path":tree}))?;
+    fs::DirBuilder::new().mode(0o700).create(&tree)?;
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(tree.join("valid"))?;
+    let mut result = CaseResult {
+        case: "Q-TOOL-MUTATION".into(),
+        binary_sha256: executable_sha256()?,
+        verdict: Verdict::AssumptionHolds,
+        iterations: 0,
+        detail: "Native mutation baseline".into(),
+        evidence: Vec::new(),
+    };
+    let outcome = tools(out, &mut result);
+    if let Err(ref error) = outcome {
+        result.verdict = Verdict::ContractViolation;
+        result.detail = error.to_string();
+    }
+    save_case(out, &result)?;
+    outcome
+}
+
 fn locks(out: &Path, result: &mut CaseResult) -> Result<()> {
+    production_ancestors(out)?;
     let mut p = platform(out, &helper()?)?;
     p.acquire_instance_lock()
         .map_err(|e| format!("first lock: {e:?}"))?;
@@ -226,13 +314,16 @@ fn locks(out: &Path, result: &mut CaseResult) -> Result<()> {
                 _ => {}
             }
         }
-        let mut bad = NativePlatform::new(Paths::qualification(root.clone()));
+        let mut bad = NativePlatform::new(Paths::qualification(root.clone()))?;
+        let expected = match variant {
+            "symlink" => "native: lock open",
+            "ancestor" => "native: unsafe ancestor",
+            _ => "native: lock metadata",
+        };
         ensure(
-            matches!(
-                bad.acquire_instance_lock(),
-                Err(InstanceLockError::Failed(_))
-            ),
-            &format!("lock accepted {variant}"),
+            bad.acquire_instance_lock()
+                == Err(InstanceLockError::Failed(SysError::Failed(expected))),
+            &format!("lock rejection reason differed for {variant}: expected {expected}"),
         )?;
         // Restore protected traversal for the independent dead-man.
         fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
@@ -287,11 +378,31 @@ fn tools(out: &Path, result: &mut CaseResult) -> Result<()> {
 fn tools_worker(out: &Path, result: &mut CaseResult) -> Result<()> {
     let lock_root = fixture(out).join("tool-lock");
     fs::DirBuilder::new().mode(0o700).create(&lock_root)?;
-    let mut lock = NativePlatform::new(Paths::qualification(lock_root));
+    let mut lock = NativePlatform::new(Paths::qualification(lock_root))?;
     lock.acquire_instance_lock()
         .map_err(|e| format!("tool parent lock: {e:?}"))?;
+    let scratch = fs::File::create(fixture(out).join("non-cloexec"))?;
+    let planted = scupper_darwin::qual_inheritable_fd(scratch.as_fd(), 40)?;
+    let lock_dup =
+        scupper_darwin::qual_inheritable_fd(lock.qualification_lock_fd().ok_or("lock fd")?, 41)?;
+    let planted_fds = [planted.as_raw_fd(), lock_dup.as_raw_fd()];
+    ensure(
+        !rustix::io::fcntl_getfd(&planted)?.contains(rustix::io::FdFlags::CLOEXEC)
+            && !rustix::io::fcntl_getfd(&lock_dup)?.contains(rustix::io::FdFlags::CLOEXEC),
+        "planted descriptors still have CLOEXEC",
+    )?;
+    ensure(
+        planted_fds[0] != planted_fds[1],
+        "planted descriptors collided",
+    )?;
     let mut p = platform(out, &helper()?)?;
     let h = helper()?;
+    ensure(
+        scupper_darwin::qual_sigchld_refusals(&h).is_ok(),
+        "SIGCHLD unsafe disposition allowed spawn",
+    )?;
+    pin_rejections(out, result)?;
+    utun_without_crosscheck(out)?;
     let hs = h.to_str().ok_or("helper path")?;
     let signals = fixture(out).join("signals.json");
     let output = fs::OpenOptions::new()
@@ -344,11 +455,56 @@ fn tools_worker(out: &Path, result: &mut CaseResult) -> Result<()> {
     thread::sleep(Duration::from_millis(100));
     let mut fds = scupper_darwin::proc_fds(child.0.pid())?;
     fds.sort_unstable();
-    ensure(
-        fds == [0, 1, 2],
-        "CLOEXEC_DEFAULT inherited a descriptor (including lifetime lock)",
-    )?;
+    let raw_isolated = fds == [0, 1, 2];
     drop(child);
+    let table = p.run_tool(
+        Tool::Pfctl,
+        &h,
+        &[hs, "hold-fds"],
+        b"input",
+        4096,
+        deadline(5),
+    )?;
+    table.complete()?;
+    let tool_fds: Vec<i32> = serde_json::from_slice(&table.stdout.bytes)?;
+    let tool_isolated =
+        tool_fds == [0, 1, 2] && planted_fds.iter().all(|fd| !tool_fds.contains(fd));
+    let spawn = p.spawn(
+        scupper_core::mac::TunnelGeneration::new(2)?,
+        SpawnAttributes {
+            default_signals: true,
+            empty_signal_mask: true,
+            cloexec_default: true,
+            synchronous: true,
+        },
+        deadline(2),
+    );
+    ensure(spawn.is_err(), "fixture unexpectedly opened utun")?;
+    let child = p
+        .spawned_children()
+        .last()
+        .ok_or("partial child missing")?
+        .clone();
+    journal_child(out, child.pid)?;
+    let mut native_fds = scupper_darwin::proc_fds(child.pid)?;
+    native_fds.sort_unstable();
+    let native_isolated =
+        native_fds == [0, 1, 2] && planted_fds.iter().all(|fd| !native_fds.contains(fd));
+    write_json(
+        out,
+        "tool-fd-isolation.json",
+        &json!({"raw":fds,"tool":tool_fds,"native":native_fds,"planted":planted_fds,"raw_isolated":raw_isolated,"tool_isolated":tool_isolated,"native_isolated":native_isolated}),
+    )?;
+    ensure(
+        raw_isolated && tool_isolated && native_isolated,
+        "CLOEXEC_DEFAULT assertion: raw/tool/NativePlatform inherited planted fd or lock dup",
+    )?;
+    p.kill_process(child.pid, child.start_time, deadline(2))?;
+    let until = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < until && scupper_darwin::sysctl_kern_proc_pid(child.pid)?.is_some() {
+        p.reap_children(deadline(1))?;
+        thread::sleep(Duration::from_millis(5));
+    }
     let invalid = FdAction {
         source: fd.as_fd(),
         target: std::os::fd::AsRawFd::as_raw_fd(&fd),
@@ -393,7 +549,13 @@ fn tools_worker(out: &Path, result: &mut CaseResult) -> Result<()> {
             true,
         ),
         (h.as_path(), vec![hs, "cap"], Vec::new(), 4096, false),
-        (h.as_path(), vec![hs, "late"], Vec::new(), 1024, true),
+        (
+            h.as_path(),
+            vec![hs, "late"],
+            vec![1; 1024 * 1024],
+            1024,
+            true,
+        ),
     ] {
         let observed = p.run_tool(Tool::Pfctl, path, &args, &input, cap, deadline(8))?;
         ensure(
@@ -426,7 +588,7 @@ fn tools_worker(out: &Path, result: &mut CaseResult) -> Result<()> {
     ensure(
         stalled.timed_out
             && stalled.reap == Reap::Status(9)
-            && stalled.fence_open_at_kill
+            && matches!(&stalled.fence_at_kill, Some(Fence::Open(entries)) if entries.iter().any(|e| e.pid == stalled.pid && e.tool == Tool::Route))
             && stalled.kill_reap_ms.is_some_and(|ms| ms <= 2000)
             && started.elapsed() < Duration::from_secs(4),
         "stalled stdin kill/reap budget",
@@ -479,14 +641,129 @@ fn tools_worker(out: &Path, result: &mut CaseResult) -> Result<()> {
     write_json(
         out,
         "tool-observations.json",
-        &json!({"fd_table":fds,"signals":observed,"stalled_elapsed_ms":started.elapsed().as_millis(),"stalled_reap":format!("{:?}",stalled.reap),"kill_reap_ms":stalled.kill_reap_ms,"fence_open_at_kill":stalled.fence_open_at_kill,"self_dup_rejected":true,"fd12_live":true}),
+        &json!({"fd_table":fds,"signals":observed,"stalled_elapsed_ms":started.elapsed().as_millis(),"stalled_reap":format!("{:?}",stalled.reap),"kill_reap_ms":stalled.kill_reap_ms,"fence_at_kill":format!("{:?}",stalled.fence_at_kill),"planted_fds":planted_fds,"tool_fd_table":tool_fds,"native_fd_table":native_fds,"sigchld_refusals":true,"self_dup_rejected":true,"fd12_live":true}),
     )?;
     result.iterations += 1;
     Ok(())
 }
 
+fn utun_without_crosscheck(out: &Path) -> Result<()> {
+    let path = helper()?.with_file_name("tool-child-utun");
+    let mut p = platform(out, &path)?;
+    let outcome = p.spawn(
+        scupper_core::mac::TunnelGeneration::new(3)?,
+        SpawnAttributes {
+            default_signals: true,
+            empty_signal_mask: true,
+            cloexec_default: true,
+            synchronous: true,
+        },
+        deadline(2),
+    );
+    let child = p
+        .spawned_children()
+        .last()
+        .ok_or("utun fixture history missing")?
+        .clone();
+    journal_child(out, child.pid)?;
+    // Gather positive control-socket evidence as well: a dead/unstarted fixture
+    // must not get credit for refusing an uncorroborated utun.
+    let mut names = Vec::new();
+    for fd in scupper_darwin::proc_socket_fds(child.pid)? {
+        if let Some(control) = scupper_darwin::proc_control(child.pid, fd)?
+            && let Some(name) = crate::platform::runtime::utun_name(&control.name, control.unit)
+        {
+            names.push(name);
+        }
+    }
+    ensure(
+        names.len() == 1,
+        "utun negative fixture did not expose exactly one live utun",
+    )?;
+    let socket = Path::new("/var/run/wireguard").join(format!("{}.sock", names[0]));
+    ensure(
+        fs::symlink_metadata(&socket).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+        "utun negative fixture unexpectedly has corroborating socket",
+    )?;
+    p.kill_process(child.pid, child.start_time, deadline(2))?;
+    let until = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < until && scupper_darwin::sysctl_kern_proc_pid(child.pid)?.is_some() {
+        p.reap_children(deadline(1))?;
+        thread::sleep(Duration::from_millis(5));
+    }
+    write_json(
+        out,
+        "tool-utun-crosscheck-negative.json",
+        &json!({"pid":child.pid,"names":names,"socket_absent":true,"spawn_refused":outcome.is_err(),"utun_retained":child.utun}),
+    )?;
+    ensure(
+        outcome.is_err() && child.utun.is_empty(),
+        "utun cross-check assertion: uncorroborated control-unit name accepted",
+    )
+}
+
+fn pin_rejections(out: &Path, result: &mut CaseResult) -> Result<()> {
+    let directory = fixture(out).join("pin-rejections");
+    fs::DirBuilder::new().mode(0o700).create(&directory)?;
+    let mut evidence = Vec::new();
+    for variant in ["symlink", "mode", "owner", "vnode", "digest"] {
+        let path = directory.join(variant);
+        fs::copy(helper()?, &path)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+        let mut reviewed = pin(&path)?;
+        match variant {
+            "symlink" => {
+                fs::rename(&path, path.with_extension("real"))?;
+                symlink(path.with_extension("real"), &path)?;
+            }
+            "mode" => fs::set_permissions(&path, fs::Permissions::from_mode(0o775))?,
+            "owner" => rustix::fs::chown(&path, Some(rustix::fs::Uid::from_raw(1)), None)?,
+            "vnode" => {
+                fs::rename(&path, path.with_extension("old"))?;
+                fs::copy(helper()?, &path)?;
+            }
+            "digest" => {
+                reviewed.sha256[0] ^= 1;
+                ensure(
+                    reviewed.sha256 != <[u8; 32]>::from(Sha256::digest(fs::read(&path)?)),
+                    "wrong digest equals actual digest",
+                )?;
+            }
+            _ => return Err("unknown pin variant".into()),
+        }
+        let expected = if variant == "digest" {
+            "native: pin digest/identity mismatch"
+        } else {
+            "native: untrusted pin"
+        };
+        let mut p = NativePlatform::new(Paths::qualification(directory.clone()))?
+            .with_pins(vec![reviewed], path.clone());
+        // Use the same pin checker as check_tools, check_pfctl and spawn; no child may launch.
+        let observed = p.run_tool(
+            Tool::Pfctl,
+            &path,
+            &["tool-child", "exit0"],
+            b"",
+            1024,
+            deadline(2),
+        );
+        ensure(
+            matches!(observed, Err(SysError::Failed(text)) if text == expected),
+            &format!("pin {variant} rejected for wrong reason"),
+        )?;
+        ensure(
+            p.fence() == Fence::Closed && p.spawned_children().is_empty(),
+            "rejected pin spawned a process",
+        )?;
+        evidence.push(json!({"variant":variant,"rejection":expected}));
+        result.iterations += 1;
+    }
+    write_json(out, "tool-pin-rejections.json", &json!(evidence))
+}
+
+#[allow(clippy::too_many_lines)] // Each worker preserves spawn, observation and reporting order.
 pub(super) fn worker(out: &Path, mode: &str) -> Result<()> {
-    let incarnation = NativePlatform::new(Paths::qualification(fixture(out))).incarnation();
+    let incarnation = NativePlatform::new(Paths::qualification(fixture(out)))?.incarnation();
     let own = scupper_darwin::sysctl_kern_proc_pid(incarnation.pid)?.ok_or("worker absent")?;
     ensure(
         own.ppid == 1 && incarnation.pid == incarnation.pgid,
@@ -505,6 +782,9 @@ pub(super) fn worker(out: &Path, mode: &str) -> Result<()> {
     }
     if mode == "exit" {
         return record_exit(out, incarnation.pid);
+    }
+    if mode == "rosetta" {
+        return rosetta_worker(out, incarnation.pid, incarnation.pgid);
     }
     let child_pin = if mode == "real" {
         std::env::current_exe()?.with_file_name("wireguard-go")
@@ -541,6 +821,15 @@ pub(super) fn worker(out: &Path, mode: &str) -> Result<()> {
         "spawn image/exe differed from staged pin",
     )?;
     let mut checks = json!({});
+    if mode == "real" {
+        let socket = Path::new("/var/run/wireguard").join(format!("{}.sock", child.utun));
+        let m = fs::symlink_metadata(&socket)?;
+        ensure(
+            m.file_type().is_socket() && m.uid() == 0,
+            "utun name lacks independent wireguard socket",
+        )?;
+        checks = json!({"utun_crosscheck_socket":socket,"uid":m.uid(),"socket":true});
+    }
     if mode == "process" {
         let wrong = StartTime {
             seconds: child.start_time.seconds + 1,
@@ -579,6 +868,53 @@ pub(super) fn worker(out: &Path, mode: &str) -> Result<()> {
         thread::sleep(Duration::from_millis(100));
     }
     Ok(())
+}
+fn rosetta_worker(out: &Path, own_pid: u32, own_group: u32) -> Result<()> {
+    let path = helper()?.with_file_name("tool-child-x86_64");
+    let mut p = platform(out, &path)?;
+    let outcome = p.spawn(
+        scupper_core::mac::TunnelGeneration::new(1)?,
+        SpawnAttributes {
+            default_signals: true,
+            empty_signal_mask: true,
+            cloexec_default: true,
+            synchronous: true,
+        },
+        deadline(5),
+    );
+    ensure(
+        matches!(
+            outcome,
+            Err(SysError::Failed("native: translated child refused"))
+        ),
+        "Rosetta child was not explicitly refused",
+    )?;
+    let child = p
+        .spawned_children()
+        .last()
+        .ok_or("translated history missing")?
+        .clone();
+    journal_child(out, child.pid)?;
+    ensure(
+        child.pid > 1 && child.image.is_some(),
+        "translated pid/image history missing before refusal",
+    )?;
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(5)
+        && scupper_darwin::sysctl_kern_proc_pid(child.pid)?.is_some()
+    {
+        p.reap_children(deadline(1))?;
+        thread::sleep(Duration::from_millis(5));
+    }
+    ensure(
+        scupper_darwin::sysctl_kern_proc_pid(child.pid)?.is_none(),
+        "translated child not killed/reaped within five seconds",
+    )?;
+    write_json(
+        out,
+        "tool-worker-rosetta.json",
+        &json!({"pid":own_pid,"pgid":own_group,"child":child.pid,"image":child.image.map(|i|i.uuid),"refused":true,"gone_ms":started.elapsed().as_millis()}),
+    )
 }
 fn record_exit(out: &Path, pid: u32) -> Result<()> {
     let mut f = fs::OpenOptions::new()
@@ -762,7 +1098,7 @@ fn launchd(out: &Path, result: &mut CaseResult) -> Result<()> {
                 "kill_group did not signal",
             )?;
         } else if mode == "kill9" {
-            scupper_darwin::signal_kill(i32::try_from(pid)?, false)?;
+            scupper_darwin::qual_signal_kill(i32::try_from(pid)?, false)?;
         } else {
             let stop = invoke("/bin/launchctl", &["bootout", &service]);
             ensure(stop.complete(), "job bootout failed")?;
@@ -785,6 +1121,26 @@ fn launchd(out: &Path, result: &mut CaseResult) -> Result<()> {
         }
         result.iterations += 1;
     }
+    let mut rosetta = CaseResult {
+        case: "Q-LAUNCHD-ROSETTA".into(),
+        binary_sha256: executable_sha256()?,
+        verdict: Verdict::Inconclusive,
+        iterations: 0,
+        detail: "Rosetta unavailable; native refusal not observed".into(),
+        evidence: Vec::new(),
+    };
+    if cfg!(target_arch = "aarch64") && Path::new("/usr/libexec/rosetta").exists() {
+        let (service, record) = launch_job(out, "rosetta", false)?;
+        ensure(
+            record["refused"] == true && record["gone_ms"].as_u64().is_some_and(|ms| ms < 5000),
+            "Rosetta refusal evidence incomplete",
+        )?;
+        let _ = invoke("/bin/launchctl", &["bootout", &service]);
+        rosetta.verdict = Verdict::AssumptionHolds;
+        rosetta.iterations = 1;
+        rosetta.detail = "x86_64 child explicitly refused, killed before Err, reaped within five seconds with pid/image history".into();
+    }
+    save_case(out, &rosetta)?;
     let (service, _) = launch_job(out, "exit", true)?;
     let until = Instant::now() + Duration::from_secs(25);
     let mut exits = Vec::<Value>::new();
@@ -817,7 +1173,7 @@ fn launchd(out: &Path, result: &mut CaseResult) -> Result<()> {
         evidence: vec![stop],
     };
     save_case(out, &measurement)?;
-    result.detail="launchd bootout/SIGKILL group disappearance measured; image/exe and guarded kills observed; child-owned utun control socket identified; R8 handoff remains provisional; Exit0 throttle is measurement only".into();
+    result.detail="launchd bootout/SIGKILL group disappearance measured; image/exe and guarded kills observed; child-owned utun control socket independently cross-checked against root-owned wireguard socket; non-real fixtures deliberately time out after 5 s without utun and cover retained partial identity; R8 handoff remains provisional; Exit0 throttle is measurement only".into();
     Ok(())
 }
 
@@ -848,6 +1204,7 @@ fn restore_jobs(
                 | "system/net.scupper.qual.r4-group"
                 | "system/net.scupper.qual.r4-process"
                 | "system/net.scupper.qual.r4-real"
+                | "system/net.scupper.qual.r4-rosetta"
                 | "system/net.scupper.qual.r4-exit"
         ) {
             failures.push("unknown R4 job intent".into());
@@ -899,7 +1256,6 @@ pub(super) fn restore(
             }
         }
         for item in fs::read_dir(directory)? {
-            use std::os::unix::fs::FileTypeExt;
             let item = item?;
             let meta = fs::symlink_metadata(item.path())?;
             let name = item.file_name();

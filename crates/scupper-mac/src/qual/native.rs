@@ -86,6 +86,7 @@ impl Options {
                 | "probe"
                 | "r4-worker"
                 | "r4-lock"
+                | "r4-tools"
         ) {
             return Err("unknown subcommand".into());
         }
@@ -199,6 +200,7 @@ pub(super) fn dispatch(args: &[String]) -> Result<()> {
             require_ack(&options.out)?;
             tool::worker(&options.out, options.name.as_deref().unwrap_or("hold"))
         }
+        "r4-tools" => tool::mutation_tools(&options.out),
         "r4-lock" => {
             require_ack(&options.out)?;
             tool::lock_contender(&options.out)

@@ -316,7 +316,9 @@ jobs:
         if: matrix.group == 'tool'
         run: |
           cc -std=c11 -Wall -Wextra -Werror crates/scupper-darwin/probe/tool-child.c -o qual-out/tool-child
-          shasum -a 256 qual-out/tool-child | tee qual-out/tool-sha256.txt
+          cc -std=c11 -Wall -Wextra -Werror -arch x86_64 crates/scupper-darwin/probe/tool-child.c -o qual-out/tool-child-x86_64
+          cc -std=c11 -Wall -Wextra -Werror -DCREATE_UTUN_NO_SOCKET crates/scupper-darwin/probe/tool-child.c -o qual-out/tool-child-utun
+          shasum -a 256 qual-out/tool-child qual-out/tool-child-x86_64 qual-out/tool-child-utun | tee qual-out/tool-sha256.txt
       - name: Compile capability probes with full diagnostics
         if: matrix.group == 'probe' || matrix.group == 'probe-hijack'
         timeout-minutes: 2
@@ -335,7 +337,7 @@ jobs:
           /usr/bin/sudo /usr/bin/install -d -o root -g wheel -m 0700 /private/var/db/scupper-qual
           /usr/bin/sudo /usr/bin/install -o root -g wheel -m 0755 target/debug/scupper-mac-qual /private/var/db/scupper-qual/scupper-mac-qual
           /usr/bin/sudo /usr/bin/install -o root -g wheel -m 0755 qual-out/abi-probe /private/var/db/scupper-qual/abi-probe
-          for binary in qual-out/probe-* qual-out/wireguard-go qual-out/base-churn qual-out/base-image-a qual-out/base-image-b qual-out/tool-child; do
+          for binary in qual-out/probe-* qual-out/wireguard-go qual-out/base-churn qual-out/base-image-a qual-out/base-image-b qual-out/tool-child qual-out/tool-child-x86_64 qual-out/tool-child-utun; do
             if [ -f "$binary" ]; then
               /usr/bin/sudo /usr/bin/install -o root -g wheel -m 0755 "$binary" "/private/var/db/scupper-qual/$(basename "$binary")"
               /usr/bin/sudo /usr/bin/shasum -a 256 "/private/var/db/scupper-qual/$(basename "$binary")" >> qual-out/executed-capability-sha256.txt
@@ -344,6 +346,10 @@ jobs:
           /usr/bin/sudo /usr/bin/shasum -a 256 /private/var/db/scupper-qual/scupper-mac-qual | tee qual-out/executed-harness-sha256.txt
           /usr/bin/sudo /usr/bin/shasum -a 256 /private/var/db/scupper-qual/abi-probe | tee qual-out/executed-probe-sha256.txt
           test "$(cut -d ' ' -f 1 qual-out/built-harness-sha256.txt)" = "$(cut -d ' ' -f 1 qual-out/executed-harness-sha256.txt)"
+      - name: Kill native R4 spawn mutants and confirm restored baseline
+        if: matrix.group == 'tool'
+        timeout-minutes: 8
+        run: python3 crates/scupper-mac/tests/r4_native_mutations.py
       - name: Preflight
         timeout-minutes: 3
         run: /usr/bin/sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,ImageOS,ImageVersion,RUNNER_NAME,GITHUB_RUN_ID,GITHUB_SHA /private/var/db/scupper-qual/scupper-mac-qual preflight --out /private/var/db/scupper-qual/evidence --disposable-runner

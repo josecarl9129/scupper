@@ -111,7 +111,7 @@ pub(super) fn run(out: &Path) -> Result<()> {
     // This gate belongs to this cell: no measurement may rely on another
     // matrix cell having checked the SDK first.
     let layout = check_layout(out);
-    let mut platform = NativePlatform::new(Paths::qualification(out.to_path_buf()));
+    let mut platform = NativePlatform::new(Paths::qualification(out.to_path_buf()))?;
     let mut results = Vec::new();
     for (id, operation) in [
         (

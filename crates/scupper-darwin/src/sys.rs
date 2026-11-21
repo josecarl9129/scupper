@@ -160,7 +160,7 @@ impl KinfoProc {
             ppid: self.ppid,
             pgid: self.pgid,
             stat: self.stat,
-            translated: self.flags & P_TRANSLATED != 0,
+            translated: crate::rules::translated(self.flags),
             start: (self.start_sec, self.start_usec),
             comm: self.comm,
         }
@@ -633,7 +633,7 @@ mod process_tests {
 }
 
 /// XNU sys/proc.h `P_TRANSLATED`; pinned by the SDK probe.
-pub const P_TRANSLATED: i32 = 0x0002_0000;
+pub const P_TRANSLATED: i32 = crate::rules::P_TRANSLATED;
 const _: () = assert!(std::mem::offset_of!(KinfoProc, flags) == 32);
 
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
@@ -699,6 +699,20 @@ impl Spawned {
     pub fn pid(&self) -> u32 {
         // Construction checked this positive pid; never use a narrowing cast.
         u32::try_from(self.pid).unwrap_or_else(|_| std::process::abort())
+    }
+    /// Inspect socket descriptors only through this owned-child capability.
+    ///
+    /// # Errors
+    /// Incomplete libproc evidence is never returned as an empty inventory.
+    pub fn socket_fds(&self) -> Result<Vec<i32>, Errno> {
+        socket_fds(self.pid())
+    }
+    /// Observe one owned child's socket; callers bracket the process image.
+    ///
+    /// # Errors
+    /// Non-sockets, short reads and libproc errors fail closed.
+    pub fn control_socket(&self, fd: i32) -> Result<Option<ControlSocket>, Errno> {
+        read_control(self.pid(), fd)
     }
     /// Poll only this own spawn record. No wildcard wait or arbitrary-pid API.
     ///
@@ -776,6 +790,7 @@ fn spawn_inner(
     fds: &[FdAction<'_>],
 ) -> Result<Spawned, Errno> {
     use std::os::unix::ffi::OsStrExt;
+    check_sigchld()?;
     if !path.is_absolute()
         || path.components().any(|c| {
             matches!(
@@ -902,10 +917,16 @@ pub fn high_fd(fd: OwnedFd) -> Result<OwnedFd, Errno> {
 ///
 /// # Errors
 /// Rejects special pids/groups and preserves the kill errno.
-pub fn signal_kill(pid: i32, group: bool) -> Result<(), Errno> {
-    if pid <= 1 {
+pub(crate) fn signal_kill(pid: i32, group: bool) -> Result<(), Errno> {
+    if pid <= 1
+        || pid == rustix::process::getpid().as_raw_pid()
+        || (group && pid == rustix::process::getpgrp().as_raw_pid())
+    {
         return Err(Errno::INVAL);
     }
+    signal_validated(pid, group)
+}
+fn signal_validated(pid: i32, group: bool) -> Result<(), Errno> {
     let rc = if group {
         // SAFETY: positive validated group id, no pointers. The adapter rechecked
         // identity immediately before entering this function and serializes reap.
@@ -923,7 +944,26 @@ pub fn signal_kill(pid: i32, group: bool) -> Result<(), Errno> {
 ///
 /// # Errors
 /// Invalid pids, lengths, churn and syscall failure prove no fd-table result.
+#[cfg(feature = "qualification")]
 pub fn proc_fds(pid: u32) -> Result<Vec<i32>, Errno> {
+    Ok(proc_fd_records(pid)?
+        .into_iter()
+        .map(|(fd, _)| fd)
+        .collect())
+}
+
+/// List socket descriptors only; errors never masquerade as a complete inventory.
+///
+/// # Errors
+/// Same bounded libproc errors as `proc_fds`.
+fn socket_fds(pid: u32) -> Result<Vec<i32>, Errno> {
+    Ok(proc_fd_records(pid)?
+        .into_iter()
+        .filter(|(_, kind)| *kind == 2)
+        .map(|(fd, _)| fd)
+        .collect())
+}
+fn proc_fd_records(pid: u32) -> Result<Vec<(i32, u32)>, Errno> {
     let pid = i32::try_from(pid).map_err(|_| Errno::INVAL)?;
     if pid <= 1 {
         return Err(Errno::INVAL);
@@ -954,7 +994,7 @@ pub fn proc_fds(pid: u32) -> Result<Vec<i32>, Errno> {
         }
         return Ok(records[..n / std::mem::size_of::<libc::proc_fdinfo>()]
             .iter()
-            .map(|r| r.proc_fd)
+            .map(|r| (r.proc_fd, r.proc_fdtype))
             .collect());
     }
     Err(Errno::NOMEM)
@@ -1008,6 +1048,7 @@ pub fn poll_pipes(
 /// # Errors
 /// Returns signal setup/restore or spawn errno. A restore failure aborts rather
 /// than leave the helper with an unreported changed signal environment.
+#[cfg(feature = "qualification")]
 pub fn spawn_signal_probe(
     path: &std::path::Path,
     argv: &[&str],
@@ -1079,7 +1120,7 @@ pub struct ControlSocket {
 /// # Errors
 /// Preserves libproc errors (including non-socket fd), rejects short replies.
 /// A non-control socket returns None; the caller must bracket process identity.
-pub fn proc_control(pid: u32, fd: i32) -> Result<Option<ControlSocket>, Errno> {
+fn read_control(pid: u32, fd: i32) -> Result<Option<ControlSocket>, Errno> {
     let pid = i32::try_from(pid).map_err(|_| Errno::INVAL)?;
     if pid <= 1 || fd < 0 {
         return Err(Errno::INVAL);
@@ -1131,3 +1172,179 @@ pub const CONTROL_FIELDS: [(&str, usize); 6] = [
     ("SOCKINFO_KERN_CTL", 6),
 ];
 const _: () = assert!(std::mem::size_of::<SocketFdInfo>() == 792);
+
+/// Refuse spawn unless exited children remain ours until an exact-pid reap.
+/// The helper is a single spawner and never changes SIGCHLD after construction.
+///
+/// # Errors
+/// Returns the sigaction errno or INVAL for any non-default/auto-reap disposition.
+pub fn check_sigchld() -> Result<(), Errno> {
+    let mut old = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+    // SAFETY: valid signal, null input makes this read-only; aligned writable
+    // output is consumed only after sigaction reports success.
+    if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), old.as_mut_ptr()) } != 0 {
+        return Err(last_errno());
+    }
+    // SAFETY: successful sigaction initialized the complete output object.
+    let old = unsafe { old.assume_init() };
+    if crate::rules::sigchld_safe(
+        old.sa_sigaction == libc::SIG_DFL,
+        old.sa_flags & libc::SA_NOCLDWAIT != 0,
+    ) {
+        Ok(())
+    } else {
+        Err(Errno::INVAL)
+    }
+}
+
+/// Qualification-only non-CLOEXEC duplicate. The serialized harness retains it
+/// across each spawn to make descriptor inheritance assertions non-vacuous.
+///
+/// # Errors
+/// Returns fcntl failure. The owned duplicate closes on every return.
+#[cfg(feature = "qualification")]
+pub fn qual_inheritable_fd(fd: BorrowedFd<'_>, minimum: i32) -> Result<OwnedFd, Errno> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: borrowed live fd, integer-only F_DUPFD creates a distinct owned fd.
+    let raw = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD, minimum) };
+    if raw < 0 {
+        return Err(last_errno());
+    }
+    // SAFETY: successful F_DUPFD returned a new exclusively owned descriptor.
+    let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+    // SAFETY: owned live descriptor; F_SETFD clears close-on-exec deliberately.
+    if unsafe { libc::fcntl(raw, libc::F_SETFD, 0) } < 0 {
+        return Err(last_errno());
+    }
+    Ok(owned)
+}
+
+/// Exercise actual spawn refusal under both inherited auto-reap dispositions.
+/// Call only in a serialized qualification process; restores the exact action.
+///
+/// # Errors
+/// Returns syscall errors or INVAL if either unsafe disposition allowed spawn.
+#[cfg(feature = "qualification")]
+pub fn qual_sigchld_refusals(path: &std::path::Path) -> Result<(), Errno> {
+    let mut old = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+    // SAFETY: read-only query with valid signal and aligned writable output.
+    if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), old.as_mut_ptr()) } != 0 {
+        return Err(last_errno());
+    }
+    // SAFETY: successful query initialized the entire object.
+    let old = unsafe { old.assume_init() };
+    let mut result = Ok(());
+    for (handler, flags) in [(libc::SIG_IGN, 0), (libc::SIG_DFL, libc::SA_NOCLDWAIT)] {
+        let action = libc::sigaction {
+            sa_sigaction: handler,
+            sa_mask: 0,
+            sa_flags: flags,
+        };
+        // SAFETY: live initialized action, valid signal; exact old action restored below.
+        if unsafe { libc::sigaction(libc::SIGCHLD, &raw const action, std::ptr::null_mut()) } != 0 {
+            result = Err(last_errno());
+            break;
+        }
+        match spawn(path, &["tool-child", "exit0"], &[]) {
+            Err(Errno::INVAL) => {}
+            Err(e) => {
+                result = Err(e);
+                break;
+            }
+            Ok(mut child) => {
+                // A mutant has invalidated owned-pid lifetime protection. This
+                // exit0 fixture needs no signal; never kill under auto-reaping.
+                for _ in 0..200 {
+                    if child.try_reap().is_ok_and(|s| s != Wait::Pending) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                result = Err(Errno::INVAL);
+                break;
+            }
+        }
+    }
+    // SAFETY: old was read successfully; restoring it never installs a Rust callback.
+    if unsafe { libc::sigaction(libc::SIGCHLD, &raw const old, std::ptr::null_mut()) } != 0 {
+        std::process::abort();
+    }
+    result
+}
+
+/// Result of an immediate kernel identity check followed by a guarded signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalOutcome {
+    /// Expected leader no longer exists (does not certify an empty group).
+    Gone,
+    /// Start or group changed; nothing signalled.
+    StartChanged,
+    /// SIGKILL delivered.
+    Signalled,
+}
+/// Guard self/special ids and re-read kernel start/group immediately before kill.
+///
+/// # Errors
+/// Returns invalid target or syscall errors; incomplete lookup never signals.
+pub fn kill_checked(
+    pid: u32,
+    group: Option<u32>,
+    start: (u64, u32),
+) -> Result<SignalOutcome, Errno> {
+    let os_pid = i32::try_from(pid).map_err(|_| Errno::INVAL)?;
+    let target = i32::try_from(group.unwrap_or(pid)).map_err(|_| Errno::INVAL)?;
+    if os_pid <= 1
+        || target <= 1
+        || os_pid == rustix::process::getpid().as_raw_pid()
+        || target == rustix::process::getpid().as_raw_pid()
+        || (group.is_some() && target == rustix::process::getpgrp().as_raw_pid())
+    {
+        return Err(Errno::INVAL);
+    }
+    let Some(current) = sysctl_kern_proc_pid(pid).map_err(|e| match e {
+        ProcError::Os(e) => e,
+        _ => Errno::INVAL,
+    })?
+    else {
+        return Ok(SignalOutcome::Gone);
+    };
+    let expected = (
+        i64::try_from(start.0).map_err(|_| Errno::INVAL)?,
+        i32::try_from(start.1).map_err(|_| Errno::INVAL)?,
+    );
+    if current.start != expected || group.is_some_and(|_| current.pgid != target) {
+        return Ok(SignalOutcome::StartChanged);
+    }
+    // Self/group guards ran before the identity query. No intervening syscall
+    // is allowed between this last identity check and the actual signal.
+    match signal_validated(target, group.is_some()) {
+        Ok(()) => Ok(SignalOutcome::Signalled),
+        Err(Errno::SRCH) => Ok(SignalOutcome::Gone),
+        Err(e) => Err(e),
+    }
+}
+/// Qualification-only unguarded kill for supervised launchd teardown experiments.
+///
+/// # Errors
+/// Rejects self/special ids and preserves signal errno.
+#[cfg(feature = "qualification")]
+pub fn qual_signal_kill(pid: i32, group: bool) -> Result<(), Errno> {
+    signal_kill(pid, group)
+}
+
+/// Qualification-only arbitrary-pid socket inventory.
+///
+/// # Errors
+/// Preserves bounded libproc inventory failures.
+#[cfg(feature = "qualification")]
+pub fn proc_socket_fds(pid: u32) -> Result<Vec<i32>, Errno> {
+    socket_fds(pid)
+}
+/// Qualification-only arbitrary-pid control observation.
+///
+/// # Errors
+/// Preserves socket read failures, including short or non-socket replies.
+#[cfg(feature = "qualification")]
+pub fn proc_control(pid: u32, fd: i32) -> Result<Option<ControlSocket>, Errno> {
+    read_control(pid, fd)
+}

@@ -8,8 +8,8 @@ ROOT = Path(__file__).resolve().parents[3]
 SOURCE = ROOT / "crates/scupper-mac/src/platform/runtime.rs"
 LOGS = ROOT / "target/r4-validation"
 MUTANTS = [
-    ("accept-self-dup", "source >= 0 && target >= 0 && source != target",
-     "source >= 0 && target >= 0", "self_dup_is_rejected"),
+    ("accept-self-dup", "    source >= 0 && target >= 0 && source != target\n}",
+     "    source >= 0 && target >= 0\n}", "self_dup_is_rejected"),
     ("reaped-without-syscall", "matches!(self, Self::Status(_) | Self::NoChild)",
      "matches!(self, Self::Pending | Self::Status(_) | Self::NoChild)",
      "only_reap_evidence_closes_fences_and_families_are_separate"),
@@ -21,6 +21,7 @@ MUTANTS = [
     ("accept-two-links", " && nlink == 1", "", "lock_rejects_extra_links_and_permissions"),
     ("omit-partial-image", "child.image = observed.image.or(retained);", "",
      "wrong_start_prevents_signal_and_partial_spawn_keeps_image"),
+    ("omit-utun-crosscheck", "if !protected_socket {", "if false && !protected_socket {", "utun_requires_independent_evidence"),
 ]
 
 def run(test):
@@ -29,12 +30,14 @@ def run(test):
                           env=dict(os.environ, CARGO_BUILD_JOBS="2", RUST_TEST_THREADS="2"),
                           capture_output=True, text=True, check=False)
 
+RULES = ROOT / "crates/scupper-darwin/src/rules.rs"
+original_rules = RULES.read_bytes()
 original = SOURCE.read_bytes()
 LOGS.mkdir(parents=True, exist_ok=True)
 try:
     for name, before, after, test in MUTANTS:
         text = original.decode()
-        assert text.count(before) >= 1, (name, "mutation anchor not unique")
+        assert text.count(before) == 1, (name, "mutation anchor not unique")
         SOURCE.write_text(text.replace(before, after, 1))
         result = run(test)
         output = result.stdout + result.stderr
@@ -42,10 +45,22 @@ try:
         assert result.returncode == 101 and "panicked at" in output and "test result: FAILED" in output, (name, output)
         print(f"KILLED by assertion: {name} / {test}", flush=True)
         SOURCE.write_bytes(original)
+    before = "default_handler && !no_child_wait"
+    assert original_rules.decode().count(before) == 1
+    RULES.write_text(original_rules.decode().replace(before, "true || (default_handler && !no_child_wait)"))
+    result = subprocess.run(["cargo", "test", "-p", "scupper-darwin", "--lib", "rules::tests::sigchld_requires_default_and_waitable_children"], cwd=ROOT,
+        env=dict(os.environ, CARGO_BUILD_JOBS="2", RUST_TEST_THREADS="2"), capture_output=True,text=True,check=False)
+    output = result.stdout + result.stderr
+    (LOGS / "mutant-omit-sigchld-policy.log").write_text(output)
+    assert result.returncode == 101 and "panicked at" in output and "test result: FAILED" in output, output
+    print("KILLED by assertion: omit-sigchld-policy", flush=True)
 finally:
     SOURCE.write_bytes(original)
+    RULES.write_bytes(original_rules)
 assert SOURCE.read_bytes() == original
 baseline = run("")
 (LOGS / "mutant-restored-baseline.log").write_text(baseline.stdout + baseline.stderr)
 assert baseline.returncode == 0, baseline.stdout + baseline.stderr
 print("RESTORED: exact original source; all portable runtime tests pass", flush=True)
+
+assert RULES.read_bytes() == original_rules

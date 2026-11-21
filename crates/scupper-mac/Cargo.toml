@@ -8,7 +8,7 @@ publish.workspace = true
 
 [features]
 testing = []
-qualification = ["testing"]
+qualification = ["testing", "scupper-darwin/qualification"]
 
 [dependencies]
 scupper-core.workspace = true
@@ -16,9 +16,9 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 sha2.workspace = true
-rustix = { workspace = true, features = ["time", "pipe"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+rustix = { workspace = true, features = ["time", "pipe"] }
 scupper-darwin = { version = "0.1.4", path = "../scupper-darwin" }
 
 [lints]

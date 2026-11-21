@@ -1,4 +1,7 @@
 //! Serialized tool execution. No workers, wildcard reap, or process-group changes.
+// Until the pf/route/DNS methods (runs R6-R10) call the runner, only the qualification
+// wrapper `NativePlatform::run_tool` uses it; production builds must not warn about that.
+#![cfg_attr(not(feature = "qualification"), allow(dead_code))]
 use crate::platform::{
     Deadline, SysError, Tool,
     runtime::{Output, Reap, Records, valid_fd_action},
@@ -28,8 +31,8 @@ pub struct ToolResult {
     pub io_failed: bool,
     /// Time spent between SIGKILL and the final reap poll.
     pub kill_reap_ms: Option<u128>,
-    /// The spawned pid was in the fence before the timeout kill.
-    pub fence_open_at_kill: bool,
+    /// Actual fence snapshot immediately before the timeout kill.
+    pub fence_at_kill: Option<crate::platform::Fence>,
 }
 impl ToolResult {
     /// Whether every byte was drained, exit was zero and status was reaped.
@@ -71,7 +74,12 @@ fn failure(_: Errno) -> SysError {
     SysError::Failed("native: tool syscall")
 }
 fn high_pipe() -> Result<(OwnedFd, OwnedFd), SysError> {
+    // Darwin lacks pipe2. Mark each end immediately, before duplication.
+    // The engine and qualification worker are single spawners: no concurrent
+    // std::process spawn may run during this pipe-to-fcntl interval.
     let (read, write) = pipe().map_err(failure)?;
+    rustix::io::fcntl_setfd(&read, rustix::io::FdFlags::CLOEXEC).map_err(failure)?;
+    rustix::io::fcntl_setfd(&write, rustix::io::FdFlags::CLOEXEC).map_err(failure)?;
     Ok((
         scupper_darwin::high_fd(read).map_err(failure)?,
         scupper_darwin::high_fd(write).map_err(failure)?,
@@ -138,7 +146,7 @@ pub(super) fn run(
         timed_out: false,
         io_failed: false,
         kill_reap_ms: None,
-        fence_open_at_kill: false,
+        fence_at_kill: None,
     };
     for (i, fd) in streams.iter().enumerate() {
         if let Some(fd) = fd {
@@ -161,8 +169,7 @@ pub(super) fn run(
         let now = scupper_darwin::monotonic_raw();
         if now >= execution_end || result.io_failed {
             result.timed_out = now >= execution_end;
-            result.fence_open_at_kill =
-                matches!(records.fence(Spawned::pid), crate::platform::Fence::Open(_));
+            result.fence_at_kill = Some(records.fence(Spawned::pid));
             let kill_started = std::time::Instant::now();
             let _ = records.tools[index].1.kill();
             // No reap may overlap kill: both require the exclusive spawn record.
@@ -228,6 +235,10 @@ fn pump(
                 }
                 Ok(n) => *sent += n,
                 Err(Errno::AGAIN | Errno::INTR) => {}
+                Err(Errno::PIPE) => {
+                    *sent = input.len();
+                    streams[i] = None;
+                }
                 Err(_) => {
                     result.io_failed = true;
                     streams[i] = None;

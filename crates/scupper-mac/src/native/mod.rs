@@ -1,9 +1,11 @@
 //! Native macOS boundary. Construction remains qualification-only until the
 //! install-record writer and production process identity are qualified.
 pub mod tool;
-use crate::platform::{
-    Tool,
-    runtime::{Records, kill_recheck, record_observation, valid_lock},
+#[cfg(feature = "qualification")]
+use crate::platform::Tool;
+use crate::platform::runtime::{
+    PinMetadata, Records, kill_recheck, pin_digest, pin_identity, record_observation, same_meta,
+    valid_lock,
 };
 use crate::{
     decode::{image, proc},
@@ -18,7 +20,7 @@ use crate::{
 use scupper_core::mac::{
     PhysicalInterface, Tunnel, TunnelGeneration, policy::AnchorText, verify::Observations,
 };
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::{
     collections::BTreeSet,
     net::SocketAddrV4,
@@ -46,8 +48,8 @@ impl Paths {
     pub fn production() -> Self {
         Self {
             root: PathBuf::from("/private/var/db/scupper"),
-            lock: PathBuf::from("/private/var/run/scupper.lock"),
-            control: PathBuf::from("/private/var/run/scupper.sock"),
+            lock: PathBuf::from("/private/var/db/scupper/run/scupper.lock"),
+            control: PathBuf::from("/private/var/db/scupper/run/scupper.sock"),
         }
     }
     /// Scratch namespace available only to qualification builds.
@@ -59,6 +61,18 @@ impl Paths {
             control: root.join("control.sock"),
             root,
         }
+    }
+    /// Instance-lock path, for read-only qualification measurements.
+    #[cfg(feature = "qualification")]
+    #[must_use]
+    pub fn lock_path(&self) -> &Path {
+        &self.lock
+    }
+    /// Control-socket path, for read-only qualification measurements.
+    #[cfg(feature = "qualification")]
+    #[must_use]
+    pub fn control_path(&self) -> &Path {
+        &self.control
     }
     /// Root of this namespace.
     #[must_use]
@@ -79,16 +93,19 @@ pub struct NativePlatform {
 impl NativePlatform {
     /// Construct the adapter for runner qualification only.
     #[cfg(feature = "qualification")]
-    #[must_use]
-    pub fn new(paths: Paths) -> Self {
-        Self {
+    ///
+    /// # Errors
+    /// Refuses inherited SIGCHLD auto-reap or non-default handlers.
+    pub fn new(paths: Paths) -> Result<Self, SysError> {
+        scupper_darwin::check_sigchld().map_err(|_| SysError::Failed("native: unsafe SIGCHLD"))?;
+        Ok(Self {
             paths,
             lock: None,
             control: None,
             records: Records::default(),
             pins: Vec::new(),
             child_pin: crate::engine::CHILD_PATH.into(),
-        }
+        })
     }
     /// Supply reviewed digests/vnodes for qualification until R5 provides them.
     /// Production pins remain the fixed engine paths. A staged child override is
@@ -126,6 +143,20 @@ impl NativePlatform {
         }
         tool::run(&mut self.records, family, path, argv, input, cap, deadline)
     }
+    /// Borrow the held lifetime lock for noninheritance qualification.
+    #[cfg(feature = "qualification")]
+    #[must_use]
+    pub fn qualification_lock_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        self.lock.as_ref().map(|f| f.as_fd())
+    }
+    /// Qualify the exact production trust check without opening or creating a lock.
+    ///
+    /// # Errors
+    /// Returns the same strict ancestor rejection as lock/socket creation.
+    #[cfg(feature = "qualification")]
+    pub fn qualification_ancestors(path: &Path) -> Result<(), SysError> {
+        validate_ancestors(path)
+    }
     fn check_pin(&mut self, path: &Path, deadline: Deadline) -> Result<(), SysError> {
         use sha2::{Digest, Sha256};
         use std::io::Read;
@@ -138,23 +169,25 @@ impl NativePlatform {
             .ok_or(SysError::Failed("native: install digest unavailable"))?;
         let before =
             std::fs::symlink_metadata(path).map_err(|_| SysError::Failed("native: pin lstat"))?;
-        if !trusted_meta(&before)
-            || (ExeId {
-                dev: before.dev(),
-                ino: before.ino(),
-            }) != pin.exe
-        {
+        let before = PinMetadata::from_metadata(&before);
+        if !pin_identity(&before, pin.exe) {
             return Err(SysError::Failed("native: untrusted pin"));
         }
         let mut file = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(0x100 | 0x0100_0000 | 0x4)
+            .custom_flags(
+                (rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC
+                    | rustix::fs::OFlags::NONBLOCK)
+                    .bits()
+                    .cast_signed(),
+            )
             .open(path)
             .map_err(|_| SysError::Failed("native: pin open"))?;
         let opened = file
             .metadata()
             .map_err(|_| SysError::Failed("native: pin fstat"))?;
-        if !same_meta(&before, &opened) {
+        if !same_meta(&before, &PinMetadata::from_metadata(&opened)) {
             return Err(SysError::Failed("native: pin changed"));
         }
         let mut digest = Sha256::new();
@@ -177,9 +210,9 @@ impl NativePlatform {
         let path_after =
             std::fs::symlink_metadata(path).map_err(|_| SysError::Failed("native: pin lstat"))?;
         self.expired(deadline)?;
-        if !same_meta(&before, &after)
-            || !same_meta(&before, &path_after)
-            || <[u8; 32]>::from(digest.finalize()) != pin.sha256
+        if !same_meta(&before, &PinMetadata::from_metadata(&after))
+            || !same_meta(&before, &PinMetadata::from_metadata(&path_after))
+            || !pin_digest(digest.finalize().into(), pin.sha256)
         {
             return Err(SysError::Failed("native: pin digest/identity mismatch"));
         }
@@ -301,6 +334,7 @@ impl NativePlatform {
         }
         self.observe_child_utun(index, deadline)
     }
+    // R8: replaced by the OD5 utun fd handoff (see CHILD_LAUNCH).
     fn observe_child_utun(&mut self, index: usize, deadline: Deadline) -> Result<Child, SysError> {
         let pid = self.records.history[index].pid;
         let version = scupper_darwin::proc_identifier(pid)
@@ -316,10 +350,19 @@ impl NativePlatform {
         loop {
             self.expired(deadline)?;
             let mut names = BTreeSet::new();
-            for fd in scupper_darwin::proc_fds(pid)
+            let owned = self
+                .records
+                .children
+                .iter()
+                .find(|c| c.pid() == pid)
+                .ok_or(SysError::Failed("native: child record missing"))?;
+            for fd in owned
+                .socket_fds()
                 .map_err(|_| SysError::Failed("native: child fd inventory"))?
             {
-                if let Ok(Some(control)) = scupper_darwin::proc_control(pid, fd)
+                if let Some(control) = owned
+                    .control_socket(fd)
+                    .map_err(|_| SysError::Failed("native: child socket observation incomplete"))?
                     && let Some(name) =
                         crate::platform::runtime::utun_name(&control.name, control.unit)
                 {
@@ -360,6 +403,13 @@ impl NativePlatform {
                     .ok_or(SysError::Failed("native: child exec version"))?;
                 if after != version {
                     return Err(SysError::Failed("native: child exec changed"));
+                }
+                let socket = Path::new("/var/run/wireguard").join(format!("{name}.sock"));
+                let protected_socket = std::fs::symlink_metadata(socket)
+                    .is_ok_and(|m| m.file_type().is_socket() && m.uid() == 0);
+                if crate::platform::runtime::utun_crosscheck(protected_socket).is_err() {
+                    self.pause(Duration::from_millis(10), deadline);
+                    continue;
                 }
                 self.records.history[index].utun = name;
                 self.expired(deadline)?;
@@ -557,7 +607,13 @@ impl Platform for NativePlatform {
         // Darwin O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK; all actual foreign calls remain in sys.rs.
         let file = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(0x100 | 0x0100_0000 | 0x4)
+            .custom_flags(
+                (rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC
+                    | rustix::fs::OFlags::NONBLOCK)
+                    .bits()
+                    .cast_signed(),
+            )
             .open(path)
             .map_err(|_| SysError::Failed("native: image open"))?;
         let meta = file
@@ -596,7 +652,11 @@ impl Platform for NativePlatform {
                 .write(true)
                 .create(true)
                 .mode(0o600)
-                .custom_flags(0x0100_0000 | 0x100)
+                .custom_flags(
+                    (rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW)
+                        .bits()
+                        .cast_signed(),
+                )
                 .open(&self.paths.lock)
                 .map_err(|_| InstanceLockError::Failed(SysError::Failed("native: lock open")))?;
             let meta = file
@@ -699,14 +759,7 @@ impl Platform for NativePlatform {
         crate::platform::checked_os_pid(expect_pid)
             .ok_or(SysError::Failed("native: invalid pid"))?;
         self.expired(deadline)?;
-        let all = scupper_darwin::sysctl_kern_proc_all()
-            .map_err(|_| SysError::Failed("native: group inventory"))?;
-        let live = all.iter().any(|p| p.pgid == os_group && p.stat != 5);
-        self.expired(deadline)?;
-        if !live {
-            return Ok(KillOutcome::Gone);
-        }
-        // The last syscall before kill is the expected leader's start/group lookup.
+        // Check the leader before interpreting an empty/zombie-only group.
         let record = scupper_darwin::sysctl_kern_proc_pid(expect_pid)
             .map_err(|_| SysError::Failed("native: kill recheck"))?;
         let current = record
@@ -720,7 +773,19 @@ impl Platform for NativePlatform {
                 return Ok(outcome);
             }
         }
-        map_kill(scupper_darwin::signal_kill(os_group, true))
+        let all = scupper_darwin::sysctl_kern_proc_all()
+            .map_err(|_| SysError::Failed("native: group inventory"))?;
+        let live = all.iter().any(|p| p.pgid == os_group && p.stat != 5);
+        self.expired(deadline)?;
+        if !live {
+            return Ok(KillOutcome::Gone);
+        }
+        // kill_checked repeats the leader check immediately before the signal.
+        map_kill(scupper_darwin::kill_checked(
+            expect_pid,
+            Some(pgid),
+            (expect_start.seconds, expect_start.microseconds),
+        ))
     }
     fn kill_process(
         &mut self,
@@ -731,8 +796,7 @@ impl Platform for NativePlatform {
         if !crate::platform::process_kill_allowed(pid, std::process::id()) {
             return Err(SysError::Failed("native: forbidden process kill"));
         }
-        let os_pid =
-            crate::platform::checked_os_pid(pid).ok_or(SysError::Failed("native: invalid pid"))?;
+        crate::platform::checked_os_pid(pid).ok_or(SysError::Failed("native: invalid pid"))?;
         self.expired(deadline)?;
         let record = scupper_darwin::sysctl_kern_proc_pid(pid)
             .map_err(|_| SysError::Failed("native: kill recheck"))?;
@@ -744,7 +808,11 @@ impl Platform for NativePlatform {
         if let Some(outcome) = kill_recheck(current.as_ref(), expect_start, None) {
             return Ok(outcome);
         }
-        map_kill(scupper_darwin::signal_kill(os_pid, false))
+        map_kill(scupper_darwin::kill_checked(
+            pid,
+            None,
+            (expect_start.seconds, expect_start.microseconds),
+        ))
     }
     fn reap_children(&mut self, deadline: Deadline) -> Result<(), SysError> {
         self.expired(deadline)?;
@@ -820,7 +888,7 @@ impl Platform for NativePlatform {
         self.check_pin(&child, deadline)
     }
     fn check_pfctl(&mut self, deadline: Deadline) -> Result<(), SysError> {
-        self.check_pin(Path::new("/sbin/pfctl"), deadline)
+        self.check_pin(Path::new(crate::engine::PINNED_TOOLS[0]), deadline)
     }
     fn spawned_children(&self) -> &[Child] {
         &self.records.history
@@ -1000,12 +1068,13 @@ mod tests {
     }
 
     #[test]
-    fn now_uses_the_sleep_counting_raw_clock_and_incarnation_has_current_boot() {
+    fn now_uses_the_sleep_counting_raw_clock_and_incarnation_has_current_boot()
+    -> Result<(), SysError> {
         // A never-slept runner cannot distinguish the clocks by observation.
         // The pinned id and monotonic_raw -> clock(NOW_CLOCK_ID) select the clock;
         // this bracket checks only that now() reads it in seconds.
         assert_eq!(scupper_darwin::NOW_CLOCK_ID, 4);
-        let mut platform = NativePlatform::new(Paths::production());
+        let mut platform = NativePlatform::new(Paths::production())?;
         let before = scupper_darwin::monotonic_raw().as_secs();
         let now = platform.now();
         let after = scupper_darwin::monotonic_raw().as_secs();
@@ -1014,11 +1083,13 @@ mod tests {
         assert_eq!(own.pid, std::process::id());
         assert_eq!(own.boot, platform.boot_id());
         assert!(own.start.microseconds < 1_000_000);
+        Ok(())
     }
 
     #[test]
-    fn pause_caps_fractional_deadlines_and_returns_immediately_when_expired() {
-        let mut platform = NativePlatform::new(Paths::production());
+    fn pause_caps_fractional_deadlines_and_returns_immediately_when_expired() -> Result<(), SysError>
+    {
+        let mut platform = NativePlatform::new(Paths::production())?;
         let before = scupper_darwin::monotonic_raw();
         platform.pause(Duration::from_secs(30), Deadline(before.as_secs()));
         assert!(
@@ -1036,6 +1107,7 @@ mod tests {
         let after = scupper_darwin::monotonic_raw();
         assert!(after >= Duration::from_secs(d.0));
         assert!(after < Duration::from_secs(d.0 + 1));
+        Ok(())
     }
 
     #[test]
@@ -1050,7 +1122,7 @@ mod tests {
             std::fs::write(&pin, b"fixture")?;
             std::fs::hard_link(&pin, &alias)?;
             symlink(&pin, &link)?;
-            let mut platform = NativePlatform::new(Paths::production());
+            let mut platform = NativePlatform::new(Paths::production())?;
             let d = Deadline(platform.now() + 5);
             let first = platform.executable_id(&pin, d)?;
             assert_eq!(platform.executable_id(&alias, d)?, first);
@@ -1091,6 +1163,7 @@ mod tests {
 
 /// Fixed provisional foreground argv/environment. R8 changes this one launch
 /// definition for OD5(a), in addition to adding the actual utun fd action.
+// R8: replaced by the OD5 utun fd handoff, together with observe_child_utun.
 const CHILD_LAUNCH: scupper_darwin::Launch = scupper_darwin::Launch {
     argv: &[crate::engine::CHILD_PATH, "-f", "utun"],
     env: &scupper_darwin::SPAWN_ENV,
@@ -1106,33 +1179,6 @@ pub struct TrustedExecutable {
     pub exe: ExeId,
     /// Reviewed SHA256 digest.
     pub sha256: [u8; 32],
-}
-fn trusted_meta(meta: &std::fs::Metadata) -> bool {
-    meta.is_file() && crate::platform::runtime::protected_owner_mode(meta.uid(), meta.mode())
-}
-fn same_meta(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
-    trusted_meta(b)
-        && (
-            a.dev(),
-            a.ino(),
-            a.len(),
-            a.mode(),
-            a.uid(),
-            a.mtime(),
-            a.mtime_nsec(),
-            a.ctime(),
-            a.ctime_nsec(),
-        ) == (
-            b.dev(),
-            b.ino(),
-            b.len(),
-            b.mode(),
-            b.uid(),
-            b.mtime(),
-            b.mtime_nsec(),
-            b.ctime(),
-            b.ctime_nsec(),
-        )
 }
 fn validate_ancestors(path: &Path) -> Result<(), SysError> {
     if !path.is_absolute()
@@ -1160,10 +1206,15 @@ fn validate_ancestors(path: &Path) -> Result<(), SysError> {
     }
     Ok(())
 }
-fn map_kill(result: Result<(), rustix::io::Errno>) -> Result<KillOutcome, SysError> {
+fn map_kill(
+    result: Result<scupper_darwin::SignalOutcome, rustix::io::Errno>,
+) -> Result<KillOutcome, SysError> {
     match result {
-        Ok(()) => Ok(KillOutcome::Signalled),
-        Err(rustix::io::Errno::SRCH) => Ok(KillOutcome::Gone),
+        Ok(scupper_darwin::SignalOutcome::Signalled) => Ok(KillOutcome::Signalled),
+        Ok(scupper_darwin::SignalOutcome::StartChanged) => Ok(KillOutcome::StartChanged),
+        Ok(scupper_darwin::SignalOutcome::Gone) | Err(rustix::io::Errno::SRCH) => {
+            Ok(KillOutcome::Gone)
+        }
         Err(_) => Err(SysError::Failed("native: kill failed")),
     }
 }

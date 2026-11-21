@@ -251,6 +251,8 @@ pub struct Child {
     /// Process identifier.
     pub pid: u32,
     /// Full kernel wall-clock start identity, including microseconds.
+    // Early partial spawn failures use 0:0 until a kernel start is observed.
+    // This sentinel is never evidence of ownership.
     pub start_time: StartTime,
     /// Child's own text-vnode identity captured after spawn, for qualification.
     pub exe: Option<ExeId>,
@@ -503,6 +505,8 @@ pub trait Platform {
     /// return error without signalling. Adapters must call `group_kill_allowed`.
     /// Recheck `expect_pid`'s start AND group.
     /// Empty groups or groups containing only zombies yield Gone.
+    /// An absent expected leader also yields Gone even if group members remain;
+    /// Gone therefore does not certify that a process group is empty.
     /// Does not wait for exit or reap: Signalled only confirms sending SIGKILL.
     /// The generic suite qualifies a five-second disappearance bound for its
     /// supervised killable children, including `reap_children`. A caller can

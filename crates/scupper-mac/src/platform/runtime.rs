@@ -120,6 +120,75 @@ pub fn valid_lock(regular: bool, uid: u32, mode: u32, nlink: u64) -> bool {
     regular && uid == 0 && mode & 0o7777 == 0o600 && nlink == 1
 }
 
+/// Portable snapshot of every pin metadata field compared across lstat/open/hash.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PinMetadata {
+    /// Regular file, never a symlink.
+    pub regular: bool,
+    /// Owner uid.
+    pub uid: u32,
+    /// Full file mode.
+    pub mode: u32,
+    /// Reviewed vnode.
+    pub exe: super::ExeId,
+    /// File length.
+    pub len: u64,
+    /// Modification seconds/nanoseconds.
+    pub modified: (i64, i64),
+    /// Change seconds/nanoseconds.
+    pub changed: (i64, i64),
+}
+impl PinMetadata {
+    /// Extract a snapshot without following a path or opening another file.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn from_metadata(m: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            regular: m.is_file(),
+            uid: m.uid(),
+            mode: m.mode(),
+            exe: super::ExeId {
+                dev: m.dev(),
+                ino: m.ino(),
+            },
+            len: m.len(),
+            modified: (m.mtime(), m.mtime_nsec()),
+            changed: (m.ctime(), m.ctime_nsec()),
+        }
+    }
+}
+/// Root-owned regular pins must not permit group/other writes.
+#[must_use]
+pub fn trusted_meta(meta: &PinMetadata) -> bool {
+    meta.regular && protected_owner_mode(meta.uid, meta.mode)
+}
+/// Every identity/content-related field must remain stable across pin checks.
+#[must_use]
+pub fn same_meta(a: &PinMetadata, b: &PinMetadata) -> bool {
+    trusted_meta(b) && a == b
+}
+/// Reviewed vnode must match before opening; digest must match after hashing.
+#[must_use]
+pub fn pin_identity(meta: &PinMetadata, exe: super::ExeId) -> bool {
+    trusted_meta(meta) && meta.exe == exe
+}
+/// The computed hash must match the separately reviewed digest.
+#[must_use]
+pub fn pin_digest(actual: [u8; 32], reviewed: [u8; 32]) -> bool {
+    actual == reviewed
+}
+/// A control-unit inference needs independent evidence from wireguard-go's socket.
+///
+/// # Errors
+/// Missing or unprotected independent evidence cannot authorize a utun name.
+pub fn utun_crosscheck(protected_socket: bool) -> Result<(), SysError> {
+    if !protected_socket {
+        return Err(SysError::Failed("native: utun cross-check unavailable"));
+    }
+    Ok(())
+}
+
 /// Update the image before any fallible post-spawn validation.
 pub fn record_observation(child: &mut Child, observed: &ProcInfo) {
     let retained = if child.start_time == observed.start {
@@ -342,33 +411,125 @@ mod tests {
         assert!(valid_fd_action(10, 3));
     }
     #[test]
+    fn utun_requires_independent_evidence() {
+        assert!(utun_crosscheck(true).is_ok());
+        assert!(utun_crosscheck(false).is_err());
+    }
+    fn metadata() -> PinMetadata {
+        PinMetadata {
+            regular: true,
+            uid: 0,
+            mode: 0o100_755,
+            exe: super::super::ExeId { dev: 1, ino: 2 },
+            len: 3,
+            modified: (4, 5),
+            changed: (6, 7),
+        }
+    }
+    #[test]
+    fn pinned_tools_reject_symlink_mode_owner_vnode_and_wrong_digest() {
+        use sha2::{Digest, Sha256};
+        let good = metadata();
+        assert!(pin_identity(&good, good.exe));
+        let mut bad = good.clone();
+        bad.regular = false;
+        assert!(!pin_identity(&bad, good.exe));
+        bad = good.clone();
+        bad.mode |= 0o020;
+        assert!(!pin_identity(&bad, good.exe));
+        bad = good.clone();
+        bad.uid = 1;
+        assert!(!pin_identity(&bad, good.exe));
+        bad = good.clone();
+        bad.exe.ino += 1;
+        assert!(!pin_identity(&bad, good.exe));
+        let actual: [u8; 32] = Sha256::digest(b"actual pinned file bytes").into();
+        let mut wrong = actual;
+        wrong[0] ^= 1;
+        assert!(!pin_digest(actual, wrong));
+        assert!(pin_digest(actual, actual));
+        for field in 0..9 {
+            let mut bad = good.clone();
+            match field {
+                0 => bad.regular = false,
+                1 => bad.uid += 1,
+                2 => bad.mode ^= 1,
+                3 => bad.exe.dev += 1,
+                4 => bad.exe.ino += 1,
+                5 => bad.len += 1,
+                6 => bad.modified.0 += 1,
+                7 => bad.modified.1 += 1,
+                _ => bad.changed.1 += 1,
+            }
+            assert!(!same_meta(&good, &bad), "changed pin field {field}");
+        }
+    }
+    proptest! {
+        #[test]
+        fn pin_metadata_predicates(uid in any::<u32>(), mode in any::<u32>(), regular in any::<bool>(), len in any::<u64>()) {
+            let mut m = metadata(); m.uid = uid; m.mode = mode; m.regular = regular;
+            prop_assert_eq!(trusted_meta(&m), regular && uid == 0 && mode & 0o022 == 0);
+            let mut changed = m.clone(); changed.len = len;
+            prop_assert_eq!(same_meta(&m, &changed), trusted_meta(&changed) && m == changed);
+        }
+    }
+    #[test]
     fn syscall_reaper_is_confined() -> Result<(), Box<dyn std::error::Error>> {
-        let needle = ["wait", "pid("].concat();
-        let sys = include_str!("../../../scupper-darwin/src/sys.rs");
-        assert_eq!(sys.matches(&needle).count(), 1);
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let darwin = root
+        let needles = ["pid", "4", "id"].map(|suffix| format!("wait{suffix}("));
+        let wait = ["libc::", "wait", "("].concat();
+        let needles = [&needles[0], &needles[1], &needles[2], &wait];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
-            .ok_or("crate parent")?
-            .join("scupper-darwin/src");
-        let syscall_file = darwin.join("sys.rs");
-        let mut pending = vec![root.join("src"), darwin];
+            .and_then(std::path::Path::parent)
+            .ok_or("workspace root")?;
+        let syscall_file = root.join("crates/scupper-darwin/src/sys.rs");
+        let mut pending = vec![root.to_path_buf()];
+        let mut exact_reaps = 0;
         while let Some(dir) = pending.pop() {
             for item in std::fs::read_dir(dir)? {
                 let item = item?;
                 if item.file_type()?.is_dir() {
-                    pending.push(item.path());
-                } else if item.path() != syscall_file
-                    && item.path().extension().is_some_and(|s| s == "rs")
-                {
-                    assert!(
-                        !std::fs::read_to_string(item.path())?.contains(&needle),
-                        "reap syscall outside darwin sys: {}",
-                        item.path().display()
-                    );
+                    if !["target", "dev", ".git"]
+                        .iter()
+                        .any(|name| item.file_name() == *name)
+                    {
+                        pending.push(item.path());
+                    }
+                } else if item.path().extension().is_some_and(|s| s == "rs") {
+                    let source = std::fs::read_to_string(item.path())?;
+                    // Ignore whitespace between a function name and its call.
+                    let compact: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+                    for needle in &needles {
+                        let mut count = compact.matches(needle.as_str()).count();
+                        // These existing Linux lab/client reapers are unrelated to
+                        // the macOS helper. Permit their typed rustix calls only;
+                        // any libc/unqualified syscall in any crate still fails.
+                        if [
+                            "xtask/src/lab/daemon/heartbeat.rs",
+                            "crates/scupper-sys/src/system.rs",
+                        ]
+                        .iter()
+                        .any(|p| item.path() == root.join(p))
+                        {
+                            count -= compact
+                                .matches(&format!("rustix::process::{needle}"))
+                                .count();
+                        }
+                        if item.path() == syscall_file && needle == &needles[0] {
+                            exact_reaps += count;
+                        } else {
+                            assert_eq!(
+                                count,
+                                0,
+                                "reap syscall outside sole exact-pid call: {}",
+                                item.path().display()
+                            );
+                        }
+                    }
                 }
             }
         }
+        assert_eq!(exact_reaps, 1);
         Ok(())
     }
 }

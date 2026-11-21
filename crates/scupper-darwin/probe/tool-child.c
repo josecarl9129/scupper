@@ -1,11 +1,18 @@
 /* Harmless R4 fixture. Every long-lived mode has a 120-second hard lifetime. */
 #define _DARWIN_C_SOURCE 1
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#ifdef CREATE_UTUN_NO_SOCKET
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <sys/kern_control.h>
+#include <sys/sys_domain.h>
+#endif
 
 int main(int argc, char **argv) {
     alarm(120);
@@ -15,6 +22,17 @@ int main(int argc, char **argv) {
         close(12);
         execl("/bin/launchctl", "launchctl", "bootstrap", "system", argv[2], (char *)NULL);
         return 9;
+    }
+    if (argc > 1 && strcmp(argv[1], "hold-fds") == 0) {
+        printf("[");
+        int comma = 0;
+        for (int fd = 0; fd < 4096; ++fd) {
+            if (fcntl(fd, F_GETFD) >= 0) printf("%s%d", comma++ ? "," : "", fd);
+        }
+        printf("]\n");
+        if (fflush(stdout) != 0) return 10;
+        sleep(1);
+        return 0;
     }
     if (argc > 1 && strcmp(argv[1], "exit0") == 0) return 0;
     if (argc > 1 && strcmp(argv[1], "signals") == 0) {
@@ -55,6 +73,28 @@ int main(int argc, char **argv) {
         sleep(1); close(STDOUT_FILENO);
         sleep(1); return 0;
     }
+#ifdef CREATE_UTUN_NO_SOCKET
+    if (argc > 1 && strcmp(argv[1], "-f") == 0) {
+        int fd = socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL);
+        if (fd < 0) return 11;
+        struct ctl_info info = {0};
+        strlcpy(info.ctl_name, "com.apple.net.utun_control", sizeof(info.ctl_name));
+        if (ioctl(fd, CTLIOCGINFO, &info) != 0) return 12;
+        struct sockaddr_ctl address = {0};
+        address.sc_len = sizeof(address);
+        address.sc_family = AF_SYSTEM;
+        address.ss_sysaddr = AF_SYS_CONTROL;
+        address.sc_id = info.ctl_id;
+        address.sc_unit = 0;
+        if (connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0) return 13;
+        /* Deliberately never publish /var/run/wireguard/<name>.sock. The native
+         * adapter must refuse this unit-derived name without independent proof.
+         * Closing/killing this journaled child destroys its kernel interface. */
+        sleep(110);
+        close(fd);
+        return 0;
+    }
+#endif
     /* Includes provisional -f utun: native spawn identity without creating utun. */
     sleep(110);
     return 0;
