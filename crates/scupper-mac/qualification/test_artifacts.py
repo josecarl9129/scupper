@@ -153,5 +153,22 @@ class ArtifactTests(unittest.TestCase):
         self.assertIn("quarantined", (self.root / "Q-SMOKE.json").read_text())
 
 
+    def test_staged_base_churn_counts_as_built_capability(self):
+        (self.root / "built-capability-sha256.txt").write_text(f"{SHA256}  qual-out/probe-pf-starters\n")
+        (self.root / "wireguard-sha256.txt").write_text(f"{SHA256}  qual-out/wireguard-go\n")
+        (self.root / "executed-capability-sha256.txt").write_text(
+            f"{SHA256}  /private/var/db/scupper-qual/probe-pf-starters\n"
+            f"{SHA256}  /private/var/db/scupper-qual/wireguard-go\n"
+            f"{SHA256}  /private/var/db/scupper-qual/base-churn\n")
+        self.write_json("probe-identity-pf-starters.json", {"name":"pf-starters", "sha256":SHA256})
+        self.assertEqual(self.check().returncode, 1)
+        (self.root / "Q-SMOKE.json").write_text(json.dumps(self.result))
+        self.write_json("verdicts.json", [self.result])
+        (self.root / "base-churn-sha256.txt").write_text(f"{SHA256}  qual-out/base-churn\n")
+        self.assertEqual(self.check().returncode, 0)
+        (self.root / "base-churn-sha256.txt").write_text(f"{'b' * 64}  qual-out/base-churn\n")
+        self.assertEqual(self.check().returncode, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

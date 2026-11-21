@@ -117,6 +117,10 @@ else:
         try:
             built_probes = hash_map(root / "built-capability-sha256.txt")
             built_probes.update(hash_map(root / "wireguard-sha256.txt"))
+            # Every cell stages the base churn helper next to the probes.
+            base_churn = root / "base-churn-sha256.txt"
+            if base_churn.exists():
+                built_probes.update(hash_map(base_churn))
             staged_probes = hash_map(root / "executed-capability-sha256.txt")
             if built_probes != staged_probes:
                 identity_errors.append("built and staged capability hashes differ")
