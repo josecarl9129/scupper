@@ -34,6 +34,23 @@ class ArtifactTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(CHECKER), str(self.root), *arguments],
                               capture_output=True, text=True, env=env, check=False)
 
+    def test_abi_probe_stringifies_member_before_macro_expansion(self):
+        source = (REPO / "crates/scupper-darwin/probe/abi.c").read_text()
+        macros = "\n".join(line for line in source.splitlines()
+                           if line.startswith(("#define FIELD(", "#define NEXT_FIELD(")))
+        shim = (macros + "\n#define p_starttime p_un.__p_starttime\n"
+                "NEXT_FIELD(kinfo_proc, kp_proc.p_starttime);\n"
+                "NEXT_FIELD(kinfo_proc, kp_proc.p_starttime.tv_sec);\n"
+                "NEXT_FIELD(kinfo_proc, kp_proc.p_starttime.tv_usec);\n")
+        result = subprocess.run(["cc", "-E", "-P", "-x", "c", "-"], input=shim,
+                                capture_output=True, text=True, check=True)
+        for member in ["kp_proc.p_starttime", "kp_proc.p_starttime.tv_sec",
+                       "kp_proc.p_starttime.tv_usec"]:
+            self.assertIn('"' + member + '"', result.stdout)
+        self.assertNotIn('"kp_proc.p_un.__p_starttime', result.stdout)
+        self.assertIn("offsetof(struct kinfo_proc, kp_proc.p_un.__p_starttime)",
+                      result.stdout)
+
     def test_matching_identity_passes_and_summary_names_hash(self):
         self.assertEqual(self.check().returncode, 0)
         summary = self.root / "summary.txt"

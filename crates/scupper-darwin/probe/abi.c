@@ -17,7 +17,7 @@
 
 #define BEGIN(type) printf("\"" #type "\":{\"size\":%zu,\"fields\":{", sizeof(struct type))
 #define FIELD(type, field) printf("\"" #field "\":%zu", offsetof(struct type, field))
-#define NEXT_FIELD(type, field) do { printf(","); FIELD(type, field); } while (0)
+#define NEXT_FIELD(type, field) do { printf(",\"" #field "\":%zu", offsetof(struct type, field)); } while (0)
 #define END() printf("}}")
 
 /* Harness-only identity lookup. This keeps bootstrap restore signalling bound

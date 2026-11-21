@@ -215,11 +215,34 @@ pub fn sysctl_kern_proc_pid(pid: u32) -> Result<Option<KProc>, ProcError> {
     if pid <= 0 {
         return Err(ProcError::Os(Errno::INVAL));
     }
-    let mut records = read_processes([libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid])?;
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+    let mut records = read_pid_with(|buffer| process_sysctl(&mut mib, Some(buffer)))?;
     if records.len() > 1 || records.first().is_some_and(|p| p.pid != pid) {
         return Err(ProcError::Layout);
     }
     Ok(records.pop())
+}
+
+fn read_pid_with(
+    mut query: impl FnMut(&mut [KinfoProc]) -> Result<usize, Errno>,
+) -> Result<Vec<KProc>, ProcError> {
+    // One record plus a sentinel slot to detect an over-long successful reply.
+    for _ in 0..8 {
+        let mut records = [KinfoProc::zeroed(), KinfoProc::zeroed()];
+        let returned = match query(&mut records) {
+            Ok(returned) => returned,
+            Err(Errno::NOMEM) => continue,
+            Err(error) => return Err(ProcError::Os(error)),
+        };
+        if returned > KINFO_PROC_SIZE || returned % KINFO_PROC_SIZE != 0 {
+            return Err(ProcError::Layout);
+        }
+        return Ok(records[..returned / KINFO_PROC_SIZE]
+            .iter()
+            .map(KinfoProc::owned)
+            .collect());
+    }
+    Err(ProcError::Incomplete)
 }
 
 fn read_processes(mut mib: [i32; 4]) -> Result<Vec<KProc>, ProcError> {
@@ -308,12 +331,22 @@ pub fn proc_pidpath(pid: u32) -> Result<std::path::PathBuf, Errno> {
         return Err(Errno::INVAL);
     }
     let mut bytes = vec![0_u8; 4096];
+    let capacity = u32::try_from(bytes.len()).map_err(|_| Errno::INVAL)?;
+    // SAFETY: __error takes no arguments and returns this thread's live errno
+    // slot. The pointer stays on this thread and is used immediately below.
+    let errno = unsafe { libc::__error() };
+    // SAFETY: errno is this thread's aligned, writable, non-null errno slot.
+    // Reset it before libproc, which can return an empty path without setting it.
+    unsafe { *errno = 0 };
     // SAFETY: the owned, initialised byte buffer lives through the synchronous
-    // call and has precisely the advertised 4096 bytes. No data is used on
+    // call and has precisely the advertised capacity. No data is used on
     // failure. Success checks returned length and NUL termination before use.
-    let rc = unsafe { libc::proc_pidpath(pid, bytes.as_mut_ptr().cast(), 4096) };
+    let rc = unsafe { libc::proc_pidpath(pid, bytes.as_mut_ptr().cast(), capacity) };
     if rc <= 0 {
-        return Err(last_errno());
+        return Err(std::io::Error::last_os_error()
+            .raw_os_error()
+            .filter(|error| *error != 0)
+            .map_or(Errno::INVAL, Errno::from_raw_os_error));
     }
     let len = usize::try_from(rc).map_err(|_| Errno::INVAL)?;
     if len >= bytes.len() || bytes[len] != 0 || bytes[..len].contains(&0) || bytes[0] != b'/' {
@@ -436,6 +469,47 @@ mod process_tests {
             Err(ProcError::Incomplete)
         );
         assert_eq!(read_processes_with(|_| Ok(0)), Ok(Vec::new()));
+    }
+    #[test]
+    fn pid_reads_use_two_records_and_reject_malformed_success() -> Result<(), ProcError> {
+        assert_eq!(
+            read_pid_with(|buffer| {
+                assert_eq!(buffer.len(), 2);
+                Ok(0)
+            })?,
+            Vec::new()
+        );
+        let mut attempts = 0;
+        let got = read_pid_with(|buffer| {
+            assert_eq!(buffer.len(), 2);
+            assert_eq!(buffer[0].pid, 0);
+            attempts += 1;
+            buffer[0].pid = 123;
+            if attempts == 1 {
+                Err(Errno::NOMEM)
+            } else {
+                Ok(KINFO_PROC_SIZE)
+            }
+        })?;
+        assert_eq!(attempts, 2);
+        assert_eq!(got[0].pid, 123);
+        for length in [
+            1,
+            KINFO_PROC_SIZE - 1,
+            2 * KINFO_PROC_SIZE,
+            3 * KINFO_PROC_SIZE,
+        ] {
+            assert_eq!(read_pid_with(|_| Ok(length)), Err(ProcError::Layout));
+        }
+        assert_eq!(
+            read_pid_with(|_| Err(Errno::NOMEM)),
+            Err(ProcError::Incomplete)
+        );
+        assert_eq!(
+            read_pid_with(|_| Err(Errno::PERM)),
+            Err(ProcError::Os(Errno::PERM))
+        );
+        Ok(())
     }
     #[test]
     fn raw_clock_ids_are_pinned() {

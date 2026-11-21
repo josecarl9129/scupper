@@ -8,6 +8,30 @@ use crate::{
 pub const MAXCOMLEN: usize = 16;
 /// Qualified LP64 `kinfo_proc` stride; Q-SMOKE compares it with the SDK.
 pub const RECORD_BYTES: usize = 648;
+/// Consumed process-record offsets, compared with the SDK before qualification.
+pub const FIELDS: [(&str, usize); 7] = [
+    ("kp_proc.p_starttime.tv_sec", START_SEC),
+    ("kp_proc.p_starttime.tv_usec", START_USEC),
+    ("kp_proc.p_stat", STAT),
+    ("kp_proc.p_pid", PID),
+    ("kp_proc.p_comm", COMM),
+    ("kp_eproc.e_ppid", PPID),
+    ("kp_eproc.e_pgid", PGID),
+];
+/// Start seconds offset.
+pub const START_SEC: usize = 0;
+/// Start microseconds offset.
+pub const START_USEC: usize = 8;
+/// State offset.
+pub const STAT: usize = 36;
+/// PID offset.
+pub const PID: usize = 40;
+/// Command name offset.
+pub const COMM: usize = 243;
+/// Parent PID offset.
+pub const PPID: usize = 560;
+/// Process group offset.
+pub const PGID: usize = 564;
 const INVALID: SysError = SysError::Failed("native: process layout");
 
 /// Decode the S* state byte; unknown states cannot establish completeness.
@@ -67,7 +91,7 @@ pub fn records(bytes: &[u8]) -> Result<Vec<ProcInfo>, SysError> {
         .as_chunks::<RECORD_BYTES>()
         .0
         .iter()
-        .filter(|b| b[40..44] != [0; 4])
+        .filter(|b| b[PID..PID + 4] != [0; 4])
         .map(|b| {
             let i32_at = |offset| -> Result<i32, SysError> {
                 Ok(i32::from_le_bytes(
@@ -80,20 +104,38 @@ pub fn records(bytes: &[u8]) -> Result<Vec<ProcInfo>, SysError> {
             let id = |offset| -> Result<u32, SysError> {
                 u32::try_from(i32_at(offset)?).map_err(|_| INVALID)
             };
-            let pid = id(40)?;
-            let sec = i64::from_le_bytes(b[..8].try_into().map_err(|_| INVALID)?);
+            let pid = id(PID)?;
+            let sec = i64::from_le_bytes(
+                b[START_SEC..START_SEC + 8]
+                    .try_into()
+                    .map_err(|_| INVALID)?,
+            );
             Ok(ProcInfo {
                 pid,
-                ppid: id(560)?,
-                pgid: id(564)?,
-                state: state(b[36])?,
-                start: start(sec, i32_at(8)?)?,
-                name: name(&b[243..260]),
+                ppid: id(PPID)?,
+                pgid: id(PGID)?,
+                state: state(b[STAT])?,
+                start: start(sec, i32_at(START_USEC)?)?,
+                name: name(&b[COMM..=COMM + MAXCOMLEN]),
                 path: None,
                 exe: None,
             })
         })
         .collect()
+}
+
+/// A complete inventory must retain the helper identity read before the table.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn require_self(
+    list: &[ProcInfo],
+    pid: u32,
+    start: StartTime,
+) -> Result<(), ProcessError> {
+    if list.iter().any(|p| p.pid == pid && p.start == start) {
+        Ok(())
+    } else {
+        Err(SysError::Failed("native: process table implausible").into())
+    }
 }
 
 /// Resolve one path lookup against a subsequent complete PID lookup. The first
@@ -116,7 +158,7 @@ pub fn resolve_path(
     };
     if current.pid != listed.pid {
         return Err(ProcessError {
-            pid: Some(listed.pid),
+            pid: None,
             error: INVALID,
         });
     }
@@ -184,7 +226,8 @@ mod tests {
     }
 
     #[test]
-    fn replay_all_imported_runner_fixtures() -> Result<(), Box<dyn std::error::Error>> {
+    fn replay_all_available_fixtures_including_synthetic_layout()
+    -> Result<(), Box<dyn std::error::Error>> {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/macos");
         let mut count = 0;
         for entry in std::fs::read_dir(root)? {
@@ -245,9 +288,34 @@ mod tests {
         assert_eq!(valid.exe, None);
         let mut wrong = listed.clone();
         wrong.pid += 1;
-        assert!(resolve_path(listed, None, Some(wrong)).is_err());
+        assert_eq!(
+            resolve_path(listed, None, Some(wrong)),
+            Err(ProcessError::from(INVALID))
+        );
         Ok(())
     }
+    #[test]
+    fn complete_inventory_requires_self_with_the_same_start() -> Result<(), SysError> {
+        let list = records(include_bytes!(
+            "../../tests/fixtures/macos/layout/kinfo_proc.bin"
+        ))?;
+        let own = &list[0];
+        assert!(require_self(&list, own.pid, own.start).is_ok());
+        for missing in [&[][..], &list[..]] {
+            let error = require_self(missing, own.pid + 1, own.start);
+            assert_eq!(
+                error,
+                Err(ProcessError::from(SysError::Failed(
+                    "native: process table implausible"
+                )))
+            );
+        }
+        let mut reused = own.start;
+        reused.microseconds += 1;
+        assert!(require_self(&list, own.pid, reused).is_err());
+        Ok(())
+    }
+
     proptest! {
         #[test]
         fn arbitrary_bytes_never_panic(bytes in prop::collection::vec(any::<u8>(), 0..4096), sec in any::<i64>(), usec in any::<i32>(), stat in any::<u8>()) {

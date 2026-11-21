@@ -65,6 +65,9 @@ jobs:
       - name: Test
         run: timeout 600 cargo test --workspace --all-features --locked
 
+      - name: Portable qualification artifact and ABI macro regressions
+        run: python3 crates/scupper-mac/qualification/test_artifacts.py
+
       - name: Check nftables goldens without tunnel links
         run: |
           if ! command -v nft >/dev/null; then
@@ -294,7 +297,7 @@ jobs:
           env -u CARGO_TARGET_TMPDIR cargo build -p scupper-mac --bin scupper-mac-qual --features qualification --locked 2>&1 | tee qual-out/build.log
           shasum -a 256 target/debug/scupper-mac-qual | tee qual-out/built-harness-sha256.txt
       - name: Native lint and tests of the FFI crate and adapter
-        timeout-minutes: 8
+        timeout-minutes: 15
         run: |
           env -u CARGO_TARGET_TMPDIR cargo clippy -p scupper-darwin -p scupper-mac --all-targets --all-features --locked -- -D warnings
           env -u CARGO_TARGET_TMPDIR cargo test -p scupper-darwin -p scupper-mac --all-features --locked

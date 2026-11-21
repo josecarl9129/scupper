@@ -5,8 +5,8 @@ use crate::{
     platform::{
         CheapObservation, Child, Collection, ConfigKey, Deadline, Enumeration, ExeId, Fence,
         InstallRecord, InstanceLockError, KillOutcome, LeaveRoutes, PfEnable, PfInfo, Platform,
-        ProcInfo, ProcState, ProcessError, RefLine, ReferenceQualification, Release, SafetyEvent,
-        Setting, SpawnAttributes, SysError, ToolOutcome, WriteOutcome,
+        ProcInfo, ProcState, ProcessError, RefLine, ReferenceQualification, Release, Setting,
+        SpawnAttributes, SysError, ToolOutcome, WriteOutcome,
     },
     snapshot::{BootId, COPY_BYTES, Copy, CopyRead, HelperIncarnation, StartTime},
 };
@@ -75,6 +75,15 @@ impl NativePlatform {
     }
     fn process_list(&mut self, deadline: Deadline) -> Result<Vec<ProcInfo>, ProcessError> {
         self.expired(deadline)?;
+        let pid = std::process::id();
+        let own = scupper_darwin::sysctl_kern_proc_pid(pid)
+            .map_err(process_error)?
+            .ok_or(SysError::Failed("native: process table implausible"))?;
+        let own = decode(&own)?;
+        if own.pid != pid {
+            return Err(SysError::Failed("native: process layout").into());
+        }
+        self.expired(deadline)?;
         let records = scupper_darwin::sysctl_kern_proc_all().map_err(process_error)?;
         let mut procs = Vec::with_capacity(records.len());
         for record in records {
@@ -90,11 +99,7 @@ impl NativePlatform {
             let path = scupper_darwin::proc_pidpath(entry.pid);
             // Bracket every path read, including success, by (pid,start).
             // ESRCH/ENOENT alone never establish that a listed PID vanished.
-            let current =
-                scupper_darwin::sysctl_kern_proc_pid(entry.pid).map_err(|error| ProcessError {
-                    pid: Some(entry.pid),
-                    error: process_error(error).error,
-                })?;
+            let current = scupper_darwin::sysctl_kern_proc_pid(entry.pid).map_err(process_error)?;
             let current = current.as_ref().map(decode).transpose()?;
             let Some(entry) = proc::resolve_path(entry, path.ok(), current)? else {
                 continue;
@@ -102,6 +107,7 @@ impl NativePlatform {
             procs.push(entry);
         }
         self.expired(deadline)?;
+        proc::require_self(&procs, pid, own.start)?;
         Ok(procs)
     }
 }
@@ -129,10 +135,7 @@ fn decode(record: &scupper_darwin::KProc) -> Result<ProcInfo, ProcessError> {
             exe: None,
         })
     };
-    fields().map_err(|error| ProcessError {
-        pid: Some(pid),
-        error,
-    })
+    fields().map_err(ProcessError::from)
 }
 
 impl Platform for NativePlatform {
@@ -217,7 +220,6 @@ impl Platform for NativePlatform {
             ino: meta.ino(),
         })
     }
-    fn report_safety(&mut self, _event: SafetyEvent) {}
     fn acquire_instance_lock(&mut self) -> Result<(), InstanceLockError> {
         Err(InstanceLockError::Failed(UNIMPLEMENTED))
     }
@@ -404,7 +406,38 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     #[test]
+    fn invalid_decoded_records_and_sysctl_errors_do_not_name_a_pathless_pid() {
+        let mut record = scupper_darwin::KProc {
+            pid: 123,
+            ppid: 1,
+            pgid: 123,
+            stat: 0,
+            start: (456, 789),
+            comm: [0; 17],
+        };
+        let error = decode(&record).err();
+        assert!(error.is_some());
+        assert_eq!(error.and_then(|e| e.pid), None);
+        record.stat = 3;
+        record.start.0 = -1;
+        let error = decode(&record).err();
+        assert!(error.is_some());
+        assert_eq!(error.and_then(|e| e.pid), None);
+        assert_eq!(
+            process_error(scupper_darwin::ProcError::Incomplete).pid,
+            None
+        );
+        assert_eq!(
+            process_error(scupper_darwin::ProcError::Os(rustix::io::Errno::PERM)).pid,
+            None
+        );
+    }
+
+    #[test]
     fn now_uses_the_sleep_counting_raw_clock_and_incarnation_has_current_boot() {
+        // A never-slept runner cannot distinguish the clocks by observation.
+        // The pinned id and monotonic_raw -> clock(NOW_CLOCK_ID) select the clock;
+        // this bracket checks only that now() reads it in seconds.
         assert_eq!(scupper_darwin::NOW_CLOCK_ID, 4);
         let mut platform = NativePlatform::new(Paths::production());
         let before = scupper_darwin::monotonic_raw().as_secs();

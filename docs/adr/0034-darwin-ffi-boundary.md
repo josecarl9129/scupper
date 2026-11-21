@@ -60,3 +60,17 @@ bootstrap qualification harness observes state only; it cannot establish native
 firewall enforcement or authorize production protection claims. Native adapter
 operations and their qualification are added separately, with the constructor
 remaining gated by the `qualification` feature during adapter development.
+
+## Base binding failure inventory
+
+The infallible `now`/raw-clock and `incarnation` operations abort on an OS
+failure or an invalid value rather than invent time or a process identity.
+Abort skips Rust destructors, including the qualification harness's supervised
+child cleanup. The independent dead-man restores journaled children by their
+recorded `(pid, start)` identities.
+
+Base read-only children are journaled after spawn and identity lookup, without
+an exec gate. A controller death before journal sync can leave an unjournaled
+sleep (at most 360 seconds) or churn process (at most 180 seconds). This bounded
+residual is a deliberate difference from the capability probes' exec-gated
+journal discipline; these children make no network or firewall mutations.

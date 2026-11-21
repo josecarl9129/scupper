@@ -2,9 +2,10 @@
 use super::{
     CaseResult, Digest, DirBuilderExt, Duration, EnvironmentIssue, Instant, Manifest,
     OpenOptionsExt, Path, Result, Sha256, TOOL_BUDGET, Value, Verdict, Write, Writer, command,
-    environment_issue, executable_sha256, fs, json, protected_path, read_json, require_ack,
-    save_case, thread, write_json,
+    compare_process_layout, environment_issue, executable_sha256, fs, json, probe_path,
+    protected_path, read_json, require_ack, save_case, thread, write_json,
 };
+use crate::qual::base_check::{self, Oracle};
 use crate::{
     decode::proc,
     native::{NativePlatform, Paths},
@@ -31,8 +32,9 @@ impl Supervised {
             .stderr(Stdio::null())
             .spawn()?;
         let guard = Self(child);
-        let record = scupper_darwin::sysctl_kern_proc_pid(guard.0.id())?
-            .ok_or("base child disappeared before identity read")?;
+        let record = scupper_darwin::sysctl_kern_proc_pid(guard.0.id())
+            .map_err(harness_process_error)?
+            .ok_or_else(|| environment_issue("base child disappeared before identity read"))?;
         // Persist the child identity independently of the controller list:
         // dispatch clears that list after run, but restoration must retain any
         // child whose bounded reap did not complete.
@@ -70,10 +72,45 @@ impl Drop for Supervised {
     }
 }
 
+// Churn and OS failures in the harness prove nothing about the adapter.
+// Malformed successful kernel replies remain contract violations.
+fn harness_process_error(error: scupper_darwin::ProcError) -> Box<dyn std::error::Error> {
+    match error {
+        scupper_darwin::ProcError::Incomplete | scupper_darwin::ProcError::Os(_) => {
+            environment_issue(error)
+        }
+        scupper_darwin::ProcError::Layout => Box::new(error),
+    }
+}
+
+fn check_layout(out: &Path) -> Result<()> {
+    require_ack(out)?;
+    let probe = probe_path()?;
+    protected_path(&probe, false)?;
+    let evidence = command(
+        probe.to_str().ok_or("non-UTF8 probe path")?,
+        &[],
+        None,
+        TOOL_BUDGET,
+    );
+    write_json(out, "base-abi-command.json", &evidence)?;
+    if !evidence.complete() {
+        return Err(environment_issue(
+            "base SDK ABI probe unavailable; see base-abi-command.json",
+        ));
+    }
+    let abi: Value = serde_json::from_str(&evidence.stdout)?;
+    write_json(out, "base-abi.json", &abi)?;
+    compare_process_layout(&abi)
+}
+
 pub(super) fn run(out: &Path) -> Result<()> {
     if !Manifest::bundled()?.budgets_fit() {
         return Err("base manifest exceeds budget".into());
     }
+    // This gate belongs to this cell: no measurement may rely on another
+    // matrix cell having checked the SDK first.
+    let layout = check_layout(out);
     let mut platform = NativePlatform::new(Paths::qualification(out.to_path_buf()));
     let mut results = Vec::new();
     for (id, operation) in [
@@ -96,7 +133,12 @@ pub(super) fn run(out: &Path) -> Result<()> {
             detail: "base contract exercised; no assumptions promoted".into(),
             evidence: Vec::new(),
         };
-        if let Err(error) = operation(out, &mut platform, &mut result) {
+        let measured = match &layout {
+            Ok(()) => operation(out, &mut platform, &mut result),
+            Err(error) if error.is::<EnvironmentIssue>() => Err(environment_issue(error)),
+            Err(error) => Err(format!("base ABI gate: {error}").into()),
+        };
+        if let Err(error) = measured {
             result.verdict = if error.is::<EnvironmentIssue>() {
                 Verdict::Inconclusive
             } else {
@@ -165,6 +207,21 @@ fn boot(out: &Path, platform: &mut NativePlatform, result: &mut CaseResult) -> R
     if load.0.try_wait()?.is_some() {
         return Err(environment_issue("boot churn exited during boot reads"));
     }
+    let final_oracle = command(
+        "/usr/sbin/sysctl",
+        &["-n", "kern.bootsessionuuid"],
+        None,
+        TOOL_BUDGET,
+    );
+    let valid = final_oracle.complete();
+    let final_expected = BootId::try_from(final_oracle.stdout.trim());
+    result.evidence.push(final_oracle);
+    if !valid {
+        return Err(environment_issue("final boot UUID command unavailable"));
+    }
+    if final_expected? != expected {
+        return Err("boot UUID oracle changed during Q-BOOT".into());
+    }
     latency.sort_unstable();
     write_json(
         out,
@@ -191,9 +248,11 @@ fn processes(out: &Path, platform: &mut NativePlatform, result: &mut CaseResult)
     let oracle = children
         .iter()
         .map(|c| {
-            scupper_darwin::sysctl_kern_proc_pid(c.0.id())?.ok_or(scupper_darwin::ProcError::Layout)
+            scupper_darwin::sysctl_kern_proc_pid(c.0.id())
+                .map_err(harness_process_error)?
+                .ok_or_else(|| environment_issue("oracle vanished before identity read"))
         })
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>>>()?;
     write_json(
         out,
         "base-oracle.json",
@@ -235,29 +294,41 @@ fn processes(out: &Path, platform: &mut NativePlatform, result: &mut CaseResult)
                 }
             }
             Enumeration::Incomplete(error) => {
-                if error.error == crate::platform::SysError::Failed("native: process layout") {
-                    return Err("integral length or process layout violated".into());
-                }
+                base_check::inventory(
+                    &Enumeration::Incomplete(error.clone()),
+                    Oracle::Stopped(children[0].0.id()),
+                )?;
                 incomplete.push(json!({"iteration": iteration, "pid": error.pid, "error": error.error.to_string()}));
             }
         }
         // Independent census records every live pathless entry, even when a
         // foreign pathless process prevents the adapter from completing a read.
         if iteration.is_multiple_of(50) {
-            for p in scupper_darwin::sysctl_kern_proc_all()? {
-                if p.pid <= 0 || proc::state(p.stat)? == ProcState::Zombie {
-                    continue;
-                }
-                let pid = u32::try_from(p.pid)?;
-                if let Err(error) = scupper_darwin::proc_pidpath(pid) {
-                    let current = scupper_darwin::sysctl_kern_proc_pid(pid)?;
-                    if current
-                        .as_ref()
-                        .is_some_and(|q| q.start == p.start && q.stat != 5)
-                    {
-                        census.push(json!({"iteration": iteration, "pid": pid, "errno": error.raw_os_error()}));
+            let observed = (|| -> Result<()> {
+                for p in scupper_darwin::sysctl_kern_proc_all().map_err(harness_process_error)? {
+                    if p.pid <= 0 || proc::state(p.stat)? == ProcState::Zombie {
+                        continue;
+                    }
+                    let pid = u32::try_from(p.pid)?;
+                    if let Err(error) = scupper_darwin::proc_pidpath(pid) {
+                        let current = scupper_darwin::sysctl_kern_proc_pid(pid)
+                            .map_err(harness_process_error)?;
+                        if current
+                            .as_ref()
+                            .is_some_and(|q| q.start == p.start && q.stat != 5)
+                        {
+                            census.push(json!({"iteration": iteration, "pid": pid, "errno": error.raw_os_error()}));
+                        }
                     }
                 }
+                Ok(())
+            })();
+            if let Err(error) = observed {
+                if !error.is::<EnvironmentIssue>() {
+                    return Err(error);
+                }
+                incomplete
+                    .push(json!({"iteration": iteration, "harness_census": error.to_string()}));
             }
         }
         result.iterations += 1;
@@ -297,49 +368,91 @@ fn processes(out: &Path, platform: &mut NativePlatform, result: &mut CaseResult)
             "runner did not sustain approximately 200 forks/s for 60 seconds",
         ));
     }
-    stopped(out, &children[0], platform)?;
-    path_changes(out, platform)?;
+    let mut unqualified = Vec::new();
+    let remaining = Duration::from_secs(360).saturating_sub(case_start.elapsed());
+    let until = scupper_darwin::monotonic_raw() + remaining;
+    record_subcheck(
+        stopped(out, &children[0], platform, until),
+        "stopped",
+        &mut unqualified,
+    )?;
+    record_subcheck(
+        path_changes(out, platform, until),
+        "path changes",
+        &mut unqualified,
+    )?;
+    if incomplete
+        .iter()
+        .any(|entry| entry.get("harness_census").is_some())
+    {
+        unqualified.push(
+            "harness census encountered transient process reads; see base-processes.json".into(),
+        );
+    }
+    if !unqualified.is_empty() {
+        result.verdict = Verdict::Inconclusive;
+        result.detail = unqualified.join("; ");
+    }
     if complete == 0 {
         result.verdict = Verdict::Inconclusive;
-        result.detail = "500 observations, no Complete inventory; oracle completeness remains unqualified; see pathless census and per-read errors".into();
+        result.detail = format!(
+            "500 observations, no Complete inventory; oracle completeness remains unqualified; see pathless census and per-read errors; {}",
+            unqualified.join("; ")
+        );
     }
     if case_start.elapsed() >= Duration::from_secs(360) {
-        return Err("Q-PROC exceeded its six-minute case deadline".into());
+        return Err(environment_issue(
+            "Q-PROC subchecks exhausted the six-minute case budget",
+        ));
     }
     Ok(())
 }
 
-fn stopped(out: &Path, child: &Supervised, platform: &mut NativePlatform) -> Result<()> {
+fn record_subcheck(check: Result<()>, label: &str, unqualified: &mut Vec<String>) -> Result<()> {
+    if let Err(error) = check {
+        if !error.is::<EnvironmentIssue>() {
+            return Err(error);
+        }
+        unqualified.push(format!("{label}: {error}"));
+    }
+    Ok(())
+}
+
+fn stopped(
+    out: &Path,
+    child: &Supervised,
+    platform: &mut NativePlatform,
+    case_until: Duration,
+) -> Result<()> {
+    if scupper_darwin::monotonic_raw() >= case_until {
+        return Err(environment_issue(
+            "stopped subcheck has no remaining case budget",
+        ));
+    }
     let pid =
         rustix::process::Pid::from_raw(i32::try_from(child.0.id())?).ok_or("invalid oracle pid")?;
     rustix::process::kill_process(pid, rustix::process::Signal::STOP)?;
-    let until = scupper_darwin::monotonic_raw() + Duration::from_secs(2);
+    let until = (scupper_darwin::monotonic_raw() + Duration::from_secs(2)).min(case_until);
     let check = (|| -> Result<()> {
         loop {
-            let p = scupper_darwin::sysctl_kern_proc_pid(child.0.id())?
-                .ok_or("stopped oracle vanished")?;
+            let p = scupper_darwin::sysctl_kern_proc_pid(child.0.id())
+                .map_err(harness_process_error)?
+                .ok_or_else(|| environment_issue("stopped oracle vanished"))?;
             if proc::state(p.stat)? == ProcState::Stopped {
                 break;
             }
             if scupper_darwin::monotonic_raw() >= until {
-                return Err("SSTOP not observed".into());
+                return Err(environment_issue("SSTOP not observed within budget"));
             }
             let d = Deadline(platform.now() + 1);
             platform.pause(Duration::from_millis(10), d);
         }
-        let d = Deadline(platform.now() + 2);
-        let inventory = platform.processes(d);
-        if let Enumeration::Complete(list) = &inventory
-            && !list
-                .iter()
-                .any(|p| p.pid == child.0.id() && p.state == ProcState::Stopped)
-        {
-            return Err("native inventory omitted or misclassified stopped oracle".into());
-        }
-        write_json(
+        retry_inventory(
             out,
             "base-stopped-inventory.json",
-            &json!({"inventory": format!("{inventory:?}")}),
+            platform,
+            Oracle::Stopped(child.0.id()),
+            case_until,
         )?;
         Ok(())
     })();
@@ -353,14 +466,19 @@ fn stopped(out: &Path, child: &Supervised, platform: &mut NativePlatform) -> Res
     )
 }
 
-fn path_changes(out: &Path, platform: &mut NativePlatform) -> Result<()> {
+fn path_changes(out: &Path, platform: &mut NativePlatform, case_until: Duration) -> Result<()> {
+    if scupper_darwin::monotonic_raw() >= case_until {
+        return Err(environment_issue(
+            "path subcheck has no remaining case budget",
+        ));
+    }
     let source = out.join("base-sleep");
     let renamed = out.join("base-renamed-sleep");
     fs::copy("/bin/sleep", &source)?;
     let d = Deadline(platform.now() + 2);
     let identity = platform.executable_id(&source, d)?;
     let child = Supervised::spawn(out, &source, &["120"], "path-oracle.log")?;
-    let before = scupper_darwin::proc_pidpath(child.0.id())?;
+    let before = scupper_darwin::proc_pidpath(child.0.id()).map_err(environment_issue)?;
     fs::rename(&source, &renamed)?;
     let after_rename = scupper_darwin::proc_pidpath(child.0.id());
     let d = Deadline(platform.now() + 2);
@@ -369,23 +487,62 @@ fn path_changes(out: &Path, platform: &mut NativePlatform) -> Result<()> {
     }
     fs::remove_file(&renamed)?;
     let after_unlink = scupper_darwin::proc_pidpath(child.0.id());
-    let d = Deadline(platform.now() + 2);
-    let inventory = platform.processes(d);
-    if let Enumeration::Complete(list) = &inventory
-        && after_unlink.is_err()
-        && (list.iter().any(|p| p.pid == child.0.id())
-            || scupper_darwin::sysctl_kern_proc_pid(child.0.id())?.is_some_and(|p| p.stat != 5))
-    {
-        return Err("Complete included live pathless oracle".into());
-    }
+    let check = if after_unlink.is_ok() {
+        Err(environment_issue(
+            "unlink rule not exercised: proc_pidpath still succeeds",
+        ))
+    } else {
+        let current =
+            scupper_darwin::sysctl_kern_proc_pid(child.0.id()).map_err(harness_process_error)?;
+        if current.is_none_or(|p| p.stat == 5) {
+            Err(environment_issue("unlink oracle no longer live"))
+        } else {
+            retry_inventory(
+                out,
+                "base-unlinked-inventory.json",
+                platform,
+                Oracle::Pathless(child.0.id()),
+                case_until,
+            )
+        }
+    };
     write_json(
         out,
         "base-paths.json",
         &json!({"pid": child.0.id(), "before": before,
         "after_rename": after_rename.as_ref().map(|p| p.to_string_lossy()).map_err(|e| e.raw_os_error()),
         "after_unlink": after_unlink.as_ref().map(|p| p.to_string_lossy()).map_err(|e| e.raw_os_error()),
-        "enumeration": format!("{inventory:?}")}),
-    )
+        "check": check.as_ref().map_err(ToString::to_string)}),
+    )?;
+    check
+}
+
+fn retry_inventory(
+    out: &Path,
+    evidence: &str,
+    platform: &mut NativePlatform,
+    oracle: Oracle,
+    case_until: Duration,
+) -> Result<()> {
+    let until = (scupper_darwin::monotonic_raw() + Duration::from_secs(15)).min(case_until);
+    let mut attempts = Vec::new();
+    for _ in 0..5 {
+        if scupper_darwin::monotonic_raw() >= until {
+            break;
+        }
+        let deadline = Deadline((platform.now() + 2).min(until.as_secs()));
+        let inventory = platform.processes(deadline);
+        attempts.push(format!("{inventory:?}"));
+        write_json(out, evidence, &attempts)?;
+        if base_check::inventory(&inventory, oracle)? {
+            return Ok(());
+        }
+        let deadline = Deadline((platform.now() + 1).min(until.as_secs()));
+        platform.pause(Duration::from_millis(50), deadline);
+    }
+    Err(environment_issue(format!(
+        "oracle inventory incomplete after bounded retries; see {evidence}"
+    )))
 }
 
 fn capture_processes(
@@ -394,24 +551,25 @@ fn capture_processes(
     result: &mut CaseResult,
 ) -> Result<()> {
     let start = Instant::now();
-    let records = scupper_darwin::sysctl_kern_proc_all()?;
+    let records = scupper_darwin::sysctl_kern_proc_all().map_err(harness_process_error)?;
     let mut bytes = Vec::new();
     for p in &records {
         let mut b = [0_u8; proc::RECORD_BYTES];
-        b[..8].copy_from_slice(&p.start.0.to_le_bytes());
-        b[8..12].copy_from_slice(&p.start.1.to_le_bytes());
-        b[36] = p.stat;
-        b[40..44].copy_from_slice(&p.pid.to_le_bytes());
-        b[243..260].copy_from_slice(&p.comm);
+        b[proc::START_SEC..proc::START_SEC + 8].copy_from_slice(&p.start.0.to_le_bytes());
+        b[proc::START_USEC..proc::START_USEC + 4].copy_from_slice(&p.start.1.to_le_bytes());
+        b[proc::STAT] = p.stat;
+        b[proc::PID..proc::PID + 4].copy_from_slice(&p.pid.to_le_bytes());
+        b[proc::COMM..=proc::COMM + proc::MAXCOMLEN].copy_from_slice(&p.comm);
         if let Some(end) = p.comm.iter().position(|byte| *byte == 0) {
-            b[243 + end..260].fill(0);
+            b[proc::COMM + end..=proc::COMM + proc::MAXCOMLEN].fill(0);
         }
-        b[560..564].copy_from_slice(&p.ppid.to_le_bytes());
-        b[564..568].copy_from_slice(&p.pgid.to_le_bytes());
+        b[proc::PPID..proc::PPID + 4].copy_from_slice(&p.ppid.to_le_bytes());
+        b[proc::PGID..proc::PGID + 4].copy_from_slice(&p.pgid.to_le_bytes());
         bytes.extend_from_slice(&b);
     }
-    // Preserve the exact consumed kernel bytes; redact all opaque SDK fields,
-    // including addresses/credentials, instead of exposing struct padding.
+    // Reconstruct consumed typed fields at SDK-checked decoder offsets. This
+    // value regression corpus is not a raw buffer capture or a layout oracle.
+    // Opaque SDK fields (including addresses/credentials) remain zeroed.
     let decoded = proc::records(&bytes)?;
     let source = records.iter().filter(|p| p.pid != 0).collect::<Vec<_>>();
     if decoded.len() != source.len() {
@@ -430,7 +588,7 @@ fn capture_processes(
             return Err("fixture decoder disagrees with typed kernel fields".into());
         }
     }
-    let build = scupper_darwin::sysctl_string("kern.osversion")?;
+    let build = scupper_darwin::sysctl_string("kern.osversion").map_err(environment_issue)?;
     if !build.bytes().all(|b| b.is_ascii_alphanumeric()) {
         return Err("invalid build fixture component".into());
     }
@@ -450,12 +608,44 @@ fn capture_processes(
         "kinfo_proc.json",
         &json!({"build": build, "stride": proc::RECORD_BYTES,
         "bytes": bytes.len(), "records": records.len(), "decoded": decoded.len(), "sha256": format!("{:x}", Sha256::digest(&bytes)),
+        "encoding": "consumed typed fields reconstructed at SDK-checked decoder offsets",
         "redaction": "all bytes except start, stat, pid, NUL-terminated comm, ppid, pgid zeroed"}),
     )?;
     if start.elapsed() >= Duration::from_secs(60) {
         return Err("base capture exceeded one-minute budget".into());
     }
     result.iterations = 1;
-    result.detail = "redacted raw sysctl fields saved as portable Linux fixtures; opaque addresses and credentials zeroed".into();
+    result.detail = "consumed typed sysctl fields reconstructed as portable value fixtures; opaque fields zeroed".into();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn harness_churn_is_environment_noise_but_layout_is_a_violation() {
+        assert!(
+            harness_process_error(scupper_darwin::ProcError::Incomplete).is::<EnvironmentIssue>()
+        );
+        assert!(
+            harness_process_error(scupper_darwin::ProcError::Os(rustix::io::Errno::NOMEM))
+                .is::<EnvironmentIssue>()
+        );
+        assert!(!harness_process_error(scupper_darwin::ProcError::Layout).is::<EnvironmentIssue>());
+    }
+
+    #[test]
+    fn subchecks_keep_environment_noise_without_suppressing_violations() -> Result<()> {
+        let mut missing = Vec::new();
+        record_subcheck(
+            Err(environment_issue("incomplete")),
+            "stopped",
+            &mut missing,
+        )?;
+        record_subcheck(Ok(()), "path changes", &mut missing)?;
+        assert_eq!(missing, ["stopped: incomplete"]);
+        assert!(record_subcheck(Err("adapter breach".into()), "stopped", &mut missing).is_err());
+        Ok(())
+    }
 }

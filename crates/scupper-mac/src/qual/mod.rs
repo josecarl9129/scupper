@@ -7,6 +7,8 @@
 //! journaled fixture resources; they never qualify a production adapter.
 
 #[cfg(any(target_os = "macos", test))]
+mod base_check;
+#[cfg(any(target_os = "macos", test))]
 mod guard;
 #[cfg(any(target_os = "macos", test))]
 mod journal;

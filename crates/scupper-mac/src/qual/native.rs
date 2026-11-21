@@ -1024,19 +1024,13 @@ fn smoke_checks(out: &Path, result: &mut CaseResult, started: Instant) -> Result
 }
 
 fn compare_process_layout(abi: &Value) -> Result<()> {
-    if scupper_darwin::KINFO_PROC_SIZE != crate::decode::proc::RECORD_BYTES
-        || scupper_darwin::MAXCOMLEN != crate::decode::proc::MAXCOMLEN
-        || abi["kinfo_proc"]["size"].as_u64() != Some(scupper_darwin::KINFO_PROC_SIZE as u64)
-        || abi["MAXCOMLEN"].as_u64() != Some(scupper_darwin::MAXCOMLEN as u64)
-    {
-        return Err("SDK/Rust process size or MAXCOMLEN mismatch".into());
-    }
-    for (field, offset) in scupper_darwin::KINFO_PROC_FIELDS {
-        if abi["kinfo_proc"]["fields"][field].as_u64() != Some(offset as u64) {
-            return Err(format!("SDK/Rust kinfo_proc offset mismatch: {field}").into());
-        }
-    }
-    Ok(())
+    super::base_check::compare_process_layout(
+        abi,
+        &scupper_darwin::KINFO_PROC_FIELDS,
+        scupper_darwin::KINFO_PROC_SIZE,
+        scupper_darwin::MAXCOMLEN,
+    )
+    .map_err(Into::into)
 }
 
 fn boot_reads(out: &Path, result: &mut CaseResult, started: Instant) -> Result<()> {
