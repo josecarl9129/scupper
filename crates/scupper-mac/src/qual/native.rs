@@ -3,6 +3,7 @@ use std::{
     error::Error,
     fs,
     io::Write,
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     thread,
@@ -11,12 +12,14 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use super::{
     CaseResult, Evidence, Manifest, Verdict,
     command::{command, unix_seconds},
     guard::{Ack, MAX_ARM_SECONDS, check_environment, preflight_conditions},
     redact,
+    restore_check::{self, RestoreEffects},
 };
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -79,8 +82,32 @@ pub(super) fn dispatch(args: &[String]) -> Result<()> {
         rustix::process::geteuid().is_root(),
         options.disposable,
     )?;
-    fs::create_dir_all(&options.out)?;
+    // Refuse runner-writable code and paths before creating or loading evidence.
+    // Stage the harness and probe as root before the first privileged invocation.
+    protected_path(&std::env::current_exe()?, false)?;
+    protected_path(&probe_path()?, false)?;
+    if !options.out.is_absolute() {
+        return Err("--out must be an absolute path under a root-owned directory".into());
+    }
+    let parent = options
+        .out
+        .parent()
+        .ok_or("artifact directory needs a parent")?;
+    protected_path(parent, true)?;
+    if !options.out.exists() {
+        fs::DirBuilder::new().mode(0o700).create(&options.out)?;
+    }
+    protected_path(&options.out, true)?;
     options.out = options.out.canonicalize()?;
+    for entry in fs::read_dir(&options.out)? {
+        protected_path(&entry?.path(), false)?;
+    }
+    if options.out.join("preflight.json").exists() {
+        let baseline: Snapshot = read_json(&options.out.join("preflight.json"))?;
+        if baseline.binary_sha256 != executable_sha256()? {
+            return Err("executed harness SHA256 differs from preflight".into());
+        }
+    }
     match options.action.as_str() {
         "preflight" => preflight(&options.out),
         "arm" => arm(&options),
@@ -109,6 +136,68 @@ pub(super) fn dispatch(args: &[String]) -> Result<()> {
     }
 }
 
+// lstat each component, including ancestors: a protected file inside a writable
+// directory can still be replaced. Never follow a caller-planted symlink.
+fn protected_path(path: &Path, directory: bool) -> Result<()> {
+    if !path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err("protected paths must be absolute without dot components".into());
+    }
+    for component in path.ancestors() {
+        let meta = fs::symlink_metadata(component)?;
+        let needs_directory = component != path || directory;
+        if meta.uid() != 0
+            || meta.mode() & 0o022 != 0
+            || (needs_directory && !meta.is_dir())
+            || (!needs_directory && !meta.is_file())
+        {
+            return Err(format!(
+                "{} must be root-owned, non-writable by other users, and a regular {}",
+                component.display(),
+                if needs_directory { "directory" } else { "file" }
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn probe_path() -> Result<PathBuf> {
+    Ok(std::env::current_exe()?
+        .parent()
+        .ok_or("executable needs a parent")?
+        .join("abi-probe"))
+}
+
+fn executable_sha256() -> Result<String> {
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(fs::read(std::env::current_exe()?)?)
+    ))
+}
+
+fn monotonic_seconds() -> Result<u64> {
+    Ok(
+        rustix::time::clock_gettime(rustix::time::ClockId::Monotonic)
+            .tv_sec
+            .try_into()?,
+    )
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct EnvironmentIssue(String);
+
+fn environment_issue(error: impl std::fmt::Display) -> Box<dyn Error> {
+    Box::new(EnvironmentIssue(error.to_string()))
+}
+
 fn clean_value(value: &mut Value) {
     match value {
         Value::String(text) => *text = redact(text),
@@ -123,12 +212,18 @@ fn write_json(out: &Path, name: &str, value: &impl Serialize) -> Result<()> {
     clean_value(&mut value);
     let path = out.join(name);
     let temp = path.with_extension(format!("{}.tmp", std::process::id()));
-    fs::write(&temp, serde_json::to_vec_pretty(&value)?)?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp)?;
+    file.write_all(&serde_json::to_vec_pretty(&value)?)?;
     fs::rename(temp, path)?;
     Ok(())
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+    protected_path(path, false)?;
     Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
 
@@ -159,6 +254,7 @@ fn invoke(program: &str, args: &[&str]) -> Evidence {
 struct Snapshot {
     at: u64,
     image: BTreeMap<String, String>,
+    binary_sha256: String,
     observations: BTreeMap<String, Evidence>,
     inconclusive: Vec<String>,
 }
@@ -243,6 +339,7 @@ fn snapshot(out: &Path, phase: &str, deadline: Instant) -> Result<Snapshot> {
     Ok(Snapshot {
         at: unix_seconds(),
         image,
+        binary_sha256: executable_sha256()?,
         observations,
         inconclusive,
     })
@@ -276,7 +373,7 @@ struct ProcessIdentity {
 }
 
 fn lookup_identity(out: &Path, pid: u32) -> Result<Option<ProcessIdentity>> {
-    let probe = out.join("abi-probe");
+    let probe = probe_path()?;
     let evidence = invoke(
         probe.to_str().ok_or("non-UTF8 probe path")?,
         &["--process-identity", &pid.to_string()],
@@ -314,7 +411,8 @@ fn require_ack(out: &Path) -> Result<Ack> {
     let ack: Ack = read_json(&out.join("ack.json"))
         .map_err(|error| format!("fresh dead-man acknowledgement required: {error}"))?;
     let boot = scupper_darwin::sysctl_string("kern.bootsessionuuid")?;
-    if !ack.fresh(unix_seconds(), &boot) || process_identity(out, ack.pid)?.start != ack.start {
+    if !ack.fresh(monotonic_seconds()?, &boot) || process_identity(out, ack.pid)?.start != ack.start
+    {
         return Err(
             "dead-man acknowledgement is stale, expired or has a different process/boot identity"
                 .into(),
@@ -371,7 +469,19 @@ fn arm(options: &Options) -> Result<()> {
         after = options.after
     );
     let path = options.out.join("restore.plist");
-    fs::write(&path, plist)?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)?;
+    file.write_all(plist.as_bytes())?;
+    rustix::fs::chown(
+        &path,
+        Some(rustix::fs::Uid::ROOT),
+        Some(rustix::fs::Gid::ROOT),
+    )?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
+    protected_path(&path, false)?;
     let bootstrap = invoke(
         "/bin/launchctl",
         &[
@@ -438,12 +548,15 @@ fn deadman(options: &Options) -> Result<()> {
         return Err("dead-man must be a launchd child and process group leader".into());
     }
     let armed_at = unix_seconds();
+    let armed_monotonic = monotonic_seconds()?;
     let ack = Ack {
         pid: std::process::id(),
         start: identity.start,
         pgid: identity.pgid,
         ppid: identity.ppid,
         armed_at,
+        armed_monotonic,
+        fire_monotonic: armed_monotonic + options.after,
         fire_at: armed_at + options.after,
         boot_session: scupper_darwin::sysctl_string("kern.bootsessionuuid")?,
     };
@@ -568,10 +681,11 @@ fn capture(out: &Path) -> Result<CaseResult> {
     write_json(out, "capture.json", &snapshot)?;
     let result = CaseResult {
         case: "Q-CAPTURE".into(),
+        binary_sha256: snapshot.binary_sha256,
         verdict,
         iterations: 1,
         detail: if snapshot.inconclusive.is_empty() {
-            "raw text inventory and system-tool SHA256s captured".into()
+            "raw inventory and available system-tool SHA256 evidence captured".into()
         } else {
             snapshot.inconclusive.join("; ")
         },
@@ -600,13 +714,17 @@ fn run_smoke(out: &Path) -> Result<()> {
     let baseline: Snapshot = read_json(&out.join("preflight.json"))?;
     let started = Instant::now();
     let mut result = CaseResult {
-        case: "Q-SMOKE".into(), verdict: Verdict::AssumptionHolds, iterations: 0,
-        detail: "ABI layout evidence, guard refusal, independent dead-man ack, restore idempotence and 1000 stable boot UUID reads; no native assumptions promoted".into(),
+        case: "Q-SMOKE".into(), binary_sha256: executable_sha256()?, verdict: Verdict::AssumptionHolds, iterations: 0,
+        detail: "ABI layout evidence, guard refusal, independent dead-man ack, restore actions/available static observations unchanged and 1000 stable boot UUID reads; no native assumptions promoted".into(),
         evidence: Vec::new(),
     };
     let smoke = smoke_checks(out, &mut result, started);
     if let Err(error) = smoke {
-        result.verdict = Verdict::ContractViolation;
+        result.verdict = if error.is::<EnvironmentIssue>() {
+            Verdict::Inconclusive
+        } else {
+            Verdict::ContractViolation
+        };
         result.detail = error.to_string();
     } else if !baseline.inconclusive.is_empty() {
         result.verdict = Verdict::Inconclusive;
@@ -622,13 +740,15 @@ fn run_smoke(out: &Path) -> Result<()> {
 }
 
 fn smoke_checks(out: &Path, result: &mut CaseResult, started: Instant) -> Result<()> {
-    let probe = out.join("abi-probe");
+    let probe = probe_path()?;
     let abi = invoke(probe.to_str().ok_or("non-UTF8 probe path")?, &[]);
     let complete = abi.complete();
     let parsed = serde_json::from_str::<Value>(&abi.stdout);
     result.evidence.push(abi);
     if !complete {
-        return Err("SDK ABI probe failed; see command evidence".into());
+        return Err(environment_issue(
+            "SDK ABI probe failed; see command evidence",
+        ));
     }
     let abi = parsed?;
     for name in [
@@ -666,18 +786,47 @@ fn smoke_checks(out: &Path, result: &mut CaseResult, started: Instant) -> Result
             "missing --disposable-runner did not produce the required guard refusal".into(),
         );
     }
-    let ack = require_ack(out)?;
+    let ack = require_ack(out).map_err(environment_issue)?;
     write_json(out, "smoke-ack.json", &ack)?;
     let deadline = started + Duration::from_secs(180);
     let first = restore(out, deadline)?;
     write_json(out, "smoke-restore-first.json", &first)?;
     let second = restore(out, deadline)?;
     write_json(out, "smoke-restore-second.json", &second)?;
-    if !second.already_restored
-        || !first.network_mutations.is_empty()
-        || !second.network_mutations.is_empty()
+    let comparison = restore_check::compare(
+        &RestoreEffects {
+            already_restored: first.already_restored,
+            network_mutations: &first.network_mutations,
+            writer_stop_count: first.writer_stop_evidence.len(),
+            observations: &first.post_state.observations,
+        },
+        &RestoreEffects {
+            already_restored: second.already_restored,
+            network_mutations: &second.network_mutations,
+            writer_stop_count: second.writer_stop_evidence.len(),
+            observations: &second.post_state.observations,
+        },
+    );
+    write_json(out, "smoke-restore-comparison.json", &comparison)?;
+    if !comparison.violations.is_empty() {
+        return Err(format!(
+            "restore idempotence contract violation: {}; see smoke-restore-comparison.json",
+            comparison.violations.join("; ")
+        )
+        .into());
+    }
+    // Optional inventory failures stay diagnostic. Incomplete pf observations
+    // prevent an idempotence verdict even when they do not gate preflight.
+    if comparison
+        .unavailable_observations
+        .iter()
+        .any(|name| name.starts_with("pf-"))
     {
-        return Err("the bootstrap restoration was not an idempotent network no-op".into());
+        result.verdict = Verdict::Inconclusive;
+        result.detail = format!(
+            "restore comparison incomplete: {:?}; see smoke-restore-comparison.json",
+            comparison.unavailable_observations
+        );
     }
     if !first.post_state.inconclusive.is_empty() || !second.post_state.inconclusive.is_empty() {
         result.verdict = Verdict::Inconclusive;
@@ -690,7 +839,7 @@ fn smoke_checks(out: &Path, result: &mut CaseResult, started: Instant) -> Result
 }
 
 fn boot_reads(out: &Path, result: &mut CaseResult, started: Instant) -> Result<()> {
-    let boot = scupper_darwin::sysctl_string("kern.bootsessionuuid")?;
+    let boot = scupper_darwin::sysctl_string("kern.bootsessionuuid").map_err(environment_issue)?;
     if !valid_uuid(&boot) {
         return Err("kern.bootsessionuuid is not a valid UUID".into());
     }
@@ -698,10 +847,13 @@ fn boot_reads(out: &Path, result: &mut CaseResult, started: Instant) -> Result<(
     let mut journal = fs::OpenOptions::new()
         .create_new(true)
         .write(true)
+        .mode(0o600)
         .open(out.join("boot-reads.jsonl"))?;
     for iteration in 0..1000 {
         if started.elapsed() >= Duration::from_secs(180) {
-            return Err("Q-SMOKE exceeded its three-minute case deadline".into());
+            return Err(environment_issue(
+                "Q-SMOKE exceeded its three-minute case deadline",
+            ));
         }
         writeln!(
             journal,
@@ -712,7 +864,7 @@ fn boot_reads(out: &Path, result: &mut CaseResult, started: Instant) -> Result<(
         let observation = json!({"iteration": iteration, "elapsed_ms": started.elapsed().as_millis(), "result": value.as_ref().map(String::as_str).map_err(ToString::to_string)});
         writeln!(journal, "{observation}")?;
         reads.push(observation);
-        if value? != boot {
+        if value.map_err(environment_issue)? != boot {
             return Err("boot-session UUID changed within the smoke case".into());
         }
         result.iterations += 1;

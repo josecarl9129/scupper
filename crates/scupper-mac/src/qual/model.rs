@@ -53,6 +53,8 @@ impl Evidence {
 pub struct CaseResult {
     /// Manifest case id.
     pub case: String,
+    /// SHA256 of the root-owned harness executable producing this verdict.
+    pub binary_sha256: String,
     /// Experiment outcome.
     pub verdict: Verdict,
     /// Number of completed iterations.
@@ -172,6 +174,7 @@ mod tests {
         assert_eq!(redact(&output), output);
         let serialized = serde_json::to_string(&CaseResult {
             case: "Q-CAPTURE".into(),
+            binary_sha256: "0".repeat(64),
             verdict: Verdict::Inconclusive,
             iterations: 0,
             detail: output,

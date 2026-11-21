@@ -368,7 +368,7 @@ Rules:
 ### Cargo workspace
 
 ```
-Cargo.toml          workspace; [workspace.lints]: forbid(unsafe_code), deny clippy::unwrap_used, expect_used
+Cargo.toml          workspace; forbid(unsafe_code) except scupper-darwin (ADR 0034); deny clippy::unwrap_used, expect_used
 rust-toolchain.toml pinned
 deny.toml
 crates/
@@ -376,6 +376,7 @@ crates/
                     (nft, pf, units), verdict + staging, failover machine, planner, parsers
   scupper-proto/    serde types for API, control socket and --json (schema = 1)
   scupper-sys/      Linux adapters: Exec with timeouts and allow-list, System impl, netns, probes
+  scupper-darwin/   typed, owned Darwin FFI; private unsafe sys module (ADR 0034)
   scupper-mac/      pf, supervised wireguard-go/UAPI, launchd, network fingerprint (§14)
   scupperd/         bin: reconciler, events, alert/heartbeat scheduling, control socket
   scupper-edge/     bin: DNS forwarder, HTTP API, metrics
@@ -397,7 +398,8 @@ the start of M2.
 | `ipnet` | core | prefixes |
 | `clap` (derive), `clap_complete`, `clap_mangen` | CLI | command tree, completions, man pages |
 | `dialoguer`, `comfy-table`, `anstream` | CLI | prompts and pickers, TTY tables, TTY-aware colour (§11) |
-| `rustix` | sys, CLI deploy | `setns`, credential drop, sockopts; nonblocking deploy stdin and process-group termination on Linux/macOS, without first-party unsafe |
+| `libc` | darwin | private read-only Darwin FFI (ADR 0034) |
+| `rustix` | sys, CLI deploy, darwin, mac qualification | `setns`, credential drop, sockopts; nonblocking deploy stdin and process-group termination on Linux/macOS; Darwin errno and qualification ownership/monotonic clock |
 | `socket2` | sys, edge | `bind_device`, `IP_FREEBIND` |
 | `ureq` (rustls) | CLI, delivery child | sync HTTPS for API client, sinks, heartbeat |
 | `tokio` (rt, net, time), `hyper`, `hyper-util` | edge only | concurrent DNS and HTTP |
@@ -4931,7 +4933,7 @@ hardware) before anything depends on them.
 | [0018](adr/0018-alerts-via-uplink.md) | Alerts and heartbeat leave via the host uplink |
 | [0019](adr/0019-jsonl-event-log.md) | JSON Lines event log |
 | [0020](adr/0020-probes-resolve-through-exit.md) | Probes resolve names through the exit they test |
-| [0021](adr/0021-mac-wg-quick-pf.md) | Mac: wg-quick, pf sub-anchor, fingerprint-based auto-join (amended by 0033) |
+| [0021](adr/0021-mac-wg-quick-pf.md) | Mac: wg-quick, pf sub-anchor, fingerprint-based auto-join (amended by 0033, 0034) |
 | [0022](adr/0022-polling-reconcile.md) | Level-triggered polling reconcile loop |
 | [0023](adr/0023-secret-refs.md) | Secret references: gateway files by name, operator secrets resolved just in time |
 | [0024](adr/0024-ha-options-deferred.md) | High availability options, deferred |
@@ -4944,6 +4946,7 @@ hardware) before anything depends on them.
 | [0031](adr/0031-quarantine-latch.md) | Persisted quarantine latch after an exhausted repair budget |
 | [0032](adr/0032-post-nat-uplink-filter.md) | Drop exit-sourced uplink packets after NAT |
 | [0033](adr/0033-mac-own-tunnel-driver.md) | Mac: scupper drives its own pinned wireguard-go, without wg-quick or Homebrew |
+| [0034](adr/0034-darwin-ffi-boundary.md) | Darwin FFI confined to a typed, owned scupper-darwin boundary |
 
 ### M2-2t1 implementation deviations
 

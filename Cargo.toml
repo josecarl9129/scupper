@@ -10,6 +10,7 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [workspace.dependencies]
+libc = { version = "0.2.191", default-features = false }
 scupper-proto = { version = "0.1.4", path = "crates/scupper-proto" }
 scupper-core = { version = "0.1.4", path = "crates/scupper-core" }
 scupper-sys = { version = "0.1.4", path = "crates/scupper-sys" }

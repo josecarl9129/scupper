@@ -3,7 +3,8 @@
 Status: accepted, 2026-11-08. Design: [DESIGN.md](../DESIGN.md).
 
 Amended by [0033](0033-mac-own-tunnel-driver.md) (2026-11-13) for the tunnel
-driver. The pf policy, DHCP/ND lifecycle, verifier and hook-loss contracts below
+driver, and [0034](0034-darwin-ffi-boundary.md) (2026-11-20) for the Darwin
+FFI boundary. The pf policy, DHCP/ND lifecycle, verifier and hook-loss contracts below
 are specified by DESIGN §14.
 
 ## Context

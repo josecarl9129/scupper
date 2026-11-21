@@ -7,3 +7,33 @@ mod sys;
 
 #[cfg(target_os = "macos")]
 pub use sys::sysctl_string;
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::sysctl_string;
+    use rustix::io::Errno;
+
+    #[test]
+    fn osversion_is_a_nonempty_string() -> Result<(), Errno> {
+        assert_ne!(sysctl_string("kern.osversion")?, "");
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_name_returns_noent() {
+        assert_eq!(
+            sysctl_string("kern.scupper_nonexistent_qualification_oid"),
+            Err(Errno::NOENT)
+        );
+    }
+
+    #[test]
+    fn interior_nul_returns_inval() {
+        assert_eq!(sysctl_string("kern.osversion\0ignored"), Err(Errno::INVAL));
+    }
+
+    #[test]
+    fn integer_oid_is_rejected_as_a_string() {
+        assert_eq!(sysctl_string("hw.ncpu"), Err(Errno::INVAL));
+    }
+}

@@ -27,6 +27,8 @@ pub(super) struct Ack {
     pub armed_at: u64,
     pub fire_at: u64,
     pub boot_session: String,
+    pub armed_monotonic: u64,
+    pub fire_monotonic: u64,
 }
 
 impl Ack {
@@ -35,9 +37,9 @@ impl Ack {
             && self.pgid == self.pid
             && self.ppid == 1
             && !self.start.is_empty()
-            && self.armed_at <= now
-            && now < self.fire_at
-            && self.fire_at - self.armed_at <= MAX_ARM_SECONDS
+            && self.armed_monotonic <= now
+            && now < self.fire_monotonic
+            && self.fire_monotonic - self.armed_monotonic <= MAX_ARM_SECONDS
             && self.boot_session == boot_session
     }
 }
@@ -67,12 +69,24 @@ pub(super) fn preflight_conditions(
     binary_is_arm64: bool,
 ) -> Vec<String> {
     let mut inconclusive = Vec::new();
-    for (name, evidence) in observations {
-        // On native Apple Silicon this optional OID may be absent. Record the
-        // exact error and permit only that specific absence, never other errors.
+    // Optional inventory failures stay in raw evidence. Only prerequisites for
+    // safe qualification gate a cell, including missing observations.
+    for name in [
+        "pf-references",
+        "pf-anchors",
+        "pf-apple-anchors",
+        "translated",
+        "binary-arch",
+        "machine",
+    ] {
+        let Some(evidence) = observations.get(name) else {
+            inconclusive.push(format!("{name}: observation missing"));
+            continue;
+        };
+        // Native arm64 can omit this OID; accept only its exact unknown-OID error.
         let absent_translation_oid = name == "translated"
             && evidence.exit_code == Some(1)
-            && evidence.stderr.contains("unknown oid")
+            && evidence.stderr.trim() == "sysctl: unknown oid 'sysctl.proc_translated'"
             && !evidence.timed_out
             && !evidence.truncated;
         if !evidence.complete() && !absent_translation_oid {
@@ -103,7 +117,7 @@ pub(super) fn preflight_conditions(
         Some(e) if e.complete() && e.stdout.trim() == "0" => {}
         Some(e)
             if e.exit_code == Some(1)
-                && e.stderr.contains("unknown oid")
+                && e.stderr.trim() == "sysctl: unknown oid 'sysctl.proc_translated'"
                 && !e.timed_out
                 && !e.truncated => {}
         _ => inconclusive.push("translation status not established".into()),
@@ -212,6 +226,36 @@ mod tests {
     }
 
     #[test]
+    fn optional_observations_do_not_gate_but_missing_safety_observations_do() {
+        let mut observations = std::collections::BTreeMap::from([
+            (
+                "pf-references".into(),
+                observation("No pf starter references held"),
+            ),
+            ("pf-anchors".into(), observation("com.apple")),
+            ("pf-apple-anchors".into(), observation("")),
+            ("translated".into(), observation("0")),
+            ("binary-arch".into(), observation("arm64")),
+            ("machine".into(), observation("arm64")),
+        ]);
+        for name in ["sdk", "tool-sha256", "scutil-keys"] {
+            let mut failed = observation("");
+            failed.timed_out = true;
+            observations.insert(name.into(), failed);
+        }
+        assert_eq!(
+            preflight_conditions(&observations, true),
+            Vec::<String>::new()
+        );
+        observations.remove("pf-anchors");
+        assert!(
+            preflight_conditions(&observations, true)
+                .iter()
+                .any(|reason| reason.contains("pf-anchors"))
+        );
+    }
+
+    #[test]
     fn guard_checks_every_condition_and_ack_cannot_cross_boots_or_expire() {
         assert!(check_environment("true", "github-hosted", true, true).is_ok());
         for values in [
@@ -230,14 +274,23 @@ mod tests {
             armed_at: 100,
             fire_at: 200,
             boot_session: "boot".into(),
+            armed_monotonic: 100,
+            fire_monotonic: 200,
         };
         assert!(ack.fresh(150, "boot"));
         assert!(!ack.fresh(99, "boot"));
         assert!(!ack.fresh(200, "boot"));
         assert!(!ack.fresh(150, "another boot"));
-        let invalid = Ack {
-            fire_at: 100 + MAX_ARM_SECONDS + 1,
+        // Wall-clock jumps do not change monotonic acknowledgement freshness.
+        let jumped = Ack {
+            armed_at: 999_999,
+            fire_at: 1,
             ..ack
+        };
+        assert!(jumped.fresh(150, "boot"));
+        let invalid = Ack {
+            fire_monotonic: 100 + MAX_ARM_SECONDS + 1,
+            ..jumped
         };
         assert!(!invalid.fresh(150, "boot"));
     }

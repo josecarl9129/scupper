@@ -223,7 +223,10 @@ jobs:
           if-no-files-found: error
 
   macos-native:
-    if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/heads/lab/') || startsWith(github.head_ref, 'lab/') }}
+    defaults:
+      run:
+        shell: bash
+    if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/heads/lab/') }}
     strategy:
       fail-fast: false
       matrix:
@@ -251,46 +254,69 @@ jobs:
       - name: Build qualification harness as runner user
         timeout-minutes: 8
         run: |
+          python3 crates/scupper-mac/qualification/test_artifacts.py
           mkdir -p qual-out
+          rm -f target/debug/scupper-mac-qual
           rustc -Vv | tee qual-out/rustc.txt
           env -u CARGO_TARGET_TMPDIR cargo build -p scupper-mac --bin scupper-mac-qual --features qualification --locked 2>&1 | tee qual-out/build.log
+          shasum -a 256 target/debug/scupper-mac-qual | tee qual-out/built-harness-sha256.txt
+      - name: Native lint and tests of the FFI crate
+        timeout-minutes: 8
+        run: |
+          env -u CARGO_TARGET_TMPDIR cargo clippy -p scupper-darwin --all-targets --locked -- -D warnings
+          env -u CARGO_TARGET_TMPDIR cargo test -p scupper-darwin --locked
       - name: Compile SDK ABI probe
         timeout-minutes: 2
         run: |
-          cc -std=c11 -Wall -Wextra -Werror -v crates/scupper-darwin/probe/abi.c -lproc -o qual-out/abi-probe 2>&1 | tee qual-out/abi-build.log
+          cc -std=c11 -Wall -Wextra -Werror -v crates/scupper-darwin/probe/abi.c -o qual-out/abi-probe 2>&1 | tee qual-out/abi-build.log
           qual-out/abi-probe | tee qual-out/abi-sdk.json
+      - name: Stage root-owned qualification files
+        timeout-minutes: 1
+        run: |
+          # Fail closed on an existing path; never install through a planted link.
+          test ! -e /private/var/db/scupper-qual
+          test ! -L /private/var/db/scupper-qual
+          /usr/bin/sudo /usr/bin/install -d -o root -g wheel -m 0700 /private/var/db/scupper-qual
+          /usr/bin/sudo /usr/bin/install -o root -g wheel -m 0755 target/debug/scupper-mac-qual /private/var/db/scupper-qual/scupper-mac-qual
+          /usr/bin/sudo /usr/bin/install -o root -g wheel -m 0755 qual-out/abi-probe /private/var/db/scupper-qual/abi-probe
+          /usr/bin/sudo /usr/bin/shasum -a 256 /private/var/db/scupper-qual/scupper-mac-qual | tee qual-out/executed-harness-sha256.txt
+          /usr/bin/sudo /usr/bin/shasum -a 256 /private/var/db/scupper-qual/abi-probe | tee qual-out/executed-probe-sha256.txt
+          test "$(cut -d ' ' -f 1 qual-out/built-harness-sha256.txt)" = "$(cut -d ' ' -f 1 qual-out/executed-harness-sha256.txt)"
       - name: Preflight
         timeout-minutes: 3
-        run: sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,ImageOS,ImageVersion,RUNNER_NAME,GITHUB_RUN_ID,GITHUB_SHA target/debug/scupper-mac-qual preflight --out qual-out --disposable-runner
+        run: /usr/bin/sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,ImageOS,ImageVersion,RUNNER_NAME,GITHUB_RUN_ID,GITHUB_SHA /private/var/db/scupper-qual/scupper-mac-qual preflight --out /private/var/db/scupper-qual/evidence --disposable-runner
       - name: Arm independent launchd restore
         timeout-minutes: 1
-        run: sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT target/debug/scupper-mac-qual arm --after 1080 --out qual-out --disposable-runner
+        run: /usr/bin/sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT /private/var/db/scupper-qual/scupper-mac-qual arm --after 1080 --out /private/var/db/scupper-qual/evidence --disposable-runner
       - name: Run smoke qualification
         timeout-minutes: 6
-        run: sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,ImageOS,ImageVersion,RUNNER_NAME,GITHUB_RUN_ID,GITHUB_SHA target/debug/scupper-mac-qual run --group ${{ matrix.group }} --out qual-out --disposable-runner
+        run: /usr/bin/sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,ImageOS,ImageVersion,RUNNER_NAME,GITHUB_RUN_ID,GITHUB_SHA /private/var/db/scupper-qual/scupper-mac-qual run --group ${{ matrix.group }} --out /private/var/db/scupper-qual/evidence --disposable-runner
       - name: Restore and stop dead-man
         if: always()
         timeout-minutes: 3
         run: |
           mkdir -p qual-out
           restore_status=0
-          if [ -f qual-out/preflight.json ] && [ -x target/debug/scupper-mac-qual ]; then
-            sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT target/debug/scupper-mac-qual restore --out qual-out --disposable-runner || restore_status=$?
+          if /usr/bin/sudo /bin/test -f /private/var/db/scupper-qual/evidence/preflight.json && /usr/bin/sudo /bin/test -x /private/var/db/scupper-qual/scupper-mac-qual; then
+            /usr/bin/sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT /private/var/db/scupper-qual/scupper-mac-qual restore --out /private/var/db/scupper-qual/evidence --disposable-runner || restore_status=$?
           fi
           # The bootstrap owns no network resources; restore is a checked no-op.
-          # Keep bootout diagnostics even when bootstrap never succeeded.
-          sudo launchctl print system/net.scupper.qual.restore > qual-out/deadman-final-status.log 2>&1 || true
-          sudo launchctl bootout system/net.scupper.qual.restore > qual-out/deadman-bootout.log 2>&1 || cat qual-out/deadman-bootout.log
-          if sudo launchctl print system/net.scupper.qual.restore > qual-out/deadman-after-bootout.log 2>&1; then
+          # Redirections are opened by the runner, never by a privileged process.
+          /usr/bin/sudo /bin/launchctl print system/net.scupper.qual.restore > qual-out/deadman-final-status.log 2>&1 || true
+          /usr/bin/sudo /bin/launchctl bootout system/net.scupper.qual.restore > qual-out/deadman-bootout.log 2>&1 || cat qual-out/deadman-bootout.log
+          if /usr/bin/sudo /bin/launchctl print system/net.scupper.qual.restore > qual-out/deadman-after-bootout.log 2>&1; then
             cat qual-out/deadman-after-bootout.log
             restore_status=1
           fi
-          sudo find qual-out -type d -exec chmod a+rx {} +
-          sudo find qual-out -type f -exec chmod a+r {} +
+          # Export only after the worker is gone. Root only reads its protected
+          # evidence; the unprivileged tar creates the artifact files.
+          if /usr/bin/sudo /bin/test -d /private/var/db/scupper-qual/evidence; then
+            /usr/bin/sudo /usr/bin/tar -C /private/var/db/scupper-qual/evidence -cf - . | tar --no-same-owner -C qual-out -xf -
+          fi
           exit "$restore_status"
-      - name: Check artifact redaction
+      - name: Check artifact redaction and executable identity
         if: always()
-        run: sudo python3 crates/scupper-mac/qualification/check-artifacts.py qual-out
+        run: python3 crates/scupper-mac/qualification/check-artifacts.py qual-out
       - name: Summarize verdicts
         if: always()
         env:
