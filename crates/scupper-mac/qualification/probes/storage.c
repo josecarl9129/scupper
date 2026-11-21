@@ -41,7 +41,9 @@ static void basics(const char *dir, const char *volume) {
   }
   unlink(path);
 }
-static bool detach_image(const char *mount) {
+static bool detach_image(const char *mount_path) {
+  /* The argv helper takes non-const strings; detach never writes through it. */
+  char *mount = (char *)mount_path;
   struct output detach = RUN_FOR(30000, "/usr/bin/hdiutil", "detach", mount);
   if (detach.status || detach.timeout)
     detach = RUN_FOR(30000, "/usr/bin/hdiutil", "detach", "-force", mount);
