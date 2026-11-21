@@ -26,6 +26,8 @@ use super::{
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 const LABEL: &str = "net.scupper.qual.restore";
 const SERVICE: &str = "system/net.scupper.qual.restore";
+#[path = "base.rs"]
+mod base;
 #[path = "resources.rs"]
 mod resources;
 
@@ -77,12 +79,15 @@ impl Options {
         ) {
             return Err("unknown subcommand".into());
         }
-        if !matches!(options.group.as_str(), "smoke" | "probe" | "probe-hijack")
-            || options.after == 0
+        if !matches!(
+            options.group.as_str(),
+            "smoke" | "base" | "probe" | "probe-hijack"
+        ) || options.after == 0
             || options.after > MAX_ARM_SECONDS
         {
             return Err(
-                "group must be smoke/probe/probe-hijack; --after must be 1..1080 seconds".into(),
+                "group must be smoke/base/probe/probe-hijack; --after must be 1..1080 seconds"
+                    .into(),
             );
         }
         if options.action == "probe"
@@ -164,6 +169,8 @@ pub(super) fn dispatch(args: &[String]) -> Result<()> {
                 run_probe(&options.out, options.name.as_deref().ok_or("missing name")?)
             } else if options.group == "smoke" {
                 run_smoke(&options.out)
+            } else if options.group == "base" {
+                base::run(&options.out)
             } else {
                 run_probes(&options.out, &options.group)
             };
@@ -943,6 +950,7 @@ fn smoke_checks(out: &Path, result: &mut CaseResult, started: Instant) -> Result
             return Err(format!("ABI probe missing size/fields for {name}").into());
         }
     }
+    compare_process_layout(&abi)?;
     write_json(out, "abi.json", &abi)?;
     let exe = std::env::current_exe()?;
     let refused = invoke(
@@ -1013,6 +1021,22 @@ fn smoke_checks(out: &Path, result: &mut CaseResult, started: Instant) -> Result
         );
     }
     boot_reads(out, result, started)
+}
+
+fn compare_process_layout(abi: &Value) -> Result<()> {
+    if scupper_darwin::KINFO_PROC_SIZE != crate::decode::proc::RECORD_BYTES
+        || scupper_darwin::MAXCOMLEN != crate::decode::proc::MAXCOMLEN
+        || abi["kinfo_proc"]["size"].as_u64() != Some(scupper_darwin::KINFO_PROC_SIZE as u64)
+        || abi["MAXCOMLEN"].as_u64() != Some(scupper_darwin::MAXCOMLEN as u64)
+    {
+        return Err("SDK/Rust process size or MAXCOMLEN mismatch".into());
+    }
+    for (field, offset) in scupper_darwin::KINFO_PROC_FIELDS {
+        if abi["kinfo_proc"]["fields"][field].as_u64() != Some(offset as u64) {
+            return Err(format!("SDK/Rust kinfo_proc offset mismatch: {field}").into());
+        }
+    }
+    Ok(())
 }
 
 fn boot_reads(out: &Path, result: &mut CaseResult, started: Instant) -> Result<()> {

@@ -24,3 +24,5 @@ mod tests {
         assert_eq!(super::iowr(b'D', 5, 16), 0xC010_4405);
     }
 }
+
+pub mod proc;

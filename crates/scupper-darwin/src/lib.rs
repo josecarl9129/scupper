@@ -6,7 +6,11 @@
 mod sys;
 
 #[cfg(target_os = "macos")]
-pub use sys::sysctl_string;
+pub use sys::{
+    KINFO_PROC_FIELDS, KINFO_PROC_SIZE, KProc, MAXCOMLEN, NOW_CLOCK_ID, ProcError, UPTIME_CLOCK_ID,
+    monotonic_raw, proc_pidpath, sysctl_kern_proc_all, sysctl_kern_proc_pid, sysctl_string,
+    uptime_raw,
+};
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {

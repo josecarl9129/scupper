@@ -231,7 +231,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [macos-15, macos-26]
-        group: [smoke, probe, probe-hijack]
+        group: [smoke, base, probe, probe-hijack]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     continue-on-error: ${{ matrix.group == 'probe-hijack' }}
@@ -253,12 +253,12 @@ jobs:
             target
           key: native-${{ matrix.runner }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
       - uses: actions/setup-go@v5
-        if: matrix.group != 'smoke'
+        if: matrix.group == 'probe' || matrix.group == 'probe-hijack'
         with:
           go-version: '1.27.4'
           cache: false
       - name: Build pinned upstream wireguard-go
-        if: matrix.group != 'smoke'
+        if: matrix.group == 'probe' || matrix.group == 'probe-hijack'
         timeout-minutes: 3
         env:
           GOTOOLCHAIN: local
@@ -293,18 +293,20 @@ jobs:
           rustc -Vv | tee qual-out/rustc.txt
           env -u CARGO_TARGET_TMPDIR cargo build -p scupper-mac --bin scupper-mac-qual --features qualification --locked 2>&1 | tee qual-out/build.log
           shasum -a 256 target/debug/scupper-mac-qual | tee qual-out/built-harness-sha256.txt
-      - name: Native lint and tests of the FFI crate
+      - name: Native lint and tests of the FFI crate and adapter
         timeout-minutes: 8
         run: |
-          env -u CARGO_TARGET_TMPDIR cargo clippy -p scupper-darwin --all-targets --locked -- -D warnings
-          env -u CARGO_TARGET_TMPDIR cargo test -p scupper-darwin --locked
+          env -u CARGO_TARGET_TMPDIR cargo clippy -p scupper-darwin -p scupper-mac --all-targets --all-features --locked -- -D warnings
+          env -u CARGO_TARGET_TMPDIR cargo test -p scupper-darwin -p scupper-mac --all-features --locked
       - name: Compile SDK ABI probe
         timeout-minutes: 2
         run: |
           cc -std=c11 -Wall -Wextra -Werror -v crates/scupper-darwin/probe/abi.c -o qual-out/abi-probe 2>&1 | tee qual-out/abi-build.log
           qual-out/abi-probe | tee qual-out/abi-sdk.json
+          cc -std=c11 -Wall -Wextra -Werror crates/scupper-darwin/probe/base-churn.c -o qual-out/base-churn
+          shasum -a 256 qual-out/base-churn | tee qual-out/base-churn-sha256.txt
       - name: Compile capability probes with full diagnostics
-        if: matrix.group != 'smoke'
+        if: matrix.group == 'probe' || matrix.group == 'probe-hijack'
         timeout-minutes: 2
         run: |
           for source in crates/scupper-mac/qualification/probes/*.c; do
@@ -321,7 +323,7 @@ jobs:
           /usr/bin/sudo /usr/bin/install -d -o root -g wheel -m 0700 /private/var/db/scupper-qual
           /usr/bin/sudo /usr/bin/install -o root -g wheel -m 0755 target/debug/scupper-mac-qual /private/var/db/scupper-qual/scupper-mac-qual
           /usr/bin/sudo /usr/bin/install -o root -g wheel -m 0755 qual-out/abi-probe /private/var/db/scupper-qual/abi-probe
-          for binary in qual-out/probe-* qual-out/wireguard-go; do
+          for binary in qual-out/probe-* qual-out/wireguard-go qual-out/base-churn; do
             if [ -f "$binary" ]; then
               /usr/bin/sudo /usr/bin/install -o root -g wheel -m 0755 "$binary" "/private/var/db/scupper-qual/$(basename "$binary")"
               /usr/bin/sudo /usr/bin/shasum -a 256 "/private/var/db/scupper-qual/$(basename "$binary")" >> qual-out/executed-capability-sha256.txt

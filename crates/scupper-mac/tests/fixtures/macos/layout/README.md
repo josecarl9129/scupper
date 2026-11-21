@@ -1,0 +1,1 @@
+Synthetic LP64 layout fixture, with opaque fields zeroed. It exercises the SDK offsets; it is not runner evidence. The base qualification cell exports redacted kernel records under fixtures/macos/<build>/ for Linux replay.

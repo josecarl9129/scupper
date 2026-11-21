@@ -54,7 +54,14 @@ int main(int argc, char **argv) {
     }
     printf("{");
     BEGIN(kinfo_proc);
-    FIELD(kinfo_proc, kp_proc); NEXT_FIELD(kinfo_proc, kp_eproc); END();
+    FIELD(kinfo_proc, kp_proc); NEXT_FIELD(kinfo_proc, kp_eproc);
+    NEXT_FIELD(kinfo_proc, kp_proc.p_pid); NEXT_FIELD(kinfo_proc, kp_proc.p_stat);
+    NEXT_FIELD(kinfo_proc, kp_proc.p_starttime);
+    NEXT_FIELD(kinfo_proc, kp_proc.p_starttime.tv_sec);
+    NEXT_FIELD(kinfo_proc, kp_proc.p_starttime.tv_usec);
+    NEXT_FIELD(kinfo_proc, kp_proc.p_comm);
+    NEXT_FIELD(kinfo_proc, kp_eproc.e_ppid); NEXT_FIELD(kinfo_proc, kp_eproc.e_pgid); END();
+    printf(",\"MAXCOMLEN\":%d", MAXCOMLEN);
     printf(","); BEGIN(proc_bsdinfo);
     FIELD(proc_bsdinfo, pbi_pid); NEXT_FIELD(proc_bsdinfo, pbi_ppid);
     NEXT_FIELD(proc_bsdinfo, pbi_pgid); NEXT_FIELD(proc_bsdinfo, pbi_comm);

@@ -79,6 +79,27 @@
       "minimum_iterations": 1,
       "budget_minutes": 1,
       "supported_assumptions": []
+    },
+    {
+      "id": "Q-BOOT",
+      "group": "base",
+      "minimum_iterations": 100000,
+      "budget_minutes": 3,
+      "supported_assumptions": []
+    },
+    {
+      "id": "Q-PROC",
+      "group": "base",
+      "minimum_iterations": 500,
+      "budget_minutes": 6,
+      "supported_assumptions": []
+    },
+    {
+      "id": "Q-CAPTURE-BASE",
+      "group": "base",
+      "minimum_iterations": 1,
+      "budget_minutes": 1,
+      "supported_assumptions": []
     }
   ]
 }

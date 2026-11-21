@@ -155,7 +155,7 @@ mod tests {
         assert!(manifest.budgets_fit());
         assert_eq!(manifest.cell_budget_minutes - manifest.overhead_minutes, 18);
         assert_eq!(MAX_FINAL_RESTORE_SECONDS, 240);
-        assert_eq!(manifest.cases.len(), 11);
+        assert_eq!(manifest.cases.len(), 14);
         assert!(
             manifest
                 .cases

@@ -6,6 +6,8 @@
 
 pub mod decode;
 pub mod engine;
+#[cfg(target_os = "macos")]
+pub mod native;
 pub mod platform;
 #[cfg(feature = "qualification")]
 pub mod qual;
