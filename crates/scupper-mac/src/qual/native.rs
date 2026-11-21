@@ -92,7 +92,10 @@ impl Options {
             return Err("probe requires a known --name".into());
         }
         if options.action == "probe"
-            && options.name.as_deref() == Some("dns-default")
+            && options
+                .name
+                .as_deref()
+                .is_some_and(|name| name.starts_with("dns-default"))
             && options.group != "probe-hijack"
         {
             return Err("dns-default requires --group probe-hijack".into());
@@ -390,7 +393,11 @@ fn preflight(out: &Path) -> Result<()> {
             "preflight already exists; use a new artifact directory for a new campaign".into(),
         );
     }
-    let snapshot = snapshot(out, "preflight", Instant::now() + Duration::from_secs(90))?;
+    let snapshot = snapshot(
+        out,
+        "preflight",
+        Instant::now() + Duration::from_secs(super::probe::RESTORE_BUDGET_SECONDS),
+    )?;
     write_json(out, "preflight.json", &snapshot)?;
     write_json(out, "writers.json", &Vec::<Writer>::new())?;
     write_json(out, "manifest.json", &Manifest::bundled()?)?;
@@ -695,6 +702,7 @@ struct Restore {
     network_mutations: Vec<String>,
     writer_stop_evidence: Vec<Evidence>,
     changed_observations: Vec<String>,
+    os_drift: Vec<String>,
     post_state: Snapshot,
     violations: Vec<String>,
 }
@@ -720,6 +728,17 @@ fn restore(out: &Path, deadline: Instant) -> Result<Restore> {
             Err(error) => violations.push(format!("{name}: stop writers: {error}")),
         }
         scopes.push((name, scope));
+    }
+    let mut journaled_keys = Vec::new();
+    for directory in scopes
+        .iter()
+        .map(|(_, scope)| scope.as_path())
+        .chain(std::iter::once(out))
+    {
+        match resources::journaled_keys(directory) {
+            Ok(keys) => journaled_keys.extend(keys),
+            Err(error) => violations.push(format!("key journal inventory: {error}")),
+        }
     }
     // Final/dead-man recovery visits all independent journals. An inventory
     // failure in one scope cannot suppress cleanup in another scope.
@@ -747,13 +766,15 @@ fn restore(out: &Path, deadline: Instant) -> Result<Restore> {
         }
     }
     let post = snapshot(out, &unique("post"), deadline)?;
-    let changed = restore_check::state_diff(&before.observations, &post.observations);
-    violations.extend(changed.iter().cloned());
+    let changed =
+        restore_check::state_changes(&before.observations, &post.observations, &journaled_keys);
+    violations.extend(changed.violations.iter().cloned());
     let result = Restore {
         already_restored: out.join("restored.json").exists(),
         network_mutations: actions,
         writer_stop_evidence: stopped,
-        changed_observations: changed,
+        changed_observations: changed.violations,
+        os_drift: changed.os_drift,
         post_state: post,
         violations,
     };
@@ -993,7 +1014,10 @@ fn boot_reads(out: &Path, result: &mut CaseResult, started: Instant) -> Result<(
 }
 
 fn restore_checked(out: &Path) -> Result<()> {
-    let result = restore(out, Instant::now() + Duration::from_secs(90))?;
+    let result = restore(
+        out,
+        Instant::now() + Duration::from_secs(super::probe::RESTORE_BUDGET_SECONDS),
+    )?;
     let prior = out.join("Q-RESTORE.json");
     let earlier_violation =
         prior.exists() && read_json::<CaseResult>(&prior)?.verdict == Verdict::ContractViolation;
@@ -1034,9 +1058,15 @@ fn run_probes(out: &Path, group: &str) -> Result<()> {
     let failures = super::probe::run_all(
         super::probe::NAMES
             .into_iter()
-            .filter(|name| (*name == "dns-default") == (group == "probe-hijack")),
+            .filter(|name| name.starts_with("dns-default") == (group == "probe-hijack")),
         |name| run_probe(out, name),
-        || probe_restore_checks(out, "final", Instant::now() + Duration::from_secs(90)),
+        || {
+            probe_restore_checks(
+                out,
+                "final",
+                Instant::now() + Duration::from_secs(super::probe::RESTORE_BUDGET_SECONDS),
+            )
+        },
     );
     write_json(out, "probe-cell-failures.json", &failures)?;
     if failures.is_empty() {
@@ -1071,7 +1101,12 @@ fn run_probe(out: &Path, name: &str) -> Result<()> {
     let save_error = save_case(out, &result).err();
     // Restore even when execution, output decoding or classification failed.
     if scope.join("preflight.json").exists() {
-        let deadline = started + Duration::from_secs(if name == "dns-default" { 60 } else { 120 });
+        let deadline = started
+            + Duration::from_secs(if name.starts_with("dns-default") {
+                60
+            } else {
+                120
+            });
         if let Err(error) = probe_restore_checks(&scope, name, deadline) {
             result.verdict = Verdict::ContractViolation;
             result.detail = format!("{}; probe restore failed: {error}", result.detail);
@@ -1126,7 +1161,11 @@ fn measure_probe(out: &Path, scope: &Path, name: &str, result: &mut CaseResult) 
         bin.to_str().ok_or("invalid probe path")?,
         &args[..count],
         None,
-        Duration::from_secs(if name == "dns-default" { 10 } else { 90 }),
+        Duration::from_secs(if name.starts_with("dns-default") {
+            10
+        } else {
+            90
+        }),
     );
     let classification = classify_probe(out, name, &evidence, result);
     result.evidence.push(evidence);

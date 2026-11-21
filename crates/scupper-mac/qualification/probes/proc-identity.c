@@ -1,4 +1,5 @@
 #include "utun.h"
+#include <strings.h> /* Darwin strcasecmp */
 /* XNU bsd/sys/proc_info_private.h; unavailable in the public SDK. */
 struct qual_unique {
   uint8_t p_uuid[16];
@@ -8,6 +9,8 @@ struct qual_unique {
 };
 _Static_assert(sizeof(struct qual_unique) == 56, "unique identity layout");
 static const char *file_uuids;
+static bool identity_matches_file;
+static bool identity_matches_r2_pin;
 static uint64_t identify(pid_t pid, const char *phase) {
   char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
   errno = 0;
@@ -36,6 +39,11 @@ static uint64_t identify(pid_t pid, const char *phase) {
       u.p_uuid[5], u.p_uuid[6], u.p_uuid[7], u.p_uuid[8], u.p_uuid[9],
       u.p_uuid[10], u.p_uuid[11], u.p_uuid[12], u.p_uuid[13], u.p_uuid[14],
       u.p_uuid[15]);
+  identity_matches_file =
+      r == (int)sizeof(u) && file_uuids && strcasestr(file_uuids, uuid);
+  identity_matches_r2_pin =
+      r == (int)sizeof(u) &&
+      !strcasecmp(uuid, "D4946FC0-C4E2-3F64-A76D-F48900B81CE7");
   event("uuid-comparison");
   fputs(",\"phase\":", stdout);
   string(phase);
@@ -114,17 +122,25 @@ int main(int argc, char **argv) {
                ? -1
                : strstr(wg_uuids.out, "UUID:") != NULL,
            1);
+  int wg_identity = -1;
   char name[IFNAMSIZ] = {0};
   int fd = utun(0, name);
   if (fd >= 0) {
     p = wireguard(argv[2], fd, name);
     if (p > 1) {
-      (void)uapi(name);
-      (void)identify(p, "wireguard-go");
+      int get = uapi(name, p);
+      uint64_t unique = identify(p, "wireguard-go");
+      event("wireguard-r2-pin-comparison");
+      printf(",\"matches_file\":%s,\"matches_r2_uuid\":%s}",
+             identity_matches_file ? "true" : "false",
+             identity_matches_r2_pin ? "true" : "false");
+      if (unique && get >= 0 && !wg_uuids.status && !wg_uuids.timeout)
+        wg_identity = identity_matches_file && identity_matches_r2_pin && get;
       kill_child(p);
     }
     close(fd);
   }
+  question("Q-PROC-WG-P-UUID", wg_identity, wg_identity < 0 ? 0 : 1);
   unlink(path);
   unlink(moved);
   unlink(hard);

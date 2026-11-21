@@ -35,9 +35,9 @@ int main(int argc, char **argv) {
     return end();
   }
   question("Q-REFS-empty", empty == ENOENT, 1);
-  for (int j = 0; j < 4; ++j) {
-    int n = (int[]){1, 2, 3, 8}[j];
-    uint64_t tokens[8];
+  for (int j = 0; j < 5; ++j) {
+    int n = (int[]){1, 2, 3, 8, 64}[j];
+    uint64_t tokens[64];
     for (int i = 0; i < n; ++i)
       tokens[i] = acquire();
     struct output text = refs();

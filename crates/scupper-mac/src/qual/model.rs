@@ -151,7 +151,7 @@ mod tests {
         let manifest = Manifest::bundled()?;
         assert!(manifest.budgets_fit());
         assert_eq!(manifest.cell_budget_minutes - manifest.overhead_minutes, 18);
-        assert_eq!(manifest.cases.len(), 10);
+        assert_eq!(manifest.cases.len(), 11);
         assert!(
             manifest
                 .cases

@@ -121,6 +121,39 @@ pub(super) fn valid_key_list(evidence: &Evidence) -> bool {
         })
 }
 
+pub(super) fn resolver_clone(text: &str) -> bool {
+    let mut netif = 3;
+    text.lines().any(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.first() == Some(&"Destination") {
+            netif = fields
+                .iter()
+                .position(|field| *field == "Netif")
+                .unwrap_or(3);
+        }
+        fields.len() > netif
+            && fields.len() >= 4
+            && fields[0] == "127.0.0.53"
+            && fields[1] == "127.0.0.1"
+            && fields[2].contains('H')
+            && fields[2].contains('W')
+            && !fields[2].contains('S')
+            && fields[netif] == "lo0"
+    })
+}
+
+fn harness_key(key: &str, journaled: &[String]) -> bool {
+    key.starts_with("State:/Network/Service/scupper-qual-")
+        || key.contains("com.scupper.")
+        || journaled.iter().any(|owned| owned == key)
+}
+
+#[derive(Debug, Default, Serialize)]
+pub(super) struct StateChanges {
+    pub violations: Vec<String>,
+    pub os_drift: Vec<String>,
+}
+
 fn normalized(name: &str, text: &str) -> Vec<String> {
     if name == "scutil-keys" {
         return key_list(text);
@@ -177,11 +210,13 @@ fn normalized(name: &str, text: &str) -> Vec<String> {
     lines
 }
 
-pub(super) fn state_diff(
+pub(super) fn state_changes(
     before: &BTreeMap<String, Evidence>,
     after: &BTreeMap<String, Evidence>,
-) -> Vec<String> {
+    journaled_keys: &[String],
+) -> StateChanges {
     let mut changes = Vec::new();
+    let mut os_drift = Vec::new();
     if !before.get("scutil-keys").is_some_and(valid_key_list)
         || !after.get("scutil-keys").is_some_and(valid_key_list)
     {
@@ -193,21 +228,108 @@ pub(super) fn state_diff(
     for name in REQUIRED.into_iter().filter(|name| *name != "pf-info") {
         match (before.get(name), after.get(name)) {
             (Some(a), Some(b)) if a.complete() && b.complete() => {
-                if normalized(name, &a.stdout) != normalized(name, &b.stdout)
-                    || a.stderr != b.stderr
-                {
+                let old = normalized(name, &a.stdout);
+                let mut new = normalized(name, &b.stdout);
+                if name == "scutil-keys" {
+                    new.retain(|key| {
+                        if !old.contains(key) && !harness_key(key, journaled_keys) {
+                            os_drift.push(key.clone());
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                }
+                if old != new || a.stderr != b.stderr {
                     changes.push(format!("{name}: post-state differs from preflight"));
                 }
             }
             _ => changes.push(format!("{name}: baseline or post-state unavailable")),
         }
     }
-    changes
+    StateChanges {
+        violations: changes,
+        os_drift,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
+
+    fn state_diff(
+        before: &BTreeMap<String, Evidence>,
+        after: &BTreeMap<String, Evidence>,
+    ) -> Vec<String> {
+        state_changes(before, after, &[]).violations
+    }
+
+    #[test]
+    fn resolver_clone_is_exact_and_remains_a_restore_difference() {
+        let line = "127.0.0.53 127.0.0.1 UHW3I lo0 3579";
+        assert!(resolver_clone(line));
+        assert!(resolver_clone(
+            "Destination Gateway Flags Refs Use Netif Expire\n127.0.0.53 127.0.0.1 UHW3I 0 3 lo0 3579\n"
+        ));
+        for changed in [
+            line.replace("127.0.0.53", "127.0.0.54"),
+            line.replace("127.0.0.1 ", "127.0.0.2 "),
+            line.replace("UHW3I", "UHSW"),
+            line.replace("lo0", "en0"),
+        ] {
+            assert!(!resolver_clone(&changed));
+        }
+        let header = "Destination Gateway Flags Netif Expire\n";
+        assert_ne!(
+            normalized("routes", header),
+            normalized("routes", &format!("{header}{line}\n"))
+        );
+    }
+
+    #[test]
+    fn lazy_os_keys_are_drift_but_removals_and_owned_additions_violate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut before = BTreeMap::from([("scutil-keys".into(), observation())]);
+        before
+            .get_mut("scutil-keys")
+            .ok_or("missing fixture keys")?
+            .stdout = "subKey [0] = State:/original\n".into();
+        let mut after = before.clone();
+        after
+            .get_mut("scutil-keys")
+            .ok_or("missing fixture keys")?
+            .stdout
+            .push_str("subKey [1] = State:/Network/NetBIOS\n");
+        let baseline = state_changes(&before, &before, &[]).violations;
+        let added = state_changes(&before, &after, &[]);
+        assert_eq!(added.violations, baseline);
+        assert_eq!(added.os_drift, ["State:/Network/NetBIOS"]);
+        for key in [
+            "State:/Network/Service/scupper-qual-dns/DNS",
+            "State:/Network/Service/com.scupper.tunnel/DNS",
+            "State:/journaled",
+        ] {
+            let mut owned = after.clone();
+            writeln!(
+                owned
+                    .get_mut("scutil-keys")
+                    .ok_or("missing fixture keys")?
+                    .stdout,
+                "subKey [2] = {key}"
+            )?;
+            assert_ne!(
+                state_changes(&before, &owned, &["State:/journaled".into()]).violations,
+                baseline
+            );
+        }
+        after
+            .get_mut("scutil-keys")
+            .ok_or("missing fixture keys")?
+            .stdout = "subKey [0] = State:/Network/NetBIOS\n".into();
+        assert_ne!(state_changes(&before, &after, &[]).violations, baseline);
+        Ok(())
+    }
 
     fn observation() -> Evidence {
         Evidence {

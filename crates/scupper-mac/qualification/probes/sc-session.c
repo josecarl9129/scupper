@@ -8,18 +8,19 @@ struct burst_result {
 };
 struct sample {
   char key[160];
+  CFStringRef cfkey;
   uint64_t killed, absent;
   bool seen, reappeared;
 };
 struct snapshot {
-  uint64_t at;
+  uint64_t at, completed;
   unsigned count;
-  char bits[51];
+  char bits[56];
 };
 struct census {
   pthread_mutex_t mutex;
-  struct sample samples[200];
-  struct snapshot polls[2048];
+  struct sample samples[220];
+  struct snapshot polls[8192];
   unsigned count, poll_count;
   uint64_t done;
   bool failed;
@@ -32,7 +33,7 @@ static void *lister(void *context) {
     CFArrayRef keys = SCDynamicStoreCopyKeyList(
         store, CFSTR("^State:/Network/Service/scupper-qual-[0-9]+/DNS$"));
     pthread_mutex_lock(&c->mutex);
-    if (!keys || c->poll_count == 2048) {
+    if (!keys || c->poll_count == 8192) {
       c->failed = true;
       pthread_mutex_unlock(&c->mutex);
       if (keys)
@@ -44,10 +45,8 @@ static void *lister(void *context) {
     poll->count = c->count;
     unsigned bits = 0;
     for (unsigned i = 0; i < c->count; ++i) {
-      CFStringRef key = cfstr(c->samples[i].key);
       bool present = CFArrayContainsValue(
-          keys, CFRangeMake(0, CFArrayGetCount(keys)), key);
-      CFRelease(key);
+          keys, CFRangeMake(0, CFArrayGetCount(keys)), c->samples[i].cfkey);
       if (present)
         bits |= 1U << (i % 4);
       if (i % 4 == 3 || i + 1 == c->count) {
@@ -63,20 +62,27 @@ static void *lister(void *context) {
       } else if (!c->samples[i].absent)
         c->samples[i].absent = millis();
     }
+    poll->completed = millis();
+    bool tail = c->done != 0;
+    /* Keep the last kill at high resolution until its first absence too. */
+    for (unsigned i = 0; i < c->count; ++i)
+      if (!c->samples[i].absent)
+        tail = false;
     bool done = c->done && start >= c->done + 10000;
     pthread_mutex_unlock(&c->mutex);
     CFRelease(keys);
     if (done)
       break;
     uint64_t elapsed = millis() - start;
-    if (elapsed < 50)
-      pause_ms((unsigned)(50 - elapsed));
+    unsigned interval = tail ? 50 : 5;
+    if (elapsed < interval)
+      pause_ms((unsigned)(interval - elapsed));
   }
   CFRelease(store);
   return NULL;
 }
 /* Markers bound observation delays, not configd request ordering. */
-static pid_t writer(const char *text, bool temporary, bool preadd,
+static pid_t writer(const char *text, const char *mode, bool preadd,
                     int *marker) {
   int ready[2];
   if (pipe(ready))
@@ -85,7 +91,7 @@ static pid_t writer(const char *text, bool temporary, bool preadd,
   char *args[] = {(char *)self_path,
                   "--writer",
                   (char *)text,
-                  temporary ? "temporary" : "plain",
+                  (char *)mode,
                   preadd ? "pre-add" : "ready",
                   NULL};
   pid_t pid = spawn_self(args, ready[1]);
@@ -101,9 +107,11 @@ static int writer_main(char **argv) {
   bool preadd = !strcmp(argv[4], "pre-add");
   if (preadd && write(3, "p", 1) != 1)
     return 2;
-  Boolean ok = !strcmp(argv[3], "temporary")
+  Boolean ok = strcmp(argv[3], "plain")
                    ? SCDynamicStoreAddTemporaryValue(s, key, CFSTR("fixture"))
                    : SCDynamicStoreSetValue(s, key, CFSTR("fixture"));
+  if (ok && !strcmp(argv[3], "updated"))
+    ok = SCDynamicStoreSetValue(s, key, CFSTR("updated-fixture"));
   if (!ok)
     return 2;
   if (!preadd && write(3, "r", 1) != 1)
@@ -145,16 +153,20 @@ int main(int argc, char **argv) {
   if (!c || pthread_mutex_init(&c->mutex, NULL))
     _exit(2);
   struct sample *samples = c->samples;
-  for (unsigned i = 0; i < 200; ++i)
+  for (unsigned i = 0; i < 220; ++i) {
     snprintf(samples[i].key, sizeof(samples[i].key),
              "State:/Network/Service/scupper-qual-%u/DNS", i);
+    samples[i].cfkey = cfstr(samples[i].key);
+  }
   pthread_t thread;
   if (pthread_create(&thread, NULL, lister, c))
     _exit(2);
-  for (unsigned i = 0; i < 200; ++i) {
+  for (unsigned i = 0; i < 220; ++i) {
     int marker;
-    bool preadd = i >= 100;
-    pid_t p = writer(samples[i].key, true, preadd, &marker);
+    bool preadd = i >= 100 && i < 200;
+    bool updated = i >= 200;
+    pid_t p = writer(samples[i].key, updated ? "updated" : "temporary", preadd,
+                     &marker);
     await_marker(marker);
     unsigned delay = arc4random_uniform(preadd ? 6 : 51);
     pause_ms(delay);
@@ -169,22 +181,30 @@ int main(int argc, char **argv) {
     event("kill");
     printf(",\"iteration\":%u,\"phase\":\"%s\",\"delay_ms\":%u,\"killed_ms\":"
            "%" PRIu64 "}",
-           i, preadd ? "pre-add" : "ready", delay, samples[i].killed);
+           i,
+           updated  ? "updated"
+           : preadd ? "pre-add"
+                    : "ready",
+           delay, samples[i].killed);
   }
   pthread_mutex_lock(&c->mutex);
   c->done = millis();
   pthread_mutex_unlock(&c->mutex);
   if (pthread_join(thread, NULL))
     _exit(2);
+  /* Compact samples retain every timestamp/presence bit without overflowing
+     the harness output bound when polling the kill window every 5 ms. */
+  event("key-polls");
+  fputs(",\"samples\":[", stdout);
   for (unsigned i = 0; i < c->poll_count; ++i) {
-    event("key-poll");
-    printf(",\"at_ms\":%" PRIu64 ",\"key_count\":%u,\"present_bits\":",
-           c->polls[i].at, c->polls[i].count);
+    printf("%s[%" PRIu64 ",%" PRIu64 ",%u,", i ? "," : "", c->polls[i].at,
+           c->polls[i].completed, c->polls[i].count);
     string(c->polls[i].bits);
-    putchar('}');
+    putchar(']');
   }
-  bool clean = true;
-  for (unsigned i = 0; i < 200; ++i) {
+  fputs("]}", stdout);
+  bool clean = true, updated_clean = true;
+  for (unsigned i = 0; i < 220; ++i) {
     event("teardown");
     printf(",\"iteration\":%u,\"killed_ms\":%" PRIu64
            ",\"first_absent_ms\":%" PRIu64
@@ -192,17 +212,24 @@ int main(int argc, char **argv) {
            i, samples[i].killed, samples[i].absent,
            samples[i].seen ? "true" : "false",
            samples[i].reappeared ? "true" : "false");
-    clean = clean && samples[i].absent &&
-            samples[i].absent - samples[i].killed <= 10000 &&
-            !samples[i].reappeared;
+    bool removed = samples[i].absent &&
+                   samples[i].absent - samples[i].killed <= 10000 &&
+                   !samples[i].reappeared;
+    if (i < 200)
+      clean = clean && removed;
+    else
+      updated_clean = updated_clean && removed;
+    CFRelease(samples[i].cfkey);
     remove_key(s, samples[i].key);
   }
   question("Q-SC-TEMPORARY-TEARDOWN", c->failed ? -1 : clean, 200);
+  question("Q-SC-UPDATED-TEMPORARY-TEARDOWN", c->failed ? -1 : updated_clean,
+           20);
   pthread_mutex_destroy(&c->mutex);
   free(c);
   const char *plain = "State:/Network/Service/scupper-qual-plain/DNS";
   int marker;
-  pid_t p = writer(plain, false, false, &marker);
+  pid_t p = writer(plain, "plain", false, &marker);
   await_marker(marker);
   kill(p, SIGKILL);
   waitpid(p, NULL, 0);

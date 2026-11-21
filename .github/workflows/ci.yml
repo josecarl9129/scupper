@@ -337,7 +337,7 @@ jobs:
         timeout-minutes: 1
         run: |
           after=1080
-          if [ '${{ matrix.group }}' = probe-hijack ]; then after=10; fi
+          # Independent recovery covers the harness and its restore captures.
           /usr/bin/sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT /private/var/db/scupper-qual/scupper-mac-qual arm --after "$after" --out /private/var/db/scupper-qual/evidence --disposable-runner
       - name: Run qualification cell
         timeout-minutes: 18

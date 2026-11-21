@@ -41,6 +41,12 @@ static void basics(const char *dir, const char *volume) {
   }
   unlink(path);
 }
+static bool detach_image(const char *mount) {
+  struct output detach = RUN_FOR(30000, "/usr/bin/hdiutil", "detach", mount);
+  if (detach.status || detach.timeout)
+    detach = RUN_FOR(30000, "/usr/bin/hdiutil", "detach", "-force", mount);
+  return !detach.status && !detach.timeout;
+}
 int main(int argc, char **argv) {
   begin(argc, argv);
   basics(qual_out, "boot-volume");
@@ -70,9 +76,10 @@ int main(int argc, char **argv) {
     }
     /* Failed attach can still leave a device; stop and let restore inspect
        hdiutil's image-path inventory rather than overwriting a live image. */
-    struct output detach = RUN("/usr/bin/hdiutil", "detach", mount);
-    if (detach.timeout)
-      _exit(2);
+    if (!detach_image(mount)) {
+      question("Q-STORE-image", -1, 0);
+      return end();
+    }
   }
   if (!attached) {
     question("Q-STORE-image", -1, 0);
@@ -107,10 +114,28 @@ int main(int argc, char **argv) {
          we);
   sync_fd(fill, "filler-fullfsync");
   /* Try one-byte writes to consume space remaining below the large write. */
-  for (unsigned i = 0; i < 16384 && millis() < until; ++i) {
-    if (write(fill, data, 1) != 1)
+  unsigned top_up = 0;
+  ssize_t top_last = 0;
+  int top_error = 0;
+  while (top_up < 16384 && millis() < until) {
+    errno = 0;
+    top_last = write(fill, data, 1);
+    top_error = errno;
+    if (top_last != 1)
       break;
+    ++top_up;
   }
+  event("fill-top-up");
+  printf(",\"bytes\":%u,\"last_write\":%zd,\"errno\":%d}", top_up, top_last,
+         top_error);
+  /* A new block at EOF, after the fill and top-up, is the full criterion.
+     APFS can retain free metadata/reserved blocks after refusing user data. */
+  errno = 0;
+  ssize_t full_write = write(fill, data, 4096);
+  int full_error = errno;
+  event("full-fresh-block");
+  printf(",\"requested\":4096,\"returned\":%zd,\"errno\":%d}", full_write,
+         full_error);
   struct statfs fs = {0};
   errno = 0;
   int sr = statfs(mount, &fs);
@@ -140,9 +165,13 @@ int main(int argc, char **argv) {
     sync_fd(ex, "exclusive-fullfsync");
     close(ex);
   }
-  question("Q-STORE-full", sr || fs.f_bfree ? -1 : 1, 1);
+  question("Q-STORE-full",
+           full_write < 0 && full_error != ENOSPC
+               ? -1
+               : full_write == -1 && full_error == ENOSPC,
+           1);
   close(fill);
   close(old);
-  (void)RUN("/usr/bin/hdiutil", "detach", mount);
+  detach_image(mount);
   return end();
 }

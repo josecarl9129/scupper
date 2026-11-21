@@ -32,11 +32,15 @@ static inline CFDictionaryRef dns_value(bool supplemental) {
   CFArrayRef servers = CFArrayCreate(NULL, server, 1, &kCFTypeArrayCallBacks),
              domains = CFArrayCreate(NULL, domain, 1, &kCFTypeArrayCallBacks);
   const void *keys[] = {kSCPropNetDNSServerAddresses,
+                        CFSTR("SupplementalMatchDomainsNoSearch"),
                         kSCPropNetDNSSupplementalMatchDomains};
-  const void *values[] = {servers, domains};
+  int no_search = 1;
+  CFNumberRef number = CFNumberCreate(NULL, kCFNumberIntType, &no_search);
+  const void *values[] = {servers, number, domains};
   CFDictionaryRef dict = CFDictionaryCreate(
-      NULL, keys, values, supplemental ? 2 : 1, &kCFTypeDictionaryKeyCallBacks,
+      NULL, keys, values, supplemental ? 3 : 2, &kCFTypeDictionaryKeyCallBacks,
       &kCFTypeDictionaryValueCallBacks);
+  CFRelease(number);
   CFRelease(servers);
   CFRelease(domains);
   if (!dict)

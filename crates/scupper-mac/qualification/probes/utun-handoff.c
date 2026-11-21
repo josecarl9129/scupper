@@ -31,7 +31,7 @@ int main(int argc, char **argv) {
   struct socket_fdinfo helper = {0}, child = {0};
   bool h = socket_info(getpid(), fd, &helper);
   pid_t pid = wireguard(argv[2], fd, name);
-  int get = pid < 0 ? -1 : uapi(name);
+  int get = pid < 0 ? -1 : uapi(name, pid);
   bool c = pid > 1 && socket_info(pid, 3, &child);
   struct proc_fdinfo list[512] = {0};
   errno = 0;
@@ -43,17 +43,8 @@ int main(int argc, char **argv) {
     printf("%s{\"fd\":%d,\"type\":%u}", i ? "," : "", list[i].proc_fd,
            list[i].proc_fdtype);
   fputs("]}", stdout);
-  event("name-file");
-  char path[PATH_MAX], value[128] = {0};
-  snprintf(path, sizeof(path), "%s/wg-name-%d", qual_out, getpid());
-  int nf = open(path, O_RDONLY);
-  ssize_t got = nf < 0 ? -1 : read(nf, value, sizeof(value) - 1);
-  int ne = errno;
-  if (nf >= 0)
-    close(nf);
-  printf(",\"read\":%zd,\"errno\":%d,\"value\":", got, ne);
-  string(value);
-  putchar('}');
+  /* Pinned upstream only writes WG_TUN_NAME_FILE from CreateTUN("utun").
+     WG_TUN_FD calls CreateTUNFromFile directly: identity uses helper name. */
   unsigned unit = (unsigned)strtoul(name + 4, NULL, 10) + 1;
   /* A different process attempts the exact occupied unit. */
   int gate[2], result_pipe[2];
@@ -110,8 +101,9 @@ int main(int argc, char **argv) {
   printf(",\"rc\":%d,\"errno\":%d,\"name\":", attempt.rc, attempt.error);
   string(attempt.name);
   putchar('}');
-  bool occupied = WIFEXITED(status) && WEXITSTATUS(status) == 0;
-  kill_child(pid);
+  bool occupied = WIFEXITED(status) && WEXITSTATUS(status) == 0 &&
+                  attempt.rc < 0 && attempt.error == EBUSY;
+  bool killed = kill_child(pid);
   bool held = if_nametoindex(name) != 0;
   close(fd);
   uint64_t until = millis() + 2000;
@@ -124,11 +116,18 @@ int main(int argc, char **argv) {
          held ? "true" : "false", gone ? "true" : "false", status);
   bool identity = h && c && helper.psi.soi_so != 0 &&
                   helper.psi.soi_so == child.psi.soi_so &&
+                  helper.psi.soi_proto.pri_kern_ctl.kcsi_unit ==
+                      child.psi.soi_proto.pri_kern_ctl.kcsi_unit &&
                   child.psi.soi_proto.pri_kern_ctl.kcsi_unit == unit &&
                   !strcmp(child.psi.soi_proto.pri_kern_ctl.kcsi_name,
                           "com.apple.net.utun_control");
-  question(
-      "Q-UTUN-HANDOFF",
-      pid < 0 || get < 0 ? -1 : identity && get && held && gone && occupied, 1);
+  event("handoff-identity");
+  printf(",\"same_socket_and_unit\":%s,\"child_killed_by_sigkill\":%s}",
+         identity ? "true" : "false", killed ? "true" : "false");
+  question("Q-UTUN-HANDOFF",
+           pid < 0 || get < 0
+               ? -1
+               : identity && get && killed && held && gone && occupied,
+           1);
   return end();
 }

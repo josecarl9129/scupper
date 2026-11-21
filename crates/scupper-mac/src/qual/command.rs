@@ -8,7 +8,8 @@ use std::{
 
 use super::{Evidence, redact};
 
-const OUTPUT_LIMIT: usize = 256 * 1024;
+// The SC kill-window census retains every 5 ms poll, including a 10 s tail.
+const OUTPUT_LIMIT: usize = 1024 * 1024;
 
 pub(super) fn unix_seconds() -> u64 {
     SystemTime::now()
@@ -209,9 +210,10 @@ mod tests {
 
     #[test]
     fn cap_is_bounded_while_child_is_fully_drained() {
+        let count = (OUTPUT_LIMIT + 1024).to_string();
         let evidence = command(
-            "/bin/sh",
-            &["-c", "head -c 300000 /dev/zero"],
+            "/usr/bin/head",
+            &["-c", &count, "/dev/zero"],
             None,
             Duration::from_secs(2),
         );

@@ -3,7 +3,9 @@ use serde_json::Value;
 
 use super::Verdict;
 
-pub(super) const NAMES: [&str; 8] = [
+pub(super) const RESTORE_BUDGET_SECONDS: u64 = 90;
+
+pub(super) const NAMES: [&str; 9] = [
     "pf-starters",
     "pf-eexist",
     "proc-identity",
@@ -12,6 +14,7 @@ pub(super) const NAMES: [&str; 8] = [
     "sc-session",
     "dns-keys",
     "dns-default",
+    "dns-default-minimal",
 ];
 
 pub(super) fn questions(value: &Value) -> Result<Vec<(String, Verdict, u32)>, &'static str> {
@@ -101,7 +104,7 @@ pub(super) fn pf_size_query(value: &Value) -> (Verdict, u32) {
         }
     }
     (
-        if count == 4 {
+        if count == 5 {
             Verdict::AssumptionHolds
         } else {
             Verdict::Inconclusive
@@ -156,7 +159,7 @@ pub(super) fn pf_layout(value: &Value) -> Verdict {
             let Some(tokens) = tokens.iter().map(Value::as_u64).collect::<Option<Vec<_>>>() else {
                 return Verdict::Inconclusive;
             };
-            if !matches!(tokens.len(), 1 | 2 | 3 | 8)
+            if !matches!(tokens.len(), 1 | 2 | 3 | 8 | 64)
                 || tokens.contains(&0)
                 || tokens
                     .iter()
@@ -197,7 +200,7 @@ pub(super) fn pf_layout(value: &Value) -> Verdict {
         }
         reads += 1;
     }
-    if reads == 28 {
+    if reads == 35 {
         Verdict::AssumptionHolds
     } else {
         Verdict::Inconclusive
@@ -220,12 +223,50 @@ mod tests {
             assert!(case.is_some_and(|case| case.budget_minutes <= 2
                 && case.supported_assumptions.is_empty()
                 && case.group
-                    == if name == "dns-default" {
+                    == if name.starts_with("dns-default") {
                         "probe-hijack"
                     } else {
                         "probe"
                     }));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn hijack_deadman_exceeds_cases_and_final_restore_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let manifest = super::super::Manifest::bundled()?;
+        let case_seconds: u64 = manifest
+            .cases
+            .iter()
+            .filter(|case| case.group == "probe-hijack")
+            .map(|case| u64::from(case.budget_minutes) * 60)
+            .sum();
+        let workflow = include_str!("../../../../.github/workflows/ci.yml");
+        let arm = workflow
+            .split("- name: Arm independent launchd restore")
+            .nth(1)
+            .ok_or("missing arm step")?
+            .split("- name: Run qualification cell")
+            .next()
+            .ok_or("missing run step boundary")?;
+        let deadlines: Vec<u64> = arm
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix("after=")
+                    .and_then(|value| value.parse().ok())
+            })
+            .collect();
+        assert_eq!(
+            deadlines.len(),
+            1,
+            "one shared arm deadline; no hijack override"
+        );
+        assert!(deadlines[0] >= 120);
+        assert!(deadlines[0] > case_seconds + RESTORE_BUDGET_SECONDS);
+        assert!(arm.contains("--after \"$after\""));
+        assert!(!arm.contains("then after="));
         Ok(())
     }
 
@@ -248,7 +289,7 @@ mod tests {
         let mut events = vec![
             json!({"event":"layout", "token_size":84, "request_size":16, "ioctl":0xc010_4405_u64}),
         ];
-        for n in [1_u64, 2, 3, 8] {
+        for n in [1_u64, 2, 3, 8, 64] {
             for c in [0, 83, 84, 85, 167, 168, n * 84, n * 84 + 84] {
                 events.push(
                     json!({"event":"series", "acquisition_order":(1..=n).collect::<Vec<_>>()}),
@@ -259,8 +300,8 @@ mod tests {
         }
         let good = json!({"events":events});
         assert_eq!(pf_layout(&good), Verdict::AssumptionHolds);
-        assert_eq!(pf_size_query(&good), (Verdict::AssumptionHolds, 4));
-        assert_eq!(pf_read_count(&good), 28);
+        assert_eq!(pf_size_query(&good), (Verdict::AssumptionHolds, 5));
+        assert_eq!(pf_read_count(&good), 35);
         let mut bad = good.clone();
         bad["events"][8]["tokens"][0]["token"] = json!(999);
         assert_eq!(pf_layout(&bad), Verdict::AssumptionRefuted);
@@ -271,7 +312,7 @@ mod tests {
         let mut short = good;
         short["events"].as_array_mut().map(Vec::pop);
         assert_eq!(pf_layout(&short), Verdict::Inconclusive);
-        assert_eq!(pf_read_count(&short), 27);
+        assert_eq!(pf_read_count(&short), 34);
     }
     #[test]
     fn wrong_command_and_readonly_denial_are_harness_failures() {

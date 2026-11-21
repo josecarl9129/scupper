@@ -158,7 +158,8 @@ static inline void drain(int fd, char *dst, size_t *used) {
     dst[*used] = 0;
   }
 }
-static inline struct output run(char *const args[], const char *kind) {
+static inline struct output run_for(char *const args[], const char *kind,
+                                    unsigned budget_ms) {
   struct output o = {.status = -1};
   int a[2], b[2], gate[2];
   if (pipe(a) || pipe(b) || pipe(gate))
@@ -192,7 +193,7 @@ static inline struct output run(char *const args[], const char *kind) {
   o.pid = pid;
   if (fcntl(a[0], F_SETFL, O_NONBLOCK) || fcntl(b[0], F_SETFL, O_NONBLOCK))
     _exit(2);
-  uint64_t deadline = millis() + 8000;
+  uint64_t deadline = millis() + budget_ms;
   size_t na = 0, nb = 0;
   int status = 0;
   for (;;) {
@@ -236,6 +237,11 @@ static inline struct output run(char *const args[], const char *kind) {
   putchar('}');
   return o;
 }
+static inline struct output run(char *const args[], const char *kind) {
+  return run_for(args, kind, 8000);
+}
+#define RUN_FOR(ms, ...)                                                       \
+  run_for((char *const[]){__VA_ARGS__, NULL}, "child", ms)
 #define RUN(...) run((char *const[]){__VA_ARGS__, NULL}, "child")
 static inline struct output pf(const char *arg) {
   return RUN("/sbin/pfctl", (char *)arg);

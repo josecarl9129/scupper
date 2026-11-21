@@ -24,6 +24,14 @@ fn entries(out: &Path) -> Result<Vec<Entry>> {
     Ok(journal::committed(&fs::read_to_string(path)?)?)
 }
 
+pub(super) fn journaled_keys(out: &Path) -> Result<Vec<String>> {
+    Ok(entries(out)?
+        .into_iter()
+        .filter(|e| e.kind == "key")
+        .map(|e| e.path)
+        .collect())
+}
+
 pub(super) fn writers(out: &Path, probes_only: bool) -> Result<Vec<Writer>> {
     Ok(entries(out)?
         .into_iter()
@@ -214,6 +222,7 @@ pub(super) fn undo(
         }
     }
     undo_keys(out, &entries, deadline, &mut actions, &mut failures)?;
+    undo_resolver_clone(out, before, &entries, deadline, &mut actions, &mut failures)?;
     // Holder processes were killed by exact pid/start before any cleanup.
     // Images are matched by their recorded path, never a guessed disk number.
     let paths: Vec<_> = entries
@@ -224,14 +233,7 @@ pub(super) fn undo(
     match attached_devices(out, &paths, deadline) {
         Ok(devices) => {
             for device in devices {
-                action(
-                    out,
-                    "/usr/bin/hdiutil",
-                    &["detach", &device],
-                    deadline,
-                    &mut actions,
-                    &mut failures,
-                )?;
+                detach_device(out, &device, deadline, &mut actions, &mut failures)?;
             }
         }
         Err(error) => failures.push(error.to_string()),
@@ -267,6 +269,83 @@ pub(super) fn undo(
         }
     }
     Ok((actions, failures))
+}
+
+fn detach_device(
+    out: &Path,
+    device: &str,
+    deadline: Instant,
+    actions: &mut Vec<String>,
+    failures: &mut Vec<String>,
+) -> Result<()> {
+    for force in [false, true] {
+        let args = if force {
+            vec!["detach", "-force", device]
+        } else {
+            vec!["detach", device]
+        };
+        let evidence = command(
+            "/usr/bin/hdiutil",
+            &args,
+            None,
+            Duration::from_secs(30).min(deadline.saturating_duration_since(Instant::now())),
+        );
+        actions.push(format!("/usr/bin/hdiutil {}", args.join(" ")));
+        write_json(out, &format!("{}.json", unique("undo-image")), &evidence)?;
+        if evidence.complete() {
+            return Ok(());
+        }
+    }
+    failures.push(format!(
+        "fixture image detach and forced retry failed: {device}"
+    ));
+    Ok(())
+}
+
+fn undo_resolver_clone(
+    out: &Path,
+    before: &Snapshot,
+    entries: &[Entry],
+    deadline: Instant,
+    actions: &mut Vec<String>,
+    failures: &mut Vec<String>,
+) -> Result<()> {
+    if entries
+        .iter()
+        .any(|e| e.kind == "cloned-route" && e.path == "127.0.0.53")
+        && !before
+            .observations
+            .get("routes")
+            .is_some_and(|e| restore_check::resolver_clone(&e.stdout))
+    {
+        let routes = invoke_before("/usr/sbin/netstat", &["-rn", "-f", "inet"], deadline);
+        write_json(
+            out,
+            &format!("{}.json", unique("resolver-clone-inventory")),
+            &routes,
+        )?;
+        if !routes.complete() {
+            failures.push("cannot inventory journaled resolver clone".into());
+        } else if restore_check::resolver_clone(&routes.stdout) {
+            action(
+                out,
+                "/sbin/route",
+                &[
+                    "-n",
+                    "delete",
+                    "-host",
+                    "127.0.0.53",
+                    "127.0.0.1",
+                    "-ifscope",
+                    "lo0",
+                ],
+                deadline,
+                actions,
+                failures,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn undo_tokens(

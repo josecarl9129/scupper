@@ -8,7 +8,7 @@ static const char *self_path;
 struct lookup_result {
   int rc, error;
 };
-static unsigned resolve_test(int udp, unsigned phase) {
+static int resolve_test(int udp, unsigned phase) {
   char *args[] = {(char *)self_path, "--resolve", NULL};
   int reply[2];
   if (pipe(reply))
@@ -76,7 +76,7 @@ static unsigned resolve_test(int udp, unsigned phase) {
          "errno\":%d}",
          phase, queries, status, reaped ? "true" : "false", result.rc,
          result.error);
-  return queries;
+  return queries ? 1 : result.rc == INT_MIN ? -1 : 0;
 }
 static int resolver_one(const char *text) {
   const char *start = strstr(text, "resolver #1\n");
@@ -100,7 +100,109 @@ static bool temporary_key(SCDynamicStoreRef s, const char *text,
   CFRelease(key);
   return ok;
 }
+static const char *dns_key = "State:/Network/Service/scupper-qual-dns/DNS";
+static const char *ipv4_key = "State:/Network/Service/scupper-qual-dns/IPv4";
+static volatile sig_atomic_t undo_fd = -1;
+/* Only async-signal-safe operations in the handler. The gated undo sentinel
+   has its own SC session and removes both keys on alarm or unexpected EOF. */
+static void hijack_alarm(int signal_number) {
+  (void)signal_number;
+  if (undo_fd >= 0)
+    (void)write((int)undo_fd, "u", 1);
+  _exit(124); /* also tears down the temporary owning SC session and utun */
+}
+static int undo_main(const char *out) {
+  await_gate();
+  alarm(12);
+  struct pollfd p = {.fd = 3, .events = POLLIN};
+  char command = 0;
+  int ready = poll(&p, 1, 8500);
+  if (ready > 0 && read(3, &command, 1) == 1 && command == 'd')
+    return 0;
+  SCDynamicStoreRef s = session();
+  CFStringRef dns = cfstr(dns_key), ip = cfstr(ipv4_key);
+  Boolean ip_removed = SCDynamicStoreRemoveValue(s, ip);
+  int ip_error = SCError();
+  Boolean dns_removed = SCDynamicStoreRemoveValue(s, dns);
+  int dns_error = SCError();
+  char path[PATH_MAX];
+  snprintf(path, sizeof(path), "%s/dns-alarm-undo.json", out);
+  int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  if (fd >= 0) {
+    dprintf(fd,
+            "{\"ipv4_removed\":%s,\"ipv4_sc_error\":%d,\"dns_removed\":%s,"
+            "\"dns_sc_error\":%d}\n",
+            ip_removed ? "true" : "false", ip_error,
+            dns_removed ? "true" : "false", dns_error);
+    fsync(fd);
+    close(fd);
+  }
+  CFRelease(dns);
+  CFRelease(ip);
+  CFRelease(s);
+  return 0;
+}
+static void network_phase(SCDynamicStoreRef s, unsigned phase) {
+  event("phase-network");
+  printf(",\"phase\":%u,\"key\":\"State:/Network/Global/IPv4\"", phase);
+  CFPropertyListRef global =
+      SCDynamicStoreCopyValue(s, CFSTR("State:/Network/Global/IPv4"));
+  int error = global ? 0 : SCError();
+  printf(",\"present\":%s,\"sc_error\":%d", global ? "true" : "false", error);
+  if (global) {
+    value_json(global);
+    CFRelease(global);
+  }
+  putchar('}');
+  (void)RUN("/usr/sbin/netstat", "-rn");
+  (void)RUN("/usr/sbin/scutil", "--nwi");
+}
+static void measure_phase(SCDynamicStoreRef s, int udp, unsigned phase,
+                          bool setup_ok, const char *default_question,
+                          const char *effect_question) {
+  pause_ms(200);
+  network_phase(s, phase);
+  struct output dns = RUN("/usr/sbin/scutil", "--dns");
+  int effect = resolve_test(udp, phase);
+  question(effect_question, setup_ok ? effect : -1, 1);
+  question(default_question,
+           !setup_ok || dns.status || dns.timeout ? -1 : resolver_one(dns.out),
+           1);
+}
+static CFDictionaryRef ipv4_value(const char *name, bool router,
+                                  bool override) {
+  CFStringRef iface = cfstr(name);
+  const void *address[] = {CFSTR("198.51.100.1")},
+             *mask[] = {CFSTR("255.255.255.255")};
+  CFArrayRef addresses =
+                 CFArrayCreate(NULL, address, 1, &kCFTypeArrayCallBacks),
+             masks = CFArrayCreate(NULL, mask, 1, &kCFTypeArrayCallBacks);
+  int one = 1;
+  CFNumberRef number = CFNumberCreate(NULL, kCFNumberIntType, &one);
+  const void *keys[] = {kSCPropInterfaceName, kSCPropNetIPv4Addresses,
+                        kSCPropNetIPv4SubnetMasks, NULL, NULL};
+  const void *values[] = {iface, addresses, masks, NULL, NULL};
+  CFIndex count = 3;
+  if (router) {
+    keys[count] = kSCPropNetIPv4Router;
+    values[count++] = CFSTR("198.51.100.2");
+  }
+  if (override) {
+    keys[count] = CFSTR("OverridePrimary");
+    values[count++] = number;
+  }
+  CFDictionaryRef dict = CFDictionaryCreate(NULL, keys, values, count,
+                                            &kCFTypeDictionaryKeyCallBacks,
+                                            &kCFTypeDictionaryValueCallBacks);
+  CFRelease(iface);
+  CFRelease(addresses);
+  CFRelease(masks);
+  CFRelease(number);
+  return dict;
+}
 int main(int argc, char **argv) {
+  if (argc == 3 && !strcmp(argv[1], "--dns-undo-child"))
+    return undo_main(argv[2]);
   if (argc == 2 && !strcmp(argv[1], "--resolve")) {
     await_gate();
     alarm(2);
@@ -117,10 +219,7 @@ int main(int argc, char **argv) {
   }
   begin(argc, argv);
   self_path = argv[0];
-  alarm(9); /* whole hijack, including optional utun phase, <10 s */
   SCDynamicStoreRef s = session();
-  const char *dns = "State:/Network/Service/scupper-qual-dns/DNS",
-             *ipv4 = "State:/Network/Service/scupper-qual-dns/IPv4";
   int udp = socket(AF_INET, SOCK_DGRAM, 0);
   if (udp < 0)
     _exit(2);
@@ -145,72 +244,88 @@ int main(int argc, char **argv) {
     CFRelease(s);
     return end();
   }
+  network_phase(s, 0);
   (void)RUN("/usr/sbin/scutil", "--dns");
+  int undo[2];
+  high_pipe(undo);
+  char *undo_args[] = {(char *)self_path, "--dns-undo-child", (char *)qual_out,
+                       NULL};
+  pid_t undo_pid = spawn_self(undo_args, undo[0]);
+  close(undo[0]);
+  undo_fd = undo[1];
+  struct sigaction action = {0};
+  action.sa_handler = hijack_alarm;
+  sigemptyset(&action.sa_mask);
+  if (sigaction(SIGALRM, &action, NULL))
+    _exit(2);
+  alarm(
+      9); /* bound the active hijack; independent recovery covers the harness */
   CFDictionaryRef dict = dns_value(false);
-  bool ok = temporary_key(s, dns, dict);
+  bool dns_ok = temporary_key(s, dns_key, dict);
   CFRelease(dict);
-  pause_ms(200);
-  struct output only = RUN("/usr/sbin/scutil", "--dns");
-  unsigned queries = resolve_test(udp, 1);
-  question("Q-DNS-KEY-ALONE-EFFECT", queries ? 1 : -1, 1);
-  int one = resolver_one(only.out);
-  question("Q-DNS-KEY-ALONE-DEFAULT",
-           !ok || only.status || only.timeout ? -1 : one, 1);
-  int override = 1;
-  CFNumberRef number = CFNumberCreate(NULL, kCFNumberIntType, &override);
-  const void *override_keys[] = {CFSTR("OverridePrimary")},
-             *override_values[] = {number};
-  dict = CFDictionaryCreate(NULL, override_keys, override_values, 1,
-                            &kCFTypeDictionaryKeyCallBacks,
-                            &kCFTypeDictionaryValueCallBacks);
-  bool base_ok = temporary_key(s, ipv4, dict);
+#ifndef QUAL_DNS_MINIMAL
+  measure_phase(s, udp, 1, dns_ok, "Q-DNS-KEY-ALONE-DEFAULT",
+                "Q-DNS-KEY-ALONE-EFFECT");
+  int one = 1;
+  CFNumberRef number = CFNumberCreate(NULL, kCFNumberIntType, &one);
+  const void *keys[] = {CFSTR("OverridePrimary")}, *values[] = {number};
+  dict =
+      CFDictionaryCreate(NULL, keys, values, 1, &kCFTypeDictionaryKeyCallBacks,
+                         &kCFTypeDictionaryValueCallBacks);
+  bool base_ok = temporary_key(s, ipv4_key, dict);
   CFRelease(dict);
-  pause_ms(200);
-  struct output base = RUN("/usr/sbin/scutil", "--dns");
-  int two = resolver_one(base.out);
-  queries = resolve_test(udp, 2);
-  question("Q-DNS-IPV4-OVERRIDE-DEFAULT",
-           !base_ok || base.status || base.timeout ? -1 : two, 1);
-  question("Q-DNS-IPV4-OVERRIDE-EFFECT", queries ? 1 : -1, 1);
+  CFRelease(number);
+  measure_phase(s, udp, 2, dns_ok && base_ok, "Q-DNS-IPV4-OVERRIDE-DEFAULT",
+                "Q-DNS-IPV4-OVERRIDE-EFFECT");
+#endif
   char name[IFNAMSIZ] = {0};
-  int fd = two == 1 ? -1 : utun(0, name);
+  int fd = utun(0, name);
   if (fd >= 0) {
-    CFStringRef iface = cfstr(name);
-    const void *address[] = {CFSTR("198.51.100.1")},
-               *mask[] = {CFSTR("255.255.255.255")};
-    CFArrayRef addresses =
-                   CFArrayCreate(NULL, address, 1, &kCFTypeArrayCallBacks),
-               masks = CFArrayCreate(NULL, mask, 1, &kCFTypeArrayCallBacks);
-    const void *keys[] = {CFSTR("OverridePrimary"), kSCPropInterfaceName,
-                          kSCPropNetIPv4Addresses, kSCPropNetIPv4SubnetMasks,
-                          kSCPropNetIPv4Router};
-    const void *values[] = {number, iface, addresses, masks,
-                            CFSTR("198.51.100.2")};
-    dict = CFDictionaryCreate(NULL, keys, values, 5,
-                              &kCFTypeDictionaryKeyCallBacks,
-                              &kCFTypeDictionaryValueCallBacks);
     struct output setup =
         RUN("/sbin/ifconfig", name, "inet", "198.51.100.1", "198.51.100.2",
             "netmask", "255.255.255.255", "up");
-    bool ip_ok =
-        base_ok && !setup.status && !setup.timeout && set_key(s, ipv4, dict);
+    bool configured = dns_ok && !setup.status && !setup.timeout;
+#ifdef QUAL_DNS_MINIMAL
+    /* Separate process/alarm budget for the two minimal dictionaries. Both
+       replace the whole value so neither inherits fields from the prior phase.
+     */
+    dict = ipv4_value(name, false, true);
+    bool no_router = temporary_key(s, ipv4_key, dict);
     CFRelease(dict);
-    CFRelease(iface);
-    CFRelease(addresses);
-    CFRelease(masks);
-    pause_ms(200);
-    struct output both = RUN("/usr/sbin/scutil", "--dns");
-    queries = resolve_test(udp, 3);
-    question("Q-DNS-IPV4-UTUN-EFFECT", queries ? 1 : -1, 1);
-    int three = resolver_one(both.out);
-    question("Q-DNS-IPV4-UTUN-DEFAULT",
-             !ip_ok || both.status || both.timeout ? -1 : three, 1);
-    close(fd);
-  } else if (two != 1)
+    measure_phase(s, udp, 4, configured && no_router,
+                  "Q-DNS-IPV4-NO-ROUTER-DEFAULT",
+                  "Q-DNS-IPV4-NO-ROUTER-EFFECT");
+    dict = ipv4_value(name, true, false);
+    bool no_override = set_key(s, ipv4_key, dict);
+    CFRelease(dict);
+    measure_phase(s, udp, 5, configured && no_override,
+                  "Q-DNS-IPV4-NO-OVERRIDE-DEFAULT",
+                  "Q-DNS-IPV4-NO-OVERRIDE-EFFECT");
+#else
+    dict = ipv4_value(name, true, true);
+    bool full = base_ok && set_key(s, ipv4_key, dict);
+    CFRelease(dict);
+    measure_phase(s, udp, 3, configured && full, "Q-DNS-IPV4-UTUN-DEFAULT",
+                  "Q-DNS-IPV4-UTUN-EFFECT");
+#endif
+  } else {
+#ifdef QUAL_DNS_MINIMAL
+    question("Q-DNS-IPV4-NO-ROUTER-DEFAULT", -1, 0);
+    question("Q-DNS-IPV4-NO-OVERRIDE-DEFAULT", -1, 0);
+#else
     question("Q-DNS-IPV4-UTUN-DEFAULT", -1, 0);
-  CFRelease(number);
-  remove_key(s, ipv4);
-  remove_key(s, dns);
+#endif
+  }
+  remove_key(s, ipv4_key);
+  remove_key(s, dns_key);
+  if (fd >= 0)
+    close(fd);
+  alarm(0);
+  if (write((int)undo_fd, "d", 1) != 1)
+    _exit(2);
+  close((int)undo_fd);
+  undo_fd = -1;
+  waitpid(undo_pid, NULL, 0);
   close(udp);
   CFRelease(s);
   return end();

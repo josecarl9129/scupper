@@ -5,6 +5,7 @@ int main(int argc, char **argv) {
   const char *key = "State:/Network/Service/scupper-qual-dns/DNS";
   struct output before = RUN("/usr/sbin/scutil", "--dns");
   CFDictionaryRef value = dns_value(true);
+  resource("cloned-route", "127.0.0.53");
   bool ok = set_key(s, key, value);
   CFRelease(value);
   pause_ms(250);

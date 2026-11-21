@@ -54,5 +54,36 @@ int main(int argc, char **argv) {
                         anonymous == 1 && cleared == 0),
            1);
   (void)pf("-d");
+  /* This deliberately exercises stale numeric release inside the disposable,
+     all-harness token set, including address-derived value reuse. */
+  uint64_t stale = acquire();
+  bool released = release(stale);
+  uint64_t holder = acquire();
+  event("stale-release-before");
+  printf(",\"stale\":%" PRIu64 ",\"holder\":%" PRIu64
+         ",\"value_reissued\":%s,\"initial_release_ok\":%s}",
+         stale, holder, stale == holder ? "true" : "false",
+         released ? "true" : "false");
+  int live = pf_open();
+  if (live >= 0)
+    (void)token_read(live, 84 * 128, "stale-release-inventory-before");
+  (void)refs();
+  int was_enabled = enabled();
+  bool stale_success = release(stale); /* command event retains exact text */
+  int now_enabled = enabled();
+  if (live >= 0) {
+    (void)token_read(live, 84 * 128, "stale-release-inventory-after");
+    close(live);
+  }
+  (void)refs();
+  event("stale-release-effect");
+  printf(",\"stale_release_ok\":%s,\"enabled_before\":%d,\"enabled_after\":%d,"
+         "\"released_reissued_holder\":%s}",
+         stale_success ? "true" : "false", was_enabled, now_enabled,
+         stale == holder && stale_success && now_enabled == 0 ? "true"
+                                                              : "false");
+  if (!(stale == holder && stale_success))
+    (void)release(holder);
+  (void)pf("-d");
   return end();
 }

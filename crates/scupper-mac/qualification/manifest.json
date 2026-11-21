@@ -72,6 +72,13 @@
       "minimum_iterations": 1,
       "budget_minutes": 1,
       "supported_assumptions": []
+    },
+    {
+      "id": "Q-PROBE-DNS-DEFAULT-MINIMAL",
+      "group": "probe-hijack",
+      "minimum_iterations": 1,
+      "budget_minutes": 1,
+      "supported_assumptions": []
     }
   ]
 }
