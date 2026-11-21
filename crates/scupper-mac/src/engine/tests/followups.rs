@@ -14,7 +14,7 @@ fn refused(
 
 #[test]
 fn instance_lock_is_first_and_socket_creation_requires_it() {
-    let mut p = fixture(&Snapshot::initial(Some(501)));
+    let mut p = fixture(&Snapshot::initial(Some(501), None));
     assert!(p.create_control_socket().is_err());
     p.calls.clear();
     let e = Engine::start(p).unwrap();
@@ -105,7 +105,7 @@ fn instance_lock_survives_exit0_until_process_teardown() {
 #[test]
 fn ownership_failure_before_recovery_or_pair_repair_never_writes() {
     for recovery in [false, true] {
-        let mut p = fixture(&Snapshot::initial(Some(501)));
+        let mut p = fixture(&Snapshot::initial(Some(501), None));
         p.mutate(Mutation::MissingCopy(Copy::B));
         if recovery {
             p.mutate(Mutation::CopyRot(Copy::A));
@@ -678,7 +678,7 @@ fn generated_queued_joins_full_window_cancel_without_losing_admitted_ids() {
 
 #[test]
 fn old_eight_join_snapshot_fallback_sacrifices_only_oldest_replay_for_leave() {
-    let mut snapshot = Snapshot::initial(Some(501));
+    let mut snapshot = Snapshot::initial(Some(501), None);
     snapshot.requests = (1..=8)
         .map(|id| RequestRecord {
             id,
@@ -796,7 +796,7 @@ fn generated_sixty_second_persist_intent_supersession_and_storage_heal() {
 #[test]
 fn deferred_ownership_failure_never_repairs_or_commits_recovery() {
     for recovery in [false, true] {
-        let mut p = fixture(&Snapshot::initial(Some(501)));
+        let mut p = fixture(&Snapshot::initial(Some(501), None));
         p.mutate(Mutation::MissingCopy(Copy::B));
         if recovery {
             p.mutate(Mutation::CopyRot(Copy::A));
@@ -986,7 +986,7 @@ fn lockless_error_intent_product_is_read_only_and_reloads_within_one_second() {
         Fault::LockInterrupted,
     ] {
         for intent in 0..10 {
-            let mut snapshot = Snapshot::initial(Some(501));
+            let mut snapshot = Snapshot::initial(Some(501), None);
             snapshot.machine.join_intended = intent == 0 || intent == 8;
             snapshot.machine.hold = intent == 6;
             snapshot.internal_error = (intent == 7).then_some(snapshot::InternalError::Other);
@@ -997,7 +997,7 @@ fn lockless_error_intent_product_is_read_only_and_reloads_within_one_second() {
                 // Preserve a valid checksum so this tests that uncertain intent,
                 // rather than physical corruption, still requests containment.
                 use sha2::{Digest, Sha256};
-                let mut p = fixture(&Snapshot::initial(Some(501)));
+                let mut p = fixture(&Snapshot::initial(Some(501), None));
                 let body = serde_json::to_vec(&snapshot).unwrap();
                 let mut bytes = Box::new([0; snapshot::COPY_BYTES]);
                 bytes[..8].copy_from_slice(&snapshot::MAGIC);
@@ -1084,7 +1084,7 @@ fn lockless_error_intent_product_is_read_only_and_reloads_within_one_second() {
 
 #[test]
 fn lockless_retries_structural_errors_at_bounded_cadence_then_starts_without_disabling_pf() {
-    let mut state = Snapshot::initial(Some(501));
+    let mut state = Snapshot::initial(Some(501), None);
     state.machine.join_intended = true;
     for failures in [1, 2, 5] {
         let mut p = if failures == 5 {
@@ -1143,7 +1143,7 @@ fn lockless_retries_structural_errors_at_bounded_cadence_then_starts_without_dis
 
 #[test]
 fn lockless_handoff_reaps_delayed_load_before_normal_policy_and_no_later_overwrite() {
-    let mut snapshot = Snapshot::initial(Some(501));
+    let mut snapshot = Snapshot::initial(Some(501), None);
     snapshot.machine.join_intended = true;
     let mut p = fixture(&snapshot);
     p.inject(Call::AcquireInstanceLock, 1, Fault::ReadFail);
@@ -1174,7 +1174,7 @@ fn lockless_handoff_reaps_delayed_load_before_normal_policy_and_no_later_overwri
 fn stuck_deferred_ownership_product_decides_with_and_without_join_intent() {
     for join in [false, true] {
         for pass in [false, true] {
-            let mut snapshot = Snapshot::initial(Some(501));
+            let mut snapshot = Snapshot::initial(Some(501), None);
             snapshot.machine.join_intended = join;
             let mut p = fixture(&snapshot);
             p.acquire_instance_lock().unwrap();
@@ -1532,7 +1532,7 @@ fn held_two_slot_shapes_block_without_reference_allocation() {
 
 #[test]
 fn lockless_checks_only_pfctl_and_preserves_flush_backoff_with_persistent_failure() {
-    let mut state = Snapshot::initial(Some(501));
+    let mut state = Snapshot::initial(Some(501), None);
     state.machine.join_intended = true;
     let mut p = fixture(&state);
     p.inject_persistent(Call::AcquireInstanceLock, Fault::ReadFail);
@@ -1572,7 +1572,7 @@ fn lockless_checks_only_pfctl_and_preserves_flush_backoff_with_persistent_failur
 
 #[test]
 fn lockless_unreadable_intent_shares_one_second_budget_before_first_lockdown() {
-    let mut p = fixture(&Snapshot::initial(Some(501)));
+    let mut p = fixture(&Snapshot::initial(Some(501), None));
     p.inject_persistent(Call::AcquireInstanceLock, Fault::ReadFail);
     for copy in [Copy::A, Copy::B] {
         p.inject_persistent(Call::Read(copy), Fault::WriteHang);
@@ -1591,7 +1591,7 @@ fn lockless_unreadable_intent_shares_one_second_budget_before_first_lockdown() {
 #[test]
 fn contention_intent_product_exits_before_any_read_or_effect() {
     for intent in 0..4 {
-        let mut state = Snapshot::initial(Some(501));
+        let mut state = Snapshot::initial(Some(501), None);
         state.machine.join_intended = intent == 0;
         let mut owner = fixture(&state);
         if intent == 2 {
@@ -1613,7 +1613,7 @@ fn contention_intent_product_exits_before_any_read_or_effect() {
 
 #[test]
 fn lockless_handoff_to_left_cleans_its_fallback_policy_under_the_normal_lock() {
-    let mut p = fixture(&Snapshot::initial(Some(501)));
+    let mut p = fixture(&Snapshot::initial(Some(501), None));
     p.inject(Call::AcquireInstanceLock, 1, Fault::ReadFail);
     p.inject(Call::Read(Copy::A), 1, Fault::ReadFail);
     let mut e = Engine::start(p).unwrap();
@@ -1861,7 +1861,7 @@ fn lockless_handoff_preserves_durable_leaving_cleanup_and_reference_release() {
 
 #[test]
 fn lockless_handoff_kills_hung_load_after_deadline_and_maintains_lockdown() {
-    let mut state = Snapshot::initial(Some(501));
+    let mut state = Snapshot::initial(Some(501), None);
     state.machine.join_intended = true;
     let mut p = fixture(&state);
     p.inject(Call::AcquireInstanceLock, 1, Fault::ReadFail);
@@ -1949,7 +1949,7 @@ fn constructor_stuck_healthy_storage_reserves_reference_after_d3_containment() {
 
 #[test]
 fn lockless_contention_drains_and_retry_eintr_is_bounded() {
-    let mut snapshot = Snapshot::initial(Some(501));
+    let mut snapshot = Snapshot::initial(Some(501), None);
     snapshot.machine.join_intended = true;
     let mut p = fixture(&snapshot);
     p.inject(Call::AcquireInstanceLock, 1, Fault::ReadFail);
@@ -1998,7 +1998,7 @@ fn lockless_contention_drains_and_retry_eintr_is_bounded() {
 
 #[test]
 fn enabled_stateless_emergency_skips_enable_and_failed_enable_still_flushes() {
-    let mut snapshot = Snapshot::initial(Some(501));
+    let mut snapshot = Snapshot::initial(Some(501), None);
     snapshot.machine.join_intended = true;
     let mut p = fixture(&snapshot);
     p.inject_persistent(Call::AcquireInstanceLock, Fault::ReadFail);
@@ -2085,7 +2085,7 @@ fn locked_intent_probe_contains_before_thirty_second_storage_stall() {
 
 #[test]
 fn locked_slow_left_probe_removes_containment_after_full_start() {
-    let mut p = fixture(&Snapshot::initial(Some(501)));
+    let mut p = fixture(&Snapshot::initial(Some(501), None));
     // One abandoned probe occupies a worker. The remaining worker completes
     // the full read across slices, returning two equal valid Left copies.
     p.inject(Call::Read(Copy::A), 1, Fault::WriteHang);
@@ -2105,7 +2105,7 @@ fn locked_slow_left_probe_removes_containment_after_full_start() {
 
 #[test]
 fn locked_equal_left_probe_never_runs_containment() {
-    let mut e = Engine::start(fixture(&Snapshot::initial(Some(501)))).unwrap();
+    let mut e = Engine::start(fixture(&Snapshot::initial(Some(501), None))).unwrap();
     drive(&mut e, 100);
     assert!(!e.platform.enabled);
     for call in [
@@ -2120,7 +2120,7 @@ fn locked_equal_left_probe_never_runs_containment() {
 
 #[test]
 fn lockless_persistent_error_kills_and_reaps_hung_own_tool_then_maintains() {
-    let mut state = Snapshot::initial(Some(501));
+    let mut state = Snapshot::initial(Some(501), None);
     state.machine.join_intended = true;
     let mut p = fixture(&state);
     p.inject_persistent(Call::AcquireInstanceLock, Fault::ReadFail);
@@ -2295,7 +2295,7 @@ fn invariant_refusal_status_acknowledges_prior_containment() {
 
 #[test]
 fn locked_probe_left_cleanup_crash_preserves_error_until_explicit_leave() {
-    let mut state = Snapshot::initial(Some(501));
+    let mut state = Snapshot::initial(Some(501), None);
     state.internal_error = Some(snapshot::InternalError::Other);
     let e = Engine::start(fixture(&state)).unwrap();
     assert!(e.containment_cleanup_only);
@@ -2405,7 +2405,7 @@ fn held_emergency_unkillable_own_tool_repairs_on_one_second_cadence() {
 #[test]
 fn emergency_caps_unkillable_own_pfctl_children_and_reports_capacity() {
     for lockless in [false, true] {
-        let mut state = Snapshot::initial(Some(501));
+        let mut state = Snapshot::initial(Some(501), None);
         state.machine.join_intended = true;
         let mut p = fixture(&state);
         if lockless {
@@ -2440,7 +2440,7 @@ fn emergency_caps_unkillable_own_pfctl_children_and_reports_capacity() {
 
 #[test]
 fn socket_failure_drains_own_tools_without_a_second_emergency_step() {
-    let mut state = Snapshot::initial(Some(501));
+    let mut state = Snapshot::initial(Some(501), None);
     state.machine.join_intended = true;
     let mut p = fixture(&state);
     p.inject_persistent(Call::CreateControlSocket, Fault::NoSpace);
@@ -2863,7 +2863,7 @@ fn stateful_emergency_storage_wait_never_reenters_outer_frame() {
 
 #[test]
 fn constructor_recovery_slow_pair_commit_keeps_full_budget() {
-    let mut p = fixture(&Snapshot::initial(Some(501)));
+    let mut p = fixture(&Snapshot::initial(Some(501), None));
     for copy in [Copy::A, Copy::B] {
         p.mutate(Mutation::CopyRot(copy));
         p.inject(Call::Write(copy), 1, Fault::StorageDelay(60));

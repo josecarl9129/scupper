@@ -236,6 +236,51 @@ fn boot(out: &Path, platform: &mut NativePlatform, result: &mut CaseResult) -> R
 #[allow(clippy::too_many_lines)] // One bounded churn campaign, with its oracle lifetimes in scope.
 fn processes(out: &Path, platform: &mut NativePlatform, result: &mut CaseResult) -> Result<()> {
     let case_start = Instant::now();
+    let boot = platform.boot_id();
+    // This guarded, fresh scratch setup has no engine storage/install record and
+    // enables no helper. Persist the same initial state that setup will write.
+    let initial = crate::snapshot::Snapshot::initial(None, boot.clone());
+    let bytes = crate::snapshot::encode(1, &initial)?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(out.join("base-initial-snapshot.bin"))?;
+    file.write_all(bytes.as_ref())?;
+    file.sync_all()?;
+    fs::File::open(out)?.sync_all()?;
+    write_json(out, "base-initial-snapshot.json", &initial)?;
+    let history = initial.image_history;
+    let child_path = std::env::current_exe()?.with_file_name("wireguard-go");
+    let mut pin_results = Vec::new();
+    let mut pins = Vec::new();
+    let mut pin_errors = Vec::new();
+    for path in crate::engine::PINNED_TOOLS
+        .iter()
+        .map(Path::new)
+        .chain(std::iter::once(child_path.as_path()))
+    {
+        let d = Deadline(platform.now() + 5);
+        match platform.image_uuid(path, d) {
+            Ok(uuid) => {
+                pins.push((path.display().to_string(), uuid));
+                pin_results.push(json!({"path": path, "uuid": hex_uuid(uuid)}));
+            }
+            Err(error) => {
+                pin_errors.push(format!("image_uuid {}: {error}", path.display()));
+                pin_results.push(json!({"path": path, "error": error.to_string()}));
+            }
+        }
+    }
+    write_json(out, "base-pin-images.json", &pin_results)?;
+    if boot.is_none() {
+        pin_errors.push("synthetic empty history: current boot unavailable".into());
+        return Err(environment_issue(pin_errors.join("; ")));
+    }
+    let pin_uuids = pin_errors
+        .is_empty()
+        .then(|| pins.iter().map(|(_, uuid)| *uuid).collect::<Vec<_>>());
+
     let mut children = Vec::new();
     for i in 0..8 {
         children.push(Supervised::spawn(
@@ -286,7 +331,7 @@ fn processes(out: &Path, platform: &mut NativePlatform, result: &mut CaseResult)
                         "pid": p.pid, "ppid": p.ppid, "uid": scupper_darwin::proc_uid(p.pid).ok(),
                         "p_comm": p.name, "start": [p.start.seconds, u64::from(p.start.microseconds)],
                         "uuid": p.image.map(|i| hex_uuid(i.uuid)), "uniqueid": p.image.map(|i| i.uniqueid),
-                        "classification": "validated image; engine incomplete: history/pins unknown"}));
+                        "classification": base_check::census_classification(p, &history, boot.as_ref(), &pins, pin_uuids.as_deref())}));
                 }
                 for p in &oracle {
                     if !list.iter().any(|got| {
@@ -332,29 +377,24 @@ fn processes(out: &Path, platform: &mut NativePlatform, result: &mut CaseResult)
                         {
                             let d = Deadline(platform.now() + 2);
                             let observed = platform.observe_image(pid, d);
-                            let mut history = ImageHistory::default();
-                            history.observe_boot(platform.boot_id());
                             let image = observed
                                 .as_ref()
                                 .ok()
                                 .and_then(|p| p.as_ref())
                                 .and_then(|p| p.image);
-                            let classification = observed
-                                .as_ref()
-                                .ok()
-                                .and_then(|p| p.as_ref())
-                                .map_or("incomplete: bracket rejected", |p| {
-                                    if crate::platform::provably_foreign(
-                                        p,
-                                        &history,
-                                        history.boot.as_ref(),
-                                        None,
-                                    ) {
-                                        "foreign"
-                                    } else {
-                                        "incomplete: history/pin unknown"
-                                    }
-                                });
+                            let classification =
+                                observed.as_ref().ok().and_then(|p| p.as_ref()).map_or_else(
+                                    || "withheld: image unknown".into(),
+                                    |p| {
+                                        base_check::census_classification(
+                                            p,
+                                            &history,
+                                            boot.as_ref(),
+                                            &pins,
+                                            pin_uuids.as_deref(),
+                                        )
+                                    },
+                                );
                             census.push(json!({"iteration": iteration, "pid": pid, "ppid": p.ppid,
                                 "uid": scupper_darwin::proc_uid(pid).ok(), "p_comm": proc::name(&p.comm),
                                 "start": p.start, "errno": error.raw_os_error(),
@@ -410,7 +450,8 @@ fn processes(out: &Path, platform: &mut NativePlatform, result: &mut CaseResult)
             "runner did not sustain approximately 200 forks/s for 60 seconds",
         ));
     }
-    let mut unqualified = Vec::new();
+    let mut unqualified = pin_errors;
+    unqualified.extend(base_check::withheld_persistent_pathless(&census, complete));
     let remaining = Duration::from_secs(360).saturating_sub(case_start.elapsed());
     let until = scupper_darwin::monotonic_raw() + remaining;
     record_subcheck(

@@ -54,7 +54,7 @@ fn class(seq: u64, snapshot: &Snapshot) -> CopyClass {
     classify_copy(CopyRead::Bytes(encode(seq, snapshot).unwrap().to_vec()))
 }
 fn initial_class(seq: u64) -> CopyClass {
-    class(seq, &Snapshot::initial(None))
+    class(seq, &Snapshot::initial(None, None))
 }
 fn is_invalid(bytes: Vec<u8>) {
     assert!(matches!(
@@ -71,7 +71,7 @@ fn assert_trust(a: CopyClass, b: CopyClass, source: Copy, seq: u64, repair: Opti
         StartDecision::Trust {
             source,
             seq,
-            snapshot: Snapshot::initial(None),
+            snapshot: Snapshot::initial(None, None),
             repair
         }
     );
@@ -79,7 +79,7 @@ fn assert_trust(a: CopyClass, b: CopyClass, source: Copy, seq: u64, repair: Opti
 
 #[test]
 fn initial_and_recovery_are_valid_and_restart_with_hold() {
-    let initial = Snapshot::initial(Some(42));
+    let initial = Snapshot::initial(Some(42), None);
     assert_eq!(initial.validate().unwrap(), Durable::default());
     let recovery = Snapshot::recovery(
         Some(boot()),
@@ -132,7 +132,7 @@ fn boot_start_time_unknown_fields_and_request_states() {
         );
     }
     let mut values = vec![
-        serde_json::to_value(Snapshot::initial(None)).unwrap(),
+        serde_json::to_value(Snapshot::initial(None, None)).unwrap(),
         serde_json::to_value(DurableRecord::default()).unwrap(),
         serde_json::to_value(evidence(ReferenceEntry::Token(1))).unwrap(),
         serde_json::to_value(helper(1)).unwrap(),
@@ -170,7 +170,7 @@ fn boot_start_time_unknown_fields_and_request_states() {
 
 #[test]
 fn bounded_decode_and_counter_limits() {
-    let original = serde_json::to_value(Snapshot::initial(None)).unwrap();
+    let original = serde_json::to_value(Snapshot::initial(None, None)).unwrap();
     let bad_fields = [
         ("older_references", json!([1, 2])),
         ("uncertain_acquires", json!([1, 2, 3])),
@@ -219,15 +219,15 @@ fn bounded_decode_and_counter_limits() {
     let mut requests = original;
     requests["requests"] = json!([{"id": COUNTER_MAX, "kind": "Join"}]);
     assert!(serde_json::from_value::<Snapshot>(requests).is_err());
-    let mut trailing = serde_json::to_vec(&Snapshot::initial(None)).unwrap();
+    let mut trailing = serde_json::to_vec(&Snapshot::initial(None, None)).unwrap();
     trailing.extend_from_slice(b" {}");
     is_invalid(raw(1, &trailing));
     is_invalid(raw(
         COUNTER_MAX,
-        &serde_json::to_vec(&Snapshot::initial(None)).unwrap(),
+        &serde_json::to_vec(&Snapshot::initial(None, None)).unwrap(),
     ));
     assert_eq!(
-        encode(COUNTER_MAX, &Snapshot::initial(None)),
+        encode(COUNTER_MAX, &Snapshot::initial(None, None)),
         Err(SnapshotError::Counter)
     );
     assert!(
@@ -275,7 +275,7 @@ fn classification_i() {
 }
 #[test]
 fn classification_x() {
-    let mut unknown = encode(5, &Snapshot::initial(None)).unwrap().to_vec();
+    let mut unknown = encode(5, &Snapshot::initial(None, None)).unwrap().to_vec();
     unknown[8..12].copy_from_slice(&(FORMAT + 1).to_le_bytes());
     unknown[12..20].copy_from_slice(&u64::MAX.to_le_bytes());
     assert_eq!(classify_copy(CopyRead::Bytes(unknown)), CopyClass::X);
@@ -296,20 +296,23 @@ fn classification_t_wrong_length() {
 }
 #[test]
 fn classification_t_bad_magic() {
-    let mut bytes = encode(1, &Snapshot::initial(None)).unwrap().to_vec();
+    let mut bytes = encode(1, &Snapshot::initial(None, None)).unwrap().to_vec();
     bytes[0] ^= 1;
     assert_eq!(classify_copy(CopyRead::Bytes(bytes)), CopyClass::T);
 }
 #[test]
 fn classification_t_body_len() {
-    let mut bytes = encode(1, &Snapshot::initial(None)).unwrap().to_vec();
+    let mut bytes = encode(1, &Snapshot::initial(None, None)).unwrap().to_vec();
     bytes[20..24].copy_from_slice(&u32::try_from(BODY_MAX + 1).unwrap().to_le_bytes());
     assert_eq!(classify_copy(CopyRead::Bytes(bytes)), CopyClass::T);
 }
 #[test]
 fn classification_t_checksum() {
-    let original = encode(1, &Snapshot::initial(None)).unwrap().to_vec();
-    let end = 24 + serde_json::to_vec(&Snapshot::initial(None)).unwrap().len();
+    let original = encode(1, &Snapshot::initial(None, None)).unwrap().to_vec();
+    let end = 24
+        + serde_json::to_vec(&Snapshot::initial(None, None))
+            .unwrap()
+            .len();
     for pos in [12, 24, end] {
         let mut bytes = original.clone();
         bytes[pos] ^= 1;
@@ -322,7 +325,7 @@ fn classification_t_checksum() {
 }
 #[test]
 fn nonzero_padding_is_i_and_not_t() {
-    let mut bytes = encode(1, &Snapshot::initial(None)).unwrap().to_vec();
+    let mut bytes = encode(1, &Snapshot::initial(None, None)).unwrap().to_vec();
     bytes[COPY_BYTES - 1] = 1;
     is_invalid(bytes);
 }
@@ -359,7 +362,7 @@ fn all_36_start_table_pairs() {
                     StartDecision::Trust {
                         source: Copy::A,
                         seq: 5,
-                        snapshot: Snapshot::initial(None),
+                        snapshot: Snapshot::initial(None, None),
                         repair: (j != 0).then_some(Copy::B),
                     }
                 ),
@@ -368,7 +371,7 @@ fn all_36_start_table_pairs() {
                     StartDecision::Trust {
                         source: Copy::B,
                         seq: 5,
-                        snapshot: Snapshot::initial(None),
+                        snapshot: Snapshot::initial(None, None),
                         repair: Some(Copy::A),
                     }
                 ),
@@ -412,11 +415,15 @@ fn start_ordering_equal_sequence_divergence_and_full_copy_comparison() {
         },
         6,
     );
-    is_recovery(initial_class(5), class(5, &Snapshot::initial(Some(1))), 6);
+    is_recovery(
+        initial_class(5),
+        class(5, &Snapshot::initial(Some(1), None)),
+        6,
+    );
     // A checksum does not make a noncanonical spelling valid.
     let body = format!(
         "{} ",
-        serde_json::to_string(&Snapshot::initial(None)).unwrap()
+        serde_json::to_string(&Snapshot::initial(None, None)).unwrap()
     );
     let different_bytes = classify_copy(CopyRead::Bytes(raw(5, body.as_bytes())));
     assert!(matches!(different_bytes, CopyClass::I { .. }));
@@ -444,7 +451,7 @@ fn recovery_sequence_only_uses_authenticated_known_format_headers() {
         initial_class(COUNTER_MAX - 2),
         COUNTER_MAX - 1,
     );
-    let mut torn = encode(1, &Snapshot::initial(None)).unwrap().to_vec();
+    let mut torn = encode(1, &Snapshot::initial(None, None)).unwrap().to_vec();
     torn[12..20].copy_from_slice(&1_000_000_000_u64.to_le_bytes());
     let torn = classify_copy(CopyRead::Bytes(torn));
     assert_eq!(torn, CopyClass::T);
@@ -464,9 +471,9 @@ fn recovery_sequence_only_uses_authenticated_known_format_headers() {
 #[test]
 #[allow(clippy::too_many_lines)] // Keep the helper preference and salvage matrix together.
 fn recovery_helper_prefers_v_then_highest_sequence_and_salvages_i_object_only() {
-    let mut a = Snapshot::initial(None);
+    let mut a = Snapshot::initial(None, None);
     a.helper = Some(helper(1));
-    let mut b = Snapshot::initial(None);
+    let mut b = Snapshot::initial(None, None);
     b.helper = Some(helper(2));
     assert_eq!(
         decide(class(1, &a), class(2, &b)),
@@ -604,14 +611,14 @@ fn canonical_reference_validation_and_encoder_rejection() {
     s.machine.uncertain_acquires = vec![0, 2].try_into().unwrap();
     s.references[0].as_mut().unwrap().key = ReferenceEntry::Acquire(0);
     cases.push(s);
-    let mut s = Snapshot::initial(None);
+    let mut s = Snapshot::initial(None, None);
     s.references[1] = Some(evidence(ReferenceEntry::Token(10)));
     cases.push(s);
-    let mut s = Snapshot::initial(None);
+    let mut s = Snapshot::initial(None, None);
     s.machine.pf_reference = Some(0);
     s.references[0] = Some(evidence(ReferenceEntry::Token(0)));
     cases.push(s);
-    let mut s = Snapshot::initial(None);
+    let mut s = Snapshot::initial(None, None);
     s.machine.pf_reference = Some(7);
     s.machine.older_references = vec![7].try_into().unwrap();
     s.references = [
@@ -619,10 +626,10 @@ fn canonical_reference_validation_and_encoder_rejection() {
         Some(evidence(ReferenceEntry::Token(7))),
     ];
     cases.push(s);
-    let mut s = Snapshot::initial(None);
+    let mut s = Snapshot::initial(None, None);
     s.machine.hold = true;
     cases.push(s);
-    let mut s = Snapshot::initial(None);
+    let mut s = Snapshot::initial(None, None);
     s.machine.pending_cleanup = vec![StepRecord::from(Step::ReleaseReference)]
         .try_into()
         .unwrap();
@@ -635,7 +642,7 @@ fn canonical_reference_validation_and_encoder_rejection() {
         assert!(encode(1, &s).is_err());
         is_invalid(raw(1, &serde_json::to_vec(&s).unwrap()));
     }
-    let mut transient = Snapshot::initial(None);
+    let mut transient = Snapshot::initial(None, None);
     transient.machine.reference_sequence = COUNTER_MAX - 1;
     transient.machine.reference_intent = Some((true, COUNTER_MAX - 1));
     transient.references[0] = Some(evidence(ReferenceEntry::Acquire(COUNTER_MAX - 1)));
@@ -649,7 +656,7 @@ fn canonical_reference_validation_and_encoder_rejection() {
         Some(evidence(ReferenceEntry::Acquire(COUNTER_MAX - 1))),
     ];
     assert!(transient.validate().is_ok());
-    let mut leaving_hold = Snapshot::initial(None);
+    let mut leaving_hold = Snapshot::initial(None, None);
     leaving_hold.machine.hold = true;
     leaving_hold.machine.leaving = true;
     leaving_hold.machine.leave_requested = true;
@@ -732,7 +739,7 @@ fn assert_bad_durable(d: DurableRecord) {
     assert!(d.to_core().is_err(), "{d:?}");
     let s = Snapshot {
         machine: d,
-        ..Snapshot::initial(None)
+        ..Snapshot::initial(None, None)
     };
     assert!(s.validate().is_err());
     assert!(encode(1, &s).is_err());
@@ -761,7 +768,7 @@ fn noncanonical_body_spellings_are_invalid() {
 
 #[test]
 fn recovery_helper_equal_sequence_ties_choose_a() {
-    let mut a = Snapshot::initial(None);
+    let mut a = Snapshot::initial(None, None);
     a.helper = Some(helper(1));
     let mut b = a.clone();
     b.helper = Some(helper(2));
@@ -800,6 +807,14 @@ fn trust_rejects_non_v_instead_of_silently_recovering() {
     );
 }
 
+fn full_history() -> ImageHistory {
+    let mut history = ImageHistory::empty_for_boot(boot());
+    for i in 0..8 {
+        history.record([255 - i; 16]);
+    }
+    history
+}
+
 fn raw_maximal() -> Snapshot {
     let text: BoundedText<256> = "W".repeat(256).try_into().unwrap();
     let reason = ReasonRecord {
@@ -820,7 +835,7 @@ fn raw_maximal() -> Snapshot {
         })
     };
     Snapshot {
-        image_history: ImageHistory::default(),
+        image_history: full_history(),
         owner_uid: Some(u32::MAX),
         machine: DurableRecord {
             verification_context: [u64::MAX; 4],
@@ -945,7 +960,7 @@ fn from_machine(machine: &Machine) -> Snapshot {
     Snapshot {
         machine: DurableRecord::try_from(d).unwrap(),
         references: std::array::from_fn(|i| keys.get(i).copied().map(evidence)),
-        ..Snapshot::initial(None)
+        ..Snapshot::initial(None, None)
     }
 }
 fn check_round_trip(machine: &Machine) {
@@ -1226,6 +1241,7 @@ fn rich_reachable_snapshot() -> Snapshot {
     assert!(machine.durable().leaving && machine.durable().leave_requested);
     assert!(!machine.durable().join_intended);
     let mut snapshot = from_machine(&machine);
+    snapshot.image_history = full_history();
     snapshot.owner_uid = Some(u32::MAX);
     snapshot.helper = Some(helper(u32::MAX));
     snapshot.endpoint = Some("255.255.255.255:65535".parse().unwrap());
@@ -1445,7 +1461,7 @@ proptest! {
     ) {
         let tokens: Vec<_> = tokens.into_iter().collect();
         let count = acquire_count.min(2 - tokens.len());
-        let mut snapshot = Snapshot::initial(owner);
+        let mut snapshot = Snapshot::initial(owner, None);
         snapshot.machine.join_intended = true;
         snapshot.machine.reference_sequence = seq;
         snapshot.machine.previous_generation = generation;
@@ -1536,7 +1552,7 @@ proptest! {
 
 #[test]
 fn image_history_roundtrip_overflow_unknown_and_proven_reboot() {
-    let mut snapshot = Snapshot::initial(Some(501));
+    let mut snapshot = Snapshot::initial(Some(501), None);
     assert!(!snapshot.image_history.known);
     snapshot.image_history.observe_boot(Some(boot()));
     assert!(!snapshot.image_history.known); // missing is never empty-known
@@ -1569,7 +1585,7 @@ fn image_history_roundtrip_overflow_unknown_and_proven_reboot() {
 
 #[test]
 fn image_previous_snapshot_format_migrates_to_unknown() {
-    let mut value = serde_json::to_value(Snapshot::initial(Some(501))).unwrap();
+    let mut value = serde_json::to_value(Snapshot::initial(Some(501), None)).unwrap();
     value.as_object_mut().unwrap().remove("image_history");
     let old: LegacySnapshot = serde_json::from_value(value).unwrap();
     let body = serde_json::to_vec(&old).unwrap();
@@ -1593,7 +1609,7 @@ fn image_previous_snapshot_format_migrates_to_unknown() {
 
 #[test]
 fn image_history_requires_consistent_readable_copies() {
-    let mut s = Snapshot::initial(Some(501));
+    let mut s = Snapshot::initial(Some(501), None);
     s.image_history = ImageHistory::empty_for_boot(boot());
     s.image_history.record([1; 16]);
     let valid = || classify_copy(CopyRead::Bytes(encode(2, &s).unwrap().to_vec()));
@@ -1623,4 +1639,14 @@ fn image_history_requires_consistent_readable_copies() {
         classify_copy(CopyRead::Bytes(raw(4, &serde_json::to_vec(&body).unwrap()))),
         CopyClass::I { .. }
     ));
+}
+
+#[test]
+fn image_initial_is_known_empty_only_with_installers_proven_boot() {
+    let known = Snapshot::initial(Some(501), Some(boot()));
+    assert!(known.image_history.known_on(Some(&boot())));
+    assert!(known.image_history.uuids.is_empty());
+    let unknown = Snapshot::initial(Some(501), None);
+    assert!(!unknown.image_history.known);
+    assert_eq!(unknown.image_history.boot, None);
 }

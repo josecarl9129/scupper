@@ -290,33 +290,42 @@ impl Platform for NativePlatform {
         })
     }
     fn image_uuid(&mut self, path: &Path, deadline: Deadline) -> Result<[u8; 16], SysError> {
-        use std::{io::Read, os::unix::fs::OpenOptionsExt};
+        use std::os::unix::fs::{FileExt, OpenOptionsExt};
         self.expired(deadline)?;
         if !cfg!(target_arch = "aarch64") {
             return Err(SysError::Failed("native: image architecture unsupported"));
         }
-        // Darwin O_NOFOLLOW | O_CLOEXEC; all actual foreign calls remain in sys.rs.
+        // Darwin O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK; all actual foreign calls remain in sys.rs.
         let file = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(0x100 | 0x0100_0000)
+            .custom_flags(0x100 | 0x0100_0000 | 0x4)
             .open(path)
             .map_err(|_| SysError::Failed("native: image open"))?;
         let meta = file
             .metadata()
             .map_err(|_| SysError::Failed("native: image fstat"))?;
-        if !meta.is_file() || meta.len() > 64 * 1024 * 1024 {
-            return Err(SysError::Failed("native: image size or type"));
-        }
-        let mut bytes = Vec::new();
-        file.take(64 * 1024 * 1024 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| SysError::Failed("native: image read"))?;
         self.expired(deadline)?;
-        if bytes.len() > 64 * 1024 * 1024 {
-            return Err(SysError::Failed("native: image size"));
+        if !meta.is_file() {
+            return Err(SysError::Failed("native: image type"));
         }
-        image::macho_uuid(&bytes)
+        image::read_macho_uuid(meta.len(), |offset, length| {
+            self.expired(deadline)?;
+            let mut bytes = vec![0; length];
+            let mut done = 0;
+            while done < length {
+                self.expired(deadline)?;
+                match file.read_at(&mut bytes[done..], offset + done as u64) {
+                    Ok(0) => return Err(SysError::Failed("native: image short read")),
+                    Ok(n) => done += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => return Err(SysError::Failed("native: image read")),
+                }
+            }
+            self.expired(deadline)?;
+            Ok(bytes)
+        })
     }
+
     fn acquire_instance_lock(&mut self) -> Result<(), InstanceLockError> {
         Err(InstanceLockError::Failed(UNIMPLEMENTED))
     }

@@ -101,53 +101,99 @@ fn thin(bytes: &[u8]) -> Result<[u8; 16], SysError> {
 /// # Errors
 /// Rejects malformed, overlapping, ambiguous, unsupported or UUID-less images.
 pub fn macho_uuid(bytes: &[u8]) -> Result<[u8; 16], SysError> {
-    let magic = word(bytes, 0, true)?;
-    if !matches!(magic, 0xcafe_babe | 0xcafe_babf) {
-        return thin(bytes);
+    read_macho_uuid(bytes.len() as u64, |offset, length| {
+        let offset = usize::try_from(offset).map_err(|_| INVALID)?;
+        bytes
+            .get(offset..offset.checked_add(length).ok_or(INVALID)?)
+            .map(<[u8]>::to_vec)
+            .ok_or(INVALID)
+    })
+}
+
+/// Bounded random-access parser: headers/table, then at most 1 MiB of load
+/// commands per native slice. The reader checks its deadline before each read.
+/// All native arm64 slices must agree; no subtype preference is inferred.
+///
+/// # Errors
+/// Rejects malformed, overlapping, ambiguous or oversized images and read errors.
+#[allow(clippy::too_many_lines)] // Fat range validation and thin load commands share one bounded reader.
+pub fn read_macho_uuid(
+    file_size: u64,
+    mut read: impl FnMut(u64, usize) -> Result<Vec<u8>, SysError>,
+) -> Result<[u8; 16], SysError> {
+    fn read_thin(
+        read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>, SysError>,
+        offset: u64,
+        size: u64,
+        expected: Option<(u32, u32)>,
+    ) -> Result<[u8; 16], SysError> {
+        if size < 32 {
+            return Err(INVALID);
+        }
+        let mut header = read(offset, 32)?;
+        if let Some((cpu, subtype)) = expected
+            && (word(&header, 4, false)? != cpu || word(&header, 8, false)? != subtype)
+        {
+            return Err(INVALID);
+        }
+        let commands = usize::try_from(word(&header, 20, false)?).map_err(|_| INVALID)?;
+        if commands > 1024 * 1024 || 32 + commands as u64 > size {
+            return Err(INVALID);
+        }
+        header.extend(read(offset.checked_add(32).ok_or(INVALID)?, commands)?);
+        thin(&header)
     }
-    let count = usize::try_from(word(bytes, 4, true)?).map_err(|_| INVALID)?;
+    if file_size < 8 {
+        return Err(INVALID);
+    }
+    let header = read(0, 8)?;
+    let magic = word(&header, 0, true)?;
+    if !matches!(magic, 0xcafe_babe | 0xcafe_babf) {
+        return read_thin(&mut read, 0, file_size, None);
+    }
+    let count = usize::try_from(word(&header, 4, true)?).map_err(|_| INVALID)?;
     let stride = if magic == 0xcafe_babf { 32 } else { 20 };
     if count == 0 || count > 64 {
         return Err(INVALID);
     }
     let table_end = 8 + count * stride;
-    if table_end > bytes.len() {
+    if table_end as u64 > file_size {
         return Err(INVALID);
     }
-    let mut uuid = None;
+    let table = read(8, count * stride)?;
     let mut ranges = Vec::new();
+    let mut slices = Vec::new();
     for i in 0..count {
-        let at = 8 + i * stride;
-        let cpu = word(bytes, at, true)?;
-        let subtype = word(bytes, at + 4, true)?;
+        let at = i * stride;
+        let cpu = word(&table, at, true)?;
+        let subtype = word(&table, at + 4, true)?;
         let (offset, size) = if stride == 32 {
-            (wide(bytes, at + 8)?, wide(bytes, at + 16)?)
+            (wide(&table, at + 8)? as u64, wide(&table, at + 16)? as u64)
         } else {
             (
-                word(bytes, at + 8, true)? as usize,
-                word(bytes, at + 12, true)? as usize,
+                u64::from(word(&table, at + 8, true)?),
+                u64::from(word(&table, at + 12, true)?),
             )
         };
         let end = offset
             .checked_add(size)
-            .filter(|end| *end <= bytes.len() && offset >= table_end && size > 0)
+            .filter(|end| *end <= file_size && offset >= table_end as u64 && size > 0)
             .ok_or(INVALID)?;
-        let align = word(bytes, at + if stride == 32 { 24 } else { 16 }, true)?;
+        let align = word(&table, at + if stride == 32 { 24 } else { 16 }, true)?;
         if align > 31
-            || offset % (1_usize << align) != 0
+            || offset % (1_u64 << align) != 0
             || ranges.iter().any(|&(a, b)| offset < b && a < end)
         {
             return Err(INVALID);
         }
         ranges.push((offset, end));
-        if cpu != 0x0100_000c {
-            continue;
+        if cpu == 0x0100_000c {
+            slices.push((offset, size, cpu, subtype));
         }
-        let slice = &bytes[offset..end];
-        if word(slice, 4, false)? != cpu || word(slice, 8, false)? != subtype {
-            return Err(INVALID);
-        }
-        let value = thin(slice)?;
+    }
+    let mut uuid = None;
+    for (offset, size, cpu, subtype) in slices {
+        let value = read_thin(&mut read, offset, size, Some((cpu, subtype)))?;
         if uuid.is_some_and(|previous| previous != value) {
             return Err(INVALID);
         }
@@ -237,6 +283,46 @@ mod tests {
         assert!(macho_uuid(&duplicate).is_err());
         Ok(())
     }
+    #[test]
+    fn bounded_reader_limits_commands_and_propagates_deadline() -> Result<(), SysError> {
+        let mut header = minimal([7; 16], 0);
+        let mut reads = Vec::new();
+        let uuid = read_macho_uuid(1024 * 1024 * 1024, |offset, length| {
+            reads.push((offset, length));
+            let offset = usize::try_from(offset).map_err(|_| INVALID)?;
+            header
+                .get(offset..offset + length)
+                .map(<[u8]>::to_vec)
+                .ok_or(INVALID)
+        })?;
+        assert_eq!(uuid, [7; 16]);
+        assert_eq!(reads, [(0, 8), (0, 32), (32, 24)]);
+        header[20..24].copy_from_slice(&(1024 * 1024 + 1_u32).to_le_bytes());
+        let mut reads = Vec::new();
+        assert!(
+            read_macho_uuid(u64::MAX, |offset, length| {
+                reads.push(length);
+                let offset = usize::try_from(offset).map_err(|_| INVALID)?;
+                Ok(header[offset..offset + length].to_vec())
+            })
+            .is_err()
+        );
+        assert_eq!(reads, [8, 32]);
+        let mut count = 0;
+        assert_eq!(
+            read_macho_uuid(56, |_, _| {
+                count += 1;
+                if count == 1 {
+                    Ok(minimal([7; 16], 0)[..8].to_vec())
+                } else {
+                    Err(SysError::TimedOut)
+                }
+            }),
+            Err(SysError::TimedOut)
+        );
+        Ok(())
+    }
+
     proptest! {
         #[test]
         fn arbitrary_images_never_panic(bytes in prop::collection::vec(any::<u8>(), 0..8192)) {

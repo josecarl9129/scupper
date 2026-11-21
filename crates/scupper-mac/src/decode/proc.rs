@@ -209,6 +209,20 @@ pub fn resolve_image(
     current: Option<ProcInfo>,
     second: Option<super::image::Identifier>,
 ) -> Result<Option<ProcInfo>, ProcessError> {
+    // The name guard and ownership fields must describe the bracketed image.
+    if let Some(current) = &current
+        && current.pid == listed.pid
+        && current.start == listed.start
+        && current.state != ProcState::Zombie
+        && (current.name != listed.name
+            || current.pgid != listed.pgid
+            || current.ppid != listed.ppid)
+    {
+        return Err(ProcessError {
+            pid: Some(listed.pid),
+            error: SysError::Failed("native: image fields changed"),
+        });
+    }
     // Resolve exit/reuse before interpreting image failures.
     let resolved = resolve_path(listed.clone(), None, current);
     if !matches!(&resolved, Err(e) if e.pid == Some(listed.pid)) {
@@ -397,6 +411,35 @@ mod tests {
         assert_eq!(observe_image(listed, || Some(id), || Ok(None))?, None);
         Ok(())
     }
+    #[test]
+    fn image_bracket_rejects_changed_name_pgid_and_ppid() -> Result<(), ProcessError> {
+        let listed = records(include_bytes!(
+            "../../tests/fixtures/macos/layout/kinfo_proc.bin"
+        ))?
+        .remove(0);
+        let id = super::super::image::Identifier {
+            image: crate::platform::ImageId {
+                uuid: [1; 16],
+                uniqueid: 42,
+            },
+            idversion: 7,
+        };
+        for field in 0..3 {
+            let mut current = listed.clone();
+            match field {
+                0 => current.name = Some("changed".into()),
+                1 => current.pgid += 1,
+                _ => current.ppid += 1,
+            }
+            let result = observe_image(listed.clone(), || Some(id), || Ok(Some(current)));
+            assert!(
+                matches!(result, Err(ProcessError { pid: Some(pid), .. }) if pid == listed.pid),
+                "field {field}"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn image_bracket_rejects_exec_reuse_missing_and_changed_reads() -> Result<(), ProcessError> {
         let listed = records(include_bytes!(

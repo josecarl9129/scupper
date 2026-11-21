@@ -113,7 +113,15 @@ else:
         return values
 
     identities = sorted(root.glob("probe-identity-*.json"))
-    if identities or (root / "executed-capability-sha256.txt").exists():
+    qproc_patterns = ["Q-PROC*", "base-proc*", "proc-churn.json", "base-oracle.json",
+                      "oracle-*.log", "base-stopped*", "base-unlinked*", "base-paths.json",
+                      "base-image*.json", "base-pin-images.json", "base-initial-snapshot.*",
+                      "path-oracle.log", "pathless-census.json"]
+    if (identities or (root / "executed-capability-sha256.txt").exists()
+            or any(any(root.glob(pattern)) for pattern in qproc_patterns)
+            or any((root / name).exists() for name in [
+                "built-capability-sha256.txt", "wireguard-sha256.txt",
+                "base-churn-sha256.txt", "base-image-sha256.txt"])):
         try:
             built_probes = {}
             for name in ["built-capability-sha256.txt", "wireguard-sha256.txt"]:

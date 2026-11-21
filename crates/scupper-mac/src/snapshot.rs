@@ -328,7 +328,7 @@ pub struct ImageHistory {
     pub uuids: BoundedVec<[u8; 16], IMAGE_HISTORY_BOUND>,
 }
 impl ImageHistory {
-    /// Empty-known history requires independent evidence of a new boot.
+    /// Empty-known history requires a proven fresh installation or a new boot.
     #[must_use]
     pub fn empty_for_boot(boot: BootId) -> Self {
         Self {
@@ -389,9 +389,17 @@ pub struct Snapshot {
     pub internal_error: Option<InternalError>,
 }
 impl Snapshot {
-    /// Left state for an independently confirmed installation.
+    /// Left state for an independently proven fresh installation.
+    /// Only the installer may write this, after independently proving no existing
+    /// storage or install record. Durable initialisation must complete before the
+    /// helper is enabled. A retry preserves existing state and never overwrites it
+    /// with `initial`. A known boot establishes known-empty image history.
+    /// The backstop is load-bearing: owned children exec /opt/scupper/wireguard-go,
+    /// `p_comm` cannot be changed by the process, and wireguard-go never execs;
+    /// the wireguard-go name guard therefore withholds an owned orphan even if
+    /// the fresh-install proof was wrong.
     #[must_use]
-    pub fn initial(owner_uid: Option<u32>) -> Self {
+    pub fn initial(owner_uid: Option<u32>, boot: Option<BootId>) -> Self {
         Self {
             owner_uid,
             machine: DurableRecord::default(),
@@ -400,7 +408,7 @@ impl Snapshot {
             helper: None,
             requests: BoundedVec::default(),
             internal_error: None,
-            image_history: ImageHistory::default(),
+            image_history: boot.map_or_else(ImageHistory::default, ImageHistory::empty_for_boot),
         }
     }
     /// Conservative Recovery accounting: two potentially live unknown acquisitions.
@@ -421,7 +429,7 @@ impl Snapshot {
                 reference_sequence: 2,
                 ..DurableRecord::default()
             },
-            references: [(1, boot.clone()), (2, boot)].map(|(seq, boot)| {
+            references: [(1, boot.clone()), (2, boot.clone())].map(|(seq, boot)| {
                 Some(RefEvidence {
                     key: ReferenceEntry::Acquire(seq),
                     boot,
@@ -434,7 +442,10 @@ impl Snapshot {
             helper,
             requests: BoundedVec::default(),
             internal_error: None,
-            image_history: ImageHistory::default(),
+            image_history: ImageHistory {
+                boot,
+                ..ImageHistory::default()
+            },
         }
     }
     /// Validate core facts and the exact, canonical annotation multiset.
@@ -719,10 +730,10 @@ pub enum StartDecision {
 pub fn decide(a: CopyClass, b: CopyClass) -> StartDecision {
     // A single surviving copy still drives the lifecycle start table, but
     // absence from its history cannot certify a foreign build if the other
-    // copy is missing, unreadable, corrupt or disagrees about image history.
+    // copy is missing, unreadable, corrupt or disagrees.
     let consistent_history = matches!((&a, &b),
-        (CopyClass::V {snapshot: a, ..}, CopyClass::V {snapshot: b, ..})
-            if a.image_history == b.image_history);
+        (CopyClass::V {seq: a_seq, bytes: a_bytes, ..}, CopyClass::V {seq: b_seq, bytes: b_bytes, ..})
+            if a_seq == b_seq && a_bytes == b_bytes);
     match (&a, &b) {
         (
             CopyClass::V {
@@ -782,6 +793,7 @@ fn trust_history(
     let mut decision = trust(class, source, repair);
     if !consistent && let StartDecision::Trust { snapshot, .. } = &mut decision {
         snapshot.image_history.known = false;
+        snapshot.image_history.boot = None; // Start observes the current uncertainty epoch.
     }
     decision
 }

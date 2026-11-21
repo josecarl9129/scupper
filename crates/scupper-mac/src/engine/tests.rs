@@ -24,8 +24,8 @@ fn fixture(snapshot: &Snapshot) -> FakePlatform {
     p
 }
 fn fresh() -> Engine<FakePlatform> {
-    let mut snapshot = Snapshot::initial(Some(501));
     let p = FakePlatform::new().unwrap();
+    let mut snapshot = Snapshot::initial(Some(501), p.boot.clone());
     snapshot.endpoint = Some(execute::endpoint(&p.install.config.inputs));
     Engine::start(fixture(&snapshot)).unwrap()
 }
@@ -207,7 +207,7 @@ fn happy_join_has_reservations_readbacks_and_fresh_proofs() {
 }
 #[test]
 fn startup_probes_left_then_reads_install_and_retries_full_copies_before_any_tool() {
-    let mut p = fixture(&Snapshot::initial(Some(501)));
+    let mut p = fixture(&Snapshot::initial(Some(501), None));
     p.inject(Call::Read(Copy::A), 2, Fault::ReadFail);
     p.inject(Call::Read(Copy::B), 2, Fault::ReadFail);
     let e = Engine::start(p).unwrap();
@@ -239,7 +239,7 @@ fn pair_repair_creates_missing_and_rewrites_stale_before_helper_commit() {
     for missing in [true, false] {
         for destination in [Copy::A, Copy::B] {
             // A can only be repaired from B when A is torn/missing.
-            let mut p = fixture(&Snapshot::initial(Some(501)));
+            let mut p = fixture(&Snapshot::initial(Some(501), None));
             if missing {
                 p.mutate(Mutation::MissingCopy(destination));
             } else {
@@ -272,7 +272,7 @@ fn pair_repair_creates_missing_and_rewrites_stale_before_helper_commit() {
 #[test]
 fn failed_pair_repair_is_explicit_and_never_runs_a_tool() {
     for missing in [true, false] {
-        let mut p = fixture(&Snapshot::initial(Some(501)));
+        let mut p = fixture(&Snapshot::initial(Some(501), None));
         p.mutate(if missing {
             Mutation::MissingCopy(Copy::B)
         } else {
@@ -297,7 +297,7 @@ fn failed_pair_repair_is_explicit_and_never_runs_a_tool() {
 fn recovery_commit_precedes_start_fence_and_crashes_leave_conservative_copies() {
     for copy in [Copy::A, Copy::B] {
         for fault in [Fault::LostBeforeSync, Fault::FailedDurable] {
-            let mut p = fixture(&Snapshot::initial(Some(501)));
+            let mut p = fixture(&Snapshot::initial(Some(501), None));
             p.mutate(Mutation::CopyRot(Copy::A));
             p.mutate(Mutation::CopyRot(Copy::B));
             p.inject(Call::Write(copy), 1, fault);
@@ -312,7 +312,7 @@ fn recovery_commit_precedes_start_fence_and_crashes_leave_conservative_copies() 
             assert_eq!(restarted.status().accounting.uncertain, 2);
         }
     }
-    let mut p = fixture(&Snapshot::initial(Some(501)));
+    let mut p = fixture(&Snapshot::initial(Some(501), None));
     p.mutate(Mutation::CopyRot(Copy::A));
     p.mutate(Mutation::CopyRot(Copy::B));
     p.calls.clear();
@@ -341,9 +341,9 @@ fn recovery_commit_precedes_start_fence_and_crashes_leave_conservative_copies() 
 #[test]
 fn crash_before_helper_commit_keeps_previous_and_prevents_spawn() {
     for copy in [Copy::A, Copy::B] {
-        let mut p = fixture(&Snapshot::initial(Some(501)));
+        let mut p = fixture(&Snapshot::initial(Some(501), None));
         let previous = p.helper.clone();
-        let mut old = Snapshot::initial(Some(501));
+        let mut old = Snapshot::initial(Some(501), None);
         old.helper = Some(previous.clone());
         let bytes = snapshot::encode(1, &old).unwrap();
         for slot in &mut p.copies {
@@ -370,7 +370,7 @@ fn crash_before_helper_commit_keeps_previous_and_prevents_spawn() {
 #[test]
 fn invalid_helper_group_or_parent_exits_before_shared_writes_or_tools() {
     for parent in [false, true] {
-        let mut p = fixture(&Snapshot::initial(Some(501)));
+        let mut p = fixture(&Snapshot::initial(Some(501), None));
         if parent {
             p.procs.get_mut(&p.helper.pid).unwrap().ppid = 22;
         } else {
@@ -415,7 +415,7 @@ fn recovery_ambiguity_is_narrow_and_never_establishes_ownership() {
                 (None, None, 1, 101, false),
                 (Some("/foreign"), None, 1, 90, false),
             ] {
-                let mut p = fixture(&Snapshot::initial(Some(501)));
+                let mut p = fixture(&Snapshot::initial(Some(501), None));
                 let mut proc = p.procs[&p.helper.pid].clone();
                 proc.pid = 333;
                 proc.pgid = 222;
@@ -501,7 +501,7 @@ fn startup_settles_only_two_known_different_boots_before_restart_plan() {
         (false, false, true),
     ] {
         let mut p = FakePlatform::new().unwrap();
-        let mut snapshot = Snapshot::initial(Some(501));
+        let mut snapshot = Snapshot::initial(Some(501), None);
         snapshot.machine.pf_reference = Some(900);
         let old = if old_known {
             if different {
@@ -562,7 +562,7 @@ fn reservation_commit_failure_exposes_neither_acquire_nor_spawn() {
             // Force a changed Acquire reservation even when the prior D completion
             // already committed it; its failed N completion must be retried here.
             if step == Step::AcquireReference {
-                e.committed = Snapshot::initial(Some(501));
+                e.committed = Snapshot::initial(Some(501), None);
             }
             e.platform.inject(Call::Write(copy), 1, Fault::WriteFail);
             let start = e.platform.calls.len();
@@ -930,7 +930,7 @@ fn leave_restores_connectivity_from_joined() {
 
 fn accounted(token: bool, unknown: bool) -> Engine<FakePlatform> {
     let p = FakePlatform::new().unwrap();
-    let mut snapshot = Snapshot::initial(Some(501));
+    let mut snapshot = Snapshot::initial(Some(501), None);
     let key = if token {
         snapshot.machine.pf_reference = Some(901);
         ReferenceEntry::Token(901)
@@ -1261,7 +1261,7 @@ fn queue_overflow_masks_protection_and_preserves_caller_input() {
 }
 #[test]
 fn deferred_join_is_replayed_after_restart_before_any_effect() {
-    let mut snapshot = Snapshot::initial(Some(501));
+    let mut snapshot = Snapshot::initial(Some(501), None);
     snapshot
         .requests
         .try_push(RequestRecord {
@@ -1429,7 +1429,7 @@ fn missing_recovery_destinations_never_mean_fresh_install() {
 }
 #[test]
 fn helper_commit_failure_preserves_native_fence_and_retries_durability() {
-    let mut p = fixture(&Snapshot::initial(Some(501)));
+    let mut p = fixture(&Snapshot::initial(Some(501), None));
     p.inject(Call::Write(Copy::B), 1, Fault::WriteHang);
     let mut e = Engine::start(p).unwrap();
     assert_eq!(e.status().start_fence, StartFence::Closed);
@@ -1559,7 +1559,7 @@ fn post_settlement_reconcile_context_is_recaptured_and_proof_is_refreshed() {
 
 #[test]
 fn incomplete_startup_enumeration_retains_the_named_pid_and_can_retry() {
-    let mut p = fixture(&Snapshot::initial(Some(501)));
+    let mut p = fixture(&Snapshot::initial(Some(501), None));
     let mut hidden = p.procs[&p.helper.pid].clone();
     hidden.pid = 333;
     hidden.pgid = 222;
@@ -1640,7 +1640,7 @@ fn fresh_foreign_host_reaches_normal_and_can_join() {
 #[test]
 fn starting_overflow_preserves_joined_intent_with_and_without_entries() {
     for entries in [false, true] {
-        let mut snapshot = Snapshot::initial(Some(501));
+        let mut snapshot = Snapshot::initial(Some(501), None);
         snapshot.machine.join_intended = true;
         if entries {
             snapshot.machine.pf_reference = Some(901);
@@ -1979,7 +1979,7 @@ fn unsupported_monitor_cadence_uses_only_platform_time() {
 #[test]
 fn unrepresentable_start_selection_is_observable_stuck() {
     for invalid_snapshot in [false, true] {
-        let mut snapshot = Snapshot::initial(Some(501));
+        let mut snapshot = Snapshot::initial(Some(501), None);
         let mut p = fixture(&snapshot);
         p.acquire_instance_lock().unwrap();
         let install = Some(p.install.clone());
@@ -2020,7 +2020,7 @@ fn unrepresentable_start_selection_is_observable_stuck() {
 
 #[test]
 fn recovery_sleeping_and_stopped_orphans_each_withhold_closure() {
-    let mut p = fixture(&Snapshot::initial(Some(501)));
+    let mut p = fixture(&Snapshot::initial(Some(501), None));
     for (pid, state, path, name) in [
         (333, ProcState::Sleeping, None, None),
         (
@@ -2078,7 +2078,7 @@ fn held(unreadable: bool, missing: bool) -> Engine<FakePlatform> {
     let mut p = if missing {
         FakePlatform::new().unwrap()
     } else {
-        let mut snapshot = Snapshot::initial(Some(501));
+        let mut snapshot = Snapshot::initial(Some(501), None);
         snapshot.machine.join_intended = true;
         snapshot.machine.hold = true;
         snapshot.endpoint = Some(execute::endpoint(
@@ -2452,7 +2452,7 @@ fn missing_pair_holds_expected_policy_refuses_join_and_setup_repairs() {
                 .any(|c| matches!(c, Call::Create(_)))
         );
         // Setup owns creation. Recovery retries only writes to the existing pair.
-        let bytes = snapshot::encode(1, &Snapshot::initial(Some(501))).unwrap();
+        let bytes = snapshot::encode(1, &Snapshot::initial(Some(501), None)).unwrap();
         for copy in [Copy::A, Copy::B] {
             let d = e.deadline();
             assert_eq!(
@@ -2813,7 +2813,7 @@ fn stuck_leave_retains_an_acquisition_whose_completion_was_rejected() {
 #[test]
 fn fresh_leave_without_inputs_or_storage_never_installs_enforcement() {
     for storage in [false, true] {
-        let mut p = fixture(&Snapshot::initial(Some(501)));
+        let mut p = fixture(&Snapshot::initial(Some(501), None));
         p.inject(Call::Install, 1, Fault::ReadFail);
         if storage {
             p.inject_persistent(Call::Write(Copy::A), Fault::WriteFail);
@@ -2884,7 +2884,7 @@ fn timing_hold_prefix_read_failures_retry_each_second_without_flushing() {
 fn pair_repair_create_failures_resume_after_storage_recovers() {
     for copy in [Copy::A, Copy::B] {
         for fault in [Fault::NoSpace, Fault::FailedDurable, Fault::WriteHang] {
-            let mut p = fixture(&Snapshot::initial(Some(501)));
+            let mut p = fixture(&Snapshot::initial(Some(501), None));
             p.mutate(Mutation::MissingCopy(copy));
             p.inject(Call::Create(copy), 1, fault);
             let mut e = Engine::start(p).unwrap();
@@ -4099,7 +4099,7 @@ fn stuck_without_join_intent_never_loads_emergency() {
 
 #[test]
 fn internal_error_skips_unpersisted_startup_join_replay() {
-    let mut snapshot = Snapshot::initial(Some(501));
+    let mut snapshot = Snapshot::initial(Some(501), None);
     snapshot.internal_error = Some(snapshot::InternalError::Other);
     snapshot
         .requests
@@ -5360,7 +5360,7 @@ fn image_upgrade_retains_spawned_build_after_crash_and_pin_replacement() {
 
 #[test]
 fn image_proven_reboot_resets_and_persists_history() {
-    let mut snapshot = Snapshot::initial(Some(501));
+    let mut snapshot = Snapshot::initial(Some(501), None);
     let mut p = fixture(&snapshot);
     snapshot.image_history = snapshot::ImageHistory::empty_for_boot(p.boot.clone().unwrap());
     snapshot.image_history.record([44; 16]);
@@ -5406,3 +5406,5 @@ fn image_sweep_and_leave_require_all_pin_uuids() {
     assert!(e.verify_clear_intent().is_ok());
     assert_eq!(e.platform.signals, []);
 }
+
+mod r3b_fix1;

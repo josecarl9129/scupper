@@ -46,7 +46,7 @@ mod tests;
 
 /// Foreground child pin; setup qualification must verify its ownership and hash.
 pub const CHILD_PATH: &str = "/opt/scupper/wireguard-go";
-const PINNED_TOOLS: [&str; 4] = [
+pub(crate) const PINNED_TOOLS: [&str; 4] = [
     "/sbin/pfctl",
     "/sbin/route",
     "/usr/sbin/scutil",
@@ -450,9 +450,6 @@ impl<P: Platform> Engine<P> {
             }
         };
         let committed = snapshot.clone();
-        if snapshot.image_history.boot.is_none() {
-            snapshot.image_history.boot = snapshot.helper.as_ref().and_then(|h| h.boot.clone());
-        }
         snapshot.image_history.observe_boot(platform.boot_id());
         let bytes = snapshot::encode(seq, &snapshot).ok();
         let invalid = bytes.is_none() || snapshot.validate().is_err();

@@ -1,9 +1,64 @@
 //! Portable evidence checks shared by the native base and smoke cells.
+use crate::snapshot::{BootId, ImageHistory};
 use crate::{
     decode::proc,
     platform::{Enumeration, ProcInfo, ProcState, ProcessError, SysError},
 };
 use serde_json::Value;
+
+// Classification uses the engine's predicate; these labels only explain a
+// withheld result under the explicitly synthetic fresh-install history.
+// The caller must establish its current boot before collecting any census.
+pub(super) fn census_classification(
+    proc: &crate::platform::ProcInfo,
+    history: &ImageHistory,
+    boot: Option<&BootId>,
+    pins: &[(String, [u8; 16])],
+    pin_uuids: Option<&[[u8; 16]]>,
+) -> String {
+    debug_assert!(
+        history.known_on(boot),
+        "census requires a proven current boot"
+    );
+    if crate::platform::provably_foreign(proc, history, boot, pin_uuids) {
+        return "foreign (synthetic empty history)".into();
+    }
+    let Some(image) = proc.image.filter(|i| i.uuid != [0; 16] && i.uniqueid != 0) else {
+        return "withheld: image unknown".into();
+    };
+    if pin_uuids.is_none() {
+        return "withheld: pins unknown".into();
+    }
+    if let Some((path, _)) = pins.iter().find(|(_, uuid)| *uuid == image.uuid) {
+        return format!("withheld: equals pin {path}");
+    }
+    if history.uuids.contains(&image.uuid) {
+        return "withheld: equals history".into();
+    }
+    "withheld: name".into()
+}
+
+pub(super) fn withheld_persistent_pathless(census: &[Value], complete: usize) -> Vec<String> {
+    let mut withheld = Vec::new();
+    let mut persistent = std::collections::BTreeMap::<String, (usize, bool)>::new();
+    for entry in census {
+        if entry["source"] != "complete_inventory" {
+            continue;
+        }
+        let key = format!("{}:{}", entry["pid"], entry["start"]);
+        let (count, foreign) = persistent.entry(key).or_insert((0, true));
+        *count += 1;
+        *foreign &= entry["classification"] == "foreign (synthetic empty history)";
+    }
+    for (identity, (count, foreign)) in persistent {
+        if count * 10 >= complete * 9 && !foreign {
+            withheld.push(format!(
+                "persistent pathless {identity} withheld ({count}/{complete} Complete inventories)"
+            ));
+        }
+    }
+    withheld
+}
 
 pub(super) fn compare_process_layout(
     abi: &Value,
@@ -162,5 +217,78 @@ mod tests {
         assert!(inventory(&Enumeration::Complete(list), Oracle::Stopped(123)).is_err());
         assert!(inventory(&Enumeration::Complete(Vec::new()), Oracle::Stopped(123)).is_err());
         Ok(())
+    }
+    #[test]
+    fn census_labels_use_engine_foreign_predicate() -> Result<(), Box<dyn std::error::Error>> {
+        let boot = BootId::try_from("01234567-89AB-CDEF-0123-456789ABCDEF")?;
+        let mut history = ImageHistory::empty_for_boot(boot.clone());
+        let mut proc = proc::records(include_bytes!(
+            "../../tests/fixtures/macos/layout/kinfo_proc.bin"
+        ))?
+        .remove(0);
+        proc.image = Some(crate::platform::ImageId {
+            uuid: [3; 16],
+            uniqueid: 42,
+        });
+        proc.name = Some("foreign".into());
+        let pins = [("/sbin/pfctl".into(), [2; 16])];
+        let label = |p: &ProcInfo, h: &ImageHistory| {
+            census_classification(p, h, Some(&boot), &pins, Some(&[[2; 16]]))
+        };
+        assert_eq!(label(&proc, &history), "foreign (synthetic empty history)");
+        assert_eq!(
+            census_classification(&proc, &history, Some(&boot), &pins, None),
+            "withheld: pins unknown"
+        );
+        history.record([3; 16]);
+        assert_eq!(label(&proc, &history), "withheld: equals history");
+        history = ImageHistory::empty_for_boot(boot.clone());
+        proc.name = Some("wireguard-go".into());
+        assert_eq!(label(&proc, &history), "withheld: name");
+        proc.image.as_mut().ok_or("image absent")?.uuid = [2; 16];
+        assert_eq!(label(&proc, &history), "withheld: equals pin /sbin/pfctl");
+        proc.image = None;
+        assert_eq!(label(&proc, &history), "withheld: image unknown");
+        Ok(())
+    }
+
+    #[test]
+    fn persistent_pathless_threshold_counts_complete_inventories_and_exact_identity() {
+        let entries = |count, start, classification| {
+            (0..count)
+                .map(|iteration| {
+                    json!({"source": "complete_inventory", "pid": 777, "start": [start, 0],
+                "iteration": iteration, "classification": classification})
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            withheld_persistent_pathless(&entries(44, 1, "withheld: name"), 50),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            withheld_persistent_pathless(&entries(45, 1, "withheld: name"), 50).len(),
+            1
+        );
+        assert_eq!(
+            withheld_persistent_pathless(&entries(50, 1, "foreign (synthetic empty history)"), 50),
+            Vec::<String>::new()
+        );
+        let mut changed = entries(30, 1, "withheld: name");
+        changed.extend(entries(30, 2, "withheld: name"));
+        assert_eq!(
+            withheld_persistent_pathless(&changed, 50),
+            Vec::<String>::new()
+        );
+        for entry in &mut changed {
+            entry["source"] = json!("independent_census");
+        }
+        assert_eq!(
+            withheld_persistent_pathless(&changed, 50),
+            Vec::<String>::new()
+        );
+        let mut mixed = entries(50, 1, "foreign (synthetic empty history)");
+        mixed[0]["classification"] = json!("withheld: pins unknown");
+        assert_eq!(withheld_persistent_pathless(&mixed, 50).len(), 1);
     }
 }

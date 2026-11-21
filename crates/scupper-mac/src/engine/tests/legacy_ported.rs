@@ -209,7 +209,7 @@ fn snapshot_hold_round_trips_and_requires_intent_or_leaving() {
             leave_requested: leaving,
             ..Durable::default()
         };
-        let mut snapshot = Snapshot::initial(Some(501));
+        let mut snapshot = Snapshot::initial(Some(501), None);
         snapshot.machine = DurableRecord::try_from(&durable).unwrap();
         let bytes = snapshot::encode(1, &snapshot).unwrap();
         let CopyClass::V { snapshot, .. } =
@@ -219,11 +219,11 @@ fn snapshot_hold_round_trips_and_requires_intent_or_leaving() {
         };
         assert_eq!(snapshot.validate().unwrap(), durable);
     }
-    let mut snapshot = Snapshot::initial(Some(501));
+    let mut snapshot = Snapshot::initial(Some(501), None);
     snapshot.machine.hold = true;
     assert!(snapshot.validate().is_err());
     assert!(snapshot::encode(1, &snapshot).is_err());
-    let mut value = serde_json::to_value(Snapshot::initial(None)).unwrap();
+    let mut value = serde_json::to_value(Snapshot::initial(None, None)).unwrap();
     value["machine"].as_object_mut().unwrap().remove("hold");
     assert!(serde_json::from_value::<Snapshot>(value).is_err());
 }

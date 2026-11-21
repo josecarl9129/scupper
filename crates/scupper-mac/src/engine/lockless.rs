@@ -205,9 +205,6 @@ impl<P: Platform> Engine<P> {
             ),
         };
         let committed = state.clone();
-        if state.image_history.boot.is_none() {
-            state.image_history.boot = state.helper.as_ref().and_then(|h| h.boot.clone());
-        }
         state.image_history.observe_boot(self.platform.boot_id());
         self.previous_helper = match state.helper.clone() {
             Some(helper) => platform::PreviousHelper::Known(helper),

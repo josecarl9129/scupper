@@ -222,7 +222,7 @@ mod fake_contracts {
             let d = Deadline(p.now() + 1);
             assert!(p.poll_copy(Copy::B, d).is_pending());
             p.abandon_storage_read();
-            let bytes = snapshot::encode(1, &Snapshot::initial(Some(501))).unwrap();
+            let bytes = snapshot::encode(1, &Snapshot::initial(Some(501), None)).unwrap();
             let d = Deadline(p.now() + 5);
             assert_eq!(p.create_copy(Copy::A, &bytes, d), WriteOutcome::Synced);
             p.calls.clear();
@@ -688,7 +688,7 @@ mod fake_contracts {
     #[test]
     fn copy_rot_selects_valid_b_and_repairs_a() -> Result<(), Box<dyn std::error::Error>> {
         let mut p = seeded()?;
-        let encoded = snapshot::encode(1, &Snapshot::initial(Some(501)))?;
+        let encoded = snapshot::encode(1, &Snapshot::initial(Some(501), None))?;
         assert_eq!(commit(&mut p, &encoded), Commit::Committed);
         p.mutate(Mutation::CopyRot(Copy::A));
         let d = limit(&mut p);
@@ -954,7 +954,7 @@ mod fake_contracts {
     #[test]
     fn copy_retry_returns_u_after_three_or_v_on_third_attempt()
     -> Result<(), Box<dyn std::error::Error>> {
-        let encoded = snapshot::encode(1, &Snapshot::initial(None))?;
+        let encoded = snapshot::encode(1, &Snapshot::initial(None, None))?;
         for failures in [2, 3] {
             let mut p = seeded()?;
             assert_eq!(commit(&mut p, &encoded), Commit::Committed);

@@ -742,7 +742,7 @@ fn rejected_ownership_never_signals_a_stuck_leave_writer() {
 
 #[test]
 fn prior_fallback_load_keeps_slow_left_handoff_reads_contained() {
-    let mut p = fixture(&Snapshot::initial(Some(501)));
+    let mut p = fixture(&Snapshot::initial(Some(501), None));
     p.inject(Call::AcquireInstanceLock, 1, Fault::ReadFail);
     p.inject(Call::Read(Copy::A), 1, Fault::ReadFail);
     let mut e = Engine::start(p).unwrap();

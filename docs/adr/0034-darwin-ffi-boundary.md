@@ -80,7 +80,8 @@ journal discipline; these children make no network or firewall mutations.
 macOS continues to return `ProcInfo.exe = None` (OD4 A). For ENOENT from
 `proc_pidpath`, read flavor 17 `proc_uniqidentifierinfo`, then re-lookup
 `KERN_PROC_PID` for the enumeration's exact `(pid, start)`, then repeat flavor
-17. Require identical nonzero UUID, uniqueid and exec-sensitive idversion.
+17. Require identical nonzero UUID, uniqueid and exec-sensitive idversion, and
+require the re-lookup name, pgid and ppid to equal the listed fields.
 Any failed/short read or bracket mismatch is Incomplete with the live PID;
 confirmed vanishing and zombies retain the existing rules. `p_idversion` is
 in the flavor-17 API record at offset 32; neither public `proc_bsdinfo` nor
@@ -101,12 +102,35 @@ A translated foreign process is compared by its own main-image UUID only.
 Snapshot family/format 2 adds boot-scoped spawned-image history, bounded to eight
 distinct UUIDs. Missing, unreadable, corrupt and format-1 history is unknown,
 never empty. Overflow marks the boot unknown and never evicts a UUID silently.
-Only proof of a different boot resets it to empty-known. Unavailable or disagreeing
-copies revoke history certainty even when the lifecycle start table can trust one
+An independently proven fresh installation may write `Snapshot::initial(owner_uid,
+boot)` as known-empty for a proven boot. Only the installer may write it, after
+proving no existing storage or install record; durable initialisation completes
+before enabling the helper. Retries preserve existing state and never overwrite
+it with `initial`. Owned children exec `/opt/scupper/wireguard-go`, `p_comm`
+cannot be changed by the process, and wireguard-go never execs: the name guard
+is a load-bearing backstop if the fresh-install proof or a mismatch-history
+commit fails.
+
+After Recovery, a torn pre-spawn commit (disagreeing or unreadable copies), or
+a format-1 upgrade, history is unknown on the currently observed boot (the
+uncertainty epoch). Sweeps stay Incomplete until reboot while any foreign
+pathless process exists; there is no same-boot reset. An unreadable boot leaves
+no epoch. A helper record's boot cannot supply this epoch: Recovery can prefer
+an older valid copy's helper, so that provenance can roll back. Only a later
+different proven boot resets unknown history to known-empty. On rollback, a
+format-1 helper reads v2 copies as invalid and enters Recovery (L10).
+Unavailable or disagreeing copies revoke history certainty even when the lifecycle start table can trust one
 copy. Current tool pins also participate in negative comparisons during ordinary
 sweeps and Leave; they gain no new ownership matches. Before spawn the engine
 commits the pin UUID; write failure forbids spawn. An unexpected post-spawn UUID
-is recorded durably, the exact child is killed, and spawn fails. R4 must report
+is recorded durably, the exact child is killed, and spawn fails. A failed commit
+enters the normal PersistBlocked/Stuck path; an unconfirmed kill retains the
+child and requires a sweep. Failed or timed-out spawn also re-reads the child
+pin and durably records a changed UUID (or revokes certainty if unreadable)
+before trusting another sweep. Pin reads use O_NONBLOCK, O_NOFOLLOW and bounded
+preads: fat header/table, each native slice header, then at most 1 MiB of load
+commands, checking the deadline between reads. Fat arm64 slices must still agree;
+no implicit arm64e subtype preference is introduced. R4 must report
 the child's observed main-image identity and reject translated (Rosetta) owned
 children via `proc_translated`/`P_TRANSLATED`. The read-only pin parser supports
 thin arm64/arm64e and accepts fat files only when all native arm64 slices agree.

@@ -153,6 +153,19 @@ class ArtifactTests(unittest.TestCase):
         self.assertIn("quarantined", (self.root / "Q-SMOKE.json").read_text())
 
 
+    def test_built_capabilities_and_qproc_require_executed_manifest(self):
+        for name in ["built-capability-sha256.txt", "wireguard-sha256.txt",
+                     "base-churn-sha256.txt", "base-image-sha256.txt", "Q-PROC.json",
+                     "base-processes.json", "base-pin-images.json", "base-stopped-inventory.json",
+                     "base-images.json", "proc-churn.json"]:
+            with self.subTest(name=name):
+                path = self.root / name
+                path.write_text(f"{SHA256}  /fixture/base-churn\n")
+                result = self.check()
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("executed-capability-sha256.txt", result.stderr)
+                path.unlink()
+
     def test_staged_base_churn_counts_as_built_capability(self):
         (self.root / "built-capability-sha256.txt").write_text(f"{SHA256}  qual-out/probe-pf-starters\n")
         (self.root / "wireguard-sha256.txt").write_text(f"{SHA256}  qual-out/wireguard-go\n")

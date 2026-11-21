@@ -135,6 +135,19 @@ impl<P: Platform> Engine<P> {
                 let child = match self.platform.spawn(generation, CHILD_SPAWN_ATTRIBUTES, d) {
                     Ok(child) => child,
                     Err(error) => {
+                        // An exec may have raced a pin replacement even if spawn
+                        // failed or timed out. Preserve both builds before a sweep.
+                        let d = self.deadline();
+                        match self
+                            .platform
+                            .image_uuid(std::path::Path::new(CHILD_PATH), d)
+                        {
+                            Ok(observed) => self.snapshot.image_history.record(observed),
+                            Err(_) => self.snapshot.image_history.known = false,
+                        }
+                        if !self.commit_if_changed() {
+                            return Err(SysError::Failed("image history write failed"));
+                        }
                         self.confirm_sweep();
                         return Err(error);
                     }
@@ -145,12 +158,24 @@ impl<P: Platform> Engine<P> {
                 {
                     if let Some(image) = child.image {
                         self.snapshot.image_history.record(image.uuid);
+                    } else {
+                        self.snapshot.image_history.known = false;
                     }
-                    // Attempt the durable unexpected-build record before termination.
-                    // A failed write still kills the exact child and fails closed.
-                    let _ = self.commit_if_changed();
+                    // Keep an unconfirmed child for normal cleanup. The immutable
+                    // wireguard-go p_comm guard is load-bearing if the record fails.
+                    self.child = Some(child.clone());
+                    self.last_sweep = Some(crate::platform::Sweep::Incomplete(
+                        SysError::Failed("spawn image mismatch; sweep required").into(),
+                    ));
+                    let committed = self.commit_if_changed();
                     let d = self.deadline();
-                    let _ = self.platform.kill_process(child.pid, child.start_time, d);
+                    let killed = self.platform.kill_process(child.pid, child.start_time, d);
+                    if !committed {
+                        return Err(SysError::Failed("image history write failed"));
+                    }
+                    if killed.is_err() {
+                        return Err(SysError::Failed("spawn image mismatch; kill unconfirmed"));
+                    }
                     return Err(SysError::Failed("spawn image mismatch"));
                 }
                 let tunnel = Tunnel {

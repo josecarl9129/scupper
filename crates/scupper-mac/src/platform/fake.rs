@@ -151,6 +151,13 @@ pub enum Fault {
         /// Whether a child was created.
         child: bool,
     },
+    /// A pin replacement races spawn, which fails or times out after an exec.
+    SpawnPinChange {
+        /// New pin UUID, or unreadable replacement.
+        uuid: Option<[u8; 16]>,
+        /// Leave an unconfirmed child and return a timeout.
+        timeout: bool,
+    },
     /// Entry exits during lookup; own children remain zombies until reaped.
     ExitRace(u32),
     /// Delay process exit by this many 50 ms ticks.
@@ -2237,7 +2244,17 @@ impl Platform for FakePlatform {
         attributes: SpawnAttributes,
         deadline: Deadline,
     ) -> Result<Child, SysError> {
-        let fault = self.begin(Call::Spawn);
+        let fault = match self.begin(Call::Spawn) {
+            Some(Fault::SpawnPinChange { uuid, timeout }) => {
+                self.image_uuids.insert(CHILD_PATH.into(), uuid);
+                Some(if timeout {
+                    Fault::SpawnHang { child: true }
+                } else {
+                    Fault::ReadFail
+                })
+            }
+            fault => fault,
+        };
         self.spawn_attributes.push(attributes);
         if self.expired(deadline) {
             return Err(SysError::TimedOut);
@@ -2258,7 +2275,7 @@ impl Platform for FakePlatform {
         }
         let pid = self.allocate_pid();
         let start = self.process_start();
-        let image = self.spawn_image.or_else(|| {
+        let image = self.spawn_image.take().or_else(|| {
             let uuid = self.image_uuid(Path::new(CHILD_PATH), deadline).ok()?;
             Some(super::ImageId {
                 uuid,

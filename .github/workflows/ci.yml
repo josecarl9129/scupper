@@ -256,12 +256,12 @@ jobs:
             target
           key: native-${{ matrix.runner }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
       - uses: actions/setup-go@v5
-        if: matrix.group == 'probe' || matrix.group == 'probe-hijack'
+        if: matrix.group != 'smoke'
         with:
           go-version: '1.27.4'
           cache: false
       - name: Build pinned upstream wireguard-go
-        if: matrix.group == 'probe' || matrix.group == 'probe-hijack'
+        if: matrix.group != 'smoke'
         timeout-minutes: 3
         env:
           GOTOOLCHAIN: local

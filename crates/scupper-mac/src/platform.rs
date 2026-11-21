@@ -46,6 +46,12 @@
 //! a UUID different from every history/pin UUID, and a name other than wireguard-go.
 //! Otherwise uncertainty withholds sweep/quiescence with its PID. A foreign
 //! pathless process sharing a recorded or pinned build UUID blocks until it exits.
+//! After Recovery, a torn pre-spawn commit (disagreeing or unreadable copies),
+//! or a format-1 upgrade, history is unknown on the currently observed boot.
+//! Sweeps stay Incomplete until reboot while any foreign pathless process exists;
+//! there is no same-boot reset. An unreadable boot leaves no uncertainty epoch.
+//! A format-1 helper reads v2 copies as invalid and enters Recovery on rollback.
+//! Only an independently proven fresh install may start with known-empty history.
 //! A translated foreign process is compared by its own main-image UUID only.
 //! A survivor still parented to a lingering old helper (ppid != 1) is not matched
 //! by ambiguity. Name matching only withholds the fence; it never owns a process.
@@ -821,7 +827,7 @@ fn sweep_matching(
             pin_uuids.as_deref(),
             |proc, procs| {
                 // Only otherwise-unmatched candidates can hide a pinned process.
-                select(proc, procs).is_none()
+                proc.pid != own.pid && select(proc, procs).is_none()
             },
         ) {
             Enumeration::Incomplete(e) => {

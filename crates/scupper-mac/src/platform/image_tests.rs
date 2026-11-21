@@ -241,3 +241,20 @@ fn image_additional_pins_only_withhold_and_never_select() -> Result<(), SysError
     assert_eq!(p.signals, []);
     Ok(())
 }
+
+#[test]
+fn image_pathless_self_is_excluded_from_foreign_predicate() -> Result<(), SysError> {
+    let (mut p, mut h) = fixture()?;
+    p.procs.remove(&777);
+    h.known = false;
+    let own = p.procs.get_mut(&p.helper.pid).ok_or(SysError::Unknown)?;
+    own.path = None;
+    own.exe = None;
+    own.image = Some(ImageId {
+        uuid: [44; 16],
+        uniqueid: 44,
+    });
+    assert_eq!(run(&mut p, &h), Sweep::Swept);
+    assert_eq!(p.signals, []);
+    Ok(())
+}

@@ -104,7 +104,7 @@ fn recovery_pair_commit_retains_full_write_budget() {
 
 #[test]
 fn lockless_join_reports_lock_refusal_before_mode_refusal() {
-    let mut p = fixture(&Snapshot::initial(Some(501)));
+    let mut p = fixture(&Snapshot::initial(Some(501), None));
     p.inject_persistent(Call::AcquireInstanceLock, Fault::ReadFail);
     let mut e = Engine::start(p).unwrap();
     assert_eq!(
@@ -219,7 +219,7 @@ fn uncommitted_helper_masks_a_fresh_joined_proof() {
 
 #[test]
 fn repeated_lock_interrupts_back_off_even_without_clock_progress() {
-    let mut p = fixture(&Snapshot::initial(Some(501)));
+    let mut p = fixture(&Snapshot::initial(Some(501), None));
     p.inject_persistent(Call::AcquireInstanceLock, Fault::LockInterrupted);
     let mut e = Engine::start(p).unwrap();
     for _ in 0..20 {
@@ -232,7 +232,7 @@ fn repeated_lock_interrupts_back_off_even_without_clock_progress() {
 }
 
 fn lockless_writer() -> Engine<FakePlatform> {
-    let mut p = fixture(&Snapshot::initial(Some(501)));
+    let mut p = fixture(&Snapshot::initial(Some(501), None));
     p.inject_persistent(Call::AcquireInstanceLock, Fault::ReadFail);
     let mut e = Engine::start(p).unwrap();
     e.platform
@@ -279,7 +279,7 @@ fn lockless_cancellation_inventory_has_one_second_budget() {
 
 #[test]
 fn unequal_same_sequence_left_copies_require_containment() {
-    let a = Snapshot::initial(Some(501));
+    let a = Snapshot::initial(Some(501), None);
     let mut b = a.clone();
     b.owner_uid = Some(502);
     let mut p = fixture(&a);
@@ -341,7 +341,7 @@ fn repair_read_maintains_containment_during_storage_delay() {
 
 #[test]
 fn explicit_leave_clears_probe_only_error_retention() {
-    let mut state = Snapshot::initial(Some(501));
+    let mut state = Snapshot::initial(Some(501), None);
     state.internal_error = Some(snapshot::InternalError::Other);
     let mut e = Engine::start(fixture(&state)).unwrap();
     assert!(e.containment_cleanup_only);
@@ -403,7 +403,7 @@ fn ordinary_load_does_not_reuse_lockdown_readback_for_drift() {
 
 #[test]
 fn non_leave_record_does_not_claim_explicit_leave_cleanup() {
-    let mut state = Snapshot::initial(Some(501));
+    let mut state = Snapshot::initial(Some(501), None);
     state.internal_error = Some(snapshot::InternalError::Other);
     state
         .requests
@@ -422,7 +422,7 @@ fn non_leave_record_does_not_claim_explicit_leave_cleanup() {
 }
 
 pub(super) fn pre_persist_leaving() -> Snapshot {
-    let mut state = Snapshot::initial(Some(501));
+    let mut state = Snapshot::initial(Some(501), None);
     state.machine.leave_requested = true;
     state
         .requests
