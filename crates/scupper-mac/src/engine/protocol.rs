@@ -400,17 +400,43 @@ impl<P: Platform> Engine<P> {
             return Err(SysError::Failed("owned process inventory"));
         };
         let own = self.platform.incarnation();
+        let pin_uuids: Option<Vec<_>> = super::PINNED_TOOLS
+            .iter()
+            .map(Path::new)
+            .chain(std::iter::once(Path::new(CHILD_PATH)))
+            .map(|path| {
+                let d = self.deadline();
+                self.platform.image_uuid(path, d).ok()
+            })
+            .collect();
+        let boot = self.platform.boot_id();
+        let owned = |proc: &platform::ProcInfo| {
+            proc.path.as_deref() == Some(Path::new(CHILD_PATH))
+                || pin.is_some() && proc.exe == pin
+                || self
+                    .platform
+                    .spawned_children()
+                    .iter()
+                    .any(|child| child.pid == proc.pid && child.start_time == proc.start)
+        };
+        let qualified = platform::qualify_pathless(
+            Enumeration::Complete(processes),
+            pin.is_none(),
+            &self.snapshot.image_history,
+            boot.as_ref(),
+            pin_uuids.as_deref(),
+            |proc, _| proc.pid != own.pid && !owned(proc),
+        );
+        let Enumeration::Complete(processes) = qualified else {
+            if let Enumeration::Incomplete(error) = qualified {
+                self.last_sweep = Some(platform::Sweep::Incomplete(error));
+            }
+            return Err(SysError::Failed("owned process inventory"));
+        };
         if processes.iter().any(|proc| {
             proc.pid != own.pid
                 && (proc.state != platform::ProcState::Zombie || proc.ppid == own.pid)
-                && (proc.path.as_deref() == Some(Path::new(CHILD_PATH))
-                    || pin.is_some() && proc.exe == pin
-                    || self
-                        .platform
-                        .spawned_children()
-                        .iter()
-                        .any(|child| child.pid == proc.pid && child.start_time == proc.start)
-                    || pin.is_none() && proc.path.is_none() && proc.exe.is_none())
+                && owned(proc)
         }) {
             return Err(SysError::Failed("owned process"));
         }

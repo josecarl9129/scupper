@@ -7,10 +7,10 @@ use super::{
 };
 use crate::qual::base_check::{self, Oracle};
 use crate::{
-    decode::proc,
+    decode::{image, proc},
     native::{NativePlatform, Paths},
     platform::{Deadline, Enumeration, Platform, ProcState},
-    snapshot::BootId,
+    snapshot::{BootId, ImageHistory},
 };
 use std::process::{Child, Command, Stdio};
 
@@ -278,6 +278,16 @@ fn processes(out: &Path, platform: &mut NativePlatform, result: &mut CaseResult)
         match platform.processes(d) {
             Enumeration::Complete(list) => {
                 complete += 1;
+                for p in list
+                    .iter()
+                    .filter(|p| p.state != ProcState::Zombie && p.path.is_none())
+                {
+                    census.push(json!({"iteration": iteration, "source": "complete_inventory",
+                        "pid": p.pid, "ppid": p.ppid, "uid": scupper_darwin::proc_uid(p.pid).ok(),
+                        "p_comm": p.name, "start": [p.start.seconds, u64::from(p.start.microseconds)],
+                        "uuid": p.image.map(|i| hex_uuid(i.uuid)), "uniqueid": p.image.map(|i| i.uniqueid),
+                        "classification": "validated image; engine incomplete: history/pins unknown"}));
+                }
                 for p in &oracle {
                     if !list.iter().any(|got| {
                         i32::try_from(got.pid).ok() == Some(p.pid)
@@ -286,10 +296,13 @@ fn processes(out: &Path, platform: &mut NativePlatform, result: &mut CaseResult)
                         return Err(format!("Complete inventory missing oracle {}", p.pid).into());
                     }
                 }
-                if list
-                    .iter()
-                    .any(|p| p.exe.is_some() || (p.state != ProcState::Zombie && p.path.is_none()))
-                {
+                if list.iter().any(|p| {
+                    p.exe.is_some()
+                        || (p.state != ProcState::Zombie
+                            && p.path.is_none()
+                            && p.image
+                                .is_none_or(|image| image.uuid == [0; 16] || image.uniqueid == 0))
+                }) {
                     return Err("Complete violates OD4/pathless rule".into());
                 }
             }
@@ -317,7 +330,36 @@ fn processes(out: &Path, platform: &mut NativePlatform, result: &mut CaseResult)
                             .as_ref()
                             .is_some_and(|q| q.start == p.start && q.stat != 5)
                         {
-                            census.push(json!({"iteration": iteration, "pid": pid, "errno": error.raw_os_error()}));
+                            let d = Deadline(platform.now() + 2);
+                            let observed = platform.observe_image(pid, d);
+                            let mut history = ImageHistory::default();
+                            history.observe_boot(platform.boot_id());
+                            let image = observed
+                                .as_ref()
+                                .ok()
+                                .and_then(|p| p.as_ref())
+                                .and_then(|p| p.image);
+                            let classification = observed
+                                .as_ref()
+                                .ok()
+                                .and_then(|p| p.as_ref())
+                                .map_or("incomplete: bracket rejected", |p| {
+                                    if crate::platform::provably_foreign(
+                                        p,
+                                        &history,
+                                        history.boot.as_ref(),
+                                        None,
+                                    ) {
+                                        "foreign"
+                                    } else {
+                                        "incomplete: history/pin unknown"
+                                    }
+                                });
+                            census.push(json!({"iteration": iteration, "pid": pid, "ppid": p.ppid,
+                                "uid": scupper_darwin::proc_uid(pid).ok(), "p_comm": proc::name(&p.comm),
+                                "start": p.start, "errno": error.raw_os_error(),
+                                "uuid": image.map(|i| hex_uuid(i.uuid)), "uniqueid": image.map(|i| i.uniqueid),
+                                "classification": classification}));
                         }
                     }
                 }
@@ -379,6 +421,11 @@ fn processes(out: &Path, platform: &mut NativePlatform, result: &mut CaseResult)
     record_subcheck(
         path_changes(out, platform, until),
         "path changes",
+        &mut unqualified,
+    )?;
+    record_subcheck(
+        image_cases(out, platform, until),
+        "image UUID",
         &mut unqualified,
     )?;
     if incomplete
@@ -617,6 +664,177 @@ fn capture_processes(
     result.iterations = 1;
     result.detail = "consumed typed sysctl fields reconstructed as portable value fixtures; opaque fields zeroed".into();
     Ok(())
+}
+
+fn hex_uuid(uuid: [u8; 16]) -> String {
+    use std::fmt::Write as _;
+    uuid.into_iter()
+        .fold(String::with_capacity(32), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
+fn ready(out: &Path, output: &str, until: Duration) -> Result<()> {
+    loop {
+        if fs::read(out.join(output)).is_ok_and(|bytes| bytes.starts_with(b"ready-")) {
+            return Ok(());
+        }
+        if scupper_darwin::monotonic_raw() >= until {
+            return Err(environment_issue("image child readiness deadline"));
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+fn identifier(pid: u32) -> Result<image::Identifier> {
+    Ok(image::identifier(
+        &scupper_darwin::proc_identifier(pid).map_err(environment_issue)?,
+    )?)
+}
+#[allow(clippy::too_many_lines)] // Bounded unlink/classification and exec-race campaign with oracle guards.
+fn image_cases(out: &Path, platform: &mut NativePlatform, case_until: Duration) -> Result<()> {
+    let a = std::env::current_exe()?.with_file_name("base-image-a");
+    let b = a.with_file_name("base-image-b");
+    protected_path(&a, false)?;
+    protected_path(&b, false)?;
+    let d = Deadline(platform.now() + 2);
+    let uuid_a = platform.image_uuid(&a, d)?;
+    let uuid_b = platform.image_uuid(&b, d)?;
+    if uuid_a == uuid_b {
+        return Err("exec oracles unexpectedly share LC_UUID".into());
+    }
+    let scratch = out.join("unlinked-image");
+    fs::copy(&a, &scratch)?;
+    let child = Supervised::spawn(out, &scratch, &[], "image-unlink.log")?;
+    ready(
+        out,
+        "image-unlink.log",
+        case_until.min(scupper_darwin::monotonic_raw() + Duration::from_secs(2)),
+    )?;
+    fs::remove_file(&scratch)?;
+    retry_inventory(
+        out,
+        "base-image-inventory.json",
+        platform,
+        Oracle::Pathless(child.0.id()),
+        case_until,
+    )?;
+    let d = Deadline(platform.now() + 5);
+    let observed = platform
+        .observe_image(child.0.id(), d)
+        .map_err(|e| environment_issue(format!("image bracket: {e:?}")))?
+        .ok_or("image child vanished")?;
+    if observed.image.is_none_or(|i| i.uuid != uuid_a) {
+        return Err("unlinked image differs from parsed LC_UUID".into());
+    }
+    let boot = platform
+        .boot_id()
+        .ok_or_else(|| environment_issue("image case boot unknown"))?;
+    let mut history = ImageHistory::empty_for_boot(boot.clone());
+    history.record(uuid_a);
+    let same = crate::platform::provably_foreign(&observed, &history, Some(&boot), Some(&[uuid_b]));
+    history = ImageHistory::empty_for_boot(boot.clone());
+    history.record(uuid_b);
+    let different =
+        crate::platform::provably_foreign(&observed, &history, Some(&boot), Some(&[uuid_b]));
+    if same || !different {
+        return Err("negative-only history classification failed".into());
+    }
+    let inventory = Enumeration::Complete(vec![observed.clone()]);
+    let foreign = crate::platform::qualify_pathless(
+        inventory.clone(),
+        false,
+        &history,
+        Some(&boot),
+        Some(&[uuid_b]),
+        |_, _| true,
+    );
+    history.record(uuid_a);
+    let blocked = crate::platform::qualify_pathless(
+        inventory,
+        false,
+        &history,
+        Some(&boot),
+        Some(&[uuid_b]),
+        |_, _| true,
+    );
+    if !matches!(foreign, Enumeration::Complete(_))
+        || !matches!(blocked, Enumeration::Incomplete(ref e) if e.pid == Some(observed.pid))
+    {
+        return Err("engine pathless classification failed".into());
+    }
+    let mut rejected = 0;
+    let mut accepted = 0;
+    let mut measurements = Vec::new();
+    for iteration in 0..200 {
+        if scupper_darwin::monotonic_raw() >= case_until {
+            return Err(environment_issue("exec campaign case deadline"));
+        }
+        let trigger = out.join(format!("exec-trigger-{iteration}"));
+        let output = format!("exec-{iteration}.log");
+        let child = Supervised::spawn(
+            out,
+            &a,
+            &[
+                b.to_str().ok_or("binary path")?,
+                trigger.to_str().ok_or("trigger path")?,
+            ],
+            &output,
+        )?;
+        let until = case_until.min(scupper_darwin::monotonic_raw() + Duration::from_secs(2));
+        ready(out, &output, until)?;
+        let before = identifier(child.0.id())?;
+        if before.image.uuid != uuid_a {
+            return Err("pre-exec oracle mismatch".into());
+        }
+        fs::write(&trigger, b"exec")?;
+        // Every attempt invokes the same ordered bracket as pathless enumeration.
+        // The final identifier distinguishes exec (same pid/start and uniqueid,
+        // changed idversion) from the initial image. Validate both pairings.
+        let mut saw_post = false;
+        while scupper_darwin::monotonic_raw() < until {
+            let first = identifier(child.0.id())?;
+            let d = Deadline(platform.now() + 2);
+            let entry = platform.observe_image_version(child.0.id(), d);
+            let last = identifier(child.0.id())?;
+            match entry {
+                Ok((Some(entry), Some(version))) if entry.image.is_some() => {
+                    accepted += 1;
+                    let image = entry.image.ok_or("missing image")?;
+                    if (version == before.idversion && image.uuid != uuid_a)
+                        || (version != before.idversion && image.uuid != uuid_b)
+                        || image.uniqueid != before.image.uniqueid
+                        || (first.idversion != before.idversion && image.uuid != uuid_b)
+                        || (last.idversion == before.idversion && image.uuid != uuid_a)
+                        || ![uuid_a, uuid_b].contains(&image.uuid)
+                    {
+                        return Err(
+                            "exec bracket paired pre-exec UUID with post-exec identity".into()
+                        );
+                    }
+                }
+                Err(_) => rejected += 1,
+                _ => return Err("exec child unexpectedly vanished or lacked image".into()),
+            }
+            if last.image.uuid == uuid_b {
+                saw_post = true;
+                break;
+            }
+        }
+        fs::remove_file(trigger)?;
+        if !saw_post {
+            return Err(environment_issue("exec transition not observed"));
+        }
+        measurements.push(
+            json!({"iteration": iteration, "pid": child.0.id(), "pre_idversion": before.idversion}),
+        );
+    }
+    write_json(
+        out,
+        "base-images.json",
+        &json!({"uuid_a": hex_uuid(uuid_a), "uuid_b": hex_uuid(uuid_b),
+        "unlink_pid": observed.pid, "same_history": "incomplete", "unrelated_history": "foreign",
+        "exec_iterations": 200, "accepted": accepted, "bracket_rejections": rejected, "measurements": measurements}),
+    )
 }
 
 #[cfg(test)]

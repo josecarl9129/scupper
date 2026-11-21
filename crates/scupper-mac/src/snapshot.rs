@@ -16,9 +16,9 @@ use std::{fmt, marker::PhantomData, net::SocketAddrV4, ops::Deref};
 /// Physical size of each independently stored copy.
 pub const COPY_BYTES: usize = 16 * 1024;
 /// Snapshot signature, including its family version.
-pub const MAGIC: [u8; 8] = *b"SCPMACS\x01";
+pub const MAGIC: [u8; 8] = *b"SCPMACS\x02";
 /// Supported storage format.
-pub const FORMAT: u32 = 1;
+pub const FORMAT: u32 = 2;
 /// Largest JSON body that fits with the header and digest.
 pub const BODY_MAX: usize = COPY_BYTES - 24 - 32;
 /// Exclusive upper limit for persistent counters.
@@ -314,6 +314,59 @@ pub enum InternalError {
     /// Another internal failure.
     Other,
 }
+/// Maximum distinct spawned builds retained per boot. Overflow loses certainty.
+pub const IMAGE_HISTORY_BOUND: usize = 8;
+/// Durable negative-evidence history. Default/missing history is unknown, never empty.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImageHistory {
+    /// Boot to which these observations belong; unknown boot grants no evidence.
+    pub boot: Option<BootId>,
+    /// Whether every spawned build on this boot is represented.
+    pub known: bool,
+    /// Bounded set of observed builds, retained even after certainty is lost.
+    pub uuids: BoundedVec<[u8; 16], IMAGE_HISTORY_BOUND>,
+}
+impl ImageHistory {
+    /// Empty-known history requires independent evidence of a new boot.
+    #[must_use]
+    pub fn empty_for_boot(boot: BootId) -> Self {
+        Self {
+            boot: Some(boot),
+            known: true,
+            uuids: BoundedVec::default(),
+        }
+    }
+    /// Only a proven different boot resets history. An unknown lookup revokes
+    /// certainty while retaining the previous boot for a later reboot proof.
+    pub fn observe_boot(&mut self, boot: Option<BootId>) {
+        if let Some(boot) = boot {
+            if self.boot.as_ref().is_some_and(|old| *old != boot) {
+                *self = Self::empty_for_boot(boot);
+            } else {
+                self.boot = Some(boot);
+            }
+        } else {
+            self.known = false;
+        }
+    }
+    /// Add before spawning, and after unexpected observed images. Never evict a
+    /// build to make room: overflow makes the entire boot's history unknown.
+    pub fn record(&mut self, uuid: [u8; 16]) {
+        if uuid == [0; 16] {
+            self.known = false;
+            return;
+        }
+        if !self.uuids.contains(&uuid) && self.uuids.try_push(uuid).is_err() {
+            self.known = false;
+        }
+    }
+    /// Certainty is usable only with a currently proven matching boot.
+    #[must_use]
+    pub fn known_on(&self, boot: Option<&BootId>) -> bool {
+        self.known && boot.is_some() && self.boot.as_ref() == boot
+    }
+}
 /// One complete bounded authoritative storage model.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -330,6 +383,8 @@ pub struct Snapshot {
     pub helper: Option<HelperIncarnation>,
     /// Durable request replay window.
     pub requests: BoundedVec<RequestRecord, 8>,
+    /// Spawned image evidence, retained until a different boot is proven.
+    pub image_history: ImageHistory,
     /// Failure recorded on entry to Stuck.
     pub internal_error: Option<InternalError>,
 }
@@ -345,6 +400,7 @@ impl Snapshot {
             helper: None,
             requests: BoundedVec::default(),
             internal_error: None,
+            image_history: ImageHistory::default(),
         }
     }
     /// Conservative Recovery accounting: two potentially live unknown acquisitions.
@@ -378,6 +434,7 @@ impl Snapshot {
             helper,
             requests: BoundedVec::default(),
             internal_error: None,
+            image_history: ImageHistory::default(),
         }
     }
     /// Validate core facts and the exact, canonical annotation multiset.
@@ -386,6 +443,16 @@ impl Snapshot {
     /// Rejects invalid core state, exhausted counters, and mismatched evidence.
     pub fn validate(&self) -> Result<Durable, SnapshotError> {
         let durable = self.machine.to_core().map_err(|_| SnapshotError::Machine)?;
+        if self.image_history.known && self.image_history.boot.is_none()
+            || self
+                .image_history
+                .uuids
+                .iter()
+                .enumerate()
+                .any(|(i, uuid)| *uuid == [0; 16] || self.image_history.uuids[..i].contains(uuid))
+        {
+            return Err(SnapshotError::Invalid);
+        }
         if self.requests.iter().any(|r| counter(r.id).is_err()) {
             return Err(SnapshotError::Counter);
         }
@@ -526,6 +593,35 @@ pub enum CopyClass {
     /// Unreadable.
     U,
 }
+// Separate strict previous-format mirror: defaults on the current Snapshot
+// would silently turn a missing v2 history into a valid v2 record.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacySnapshot {
+    owner_uid: Option<u32>,
+    machine: DurableRecord,
+    references: [Option<RefEvidence>; 2],
+    endpoint: Option<SocketAddrV4>,
+    helper: Option<HelperIncarnation>,
+    requests: BoundedVec<RequestRecord, 8>,
+    internal_error: Option<InternalError>,
+}
+fn migrate_legacy(bytes: &[u8]) -> Option<Snapshot> {
+    let old: LegacySnapshot = serde_json::from_slice(bytes).ok()?;
+    if serde_json::to_vec(&old).ok()? != bytes {
+        return None;
+    }
+    Some(Snapshot {
+        owner_uid: old.owner_uid,
+        machine: old.machine,
+        references: old.references,
+        endpoint: old.endpoint,
+        helper: old.helper,
+        requests: old.requests,
+        internal_error: old.internal_error,
+        image_history: ImageHistory::default(),
+    })
+}
 /// Classify without trusting torn or unknown-format headers.
 /// Padding is outside the checksum: nonzero padding is a semantic error (I).
 #[must_use]
@@ -535,10 +631,13 @@ pub fn classify_copy(read: CopyRead) -> CopyClass {
         CopyRead::Unreadable => return CopyClass::U,
         CopyRead::Bytes(bytes) => bytes,
     };
-    if bytes.len() != COPY_BYTES || bytes[..8] != MAGIC {
+    let old = bytes.len() == COPY_BYTES
+        && bytes[..8] == *b"SCPMACS\x01"
+        && bytes[8..12] == 1_u32.to_le_bytes();
+    if bytes.len() != COPY_BYTES || (bytes[..8] != MAGIC && !old) {
         return CopyClass::T;
     }
-    if bytes[8..12] != FORMAT.to_le_bytes() {
+    if !old && bytes[8..12] != FORMAT.to_le_bytes() {
         return CopyClass::X;
     }
     let seq = u64::from_le_bytes(bytes[12..20].try_into().unwrap_or_default());
@@ -550,7 +649,20 @@ pub fn classify_copy(read: CopyRead) -> CopyClass {
     if Sha256::digest(&bytes[..end])[..] != bytes[end..end + 32] {
         return CopyClass::T;
     }
-    if seq < COUNTER_MAX
+    if old
+        && seq < COUNTER_MAX
+        && bytes[end + 32..].iter().all(|b| *b == 0)
+        && let Some(snapshot) = migrate_legacy(&bytes[24..end])
+        && snapshot.validate().is_ok()
+    {
+        return CopyClass::V {
+            seq,
+            snapshot,
+            bytes,
+        };
+    }
+    if !old
+        && seq < COUNTER_MAX
         && bytes[end + 32..].iter().all(|b| *b == 0)
         && let Ok(snapshot) = serde_json::from_slice::<Snapshot>(&bytes[24..end])
         && snapshot.validate().is_ok()
@@ -588,7 +700,8 @@ pub enum StartDecision {
         seq: u64,
         /// Validated state.
         snapshot: Snapshot,
-        /// Slot to rewrite byte-for-byte.
+        /// Slot to repair before effects; history annotations may be downgraded
+        /// to unknown independently of the trusted lifecycle state.
         repair: Option<Copy>,
     },
     /// Persist a conservative Recovery snapshot before exposing effects.
@@ -599,9 +712,17 @@ pub enum StartDecision {
         helper: Option<HelperIncarnation>,
     },
 }
-/// Apply every row of the asymmetric A-first start table.
+/// Apply every row of the asymmetric A-first lifecycle start table. Image
+/// history requires agreement between both readable validated copies; otherwise
+/// its certainty is revoked independently of lifecycle trust.
 #[must_use]
 pub fn decide(a: CopyClass, b: CopyClass) -> StartDecision {
+    // A single surviving copy still drives the lifecycle start table, but
+    // absence from its history cannot certify a foreign build if the other
+    // copy is missing, unreadable, corrupt or disagrees about image history.
+    let consistent_history = matches!((&a, &b),
+        (CopyClass::V {snapshot: a, ..}, CopyClass::V {snapshot: b, ..})
+            if a.image_history == b.image_history);
     match (&a, &b) {
         (
             CopyClass::V {
@@ -610,16 +731,16 @@ pub fn decide(a: CopyClass, b: CopyClass) -> StartDecision {
             CopyClass::V {
                 seq: gb, bytes: bb, ..
             },
-        ) if ga == gb && ba == bb => return trust(a, Copy::A, None),
+        ) if ga == gb && ba == bb => return trust_history(a, Copy::A, None, consistent_history),
         (
             CopyClass::V { seq: ga, .. },
             CopyClass::V { seq: gb, .. } | CopyClass::I { seq: gb, .. },
-        ) if gb < ga => return trust(a, Copy::A, Some(Copy::B)),
+        ) if gb < ga => return trust_history(a, Copy::A, Some(Copy::B), consistent_history),
         (CopyClass::V { .. }, CopyClass::T | CopyClass::M | CopyClass::U | CopyClass::X) => {
-            return trust(a, Copy::A, Some(Copy::B));
+            return trust_history(a, Copy::A, Some(Copy::B), consistent_history);
         }
         (CopyClass::T | CopyClass::M | CopyClass::U, CopyClass::V { .. }) => {
-            return trust(b, Copy::B, Some(Copy::A));
+            return trust_history(b, Copy::B, Some(Copy::A), consistent_history);
         }
         _ => {}
     }
@@ -651,6 +772,18 @@ pub fn decide(a: CopyClass, b: CopyClass) -> StartDecision {
                 .map(|(_, h)| h.clone())
         });
     StartDecision::Recovery { seq, helper }
+}
+fn trust_history(
+    class: CopyClass,
+    source: Copy,
+    repair: Option<Copy>,
+    consistent: bool,
+) -> StartDecision {
+    let mut decision = trust(class, source, repair);
+    if !consistent && let StartDecision::Trust { snapshot, .. } = &mut decision {
+        snapshot.image_history.known = false;
+    }
+    decision
 }
 fn trust(class: CopyClass, source: Copy, repair: Option<Copy>) -> StartDecision {
     if let CopyClass::V { seq, snapshot, .. } = class {

@@ -183,7 +183,7 @@ impl<P: Platform> Engine<P> {
         let a = snapshot::classify_copy(self.read_locked_copy(Copy::A, contain));
         let b = snapshot::classify_copy(self.read_locked_copy(Copy::B, contain));
         let missing = [matches!(a, CopyClass::M), matches!(b, CopyClass::M)];
-        let (seq, state, repair, recovery) = match snapshot::decide(a, b) {
+        let (seq, mut state, repair, recovery) = match snapshot::decide(a, b) {
             StartDecision::Trust {
                 seq,
                 snapshot,
@@ -204,6 +204,11 @@ impl<P: Platform> Engine<P> {
                 true,
             ),
         };
+        let committed = state.clone();
+        if state.image_history.boot.is_none() {
+            state.image_history.boot = state.helper.as_ref().and_then(|h| h.boot.clone());
+        }
+        state.image_history.observe_boot(self.platform.boot_id());
         self.previous_helper = match state.helper.clone() {
             Some(helper) => platform::PreviousHelper::Known(helper),
             None if recovery || state.machine.hold => platform::PreviousHelper::Unknown,
@@ -220,7 +225,7 @@ impl<P: Platform> Engine<P> {
             });
         self.seq = seq;
         self.snapshot = state.clone();
-        self.committed = state;
+        self.committed = committed;
         let mut staging_failed = false;
         // Read-only uncertainty may have installed Lockdown over durable
         // Left. Once locked and fenced, normal Leave must remove our policy.

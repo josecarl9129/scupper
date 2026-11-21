@@ -15,6 +15,18 @@
 #include <sys/proc_info.h>
 #include <net/route.h>
 
+/* Public SDKs do not ship proc_info_private.h. This API wire declaration
+   is pinned to XNU bsd/sys/proc_info_private.h, proc_uniqidentifierinfo.
+   Neither proc_bsdinfo nor extern_proc exposes p_idversion. */
+struct proc_uniqidentifierinfo {
+    uint8_t p_uuid[16];
+    uint64_t p_uniqueid, p_puniqueid;
+    int32_t p_idversion, p_orig_ppidversion;
+    uint64_t p_reserve2, p_reserve3;
+};
+_Static_assert(sizeof(struct proc_uniqidentifierinfo) == 56, "identifier size");
+_Static_assert(offsetof(struct proc_uniqidentifierinfo, p_idversion) == 32, "exec version offset");
+
 #define BEGIN(type) printf("\"" #type "\":{\"size\":%zu,\"fields\":{", sizeof(struct type))
 #define FIELD(type, field) printf("\"" #field "\":%zu", offsetof(struct type, field))
 #define NEXT_FIELD(type, field) do { printf(",\"" #field "\":%zu", offsetof(struct type, field)); } while (0)
@@ -63,9 +75,13 @@ int main(int argc, char **argv) {
     NEXT_FIELD(kinfo_proc, kp_eproc.e_ppid); NEXT_FIELD(kinfo_proc, kp_eproc.e_pgid); END();
     printf(",\"MAXCOMLEN\":%d", MAXCOMLEN);
     printf(","); BEGIN(proc_bsdinfo);
-    FIELD(proc_bsdinfo, pbi_pid); NEXT_FIELD(proc_bsdinfo, pbi_ppid);
+    FIELD(proc_bsdinfo, pbi_uid); NEXT_FIELD(proc_bsdinfo, pbi_pid); NEXT_FIELD(proc_bsdinfo, pbi_ppid);
     NEXT_FIELD(proc_bsdinfo, pbi_pgid); NEXT_FIELD(proc_bsdinfo, pbi_comm);
     NEXT_FIELD(proc_bsdinfo, pbi_start_tvsec); NEXT_FIELD(proc_bsdinfo, pbi_start_tvusec); END();
+    printf(","); BEGIN(proc_uniqidentifierinfo);
+    FIELD(proc_uniqidentifierinfo, p_uuid);
+    NEXT_FIELD(proc_uniqidentifierinfo, p_uniqueid);
+    NEXT_FIELD(proc_uniqidentifierinfo, p_idversion); END();
     printf(","); BEGIN(proc_fdinfo);
     FIELD(proc_fdinfo, proc_fd); NEXT_FIELD(proc_fdinfo, proc_fdtype); END();
     printf(","); BEGIN(socket_fdinfo);

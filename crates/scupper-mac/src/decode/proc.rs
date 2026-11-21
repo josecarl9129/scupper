@@ -119,6 +119,7 @@ pub fn records(bytes: &[u8]) -> Result<Vec<ProcInfo>, SysError> {
                 name: name(&b[COMM..=COMM + MAXCOMLEN]),
                 path: None,
                 exe: None,
+                image: None,
             })
         })
         .collect()
@@ -173,6 +174,55 @@ pub fn resolve_path(
         error: SysError::Failed("native: live pathless process"),
     })?);
     Ok(Some(listed))
+}
+
+/// Run the ordered bracket. Keeping orchestration portable lets Linux tests
+/// audit the actual native read order, including the indispensable PID re-lookup.
+///
+/// # Errors
+/// Every failed live observation retains its PID. A vanished re-lookup wins.
+pub fn observe_image(
+    listed: ProcInfo,
+    mut read_identifier: impl FnMut() -> Option<super::image::Identifier>,
+    relookup: impl FnOnce() -> Result<Option<ProcInfo>, ProcessError>,
+) -> Result<Option<ProcInfo>, ProcessError> {
+    let first = read_identifier();
+    let current = relookup().map_err(|mut e| {
+        e.pid = Some(listed.pid);
+        e
+    })?;
+    let second = read_identifier();
+    resolve_image(listed, first, current, second)
+}
+
+/// Resolve a pathless image bracket: the PID re-lookup must follow the first
+/// identifier read and precede the second. PID/start reuse, exit and zombies
+/// retain the existing `resolve_path` semantics; every identifier failure stays
+/// incomplete for a confirmed live entry.
+///
+/// # Errors
+/// Reports the PID for failed/changed identifier reads; never attaches a UUID
+/// when the PID/start re-lookup was absent or inconsistent.
+pub fn resolve_image(
+    mut listed: ProcInfo,
+    first: Option<super::image::Identifier>,
+    current: Option<ProcInfo>,
+    second: Option<super::image::Identifier>,
+) -> Result<Option<ProcInfo>, ProcessError> {
+    // Resolve exit/reuse before interpreting image failures.
+    let resolved = resolve_path(listed.clone(), None, current);
+    if !matches!(&resolved, Err(e) if e.pid == Some(listed.pid)) {
+        return resolved;
+    }
+    if let (Some(first), Some(second)) = (first, second)
+        && first == second
+        && first.image.uuid != [0; 16]
+        && first.image.uniqueid != 0
+    {
+        listed.image = Some(first.image);
+        return Ok(Some(listed));
+    }
+    resolved
 }
 
 #[cfg(test)]
@@ -316,6 +366,94 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn image_bracket_orders_identifier_relookup_identifier() -> Result<(), ProcessError> {
+        use std::cell::RefCell;
+        let listed = records(include_bytes!(
+            "../../tests/fixtures/macos/layout/kinfo_proc.bin"
+        ))?
+        .remove(0);
+        let order = RefCell::new(Vec::new());
+        let id = super::super::image::Identifier {
+            image: crate::platform::ImageId {
+                uuid: [1; 16],
+                uniqueid: 42,
+            },
+            idversion: 7,
+        };
+        let got = observe_image(
+            listed.clone(),
+            || {
+                order.borrow_mut().push("image");
+                Some(id)
+            },
+            || {
+                order.borrow_mut().push("pid");
+                Ok(Some(listed.clone()))
+            },
+        )?;
+        assert!(got.is_some());
+        assert_eq!(*order.borrow(), ["image", "pid", "image"]);
+        assert_eq!(observe_image(listed, || Some(id), || Ok(None))?, None);
+        Ok(())
+    }
+    #[test]
+    fn image_bracket_rejects_exec_reuse_missing_and_changed_reads() -> Result<(), ProcessError> {
+        let listed = records(include_bytes!(
+            "../../tests/fixtures/macos/layout/kinfo_proc.bin"
+        ))?
+        .remove(0);
+        let first = super::super::image::Identifier {
+            image: crate::platform::ImageId {
+                uuid: [1; 16],
+                uniqueid: 42,
+            },
+            idversion: 7,
+        };
+        let accepted = resolve_image(
+            listed.clone(),
+            Some(first),
+            Some(listed.clone()),
+            Some(first),
+        )?
+        .ok_or(SysError::Unknown)?;
+        assert_eq!(accepted.image, Some(first.image));
+        assert_eq!(accepted.path, None);
+        for field in 0..3 {
+            let mut second = first;
+            match field {
+                0 => second.idversion += 1,
+                1 => second.image.uniqueid += 1,
+                _ => second.image.uuid = [2; 16],
+            }
+            assert!(
+                resolve_image(
+                    listed.clone(),
+                    Some(first),
+                    Some(listed.clone()),
+                    Some(second)
+                )
+                .is_err()
+            );
+        }
+        for (before, after) in [(None, Some(first)), (Some(first), None), (None, None)] {
+            assert!(resolve_image(listed.clone(), before, Some(listed.clone()), after).is_err());
+        }
+        assert_eq!(
+            resolve_image(listed.clone(), Some(first), None, Some(first))?,
+            None
+        );
+        let mut reused = listed.clone();
+        reused.start.microseconds += 1;
+        assert_eq!(
+            resolve_image(listed.clone(), Some(first), Some(reused), Some(first))?,
+            None
+        );
+        let mut wrong = listed.clone();
+        wrong.pid += 1;
+        assert!(resolve_image(listed, Some(first), Some(wrong), Some(first)).is_err());
+        Ok(())
+    }
     proptest! {
         #[test]
         fn arbitrary_bytes_never_panic(bytes in prop::collection::vec(any::<u8>(), 0..4096), sec in any::<i64>(), usec in any::<i32>(), stat in any::<u8>()) {

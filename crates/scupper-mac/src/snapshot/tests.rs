@@ -276,7 +276,7 @@ fn classification_i() {
 #[test]
 fn classification_x() {
     let mut unknown = encode(5, &Snapshot::initial(None)).unwrap().to_vec();
-    unknown[8..12].copy_from_slice(&2_u32.to_le_bytes());
+    unknown[8..12].copy_from_slice(&(FORMAT + 1).to_le_bytes());
     unknown[12..20].copy_from_slice(&u64::MAX.to_le_bytes());
     assert_eq!(classify_copy(CopyRead::Bytes(unknown)), CopyClass::X);
 }
@@ -458,7 +458,7 @@ fn recovery_sequence_only_uses_authenticated_known_format_headers() {
     );
     is_recovery(torn, CopyClass::M, 1);
     let mut unknown = raw(u64::MAX, b"{}");
-    unknown[8..12].copy_from_slice(&2_u32.to_le_bytes());
+    unknown[8..12].copy_from_slice(&(FORMAT + 1).to_le_bytes());
     is_recovery(classify_copy(CopyRead::Bytes(unknown)), CopyClass::M, 1);
 }
 #[test]
@@ -820,6 +820,7 @@ fn raw_maximal() -> Snapshot {
         })
     };
     Snapshot {
+        image_history: ImageHistory::default(),
         owner_uid: Some(u32::MAX),
         machine: DurableRecord {
             verification_context: [u64::MAX; 4],
@@ -1531,4 +1532,95 @@ proptest! {
             check_round_trip(&machine);
         }
     }
+}
+
+#[test]
+fn image_history_roundtrip_overflow_unknown_and_proven_reboot() {
+    let mut snapshot = Snapshot::initial(Some(501));
+    assert!(!snapshot.image_history.known);
+    snapshot.image_history.observe_boot(Some(boot()));
+    assert!(!snapshot.image_history.known); // missing is never empty-known
+    snapshot.image_history = ImageHistory::empty_for_boot(boot());
+    for i in 1..=8 {
+        snapshot.image_history.record([i; 16]);
+    }
+    snapshot.image_history.record([1; 16]);
+    assert!(snapshot.image_history.known);
+    let bytes = encode(1, &snapshot).unwrap();
+    assert_eq!(&bytes[..8], b"SCPMACS\x02");
+    assert_eq!(FORMAT, 2);
+    assert!(
+        matches!(classify_copy(CopyRead::Bytes(bytes.to_vec())), CopyClass::V { snapshot: s, .. } if s == snapshot)
+    );
+    snapshot.image_history.record([9; 16]);
+    assert!(!snapshot.image_history.known);
+    assert_eq!(snapshot.image_history.uuids.len(), 8);
+    snapshot.image_history.observe_boot(None);
+    snapshot.image_history.observe_boot(Some(boot()));
+    assert!(!snapshot.image_history.known);
+    let different = BootId::try_from("11234567-89AB-CDEF-0123-456789ABCDEF").unwrap();
+    snapshot.image_history.observe_boot(Some(different));
+    assert!(snapshot.image_history.known);
+    assert!(snapshot.image_history.uuids.is_empty());
+    let mut value = serde_json::to_value(&snapshot).unwrap();
+    value["image_history"]["uuids"] = serde_json::to_value(vec![[1; 16]; 9]).unwrap();
+    assert!(serde_json::from_value::<Snapshot>(value).is_err());
+}
+
+#[test]
+fn image_previous_snapshot_format_migrates_to_unknown() {
+    let mut value = serde_json::to_value(Snapshot::initial(Some(501))).unwrap();
+    value.as_object_mut().unwrap().remove("image_history");
+    let old: LegacySnapshot = serde_json::from_value(value).unwrap();
+    let body = serde_json::to_vec(&old).unwrap();
+    let mut bytes = raw(4, &body);
+    bytes[..8].copy_from_slice(b"SCPMACS\x01");
+    bytes[8..12].copy_from_slice(&1_u32.to_le_bytes());
+    let end = 24 + body.len();
+    let digest = Sha256::digest(&bytes[..end]);
+    bytes[end..end + 32].copy_from_slice(&digest);
+    let CopyClass::V { snapshot, .. } = classify_copy(CopyRead::Bytes(bytes.clone())) else {
+        panic!("old snapshot rejected");
+    };
+    assert!(!snapshot.image_history.known);
+    assert!(snapshot.image_history.uuids.is_empty());
+    bytes[30] ^= 1;
+    assert!(matches!(
+        classify_copy(CopyRead::Bytes(bytes)),
+        CopyClass::T
+    ));
+}
+
+#[test]
+fn image_history_requires_consistent_readable_copies() {
+    let mut s = Snapshot::initial(Some(501));
+    s.image_history = ImageHistory::empty_for_boot(boot());
+    s.image_history.record([1; 16]);
+    let valid = || classify_copy(CopyRead::Bytes(encode(2, &s).unwrap().to_vec()));
+    for other in [CopyClass::M, CopyClass::U, CopyClass::T, CopyClass::X] {
+        let StartDecision::Trust { snapshot, .. } = decide(valid(), other) else {
+            panic!("expected lifecycle trust");
+        };
+        assert!(!snapshot.image_history.known);
+        assert!(snapshot.image_history.uuids.contains(&[1; 16]));
+    }
+    let StartDecision::Trust { snapshot, .. } = decide(valid(), valid()) else {
+        panic!("expected identical trust");
+    };
+    assert!(snapshot.image_history.known);
+    let mut different = s.clone();
+    different.image_history.record([2; 16]);
+    let StartDecision::Trust { snapshot, .. } = decide(
+        classify_copy(CopyRead::Bytes(encode(3, &different).unwrap().to_vec())),
+        valid(),
+    ) else {
+        panic!("expected newer A");
+    };
+    assert!(!snapshot.image_history.known);
+    let mut body = serde_json::to_value(s).unwrap();
+    body.as_object_mut().unwrap().remove("image_history");
+    assert!(matches!(
+        classify_copy(CopyRead::Bytes(raw(4, &serde_json::to_vec(&body).unwrap()))),
+        CopyClass::I { .. }
+    ));
 }

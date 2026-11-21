@@ -61,12 +61,13 @@ impl<P: Platform> Engine<P> {
         if self.start_fence != StartFence::Closed {
             let tools: Vec<_> = PINNED_TOOLS.iter().map(Path::new).collect();
             let overall = self.emergency_drain_deadline();
-            self.start_fence = platform::poll_start_fence(
+            self.start_fence = platform::poll_start_fence_with_history(
                 &mut self.platform,
                 self.previous_helper.clone(),
                 &tools,
                 Path::new(CHILD_PATH),
                 &[],
+                &self.snapshot.image_history,
                 &self.timings,
                 overall,
             );

@@ -1030,7 +1030,30 @@ fn compare_process_layout(abi: &Value) -> Result<()> {
         scupper_darwin::KINFO_PROC_SIZE,
         scupper_darwin::MAXCOMLEN,
     )
-    .map_err(Into::into)
+    .map_err(Into::<Box<dyn Error>>::into)?;
+    if abi["proc_bsdinfo"]["size"].as_u64() != Some(136)
+        || abi["proc_bsdinfo"]["fields"]["pbi_uid"].as_u64() != Some(20)
+        || abi["proc_bsdinfo"]["fields"]["pbi_pid"].as_u64() != Some(12)
+    {
+        return Err("census uid ABI mismatch".into());
+    }
+    if abi["proc_uniqidentifierinfo"]["size"].as_u64()
+        != Some(scupper_darwin::IDENTIFIER_SIZE as u64)
+    {
+        return Err("identifier ABI size mismatch".into());
+    }
+    for ((field, offset), (decoded_field, decoded_offset)) in scupper_darwin::IDENTIFIER_FIELDS
+        .iter()
+        .zip(crate::decode::image::IDENTIFIER_FIELDS)
+    {
+        if *field != decoded_field
+            || *offset != decoded_offset
+            || abi["proc_uniqidentifierinfo"]["fields"][field].as_u64() != Some(*offset as u64)
+        {
+            return Err("identifier ABI offset mismatch".into());
+        }
+    }
+    Ok(())
 }
 
 fn boot_reads(out: &Path, result: &mut CaseResult, started: Instant) -> Result<()> {

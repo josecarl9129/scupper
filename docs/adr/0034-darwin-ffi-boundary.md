@@ -74,3 +74,39 @@ an exec gate. A controller death before journal sync can leave an unjournaled
 sleep (at most 360 seconds) or churn process (at most 180 seconds). This bounded
 residual is a deliberate difference from the capability probes' exec-gated
 journal discipline; these children make no network or firewall mutations.
+
+## OD4 B-neg: negative-only main-image evidence (R3b)
+
+macOS continues to return `ProcInfo.exe = None` (OD4 A). For ENOENT from
+`proc_pidpath`, read flavor 17 `proc_uniqidentifierinfo`, then re-lookup
+`KERN_PROC_PID` for the enumeration's exact `(pid, start)`, then repeat flavor
+17. Require identical nonzero UUID, uniqueid and exec-sensitive idversion.
+Any failed/short read or bracket mismatch is Incomplete with the live PID;
+confirmed vanishing and zombies retain the existing rules. `p_idversion` is
+in the flavor-17 API record at offset 32; neither public `proc_bsdinfo` nor
+`extern_proc` exposes it. The C probe and Rust const assertions pin this
+[XNU API wire declaration](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/proc_info_private.h).
+The SDK omits that private header, so the probe declares the wire record just
+as the existing R2 identity probe does; this is not an independent SDK oracle.
+
+Ownership and ambiguity rules run first. A remaining pathless live process is
+provably foreign only if its validated UUID differs from every UUID in known
+durable spawned-image history for the current boot and every current pin UUID,
+and its known kernel name is not `wireguard-go`. Unknown history, unknown boot,
+unknown pin UUID, missing image or name, and UUID equality withhold completeness
+with the PID. UUID equality never selects or signals a process. A foreign
+pathless process sharing a recorded or pinned build UUID blocks until it exits.
+A translated foreign process is compared by its own main-image UUID only.
+
+Snapshot family/format 2 adds boot-scoped spawned-image history, bounded to eight
+distinct UUIDs. Missing, unreadable, corrupt and format-1 history is unknown,
+never empty. Overflow marks the boot unknown and never evicts a UUID silently.
+Only proof of a different boot resets it to empty-known. Unavailable or disagreeing
+copies revoke history certainty even when the lifecycle start table can trust one
+copy. Current tool pins also participate in negative comparisons during ordinary
+sweeps and Leave; they gain no new ownership matches. Before spawn the engine
+commits the pin UUID; write failure forbids spawn. An unexpected post-spawn UUID
+is recorded durably, the exact child is killed, and spawn fails. R4 must report
+the child's observed main-image identity and reject translated (Rosetta) owned
+children via `proc_translated`/`P_TRANSLATED`. The read-only pin parser supports
+thin arm64/arm64e and accepts fat files only when all native arm64 slices agree.

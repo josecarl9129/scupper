@@ -430,7 +430,7 @@ impl<P: Platform> Engine<P> {
             .as_ref()
             .map_or(Timings::default(), |r| r.config.timings);
 
-        let (seq, snapshot, repair, recovery) = match decision {
+        let (seq, mut snapshot, repair, recovery) = match decision {
             StartDecision::Trust {
                 seq,
                 snapshot,
@@ -449,6 +449,11 @@ impl<P: Platform> Engine<P> {
                 (seq, snapshot, None, true)
             }
         };
+        let committed = snapshot.clone();
+        if snapshot.image_history.boot.is_none() {
+            snapshot.image_history.boot = snapshot.helper.as_ref().and_then(|h| h.boot.clone());
+        }
+        snapshot.image_history.observe_boot(platform.boot_id());
         let bytes = snapshot::encode(seq, &snapshot).ok();
         let invalid = bytes.is_none() || snapshot.validate().is_err();
         // Preserve the original repair/Recovery protocol, but defer every write
@@ -467,7 +472,7 @@ impl<P: Platform> Engine<P> {
             timings,
             machine: Machine::restart(Durable::default()),
             adopted: false,
-            committed: snapshot.clone(),
+            committed,
             snapshot: snapshot.clone(),
             seq,
             mode: Mode::Starting,
@@ -619,12 +624,13 @@ impl<P: Platform> Engine<P> {
         let own = self.platform.incarnation();
         let tools: Vec<_> = PINNED_TOOLS.iter().map(Path::new).collect();
         let overall = Deadline(self.platform.now().saturating_add(1));
-        self.start_fence = platform::poll_start_fence(
+        self.start_fence = platform::poll_start_fence_with_history(
             &mut self.platform,
             self.previous_helper.clone(),
             &tools,
             Path::new(CHILD_PATH),
             &[],
+            &self.snapshot.image_history,
             &self.timings,
             overall,
         );
@@ -1568,10 +1574,13 @@ impl<P: Platform> Engine<P> {
     }
     fn confirm_sweep(&mut self) -> bool {
         let overall = self.deadline();
-        let swept = platform::sweep(
+        let pins: Vec<_> = PINNED_TOOLS.iter().map(Path::new).collect();
+        let swept = platform::sweep_with_history(
             &mut self.platform,
             Path::new(CHILD_PATH),
             &[],
+            &self.snapshot.image_history,
+            &pins,
             &self.timings,
             overall,
         );

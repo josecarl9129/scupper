@@ -264,6 +264,7 @@ mod fake_contracts {
     // therefore also exposes the host's newer pathless orphan; resolve that
     // independent uncertainty before testing specific child-record ownership.
     fn resolve_host_pathless_after_missing_pin(p: &mut FakePlatform) {
+        p.procs.get_mut(&14).unwrap().path = None;
         assert!(matches!(
             sweep(p, Path::new(CHILD_PATH)),
             Sweep::Incomplete(ProcessError { pid: Some(14), .. })
@@ -428,6 +429,7 @@ mod fake_contracts {
                 .map(|n| n.to_string_lossy().into_owned()),
             path: Some(path.into()),
             exe: None,
+            image: None,
         }
     }
     fn acquire(p: &mut FakePlatform) -> u64 {
@@ -1294,13 +1296,36 @@ mod fake_contracts {
         let mut foreign = proc(201, 50, 201, 77, "/foreign");
         foreign.path = None;
         foreign.exe = Some(ExeId { dev: 9, ino: 201 });
+        foreign.image = Some(super::super::ImageId {
+            uuid: [9; 16],
+            uniqueid: 201,
+        });
         p.procs.insert(201, foreign);
-        assert_eq!(sweep(&mut p, Path::new(CHILD_PATH)), Sweep::Swept);
+        assert!(matches!(
+            sweep(&mut p, Path::new(CHILD_PATH)),
+            Sweep::Incomplete(ProcessError { pid: Some(201), .. })
+        ));
+        let history =
+            snapshot::ImageHistory::empty_for_boot(p.boot.clone().ok_or(SysError::Unknown)?);
+        let overall = limit(&mut p);
+        assert_eq!(
+            super::super::sweep_with_history(
+                &mut p,
+                Path::new(CHILD_PATH),
+                &[],
+                &history,
+                &[],
+                &Timings::default(),
+                overall
+            ),
+            Sweep::Swept
+        );
         let d = limit(&mut p);
         assert!(matches!(p.processes(d), Enumeration::Complete(ref entries)
             if entries.iter().any(|entry| entry.pid == 201 && entry.path.is_none() && entry.exe.is_some())));
         if let Some(entry) = p.procs.get_mut(&201) {
             entry.exe = None;
+            entry.image = None;
         }
         let d = limit(&mut p);
         assert!(matches!(
@@ -1948,6 +1973,10 @@ mod fake_contracts {
             if identity_readable {
                 orphan.exe = p.executables.get(Path::new("/sbin/pfctl")).copied();
                 orphan.path = None;
+                orphan.image = Some(super::super::ImageId {
+                    uuid: [9; 16],
+                    uniqueid: 200,
+                });
             }
             p.procs.insert(200, orphan);
             assert_eq!(
@@ -2470,7 +2499,7 @@ mod fake_contracts {
             p.executables
                 .insert(CHILD_PATH.into(), ExeId { dev: 1, ino: 999 });
             let overall = limit(&mut p);
-            assert_eq!(
+            assert!(matches!(
                 super::super::sweep(
                     &mut p,
                     Path::new(CHILD_PATH),
@@ -2478,8 +2507,8 @@ mod fake_contracts {
                     &Timings::default(),
                     overall,
                 ),
-                Sweep::Swept
-            );
+                Sweep::Incomplete(ProcessError {pid: Some(pid), ..}) if pid == child.pid
+            ));
             assert_eq!(p.procs[&child.pid].state, ProcState::Running);
             assert_eq!(p.signals, []);
         }
@@ -2567,8 +2596,8 @@ mod fake_contracts {
     }
 
     #[test]
-    fn missing_tool_only_blocks_eligible_pathless_startup_candidates() -> Result<(), SysError> {
-        for (parent, seconds, blocked) in [(77, 50, false), (1, 101, false), (1, 50, true)] {
+    fn missing_tool_blocks_all_unselected_pathless_startup_candidates() -> Result<(), SysError> {
+        for (parent, seconds, blocked) in [(77, 50, true), (1, 101, true), (1, 50, true)] {
             let mut p = fake()?;
             p.executables.remove(Path::new("/sbin/pfctl"));
             let mut foreign = proc(200, seconds, 200, parent, "/foreign/updated-browser");

@@ -425,12 +425,26 @@ fn recovery_ambiguity_is_narrow_and_never_establishes_ownership() {
                 proc.path = path.map(Into::into);
                 proc.name = name.map(Into::into);
                 proc.exe = Some(ExeId { dev: 77, ino: 88 });
+                proc.image = Some(platform::ImageId {
+                    uuid: [9; 16],
+                    uniqueid: 333,
+                });
                 p.procs.insert(333, proc);
                 if recovery {
                     p.mutate(Mutation::CopyRot(Copy::A));
                     p.mutate(Mutation::CopyRot(Copy::B));
                 }
                 let mut e = Engine::start(p).unwrap();
+                if path.is_none() && state != ProcState::Zombie && !(recovery && ambiguous) {
+                    assert!(
+                        matches!(e.start_fence, StartFence::Processes(Sweep::Incomplete(ref error)) if error.pid == Some(333))
+                    );
+                    assert_eq!(e.platform.signals, []);
+                    e.platform.procs.remove(&333);
+                    tick(&mut e);
+                    assert_eq!(e.mode, Mode::Normal);
+                    continue;
+                }
                 if recovery && ambiguous && state != ProcState::Zombie {
                     assert_eq!(e.mode, Mode::Starting);
                     assert!(
@@ -448,6 +462,7 @@ fn recovery_ambiguity_is_narrow_and_never_establishes_ownership() {
                     // First pin the documented pathless-launchd residual.
                     let mut residual = p.clone();
                     residual.procs.remove(&333);
+                    residual.procs.get_mut(&14).unwrap().path = None;
                     let d = Deadline(residual.now() + 2);
                     residual.pause(Duration::from_secs(2), d);
                     residual.restart();
@@ -2022,6 +2037,10 @@ fn recovery_sleeping_and_stopped_orphans_each_withhold_closure() {
         orphan.state = state;
         orphan.path = path.map(Into::into);
         orphan.name = name.map(Into::into);
+        orphan.image = Some(platform::ImageId {
+            uuid: [9; 16],
+            uniqueid: u64::from(pid),
+        });
         orphan.exe = Some(ExeId {
             dev: 77,
             ino: u64::from(pid),
@@ -2621,6 +2640,11 @@ fn timing_ambiguous_start_returns_early_and_reenumerates() {
     let mut p = FakePlatform::new().unwrap();
     let mut proc = p.procs[&14].clone();
     proc.start.seconds = 90;
+    proc.path = None;
+    proc.image = Some(platform::ImageId {
+        uuid: [9; 16],
+        uniqueid: 14,
+    });
     p.procs.insert(14, proc);
     let before = p.now();
     let mut e = Engine::start(p).unwrap();
@@ -5233,3 +5257,152 @@ mod ledger_review;
 
 mod containment;
 mod leave_storage;
+
+#[test]
+fn image_history_is_durable_before_spawn_and_failed_write_prevents_spawn() {
+    for fail in [false, true] {
+        let mut e = fresh();
+        e.submit(Request {
+            id: 1,
+            kind: RequestKind::Join,
+        })
+        .unwrap();
+        before_pending(&mut e, Step::StartChild);
+        e.platform.calls.clear();
+        let uuid = e
+            .platform
+            .image_uuid(Path::new(CHILD_PATH), Deadline(1000))
+            .unwrap();
+        if fail {
+            e.platform.inject(Call::Write(Copy::A), 1, Fault::WriteFail);
+        }
+        let result = e.execute(Step::StartChild);
+        if fail {
+            assert_eq!(result, Err(SysError::Failed("image history write failed")));
+            assert!(!e.platform.calls.contains(&Call::Spawn));
+        } else {
+            assert!(result.is_ok());
+            assert!(e.committed.image_history.uuids.contains(&uuid));
+            let spawn = e
+                .platform
+                .calls
+                .iter()
+                .position(|c| *c == Call::Spawn)
+                .unwrap();
+            assert!(e.platform.calls[..spawn].contains(&Call::Write(Copy::B)));
+            assert!(
+                read_snapshot(&mut e.platform, Copy::A)
+                    .image_history
+                    .uuids
+                    .contains(&uuid)
+            );
+        }
+    }
+}
+
+#[test]
+fn image_spawn_mismatch_is_recorded_killed_and_failed() {
+    let mut e = fresh();
+    e.submit(Request {
+        id: 1,
+        kind: RequestKind::Join,
+    })
+    .unwrap();
+    before_pending(&mut e, Step::StartChild);
+    e.platform.spawn_image = Some(platform::ImageId {
+        uuid: [88; 16],
+        uniqueid: 1234,
+    });
+    assert_eq!(
+        e.execute(Step::StartChild),
+        Err(SysError::Failed("spawn image mismatch"))
+    );
+    assert!(e.committed.image_history.uuids.contains(&[88; 16]));
+    let child = e.platform.spawned_children().last().unwrap();
+    assert!(e.platform.signals.contains(&(child.pid, child.start_time)));
+    assert!(
+        read_snapshot(&mut e.platform, Copy::A)
+            .image_history
+            .uuids
+            .contains(&[88; 16])
+    );
+}
+
+#[test]
+fn image_upgrade_retains_spawned_build_after_crash_and_pin_replacement() {
+    let e = joined();
+    let child = e.child.clone().unwrap();
+    let history = e.snapshot.image_history.clone();
+    let u1 = child.image.unwrap().uuid;
+    assert!(history.uuids.contains(&u1));
+    let mut p = e.into_platform();
+    p.abandon_process_group = true;
+    p.restart();
+    p.image_uuids.insert(CHILD_PATH.into(), Some([22; 16]));
+    let proc = p.procs.get_mut(&child.pid).unwrap();
+    proc.path = None;
+    proc.exe = None;
+    proc.name = Some("renamed-child".into()); // isolate history from the name guard
+    p.signals.clear();
+    let d = Deadline(p.now() + 2);
+    let result = platform::sweep_with_history(
+        &mut p,
+        Path::new(CHILD_PATH),
+        &[],
+        &history,
+        &[],
+        &Timings::default(),
+        d,
+    );
+    assert!(matches!(result, Sweep::Incomplete(ref e) if e.pid == Some(child.pid)));
+    assert_eq!(p.signals, []);
+}
+
+#[test]
+fn image_proven_reboot_resets_and_persists_history() {
+    let mut snapshot = Snapshot::initial(Some(501));
+    let mut p = fixture(&snapshot);
+    snapshot.image_history = snapshot::ImageHistory::empty_for_boot(p.boot.clone().unwrap());
+    snapshot.image_history.record([44; 16]);
+    p = fixture(&snapshot);
+    p.mutate(Mutation::Reboot);
+    let mut e = Engine::start(p).unwrap();
+    assert!(e.snapshot.image_history.known);
+    assert_eq!(e.snapshot.image_history.boot, e.platform.boot);
+    assert_eq!(e.snapshot.image_history.uuids.len(), 0);
+    assert_eq!(
+        read_snapshot(&mut e.platform, Copy::A).image_history,
+        e.snapshot.image_history
+    );
+}
+
+#[test]
+fn image_sweep_and_leave_require_all_pin_uuids() {
+    let mut e = fresh();
+    e.snapshot.image_history =
+        snapshot::ImageHistory::empty_for_boot(e.platform.boot.clone().unwrap());
+    let mut proc = e.platform.procs[&e.platform.helper.pid].clone();
+    proc.pid = 888;
+    proc.pgid = 888;
+    proc.ppid = 2;
+    proc.path = None;
+    proc.exe = None;
+    proc.image = Some(platform::ImageId {
+        uuid: [88; 16],
+        uniqueid: 888,
+    });
+    proc.name = Some("foreign".into());
+    e.platform.procs.insert(888, proc);
+    e.platform.image_uuids.insert("/sbin/pfctl".into(), None);
+    assert!(!e.confirm_sweep());
+    assert!(matches!(e.last_sweep, Some(Sweep::Incomplete(ref e)) if e.pid == Some(888)));
+    assert_eq!(
+        e.verify_clear_intent(),
+        Err(SysError::Failed("owned process inventory"))
+    );
+    assert_eq!(e.platform.signals, []);
+    e.platform.image_uuids.remove(Path::new("/sbin/pfctl"));
+    assert!(e.confirm_sweep());
+    assert!(e.verify_clear_intent().is_ok());
+    assert_eq!(e.platform.signals, []);
+}

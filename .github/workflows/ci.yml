@@ -308,6 +308,9 @@ jobs:
           qual-out/abi-probe | tee qual-out/abi-sdk.json
           cc -std=c11 -Wall -Wextra -Werror crates/scupper-darwin/probe/base-churn.c -o qual-out/base-churn
           shasum -a 256 qual-out/base-churn | tee qual-out/base-churn-sha256.txt
+          cc -std=c11 -Wall -Wextra -Werror -arch arm64 -DIMAGE_VARIANT=1 crates/scupper-darwin/probe/base-image.c -o qual-out/base-image-a
+          cc -std=c11 -Wall -Wextra -Werror -arch arm64 -DIMAGE_VARIANT=2 crates/scupper-darwin/probe/base-image.c -o qual-out/base-image-b
+          shasum -a 256 qual-out/base-image-a qual-out/base-image-b | tee qual-out/base-image-sha256.txt
       - name: Compile capability probes with full diagnostics
         if: matrix.group == 'probe' || matrix.group == 'probe-hijack'
         timeout-minutes: 2
@@ -326,7 +329,7 @@ jobs:
           /usr/bin/sudo /usr/bin/install -d -o root -g wheel -m 0700 /private/var/db/scupper-qual
           /usr/bin/sudo /usr/bin/install -o root -g wheel -m 0755 target/debug/scupper-mac-qual /private/var/db/scupper-qual/scupper-mac-qual
           /usr/bin/sudo /usr/bin/install -o root -g wheel -m 0755 qual-out/abi-probe /private/var/db/scupper-qual/abi-probe
-          for binary in qual-out/probe-* qual-out/wireguard-go qual-out/base-churn; do
+          for binary in qual-out/probe-* qual-out/wireguard-go qual-out/base-churn qual-out/base-image-a qual-out/base-image-b; do
             if [ -f "$binary" ]; then
               /usr/bin/sudo /usr/bin/install -o root -g wheel -m 0755 "$binary" "/private/var/db/scupper-qual/$(basename "$binary")"
               /usr/bin/sudo /usr/bin/shasum -a 256 "/private/var/db/scupper-qual/$(basename "$binary")" >> qual-out/executed-capability-sha256.txt

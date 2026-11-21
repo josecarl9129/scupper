@@ -356,6 +356,59 @@ pub fn proc_pidpath(pid: u32) -> Result<std::path::PathBuf, Errno> {
     Ok(std::ffi::OsString::from_vec(bytes).into())
 }
 
+/// Size and consumed offsets of XNU's API `proc_uniqidentifierinfo` (flavor 17).
+pub const IDENTIFIER_SIZE: usize = 56;
+/// Identifier field offsets, checked against the C probe and portable decoder.
+pub const IDENTIFIER_FIELDS: [(&str, usize); 3] = [
+    ("p_uuid", std::mem::offset_of!(UniqueIdentifier, uuid)),
+    (
+        "p_uniqueid",
+        std::mem::offset_of!(UniqueIdentifier, uniqueid),
+    ),
+    (
+        "p_idversion",
+        std::mem::offset_of!(UniqueIdentifier, idversion),
+    ),
+];
+#[repr(C)]
+struct UniqueIdentifier {
+    uuid: [u8; 16],
+    uniqueid: u64,
+    parent: u64,
+    idversion: i32,
+    parent_version: i32,
+    reserved: [u64; 2],
+}
+const _: () = {
+    assert!(std::mem::size_of::<UniqueIdentifier>() == IDENTIFIER_SIZE);
+    assert!(IDENTIFIER_FIELDS[0].1 == 0);
+    assert!(IDENTIFIER_FIELDS[1].1 == 16);
+    assert!(IDENTIFIER_FIELDS[2].1 == 32);
+};
+/// Read the main-image UUID, reuse-free uniqueid and exec-sensitive idversion.
+/// Decoding remains the caller's portable responsibility.
+///
+/// # Errors
+/// Rejects every short/long reply and invalid pid; preserves syscall errno.
+pub fn proc_identifier(pid: u32) -> Result<[u8; IDENTIFIER_SIZE], Errno> {
+    let pid = i32::try_from(pid).map_err(|_| Errno::INVAL)?;
+    if pid <= 0 {
+        return Err(Errno::INVAL);
+    }
+    let mut bytes = [0_u8; IDENTIFIER_SIZE];
+    // SAFETY: the exclusive, initialized 56-byte buffer lives through this
+    // synchronous call; proc_pidinfo copies bytes and requires no alignment.
+    // Flavor 17 is read-only. Only a full-sized success exposes these bytes.
+    let returned = unsafe { libc::proc_pidinfo(pid, 17, 0, bytes.as_mut_ptr().cast(), 56) };
+    if returned <= 0 {
+        return Err(last_errno());
+    }
+    if returned != 56 {
+        return Err(Errno::INVAL);
+    }
+    Ok(bytes)
+}
+
 /// Sleep-counting, unadjusted clock id used by `NativePlatform::now`.
 pub const NOW_CLOCK_ID: libc::clockid_t = libc::CLOCK_MONOTONIC_RAW;
 /// Sleep-excluding raw clock id, reserved for the wake-delta monitor.
@@ -392,6 +445,38 @@ fn clock(id: libc::clockid_t) -> std::time::Duration {
     }
     std::time::Duration::new(seconds, nanos)
 }
+
+/// Read effective uid for the text-only qualification census.
+///
+/// # Errors
+/// Returns errno or INVAL on short replies or a mismatched PID.
+pub fn proc_uid(pid: u32) -> Result<u32, Errno> {
+    let pid = i32::try_from(pid).map_err(|_| Errno::INVAL)?;
+    if pid <= 0 {
+        return Err(Errno::INVAL);
+    }
+    let mut bytes = [0_u8; 136];
+    // SAFETY: exclusive initialized storage has the full pinned proc_bsdinfo
+    // size. The synchronous call writes only bytes; fields are decoded only
+    // after checking its exact length and matching PID. Flavor 3 is read-only.
+    let returned = unsafe { libc::proc_pidinfo(pid, 3, 0, bytes.as_mut_ptr().cast(), 136) };
+    if returned <= 0 {
+        return Err(last_errno());
+    }
+    if returned != 136
+        || i32::from_ne_bytes(bytes[12..16].try_into().map_err(|_| Errno::INVAL)?) != pid
+    {
+        return Err(Errno::INVAL);
+    }
+    Ok(u32::from_ne_bytes(
+        bytes[20..24].try_into().map_err(|_| Errno::INVAL)?,
+    ))
+}
+const _: () = {
+    assert!(std::mem::size_of::<libc::proc_bsdinfo>() == 136);
+    assert!(std::mem::offset_of!(libc::proc_bsdinfo, pbi_uid) == 20);
+    assert!(std::mem::offset_of!(libc::proc_bsdinfo, pbi_pid) == 12);
+};
 
 #[cfg(test)]
 mod process_tests {

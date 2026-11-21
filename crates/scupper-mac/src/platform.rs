@@ -39,15 +39,23 @@
 //! qualified disable evidence settles them or setup resets recovery storage.
 //! Helpers cap each call by `Timings::command_deadline` and the caller’s overall
 //! deadline. Retry pauses are bounded by that budget and never sleep in the fake.
-//! Recovery residuals: a foreign wireguard-go or pathless launchd child blocks
-//! Recovery until it exits (fail closed, with its pid). A survivor still parented
-//! to a lingering old helper (ppid != 1) is not matched by ambiguity. Process-name
-//! matching never establishes ownership; it only withholds the fence.
+//! Existing path, exact-record, previous-group and ambiguity rules take precedence
+//! over image evidence. Image UUID equality never selects or kills. A pathless
+//! live process is provably foreign only with validated image identity, known
+//! durable spawned-image history for this boot, every current pin UUID known,
+//! a UUID different from every history/pin UUID, and a name other than wireguard-go.
+//! Otherwise uncertainty withholds sweep/quiescence with its PID. A foreign
+//! pathless process sharing a recorded or pinned build UUID blocks until it exits.
+//! A translated foreign process is compared by its own main-image UUID only.
+//! A survivor still parented to a lingering old helper (ppid != 1) is not matched
+//! by ambiguity. Name matching only withholds the fence; it never owns a process.
 //! The macOS adapter must fill `name` from `p_comm` (`MAXCOMLEN` accommodates
 //! wireguard-go), and map SSLEEP and SSTOP to live Sleeping/Stopped states.
 //! With an unreadable pin, ordinary sweeps also withhold closure for sleeping
 //! pathless processes. Upgrades must account for that availability residual.
-use crate::snapshot::{BootId, COPY_BYTES, Copy, CopyRead, HelperIncarnation, StartTime};
+use crate::snapshot::{
+    BootId, COPY_BYTES, Copy, CopyRead, HelperIncarnation, ImageHistory, StartTime,
+};
 pub mod types;
 use scupper_core::mac::{
     PhysicalInterface, Tunnel, TunnelGeneration, policy::AnchorText, verify::Observations,
@@ -60,6 +68,8 @@ pub use types::{
 
 #[cfg(feature = "testing")]
 pub mod fake;
+#[cfg(test)]
+mod image_tests;
 #[cfg(feature = "testing")]
 pub mod tests;
 
@@ -158,7 +168,7 @@ pub struct ExeId {
 /// Incomplete process observation, retaining the offending PID when known.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcessError {
-    /// Live process with neither a readable path nor executable identity.
+    /// Live process whose path/image evidence or ownership is uncertain.
     pub pid: Option<u32>,
     /// Underlying observation, signalling or reap failure.
     pub error: SysError,
@@ -167,6 +177,14 @@ impl From<SysError> for ProcessError {
     fn from(error: SysError) -> Self {
         Self { pid: None, error }
     }
+}
+/// Main-image build identity. Equality never establishes process ownership.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageId {
+    /// Mach-O `LC_UUID` (nonzero).
+    pub uuid: [u8; 16],
+    /// Kernel reuse-free process identifier.
+    pub uniqueid: u64,
 }
 /// One entry from complete process enumeration, including foreign processes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -187,6 +205,8 @@ pub struct ProcInfo {
     pub path: Option<std::path::PathBuf>,
     /// Executable vnode identity; adds ownership matches independently of path.
     pub exe: Option<ExeId>,
+    /// Validated main-image identity; negative evidence only.
+    pub image: Option<ImageId>,
 }
 /// Observable process lifecycle state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -227,6 +247,8 @@ pub struct Child {
     pub start_time: StartTime,
     /// Child's own text-vnode identity captured after spawn, for qualification.
     pub exe: Option<ExeId>,
+    /// Validated main-image identity; negative evidence only.
+    pub image: Option<ImageId>,
     /// Helper's process group, shared by the foreground child.
     pub pgid: u32,
     /// Kernel utun name.
@@ -329,9 +351,9 @@ pub enum SafetyEvent {
 /// child was reaped. A failed observation never certifies absence. UAPI writes
 /// close their socket on timeout; any late child effect is covered by the sweep.
 ///
-/// macOS qualification must verify text-vnode identity after executable unlink
-/// (e.g. PROC_PIDREGIONPATHINFO/text-vnode stat), and measure pathless live
-/// processes on normal target builds. A `proc_pidpath` failure alone proves no exit.
+/// macOS leaves executable vnode identity absent (OD4 A). Pathless live entries
+/// use an exec-sensitive image bracket as negative evidence only (OD4 B-neg).
+/// A `proc_pidpath` failure alone proves no exit.
 #[allow(clippy::missing_errors_doc)] // Each method states its uncertainty contract.
 pub trait Platform {
     /// Log a secret-free safety diagnostic; grants no enforcement/publication claim.
@@ -451,8 +473,13 @@ pub trait Platform {
     /// race internally. A vanished entry is one whose `KERN_PROC_PID` re-lookup is
     /// absent, has a different start, or is a zombie (which may instead be listed).
     /// A path lookup ESRCH alone does not establish vanishing of a listed live PID.
-    /// Zombies need neither path nor identity. A live entry lacking both makes
-    /// the observation Incomplete with its PID; other observation failures carry
+    /// Zombies need no image. Pathless live entries require a validated image;
+    /// otherwise the observation is
+    /// Incomplete with its PID. For ENOENT, read the image identifier before
+    /// the PID/start re-lookup and repeat it after: UUID, uniqueid and exec-sensitive
+    /// idversion must match. Short reads, zero UUID, errno or bracket mismatch
+    /// withhold completeness for a confirmed live PID. Image UUIDs never own it.
+    /// Other observation failures carry
     /// no PID when unknown. Incomplete proves no absence.
     fn processes(&mut self, deadline: Deadline) -> Enumeration<Vec<ProcInfo>, ProcessError>;
     /// Obtain a regular pinned executable's vnode identity with lstat semantics:
@@ -460,6 +487,11 @@ pub trait Platform {
     /// Read-only; failure/timeout grants no current identity. Paths and exact
     /// recorded (pid, start) pairs independently match. Re-stat every sweep poll.
     fn executable_id(&mut self, path: &Path, deadline: Deadline) -> Result<ExeId, SysError>;
+    /// Read-only pin `LC_UUID`: open `O_RDONLY | O_NOFOLLOW | O_CLOEXEC`, fstat a
+    /// regular file, parse native arm64/arm64e Mach-O load commands. Reject
+    /// missing/zero UUIDs, parse failures and unresolved fat-slice disagreement.
+    /// Failure means unknown. No UUID equality establishes ownership.
+    fn image_uuid(&mut self, path: &Path, deadline: Deadline) -> Result<[u8; 16], SysError>;
     /// Signal only pgid > 1 and different from the helper's own group; otherwise
     /// return error without signalling. Adapters must call `group_kill_allowed`.
     /// Recheck `expect_pid`'s start AND group.
@@ -550,6 +582,11 @@ pub trait Platform {
     /// with `POSIX_SPAWN_SETSIGMASK`, and use `POSIX_SPAWN_CLOEXEC_DEFAULT` with
     /// explicit fd actions. No inherited storage lock or snapshot fd may survive
     /// exec. The helper must lead its group and have launchd (pid 1) as parent.
+    /// The caller durably records the pin UUID in boot-scoped spawned-image
+    /// history before every call; a history write failure forbids spawning.
+    /// Success includes the child's observed main-image identity. Owned children
+    /// must be native: refuse translated (Rosetta) children by checking
+    /// `proc_translated/P_TRANSLATED` before reporting success (native R4).
     /// Success returns complete identity; error/timeout may
     /// leave a child, requiring sweep. Process mutation, not a tool fence child.
     fn spawn(
@@ -719,14 +756,16 @@ pub const fn process_kill_allowed(pid: u32, own_pid: u32) -> bool {
 pub fn checked_os_pid(pid: u32) -> Option<i32> {
     i32::try_from(pid).ok()
 }
-#[allow(clippy::too_many_lines)] // One bounded enumeration/signal/confirmation protocol.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)] // One bounded enumeration/signal/confirmation protocol.
 fn sweep_matching(
     p: &mut impl Platform,
     pinned_paths: &[&Path],
+    image_paths: &[&Path],
     recorded_children: &[Child],
     timings: &Timings,
     overall: Deadline,
     poll: bool,
+    history: &ImageHistory,
     target: impl Fn(&ProcInfo, &[ProcInfo], bool) -> Option<Target>,
 ) -> Sweep {
     let own = p.incarnation();
@@ -750,6 +789,13 @@ fn sweep_matching(
             continue;
         }
         let (identities, unknown_pin) = pinned_identities(p, pinned_paths, timings, overall);
+        let pin_uuids: Option<Vec<_>> = image_paths
+            .iter()
+            .map(|path| {
+                let d = deadline(p, timings, overall);
+                p.image_uuid(path, d).ok().filter(|uuid| *uuid != [0; 16])
+            })
+            .collect();
         let records: BTreeSet<_> = recorded_children
             .iter()
             .filter(|child| child.boot.is_some() && child.boot == own.boot)
@@ -764,12 +810,20 @@ fn sweep_matching(
                     || records.contains(&(proc.pid, start_key(proc.start))),
             )
         };
+        let boot = p.boot_id();
         let d = deadline(p, timings, overall);
         let processes = p.processes(d);
-        match qualify_pathless(processes, unknown_pin, |proc, procs| {
-            // Only otherwise-unmatched candidates can hide a pinned process.
-            select(proc, procs).is_none() && target(proc, procs, true).is_some()
-        }) {
+        match qualify_pathless(
+            processes,
+            unknown_pin,
+            history,
+            boot.as_ref(),
+            pin_uuids.as_deref(),
+            |proc, procs| {
+                // Only otherwise-unmatched candidates can hide a pinned process.
+                select(proc, procs).is_none()
+            },
+        ) {
             Enumeration::Incomplete(e) => {
                 last = Sweep::Incomplete(e);
             }
@@ -876,25 +930,59 @@ fn pinned_identities(
     }
     (identities, unknown_pin)
 }
-fn qualify_pathless(
+/// Apply the engine's pathless uncertainty rule after ownership/ambiguity selection.
+/// The predicate must be true exactly for entries left unselected by those rules.
+pub fn qualify_pathless(
     processes: Enumeration<Vec<ProcInfo>, ProcessError>,
     unknown_pin: bool,
+    history: &ImageHistory,
+    boot: Option<&BootId>,
+    pin_uuids: Option<&[[u8; 16]]>,
     unmatched_candidate: impl Fn(&ProcInfo, &[ProcInfo]) -> bool,
 ) -> Enumeration<Vec<ProcInfo>, ProcessError> {
-    if unknown_pin
-        && let Enumeration::Complete(procs) = &processes
+    if let Enumeration::Complete(procs) = &processes
         && let Some(proc) = procs.iter().find(|proc| {
             proc.state != ProcState::Zombie
                 && proc.path.is_none()
                 && unmatched_candidate(proc, procs)
+                && !provably_foreign(proc, history, boot, pin_uuids)
         })
     {
         return Enumeration::Incomplete(ProcessError {
             pid: Some(proc.pid),
-            error: SysError::Failed("pinned identity unavailable for pathless process"),
+            error: SysError::Failed(if unknown_pin {
+                "pinned identity unavailable for pathless process"
+            } else {
+                "pathless image ownership undecidable"
+            }),
         });
     }
     processes
+}
+/// Negative evidence only, after all existing ownership and ambiguity rules
+/// have returned no selection. UUID equality never selects or signals a process.
+/// Missing names also withhold certainty because the extra name guard is unknown.
+#[must_use]
+pub fn provably_foreign(
+    proc: &ProcInfo,
+    history: &ImageHistory,
+    boot: Option<&BootId>,
+    pin_uuids: Option<&[[u8; 16]]>,
+) -> bool {
+    let (Some(image), Some(pins)) = (proc.image, pin_uuids) else {
+        return false;
+    };
+    history.known_on(boot)
+        && image.uuid != [0; 16]
+        && image.uniqueid != 0
+        && !history.uuids.contains(&image.uuid)
+        && pins
+            .iter()
+            .all(|uuid| *uuid != [0; 16] && *uuid != image.uuid)
+        && proc
+            .name
+            .as_deref()
+            .is_some_and(|name| name != "wireguard-go")
 }
 fn matches_executable(proc: &ProcInfo, paths: &[&Path], identities: &BTreeSet<ExeId>) -> bool {
     proc.exe.is_some_and(|exe| identities.contains(&exe))
@@ -910,8 +998,9 @@ fn matches_executable(proc: &ProcInfo, paths: &[&Path], identities: &BTreeSet<Ex
 /// own incarnation-local records also work when the boot lookup is unavailable.
 /// Hard links elsewhere also run the owned binary, but only their PID
 /// is killed, preserving group peers (including the helper).
-/// If any pinned stat fails, regardless of records, an otherwise unmatched
-/// live pathless process makes the observation Incomplete, naming its PID.
+/// Existing ownership is evaluated first. Every otherwise unmatched live pathless
+/// entry requires the negative-only image rule; unknown history/pin UUIDs or any
+/// equal UUID withhold completeness with its PID. This wrapper has unknown history.
 /// Reap own zombies first; foreign zombies cannot act and count as gone. Retry
 /// incomplete enumerations/reaps/kills and signal new/changed targets each poll.
 /// A second complete enumeration is required, even if initially empty; every
@@ -923,13 +1012,39 @@ pub fn sweep(
     timings: &Timings,
     overall: Deadline,
 ) -> Sweep {
+    sweep_with_history(
+        p,
+        pinned_path,
+        recorded_children,
+        &ImageHistory::default(),
+        &[],
+        timings,
+        overall,
+    )
+}
+/// Sweep with durable boot-scoped spawned-image history. Unknown evidence fails closed.
+/// Additional current pins are compared only for negative evidence, never ownership.
+pub fn sweep_with_history(
+    p: &mut impl Platform,
+    pinned_path: &Path,
+    recorded_children: &[Child],
+    history: &ImageHistory,
+    additional_image_pins: &[&Path],
+    timings: &Timings,
+    overall: Deadline,
+) -> Sweep {
+    let image_paths: Vec<_> = std::iter::once(pinned_path)
+        .chain(additional_image_pins.iter().copied())
+        .collect();
     sweep_matching(
         p,
         &[pinned_path],
+        &image_paths,
         recorded_children,
         timings,
         overall,
         false,
+        history,
         |_, _, owned| owned.then_some(Target::Process),
     )
 }
@@ -948,9 +1063,10 @@ pub enum PreviousHelper {
 /// Ownership uses the same union as `sweep`, including hard links. After helper
 /// restart pass no records: launchd's group cleanup and the previous-group rule
 /// cover the foreground child even after binary replacement. No durable child
-/// record is added. Missing pins fail closed only for otherwise-unmatched pathless
-/// rule candidates (older orphans or eligible previous-group members); unrelated
-/// pathless processes cannot block startup merely because a tool is missing.
+/// record is added. Existing ownership and ambiguity are evaluated before image
+/// evidence. Otherwise unmatched pathless live entries require known boot-scoped
+/// history and all pin UUIDs, a differing UUID, and the name guard; uncertainty
+/// withholds startup with the PID. This wrapper supplies unknown history.
 /// Orphans are killed individually after start recheck, never by group. Self is
 /// excluded. Known different boots skip the previous-group rule.
 ///
@@ -993,17 +1109,42 @@ pub fn start_fence(
         timings,
         overall,
         false,
+        &ImageHistory::default(),
     )
 }
 
 /// One sweep round without retry sleeps; confirmation still needs two complete reads.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn poll_start_fence(
     p: &mut impl Platform,
     previous: PreviousHelper,
     pinned_tools: &[&Path],
     child_path: &Path,
     recorded_children: &[Child],
+    timings: &Timings,
+    overall: Deadline,
+) -> StartFence {
+    poll_start_fence_with_history(
+        p,
+        previous,
+        pinned_tools,
+        child_path,
+        recorded_children,
+        &ImageHistory::default(),
+        timings,
+        overall,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn poll_start_fence_with_history(
+    p: &mut impl Platform,
+    previous: PreviousHelper,
+    pinned_tools: &[&Path],
+    child_path: &Path,
+    recorded_children: &[Child],
+    history: &ImageHistory,
     timings: &Timings,
     overall: Deadline,
 ) -> StartFence {
@@ -1016,6 +1157,7 @@ pub(crate) fn poll_start_fence(
         timings,
         overall,
         true,
+        history,
     )
 }
 
@@ -1029,6 +1171,7 @@ fn start_fence_inner(
     timings: &Timings,
     overall: Deadline,
     poll: bool,
+    history: &ImageHistory,
 ) -> StartFence {
     let own = p.incarnation();
     let pinned: Vec<_> = pinned_tools
@@ -1039,10 +1182,12 @@ fn start_fence_inner(
     let result = sweep_matching(
         p,
         &pinned,
+        &pinned,
         recorded_children,
         timings,
         overall,
         poll,
+        history,
         |proc, procs, owned| {
             if proc.pid == own.pid {
                 return None;

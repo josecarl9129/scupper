@@ -60,6 +60,8 @@ pub enum Call {
     PfInfo,
     /// Stat a pinned executable.
     ExecutableId,
+    /// Parse the pinned executable image.
+    ImageUuid,
     /// Process enumeration.
     Processes,
     /// Guarded kill attempt (not necessarily a signal).
@@ -352,6 +354,10 @@ pub struct FakePlatform {
     pub x_qualified: bool,
     /// Process table, including self, foreign processes and unreaped zombies.
     pub procs: BTreeMap<u32, ProcInfo>,
+    /// Override pin UUID reads, including unknown images.
+    pub image_uuids: BTreeMap<std::path::PathBuf, Option<[u8; 16]>>,
+    /// Override the next spawned child's observed image.
+    pub spawn_image: Option<super::ImageId>,
     /// Processes that ignore kill; their survival prevents confirmation.
     pub unkillable: BTreeSet<u32>,
     /// Outstanding mutating children; only reap closes this incarnation’s fence.
@@ -524,6 +530,7 @@ impl FakePlatform {
             name: Some("helper".into()),
             path: Some("/opt/scupper/helper".into()),
             exe: Some(ExeId { dev: 1, ino: 1 }),
+            image: None,
         };
         Ok(Self {
             #[cfg(test)]
@@ -584,6 +591,8 @@ impl FakePlatform {
                 )
             })
             .collect(),
+            image_uuids: BTreeMap::new(),
+            spawn_image: None,
             disable_invalidates_tokens: true,
             executable_symlinks: BTreeSet::new(),
             x_qualified: false,
@@ -619,7 +628,13 @@ impl FakePlatform {
                         ProcState::Running,
                         Some("/usr/bin/foreign-new"),
                     ),
-                    (14, 1, 101, ProcState::Sleeping, None),
+                    (
+                        14,
+                        1,
+                        101,
+                        ProcState::Sleeping,
+                        Some("/usr/bin/foreign-host"),
+                    ),
                 ] {
                     let mut proc = own.clone();
                     proc.pid = pid;
@@ -760,6 +775,7 @@ impl FakePlatform {
                 | Call::Artifacts
                 | Call::Processes
                 | Call::ExecutableId
+                | Call::ImageUuid
                 | Call::Fence
         ) {
             self.capture_completed(call);
@@ -879,6 +895,7 @@ impl FakePlatform {
                                 .map(|n| n.to_string_lossy().into_owned()),
                             path: Some(path.into()),
                             exe: self.executables.get(Path::new(path)).copied(),
+                            image: None,
                         },
                     );
                     self.unkillable.insert(pid);
@@ -1348,6 +1365,7 @@ impl FakePlatform {
                 name: Some("helper".into()),
                 path: Some("/opt/scupper/helper".into()),
                 exe: Some(ExeId { dev: 1, ino: 1 }),
+                image: None,
             },
         );
         self.running = true;
@@ -1955,7 +1973,9 @@ impl Platform for FakePlatform {
             proc.pid != 0
                 && proc.state != ProcState::Zombie
                 && proc.path.is_none()
-                && proc.exe.is_none()
+                && proc
+                    .image
+                    .is_none_or(|image| image.uuid == [0; 16] || image.uniqueid == 0)
         }) {
             return Enumeration::Incomplete(ProcessError {
                 pid: Some(proc.pid),
@@ -1969,6 +1989,22 @@ impl Platform for FakePlatform {
                 .cloned()
                 .collect(),
         )
+    }
+    fn image_uuid(&mut self, path: &Path, deadline: Deadline) -> Result<[u8; 16], SysError> {
+        self.checked(Call::ImageUuid, deadline)?;
+        if self.executable_symlinks.contains(path) {
+            return Err(SysError::Failed("symlink executable pin"));
+        }
+        let uuid = match self.image_uuids.get(path) {
+            Some(uuid) => *uuid,
+            None => self.executables.get(path).map(|exe| {
+                let mut uuid = [1; 16];
+                uuid[..8].copy_from_slice(&exe.ino.to_le_bytes());
+                uuid
+            }),
+        };
+        uuid.filter(|uuid| *uuid != [0; 16])
+            .ok_or(SysError::Failed("pin UUID unknown"))
     }
     fn executable_id(&mut self, path: &Path, deadline: Deadline) -> Result<ExeId, SysError> {
         self.checked(Call::ExecutableId, deadline)?;
@@ -2222,12 +2258,20 @@ impl Platform for FakePlatform {
         }
         let pid = self.allocate_pid();
         let start = self.process_start();
+        let image = self.spawn_image.or_else(|| {
+            let uuid = self.image_uuid(Path::new(CHILD_PATH), deadline).ok()?;
+            Some(super::ImageId {
+                uuid,
+                uniqueid: u64::from(pid),
+            })
+        });
         let child = Child {
             boot: self.boot.clone(),
             generation: generation.value(),
             pid,
             start_time: start,
             exe: self.executables.get(Path::new(CHILD_PATH)).copied(),
+            image,
             pgid: self.helper.pgid,
             utun: "utun6".into(),
         };
@@ -2242,6 +2286,7 @@ impl Platform for FakePlatform {
                 name: Some("wireguard-go".into()),
                 path: Some(CHILD_PATH.into()),
                 exe: self.executables.get(Path::new(CHILD_PATH)).copied(),
+                image,
             },
         );
         self.children.insert(pid, child.clone());

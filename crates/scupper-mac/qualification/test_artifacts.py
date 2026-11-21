@@ -169,6 +169,29 @@ class ArtifactTests(unittest.TestCase):
         (self.root / "base-churn-sha256.txt").write_text(f"{'b' * 64}  qual-out/base-churn\n")
         self.assertEqual(self.check().returncode, 1)
 
+    def test_staged_base_images_require_matching_built_hashes(self):
+        (self.root / "built-capability-sha256.txt").write_text(f"{SHA256}  qual-out/probe-pf-starters\n")
+        (self.root / "wireguard-sha256.txt").write_text(f"{SHA256}  qual-out/wireguard-go\n")
+        (self.root / "executed-capability-sha256.txt").write_text(
+            "".join(f"{SHA256}  /fixture/{name}\n" for name in
+                    ["probe-pf-starters", "wireguard-go", "base-image-a", "base-image-b"]))
+        self.write_json("probe-identity-pf-starters.json", {"name":"pf-starters", "sha256":SHA256})
+        self.assertEqual(self.check().returncode, 1)
+        self.write_json("Q-SMOKE.json", self.result)
+        self.write_json("verdicts.json", [self.result])
+        (self.root / "base-image-sha256.txt").write_text(
+            "".join(f"{SHA256}  qual-out/base-image-{name}\n" for name in ["a", "b"]))
+        self.assertEqual(self.check().returncode, 0)
+        (self.root / "base-image-sha256.txt").write_text(f"{SHA256}  qual-out/base-image-a\n")
+        self.assertEqual(self.check().returncode, 1)
+
+    def test_base_cell_hashes_are_checked_without_probe_identity(self):
+        (self.root / "executed-capability-sha256.txt").write_text(f"{SHA256}  /fixture/base-image-a\n")
+        (self.root / "base-image-sha256.txt").write_text(f"{SHA256}  /fixture/base-image-a\n")
+        self.assertEqual(self.check().returncode, 0)
+        (self.root / "base-image-sha256.txt").write_text(f"{'b' * 64}  /fixture/base-image-a\n")
+        self.assertEqual(self.check().returncode, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

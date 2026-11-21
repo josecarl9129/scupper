@@ -1,7 +1,7 @@
 //! Native macOS boundary. Construction remains qualification-only until the
 //! install-record writer and production process identity are qualified.
 use crate::{
-    decode::proc,
+    decode::{image, proc},
     platform::{
         CheapObservation, Child, Collection, ConfigKey, Deadline, Enumeration, ExeId, Fence,
         InstallRecord, InstanceLockError, KillOutcome, LeaveRoutes, PfEnable, PfInfo, Platform,
@@ -73,6 +73,45 @@ impl NativePlatform {
             Ok(())
         }
     }
+    /// Qualification-only single-process image bracket, also used by the
+    /// pathless adapter. This does not grant ownership or certify a full inventory.
+    ///
+    /// # Errors
+    /// Returns the live PID for invalid image brackets, or an observation error.
+    #[cfg(feature = "qualification")]
+    pub fn observe_image(
+        &mut self,
+        pid: u32,
+        deadline: Deadline,
+    ) -> Result<Option<ProcInfo>, ProcessError> {
+        self.expired(deadline)?;
+        let record = scupper_darwin::sysctl_kern_proc_pid(pid).map_err(process_error)?;
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        let result = observe_image(decode(&record)?)?;
+        self.expired(deadline)?;
+        Ok(result)
+    }
+    /// Return the exact exec version validated by the image bracket, for Q-PROC.
+    ///
+    /// # Errors
+    /// Returns observation errors, retaining the PID when the bracket fails.
+    #[cfg(feature = "qualification")]
+    pub fn observe_image_version(
+        &mut self,
+        pid: u32,
+        deadline: Deadline,
+    ) -> Result<(Option<ProcInfo>, Option<i32>), ProcessError> {
+        self.expired(deadline)?;
+        let record = scupper_darwin::sysctl_kern_proc_pid(pid).map_err(process_error)?;
+        let Some(record) = record else {
+            return Ok((None, None));
+        };
+        let result = observe_image_detail(decode(&record)?)?;
+        self.expired(deadline)?;
+        Ok(result)
+    }
     fn process_list(&mut self, deadline: Deadline) -> Result<Vec<ProcInfo>, ProcessError> {
         self.expired(deadline)?;
         let pid = std::process::id();
@@ -97,11 +136,15 @@ impl NativePlatform {
                 continue;
             }
             let path = scupper_darwin::proc_pidpath(entry.pid);
-            // Bracket every path read, including success, by (pid,start).
-            // ESRCH/ENOENT alone never establish that a listed PID vanished.
-            let current = scupper_darwin::sysctl_kern_proc_pid(entry.pid).map_err(process_error)?;
-            let current = current.as_ref().map(decode).transpose()?;
-            let Some(entry) = proc::resolve_path(entry, path.ok(), current)? else {
+            let resolved = if path.as_ref().is_err_and(|e| e.raw_os_error() == 2) {
+                observe_image(entry)
+            } else {
+                // ESRCH alone proves no exit; bracket successful paths too.
+                let current =
+                    scupper_darwin::sysctl_kern_proc_pid(entry.pid).map_err(process_error)?;
+                proc::resolve_path(entry, path.ok(), current.as_ref().map(decode).transpose()?)
+            };
+            let Some(entry) = resolved? else {
                 continue;
             };
             procs.push(entry);
@@ -110,6 +153,31 @@ impl NativePlatform {
         proc::require_self(&procs, pid, own.start)?;
         Ok(procs)
     }
+}
+fn observe_image(entry: ProcInfo) -> Result<Option<ProcInfo>, ProcessError> {
+    observe_image_detail(entry).map(|(entry, _)| entry)
+}
+fn observe_image_detail(entry: ProcInfo) -> Result<(Option<ProcInfo>, Option<i32>), ProcessError> {
+    let pid = entry.pid;
+    let mut version = None;
+    let result = proc::observe_image(
+        entry,
+        || {
+            let id = scupper_darwin::proc_identifier(pid)
+                .ok()
+                .and_then(|bytes| image::identifier(&bytes).ok());
+            version = id.map(|id| id.idversion);
+            id
+        },
+        || {
+            scupper_darwin::sysctl_kern_proc_pid(pid)
+                .map_err(process_error)?
+                .as_ref()
+                .map(decode)
+                .transpose()
+        },
+    )?;
+    Ok((result, version))
 }
 fn process_error(error: scupper_darwin::ProcError) -> ProcessError {
     ProcessError::from(SysError::Failed(match error {
@@ -133,6 +201,7 @@ fn decode(record: &scupper_darwin::KProc) -> Result<ProcInfo, ProcessError> {
             name: proc::name(&record.comm),
             path: None,
             exe: None,
+            image: None,
         })
     };
     fields().map_err(ProcessError::from)
@@ -219,6 +288,34 @@ impl Platform for NativePlatform {
             dev: meta.dev(),
             ino: meta.ino(),
         })
+    }
+    fn image_uuid(&mut self, path: &Path, deadline: Deadline) -> Result<[u8; 16], SysError> {
+        use std::{io::Read, os::unix::fs::OpenOptionsExt};
+        self.expired(deadline)?;
+        if !cfg!(target_arch = "aarch64") {
+            return Err(SysError::Failed("native: image architecture unsupported"));
+        }
+        // Darwin O_NOFOLLOW | O_CLOEXEC; all actual foreign calls remain in sys.rs.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x100 | 0x0100_0000)
+            .open(path)
+            .map_err(|_| SysError::Failed("native: image open"))?;
+        let meta = file
+            .metadata()
+            .map_err(|_| SysError::Failed("native: image fstat"))?;
+        if !meta.is_file() || meta.len() > 64 * 1024 * 1024 {
+            return Err(SysError::Failed("native: image size or type"));
+        }
+        let mut bytes = Vec::new();
+        file.take(64 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| SysError::Failed("native: image read"))?;
+        self.expired(deadline)?;
+        if bytes.len() > 64 * 1024 * 1024 {
+            return Err(SysError::Failed("native: image size"));
+        }
+        image::macho_uuid(&bytes)
     }
     fn acquire_instance_lock(&mut self) -> Result<(), InstanceLockError> {
         Err(InstanceLockError::Failed(UNIMPLEMENTED))
@@ -491,6 +588,17 @@ mod tests {
             assert!(platform.executable_id(&link, d).is_err());
             assert!(platform.executable_id(&root, d).is_err());
             assert!(platform.executable_id(&root.join("absent"), d).is_err());
+            assert!(platform.image_uuid(&link, d).is_err());
+            assert!(platform.image_uuid(&root, d).is_err());
+            assert!(platform.image_uuid(&pin, d).is_err()); // not Mach-O
+            let bytes = include_bytes!("../../tests/fixtures/macos/layout/thin-arm64-header.bin");
+            std::fs::write(&pin, bytes)?;
+            assert_eq!(platform.image_uuid(&pin, d)?, image::macho_uuid(bytes)?);
+            let expired_image = Deadline(platform.now());
+            assert_eq!(
+                platform.image_uuid(&pin, expired_image),
+                Err(SysError::TimedOut)
+            );
             let expired = Deadline(platform.now());
             assert_eq!(
                 platform.executable_id(&pin, expired),

@@ -1,6 +1,6 @@
 //! Core step mapping and observation cadence over Platform only.
 use super::{
-    Clock, Completion, Engine, Event, Form, Inputs, Mode, Platform, QueueEvent, Reason,
+    CHILD_PATH, Clock, Completion, Engine, Event, Form, Inputs, Mode, Platform, QueueEvent, Reason,
     RefEvidence, Step, SysError, Tunnel, TunnelGeneration, Verdict, verify,
 };
 use crate::platform::{Collection, ConfigKey, Setting, SpawnAttributes};
@@ -121,6 +121,17 @@ impl<P: Platform> Engine<P> {
                     return Err(SysError::Failed("child sweep unconfirmed"));
                 }
                 let d = self.deadline();
+                let uuid = self
+                    .platform
+                    .image_uuid(std::path::Path::new(CHILD_PATH), d)?;
+                self.snapshot
+                    .image_history
+                    .observe_boot(self.platform.boot_id());
+                self.snapshot.image_history.record(uuid);
+                if !self.commit_if_changed() {
+                    return Err(SysError::Failed("image history write failed"));
+                }
+                let d = self.deadline();
                 let child = match self.platform.spawn(generation, CHILD_SPAWN_ATTRIBUTES, d) {
                     Ok(child) => child,
                     Err(error) => {
@@ -128,6 +139,20 @@ impl<P: Platform> Engine<P> {
                         return Err(error);
                     }
                 };
+                if child
+                    .image
+                    .is_none_or(|image| image.uuid != uuid || image.uniqueid == 0)
+                {
+                    if let Some(image) = child.image {
+                        self.snapshot.image_history.record(image.uuid);
+                    }
+                    // Attempt the durable unexpected-build record before termination.
+                    // A failed write still kills the exact child and fails closed.
+                    let _ = self.commit_if_changed();
+                    let d = self.deadline();
+                    let _ = self.platform.kill_process(child.pid, child.start_time, d);
+                    return Err(SysError::Failed("spawn image mismatch"));
+                }
                 let tunnel = Tunnel {
                     name: child.utun.parse().map_err(|_| SysError::Unknown)?,
                     generation,

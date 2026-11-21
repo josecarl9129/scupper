@@ -70,10 +70,7 @@ pub(super) fn inventory(
             ) {
                 return Err(format!("adapter process contract breach: {error:?}"));
             }
-            Ok(
-                matches!(oracle, Oracle::Pathless(pid) if error.pid == Some(pid)
-                && error.error == SysError::Failed("native: live pathless process")),
-            )
+            Ok(false)
         }
         Enumeration::Complete(list) => match oracle {
             Oracle::Stopped(pid) => {
@@ -86,8 +83,17 @@ pub(super) fn inventory(
                     Err("native inventory omitted or misclassified stopped oracle".into())
                 }
             }
-            Oracle::Pathless(_) => {
-                Err("Complete inventory despite confirmed live pathless oracle".into())
+            Oracle::Pathless(pid) => {
+                if list.iter().any(|p| {
+                    p.pid == pid
+                        && p.path.is_none()
+                        && p.image
+                            .is_some_and(|image| image.uuid != [0; 16] && image.uniqueid != 0)
+                }) {
+                    Ok(true)
+                } else {
+                    Err("Complete inventory missing validated pathless oracle".into())
+                }
             }
         },
     }
@@ -139,7 +145,7 @@ mod tests {
         assert!(!inventory(&unrelated, Oracle::Stopped(123))?);
         assert!(!inventory(&unrelated, Oracle::Pathless(123))?);
         let expected = incomplete(Some(123), SysError::Failed("native: live pathless process"));
-        assert!(inventory(&expected, Oracle::Pathless(123))?);
+        assert!(!inventory(&expected, Oracle::Pathless(123))?);
         let layout = incomplete(None, SysError::Failed("native: process layout"));
         assert!(inventory(&layout, Oracle::Stopped(123)).is_err());
         assert!(inventory(&layout, Oracle::Pathless(123)).is_err());

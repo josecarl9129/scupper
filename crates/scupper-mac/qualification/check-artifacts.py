@@ -113,14 +113,19 @@ else:
         return values
 
     identities = sorted(root.glob("probe-identity-*.json"))
-    if identities:
+    if identities or (root / "executed-capability-sha256.txt").exists():
         try:
-            built_probes = hash_map(root / "built-capability-sha256.txt")
-            built_probes.update(hash_map(root / "wireguard-sha256.txt"))
+            built_probes = {}
+            for name in ["built-capability-sha256.txt", "wireguard-sha256.txt"]:
+                if identities or (root / name).exists():
+                    built_probes.update(hash_map(root / name))
             # Every cell stages the base churn helper next to the probes.
             base_churn = root / "base-churn-sha256.txt"
             if base_churn.exists():
                 built_probes.update(hash_map(base_churn))
+            base_images = root / "base-image-sha256.txt"
+            if base_images.exists():
+                built_probes.update(hash_map(base_images))
             staged_probes = hash_map(root / "executed-capability-sha256.txt")
             if built_probes != staged_probes:
                 identity_errors.append("built and staged capability hashes differ")
