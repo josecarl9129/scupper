@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+pub(super) const MAX_FINAL_RESTORE_SECONDS: u64 = 240;
+
 /// A case result is evidence, not an automatic qualification promotion.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -104,7 +106,7 @@ impl Manifest {
         serde_json::from_str(include_str!("../../qualification/manifest.json"))
     }
 
-    /// Enforce sum of case budgets plus ten percent within the harness budget.
+    /// Fit case slack and the bounded final restore within the harness budget.
     #[must_use]
     pub fn budgets_fit(&self) -> bool {
         let Some(available) = self.cell_budget_minutes.checked_sub(self.overhead_minutes) else {
@@ -115,9 +117,10 @@ impl Manifest {
             *groups.entry(&case.group).or_default() += u64::from(case.budget_minutes);
         }
         !groups.is_empty()
-            && groups
-                .values()
-                .all(|minutes| minutes * 110 <= u64::from(available) * 100)
+            && groups.values().all(|minutes| {
+                minutes * 110 <= u64::from(available) * 100
+                    && minutes * 60 + MAX_FINAL_RESTORE_SECONDS <= u64::from(available) * 60
+            })
     }
 }
 
@@ -151,6 +154,7 @@ mod tests {
         let manifest = Manifest::bundled()?;
         assert!(manifest.budgets_fit());
         assert_eq!(manifest.cell_budget_minutes - manifest.overhead_minutes, 18);
+        assert_eq!(MAX_FINAL_RESTORE_SECONDS, 240);
         assert_eq!(manifest.cases.len(), 11);
         assert!(
             manifest
@@ -158,6 +162,15 @@ mod tests {
                 .iter()
                 .all(|case| case.minimum_iterations > 0)
         );
+        // Fifteen case minutes fit the old 10% rule, but leave only three
+        // minutes for final recovery instead of the required maximum of four.
+        let mut over = Manifest::bundled()?;
+        over.cases
+            .iter_mut()
+            .find(|case| case.group == "probe")
+            .ok_or("missing probe case")?
+            .budget_minutes += 1;
+        assert!(!over.budgets_fit());
         let mut over = manifest;
         over.cases[0].budget_minutes = 18;
         assert!(!over.budgets_fit());

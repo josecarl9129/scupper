@@ -3,8 +3,6 @@ use serde_json::Value;
 
 use super::Verdict;
 
-pub(super) const RESTORE_BUDGET_SECONDS: u64 = 90;
-
 pub(super) const NAMES: [&str; 9] = [
     "pf-starters",
     "pf-eexist",
@@ -264,7 +262,25 @@ mod tests {
             "one shared arm deadline; no hijack override"
         );
         assert!(deadlines[0] >= 120);
-        assert!(deadlines[0] > case_seconds + RESTORE_BUDGET_SECONDS);
+        assert!(deadlines[0] > case_seconds + super::super::model::MAX_FINAL_RESTORE_SECONDS);
+        // The largest probe group and the maximum final restore must also fit
+        // before the shared dead-man fires (scoped recovery is in each case).
+        let probe_seconds: u64 = manifest
+            .cases
+            .iter()
+            .filter(|case| case.group == "probe")
+            .map(|case| u64::from(case.budget_minutes) * 60)
+            .sum();
+        assert!(deadlines[0] >= probe_seconds + super::super::model::MAX_FINAL_RESTORE_SECONDS);
+        let restore_minutes = workflow
+            .split("- name: Restore and stop dead-man")
+            .nth(1)
+            .ok_or("missing always-step recovery")?
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("timeout-minutes: "))
+            .ok_or("missing always-step deadline")?
+            .parse::<u64>()?;
+        assert!(restore_minutes * 60 > super::super::model::MAX_FINAL_RESTORE_SECONDS);
         assert!(arm.contains("--after \"$after\""));
         assert!(!arm.contains("then after="));
         Ok(())

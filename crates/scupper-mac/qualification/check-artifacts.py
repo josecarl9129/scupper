@@ -9,6 +9,10 @@ import sys
 root = Path(sys.argv[1])
 
 ASSIGNMENT = re.compile(r"(?:private_key|preshared_key)=", re.I)
+MACH_MAGICS = {bytes.fromhex(magic) for magic in (
+    "cf fa ed fe", "ce fa ed fe", "fe ed fa cf", "fe ed fa ce",
+    "ca fe ba be", "be ba fe ca",
+)}
 
 
 def contains_assignment(value, depth=0):
@@ -65,6 +69,12 @@ else:
     for name in binaries:
         for path in root.rglob(name):
             if path.is_file() or path.is_symlink():
+                path.unlink()
+    for path in root.rglob("*"):
+        if path.is_file() and not path.is_symlink():
+            with path.open("rb") as artifact:
+                magic = artifact.read(4)
+            if magic in MACH_MAGICS or path.suffix.lower() in {".dmg", ".sparseimage", ".sparsebundle", ".iso", ".cdr", ".img"}:
                 path.unlink()
     bad = []
     for path in sorted(root.rglob("*")):

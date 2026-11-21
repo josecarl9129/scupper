@@ -14,6 +14,65 @@ use std::{
 };
 
 use super::super::journal::{self, Entry};
+use super::super::recovery::Completed;
+
+fn completed(out: &Path) -> Result<Completed> {
+    let path = out.join("completed-resources.json");
+    if path.exists() {
+        super::read_json(&path)
+    } else {
+        Ok(Completed::default())
+    }
+}
+
+fn update_completed(
+    out: &Path,
+    deadline: Instant,
+    update: impl FnOnce(&mut Completed),
+) -> Result<()> {
+    let _lock = lock(out, "completion.lock", deadline)?;
+    let mut state = completed(out)?;
+    update(&mut state);
+    write_json(out, "completed-resources.json", &state)
+}
+
+pub(super) fn writer_completed(out: &Path, writer: &Writer) -> Result<bool> {
+    Ok(completed(out)?.writers.contains(writer))
+}
+
+pub(super) fn complete_writer(out: &Path, writer: Writer, deadline: Instant) -> Result<()> {
+    let entries = entries(out)?;
+    update_completed(out, deadline, |state| {
+        state.writer_stopped(writer, &entries);
+    })
+}
+
+pub(super) fn remaining(out: &Path) -> Result<usize> {
+    let state = completed(out)?;
+    let controllers: Vec<Writer> = super::read_json(&out.join("writers.json"))?;
+    Ok(state.pending(entries(out)?).len()
+        + controllers
+            .iter()
+            .filter(|writer| writer.pid != std::process::id() && !state.writers.contains(writer))
+            .count())
+}
+
+fn writers_quiescent(out: &Path) -> Result<bool> {
+    let state = completed(out)?;
+    let mut writers: Vec<Writer> = super::read_json(&out.join("writers.json"))?;
+    writers.extend(
+        entries(out)?
+            .into_iter()
+            .filter(|e| matches!(e.kind.as_str(), "probe" | "child" | "pf-acquire"))
+            .map(|e| Writer {
+                pid: e.pid,
+                start: e.start,
+            }),
+    );
+    Ok(writers
+        .iter()
+        .all(|writer| writer.pid == std::process::id() || state.writers.contains(writer)))
+}
 
 fn entries(out: &Path) -> Result<Vec<Entry>> {
     let path = out.join("resources.jsonl");
@@ -33,8 +92,10 @@ pub(super) fn journaled_keys(out: &Path) -> Result<Vec<String>> {
 }
 
 pub(super) fn writers(out: &Path, probes_only: bool) -> Result<Vec<Writer>> {
-    Ok(entries(out)?
+    Ok(completed(out)?
+        .pending(entries(out)?)
         .into_iter()
+        .map(|(_, e)| e)
         .filter(|e| {
             if probes_only {
                 e.kind == "probe"
@@ -50,12 +111,16 @@ pub(super) fn writers(out: &Path, probes_only: bool) -> Result<Vec<Writer>> {
 }
 
 pub(super) fn restore_lock(out: &Path, deadline: Instant) -> Result<fs::File> {
+    lock(out, "restore.lock", deadline)
+}
+
+fn lock(out: &Path, name: &str, deadline: Instant) -> Result<fs::File> {
     let lock = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .mode(0o600)
-        .open(out.join("restore.lock"))?;
+        .open(out.join(name))?;
     loop {
         match rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
             Ok(()) => return Ok(lock),
@@ -150,10 +215,10 @@ fn attached_devices(out: &Path, paths: &[&str], deadline: Instant) -> Result<Vec
     let json: Value = serde_json::from_str(&parsed.stdout)?;
     let mut devices = Vec::new();
     for image in json["images"].as_array().ok_or("missing images array")? {
-        if !image["image-path"]
+        let path = image["image-path"]
             .as_str()
-            .is_some_and(|path| paths.contains(&path))
-        {
+            .ok_or("attached image has no path")?;
+        if !paths.contains(&path) {
             continue;
         }
         let device = image["system-entities"]
@@ -181,7 +246,11 @@ pub(super) fn undo(
     restore_pf_state: bool,
 ) -> Result<(Vec<String>, Vec<String>)> {
     repair_tail(out)?;
-    let entries = entries(out)?;
+    let pending = completed(out)?.pending(entries(out)?);
+    if pending.is_empty() && !restore_pf_state {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let entries: Vec<_> = pending.iter().map(|(_, e)| e.clone()).collect();
     let mut actions = Vec::new();
     let mut failures = Vec::new();
     undo_tokens(out, &entries, deadline, &mut actions, &mut failures)?;
@@ -268,7 +337,118 @@ pub(super) fn undo(
             actions.push(format!("unlink {}", e.path));
         }
     }
+    complete_from_inventory(out, &pending, deadline, &mut failures)?;
     Ok((actions, failures))
+}
+
+fn complete_from_inventory(
+    out: &Path,
+    pending: &[(usize, Entry)],
+    deadline: Instant,
+    failures: &mut Vec<String>,
+) -> Result<()> {
+    // Only complete entries after a complete inventory verifies absence. An
+    // action's success alone cannot prove that no fixture resource remains.
+    if !writers_quiescent(out)? {
+        return Ok(());
+    }
+    let entries: Vec<_> = pending.iter().map(|(_, e)| e.clone()).collect();
+    let paths: Vec<_> = entries
+        .iter()
+        .filter(|e| e.kind == "image")
+        .map(|e| e.path.as_str())
+        .collect();
+    let mut verified = Vec::new();
+    if entries
+        .iter()
+        .any(|e| matches!(e.kind.as_str(), "token" | "pf-acquire"))
+    {
+        match live_tokens(out, deadline) {
+            Ok(tokens) => {
+                for (index, entry) in pending {
+                    if matches!(entry.kind.as_str(), "token" | "pf-acquire")
+                        && !tokens.iter().any(|token| {
+                            journal::owns_token(
+                                std::slice::from_ref(entry),
+                                token.value,
+                                token.pid,
+                                token.timestamp,
+                                unix_seconds(),
+                            )
+                        })
+                        && (entry.kind != "pf-acquire"
+                            || writer_completed(
+                                out,
+                                &Writer {
+                                    pid: entry.pid,
+                                    start: entry.start.clone(),
+                                },
+                            )?)
+                    {
+                        verified.push(*index);
+                    }
+                }
+            }
+            Err(error) => failures.push(format!("token completion inventory: {error}")),
+        }
+    }
+    if !paths.is_empty() {
+        match attached_devices(out, &paths, deadline) {
+            Ok(devices) if devices.is_empty() => verified.extend(
+                pending
+                    .iter()
+                    // The mount intent belongs to this fixture image too;
+                    // detachment proves that it cannot remain mounted.
+                    .filter(|(_, e)| matches!(e.kind.as_str(), "image" | "mount"))
+                    .map(|(index, _)| *index),
+            ),
+            Ok(_) => failures.push("fixture image remains attached".into()),
+            Err(error) => failures.push(format!("image completion inventory: {error}")),
+        }
+    }
+    update_completed(out, deadline, |state| state.entries.extend(verified))?;
+    Ok(())
+}
+
+pub(super) fn complete_from_snapshot(out: &Path, post: &Snapshot, deadline: Instant) -> Result<()> {
+    if !writers_quiescent(out)? {
+        return Ok(());
+    }
+    let pending = completed(out)?.pending(entries(out)?);
+    let mut verified = Vec::new();
+    for (index, entry) in pending {
+        let absent = match entry.kind.as_str() {
+            "key" => post.observations.get("scutil-keys").is_some_and(|keys| {
+                restore_check::valid_key_list(keys)
+                    && !restore_check::key_list(&keys.stdout).contains(&entry.path)
+            }),
+            "cloned-route" if entry.path == "127.0.0.53" => {
+                post.observations.get("routes").is_some_and(|routes| {
+                    routes.complete() && !restore_check::resolver_clone(&routes.stdout)
+                })
+            }
+            "loopback-alias" if entry.path == "127.0.0.53" => {
+                post.observations
+                    .get("interfaces")
+                    .is_some_and(|interfaces| {
+                        interfaces.complete()
+                            && !interfaces.stdout.lines().any(|line| {
+                                line.split_whitespace().take(2).eq(["inet", "127.0.0.53"])
+                            })
+                    })
+            }
+            "socket" => fs::symlink_metadata(&entry.path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+            _ => false,
+        };
+        if absent {
+            verified.push(index);
+        }
+    }
+    if !verified.is_empty() {
+        update_completed(out, deadline, |state| state.entries.extend(verified))?;
+    }
+    Ok(())
 }
 
 fn detach_device(
@@ -383,6 +563,9 @@ fn undo_keys(
     actions: &mut Vec<String>,
     failures: &mut Vec<String>,
 ) -> Result<()> {
+    if !entries.iter().any(|e| e.kind == "key") {
+        return Ok(());
+    }
     let keys = command(
         "/usr/sbin/scutil",
         &[],

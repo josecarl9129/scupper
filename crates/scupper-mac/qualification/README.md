@@ -87,7 +87,8 @@ entries cannot promote an assumption. There are no automatic probe reruns.
 
 The manifest reserves 12 of each 30-minute cell's minutes for setup and restore.
 Seven non-hijack probes have two-minute budgets: 14 minutes plus 10% fits the
-18-minute harness allocation. The hijack cell has two one-minute cases including
+18-minute harness allocation, as do the cases plus final restore's four-minute
+maximum. The hijack cell has two one-minute cases including
 recovery. `dns-default` runs the DNS-only, OverridePrimary-only and full utun
 phases; `dns-default-minimal` runs the no-Router and no-OverridePrimary phases.
 Each has a nine-second alarm while keys are owned and a ten-second outer command
@@ -95,7 +96,13 @@ deadline. A gated undo sentinel removes both keys on SIGALRM notification,
 unexpected parent EOF or its 8.5-second deadline, in addition to temporary-session
 teardown. The cell is `continue-on-error` on both pinned runners; the independent
 dead-man uses the same 1080 seconds as other groups. The timing regression test
-requires this deadline to exceed both case budgets plus final restore's 90 seconds.
+requires this deadline to exceed both hijack case budgets plus final restore's
+240-second maximum, and to cover the larger probe group plus that maximum.
+Final recovery gets its own budget: 10 seconds plus two seconds per incomplete
+journal entry or controller, capped at 240 seconds. Verified completed entries
+are skipped, including identities of stopped writers; every restore still takes
+a post-state snapshot and compares it with preflight. The always-step allows five
+minutes for recovery and stopping the dead-man.
 
 Compiler output is retained in full on native build failures. Artifact checks
 remove executables/images and quarantine any remaining UAPI key assignments.

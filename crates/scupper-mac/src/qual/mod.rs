@@ -14,6 +14,8 @@ mod model;
 #[cfg(any(target_os = "macos", test))]
 mod probe;
 #[cfg(any(target_os = "macos", test))]
+mod recovery;
+#[cfg(any(target_os = "macos", test))]
 mod restore_check;
 pub use model::{Case, CaseResult, Evidence, Manifest, Verdict, redact};
 

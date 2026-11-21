@@ -344,7 +344,7 @@ jobs:
         run: /usr/bin/sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,ImageOS,ImageVersion,RUNNER_NAME,GITHUB_RUN_ID,GITHUB_SHA /private/var/db/scupper-qual/scupper-mac-qual run --group ${{ matrix.group }} --out /private/var/db/scupper-qual/evidence --disposable-runner
       - name: Restore and stop dead-man
         if: always()
-        timeout-minutes: 3
+        timeout-minutes: 5
         run: |
           mkdir -p qual-out
           restore_status=0

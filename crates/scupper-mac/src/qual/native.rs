@@ -18,6 +18,7 @@ use super::{
     CaseResult, Evidence, Manifest, Verdict,
     command::{command, unix_seconds},
     guard::{Ack, MAX_ARM_SECONDS, check_environment, preflight_conditions},
+    recovery::{self, Writer},
     redact,
     restore_check::{self, RestoreEffects},
 };
@@ -29,6 +30,7 @@ const SERVICE: &str = "system/net.scupper.qual.restore";
 mod resources;
 
 const TOOL_BUDGET: Duration = Duration::from_secs(8);
+const SNAPSHOT_BUDGET: Duration = Duration::from_secs(90);
 
 struct Options {
     action: String,
@@ -393,11 +395,7 @@ fn preflight(out: &Path) -> Result<()> {
             "preflight already exists; use a new artifact directory for a new campaign".into(),
         );
     }
-    let snapshot = snapshot(
-        out,
-        "preflight",
-        Instant::now() + Duration::from_secs(super::probe::RESTORE_BUDGET_SECONDS),
-    )?;
+    let snapshot = snapshot(out, "preflight", Instant::now() + SNAPSHOT_BUDGET)?;
     write_json(out, "preflight.json", &snapshot)?;
     write_json(out, "writers.json", &Vec::<Writer>::new())?;
     write_json(out, "manifest.json", &Manifest::bundled()?)?;
@@ -440,13 +438,25 @@ fn lookup_identity_before(
         &format!("{}.json", unique(&format!("identity-{pid}"))),
         &evidence,
     )?;
-    if evidence.exit_code == Some(3) && !evidence.timed_out && !evidence.truncated {
-        let error: Value = serde_json::from_str(&evidence.stdout)?;
-        if error["error"].as_i64() == Some(i64::from(rustix::io::Errno::SRCH.raw_os_error())) {
-            return Ok(None);
-        }
+    if evidence.exit_code == Some(3)
+        && !evidence.timed_out
+        && !evidence.truncated
+        && serde_json::from_str::<Value>(&evidence.stdout).is_ok_and(|error| {
+            error["error"].as_i64() == Some(i64::from(rustix::io::Errno::SRCH.raw_os_error()))
+        })
+    {
+        return Ok(None);
     }
     if !evidence.complete() {
+        let listing = invoke_before("/bin/ps", &["-axo", "pid="], deadline);
+        write_json(
+            out,
+            &format!("{}.json", unique("identity-process-list")),
+            &listing,
+        )?;
+        if recovery::process_absent(pid, &listing) {
+            return Ok(None);
+        }
         return Err(format!(
             "cannot establish microsecond process identity for pid {pid}; see identity evidence"
         )
@@ -625,12 +635,6 @@ fn deadman(options: &Options) -> Result<()> {
     restore_checked(&options.out)
 }
 
-#[derive(Serialize, Deserialize)]
-struct Writer {
-    pid: u32,
-    start: String,
-}
-
 fn stop_writers(out: &Path, deadline: Instant) -> Result<Vec<Evidence>> {
     let controllers: Vec<Writer> = read_json(&out.join("writers.json"))?;
     let mut stopped = stop_writer_list(out, controllers, deadline)?;
@@ -660,13 +664,15 @@ fn stop_writer_list(
     for writer in writers {
         // An in-process smoke restore excludes its own controller. An external
         // restore/dead-man stops that controller before inspecting post-state.
-        if writer.pid == std::process::id() {
+        if writer.pid == std::process::id() || resources::writer_completed(out, &writer)? {
             continue;
         }
         let Some(identity) = lookup_identity_before(out, writer.pid, deadline)? else {
+            resources::complete_writer(out, writer, deadline)?;
             continue;
         };
         if identity.start != writer.start || identity.status == 5 {
+            resources::complete_writer(out, writer, deadline)?;
             continue;
         }
         let kill = invoke_before("/bin/kill", &["-KILL", &writer.pid.to_string()], deadline);
@@ -692,6 +698,7 @@ fn stop_writer_list(
             }
             thread::sleep(Duration::from_millis(20));
         }
+        resources::complete_writer(out, writer, deadline)?;
     }
     Ok(stopped)
 }
@@ -707,28 +714,24 @@ struct Restore {
     violations: Vec<String>,
 }
 
-fn restore(out: &Path, deadline: Instant) -> Result<Restore> {
-    let before: Snapshot = read_json(&out.join("preflight.json"))?;
-    let stopped = stop_writers(out, deadline)?;
-    let _lock = resources::restore_lock(out, deadline)?;
-    let mut actions = Vec::new();
-    let mut violations = Vec::new();
-    let mut stopped = stopped;
-    // Stop every scoped writer before any network cleanup, including when the
-    // dead-man interrupts a probe between its exec grant and token append.
+fn probe_scopes(out: &Path) -> Result<Vec<(&'static str, PathBuf)>> {
     let mut scopes = Vec::new();
     for name in super::probe::NAMES {
         let scope = out.join(format!("scope-{name}"));
-        if !scope.join("preflight.json").exists() {
-            continue;
+        if scope.join("preflight.json").exists() {
+            protected_path(&scope, true)?;
+            scopes.push((name, scope));
         }
-        protected_path(&scope, true)?;
-        match stop_writers(&scope, deadline) {
-            Ok(evidence) => stopped.extend(evidence),
-            Err(error) => violations.push(format!("{name}: stop writers: {error}")),
-        }
-        scopes.push((name, scope));
     }
+    Ok(scopes)
+}
+
+fn restore(out: &Path, deadline: Instant) -> Result<Restore> {
+    let before: Snapshot = read_json(&out.join("preflight.json"))?;
+    let mut actions = Vec::new();
+    let mut violations = Vec::new();
+    let mut stopped = Vec::new();
+    let scopes = probe_scopes(out)?;
     let mut journaled_keys = Vec::new();
     for directory in scopes
         .iter()
@@ -740,32 +743,79 @@ fn restore(out: &Path, deadline: Instant) -> Result<Restore> {
             Err(error) => violations.push(format!("key journal inventory: {error}")),
         }
     }
-    // Final/dead-man recovery visits all independent journals. An inventory
-    // failure in one scope cannot suppress cleanup in another scope.
-    for (name, scope) in scopes
-        .into_iter()
-        .chain(std::iter::once(("campaign", out.to_path_buf())))
-    {
-        let _scope_lock = if scope == out {
-            None
-        } else {
-            Some(resources::restore_lock(&scope, deadline)?)
-        };
-        // Release scoped references before restoring the campaign's PF state.
-        // A scoped restore (with no children) still restores its own PF state.
-        match resources::undo(&scope, &before, deadline, scope == out) {
-            Ok((undo, problems)) => {
-                actions.extend(undo);
-                violations.extend(
-                    problems
-                        .into_iter()
-                        .map(|problem| format!("{name}: {problem}")),
-                );
+    let has_pending = scopes
+        .iter()
+        .map(|(_, scope)| scope.as_path())
+        .chain(std::iter::once(out))
+        .any(|directory| match resources::remaining(directory) {
+            Ok(count) => count > 0,
+            Err(error) => {
+                violations.push(format!("pending resource inventory: {error}"));
+                true
             }
-            Err(error) => violations.push(format!("{name}: restore: {error}")),
+        });
+    // Keep the recovery lock through the post-state capture. Completion records
+    // can skip cleanup, but can never skip the snapshot/preflight comparison.
+    let mut lock = None;
+    let (cleanup, post) = recovery::recover_then_snapshot(
+        has_pending,
+        || -> Result<()> {
+            stopped.extend(stop_writers(out, deadline)?);
+            lock = Some(resources::restore_lock(out, deadline)?);
+            // Stop every scoped writer before any network cleanup. Closing exec
+            // gates prevents an uncommitted child from becoming a late writer.
+            for (name, scope) in &scopes {
+                match stop_writers(scope, deadline) {
+                    Ok(evidence) => stopped.extend(evidence),
+                    Err(error) => violations.push(format!("{name}: stop writers: {error}")),
+                }
+            }
+            // Visit all independent journals even if another scope fails.
+            for (name, scope) in scopes
+                .iter()
+                .map(|(name, scope)| (*name, scope.as_path()))
+                .chain(std::iter::once(("campaign", out)))
+            {
+                let _scope_lock = if scope == out {
+                    None
+                } else {
+                    match resources::restore_lock(scope, deadline) {
+                        Ok(lock) => Some(lock),
+                        Err(error) => {
+                            violations.push(format!("{name}: restore lock: {error}"));
+                            continue;
+                        }
+                    }
+                };
+                match resources::undo(scope, &before, deadline, scope == out) {
+                    Ok((undo, problems)) => {
+                        actions.extend(undo);
+                        violations.extend(
+                            problems
+                                .into_iter()
+                                .map(|problem| format!("{name}: {problem}")),
+                        );
+                    }
+                    Err(error) => violations.push(format!("{name}: restore: {error}")),
+                }
+            }
+            Ok(())
+        },
+        || snapshot(out, &unique("post"), deadline),
+    );
+    if let Some(Err(error)) = cleanup {
+        violations.push(format!("restore: {error}"));
+    }
+    let post = post?;
+    for directory in scopes
+        .iter()
+        .map(|(_, scope)| scope.as_path())
+        .chain(std::iter::once(out))
+    {
+        if let Err(error) = resources::complete_from_snapshot(directory, &post, deadline) {
+            violations.push(format!("record completion: {error}"));
         }
     }
-    let post = snapshot(out, &unique("post"), deadline)?;
     let changed =
         restore_check::state_changes(&before.observations, &post.observations, &journaled_keys);
     violations.extend(changed.violations.iter().cloned());
@@ -1014,10 +1064,7 @@ fn boot_reads(out: &Path, result: &mut CaseResult, started: Instant) -> Result<(
 }
 
 fn restore_checked(out: &Path) -> Result<()> {
-    let result = restore(
-        out,
-        Instant::now() + Duration::from_secs(super::probe::RESTORE_BUDGET_SECONDS),
-    )?;
+    let result = restore(out, final_restore_deadline(out)?)?;
     let prior = out.join("Q-RESTORE.json");
     let earlier_violation =
         prior.exists() && read_json::<CaseResult>(&prior)?.verdict == Verdict::ContractViolation;
@@ -1060,13 +1107,7 @@ fn run_probes(out: &Path, group: &str) -> Result<()> {
             .into_iter()
             .filter(|name| name.starts_with("dns-default") == (group == "probe-hijack")),
         |name| run_probe(out, name),
-        || {
-            probe_restore_checks(
-                out,
-                "final",
-                Instant::now() + Duration::from_secs(super::probe::RESTORE_BUDGET_SECONDS),
-            )
-        },
+        || probe_restore_checks(out, "final", final_restore_deadline(out)?),
     );
     write_json(out, "probe-cell-failures.json", &failures)?;
     if failures.is_empty() {
@@ -1074,6 +1115,14 @@ fn run_probes(out: &Path, group: &str) -> Result<()> {
     } else {
         Err(format!("probe cell failures: {}", failures.join("; ")).into())
     }
+}
+
+fn final_restore_deadline(out: &Path) -> Result<Instant> {
+    let mut remaining = resources::remaining(out)?;
+    for (_, scope) in probe_scopes(out)? {
+        remaining = remaining.saturating_add(resources::remaining(&scope)?);
+    }
+    Ok(Instant::now() + Duration::from_secs(recovery::final_restore_seconds(remaining)))
 }
 
 fn run_probe(out: &Path, name: &str) -> Result<()> {

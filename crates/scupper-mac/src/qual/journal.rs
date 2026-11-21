@@ -1,7 +1,7 @@
 //! Portable decoding and ownership checks for the fixture write-ahead journal.
 use serde::Deserialize;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub(super) struct Entry {
     pub kind: String,
     #[serde(default)]

@@ -95,6 +95,28 @@ class ArtifactTests(unittest.TestCase):
         self.assertEqual(self.check().returncode, 0)
         self.assertEqual([path.name for path in scope.iterdir()], ["resources.jsonl"])
 
+    def test_magic_removes_unknown_probes_before_redaction(self):
+        scope = self.root / "nested"
+        scope.mkdir()
+        names = []
+        for index, magic in enumerate(["cf fa ed fe", "ce fa ed fe", "fe ed fa cf",
+                                       "fe ed fa ce", "ca fe ba be", "be ba fe ca"]):
+            path = scope / ("probe-dns-default-minimal" if index == 0 else f"unknown-{index}")
+            path.write_bytes(bytes.fromhex(magic) + b"private_key=compiled literal")
+            names.append(path)
+        for name in ["unknown.dmg", "other.DMG", "scratch.sparseimage", "optical.iso"]:
+            path = scope / name
+            path.write_bytes(b"preshared_key=image fixture")
+            names.append(path)
+        text = scope / "keep.json"
+        text.write_text('{"fixture":"retained"}\n')
+        (scope / "short.txt").write_bytes(b"\xcf\xfa\xed")
+        result = self.check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(all(not path.exists() for path in names))
+        self.assertEqual(text.read_text(), '{"fixture":"retained"}\n')
+        self.assertTrue((scope / "short.txt").exists())
+
     def test_unicode_escaped_assignments_inside_embedded_json_are_quarantined(self):
         escaped = '{"reply":"private\\u005fkey\\u003dfixture-escaped"}'
         self.write_json("escaped.json", {"stdout": escaped})
