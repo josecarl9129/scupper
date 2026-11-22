@@ -2,7 +2,10 @@
 //! Enable rows are supplied by R2; acquisition/release templates must be
 //! cross-checked against full Q-ENABLE captures before promotion (R11).
 use super::pftoken::{Assumption, Assumptions};
-use crate::platform::{PfEnable, PfInfo, Release, SysError, ToolOutcome, runtime::Reap};
+use crate::platform::{
+    PfEnable, PfInfo, Release, SysError, ToolOutcome,
+    runtime::{Output, Reap},
+};
 
 /// Portable bounded tool evidence; constructing this does not interpret it.
 #[derive(Clone, Copy, Debug)]
@@ -27,6 +30,31 @@ pub struct ToolEvidence<'a> {
     /// Caller input not delivered.
     pub stdin_unsent: usize,
 }
+impl<'a> ToolEvidence<'a> {
+    /// Borrow bounded native streams with their independent loss flags intact.
+    #[must_use]
+    pub fn from_output(
+        pid: u32,
+        reap: Reap,
+        stdout: &'a Output,
+        stderr: &'a Output,
+        timed_out: bool,
+        io_failed: bool,
+        stdin_unsent: usize,
+    ) -> Self {
+        Self {
+            pid,
+            reap,
+            stdout: &stdout.bytes,
+            stderr: &stderr.bytes,
+            stdout_truncated: stdout.truncated,
+            stderr_truncated: stderr.truncated,
+            timed_out,
+            io_failed,
+            stdin_unsent,
+        }
+    }
+}
 /// Return a status only from complete streams and an actual normal wait status.
 ///
 /// # Errors
@@ -50,7 +78,7 @@ pub type Attempt<'a> = Result<(&'a str, ToolEvidence<'a>), SysError>;
 /// Interpret pf-info only with complete streams and a successful normal exit.
 #[must_use]
 pub fn info_outcome(attempt: Attempt<'_>) -> PfInfo {
-    let result = attempt.and_then(|(_, e)| info(status(&e)?, e.stdout, e.stderr));
+    let result = attempt.and_then(|(build, e)| info(build, status(&e)?, e.stdout, e.stderr));
     result.unwrap_or_else(PfInfo::Incomplete)
 }
 /// Interpret -e evidence with the build and EEXIST assumption gates.
@@ -94,6 +122,60 @@ pub const BUILDS: [&str; 2] = ["24H232", "25G332"];
 fn supported(build: &str) -> bool {
     BUILDS.contains(&build)
 }
+/// Exact stderr preamble observed in CI 45050965328 on both qualified builds.
+pub const ALTQ_PREAMBLE: &[u8] = b"No ALTQ support in kernel\nALTQ related functions disabled\n";
+/// Remove one exact leading preamble only on builds with captured evidence.
+/// The caller must still apply its complete, exact stderr rule to the remainder.
+#[must_use]
+pub fn stderr<'a>(build: &str, bytes: &'a [u8]) -> &'a [u8] {
+    if supported(build) {
+        bytes.strip_prefix(ALTQ_PREAMBLE).unwrap_or(bytes)
+    } else {
+        bytes
+    }
+}
+/// Complete read-only pfctl text with no remaining diagnostics (rules, NAT, anchors).
+///
+/// # Errors
+/// Failed exit or any stderr beyond the qualified prefix.
+pub fn read<'a>(
+    build: &str,
+    rc: i32,
+    stdout: &'a [u8],
+    stderr: &[u8],
+) -> Result<&'a [u8], SysError> {
+    if rc != 0 || !self::stderr(build, stderr).is_empty() {
+        return Err(SysError::Unknown);
+    }
+    Ok(stdout)
+}
+/// Recognize only an explicit empty-reference row, in its captured stream.
+#[must_use]
+pub fn references_empty(build: &str, stdout: &[u8], stderr: &[u8]) -> bool {
+    let stderr = self::stderr(build, stderr);
+    let empty_row = |bytes: &[u8]| {
+        matches!(
+            bytes,
+            b"No pf starter references held" | b"No pf starter references held\n"
+        )
+    };
+    (stdout.is_empty() && empty_row(stderr)) || (stderr.is_empty() && empty_row(stdout))
+}
+/// Exact harness-only global disable row; unexpected text remains inconclusive.
+///
+/// # Errors
+/// Unsupported build, failed exit or unrecognized streams.
+pub fn disable(build: &str, rc: i32, stdout: &[u8], stderr: &[u8]) -> Result<(), SysError> {
+    if supported(build)
+        && rc == 0
+        && stdout.is_empty()
+        && self::stderr(build, stderr) == b"pf disabled\n"
+    {
+        Ok(())
+    } else {
+        Err(SysError::Unknown)
+    }
+}
 /// Exact global anonymous enable outcome, including the EEXIST assumption gate.
 ///
 /// # Errors
@@ -105,6 +187,7 @@ pub fn enable(
     stderr: &[u8],
     gates: Assumptions,
 ) -> Result<PfEnable, SysError> {
+    let stderr = self::stderr(build, stderr);
     if supported(build) && stdout.is_empty() {
         match (rc, stderr) {
             (0, b"pf enabled\n") => return Ok(PfEnable::Started),
@@ -136,7 +219,7 @@ pub fn acquire(build: &str, rc: i32, stdout: &[u8], stderr: &[u8]) -> Result<u64
     if !supported(build) || rc != 0 || !stdout.is_empty() {
         return Err(SysError::Unknown);
     }
-    let text = std::str::from_utf8(stderr).map_err(|_| SysError::Unknown)?;
+    let text = std::str::from_utf8(self::stderr(build, stderr)).map_err(|_| SysError::Unknown)?;
     let text = text.strip_prefix("pf enabled\n").unwrap_or(text);
     text.strip_suffix('\n')
         .and_then(token_line)
@@ -155,6 +238,7 @@ pub fn release(
     stderr: &[u8],
     token: u64,
 ) -> Result<Release, SysError> {
+    let stderr = self::stderr(build, stderr);
     let row = format!("Token : {token} revoked.\n");
     if supported(build)
         && token != 0
@@ -171,10 +255,13 @@ pub fn release(
 ///
 /// # Errors
 /// Failed exit, unexpected stderr, invalid UTF-8 or any unparsed info line.
-pub fn info(rc: i32, stdout: &[u8], stderr: &[u8]) -> Result<crate::platform::PfInfo, SysError> {
-    if rc != 0 || !stderr.is_empty() {
-        return Err(SysError::Unknown);
-    }
+pub fn info(
+    build: &str,
+    rc: i32,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<crate::platform::PfInfo, SysError> {
+    let stdout = read(build, rc, stdout, stderr)?;
     let text = std::str::from_utf8(stdout).map_err(|_| SysError::Unknown)?;
     let parsed = scupper_core::mac::parse::pf_info(text).map_err(|_| SysError::Unknown)?;
     Ok(if parsed.enabled {
@@ -197,6 +284,140 @@ mod tests {
             timed_out: false,
             io_failed: false,
             stdin_unsent: 0,
+        }
+    }
+    #[test]
+    fn native_output_mapping_preserves_each_stream_truncation_flag() {
+        for out_lost in [false, true] {
+            for err_lost in [false, true] {
+                let mut stdout = Output::default();
+                stdout.append(b"Status: Disabled\n", 1024);
+                let mut stderr = Output::default();
+                stderr.append(ALTQ_PREAMBLE, 1024);
+                if out_lost {
+                    stdout.append(b"discarded", stdout.bytes.len());
+                }
+                if err_lost {
+                    stderr.append(b"discarded", stderr.bytes.len());
+                }
+                let e = ToolEvidence::from_output(
+                    123,
+                    Reap::Status(0),
+                    &stdout,
+                    &stderr,
+                    false,
+                    false,
+                    0,
+                );
+                assert_eq!(e.stdout, b"Status: Disabled\n");
+                assert_eq!(e.stderr, ALTQ_PREAMBLE);
+                assert_eq!(e.stdout_truncated, out_lost);
+                assert_eq!(e.stderr_truncated, err_lost);
+                assert_eq!(
+                    info_outcome(Ok(("24H232", e))),
+                    if out_lost || err_lost {
+                        PfInfo::Incomplete(SysError::Unknown)
+                    } else {
+                        PfInfo::Disabled
+                    }
+                );
+            }
+        }
+    }
+    #[test]
+    fn altq_prefix_is_exact_once_build_qualified_for_every_row() {
+        // Both enable gates and both acquisition/release suffix variants remain exact.
+        let rows: &[(&[u8], &[u8])] = &[
+            (b"Status: Disabled\n", b""),
+            (b"Status: Enabled\n", b""),
+            (b"", b"pf enabled\n"),
+            (b"", b"pfctl: pf already enabled\n"),
+            (b"", b"Token : 42\n"),
+            (b"", b"pf enabled\nToken : 42\n"),
+            (b"", b"Token : 42 revoked.\n"),
+            (b"", b"Token : 42 revoked.\npf disabled\n"),
+            (b"", b"pf disabled\n"),
+            (b"No pf starter references held\n", b""),
+            (b"", b"No pf starter references held\n"),
+            (b"com.apple\n", b""), // recursive anchors
+            (b"", b""),            // empty rules, NAT and Apple anchors
+        ];
+        for (row, &(stdout, tail)) in rows.iter().enumerate() {
+            let parse = |build, bytes: &[u8]| match row {
+                0 | 1 => info(build, 0, stdout, bytes).is_ok(),
+                2 | 3 => enable(
+                    build,
+                    i32::from(row == 3),
+                    stdout,
+                    bytes,
+                    Assumptions {
+                        eexist_establishes_anonymous: Assumption::Established,
+                        ..Assumptions::default()
+                    },
+                )
+                .is_ok(),
+                4 | 5 => acquire(build, 0, stdout, bytes) == Ok(42),
+                6 | 7 => release(build, 0, stdout, bytes, 42) == Ok(Release::Released),
+                8 => disable(build, 0, stdout, bytes).is_ok(),
+                9 | 10 => references_empty(build, stdout, bytes),
+                _ => read(build, 0, stdout, bytes).is_ok(),
+            };
+            for build in BUILDS {
+                assert!(parse(build, tail), "assertion: plain row {row} {build}");
+                let prefixed = [ALTQ_PREAMBLE, tail].concat();
+                assert!(parse(build, &prefixed), "assertion: ALTQ row {row} {build}");
+                for bad in [
+                    [ALTQ_PREAMBLE, ALTQ_PREAMBLE, tail].concat(),
+                    [b"other\n", ALTQ_PREAMBLE, tail].concat(),
+                    [ALTQ_PREAMBLE, b"other\n", tail].concat(),
+                    [ALTQ_PREAMBLE, tail, b"other\n"].concat(),
+                    [tail, ALTQ_PREAMBLE].concat(),
+                    [b"No ALTQ support in kernel\n", tail].concat(),
+                    [b"ALTQ related functions disabled\n", tail].concat(),
+                    [ALTQ_PREAMBLE.strip_suffix(b"\n").unwrap_or_default(), tail].concat(),
+                ] {
+                    // For empty tails the suffix construction is the valid prefix itself.
+                    if bad != prefixed {
+                        assert!(
+                            !parse(build, &bad),
+                            "assertion: bad row {row} {build}: {bad:?}"
+                        );
+                    }
+                }
+                assert!(
+                    !parse("unsupported", &prefixed),
+                    "assertion: unsupported row {row}"
+                );
+                for length in 1..ALTQ_PREAMBLE.len() {
+                    assert!(
+                        !parse(build, &[&ALTQ_PREAMBLE[..length], tail].concat()),
+                        "assertion: partial row {row}"
+                    );
+                }
+            }
+        }
+        for build in BUILDS {
+            assert!(
+                enable(
+                    build,
+                    1,
+                    b"",
+                    &[ALTQ_PREAMBLE, b"pfctl: pf already enabled\n"].concat(),
+                    Assumptions::default()
+                )
+                .is_err()
+            );
+            assert!(read(build, 1, b"", ALTQ_PREAMBLE).is_err());
+            assert!(disable(build, 1, b"", &[ALTQ_PREAMBLE, b"pf disabled\n"].concat()).is_err());
+            assert!(
+                disable(
+                    build,
+                    0,
+                    b"unexpected",
+                    &[ALTQ_PREAMBLE, b"pf disabled\n"].concat()
+                )
+                .is_err()
+            );
         }
     }
     #[test]
@@ -327,13 +548,20 @@ mod tests {
     #[test]
     fn info_requires_zero_exit_and_every_line_parsed() {
         use crate::platform::PfInfo;
-        assert_eq!(info(0, b"Status: Enabled\n", b""), Ok(PfInfo::Enabled));
-        assert_eq!(info(0, b"Status: Disabled\n", b""), Ok(PfInfo::Disabled));
+        assert_eq!(
+            info("24H232", 0, b"Status: Enabled\n", b""),
+            Ok(PfInfo::Enabled)
+        );
+        assert_eq!(
+            info("24H232", 0, b"Status: Disabled\n", b""),
+            Ok(PfInfo::Disabled)
+        );
         assert_eq!(
             info(
+                "24H232",
                 0,
                 include_bytes!(
-                    "../../../scupper-core/tests/fixtures/mac/pf-info-disabled-source.txt"
+                    "../../../scupper-core/tests/fixtures/mac/pf-info-disabled-24H232.txt"
                 ),
                 b""
             ),
@@ -347,7 +575,7 @@ mod tests {
             (0, b"", b""),
             (0, b"\xff", b""),
         ] {
-            assert!(info(rc, stdout, stderr).is_err());
+            assert!(info("24H232", rc, stdout, stderr).is_err());
         }
     }
     #[test]

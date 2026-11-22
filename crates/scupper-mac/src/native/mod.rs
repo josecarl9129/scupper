@@ -117,6 +117,8 @@ pub struct NativePlatform {
     #[cfg(feature = "qualification")]
     pf_spare_slots: usize,
     #[cfg(feature = "qualification")]
+    pf_text_out: Option<PathBuf>,
+    #[cfg(feature = "qualification")]
     pf_copy_decisions:
         std::sync::Arc<std::sync::Mutex<Vec<crate::decode::pftoken::EnumerationEvent>>>,
 }
@@ -144,6 +146,8 @@ impl NativePlatform {
             pf_capacities: std::sync::Arc::default(),
             #[cfg(feature = "qualification")]
             pf_spare_slots: 16,
+            #[cfg(feature = "qualification")]
+            pf_text_out: None,
             #[cfg(feature = "qualification")]
             pf_copy_decisions: std::sync::Arc::default(),
         })

@@ -320,6 +320,18 @@ fn realistic_synthetic_captures_preserve_order_and_absence() {
     assert!(parse::pf_info("Status: Enabled\n").unwrap().enabled);
 }
 #[test]
+fn runner_disabled_info_counters_cannot_supply_status_evidence() {
+    for text in [
+        include_str!("fixtures/mac/pf-info-disabled-24H232.txt"),
+        include_str!("fixtures/mac/pf-info-disabled-25G332.txt"),
+    ] {
+        assert!(!parse::pf_info(text).unwrap().enabled);
+        assert!(parse::pf_info(&text.replace("Status: Disabled", "Status: Enabled")).is_err());
+        assert!(parse::pf_info(&text.replace("dummynet", "unknown-counter")).is_err());
+        assert!(parse::pf_info(text.split_once('\n').unwrap().1).is_err());
+    }
+}
+#[test]
 fn source_derived_disabled_info_accepts_only_documented_debug_suffix() {
     assert!(
         !parse::pf_info(include_str!("fixtures/mac/pf-info-disabled-source.txt"))

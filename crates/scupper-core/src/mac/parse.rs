@@ -1,4 +1,4 @@
-//! Bounded parsers for captured tool text. Fixtures are synthetic until qualification.
+//! Bounded parsers for captured tool text; fixture provenance is recorded per capture.
 
 use super::{
     Error, Interface,
@@ -57,9 +57,10 @@ pub fn pf_info(text: &str) -> Result<PfInfo, Error> {
     })
 }
 fn valid_status_suffix(fields: &[&str], enabled: bool) -> bool {
-    // Source-derived no-uptime Disabled form: OpenBSD pfctl_parser.c,
+    // Captured no-uptime Disabled form: CI 45050965328, 24H232 and 25G332.
+    // Original source note: OpenBSD pfctl_parser.c,
     // 855d4e832803330fc45a64539854bf8d27180600, print_status().
-    // See the qualification README; this is not a per-build runner capture.
+    // See the qualification README for the original source reference.
     if let ["Debug:", level] = fields {
         return !enabled && valid_debug_level(level);
     }
@@ -108,6 +109,8 @@ fn info_counter(line: &str) -> bool {
         "state-limit",
         "src-limit",
         "synproxy",
+        "dummynet",
+        "invalid-port",
         "map-failed",
     ];
     keys.iter().any(|key| {

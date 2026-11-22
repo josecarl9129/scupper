@@ -7,6 +7,67 @@ use crate::{
 use std::{os::fd::AsFd, path::Path, time::Duration};
 
 impl NativePlatform {
+    /// Save full adapter mutator attempts before any text interpretation.
+    #[cfg(feature = "qualification")]
+    pub fn capture_pf_text(&mut self, out: Option<std::path::PathBuf>) {
+        self.pf_text_out = out;
+    }
+    #[cfg(feature = "qualification")]
+    fn save_pf_text(
+        &self,
+        build: &str,
+        args: &[&str],
+        result: &tool::ToolResult,
+        started_unix_ms: u128,
+        started: std::time::Instant,
+    ) -> Result<(), SysError> {
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
+        let Some(out) = &self.pf_text_out else {
+            return Ok(());
+        };
+        let evidence = crate::qual::Evidence {
+            command: std::iter::once(crate::engine::PFCTL)
+                .chain(args.iter().copied())
+                .map(str::to_owned)
+                .collect(),
+            stdin: None,
+            pid: Some(result.pid),
+            exit_code: match result.reap {
+                crate::platform::runtime::Reap::Status(s) if s.trailing_zeros() >= 7 => {
+                    Some((s >> 8) & 255)
+                }
+                _ => None,
+            },
+            started_unix_ms,
+            elapsed_ms: started.elapsed().as_millis(),
+            timed_out: result.timed_out,
+            truncated: result.io_failed
+                || result.stdout.truncated
+                || result.stderr.truncated
+                || result.stdin_unsent != 0,
+            stdout: String::from_utf8_lossy(&result.stdout.bytes).into_owned(),
+            stderr: String::from_utf8_lossy(&result.stderr.bytes).into_owned(),
+        };
+        let save = || -> Result<(), Box<dyn std::error::Error>> {
+            let capture =
+                evidence.pf_text_capture(build, &result.stdout.bytes, &result.stderr.bytes)?;
+            let name = format!(
+                "pf-text-native-{}-{}.json",
+                result.pid,
+                scupper_darwin::monotonic_raw().as_nanos()
+            );
+            let mut file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(out.join(name))?;
+            serde_json::to_writer_pretty(&mut file, &capture)?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            Ok(())
+        };
+        save().map_err(|_| SysError::Unknown)
+    }
     /// Override kernel assumptions only for this qualification instance.
     #[cfg(feature = "qualification")]
     pub fn reference_assumptions(&mut self, assumptions: pftoken::Assumptions) {
@@ -40,7 +101,16 @@ impl NativePlatform {
         deadline: Deadline,
     ) -> Result<tool::ToolResult, SysError> {
         self.check_pin(Path::new(crate::engine::PFCTL), deadline)?;
-        tool::run(
+        #[cfg(feature = "qualification")]
+        let build = Self::pf_build()?;
+        #[cfg(feature = "qualification")]
+        let started = std::time::Instant::now();
+        #[cfg(feature = "qualification")]
+        let started_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        #[cfg_attr(not(feature = "qualification"), allow(unused_mut))]
+        let mut result = tool::run(
             &mut self.records,
             Tool::Pfctl,
             Path::new(crate::engine::PFCTL),
@@ -48,7 +118,17 @@ impl NativePlatform {
             &[],
             1024 * 1024,
             deadline,
-        )
+        )?;
+        #[cfg(feature = "qualification")]
+        if matches!(args.first(), Some(&"-e" | &"-E" | &"-X" | &"-d"))
+            && self
+                .save_pf_text(&build, args, &result, started_unix_ms, started)
+                .is_err()
+        {
+            // This is post-spawn uncertainty, never a pre-spawn NotStarted result.
+            result.io_failed = true;
+        }
+        Ok(result)
     }
     pub(super) fn pf_build() -> Result<String, SysError> {
         scupper_darwin::sysctl_string("kern.osversion").map_err(|_| SysError::Unknown)
@@ -114,17 +194,15 @@ pub(super) fn evidence(
         .map(|(build, result)| {
             (
                 build.as_str(),
-                crate::decode::pftext::ToolEvidence {
-                    pid: result.pid,
-                    reap: result.reap,
-                    stdout: &result.stdout.bytes,
-                    stderr: &result.stderr.bytes,
-                    stdout_truncated: result.stdout.truncated,
-                    stderr_truncated: result.stderr.truncated,
-                    timed_out: result.timed_out,
-                    io_failed: result.io_failed,
-                    stdin_unsent: result.stdin_unsent,
-                },
+                crate::decode::pftext::ToolEvidence::from_output(
+                    result.pid,
+                    result.reap,
+                    &result.stdout,
+                    &result.stderr,
+                    result.timed_out,
+                    result.io_failed,
+                    result.stdin_unsent,
+                ),
             )
         })
         .map_err(Clone::clone)

@@ -128,7 +128,7 @@ pub enum EnumerationEvent {
     /// Result of a successful copy ioctl.
     Copy(Classification),
     /// The following size query exceeded the previous successful copy capacity.
-    TruncationWitnessed,
+    GrowthPastCopyCapacity,
 }
 /// Qualification alone may reduce the spare slots and observe copy decisions.
 ///
@@ -148,7 +148,7 @@ pub fn enumerate_with_spare(
         |capacity| vec![0_u8; capacity],
         spare,
         |classification| (observe.borrow_mut())(EnumerationEvent::Copy(classification)),
-        || (observe.borrow_mut())(EnumerationEvent::TruncationWitnessed),
+        || (observe.borrow_mut())(EnumerationEvent::GrowthPastCopyCapacity),
     )
 }
 fn enumerate_buffer(
@@ -157,7 +157,7 @@ fn enumerate_buffer(
     mut allocate: impl FnMut(usize) -> Vec<u8>,
     spare: usize,
     mut observe: impl FnMut(Classification),
-    mut truncation: impl FnMut(),
+    mut growth: impl FnMut(),
 ) -> Result<Vec<RefLine>, SysError> {
     let mut slots = 0_usize;
     let mut previous_copy_capacity = None;
@@ -175,7 +175,7 @@ fn enumerate_buffer(
             .take()
             .is_some_and(|capacity| need > capacity)
         {
-            truncation();
+            growth();
         }
         slots = slots.max(
             (need / STRIDE)
@@ -315,7 +315,7 @@ mod tests {
             assert_eq!(result, decode(&record(7)));
             let mut expected = vec![EnumerationEvent::Copy(Classification::Retry)];
             if growing {
-                expected.push(EnumerationEvent::TruncationWitnessed);
+                expected.push(EnumerationEvent::GrowthPastCopyCapacity);
             }
             expected.push(EnumerationEvent::Copy(Classification::Complete));
             assert_eq!(decisions, expected);

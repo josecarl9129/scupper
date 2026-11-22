@@ -46,6 +46,20 @@ pub struct Evidence {
 }
 
 impl Evidence {
+    /// Preserve exact pfctl bytes independently of the readable UTF-8 projection.
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn pf_text_capture(
+        &self,
+        build: &str,
+        stdout: &[u8],
+        stderr: &[u8],
+    ) -> Result<serde_json::Value, serde_json::Error> {
+        let mut capture = serde_json::to_value(self)?;
+        capture["build"] = serde_json::json!(build);
+        capture["stdout_bytes"] = serde_json::json!(stdout);
+        capture["stderr_bytes"] = serde_json::json!(stderr);
+        Ok(capture)
+    }
     #[cfg(any(target_os = "macos", test))]
     pub(super) fn complete(&self) -> bool {
         self.exit_code == Some(0) && !self.timed_out && !self.truncated
@@ -172,6 +186,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pf_text_capture_preserves_build_and_unexpected_bytes_before_verdict()
+    -> Result<(), serde_json::Error> {
+        for build in crate::decode::pftext::BUILDS {
+            for flag in 0..4 {
+                let evidence = Evidence {
+                    command: vec!["/sbin/pfctl".into(), "-E".into()],
+                    stdin: None,
+                    pid: Some(123),
+                    exit_code: if flag == 0 { None } else { Some(1) },
+                    started_unix_ms: 0,
+                    elapsed_ms: 0,
+                    timed_out: flag == 1,
+                    truncated: flag == 2,
+                    stdout: "unexpected".into(),
+                    stderr: "unexpected".into(),
+                };
+                let stdout = b"unexpected\xff\n";
+                let stderr = [crate::decode::pftext::ALTQ_PREAMBLE, b"unknown\0\xfe"].concat();
+                let serialized =
+                    serde_json::to_vec(&evidence.pf_text_capture(build, stdout, &stderr)?)?;
+                let saved: serde_json::Value = serde_json::from_slice(&serialized)?;
+                assert_eq!(saved["build"], build);
+                assert_eq!(saved["stdout_bytes"], serde_json::json!(stdout));
+                assert_eq!(saved["stderr_bytes"], serde_json::json!(stderr));
+                assert_eq!(saved["timed_out"], flag == 1);
+                assert_eq!(saved["truncated"], flag == 2);
+            }
+        }
+        Ok(())
+    }
+    #[test]
     fn manifest_has_room_for_restore_and_ten_percent_slack()
     -> Result<(), Box<dyn std::error::Error>> {
         let manifest = Manifest::bundled()?;
@@ -249,14 +294,22 @@ mod tests {
                     .find(|line| line.trim_start().starts_with("if:"))
             })
             .ok_or("helper compile step")?;
-        for group in manifest
+        let groups: Vec<_> = manifest
             .cases
             .iter()
             .map(|case| case.group.as_str())
             .filter(|group| {
                 !matches!(*group, "smoke" | "base" | "store") && !group.starts_with("probe")
             })
-        {
+            .collect();
+        assert!(!groups.is_empty(), "no helper groups derived from manifest");
+        for required in ["pf", "pf-x", "pf-x-stale"] {
+            assert!(
+                groups.contains(&required),
+                "missing helper group {required}"
+            );
+        }
+        for group in groups {
             assert!(
                 helper.contains(&format!("matrix.group == '{group}'")),
                 "{group}"

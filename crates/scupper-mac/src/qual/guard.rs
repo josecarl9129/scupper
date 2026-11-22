@@ -46,22 +46,32 @@ impl Ack {
 
 // A header-only or unknown response is not proof of zero references. Keep raw
 // evidence so a newly encountered tool format can be reviewed without rerunning.
-pub(super) fn no_foreign_references(stdout: &str, stderr: &str) -> bool {
-    let lines: Vec<_> = stdout
-        .lines()
-        .chain(stderr.lines())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
-    lines.contains(&"No pf starter references held")
-        && lines.iter().all(|line| {
-            matches!(
-                *line,
-                "No pf starter references held"
-                    | "No ALTQ support in kernel"
-                    | "ALTQ related functions disabled"
+pub(super) fn no_foreign_references(build: &str, stdout: &str, stderr: &str) -> bool {
+    crate::decode::pftext::references_empty(build, stdout.as_bytes(), stderr.as_bytes())
+}
+
+/// A missing or incomplete build observation cannot qualify stderr normalization.
+pub(super) fn pf_build(observations: &std::collections::BTreeMap<String, super::Evidence>) -> &str {
+    observations
+        .get("osversion")
+        .filter(|e| e.complete())
+        .map_or("", |e| e.stdout.trim())
+}
+
+pub(super) fn pf_read_complete(
+    observations: &std::collections::BTreeMap<String, super::Evidence>,
+    name: &str,
+) -> bool {
+    observations.get(name).is_some_and(|e| {
+        e.complete()
+            && crate::decode::pftext::read(
+                pf_build(observations),
+                0,
+                e.stdout.as_bytes(),
+                e.stderr.as_bytes(),
             )
-        })
+            .is_ok()
+    })
 }
 
 pub(super) fn preflight_conditions(
@@ -89,16 +99,20 @@ pub(super) fn preflight_conditions(
             && evidence.stderr.trim() == "sysctl: unknown oid 'sysctl.proc_translated'"
             && !evidence.timed_out
             && !evidence.truncated;
-        if !evidence.complete() && !absent_translation_oid {
+        if (!evidence.complete()
+            || (name.starts_with("pf-")
+                && name != "pf-references"
+                && !pf_read_complete(observations, name)))
+            && !absent_translation_oid
+        {
             inconclusive.push(format!(
                 "{name}: command failed, timed out or was truncated"
             ));
         }
     }
-    if observations
-        .get("pf-references")
-        .is_none_or(|refs| !no_foreign_references(&refs.stdout, &refs.stderr))
-    {
+    if observations.get("pf-references").is_none_or(|refs| {
+        !no_foreign_references(pf_build(observations), &refs.stdout, &refs.stderr)
+    }) {
         inconclusive.push("foreign pf references present or reference text not recognized".into());
     }
     if observations
@@ -298,14 +312,16 @@ mod tests {
     #[test]
     fn unknown_or_nonempty_references_never_establish_clean_preflight() {
         assert!(no_foreign_references(
+            "24H232",
             "",
             "No ALTQ support in kernel\nALTQ related functions disabled\nNo pf starter references held\n"
         ));
-        assert!(!no_foreign_references("TOKENS:\n", ""));
+        assert!(!no_foreign_references("24H232", "TOKENS:\n", ""));
         assert!(!no_foreign_references(
+            "24H232",
             "TOKENS: foreign token\n",
             "No pf starter references held"
         ));
-        assert!(!no_foreign_references("", "permission denied"));
+        assert!(!no_foreign_references("24H232", "", "permission denied"));
     }
 }

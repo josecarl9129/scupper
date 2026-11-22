@@ -186,8 +186,12 @@ fn live_tokens(out: &Path, deadline: Instant) -> Result<Vec<journal::Token>> {
     if !evidence.complete() {
         return Err(format!("ioctl: {ioctl_error}; pfctl References unavailable").into());
     }
-    if super::super::guard::no_foreign_references(&evidence.stdout, &evidence.stderr) {
+    let build = scupper_darwin::sysctl_string("kern.osversion")?;
+    if super::super::guard::no_foreign_references(&build, &evidence.stdout, &evidence.stderr) {
         return Ok(Vec::new());
+    }
+    if !crate::decode::pftext::stderr(&build, evidence.stderr.as_bytes()).is_empty() {
+        return Err("unrecognized pfctl References stderr".into());
     }
     journal::text_tokens(&evidence.stdout, unix_seconds())
         .map_err(|error| format!("ioctl: {ioctl_error}; pfctl References: {error}").into())
@@ -439,7 +443,11 @@ pub(super) fn complete_from_snapshot(
                     && super::super::restore_check::pf_status(&post.observations) == Some(false)
                     && post.observations.get("pf-references").is_some_and(|e| {
                         e.complete()
-                            && super::super::guard::no_foreign_references(&e.stdout, &e.stderr)
+                            && super::super::guard::no_foreign_references(
+                                super::super::guard::pf_build(&post.observations),
+                                &e.stdout,
+                                &e.stderr,
+                            )
                     })
             }
             "key" => post.observations.get("scutil-keys").is_some_and(|keys| {

@@ -37,6 +37,15 @@ fn ensure(ok: bool, detail: &str) -> Result<()> {
         Err(detail.to_owned().into())
     }
 }
+fn ensure_text(ok: bool, detail: &str) -> Result<()> {
+    if ok {
+        Ok(())
+    } else {
+        Err(environment_issue(format!(
+            "{detail}; inspect saved pf-text captures"
+        )))
+    }
+}
 fn append(out: &Path, value: &Value) -> Result<()> {
     let mut file = fs::OpenOptions::new()
         .create(true)
@@ -139,6 +148,7 @@ fn release(p: &mut NativePlatform, token: u64, end: Instant) -> Result<()> {
     }
 }
 fn raw(out: &Path, p: &mut NativePlatform, args: &[&str], end: Instant) -> Result<Evidence> {
+    let build = scupper_darwin::sysctl_string("kern.osversion")?;
     let started = Instant::now();
     let wall = super::super::command::unix_seconds();
     let command_line: Vec<_> = std::iter::once("/sbin/pfctl")
@@ -167,15 +177,20 @@ fn raw(out: &Path, p: &mut NativePlatform, args: &[&str], end: Instant) -> Resul
             || result.stdout.truncated
             || result.stderr.truncated
             || result.stdin_unsent != 0,
-        stdout: String::from_utf8(result.stdout.bytes)?,
-        stderr: String::from_utf8(result.stderr.bytes)?,
+        stdout: String::from_utf8_lossy(&result.stdout.bytes).into_owned(),
+        stderr: String::from_utf8_lossy(&result.stderr.bytes).into_owned(),
     };
     write_json(
         out,
         &format!("{}.json", super::unique("pf-text")),
-        &evidence,
+        &evidence.pf_text_capture(&build, &result.stdout.bytes, &result.stderr.bytes)?,
     )?;
-    if evidence.exit_code.is_none() || evidence.timed_out || evidence.truncated {
+    if evidence.exit_code.is_none()
+        || evidence.timed_out
+        || evidence.truncated
+        || std::str::from_utf8(&result.stdout.bytes).is_err()
+        || std::str::from_utf8(&result.stderr.bytes).is_err()
+    {
         return Err(environment_issue("raw pfctl incomplete"));
     }
     Ok(evidence)
@@ -187,10 +202,19 @@ fn reset(out: &Path, p: &mut NativePlatform, end: Instant) -> Result<()> {
         "reset with outstanding pfctl",
     )?;
     if p.pf_info(deadline(end)?) == PfInfo::Enabled {
-        ensure(
-            raw(out, p, &["-d"], end)?.complete(),
-            "harness disable failed",
-        )?;
+        let disabled = raw(out, p, &["-d"], end)?;
+        if pftext::disable(
+            &scupper_darwin::sysctl_string("kern.osversion")?,
+            disabled.exit_code.unwrap_or(-1),
+            disabled.stdout.as_bytes(),
+            disabled.stderr.as_bytes(),
+        )
+        .is_err()
+        {
+            return Err(environment_issue(
+                "harness disable text unexpected; full capture saved",
+            ));
+        }
     }
     info(p, &PfInfo::Disabled, end)?;
     ensure(refs(p, end)?.is_empty(), "disable retained tokens")
@@ -208,7 +232,11 @@ fn baseline(out: &Path) -> Result<()> {
         .ok_or("no preflight references")?;
     ensure(
         tokens.complete()
-            && super::super::guard::no_foreign_references(&tokens.stdout, &tokens.stderr),
+            && super::super::guard::no_foreign_references(
+                super::super::guard::pf_build(&before.observations),
+                &tokens.stdout,
+                &tokens.stderr,
+            ),
         "pf campaign requires no preflight references",
     )
 }
@@ -291,6 +319,7 @@ pub(super) fn worker(out: &Path, group: &str) -> Result<()> {
             detail: "Disposable-runner evidence only; no production assumption promotion".into(),
             evidence: vec![],
         };
+        p.capture_pf_text((id == "Q-ENABLE").then(|| out.into()));
         let end = Instant::now() + Duration::from_secs(minutes * 60);
         if let Err(error) = operation(out, &mut p, end, &mut result) {
             result.verdict = if error.is::<super::EnvironmentIssue>() {
@@ -369,7 +398,7 @@ fn enable(out: &Path, p: &mut NativePlatform, end: Instant, result: &mut CaseRes
     for _ in 0..50 {
         reset(out, p, end)?;
         let raw_enable = raw(out, p, &["-e"], end)?;
-        ensure(
+        ensure_text(
             pftext::enable(
                 &build,
                 raw_enable.exit_code.unwrap_or(-1),
@@ -380,16 +409,17 @@ fn enable(out: &Path, p: &mut NativePlatform, end: Instant, result: &mut CaseRes
             "enable text table mismatch",
         )?;
         reset(out, p, end)?;
-        ensure(
+        ensure_text(
             p.enable_pf(deadline(end)?) == Ok(PfEnable::Started),
             "disabled enable not Started",
         )?;
         for _ in 0..5 {
-            ensure(
+            ensure_text(
                 p.enable_pf(deadline(end)?) == Ok(PfEnable::AlreadyRunning),
                 "qualified EEXIST not AlreadyRunning",
             )?;
             let mut unknown = platform(out, false)?;
+            unknown.capture_pf_text(Some(out.into()));
             ensure(
                 unknown.enable_pf(deadline(end)?) == Err(SysError::Unknown),
                 "ungated EEXIST accepted",
@@ -403,7 +433,7 @@ fn enable(out: &Path, p: &mut NativePlatform, end: Instant, result: &mut CaseRes
             )?;
         }
         let raw_eexist = raw(out, p, &["-e"], end)?;
-        ensure(
+        ensure_text(
             pftext::enable(
                 &build,
                 raw_eexist.exit_code.unwrap_or(-1),
@@ -422,7 +452,7 @@ fn enable(out: &Path, p: &mut NativePlatform, end: Instant, result: &mut CaseRes
         )
         .map_err(|_| environment_issue("-E text table mismatch; full capture saved"))?;
         let raw_release = raw(out, p, &["-X", &token.to_string()], end)?;
-        ensure(
+        ensure_text(
             pftext::release(
                 &build,
                 raw_release.exit_code.unwrap_or(-1),
@@ -435,7 +465,7 @@ fn enable(out: &Path, p: &mut NativePlatform, end: Instant, result: &mut CaseRes
         let token = acquire(p, end)?;
         release(p, token, end)?;
         let foreign = acquire(p, end)?;
-        ensure(
+        ensure_text(
             raw(out, p, &["-X", &foreign.to_string()], end)?.complete(),
             "foreign -X failed",
         )?;
@@ -449,7 +479,7 @@ fn enable(out: &Path, p: &mut NativePlatform, end: Instant, result: &mut CaseRes
             ],
             end,
         );
-        ensure(process.complete(), "new adapter process enable failed")?;
+        ensure_text(process.complete(), "new adapter process enable failed")?;
         ensure(
             refs(p, end)?.is_empty(),
             "anonymous reference appeared in token list",
@@ -464,7 +494,7 @@ fn enable(out: &Path, p: &mut NativePlatform, end: Instant, result: &mut CaseRes
         )
         .map_err(|_| environment_issue("disabled -E text table mismatch; full capture saved"))?;
         let last_release = raw(out, p, &["-X", &last_token.to_string()], end)?;
-        ensure(
+        ensure_text(
             pftext::release(
                 &build,
                 last_release.exit_code.unwrap_or(-1),
@@ -656,7 +686,7 @@ fn references(
     let mut incomplete = 0_u32;
     let mut subruns = Vec::new();
     let mut coverage_missing = false;
-    let mut small_spare_truncations = 0;
+    let mut small_spare_growth = 0;
     for (spare, reads) in [(16, 1000), (0, 500), (1, 500)] {
         p.reference_spare_slots(spare);
         let _ = p.reference_copy_decisions();
@@ -681,15 +711,15 @@ fn references(
             .iter()
             .filter(|d| **d == pftoken::EnumerationEvent::Copy(Classification::Retry))
             .count();
-        let truncations = decisions
+        let growth_events = decisions
             .iter()
-            .filter(|d| **d == pftoken::EnumerationEvent::TruncationWitnessed)
+            .filter(|d| **d == pftoken::EnumerationEvent::GrowthPastCopyCapacity)
             .count();
         if spare < 16 {
-            small_spare_truncations += truncations;
+            small_spare_growth += growth_events;
         }
         coverage_missing |= spare < 16 && (retries == 0 || sub_complete == 0);
-        subruns.push(json!({"spare_slots":spare,"reads":reads,"retry":retries,"truncation_witnessed":truncations,
+        subruns.push(json!({"spare_slots":spare,"reads":reads,"retry":retries,"growth_past_copy_capacity":growth_events,
             "complete":sub_complete,"incomplete":sub_incomplete}));
         complete += sub_complete;
         incomplete += sub_incomplete;
@@ -718,7 +748,7 @@ fn references(
         )?;
         counts.push(count);
     }
-    coverage_missing |= complete == 0 || small_spare_truncations == 0;
+    coverage_missing |= complete == 0 || small_spare_growth == 0;
     let capacities = p.reference_capacities();
     ensure(
         !capacities.is_empty()
@@ -739,7 +769,7 @@ fn references(
     }
     if coverage_missing {
         return Err(environment_issue(
-            "small-spare churn requires Retry > 0 and Complete > 0 for each sub-run and truncation witnessed > 0 in at least one small-spare sub-run; inspect pf-churn.json",
+            "small-spare churn requires Retry > 0 and Complete > 0 for each sub-run and growth past copy capacity > 0 in at least one small-spare sub-run; inspect pf-churn.json",
         ));
     }
     Ok(())
@@ -767,7 +797,8 @@ pub(super) fn auxiliary(out: &Path, mode: &str, name: &str) -> Result<()> {
     let mut p = platform(out, true)?;
     let end = Instant::now() + Duration::from_secs(if mode == "r6-churn" { 120 } else { 8 });
     if mode == "r6-enable" {
-        return ensure(
+        p.capture_pf_text(Some(out.into()));
+        return ensure_text(
             p.enable_pf(deadline(end)?) == Ok(PfEnable::AlreadyRunning),
             "new-process anonymous enable failed",
         );
@@ -830,7 +861,10 @@ fn x(out: &Path, p: &mut NativePlatform, end: Instant, result: &mut CaseResult) 
         ensure(
             invalid.exit_code == Some(1)
                 && invalid.stdout.is_empty()
-                && invalid.stderr == "pfctl: pf not enabled\n",
+                && pftext::stderr(
+                    &scupper_darwin::sysctl_string("kern.osversion")?,
+                    invalid.stderr.as_bytes(),
+                ) == b"pfctl: pf not enabled\n",
             "disabled stale -X text differs from R2",
         )?;
         let new = acquire(p, end)?;

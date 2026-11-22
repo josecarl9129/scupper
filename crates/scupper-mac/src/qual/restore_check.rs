@@ -53,7 +53,13 @@ pub(super) fn compare(first: &RestoreEffects<'_>, second: &RestoreEffects<'_>) -
     }
     for name in STATIC_OBSERVATIONS {
         match (first.observations.get(name), second.observations.get(name)) {
-            (Some(old), Some(new)) if old.complete() && new.complete() => {
+            (Some(old), Some(new))
+                if old.complete()
+                    && new.complete()
+                    && (!name.starts_with("pf-")
+                        || (super::guard::pf_read_complete(first.observations, name)
+                            && super::guard::pf_read_complete(second.observations, name))) =>
+            {
                 if old.stdout != new.stdout
                     || old.stderr != new.stderr
                     || old.exit_code != new.exit_code
@@ -88,16 +94,17 @@ pub(super) fn pf_status(observations: &BTreeMap<String, Evidence>) -> Option<boo
     if !info.complete() {
         return None;
     }
-    match info
-        .stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("Status: "))?
-        .split_whitespace()
-        .next()?
+    match crate::decode::pftext::info(
+        super::guard::pf_build(observations),
+        0,
+        info.stdout.as_bytes(),
+        info.stderr.as_bytes(),
+    )
+    .ok()?
     {
-        "Enabled" => Some(true),
-        "Disabled" => Some(false),
-        _ => None,
+        crate::platform::PfInfo::Enabled => Some(true),
+        crate::platform::PfInfo::Disabled => Some(false),
+        crate::platform::PfInfo::Incomplete(_) => None,
     }
 }
 
@@ -227,7 +234,14 @@ pub(super) fn state_changes(
     }
     for name in REQUIRED.into_iter().filter(|name| *name != "pf-info") {
         match (before.get(name), after.get(name)) {
-            (Some(a), Some(b)) if a.complete() && b.complete() => {
+            (Some(a), Some(b))
+                if a.complete()
+                    && b.complete()
+                    && (!name.starts_with("pf-")
+                        || name == "pf-references"
+                        || (super::guard::pf_read_complete(before, name)
+                            && super::guard::pf_read_complete(after, name))) =>
+            {
                 let old = normalized(name, &a.stdout);
                 let mut new = normalized(name, &b.stdout);
                 if name == "scutil-keys" {
@@ -347,13 +361,58 @@ mod tests {
     }
 
     #[test]
+    fn pf_status_and_anchor_evidence_reject_unqualified_or_extra_stderr() {
+        for build in crate::decode::pftext::BUILDS {
+            let mut os = observation();
+            os.stdout = build.into();
+            let mut info = observation();
+            info.stdout = include_str!(
+                "../../../scupper-core/tests/fixtures/mac/pf-info-disabled-24H232.txt"
+            )
+            .into();
+            let mut observations = BTreeMap::from([
+                ("osversion".into(), os),
+                ("pf-info".into(), info),
+                ("pf-anchors".into(), observation()),
+            ]);
+            for name in ["pf-info", "pf-anchors"] {
+                observations.get_mut(name).expect("fixture").stderr =
+                    String::from_utf8_lossy(crate::decode::pftext::ALTQ_PREAMBLE).into_owned();
+            }
+            assert_eq!(pf_status(&observations), Some(false));
+            assert!(super::super::guard::pf_read_complete(
+                &observations,
+                "pf-anchors"
+            ));
+            observations.get_mut("osversion").expect("fixture").stdout = "unsupported".into();
+            assert_eq!(pf_status(&observations), None);
+            assert!(!super::super::guard::pf_read_complete(
+                &observations,
+                "pf-anchors"
+            ));
+            observations.get_mut("osversion").expect("fixture").stdout = build.into();
+            for name in ["pf-info", "pf-anchors"] {
+                observations
+                    .get_mut(name)
+                    .expect("fixture")
+                    .stderr
+                    .push_str("unexpected\n");
+            }
+            assert_eq!(pf_status(&observations), None);
+            assert!(!super::super::guard::pf_read_complete(
+                &observations,
+                "pf-anchors"
+            ));
+        }
+    }
+    #[test]
     fn restore_requires_complete_equal_configuration_and_ignores_route_counters() {
         let mut before: BTreeMap<_, _> = REQUIRED
             .into_iter()
             .map(|name| (name.into(), observation()))
             .collect();
         if let Some(e) = before.get_mut("pf-info") {
-            e.stdout = "Status: Disabled for 00:01".into();
+            e.stdout = "Status: Disabled for 0 days 00:00:01 Debug: Urgent".into();
         }
         if let Some(e) = before.get_mut("scutil-keys") {
             e.stdout = "subKey [0] = State:/one\nsubKey [1] = State:/two\n".into();
@@ -363,7 +422,7 @@ mod tests {
         }
         let mut after = before.clone();
         if let Some(e) = after.get_mut("pf-info") {
-            e.stdout = "Status: Disabled for 00:02".into();
+            e.stdout = "Status: Disabled for 0 days 00:00:02 Debug: Urgent".into();
         }
         if let Some(e) = after.get_mut("scutil-keys") {
             e.stdout = "subKey [9] = State:/two\nsubKey [3] = State:/one\n".into();

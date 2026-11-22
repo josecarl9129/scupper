@@ -330,6 +330,28 @@ fn fixtures(root: &Path, old: &[u8; COPY_BYTES], end: u64) -> Result<(NativePlat
     Ok((p, filler))
 }
 
+/// Obtain a settled read after bounded drainage of abandoned readers.
+fn final_race_read(p: &mut NativePlatform, end: u64) -> Result<CopyRead> {
+    // A timed-out racing read retains its reader slot until its syscall returns.
+    // Drain it before comparing settled bytes; capacity exhaustion is no product failure.
+    let drain_end = end.min(scupper_darwin::monotonic_raw().as_secs().saturating_add(5));
+    while !p.storage_readers_idle() {
+        if scupper_darwin::monotonic_raw().as_secs() >= drain_end {
+            return Err(environment_issue(
+                "full race final reader capacity unavailable: readers did not drain",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let after = p.read_copy(Copy::A, deadline(end, 5));
+    if after == CopyRead::Unreadable {
+        return Err(environment_issue(
+            "full race final read unavailable after reader drain",
+        ));
+    }
+    Ok(after)
+}
+
 /// One race at the ENOSPC-defined full state, before any destructive fault loop.
 fn full_race(
     out: &Path,
@@ -410,7 +432,7 @@ fn full_race(
             == WriteOutcome::Failed(crate::platform::SysError::Failed("no outstanding write")),
         "full race Busy did not clear after settlement",
     )?;
-    let after = p.read_copy(Copy::A, deadline(end, 5));
+    let after = final_race_read(p, end)?;
     ensure(
         valid_race_read(&after, old, new),
         "full race settled as a valid third snapshot",

@@ -229,17 +229,21 @@ journaled launchd process group. The existing dead-man/always restore stops
 that group before harness-only `pfctl -d` restores the disabled baseline.
 The adapter never globally disables pf. Q-FLUSH belongs to R7.
 
-Q-ENABLE writes full stdout/stderr/status to `pf-text-*.json`; review those
+Q-ENABLE writes full stdout/stderr/status to `pf-text-*.json`, with `build`,
+`stdout_bytes` and `stderr_bytes` preserving exact per-build bytes (including
+non-UTF-8 diagnostics). Raw harness calls and native adapter mutator attempts
+are saved before text parsing or an Inconclusive verdict; review those
 captures per build against `decode/pftext.rs` before promoting its provisional
 acquisition/release templates. Q-REFS writes raw capacities/copied records,
 500 acquisition fingerprints and value-reuse counts, and 2000 churn reads with
 eight long-lived references including the oldest. Workers acquire bursts of four.
 The 2000 reads comprise 1000 with the default 16 spare slots and 500 each with
 qualification-only spare 0 and 1. `pf-churn.json` records each sub-run's internal
-Retry count, complete/incomplete observations, and `truncation_witnessed` events
-(the next size query exceeds the previous copy capacity). Each small-spare
+Retry count, complete/incomplete observations, and `growth_past_copy_capacity` events
+(the next size query exceeds the previous copy capacity). This proves later
+growth, not truncation at the earlier copy ioctl. Each small-spare
 sub-run requires Retry > 0 and Complete > 0, and at least one small-spare sub-run
-must witness truncation; missing coverage is Inconclusive. Production always
+must observe growth past the previous copy capacity; missing coverage is Inconclusive. Production always
 uses 16 spares; the override method and portable entry point compile only with
 `qualification`, with their absence checked by `r6_no_feature.py`.
 Q-X checks X1, X1-anonymous and X2, saves `pf-x-contract.json`, and returns
@@ -258,11 +262,18 @@ Darwin Rust target and proves the qualification override API is absent without
 features. Neither Linux checks nor a successful cross-lint substitutes for the
 native campaigns or establishes a production assumption record.
 
-The no-uptime `Status: Disabled` + `Debug:` row is source-derived, not a native
-capture. Upstream pfctl's
+CI 45050965328 on 723dbda captured identical never-started, disabled info on
+24H232 (macos-15) and 25G332 (macos-26), arm64. The primary core fixtures
+`pf-info-disabled-24H232.txt` and `pf-info-disabled-25G332.txt` pin that stdout,
+including Apple's `dummynet` and `invalid-port` non-policy counters. Enabled
+status with Debug but no uptime and unknown counters still fail closed.
+All observed read-only pfctl commands exited zero with the exact stderr prefix
+`No ALTQ support in kernel\nALTQ related functions disabled\n`.
+`decode/pftext.rs` strips this exact prefix once, only for those two builds;
+all existing remainder rules still apply. Mutator captures remain pending.
+
+Original source note: upstream pfctl's
 [`print_status` at 855d4e8](https://github.com/openbsd/src/blob/855d4e832803330fc45a64539854bf8d27180600/sbin/pfctl/pfctl_parser.c)
 omits uptime when `since` is zero, then prints the Debug column with one of
-None/Urgent/Misc/Loud. The core fixture `pf-info-disabled-source.txt` pins that
-form; unknown debug levels/suffixes still fail closed. Real disabled info and
-exact acquisition/release captures on both campaign builds remain pending.
+None/Urgent/Misc/Loud. `pf-info-disabled-source.txt` retains that earlier evidence.
 Q-ENABLE's two-minute budget is unchanged until native timing evidence arrives.
