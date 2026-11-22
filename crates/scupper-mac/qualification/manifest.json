@@ -142,6 +142,41 @@
       "minimum_iterations": 500,
       "budget_minutes": 7,
       "supported_assumptions": []
+    },
+    {
+      "id": "Q-ENABLE",
+      "group": "pf",
+      "minimum_iterations": 50,
+      "budget_minutes": 2,
+      "supported_assumptions": []
+    },
+    {
+      "id": "Q-EEXIST",
+      "group": "pf",
+      "minimum_iterations": 50,
+      "budget_minutes": 2,
+      "supported_assumptions": [
+        "eexist_establishes_anonymous"
+      ]
+    },
+    {
+      "id": "Q-REFS",
+      "group": "pf",
+      "minimum_iterations": 2000,
+      "budget_minutes": 8,
+      "supported_assumptions": [
+        "pf_token_layout",
+        "fingerprints"
+      ]
+    },
+    {
+      "id": "Q-X",
+      "group": "pf-x",
+      "minimum_iterations": 3,
+      "budget_minutes": 4,
+      "supported_assumptions": [
+        "disable_voids_references"
+      ]
     }
   ],
   "group_budgets": {

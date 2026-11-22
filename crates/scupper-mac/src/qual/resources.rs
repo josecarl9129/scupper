@@ -419,7 +419,12 @@ fn complete_from_inventory(
     Ok(())
 }
 
-pub(super) fn complete_from_snapshot(out: &Path, post: &Snapshot, deadline: Instant) -> Result<()> {
+pub(super) fn complete_from_snapshot(
+    out: &Path,
+    post: &Snapshot,
+    deadline: Instant,
+    snapshot_quiescent: bool,
+) -> Result<()> {
     if !writers_quiescent(out)? {
         return Ok(());
     }
@@ -427,6 +432,16 @@ pub(super) fn complete_from_snapshot(out: &Path, post: &Snapshot, deadline: Inst
     let mut verified = Vec::new();
     for (index, entry) in pending {
         let absent = match entry.kind.as_str() {
+            "r6-group" => snapshot_quiescent && super::pf::groups_gone(out)?,
+            "r6-pf" => {
+                snapshot_quiescent
+                    && super::pf::groups_gone(out)?
+                    && super::super::restore_check::pf_status(&post.observations) == Some(false)
+                    && post.observations.get("pf-references").is_some_and(|e| {
+                        e.complete()
+                            && super::super::guard::no_foreign_references(&e.stdout, &e.stderr)
+                    })
+            }
             "key" => post.observations.get("scutil-keys").is_some_and(|keys| {
                 restore_check::valid_key_list(keys)
                     && !restore_check::key_list(&keys.stdout).contains(&entry.path)

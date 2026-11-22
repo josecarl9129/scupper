@@ -1,5 +1,6 @@
 //! Native macOS boundary. Construction remains qualification-only until the
 //! install-record writer and production process identity are qualified.
+mod pf;
 pub mod tool;
 #[cfg(feature = "qualification")]
 use crate::platform::Tool;
@@ -109,6 +110,10 @@ pub struct NativePlatform {
     pins: Vec<TrustedExecutable>,
     child_pin: PathBuf,
     storage: crate::platform::storage::darwin::Storage,
+    pf_assumptions: crate::decode::pftoken::Override,
+    pf_reader: crate::decode::pftoken::Reader,
+    #[cfg(feature = "qualification")]
+    pf_capacities: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
 }
 impl NativePlatform {
     /// Construct the adapter for runner qualification only.
@@ -128,6 +133,10 @@ impl NativePlatform {
             pins: Vec::new(),
             storage: crate::platform::storage::darwin::Storage::default(),
             child_pin: crate::engine::CHILD_PATH.into(),
+            pf_assumptions: crate::decode::pftoken::Override::default(),
+            pf_reader: crate::decode::pftoken::Reader::default(),
+            #[cfg(feature = "qualification")]
+            pf_capacities: std::sync::Arc::default(),
         })
     }
     /// Supply reviewed digests/vnodes for qualification until 5a3 provides them.
@@ -769,7 +778,7 @@ impl Platform for NativePlatform {
         Ok(())
     }
     fn reference_qualification(&self) -> ReferenceQualification {
-        ReferenceQualification::default()
+        self.pf_assumptions.assumptions().qualification()
     }
     fn read_install_record(&mut self, _deadline: Deadline) -> Result<InstallRecord, SysError> {
         Err(UNIMPLEMENTED)
@@ -798,20 +807,77 @@ impl Platform for NativePlatform {
     fn wait_write(&mut self, deadline: Deadline) -> WriteOutcome {
         self.storage.wait(deadline)
     }
-    fn enable_pf(&mut self, _deadline: Deadline) -> Result<PfEnable, SysError> {
-        Err(UNIMPLEMENTED)
+    fn enable_pf(&mut self, deadline: Deadline) -> Result<PfEnable, SysError> {
+        let build = Self::pf_build()?;
+        let result = self.pf_tool(&[crate::engine::PFCTL, "-e"], deadline)?;
+        crate::decode::pftext::enable(
+            &build,
+            pf::status(&result)?,
+            &result.stdout.bytes,
+            &result.stderr.bytes,
+            self.pf_assumptions.assumptions(),
+        )
     }
-    fn acquire(&mut self, _deadline: Deadline) -> ToolOutcome<(u64, u32)> {
-        ToolOutcome::NotStarted(UNIMPLEMENTED)
+    fn acquire(&mut self, deadline: Deadline) -> ToolOutcome<(u64, u32)> {
+        let build = match Self::pf_build() {
+            Ok(build) => build,
+            Err(e) => return ToolOutcome::NotStarted(e),
+        };
+        let result = match self.pf_tool(&[crate::engine::PFCTL, "-E"], deadline) {
+            Ok(result) => result,
+            Err(e) => return ToolOutcome::NotStarted(e),
+        };
+        match pf::status(&result).and_then(|rc| {
+            crate::decode::pftext::acquire(&build, rc, &result.stdout.bytes, &result.stderr.bytes)
+        }) {
+            Ok(token) => ToolOutcome::Ok((token, result.pid)),
+            Err(_) => ToolOutcome::Unknown {
+                reaped: result.reap.settled(),
+            },
+        }
     }
-    fn release(&mut self, _token: u64, _deadline: Deadline) -> ToolOutcome<Release> {
-        ToolOutcome::NotStarted(UNIMPLEMENTED)
+    fn release(&mut self, token: u64, deadline: Deadline) -> ToolOutcome<Release> {
+        let build = match Self::pf_build() {
+            Ok(build) => build,
+            Err(e) => return ToolOutcome::NotStarted(e),
+        };
+        let result = match self.pf_tool(&[crate::engine::PFCTL, "-X", &token.to_string()], deadline)
+        {
+            Ok(result) => result,
+            Err(e) => return ToolOutcome::NotStarted(e),
+        };
+        match pf::status(&result).and_then(|rc| {
+            crate::decode::pftext::release(
+                &build,
+                rc,
+                &result.stdout.bytes,
+                &result.stderr.bytes,
+                token,
+            )
+        }) {
+            Ok(released) => ToolOutcome::Ok(released),
+            Err(_) => ToolOutcome::Unknown {
+                reaped: result.reap.settled(),
+            },
+        }
     }
-    fn references(&mut self, _deadline: Deadline) -> Enumeration<Vec<RefLine>> {
-        Enumeration::Incomplete(UNIMPLEMENTED)
+    fn references(&mut self, deadline: Deadline) -> Enumeration<Vec<RefLine>> {
+        match self.read_references(deadline) {
+            Ok(lines) => Enumeration::Complete(lines),
+            Err(error) => Enumeration::Incomplete(error),
+        }
     }
-    fn pf_info(&mut self, _deadline: Deadline) -> PfInfo {
-        PfInfo::Incomplete(UNIMPLEMENTED)
+    fn pf_info(&mut self, deadline: Deadline) -> PfInfo {
+        let result = self
+            .pf_tool(&[crate::engine::PFCTL, "-s", "info"], deadline)
+            .and_then(|result| {
+                result.complete()?;
+                crate::decode::pftext::info(0, &result.stdout.bytes, &result.stderr.bytes)
+            });
+        match result {
+            Ok(info) => info,
+            Err(error) => PfInfo::Incomplete(error),
+        }
     }
     fn kill_group(
         &mut self,

@@ -1505,3 +1505,86 @@ pub fn full_sync(fd: impl std::os::fd::AsFd) -> Result<(), Errno> {
     let rc = unsafe { libc::fcntl(fd.as_fd().as_raw_fd(), libc::F_FULLFSYNC) };
     if rc == -1 { Err(last_errno()) } else { Ok(()) }
 }
+
+// Private XNU bsd/net/pfvar.h wire ABI, pinned by probe/abi.c on each build.
+#[repr(C, packed)]
+struct PfiocToken {
+    token: u64,
+    timestamp: u64,
+    pid: i32,
+    proc_name: [u8; 64],
+}
+#[repr(C, packed)]
+struct PfiocTokens {
+    size: i32,
+    padding: [u8; 4],
+    buffer: *mut libc::c_void,
+}
+/// Measured packed starter record size.
+pub const PF_TOKEN_SIZE: usize = size_of::<PfiocToken>();
+/// Measured ioctl request size.
+pub const PF_TOKENS_SIZE: usize = size_of::<PfiocTokens>();
+/// Packed starter offsets, in declaration order.
+pub const PF_TOKEN_FIELDS: [usize; 4] = [
+    std::mem::offset_of!(PfiocToken, token),
+    std::mem::offset_of!(PfiocToken, timestamp),
+    std::mem::offset_of!(PfiocToken, pid),
+    std::mem::offset_of!(PfiocToken, proc_name),
+];
+/// Request size/buffer offsets.
+pub const PF_TOKENS_FIELDS: [usize; 2] = [
+    std::mem::offset_of!(PfiocTokens, size),
+    std::mem::offset_of!(PfiocTokens, buffer),
+];
+/// Darwin DIOCGETSTARTERS; never use the host Linux ioctl encoding.
+pub const DIOCGETSTARTERS: u32 = 0xC010_4405;
+const _: () = {
+    assert!(PF_TOKEN_SIZE == 84);
+    assert!(PF_TOKENS_SIZE == 16);
+    assert!(PF_TOKEN_FIELDS[0] == 0 && PF_TOKEN_FIELDS[1] == 8);
+    assert!(PF_TOKEN_FIELDS[2] == 16 && PF_TOKEN_FIELDS[3] == 20);
+    assert!(PF_TOKENS_FIELDS[0] == 0 && PF_TOKENS_FIELDS[1] == 8);
+};
+/// Open read-only; enumeration needs no write capability.
+///
+/// # Errors
+/// Returns the open errno.
+pub fn pf_open() -> Result<OwnedFd, Errno> {
+    rustix::fs::open(
+        "/dev/pf",
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+}
+/// One raw ioctl, with a zero-length slice requesting only the size.
+/// Failed ioctls return only errno; the kernel does not copy size out on error.
+///
+/// # Errors
+/// Syscall errno or an invalid signed returned length.
+pub fn pf_starters(fd: BorrowedFd<'_>, bytes: &mut [u8]) -> Result<usize, Errno> {
+    let size = i32::try_from(bytes.len()).map_err(|_| Errno::INVAL)?;
+    let mut request = PfiocTokens {
+        size,
+        padding: [0; 4],
+        buffer: if bytes.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            bytes.as_mut_ptr().cast()
+        },
+    };
+    // SAFETY: fd is borrowed and live; request is initialized with exactly the
+    // pinned 16-byte layout. The buffer has bytes.len() initialized writable bytes
+    // and lives through this synchronous call. Packed fields are never referenced.
+    // A worker retains both fd and bytes through caller timeout. No size is read
+    // until rc succeeds; kernel failure does not copy it out.
+    let rc = unsafe {
+        libc::ioctl(
+            fd.as_raw_fd(),
+            libc::c_ulong::from(DIOCGETSTARTERS),
+            &raw mut request,
+        )
+    };
+    let returned =
+        super::rules::successful_size(rc != -1, || request.size).ok_or_else(last_errno)?;
+    usize::try_from(returned).map_err(|_| Errno::INVAL)
+}

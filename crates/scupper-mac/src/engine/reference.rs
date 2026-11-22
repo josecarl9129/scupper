@@ -1,4 +1,6 @@
 //! Reservation-before-ioctl reference accounting and the three freeing rules.
+//! Numeric release requires qualified fingerprints and a complete post-fence read
+//! matching the recorded PID/calendar timestamp; token values alone are reused.
 use super::{
     Engine, Enumeration, Event, Fence, Mode, Platform, Reason, RefEvidence, ReferenceEntry,
     ReferenceIntent, ReferenceSettlement, StartFence, SysError,
@@ -689,8 +691,8 @@ impl<P: Platform> Engine<P> {
             let Some(line) = lines.iter().find(|r| r.token == token) else {
                 continue;
             };
-            if qualification.fingerprints
-                && !e
+            if !qualification.fingerprints
+                || !e
                     .fingerprint
                     .as_ref()
                     .is_some_and(|f| f.pid == line.pid && f.timestamp == line.timestamp)

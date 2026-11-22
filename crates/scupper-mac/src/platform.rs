@@ -162,7 +162,9 @@ pub enum Release {
 pub struct ReferenceQualification {
     /// Assumption \[X\]: disabling pf invalidates every outstanding token.
     pub disable_voids_references: bool,
-    /// Timestamp/pid fingerprints are qualified for numeric-release ownership.
+    /// Numeric release is forbidden unless this is true AND a complete read begun
+    /// after both fences close matches the recorded PID/calendar timestamp.
+    /// Token values recur; presence alone never grants release authority.
     pub fingerprints: bool,
 }
 /// Executable vnode identity, stable across rename/unlink on this boot.

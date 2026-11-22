@@ -74,6 +74,15 @@ jobs:
           timeout 3600 python3 crates/scupper-mac/tests/r5_storage_mutations.py
           timeout 600 cargo test -p scupper-mac --no-default-features --lib production_fault_selection_has_only_none
 
+      - name: Reference protocol mutants and production assumption exclusion
+        env:
+          CARGO_BUILD_JOBS: 2
+          RUST_TEST_THREADS: 2
+        run: |
+          timeout 3600 python3 crates/scupper-mac/tests/r6_reference_mutations.py
+          timeout 600 cargo test -p scupper-mac --no-default-features --lib production_override_has_only_none
+          timeout 600 python3 crates/scupper-mac/tests/r6_no_feature.py
+
       - name: Portable qualification artifact and ABI macro regressions
         run: python3 crates/scupper-mac/qualification/test_artifacts.py
 
@@ -243,7 +252,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [macos-15, macos-26]
-        group: [smoke, base, tool, tool-mutants, store, probe, probe-hijack]
+        group: [smoke, base, tool, tool-mutants, store, pf, pf-x, probe, probe-hijack]
     runs-on: ${{ matrix.runner }}
     # Native mutants: review estimate scaled to five experiments plus margin.
     timeout-minutes: ${{ matrix.group == 'tool-mutants' && 60 || 30 }}
@@ -377,7 +386,7 @@ jobs:
           /usr/bin/sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT /private/var/db/scupper-qual/scupper-mac-qual arm --after "$after" --out /private/var/db/scupper-qual/evidence --disposable-runner
       - name: Run qualification cell
         if: matrix.group != 'tool-mutants'
-        timeout-minutes: ${{ matrix.group == 'tool' && 10 || matrix.group == 'store' && 10 || 18 }}
+        timeout-minutes: ${{ matrix.group == 'tool' && 10 || matrix.group == 'store' && 10 || matrix.group == 'pf' && 14 || matrix.group == 'pf-x' && 5 || 18 }}
         run: /usr/bin/sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,ImageOS,ImageVersion,RUNNER_NAME,GITHUB_RUN_ID,GITHUB_SHA /private/var/db/scupper-qual/scupper-mac-qual run --group ${{ matrix.group }} --out /private/var/db/scupper-qual/evidence --disposable-runner
       - name: Restore and stop dead-man
         if: always()

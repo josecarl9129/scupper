@@ -178,7 +178,7 @@ mod tests {
         assert!(manifest.budgets_fit());
         assert_eq!(manifest.cell_budget_minutes - manifest.overhead_minutes, 18);
         assert_eq!(MAX_FINAL_RESTORE_SECONDS, 240);
-        assert_eq!(manifest.cases.len(), 20);
+        assert_eq!(manifest.cases.len(), 24);
         let tools: Vec<_> = manifest
             .cases
             .iter()
@@ -238,8 +238,37 @@ mod tests {
         assert!(manifest.budgets_fit());
         let workflow = include_str!("../../../../.github/workflows/ci.yml");
         assert!(workflow.contains("runner: [macos-15, macos-26]"));
-        assert!(workflow.contains("tool-mutants, store, probe"));
+        assert!(workflow.contains("tool-mutants, store, pf, pf-x, probe"));
         assert!(workflow.contains("matrix.group == 'store' && 10"));
+        Ok(())
+    }
+
+    #[test]
+    fn reference_cells_fit_their_case_and_restore_budgets() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let manifest = Manifest::bundled()?;
+        for (id, group, iterations, minutes) in [
+            ("Q-ENABLE", "pf", 50, 2),
+            ("Q-EEXIST", "pf", 50, 2),
+            ("Q-REFS", "pf", 2000, 8),
+            ("Q-X", "pf-x", 3, 4),
+        ] {
+            let case = manifest
+                .cases
+                .iter()
+                .find(|c| c.id == id)
+                .ok_or("missing reference case")?;
+            assert_eq!(
+                (
+                    &case.group[..],
+                    case.minimum_iterations,
+                    case.budget_minutes
+                ),
+                (group, iterations, minutes)
+            );
+        }
+        assert!(manifest.budgets_fit());
+        assert!(!manifest.cases.iter().any(|c| c.id == "Q-FLUSH"));
         Ok(())
     }
 
@@ -262,9 +291,9 @@ mod tests {
             .nth(1)
             .ok_or("native CI job")?;
         assert!(native.contains("runner: [macos-15, macos-26]"));
-        assert!(
-            native.contains("group: [smoke, base, tool, tool-mutants, store, probe, probe-hijack]")
-        );
+        assert!(native.contains(
+            "group: [smoke, base, tool, tool-mutants, store, pf, pf-x, probe, probe-hijack]"
+        ));
         assert!(native.contains(&format!(
             "matrix.group == 'tool-mutants' && {} || 30",
             budget.cell_budget_minutes

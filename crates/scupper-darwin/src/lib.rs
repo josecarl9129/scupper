@@ -10,13 +10,14 @@ mod sys;
 
 #[cfg(target_os = "macos")]
 pub use sys::{
-    CONTROL_FIELDS, ControlSocket, FSTORE_FIELDS, FSTORE_SIZE, FULLFSYNC_COMMAND, FdAction,
-    IDENTIFIER_FIELDS, IDENTIFIER_SIZE, KINFO_PROC_FIELDS, KINFO_PROC_SIZE, KProc, Launch,
-    MAXCOMLEN, NOW_CLOCK_ID, P_TRANSLATED, ProcError, SPAWN_ENV, SignalOutcome, Spawned,
+    CONTROL_FIELDS, ControlSocket, DIOCGETSTARTERS, FSTORE_FIELDS, FSTORE_SIZE, FULLFSYNC_COMMAND,
+    FdAction, IDENTIFIER_FIELDS, IDENTIFIER_SIZE, KINFO_PROC_FIELDS, KINFO_PROC_SIZE, KProc,
+    Launch, MAXCOMLEN, NOW_CLOCK_ID, P_TRANSLATED, PF_TOKEN_FIELDS, PF_TOKEN_SIZE,
+    PF_TOKENS_FIELDS, PF_TOKENS_SIZE, ProcError, SPAWN_ENV, SignalOutcome, Spawned,
     UPTIME_CLOCK_ID, Wait, check_sigchld, full_sync, high_fd, interface_index, kill_checked,
-    monotonic_raw, nonblocking_pipe, poll_pipes, preallocate, proc_identifier, proc_pidpath,
-    proc_uid, spawn, spawn_launch, sysctl_kern_proc_all, sysctl_kern_proc_pid, sysctl_string,
-    uptime_raw,
+    monotonic_raw, nonblocking_pipe, pf_open, pf_starters, poll_pipes, preallocate,
+    proc_identifier, proc_pidpath, proc_uid, spawn, spawn_launch, sysctl_kern_proc_all,
+    sysctl_kern_proc_pid, sysctl_string, uptime_raw,
 };
 
 #[cfg(all(test, target_os = "macos"))]

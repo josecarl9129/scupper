@@ -882,6 +882,9 @@ fn worker_inner(out: &Path, mode: &str) -> Result<()> {
         "qualification job not parented to launchd/group leader",
     )?;
     journal_child(out, incarnation.pid)?;
+    if matches!(mode, "pf" | "pf-x") {
+        return super::pf::worker(out, mode);
+    }
     if mode == "tools" {
         let mut result=CaseResult {case:"Q-TOOL".into(),binary_sha256:executable_sha256()?,verdict:Verdict::AssumptionHolds,iterations:0,detail:"signal mask/dispositions, fd table/handoff, lock noninheritance, capped output, stalled-stdin SIGKILL/reap and separate syscall statuses observed".into(),evidence:Vec::new()};
         tools_worker(out, &mut result)?;
@@ -1109,7 +1112,7 @@ fn gated_bootstrap(out: &Path, plist: &Path) -> Result<Value> {
     )?;
     Ok(value)
 }
-fn launch_job(out: &Path, mode: &str, keep_alive: bool) -> Result<(String, Value)> {
+pub(super) fn launch_job(out: &Path, mode: &str, keep_alive: bool) -> Result<(String, Value)> {
     let label = format!("net.scupper.qual.r4-{mode}");
     let service = format!("system/{label}");
     append(out, &json!({"kind":"r4-job","path":service}))?;
@@ -1134,7 +1137,12 @@ fn launch_job(out: &Path, mode: &str, keep_alive: bool) -> Result<(String, Value
     if mode == "exit" {
         return Ok((service, json!({})));
     }
-    let until = Instant::now() + Duration::from_secs(45);
+    let until = Instant::now()
+        + Duration::from_secs(match mode {
+            "pf" => 13 * 60,
+            "pf-x" => 5 * 60,
+            _ => 45,
+        });
     let record = out.join(format!("tool-worker-{mode}.json"));
     while Instant::now() < until {
         if record.exists() {
@@ -1315,6 +1323,8 @@ fn restore_jobs(
         if !matches!(
             entry.path.as_str(),
             "system/net.scupper.qual.r4-tools"
+                | "system/net.scupper.qual.r4-pf"
+                | "system/net.scupper.qual.r4-pf-x"
                 | "system/net.scupper.qual.r4-bootout"
                 | "system/net.scupper.qual.r4-kill9"
                 | "system/net.scupper.qual.r4-group"

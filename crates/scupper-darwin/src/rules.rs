@@ -24,3 +24,25 @@ mod tests {
         assert!(!super::sigchld_safe(false, true));
     }
 }
+
+/// The kernel does not copy request size out after a failed ioctl.
+pub(crate) fn successful_size(success: bool, read: impl FnOnce() -> i32) -> Option<i32> {
+    if success { Some(read()) } else { None }
+}
+#[cfg(test)]
+mod ioctl_tests {
+    use std::cell::Cell;
+    #[test]
+    fn failed_ioctl_never_reads_size() {
+        let read = Cell::new(false);
+        assert_eq!(
+            super::successful_size(false, || {
+                read.set(true);
+                84
+            }),
+            None
+        );
+        assert!(!read.get());
+        assert_eq!(super::successful_size(true, || 84), Some(84));
+    }
+}

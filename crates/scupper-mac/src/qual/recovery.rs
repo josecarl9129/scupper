@@ -26,6 +26,24 @@ pub(super) fn recover_then_snapshot<R, S>(
     (recovered, snapshot())
 }
 
+// A diagnostic snapshot after failed cleanup cannot retroactively gain a fence
+// merely because the remaining writer exits after that snapshot started.
+pub(super) fn snapshot_can_complete<T, E>(cleanup: Option<&Result<T, E>>) -> bool {
+    cleanup.is_none_or(Result::is_ok)
+}
+#[cfg(test)]
+mod snapshot_fence_tests {
+    #[test]
+    fn late_writer_exit_does_not_authorize_a_prefence_snapshot() {
+        let failed_cleanup: Option<Result<(), &str>> = Some(Err("group still alive"));
+        let fence_at_read_start = super::snapshot_can_complete(failed_cleanup.as_ref());
+        let writer_exited_after_read = true;
+        assert!(!fence_at_read_start && writer_exited_after_read);
+        assert!(super::snapshot_can_complete(Some(&Ok::<(), &str>(()))));
+        assert!(super::snapshot_can_complete::<(), &str>(None));
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(super) struct Writer {
     pub pid: u32,

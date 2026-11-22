@@ -333,6 +333,8 @@ pub struct FakePlatform {
     /// Override a complete collection at a verifier boundary.
     #[cfg(test)]
     pub observation_override: Option<Observations>,
+    /// Qualified fingerprint ownership; false forbids numeric release.
+    pub fingerprints_qualified: bool,
     /// Model status changes between the two enablement observations.
     #[cfg(test)]
     pub pf_info_script: VecDeque<PfInfo>,
@@ -573,6 +575,7 @@ impl FakePlatform {
             observation_override: None,
             #[cfg(test)]
             pf_info_script: VecDeque::new(),
+            fingerprints_qualified: true,
             #[cfg(test)]
             acquire_zero: false,
             #[cfg(test)]
@@ -1269,6 +1272,19 @@ impl FakePlatform {
                 self.violations
                     .push("current reference released before durable Leave");
             }
+            if !self.fingerprints_qualified
+                || snapshot.references.iter().flatten().any(|entry| {
+                    entry.key == ReferenceEntry::Token(token)
+                        && !entry.fingerprint.as_ref().is_some_and(|f| {
+                            self.tokens
+                                .get(&token)
+                                .is_some_and(|r| r.pid == f.pid && r.timestamp == f.timestamp)
+                        })
+                })
+            {
+                self.violations
+                    .push("reference released without qualified matching fingerprint");
+            }
             if snapshot.references.iter().flatten().any(|entry| {
                 entry.key == ReferenceEntry::Token(token)
                     && (self.boot.is_none() || entry.boot.is_none() || entry.boot != self.boot)
@@ -1806,7 +1822,7 @@ impl Platform for FakePlatform {
     fn reference_qualification(&self) -> super::ReferenceQualification {
         super::ReferenceQualification {
             disable_voids_references: self.x_qualified,
-            fingerprints: true,
+            fingerprints: self.fingerprints_qualified,
         }
     }
     fn now(&mut self) -> u64 {

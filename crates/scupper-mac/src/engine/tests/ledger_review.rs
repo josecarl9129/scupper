@@ -388,3 +388,42 @@ fn fake_records_reference_release_without_same_boot_evidence() {
         );
     }
 }
+
+#[test]
+fn numeric_release_requires_qualified_matching_fingerprint() {
+    for qualified in [false, true] {
+        for mismatch in [0, 1, 2, 3] {
+            let mut e = joined();
+            let token = e.machine.durable().pf_reference.unwrap();
+            e.platform.fingerprints_qualified = qualified;
+            match mismatch {
+                1 => e.platform.tokens.get_mut(&token).unwrap().pid += 1,
+                2 => e.platform.tokens.get_mut(&token).unwrap().timestamp += 1,
+                3 => {
+                    e.snapshot
+                        .references
+                        .iter_mut()
+                        .flatten()
+                        .find(|r| r.key == ReferenceEntry::Token(token))
+                        .unwrap()
+                        .fingerprint = None;
+                }
+                _ => (),
+            }
+            // Same numeric value, new foreign PID or timestamp must be retained.
+            let holder = e.platform.tokens[&token].clone();
+            leave(&mut e, 2);
+            e.platform.calls.clear();
+            drive(&mut e, 400);
+            let allowed = qualified && mismatch == 0;
+            assert_eq!(
+                e.platform.calls.contains(&Call::Release(token)),
+                allowed,
+                "qualified={qualified}, mismatch={mismatch}"
+            );
+            if !allowed {
+                assert_eq!(e.platform.tokens.get(&token), Some(&holder));
+            }
+        }
+    }
+}

@@ -206,3 +206,29 @@ and executed SHA256 manifests checked recursively by `check-artifacts.py`.
 Linux runs `tests/r5_storage_mutations.py` and an exhaustive no-feature fault-enum
 compile test. The fallback mutant uses a mock successful fsync after a failed
 full-sync; actual Darwin syscall behavior remains a native-runner observation.
+
+R6 adds `pf` (Q-ENABLE 2 minutes, Q-EEXIST 2 minutes, Q-REFS 8 minutes)
+and `pf-x` (Q-X 4 minutes) on both pinned runners. These cells require pf
+Disabled and no starter references at preflight. They journal global-state
+intent before mutation and run all pf tools and four churn workers inside a
+journaled launchd process group. The existing dead-man/always restore stops
+that group before harness-only `pfctl -d` restores the disabled baseline.
+The adapter never globally disables pf. Q-FLUSH belongs to R7.
+
+Q-ENABLE writes full stdout/stderr/status to `pf-text-*.json`; review those
+captures per build against `decode/pftext.rs` before promoting its provisional
+acquisition/release templates. Q-REFS writes raw capacities/copied records,
+500 acquisition fingerprints and value-reuse counts, and 2000 churn reads with
+eight long-lived references including the oldest. Missing worker progress or
+zero complete reads cannot pass. Q-X records disabled-pf stale replies and up
+to 200 enabled-pf recurrence trials in `pf-x-observations.json`. A missing
+recurrence is a measurement limit, never evidence that values are unique.
+The harness executable remains covered by the complete built/staged manifests;
+R6 introduces no additional staged executable.
+
+Linux regression commands (all mutate only the current worktree and restore
+source bytes) are `python3 crates/scupper-mac/tests/r6_reference_mutations.py`
+and `python3 crates/scupper-mac/tests/r6_no_feature.py`. The latter requires the
+Darwin Rust target and proves the qualification override API is absent without
+features. Neither Linux checks nor a successful cross-lint substitutes for the
+native campaigns or establishes a production assumption record.

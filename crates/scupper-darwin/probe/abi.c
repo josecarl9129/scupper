@@ -15,6 +15,26 @@
 #include <libproc.h>
 #include <sys/proc_info.h>
 #include <net/route.h>
+#include <sys/ioctl.h>
+/* Private XNU wire declaration: not an independent SDK oracle. */
+struct pfioc_token {
+    uint64_t token, timestamp;
+    int32_t pid;
+    char proc_name[64];
+} __attribute__((packed));
+struct pfioc_tokens {
+    int32_t size;
+    union { void *buffer; struct pfioc_token *tokens; } __attribute__((aligned(8)));
+};
+#define DIOCGETSTARTERS _IOWR('D', 5, struct pfioc_tokens)
+_Static_assert(sizeof(struct pfioc_token) == 84, "token stride");
+_Static_assert(sizeof(struct pfioc_tokens) == 16, "tokens request");
+_Static_assert(offsetof(struct pfioc_token, token) == 0, "token value");
+_Static_assert(offsetof(struct pfioc_token, timestamp) == 8, "token timestamp");
+_Static_assert(offsetof(struct pfioc_token, pid) == 16, "token pid");
+_Static_assert(offsetof(struct pfioc_token, proc_name) == 20, "token name");
+_Static_assert(offsetof(struct pfioc_tokens, buffer) == 8, "token buffer");
+_Static_assert(DIOCGETSTARTERS == 0xC0104405UL, "starters ioctl");
 
 /* Public SDKs do not ship proc_info_private.h. This API wire declaration
    is pinned to XNU bsd/sys/proc_info_private.h, proc_uniqidentifierinfo.
@@ -74,6 +94,12 @@ int main(int argc, char **argv) {
     _Static_assert(offsetof(fstore_t, fst_length) == 16, "fstore length");
     _Static_assert(offsetof(fstore_t, fst_bytesalloc) == 24, "fstore allocated");
     printf("\"fstore_t\":{\"size\":%zu,\"fields\":{\"fst_flags\":%zu,\"fst_posmode\":%zu,\"fst_offset\":%zu,\"fst_length\":%zu,\"fst_bytesalloc\":%zu}},", sizeof(fstore_t), offsetof(fstore_t, fst_flags), offsetof(fstore_t, fst_posmode), offsetof(fstore_t, fst_offset), offsetof(fstore_t, fst_length), offsetof(fstore_t, fst_bytesalloc));
+    printf("\"DIOCGETSTARTERS\":%lu,", (unsigned long)DIOCGETSTARTERS);
+    BEGIN(pfioc_token); FIELD(pfioc_token, token);
+    NEXT_FIELD(pfioc_token, timestamp); NEXT_FIELD(pfioc_token, pid);
+    NEXT_FIELD(pfioc_token, proc_name); END(); printf(",");
+    BEGIN(pfioc_tokens); FIELD(pfioc_tokens, size);
+    NEXT_FIELD(pfioc_tokens, buffer); END(); printf(",");
     BEGIN(kinfo_proc);
     FIELD(kinfo_proc, kp_proc); NEXT_FIELD(kinfo_proc, kp_eproc);
     NEXT_FIELD(kinfo_proc, kp_proc.p_pid); NEXT_FIELD(kinfo_proc, kp_proc.p_stat);

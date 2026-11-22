@@ -1,7 +1,4 @@
 //! Serialized tool execution. No workers, wildcard reap, or process-group changes.
-// Until the pf/route/DNS methods (runs R6-R10) call the runner, only the qualification
-// wrapper `NativePlatform::run_tool` uses it; production builds must not warn about that.
-#![cfg_attr(not(feature = "qualification"), allow(dead_code))]
 use crate::platform::{
     Deadline, SysError, Tool,
     runtime::{Output, Reap, Records, valid_fd_action},

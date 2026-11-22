@@ -237,3 +237,59 @@ using a production-bin compile_error or a release-binary CI guard. Hook exclusio
 in no-feature library builds alone is not a production-binary guard. R4 native
 mutations install helpers from qual-out: the top-level built-binaries manifest
 provides their build provenance, while experiment manifests prove installed copies.
+
+## R6 native pf references and assumption gates
+
+The helper's only global enable is pinned `/sbin/pfctl -e`, through the bounded
+mutating tool runner. It takes one anonymous reference, including qualified
+EEXIST; repeated calls do not accumulate references. Numeric release cannot
+remove it. It persists after Leave until reboot or a foreign global disable.
+The adapter never runs `pfctl -d`; only disposable qualification/restore does.
+
+Starter enumeration opens `/dev/pf` read-only with close-on-exec and uses
+DIOCGETSTARTERS `0xC0104405`. The request is 16 bytes; records are packed 84-byte
+little-endian `(token, calendar timestamp, pid, proc_name)` values. Rust const
+assertions and the C probe pin sizes and offsets. The private wire declaration
+is shared XNU evidence, not an independent public-SDK layout oracle. Failed
+ioctls expose no returned size. An ENOENT size query means empty; other query
+errors are incomplete. Successful sizes must be divisible by 84. Copy capacity
+starts at `(need/84 + 16)*84`, using zeroed buffer length, never allocation
+capacity. Copy errors restart the query. Returned lengths must be aligned and
+within the buffer. Complete requires at least one whole spare slot; a full copy
+retries with doubled slots, for at most eight attempts. Sub-record buffers
+returning zero prove no absence. Duplicate token values are a layout error.
+A 16 MiB allocation bound fails closed. One abandonable worker owns its fd and
+buffer until return; timeout retains its slot and another read reports busy.
+
+Numeric token values recur. The engine may call numeric release only with
+`ReferenceQualification.fingerprints == true`, a recorded fingerprint, and a
+complete read begun after both fences closed matching that token's PID and
+calendar timestamp. Unqualified or mismatching presence never authorizes
+release. Without qualified fingerprints the token remains accounting debt until
+qualified absence, a qualified disable observation, or reboot settles it. This
+accepted availability residual prevents release based on a reused number alone;
+it does not claim timestamp monotonicity or uniqueness. The read-to-release race
+is not atomic: concurrent foreign disable/reacquisition can still replace a
+holder after the read, and PID/calendar-second fingerprints are not globally
+unique identifiers.
+
+Each kernel assumption is Unknown, Established or Refuted. Production defaults
+are all Unknown: enumeration remains incomplete, EEXIST is Unknown, and both
+optional qualifications are false. Only the `qualification` feature exposes a
+per-instance override; its variant and native setter are absent in no-feature
+builds. A no-feature exhaustive match and negative Darwin compilation checks
+pin that exclusion. The protected record format, build match key and
+SOURCES_DIGEST remain R11/promotion work. Exact enable rows cover 24H232 and
+25G332. Acquisition/release templates require full-stream Q-ENABLE captures on
+both runners before promotion; unknown text/builds remain Unknown. No
+TokenInvalid text row is promoted: disabled-pf and stale-value replies cannot
+establish safe numeric-release absence against a re-issued holder.
+
+The dedicated pf/pf-x cells require disabled/no-reference preflight and journal
+global-state intent before mutation. All adapter tools and churn processes stay
+inside a journaled launchd group with AbandonProcessGroup=false; independent
+restore stops that group and requires a complete census with no remaining
+group members before restoring pf state and checking the preflight snapshot.
+Q-EEXIST stops on refutation (OD10). Q-X's enabled-pf stale-value
+experiment records recurrence and whether a re-issued holder was released as a
+measurement, without promoting an invalid-token rule. Q-FLUSH remains R7.
