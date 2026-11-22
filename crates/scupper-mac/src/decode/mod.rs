@@ -31,3 +31,6 @@ pub mod image;
 
 pub mod pftext;
 pub mod pftoken;
+
+#[cfg(all(feature = "qualification", any(target_os = "macos", test)))]
+pub(crate) mod pfcapture;

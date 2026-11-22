@@ -16,9 +16,73 @@ TEXT = ROOT / 'crates/scupper-mac/src/decode/pftext.rs'
 ENGINE = ROOT / 'crates/scupper-mac/src/engine/reference.rs'
 RULES = ROOT / 'crates/scupper-darwin/src/rules.rs'
 CORE = ROOT / 'crates/scupper-core/src/mac/parse.rs'
+NATIVE = ROOT / 'crates/scupper-mac/src/native/mod.rs'
+NATIVE_PF = ROOT / 'crates/scupper-mac/src/native/pf.rs'
+RESOURCES = ROOT / 'crates/scupper-mac/src/qual/resources.rs'
+RESTORE = ROOT / 'crates/scupper-mac/src/qual/restore_check.rs'
+JOURNAL = ROOT / 'crates/scupper-mac/src/qual/journal.rs'
+CAPTURE = ROOT / 'crates/scupper-mac/src/decode/pfcapture.rs'
 OUT = ROOT / 'target/r6-mutants'
-ENV = dict(os.environ, CARGO_BUILD_JOBS='2', RUST_TEST_THREADS='2')
+ENV = dict(os.environ, CARGO_BUILD_JOBS='2', RUST_TEST_THREADS='2',
+           CARGO_TARGET_DIR=str(ROOT / 'target'))
 MUTANTS = [
+    ('references-empty-raw-stderr', TEXT,
+     'pub fn references_empty(build: &Build, stdout: &[u8], stderr: &[u8]) -> bool {\n    let stderr = self::stderr(build, stderr);',
+     'pub fn references_empty(_build: &Build, stdout: &[u8], stderr: &[u8]) -> bool {\n    let stderr = stderr;',
+     'scupper-mac', 'references_require_exactly_one_stream_and_disable_requires_exact_streams'),
+    ('references-empty-both-streams', TEXT,
+     '(stdout.is_empty() && empty_row(stderr)) || (stderr.is_empty() && empty_row(stdout))',
+     'empty_row(stderr) || empty_row(stdout)',
+     'scupper-mac', 'references_require_exactly_one_stream_and_disable_requires_exact_streams'),
+    ('disable-ignores-stdout', TEXT,
+     '&& stdout.is_empty()\n        && self::stderr(build, stderr) == b"pf disabled\\n"',
+     '&& self::stderr(build, stderr) == b"pf disabled\\n"',
+     'scupper-mac', 'references_require_exactly_one_stream_and_disable_requires_exact_streams'),
+    ('disable-ignores-stderr', TEXT,
+     '&& self::stderr(build, stderr) == b"pf disabled\\n"', '&& true',
+     'scupper-mac', 'references_require_exactly_one_stream_and_disable_requires_exact_streams'),
+    ('pf-status-lenient-scan', RESTORE,
+     '    match crate::decode::pftext::info(',
+     '    return info.stdout.lines().find_map(|line| match line.split_whitespace().collect::<Vec<_>>().as_slice() { ["Status:", "Enabled", ..] => Some(true), ["Status:", "Disabled", ..] => Some(false), _ => None });\n    match crate::decode::pftext::info(',
+     'scupper-mac', 'restore_decision_requires_build_and_disables_enabled_pf'),
+    ('pf-build-ignores-completeness', TEXT,
+     'observations.get("osversion").filter(|e| e.complete())?',
+     'observations.get("osversion")?',
+     'scupper-mac', 'pf_build_requires_complete_nonempty_osversion'),
+    ('live-tokens-ignores-stderr', JOURNAL,
+     'if !crate::decode::pftext::stderr(build, evidence.stderr.as_bytes()).is_empty() {',
+     'if false && !crate::decode::pftext::stderr(build, evidence.stderr.as_bytes()).is_empty() {',
+     'scupper-mac', 'live_tokens_requires_qualified_complete_stderr'),
+    ('native-pf-info-empty-build', NATIVE,
+     'let attempt = self.pf_attempt(&[crate::engine::PFCTL, "-s", "info"], deadline);',
+     'let attempt = self.pf_tool(&[crate::engine::PFCTL, "-s", "info"], deadline).map(|result| (String::new(), result));',
+     'scupper-mac', 'every_native_parser_uses_system_build_attempt'),
+    ('native-shared-attempt-empty-build', NATIVE_PF,
+     'let build = crate::decode::pftext::Build::system()?;',
+     'let build = String::new();',
+     'scupper-mac', 'every_native_parser_uses_system_build_attempt'),
+    ('restore-missing-build', RESOURCES,
+     ', ("osversion".into(), osversion)', '',
+     'scupper-mac', 'restore_decision_requires_build_and_disables_enabled_pf'),
+    ('restore-skips-disable-action', RESOURCES,
+     'Ok(true) => action(out, "/sbin/pfctl", &["-d"], deadline, actions, failures)?,',
+     'Ok(true) => {},',
+     'scupper-mac', 'restore_decision_requires_build_and_disables_enabled_pf'),
+    ('restore-skips-disable', RESTORE,
+     'pf_status(observations).ok_or("restore pf status unknown (including OS build evidence)")',
+     'pf_status(observations).map(|_| false).ok_or("restore pf status unknown (including OS build evidence)")',
+     'scupper-mac', 'restore_decision_requires_build_and_disables_enabled_pf'),
+    ('capture-selects-argv0', CAPTURE,
+     'matches!(args.get(1),', 'matches!(args.first(),',
+     'scupper-mac', 'capture_selects_argument_and_preserves_command_once'),
+    ('capture-duplicates-pfctl', CAPTURE,
+     'args.iter().map(|arg| (*arg).to_owned()).collect()',
+     'std::iter::once(crate::engine::PFCTL).chain(args.iter().copied()).map(str::to_owned).collect()',
+     'scupper-mac', 'capture_selects_argument_and_preserves_command_once'),
+    ('capture-failure-loses-reason', CAPTURE,
+     '*io_failed = true;', '*io_failed = true; return;',
+     'scupper-mac', 'capture_failure_after_successful_acquire_retains_unknown_and_reason'),
+
     ('altq-strip-anywhere', TEXT,
      'bytes.strip_prefix(ALTQ_PREAMBLE).unwrap_or(bytes)',
      'bytes.windows(ALTQ_PREAMBLE.len()).position(|w| w == ALTQ_PREAMBLE).map_or(bytes, |offset| &bytes[offset + ALTQ_PREAMBLE.len()..])',
@@ -156,10 +220,13 @@ if __name__ == '__main__':
     OUT.mkdir(parents=True, exist_ok=True)
     regression_root = ROOT / "crates/scupper-mac/proptest-regressions"
     regressions = {p: p.read_bytes() for p in regression_root.rglob("*") if p.is_file()}
-    originals = {path: path.read_bytes() for path in [TOKEN, TEXT, ENGINE, RULES, CORE]}
+    originals = {path: path.read_bytes() for path in [TOKEN, TEXT, ENGINE, RULES, CORE, NATIVE, NATIVE_PF, RESOURCES, RESTORE, JOURNAL, CAPTURE]}
     results = []
     try:
         for crate, test in [('scupper-mac', 'decode::pf'),
+                            ('scupper-mac', 'qual::guard::tests'),
+                            ('scupper-mac', 'qual::restore_check::tests'),
+                            ('scupper-mac', 'qual::journal::tests'),
                             ('scupper-mac', 'numeric_release_requires_qualified_matching_fingerprint'),
                             ('scupper-mac', 'each_numeric_release_requires_a_read_after_the_previous_release'),
                             ('scupper-core', 'source_derived_disabled_info_accepts_only_documented_debug_suffix'),
@@ -184,6 +251,9 @@ if __name__ == '__main__':
             finally:
                 path.write_bytes(originals[path])
         for crate, test in [('scupper-mac', 'decode::pf'),
+                            ('scupper-mac', 'qual::guard::tests'),
+                            ('scupper-mac', 'qual::restore_check::tests'),
+                            ('scupper-mac', 'qual::journal::tests'),
                             ('scupper-mac', 'numeric_release_requires_qualified_matching_fingerprint'),
                             ('scupper-mac', 'each_numeric_release_requires_a_read_after_the_previous_release'),
                             ('scupper-core', 'source_derived_disabled_info_accepts_only_documented_debug_suffix'),

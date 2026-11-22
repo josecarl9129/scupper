@@ -186,14 +186,8 @@ fn live_tokens(out: &Path, deadline: Instant) -> Result<Vec<journal::Token>> {
     if !evidence.complete() {
         return Err(format!("ioctl: {ioctl_error}; pfctl References unavailable").into());
     }
-    let build = scupper_darwin::sysctl_string("kern.osversion")?;
-    if super::super::guard::no_foreign_references(&build, &evidence.stdout, &evidence.stderr) {
-        return Ok(Vec::new());
-    }
-    if !crate::decode::pftext::stderr(&build, evidence.stderr.as_bytes()).is_empty() {
-        return Err("unrecognized pfctl References stderr".into());
-    }
-    journal::text_tokens(&evidence.stdout, unix_seconds())
+    let build = crate::decode::pftext::Build::system()?;
+    super::super::journal::live_text_tokens(&build, &evidence, unix_seconds())
         .map_err(|error| format!("ioctl: {ioctl_error}; pfctl References: {error}").into())
 }
 
@@ -243,6 +237,29 @@ fn attached_devices(out: &Path, paths: &[&str], deadline: Instant) -> Result<Vec
     Ok(devices)
 }
 
+/// Restore the journaled disabled baseline using live build-qualified status.
+fn undo_pf_state(
+    out: &Path,
+    deadline: Instant,
+    actions: &mut Vec<String>,
+    failures: &mut Vec<String>,
+) -> Result<()> {
+    let info = invoke_before("/sbin/pfctl", &["-s", "info"], deadline);
+    let osversion = invoke_before("/usr/sbin/sysctl", &["-n", "kern.osversion"], deadline);
+    let current = BTreeMap::from([("pf-info".into(), info), ("osversion".into(), osversion)]);
+    write_json(
+        out,
+        &format!("{}.json", unique("restore-pf-status")),
+        &current,
+    )?;
+    match restore_check::restore_disable(&current) {
+        Ok(true) => action(out, "/sbin/pfctl", &["-d"], deadline, actions, failures)?,
+        Ok(false) => {}
+        Err(reason) => failures.push(reason.into()),
+    }
+    Ok(())
+}
+
 pub(super) fn undo(
     out: &Path,
     before: &Snapshot,
@@ -282,18 +299,7 @@ pub(super) fn undo(
         }
     }
     if restore_pf_state && restore_check::pf_status(&before.observations) == Some(false) {
-        let info = invoke_before("/sbin/pfctl", &["-s", "info"], deadline);
-        let current = BTreeMap::from([("pf-info".into(), info)]);
-        if restore_check::pf_status(&current) == Some(true) {
-            action(
-                out,
-                "/sbin/pfctl",
-                &["-d"],
-                deadline,
-                &mut actions,
-                &mut failures,
-            )?;
-        }
+        undo_pf_state(out, deadline, &mut actions, &mut failures)?;
     }
     undo_keys(out, &entries, deadline, &mut actions, &mut failures)?;
     undo_resolver_clone(out, before, &entries, deadline, &mut actions, &mut failures)?;
@@ -443,10 +449,12 @@ pub(super) fn complete_from_snapshot(
                     && super::super::restore_check::pf_status(&post.observations) == Some(false)
                     && post.observations.get("pf-references").is_some_and(|e| {
                         e.complete()
-                            && super::super::guard::no_foreign_references(
-                                super::super::guard::pf_build(&post.observations),
-                                &e.stdout,
-                                &e.stderr,
+                            && super::super::guard::pf_build(&post.observations).is_some_and(
+                                |build| {
+                                    super::super::guard::no_foreign_references(
+                                        &build, &e.stdout, &e.stderr,
+                                    )
+                                },
                             )
                     })
             }

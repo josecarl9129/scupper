@@ -15,21 +15,18 @@ impl NativePlatform {
     #[cfg(feature = "qualification")]
     fn save_pf_text(
         &self,
-        build: &str,
+        build: &crate::decode::pftext::Build,
         args: &[&str],
         result: &tool::ToolResult,
         started_unix_ms: u128,
         started: std::time::Instant,
-    ) -> Result<(), SysError> {
+    ) -> Result<(), String> {
         use std::{io::Write, os::unix::fs::OpenOptionsExt};
         let Some(out) = &self.pf_text_out else {
             return Ok(());
         };
         let evidence = crate::qual::Evidence {
-            command: std::iter::once(crate::engine::PFCTL)
-                .chain(args.iter().copied())
-                .map(str::to_owned)
-                .collect(),
+            command: crate::decode::pfcapture::command(args),
             stdin: None,
             pid: Some(result.pid),
             exit_code: match result.reap {
@@ -49,8 +46,11 @@ impl NativePlatform {
             stderr: String::from_utf8_lossy(&result.stderr.bytes).into_owned(),
         };
         let save = || -> Result<(), Box<dyn std::error::Error>> {
-            let capture =
-                evidence.pf_text_capture(build, &result.stdout.bytes, &result.stderr.bytes)?;
+            let capture = evidence.pf_text_capture(
+                build.as_str(),
+                &result.stdout.bytes,
+                &result.stderr.bytes,
+            )?;
             let name = format!(
                 "pf-text-native-{}-{}.json",
                 result.pid,
@@ -66,7 +66,7 @@ impl NativePlatform {
             file.sync_all()?;
             Ok(())
         };
-        save().map_err(|_| SysError::Unknown)
+        save().map_err(|error| error.to_string())
     }
     /// Override kernel assumptions only for this qualification instance.
     #[cfg(feature = "qualification")]
@@ -95,14 +95,14 @@ impl NativePlatform {
             |mut decisions| std::mem::take(&mut *decisions),
         )
     }
-    pub(super) fn pf_tool(
+    /// Read the OS build before spawning for every native parser and capture.
+    pub(super) fn pf_attempt(
         &mut self,
         args: &[&str],
         deadline: Deadline,
-    ) -> Result<tool::ToolResult, SysError> {
+    ) -> Result<(crate::decode::pftext::Build, tool::ToolResult), SysError> {
+        let build = crate::decode::pftext::Build::system()?;
         self.check_pin(Path::new(crate::engine::PFCTL), deadline)?;
-        #[cfg(feature = "qualification")]
-        let build = Self::pf_build()?;
         #[cfg(feature = "qualification")]
         let started = std::time::Instant::now();
         #[cfg(feature = "qualification")]
@@ -120,18 +120,21 @@ impl NativePlatform {
             deadline,
         )?;
         #[cfg(feature = "qualification")]
-        if matches!(args.first(), Some(&"-e" | &"-E" | &"-X" | &"-d"))
-            && self
-                .save_pf_text(&build, args, &result, started_unix_ms, started)
-                .is_err()
-        {
-            // This is post-spawn uncertainty, never a pre-spawn NotStarted result.
-            result.io_failed = true;
+        if crate::decode::pfcapture::captured_mutator(args) {
+            let saved = self.save_pf_text(&build, args, &result, started_unix_ms, started);
+            crate::decode::pfcapture::record_failure(
+                args,
+                saved,
+                &mut result.io_failed,
+                &mut self.pf_capture_failures,
+            );
         }
-        Ok(result)
+        Ok((build, result))
     }
-    pub(super) fn pf_build() -> Result<String, SysError> {
-        scupper_darwin::sysctl_string("kern.osversion").map_err(|_| SysError::Unknown)
+    /// Drain capture failures into the qualification case detail.
+    #[cfg(feature = "qualification")]
+    pub fn take_pf_capture_failures(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pf_capture_failures)
     }
     pub(super) fn read_references(
         &mut self,
@@ -187,13 +190,13 @@ impl NativePlatform {
 }
 /// Borrow native capture fields without making any outcome decision.
 pub(super) fn evidence(
-    attempt: &Result<(String, tool::ToolResult), SysError>,
+    attempt: &Result<(crate::decode::pftext::Build, tool::ToolResult), SysError>,
 ) -> crate::decode::pftext::Attempt<'_> {
     attempt
         .as_ref()
         .map(|(build, result)| {
             (
-                build.as_str(),
+                build,
                 crate::decode::pftext::ToolEvidence::from_output(
                     result.pid,
                     result.reap,

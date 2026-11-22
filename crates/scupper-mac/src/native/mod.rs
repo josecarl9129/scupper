@@ -119,6 +119,8 @@ pub struct NativePlatform {
     #[cfg(feature = "qualification")]
     pf_text_out: Option<PathBuf>,
     #[cfg(feature = "qualification")]
+    pf_capture_failures: Vec<String>,
+    #[cfg(feature = "qualification")]
     pf_copy_decisions:
         std::sync::Arc<std::sync::Mutex<Vec<crate::decode::pftoken::EnumerationEvent>>>,
 }
@@ -148,6 +150,8 @@ impl NativePlatform {
             pf_spare_slots: 16,
             #[cfg(feature = "qualification")]
             pf_text_out: None,
+            #[cfg(feature = "qualification")]
+            pf_capture_failures: Vec::new(),
             #[cfg(feature = "qualification")]
             pf_copy_decisions: std::sync::Arc::default(),
         })
@@ -827,27 +831,18 @@ impl Platform for NativePlatform {
         self.storage.wait(deadline)
     }
     fn enable_pf(&mut self, deadline: Deadline) -> Result<PfEnable, SysError> {
-        let attempt = Self::pf_build().and_then(|build| {
-            self.pf_tool(&[crate::engine::PFCTL, "-e"], deadline)
-                .map(|result| (build, result))
-        });
+        let attempt = self.pf_attempt(&[crate::engine::PFCTL, "-e"], deadline);
         crate::decode::pftext::enable_outcome(
             pf::evidence(&attempt),
             self.pf_assumptions.assumptions(),
         )
     }
     fn acquire(&mut self, deadline: Deadline) -> ToolOutcome<(u64, u32)> {
-        let attempt = Self::pf_build().and_then(|build| {
-            self.pf_tool(&[crate::engine::PFCTL, "-E"], deadline)
-                .map(|result| (build, result))
-        });
+        let attempt = self.pf_attempt(&[crate::engine::PFCTL, "-E"], deadline);
         crate::decode::pftext::acquire_outcome(pf::evidence(&attempt))
     }
     fn release(&mut self, token: u64, deadline: Deadline) -> ToolOutcome<Release> {
-        let attempt = Self::pf_build().and_then(|build| {
-            self.pf_tool(&[crate::engine::PFCTL, "-X", &token.to_string()], deadline)
-                .map(|result| (build, result))
-        });
+        let attempt = self.pf_attempt(&[crate::engine::PFCTL, "-X", &token.to_string()], deadline);
         crate::decode::pftext::release_outcome(pf::evidence(&attempt), token)
     }
     fn references(&mut self, deadline: Deadline) -> Enumeration<Vec<RefLine>> {
@@ -857,9 +852,7 @@ impl Platform for NativePlatform {
         }
     }
     fn pf_info(&mut self, deadline: Deadline) -> PfInfo {
-        let attempt = self
-            .pf_tool(&[crate::engine::PFCTL, "-s", "info"], deadline)
-            .map(|result| (String::new(), result));
+        let attempt = self.pf_attempt(&[crate::engine::PFCTL, "-s", "info"], deadline);
         crate::decode::pftext::info_outcome(pf::evidence(&attempt))
     }
 

@@ -7,6 +7,48 @@ use crate::platform::{
     runtime::{Output, Reap},
 };
 
+/// OS build provenance required by every pfctl text parser. No default build exists.
+#[derive(Debug)]
+pub struct Build(String);
+impl Build {
+    /// Read the same kernel OS version for production and live qualification.
+    ///
+    /// # Errors
+    /// Missing, empty or malformed OS version evidence.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn system() -> Result<Self, SysError> {
+        let value =
+            scupper_darwin::sysctl_string("kern.osversion").map_err(|_| SysError::Unknown)?;
+        Self::osversion(&value).ok_or(SysError::Unknown)
+    }
+    #[cfg(any(target_os = "macos", test))]
+    fn osversion(value: &str) -> Option<Self> {
+        let value = value.trim();
+        (!value.is_empty() && value.bytes().all(|b| b.is_ascii_alphanumeric()))
+            .then(|| Self(value.to_owned()))
+    }
+    /// Snapshot provenance comes only from complete kern.osversion evidence.
+    #[cfg(all(feature = "qualification", any(target_os = "macos", test)))]
+    pub(crate) fn observed(
+        observations: &std::collections::BTreeMap<String, crate::qual::Evidence>,
+    ) -> Option<Self> {
+        let evidence = observations.get("osversion").filter(|e| e.complete())?;
+        if !evidence.stderr.is_empty() {
+            return None;
+        }
+        Self::osversion(&evidence.stdout)
+    }
+    /// Exact build value, for captures and qualified-table lookup.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    #[cfg(test)]
+    pub(crate) fn fixture(value: &str) -> Self {
+        Self::osversion(value).expect("nonempty fixture OS build")
+    }
+}
+
 /// Portable bounded tool evidence; constructing this does not interpret it.
 #[derive(Clone, Copy, Debug)]
 #[allow(clippy::struct_excessive_bools)] // Independent raw failure flags, combined only by status().
@@ -74,7 +116,7 @@ pub fn status(result: &ToolEvidence<'_>) -> Result<i32, SysError> {
     }
 }
 /// A pre-spawn error or the full evidence of an attempted pfctl operation.
-pub type Attempt<'a> = Result<(&'a str, ToolEvidence<'a>), SysError>;
+pub type Attempt<'a> = Result<(&'a Build, ToolEvidence<'a>), SysError>;
 /// Interpret pf-info only with complete streams and a successful normal exit.
 #[must_use]
 pub fn info_outcome(attempt: Attempt<'_>) -> PfInfo {
@@ -119,15 +161,15 @@ pub fn release_outcome(attempt: Attempt<'_>, token: u64) -> ToolOutcome<Release>
 }
 /// Builds covered by the disposable-runner campaign.
 pub const BUILDS: [&str; 2] = ["24H232", "25G332"];
-fn supported(build: &str) -> bool {
-    BUILDS.contains(&build)
+fn supported(build: &Build) -> bool {
+    BUILDS.contains(&build.as_str())
 }
 /// Exact stderr preamble observed in CI 45050965328 on both qualified builds.
 pub const ALTQ_PREAMBLE: &[u8] = b"No ALTQ support in kernel\nALTQ related functions disabled\n";
 /// Remove one exact leading preamble only on builds with captured evidence.
 /// The caller must still apply its complete, exact stderr rule to the remainder.
 #[must_use]
-pub fn stderr<'a>(build: &str, bytes: &'a [u8]) -> &'a [u8] {
+pub fn stderr<'a>(build: &Build, bytes: &'a [u8]) -> &'a [u8] {
     if supported(build) {
         bytes.strip_prefix(ALTQ_PREAMBLE).unwrap_or(bytes)
     } else {
@@ -139,7 +181,7 @@ pub fn stderr<'a>(build: &str, bytes: &'a [u8]) -> &'a [u8] {
 /// # Errors
 /// Failed exit or any stderr beyond the qualified prefix.
 pub fn read<'a>(
-    build: &str,
+    build: &Build,
     rc: i32,
     stdout: &'a [u8],
     stderr: &[u8],
@@ -151,7 +193,7 @@ pub fn read<'a>(
 }
 /// Recognize only an explicit empty-reference row, in its captured stream.
 #[must_use]
-pub fn references_empty(build: &str, stdout: &[u8], stderr: &[u8]) -> bool {
+pub fn references_empty(build: &Build, stdout: &[u8], stderr: &[u8]) -> bool {
     let stderr = self::stderr(build, stderr);
     let empty_row = |bytes: &[u8]| {
         matches!(
@@ -165,7 +207,7 @@ pub fn references_empty(build: &str, stdout: &[u8], stderr: &[u8]) -> bool {
 ///
 /// # Errors
 /// Unsupported build, failed exit or unrecognized streams.
-pub fn disable(build: &str, rc: i32, stdout: &[u8], stderr: &[u8]) -> Result<(), SysError> {
+pub fn disable(build: &Build, rc: i32, stdout: &[u8], stderr: &[u8]) -> Result<(), SysError> {
     if supported(build)
         && rc == 0
         && stdout.is_empty()
@@ -181,7 +223,7 @@ pub fn disable(build: &str, rc: i32, stdout: &[u8], stderr: &[u8]) -> Result<(),
 /// # Errors
 /// Unsupported build, unrecognized bytes/status or unqualified EEXIST.
 pub fn enable(
-    build: &str,
+    build: &Build,
     rc: i32,
     stdout: &[u8],
     stderr: &[u8],
@@ -215,7 +257,7 @@ fn token_line(line: &str) -> Option<u64> {
 ///
 /// # Errors
 /// Every unrecognized byte/status, duplicate token or unsupported build.
-pub fn acquire(build: &str, rc: i32, stdout: &[u8], stderr: &[u8]) -> Result<u64, SysError> {
+pub fn acquire(build: &Build, rc: i32, stdout: &[u8], stderr: &[u8]) -> Result<u64, SysError> {
     if !supported(build) || rc != 0 || !stdout.is_empty() {
         return Err(SysError::Unknown);
     }
@@ -232,7 +274,7 @@ pub fn acquire(build: &str, rc: i32, stdout: &[u8], stderr: &[u8]) -> Result<u64
 /// # Errors
 /// All nonzero exits and all unrecognized text.
 pub fn release(
-    build: &str,
+    build: &Build,
     rc: i32,
     stdout: &[u8],
     stderr: &[u8],
@@ -256,7 +298,7 @@ pub fn release(
 /// # Errors
 /// Failed exit, unexpected stderr, invalid UTF-8 or any unparsed info line.
 pub fn info(
-    build: &str,
+    build: &Build,
     rc: i32,
     stdout: &[u8],
     stderr: &[u8],
@@ -273,6 +315,73 @@ pub fn info(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn every_native_parser_uses_system_build_attempt() {
+        let native = include_str!("../native/mod.rs");
+        for method in ["enable_pf", "acquire", "release", "pf_info"] {
+            let signature = format!("    fn {method}(");
+            let body = native
+                .split_once(&signature)
+                .expect("native method")
+                .1
+                .split("\n    fn ")
+                .next()
+                .expect("method body");
+            assert!(
+                body.contains("let attempt = self.pf_attempt("),
+                "assertion: {method} must supply the system build"
+            );
+            assert!(
+                !body.contains("String::new()"),
+                "assertion: empty native build"
+            );
+        }
+        let pf = include_str!("../native/pf.rs");
+        let body = pf
+            .split_once("pub(super) fn pf_attempt(")
+            .expect("shared helper")
+            .1
+            .split("pub(super) fn read_references(")
+            .next()
+            .expect("helper body");
+        assert!(body.contains("let build = crate::decode::pftext::Build::system()?;"));
+        assert!(!body.contains("String::new()"));
+        let source = include_str!("pftext.rs");
+        let system = source
+            .split_once("pub(crate) fn system()")
+            .expect("system source")
+            .1
+            .split("fn osversion(")
+            .next()
+            .expect("build constructor");
+        assert!(system.contains("scupper_darwin::sysctl_string(\"kern.osversion\")"));
+        assert!(!system.contains("String::new()"));
+        assert!(Build::osversion("").is_none());
+        assert!(Build::osversion(" \n").is_none());
+    }
+
+    #[test]
+    fn references_require_exactly_one_stream_and_disable_requires_exact_streams() {
+        for name in BUILDS {
+            let build = Build::fixture(name);
+            let row = b"No pf starter references held\n";
+            assert!(references_empty(&build, row, ALTQ_PREAMBLE));
+            assert!(references_empty(
+                &build,
+                b"",
+                &[ALTQ_PREAMBLE, row].concat()
+            ));
+            assert!(!references_empty(
+                &build,
+                row,
+                &[ALTQ_PREAMBLE, row].concat()
+            ));
+            assert!(!references_empty(&build, row, row));
+            assert!(disable(&build, 0, b"unexpected", b"pf disabled\n").is_err());
+            assert!(disable(&build, 0, b"", b"unexpected\n").is_err());
+        }
+    }
+
     fn evidence(stderr: &[u8]) -> ToolEvidence<'_> {
         ToolEvidence {
             pid: 123,
@@ -314,7 +423,7 @@ mod tests {
                 assert_eq!(e.stdout_truncated, out_lost);
                 assert_eq!(e.stderr_truncated, err_lost);
                 assert_eq!(
-                    info_outcome(Ok(("24H232", e))),
+                    info_outcome(Ok((&Build::fixture("24H232"), e))),
                     if out_lost || err_lost {
                         PfInfo::Incomplete(SysError::Unknown)
                     } else {
@@ -343,7 +452,7 @@ mod tests {
             (b"", b""),            // empty rules, NAT and Apple anchors
         ];
         for (row, &(stdout, tail)) in rows.iter().enumerate() {
-            let parse = |build, bytes: &[u8]| match row {
+            let parse = |build: &Build, bytes: &[u8]| match row {
                 0 | 1 => info(build, 0, stdout, bytes).is_ok(),
                 2 | 3 => enable(
                     build,
@@ -362,10 +471,14 @@ mod tests {
                 9 | 10 => references_empty(build, stdout, bytes),
                 _ => read(build, 0, stdout, bytes).is_ok(),
             };
-            for build in BUILDS {
-                assert!(parse(build, tail), "assertion: plain row {row} {build}");
+            for name in BUILDS {
+                let build = &Build::fixture(name);
+                assert!(parse(build, tail), "assertion: plain row {row} {build:?}");
                 let prefixed = [ALTQ_PREAMBLE, tail].concat();
-                assert!(parse(build, &prefixed), "assertion: ALTQ row {row} {build}");
+                assert!(
+                    parse(build, &prefixed),
+                    "assertion: ALTQ row {row} {build:?}"
+                );
                 for bad in [
                     [ALTQ_PREAMBLE, ALTQ_PREAMBLE, tail].concat(),
                     [b"other\n", ALTQ_PREAMBLE, tail].concat(),
@@ -380,12 +493,12 @@ mod tests {
                     if bad != prefixed {
                         assert!(
                             !parse(build, &bad),
-                            "assertion: bad row {row} {build}: {bad:?}"
+                            "assertion: bad row {row} {build:?}: {bad:?}"
                         );
                     }
                 }
                 assert!(
-                    !parse("unsupported", &prefixed),
+                    !parse(&Build::fixture("unsupported"), &prefixed),
                     "assertion: unsupported row {row}"
                 );
                 for length in 1..ALTQ_PREAMBLE.len() {
@@ -396,7 +509,8 @@ mod tests {
                 }
             }
         }
-        for build in BUILDS {
+        for name in BUILDS {
+            let build = &Build::fixture(name);
             assert!(
                 enable(
                     build,
@@ -435,7 +549,8 @@ mod tests {
             enable_outcome(Err(error), Assumptions::default()),
             Err(SysError::Unknown)
         );
-        for build in BUILDS {
+        for name in BUILDS {
+            let build = &Build::fixture(name);
             assert_eq!(
                 acquire_outcome(Ok((build, evidence(b"Token : 42\n")))),
                 ToolOutcome::Ok((42, 123))
@@ -508,7 +623,7 @@ mod tests {
             );
         }
         assert_eq!(
-            acquire_outcome(Ok(("unknown", evidence(b"Token : 42\n")))),
+            acquire_outcome(Ok((&Build::fixture("unknown"), evidence(b"Token : 42\n")))),
             ToolOutcome::Unknown { reaped: true }
         );
     }
@@ -535,7 +650,7 @@ mod tests {
                 _ => e.stderr = b"unknown",
             }
             assert_eq!(
-                info_outcome(Ok(("", e))),
+                info_outcome(Ok((&Build::fixture("24H232"), e))),
                 if row == 0 {
                     PfInfo::Disabled
                 } else {
@@ -549,16 +664,16 @@ mod tests {
     fn info_requires_zero_exit_and_every_line_parsed() {
         use crate::platform::PfInfo;
         assert_eq!(
-            info("24H232", 0, b"Status: Enabled\n", b""),
+            info(&Build::fixture("24H232"), 0, b"Status: Enabled\n", b""),
             Ok(PfInfo::Enabled)
         );
         assert_eq!(
-            info("24H232", 0, b"Status: Disabled\n", b""),
+            info(&Build::fixture("24H232"), 0, b"Status: Disabled\n", b""),
             Ok(PfInfo::Disabled)
         );
         assert_eq!(
             info(
-                "24H232",
+                &Build::fixture("24H232"),
                 0,
                 include_bytes!(
                     "../../../scupper-core/tests/fixtures/mac/pf-info-disabled-24H232.txt"
@@ -575,12 +690,13 @@ mod tests {
             (0, b"", b""),
             (0, b"\xff", b""),
         ] {
-            assert!(info("24H232", rc, stdout, stderr).is_err());
+            assert!(info(&Build::fixture("24H232"), rc, stdout, stderr).is_err());
         }
     }
     #[test]
     fn every_build_row_and_eexist_gate() {
-        for build in BUILDS {
+        for name in BUILDS {
+            let build = &Build::fixture(name);
             assert_eq!(
                 enable(build, 0, b"", b"pf enabled\n", Assumptions::default()),
                 Ok(PfEnable::Started)
@@ -625,7 +741,8 @@ mod tests {
     }
     #[test]
     fn unknown_text_status_streams_and_builds_grant_nothing() {
-        for build in ["24H232", "25G332", "unknown"] {
+        for name in ["24H232", "25G332", "unknown"] {
+            let build = &Build::fixture(name);
             for text in [
                 "",
                 "Token : 0\n",
@@ -645,14 +762,32 @@ mod tests {
             }
         }
         for rc in [1, -1, 256] {
-            assert!(acquire("24H232", rc, b"", b"Token : 42\n").is_err());
-            assert!(release("24H232", rc, b"", b"Token : 42 revoked.\n", 42).is_err());
+            assert!(acquire(&Build::fixture("24H232"), rc, b"", b"Token : 42\n").is_err());
+            assert!(
+                release(
+                    &Build::fixture("24H232"),
+                    rc,
+                    b"",
+                    b"Token : 42 revoked.\n",
+                    42
+                )
+                .is_err()
+            );
         }
-        assert!(acquire("24H232", 0, b"extra", b"Token : 42\n").is_err());
-        assert!(release("24H232", 0, b"extra", b"Token : 42 revoked.\n", 42).is_err());
+        assert!(acquire(&Build::fixture("24H232"), 0, b"extra", b"Token : 42\n").is_err());
+        assert!(
+            release(
+                &Build::fixture("24H232"),
+                0,
+                b"extra",
+                b"Token : 42 revoked.\n",
+                42
+            )
+            .is_err()
+        );
         assert!(
             enable(
-                "24H232",
+                &Build::fixture("24H232"),
                 0,
                 b"extra",
                 b"pf enabled\n",
@@ -660,8 +795,26 @@ mod tests {
             )
             .is_err()
         );
-        assert!(enable("unknown", 0, b"", b"pf enabled\n", Assumptions::default()).is_err());
-        assert!(acquire("unknown", 0, b"", b"Token : 42\n").is_err());
-        assert!(release("unknown", 0, b"", b"Token : 42 revoked.\n", 42).is_err());
+        assert!(
+            enable(
+                &Build::fixture("unknown"),
+                0,
+                b"",
+                b"pf enabled\n",
+                Assumptions::default()
+            )
+            .is_err()
+        );
+        assert!(acquire(&Build::fixture("unknown"), 0, b"", b"Token : 42\n").is_err());
+        assert!(
+            release(
+                &Build::fixture("unknown"),
+                0,
+                b"",
+                b"Token : 42 revoked.\n",
+                42
+            )
+            .is_err()
+        );
     }
 }

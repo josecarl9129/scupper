@@ -61,7 +61,7 @@ impl Evidence {
         Ok(capture)
     }
     #[cfg(any(target_os = "macos", test))]
-    pub(super) fn complete(&self) -> bool {
+    pub(crate) fn complete(&self) -> bool {
         self.exit_code == Some(0) && !self.timed_out && !self.truncated
     }
 }

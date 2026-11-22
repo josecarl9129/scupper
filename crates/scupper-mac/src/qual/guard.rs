@@ -46,16 +46,19 @@ impl Ack {
 
 // A header-only or unknown response is not proof of zero references. Keep raw
 // evidence so a newly encountered tool format can be reviewed without rerunning.
-pub(super) fn no_foreign_references(build: &str, stdout: &str, stderr: &str) -> bool {
+pub(super) fn no_foreign_references(
+    build: &crate::decode::pftext::Build,
+    stdout: &str,
+    stderr: &str,
+) -> bool {
     crate::decode::pftext::references_empty(build, stdout.as_bytes(), stderr.as_bytes())
 }
 
 /// A missing or incomplete build observation cannot qualify stderr normalization.
-pub(super) fn pf_build(observations: &std::collections::BTreeMap<String, super::Evidence>) -> &str {
-    observations
-        .get("osversion")
-        .filter(|e| e.complete())
-        .map_or("", |e| e.stdout.trim())
+pub(super) fn pf_build(
+    observations: &std::collections::BTreeMap<String, super::Evidence>,
+) -> Option<crate::decode::pftext::Build> {
+    crate::decode::pftext::Build::observed(observations)
 }
 
 pub(super) fn pf_read_complete(
@@ -64,13 +67,10 @@ pub(super) fn pf_read_complete(
 ) -> bool {
     observations.get(name).is_some_and(|e| {
         e.complete()
-            && crate::decode::pftext::read(
-                pf_build(observations),
-                0,
-                e.stdout.as_bytes(),
-                e.stderr.as_bytes(),
-            )
-            .is_ok()
+            && pf_build(observations).is_some_and(|build| {
+                crate::decode::pftext::read(&build, 0, e.stdout.as_bytes(), e.stderr.as_bytes())
+                    .is_ok()
+            })
     })
 }
 
@@ -111,7 +111,8 @@ pub(super) fn preflight_conditions(
         }
     }
     if observations.get("pf-references").is_none_or(|refs| {
-        !no_foreign_references(pf_build(observations), &refs.stdout, &refs.stderr)
+        !pf_build(observations)
+            .is_some_and(|build| no_foreign_references(&build, &refs.stdout, &refs.stderr))
     }) {
         inconclusive.push("foreign pf references present or reference text not recognized".into());
     }
@@ -172,12 +173,45 @@ mod tests {
     }
 
     #[test]
+    fn pf_build_requires_complete_nonempty_osversion() {
+        let mut observations = std::collections::BTreeMap::new();
+        assert!(pf_build(&observations).is_none());
+        for text in ["", " \n", "24H232 extra"] {
+            observations.insert("osversion".into(), observation(text));
+            assert!(pf_build(&observations).is_none());
+        }
+        for build in crate::decode::pftext::BUILDS {
+            let os = observation(&format!("{build}\n"));
+            observations.insert("osversion".into(), os.clone());
+            assert_eq!(
+                pf_build(&observations).expect("complete build").as_str(),
+                build
+            );
+            for failure in 0..4 {
+                let mut incomplete = os.clone();
+                match failure {
+                    0 => incomplete.truncated = true,
+                    1 => incomplete.timed_out = true,
+                    2 => incomplete.exit_code = Some(1),
+                    _ => incomplete.stderr = "unexpected".into(),
+                }
+                observations.insert("osversion".into(), incomplete);
+                assert!(
+                    pf_build(&observations).is_none(),
+                    "assertion: incomplete osversion {failure}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn preflight_classifies_environment_without_network_mutation() {
         let mut observations = std::collections::BTreeMap::from([
             (
                 "pf-references".into(),
                 observation("No pf starter references held"),
             ),
+            ("osversion".into(), observation("24H232")),
             ("pf-anchors".into(), observation("com.apple")),
             ("pf-apple-anchors".into(), observation("")),
             ("translated".into(), observation("0")),
@@ -246,6 +280,7 @@ mod tests {
                 "pf-references".into(),
                 observation("No pf starter references held"),
             ),
+            ("osversion".into(), observation("24H232")),
             ("pf-anchors".into(), observation("com.apple")),
             ("pf-apple-anchors".into(), observation("")),
             ("translated".into(), observation("0")),
@@ -312,16 +347,24 @@ mod tests {
     #[test]
     fn unknown_or_nonempty_references_never_establish_clean_preflight() {
         assert!(no_foreign_references(
-            "24H232",
+            &crate::decode::pftext::Build::fixture("24H232"),
             "",
             "No ALTQ support in kernel\nALTQ related functions disabled\nNo pf starter references held\n"
         ));
-        assert!(!no_foreign_references("24H232", "TOKENS:\n", ""));
         assert!(!no_foreign_references(
-            "24H232",
+            &crate::decode::pftext::Build::fixture("24H232"),
+            "TOKENS:\n",
+            ""
+        ));
+        assert!(!no_foreign_references(
+            &crate::decode::pftext::Build::fixture("24H232"),
             "TOKENS: foreign token\n",
             "No pf starter references held"
         ));
-        assert!(!no_foreign_references("24H232", "", "permission denied"));
+        assert!(!no_foreign_references(
+            &crate::decode::pftext::Build::fixture("24H232"),
+            "",
+            "permission denied"
+        ));
     }
 }

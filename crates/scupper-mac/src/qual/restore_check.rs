@@ -95,7 +95,7 @@ pub(super) fn pf_status(observations: &BTreeMap<String, Evidence>) -> Option<boo
         return None;
     }
     match crate::decode::pftext::info(
-        super::guard::pf_build(observations),
+        &super::guard::pf_build(observations)?,
         0,
         info.stdout.as_bytes(),
         info.stderr.as_bytes(),
@@ -106,6 +106,14 @@ pub(super) fn pf_status(observations: &BTreeMap<String, Evidence>) -> Option<boo
         crate::platform::PfInfo::Disabled => Some(false),
         crate::platform::PfInfo::Incomplete(_) => None,
     }
+}
+
+/// Restore disabled baseline only from an explicitly Enabled current observation.
+/// Missing build/status is a visible restore failure, never a silent skip.
+pub(super) fn restore_disable(
+    observations: &BTreeMap<String, Evidence>,
+) -> Result<bool, &'static str> {
+    pf_status(observations).ok_or("restore pf status unknown (including OS build evidence)")
 }
 
 pub(super) fn key_list(text: &str) -> Vec<String> {
@@ -280,6 +288,43 @@ mod tests {
     }
 
     #[test]
+    fn restore_decision_requires_build_and_disables_enabled_pf() {
+        let mut enabled = observation();
+        enabled.stdout = "Status: Enabled\n".into();
+        enabled.stderr = String::from_utf8_lossy(crate::decode::pftext::ALTQ_PREAMBLE).into_owned();
+        let mut current = BTreeMap::from([("pf-info".into(), enabled)]);
+        assert!(restore_disable(&current).is_err());
+        for build in crate::decode::pftext::BUILDS {
+            current.insert(
+                "osversion".into(),
+                Evidence {
+                    stdout: build.into(),
+                    ..observation()
+                },
+            );
+            assert_eq!(restore_disable(&current), Ok(true), "must run pfctl -d");
+            current.get_mut("pf-info").expect("fixture").stdout = "Status: Disabled\n".into();
+            assert_eq!(restore_disable(&current), Ok(false));
+            for text in [
+                "Status: Disabled\nunknown\n",
+                "Status: Disabled\nStatus: Enabled\n",
+            ] {
+                current.get_mut("pf-info").expect("fixture").stdout = text.into();
+                assert!(restore_disable(&current).is_err());
+            }
+            current.get_mut("pf-info").expect("fixture").stdout = "Status: Enabled\n".into();
+        }
+        let resources = include_str!("resources.rs");
+        assert!(
+            resources.contains("(\"osversion\".into(), osversion)"),
+            "assertion: restore must supply live osversion"
+        );
+        assert!(resources.contains("match restore_check::restore_disable(&current)"));
+        assert!(resources.contains("undo_pf_state(out, deadline, &mut actions, &mut failures)?;"));
+        assert!(resources.contains("Ok(true) => action(out, \"/sbin/pfctl\", &[\"-d\"]"));
+    }
+
+    #[test]
     fn resolver_clone_is_exact_and_remains_a_restore_difference() {
         let line = "127.0.0.53 127.0.0.1 UHW3I lo0 3579";
         assert!(resolver_clone(line));
@@ -411,6 +456,13 @@ mod tests {
             .into_iter()
             .map(|name| (name.into(), observation()))
             .collect();
+        before.insert(
+            "osversion".into(),
+            Evidence {
+                stdout: "24H232".into(),
+                ..observation()
+            },
+        );
         if let Some(e) = before.get_mut("pf-info") {
             e.stdout = "Status: Disabled for 0 days 00:00:01 Debug: Urgent".into();
         }

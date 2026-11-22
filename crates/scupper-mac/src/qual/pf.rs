@@ -148,7 +148,7 @@ fn release(p: &mut NativePlatform, token: u64, end: Instant) -> Result<()> {
     }
 }
 fn raw(out: &Path, p: &mut NativePlatform, args: &[&str], end: Instant) -> Result<Evidence> {
-    let build = scupper_darwin::sysctl_string("kern.osversion")?;
+    let build = crate::decode::pftext::Build::system()?;
     let started = Instant::now();
     let wall = super::super::command::unix_seconds();
     let command_line: Vec<_> = std::iter::once("/sbin/pfctl")
@@ -183,7 +183,7 @@ fn raw(out: &Path, p: &mut NativePlatform, args: &[&str], end: Instant) -> Resul
     write_json(
         out,
         &format!("{}.json", super::unique("pf-text")),
-        &evidence.pf_text_capture(&build, &result.stdout.bytes, &result.stderr.bytes)?,
+        &evidence.pf_text_capture(build.as_str(), &result.stdout.bytes, &result.stderr.bytes)?,
     )?;
     if evidence.exit_code.is_none()
         || evidence.timed_out
@@ -204,7 +204,7 @@ fn reset(out: &Path, p: &mut NativePlatform, end: Instant) -> Result<()> {
     if p.pf_info(deadline(end)?) == PfInfo::Enabled {
         let disabled = raw(out, p, &["-d"], end)?;
         if pftext::disable(
-            &scupper_darwin::sysctl_string("kern.osversion")?,
+            &crate::decode::pftext::Build::system()?,
             disabled.exit_code.unwrap_or(-1),
             disabled.stdout.as_bytes(),
             disabled.stderr.as_bytes(),
@@ -232,11 +232,9 @@ fn baseline(out: &Path) -> Result<()> {
         .ok_or("no preflight references")?;
     ensure(
         tokens.complete()
-            && super::super::guard::no_foreign_references(
-                super::super::guard::pf_build(&before.observations),
-                &tokens.stdout,
-                &tokens.stderr,
-            ),
+            && super::super::guard::pf_build(&before.observations).is_some_and(|build| {
+                super::super::guard::no_foreign_references(&build, &tokens.stdout, &tokens.stderr)
+            }),
         "pf campaign requires no preflight references",
     )
 }
@@ -334,6 +332,13 @@ pub(super) fn worker(out: &Path, group: &str) -> Result<()> {
             result.verdict = Verdict::Inconclusive;
             result.detail = "required iterations were not reached".into();
         }
+        for failure in p.take_pf_capture_failures() {
+            result.detail.push_str("; ");
+            result.detail.push_str(&failure);
+            if result.verdict == Verdict::AssumptionHolds {
+                result.verdict = Verdict::Inconclusive;
+            }
+        }
         let stop = matches!(
             result.verdict,
             Verdict::AssumptionRefuted | Verdict::ContractViolation
@@ -394,7 +399,7 @@ fn compare_layout(abi: &Value) -> Result<()> {
 }
 #[allow(clippy::too_many_lines)] // Preserve full text captures and the anonymous-reference cycle ordering.
 fn enable(out: &Path, p: &mut NativePlatform, end: Instant, result: &mut CaseResult) -> Result<()> {
-    let build = scupper_darwin::sysctl_string("kern.osversion")?;
+    let build = crate::decode::pftext::Build::system()?;
     for _ in 0..50 {
         reset(out, p, end)?;
         let raw_enable = raw(out, p, &["-e"], end)?;
@@ -862,7 +867,7 @@ fn x(out: &Path, p: &mut NativePlatform, end: Instant, result: &mut CaseResult) 
             invalid.exit_code == Some(1)
                 && invalid.stdout.is_empty()
                 && pftext::stderr(
-                    &scupper_darwin::sysctl_string("kern.osversion")?,
+                    &crate::decode::pftext::Build::system()?,
                     invalid.stderr.as_bytes(),
                 ) == b"pfctl: pf not enabled\n",
             "disabled stale -X text differs from R2",

@@ -138,6 +138,24 @@ pub(super) fn text_tokens(text: &str, now: u64) -> Result<Vec<Token>, &'static s
     Ok(tokens)
 }
 
+/// Parse the fallback inventory only with complete streams and exact qualified stderr.
+pub(super) fn live_text_tokens(
+    build: &crate::decode::pftext::Build,
+    evidence: &super::Evidence,
+    now: u64,
+) -> Result<Vec<Token>, &'static str> {
+    if !evidence.complete() {
+        return Err("pfctl References unavailable");
+    }
+    if super::guard::no_foreign_references(build, &evidence.stdout, &evidence.stderr) {
+        return Ok(Vec::new());
+    }
+    if !crate::decode::pftext::stderr(build, evidence.stderr.as_bytes()).is_empty() {
+        return Err("unrecognized pfctl References stderr");
+    }
+    text_tokens(&evidence.stdout, now)
+}
+
 // Inventory failure must not prevent release attempts for durably known tokens.
 pub(super) fn recovery_tokens(
     entries: &[Entry],
@@ -172,6 +190,43 @@ pub(super) fn recovery_tokens(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_tokens_requires_qualified_complete_stderr() {
+        let text = "TOKENS:\nPID Process Name TOKEN TIMESTAMP\n42 pfctl 123 0 days 00:00:00\n";
+        for name in crate::decode::pftext::BUILDS {
+            let build = crate::decode::pftext::Build::fixture(name);
+            let mut evidence = super::super::Evidence {
+                command: vec![],
+                stdin: None,
+                pid: Some(42),
+                exit_code: Some(0),
+                started_unix_ms: 0,
+                elapsed_ms: 0,
+                timed_out: false,
+                truncated: false,
+                stdout: text.into(),
+                stderr: String::from_utf8_lossy(crate::decode::pftext::ALTQ_PREAMBLE).into_owned(),
+            };
+            assert_eq!(
+                live_text_tokens(&build, &evidence, 100),
+                Ok(vec![Token {
+                    value: 123,
+                    pid: 42,
+                    timestamp: 100
+                }])
+            );
+            evidence.stderr.push_str("unexpected\n");
+            assert!(live_text_tokens(&build, &evidence, 100).is_err());
+            evidence.stderr.clear();
+            evidence.truncated = true;
+            assert!(live_text_tokens(&build, &evidence, 100).is_err());
+        }
+        let resources = include_str!("resources.rs");
+        assert!(resources.contains(
+            "super::super::journal::live_text_tokens(&build, &evidence, unix_seconds())"
+        ));
+    }
 
     #[test]
     fn incomplete_final_append_does_not_discard_committed_intents() -> Result<(), serde_json::Error>
