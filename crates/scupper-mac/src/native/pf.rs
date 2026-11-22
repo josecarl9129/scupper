@@ -28,7 +28,7 @@ impl NativePlatform {
     /// Drain actual adapter copy decisions, including internal full-buffer retries.
     #[cfg(feature = "qualification")]
     #[must_use]
-    pub fn reference_copy_decisions(&mut self) -> Vec<pftoken::Classification> {
+    pub fn reference_copy_decisions(&mut self) -> Vec<pftoken::EnumerationEvent> {
         self.pf_copy_decisions.lock().map_or_else(
             |_| Vec::new(),
             |mut decisions| std::mem::take(&mut *decisions),
@@ -119,7 +119,8 @@ pub(super) fn evidence(
                     reap: result.reap,
                     stdout: &result.stdout.bytes,
                     stderr: &result.stderr.bytes,
-                    truncated: result.stdout.truncated || result.stderr.truncated,
+                    stdout_truncated: result.stdout.truncated,
+                    stderr_truncated: result.stderr.truncated,
                     timed_out: result.timed_out,
                     io_failed: result.io_failed,
                     stdin_unsent: result.stdin_unsent,

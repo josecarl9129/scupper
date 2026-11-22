@@ -72,7 +72,8 @@ jobs:
           RUST_TEST_THREADS: 2
         run: |
           timeout 3600 python3 crates/scupper-mac/tests/r5_storage_mutations.py
-          timeout 600 cargo test -p scupper-mac --no-default-features --lib production_fault_selection_has_only_none
+          timeout 600 cargo test -p scupper-mac --no-default-features --lib platform::storage::tests::production_fault_selection_has_only_none -- --exact | tee target/r5-production-fault.log
+          grep -Eq 'test result: ok\. 1 passed;' target/r5-production-fault.log
 
       - name: Reference protocol mutants and production assumption exclusion
         env:
@@ -81,7 +82,7 @@ jobs:
         run: |
           timeout 3600 python3 crates/scupper-mac/tests/r6_reference_mutations.py
           timeout 600 cargo test -p scupper-mac --no-default-features --lib decode::pftoken::production_tests::production_override_has_only_none -- --exact | tee target/r6-production-override.log
-          rg 'test result: ok\. 1 passed;' target/r6-production-override.log
+          grep -Eq 'test result: ok\. 1 passed;' target/r6-production-override.log
           timeout 600 python3 crates/scupper-mac/tests/r6_no_feature.py
 
       - name: Portable qualification artifact and ABI macro regressions

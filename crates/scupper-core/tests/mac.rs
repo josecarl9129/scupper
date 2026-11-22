@@ -340,7 +340,10 @@ fn source_derived_disabled_info_accepts_only_documented_debug_suffix() {
         "Status: Disabled unknown Debug: Urgent",
         "Status: Enabled Debug: Urgent",
     ] {
-        assert!(parse::pf_info(text).is_err(), "{text}");
+        assert!(
+            parse::pf_info(text).is_err(),
+            "assertion: accepted invalid pf info: {text}"
+        );
     }
 }
 #[test]

@@ -430,7 +430,9 @@ fn numeric_release_requires_qualified_matching_fingerprint() {
 
 #[test]
 fn each_numeric_release_requires_a_read_after_the_previous_release() {
-    for incomplete in [false, true] {
+    for scenario in 0..4 {
+        let incomplete = scenario == 1;
+        let changed = scenario >= 2;
         let e = accounted(true, false);
         let mut snapshot = e.snapshot.clone();
         snapshot.machine.older_references = vec![902].try_into().unwrap();
@@ -454,6 +456,18 @@ fn each_numeric_release_requires_a_read_after_the_previous_release() {
         if incomplete {
             e.platform.inject(Call::References, 2, Fault::Incomplete);
         }
+        if changed {
+            let initial = e.platform.tokens.values().cloned().collect();
+            let mut holder = e.platform.tokens[&902].clone();
+            if scenario == 2 {
+                holder.pid += 1;
+            } else {
+                holder.timestamp += 1;
+            }
+            e.platform
+                .references_script
+                .extend([initial, vec![holder.clone()]]);
+        }
         e.platform.calls.clear();
         let outcome = e.reconcile_references();
         let releases: Vec<_> = e
@@ -463,8 +477,12 @@ fn each_numeric_release_requires_a_read_after_the_previous_release() {
             .enumerate()
             .filter_map(|(i, call)| matches!(call, Call::Release(_)).then_some(i))
             .collect();
-        assert_eq!(releases.len(), if incomplete { 1 } else { 2 });
-        if incomplete {
+        assert_eq!(releases.len(), if incomplete || changed { 1 } else { 2 });
+        if changed {
+            assert!(outcome.is_ok());
+            assert!(e.platform.tokens.contains_key(&902));
+            assert!(!e.platform.calls.contains(&Call::Release(902)));
+        } else if incomplete {
             assert!(outcome.is_err());
             assert_eq!(e.platform.tokens.len(), 1);
         } else {

@@ -118,7 +118,7 @@ pub struct NativePlatform {
     pf_spare_slots: usize,
     #[cfg(feature = "qualification")]
     pf_copy_decisions:
-        std::sync::Arc<std::sync::Mutex<Vec<crate::decode::pftoken::Classification>>>,
+        std::sync::Arc<std::sync::Mutex<Vec<crate::decode::pftoken::EnumerationEvent>>>,
 }
 impl NativePlatform {
     /// Construct the adapter for runner qualification only.
@@ -167,6 +167,12 @@ impl NativePlatform {
     #[cfg(feature = "qualification")]
     pub fn storage_failed_create(&mut self) -> Option<(u64, CopyRead)> {
         self.storage.take_failed_create()
+    }
+    /// Actual syscall errno from the settled storage write, when one failed.
+    #[cfg(feature = "qualification")]
+    #[must_use]
+    pub fn storage_write_errno(&self) -> Option<i32> {
+        self.storage.write_errno()
     }
     /// Qualification witness that abandoned readers have exited before rewriting.
     #[cfg(feature = "qualification")]
@@ -847,17 +853,12 @@ impl Platform for NativePlatform {
         }
     }
     fn pf_info(&mut self, deadline: Deadline) -> PfInfo {
-        let result = self
+        let attempt = self
             .pf_tool(&[crate::engine::PFCTL, "-s", "info"], deadline)
-            .and_then(|result| {
-                result.complete()?;
-                crate::decode::pftext::info(0, &result.stdout.bytes, &result.stderr.bytes)
-            });
-        match result {
-            Ok(info) => info,
-            Err(error) => PfInfo::Incomplete(error),
-        }
+            .map(|result| (String::new(), result));
+        crate::decode::pftext::info_outcome(pf::evidence(&attempt))
     }
+
     fn kill_group(
         &mut self,
         pgid: u32,

@@ -183,18 +183,24 @@ write Busy/TimedOut/wait, and the two-reader/abandon limit. Full means ENOSPC on
 that is recorded rather than credited as reaching the hook. Every failure may
 leave partial bytes. Synced requires the complete applicable write/sync protocol.
 The full-image ordinary overwrite may also fail; it is recorded, with no Synced
-credit. Before filling, fixtures allocate and sync a 256 KiB slack file outside
-the copy namespace. After full-volume checks, reclaim truncates and syncs the
-held slack fd, then truncates and syncs the held filler fd before dropping and
-unlinking it, removing B and renaming reserved B for deterministic concurrency
-fixtures. Each reclaim step has a named phase (`reclaim/truncate_slack`,
-`reclaim/sync_slack`, `reclaim/truncate_filler`, `reclaim/sync_filler`,
-`reclaim/unlink_filler`, `reclaim/remove_b`, `reclaim/rename_reserved_b`).
-The phase evidence also records a `full/concurrency_reset` configuration event
-with `slack_bytes`, `enospc_retries` and `retry_delay_ms`. ENOSPC gets at most five
-retries spaced 200 ms apart, within the existing case budget; reclaim failure
-is environment Inconclusive and names the step. Concurrency evidence names the
-reclaimed image state. No harness evidence is written onto
+credit. The comprehensive concurrency suite (Busy/TimedOut/wait, racing reads,
+worker capacity and abandon-discard) runs only on the unfilled image. The full
+image performs no reclaim: no slack file, filler truncation/unlink or reserved-B
+rename. A is valid and synced before filling; B stays absent on both images (the
+fault loops need it absent, and unlinking it on the full image could fail with
+ENOSPC). Immediately after the
+ENOSPC fill and before destructive faults, `full/race` gates one overwrite of A,
+checks Busy and a short wait timeout, starts a racing reader, then releases the
+write and makes bounded reads. Valid reads must equal the exact old or new bytes;
+Synced must leave exact new bytes. The number of racing reads classified valid
+is recorded (`racing_valid_reads`; zero is a recorded coverage gap). The real settled outcome, syscall errno,
+post-read bytes and duration are recorded in `store-full-race.json` and phase
+evidence. If the race did not fail with ENOSPC, verdict detail records
+`"enospc_failure_race":"not exercised"` as a coverage gap. Fault loops continue
+from the bytes the race left, without resetting A or freeing the filler. The
+`image_state` and `full_concurrency` evidence distinguish this targeted full-state
+probe from the unfilled comprehensive suite. The full image remains filled until
+detach. No harness evidence is written onto
 either image. Every phase writes start/end timestamps, elapsed seconds and
 outcome to `store-phases.jsonl`, with completed timings in
 `store-hook-counts.json`; unexpected errors name their phase. Budget expiry is
@@ -230,8 +236,10 @@ acquisition/release templates. Q-REFS writes raw capacities/copied records,
 eight long-lived references including the oldest. Workers acquire bursts of four.
 The 2000 reads comprise 1000 with the default 16 spare slots and 500 each with
 qualification-only spare 0 and 1. `pf-churn.json` records each sub-run's internal
-Retry count and complete/incomplete observations. Each small-spare sub-run requires
-Retry > 0 and Complete > 0; missing coverage is Inconclusive. Production always
+Retry count, complete/incomplete observations, and `truncation_witnessed` events
+(the next size query exceeds the previous copy capacity). Each small-spare
+sub-run requires Retry > 0 and Complete > 0, and at least one small-spare sub-run
+must witness truncation; missing coverage is Inconclusive. Production always
 uses 16 spares; the override method and portable entry point compile only with
 `qualification`, with their absence checked by `r6_no_feature.py`.
 Q-X checks X1, X1-anonymous and X2, saves `pf-x-contract.json`, and returns

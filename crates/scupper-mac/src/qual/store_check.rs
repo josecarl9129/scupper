@@ -78,12 +78,47 @@ impl Phases {
     }
 }
 
+/// Valid racing snapshots must be byte-for-byte one of the two fixtures.
+pub(super) fn valid_race_read(read: &crate::snapshot::CopyRead, old: &[u8], new: &[u8]) -> bool {
+    match crate::snapshot::classify_copy(read.clone()) {
+        crate::snapshot::CopyClass::V { bytes, .. } => bytes == old || bytes == new,
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[derive(Debug, thiserror::Error)]
     #[error("budget expired")]
     struct BudgetExpired;
+
+    #[test]
+    fn racing_valid_reads_reject_every_other_snapshot() {
+        use crate::snapshot::{self, CopyRead, Snapshot};
+        let old = snapshot::encode(1, &Snapshot::initial(Some(0), None))
+            .unwrap_or_else(|_| unreachable!());
+        let new = snapshot::encode(2, &Snapshot::initial(Some(0), None))
+            .unwrap_or_else(|_| unreachable!());
+        let other = snapshot::encode(3, &Snapshot::initial(Some(0), None))
+            .unwrap_or_else(|_| unreachable!());
+        assert!(valid_race_read(
+            &CopyRead::Bytes(old.to_vec()),
+            &old[..],
+            &new[..]
+        ));
+        assert!(valid_race_read(
+            &CopyRead::Bytes(new.to_vec()),
+            &old[..],
+            &new[..]
+        ));
+        assert!(!valid_race_read(
+            &CopyRead::Bytes(other.to_vec()),
+            &old[..],
+            &new[..]
+        ));
+        assert!(valid_race_read(&CopyRead::Unreadable, &old[..], &new[..]));
+    }
 
     #[test]
     fn nested_phase_failure_preserves_cause_and_both_timings() {

@@ -112,7 +112,23 @@ pub fn enumerate(
     read: impl FnMut(&mut [u8]) -> Result<usize, ReadError>,
     expired: impl FnMut() -> bool,
 ) -> Result<Vec<RefLine>, SysError> {
-    enumerate_buffer(read, expired, |capacity| vec![0_u8; capacity], 16, |_| {})
+    enumerate_buffer(
+        read,
+        expired,
+        |capacity| vec![0_u8; capacity],
+        16,
+        |_| {},
+        || {},
+    )
+}
+/// Qualification observations from the actual enumeration protocol.
+#[cfg(feature = "qualification")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnumerationEvent {
+    /// Result of a successful copy ioctl.
+    Copy(Classification),
+    /// The following size query exceeded the previous successful copy capacity.
+    TruncationWitnessed,
 }
 /// Qualification alone may reduce the spare slots and observe copy decisions.
 ///
@@ -123,14 +139,16 @@ pub fn enumerate_with_spare(
     read: impl FnMut(&mut [u8]) -> Result<usize, ReadError>,
     expired: impl FnMut() -> bool,
     spare: usize,
-    observe: impl FnMut(Classification),
+    observe: impl FnMut(EnumerationEvent),
 ) -> Result<Vec<RefLine>, SysError> {
+    let observe = std::cell::RefCell::new(observe);
     enumerate_buffer(
         read,
         expired,
         |capacity| vec![0_u8; capacity],
         spare,
-        observe,
+        |classification| (observe.borrow_mut())(EnumerationEvent::Copy(classification)),
+        || (observe.borrow_mut())(EnumerationEvent::TruncationWitnessed),
     )
 }
 fn enumerate_buffer(
@@ -139,8 +157,10 @@ fn enumerate_buffer(
     mut allocate: impl FnMut(usize) -> Vec<u8>,
     spare: usize,
     mut observe: impl FnMut(Classification),
+    mut truncation: impl FnMut(),
 ) -> Result<Vec<RefLine>, SysError> {
     let mut slots = 0_usize;
+    let mut previous_copy_capacity = None;
     for _ in 0..8 {
         if expired() {
             return Err(SysError::TimedOut);
@@ -151,6 +171,12 @@ fn enumerate_buffer(
             Ok(need) if need.is_multiple_of(STRIDE) => need,
             Ok(_) => return Err(SysError::Failed("pf token layout")),
         };
+        if previous_copy_capacity
+            .take()
+            .is_some_and(|capacity| need > capacity)
+        {
+            truncation();
+        }
         slots = slots.max(
             (need / STRIDE)
                 .checked_add(spare)
@@ -167,6 +193,7 @@ fn enumerate_buffer(
         let Ok(returned) = read(&mut bytes) else {
             continue;
         };
+        previous_copy_capacity = Some(capacity);
         let classification = classify(capacity, returned, STRIDE);
         observe(classification);
         match classification {
@@ -261,16 +288,21 @@ mod tests {
     #[cfg(feature = "qualification")]
     #[test]
     fn small_spare_retries_full_copies_then_completes_without_losing_oldest() {
-        for spare in [0, 1] {
+        for (spare, growing) in [(0, false), (1, false), (0, true), (1, true)] {
             let mut copies = 0;
             let mut decisions = vec![];
             let result = enumerate_with_spare(
                 |b| {
                     if b.is_empty() {
-                        return Ok(84);
+                        return Ok(if copies == 0 || !growing {
+                            84
+                        } else {
+                            (2 + spare) * 84
+                        });
                     }
                     copies += 1;
                     if copies == 1 {
+                        assert_eq!(b.len(), (1 + spare) * 84);
                         return Ok(b.len());
                     }
                     b[..84].copy_from_slice(&record(7));
@@ -281,10 +313,12 @@ mod tests {
                 |d| decisions.push(d),
             );
             assert_eq!(result, decode(&record(7)));
-            assert_eq!(
-                decisions,
-                vec![Classification::Retry, Classification::Complete]
-            );
+            let mut expected = vec![EnumerationEvent::Copy(Classification::Retry)];
+            if growing {
+                expected.push(EnumerationEvent::TruncationWitnessed);
+            }
+            expected.push(EnumerationEvent::Copy(Classification::Complete));
+            assert_eq!(decisions, expected);
         }
     }
     #[test]
@@ -621,7 +655,8 @@ mod allocation_tests {
                         bytes
                     },
                     16,
-                    |_| {}
+                    |_| {},
+                    || {}
                 ),
                 Ok(vec![])
             );

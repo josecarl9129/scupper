@@ -2,10 +2,11 @@
 //! Enable rows are supplied by R2; acquisition/release templates must be
 //! cross-checked against full Q-ENABLE captures before promotion (R11).
 use super::pftoken::{Assumption, Assumptions};
-use crate::platform::{PfEnable, Release, SysError, ToolOutcome, runtime::Reap};
+use crate::platform::{PfEnable, PfInfo, Release, SysError, ToolOutcome, runtime::Reap};
 
 /// Portable bounded tool evidence; constructing this does not interpret it.
 #[derive(Clone, Copy, Debug)]
+#[allow(clippy::struct_excessive_bools)] // Independent raw failure flags, combined only by status().
 pub struct ToolEvidence<'a> {
     /// Spawned PID, retained independently of parsed text.
     pub pid: u32,
@@ -15,8 +16,10 @@ pub struct ToolEvidence<'a> {
     pub stdout: &'a [u8],
     /// Entire retained stderr.
     pub stderr: &'a [u8],
-    /// Either bounded stream lost bytes.
-    pub truncated: bool,
+    /// Bounded stdout lost bytes.
+    pub stdout_truncated: bool,
+    /// Bounded stderr lost bytes.
+    pub stderr_truncated: bool,
     /// Execution deadline triggered.
     pub timed_out: bool,
     /// Pipe/poll failure.
@@ -29,7 +32,12 @@ pub struct ToolEvidence<'a> {
 /// # Errors
 /// Any missing evidence, signal exit, `NoChild`, timeout or stream failure.
 pub fn status(result: &ToolEvidence<'_>) -> Result<i32, SysError> {
-    if result.timed_out || result.io_failed || result.stdin_unsent != 0 || result.truncated {
+    if result.timed_out
+        || result.io_failed
+        || result.stdin_unsent != 0
+        || result.stdout_truncated
+        || result.stderr_truncated
+    {
         return Err(SysError::Unknown);
     }
     match result.reap {
@@ -39,6 +47,12 @@ pub fn status(result: &ToolEvidence<'_>) -> Result<i32, SysError> {
 }
 /// A pre-spawn error or the full evidence of an attempted pfctl operation.
 pub type Attempt<'a> = Result<(&'a str, ToolEvidence<'a>), SysError>;
+/// Interpret pf-info only with complete streams and a successful normal exit.
+#[must_use]
+pub fn info_outcome(attempt: Attempt<'_>) -> PfInfo {
+    let result = attempt.and_then(|(_, e)| info(status(&e)?, e.stdout, e.stderr));
+    result.unwrap_or_else(PfInfo::Incomplete)
+}
 /// Interpret -e evidence with the build and EEXIST assumption gates.
 ///
 /// # Errors
@@ -178,7 +192,8 @@ mod tests {
             reap: Reap::Status(0),
             stdout: b"",
             stderr,
-            truncated: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
             timed_out: false,
             io_failed: false,
             stdin_unsent: 0,
@@ -216,14 +231,15 @@ mod tests {
                 Ok(PfEnable::Started)
             );
             // Each row retains plausible successful text, so missing guards fail.
-            for row in 0..10 {
+            for row in 0..11 {
                 for reap in [Reap::Status(0), Reap::NoChild, Reap::Pending] {
                     let corrupt = |mut e: ToolEvidence<'static>| {
                         e.reap = reap;
                         match row {
                             0 => e.stderr = b"unknown\n",
                             1 => e.reap = Reap::Status(2 << 8),
-                            2 => e.truncated = true,
+                            2 => e.stdout_truncated = true,
+                            10 => e.stderr_truncated = true,
                             3 => e.timed_out = true,
                             4 => e.io_failed = true,
                             5 => e.stdin_unsent = 1,
@@ -274,6 +290,39 @@ mod tests {
             acquire_outcome(Ok(("unknown", evidence(b"Token : 42\n")))),
             ToolOutcome::Unknown { reaped: true }
         );
+    }
+    #[test]
+    fn info_outcome_requires_complete_evidence() {
+        assert_eq!(
+            info_outcome(Err(SysError::Unknown)),
+            PfInfo::Incomplete(SysError::Unknown)
+        );
+        for row in 0..11 {
+            let mut e = evidence(b"");
+            e.stdout = b"Status: Disabled\n";
+            match row {
+                0 => {}
+                1 => e.reap = Reap::NoChild,
+                2 => e.reap = Reap::Pending,
+                3 => e.reap = Reap::Status(9),
+                4 => e.reap = Reap::Status(1 << 8),
+                5 => e.stdout_truncated = true,
+                6 => e.stderr_truncated = true,
+                7 => e.timed_out = true,
+                8 => e.io_failed = true,
+                9 => e.stdin_unsent = 1,
+                _ => e.stderr = b"unknown",
+            }
+            assert_eq!(
+                info_outcome(Ok(("", e))),
+                if row == 0 {
+                    PfInfo::Disabled
+                } else {
+                    PfInfo::Incomplete(SysError::Unknown)
+                },
+                "row {row}"
+            );
+        }
     }
     #[test]
     fn info_requires_zero_exit_and_every_line_parsed() {

@@ -258,8 +258,8 @@ pub(super) fn worker(out: &Path, group: &str) -> Result<()> {
     write_json(out, "pf-abi.json", &value)?;
     let mut p = platform(out, true)?;
     let mut results = Vec::new();
-    for (id, minutes, iterations, operation) in if group == "pf" {
-        vec![
+    for (id, minutes, iterations, operation) in match group {
+        "pf" => vec![
             (
                 "Q-ENABLE",
                 2,
@@ -268,21 +268,20 @@ pub(super) fn worker(out: &Path, group: &str) -> Result<()> {
             ),
             ("Q-EEXIST", 2, 50, eexist),
             ("Q-REFS", 8, 2000, references),
-        ]
-    } else if group == "pf-x" {
-        vec![(
+        ],
+        "pf-x" => vec![(
             "Q-X",
             2,
             3,
             x as fn(&Path, &mut NativePlatform, Instant, &mut CaseResult) -> Result<()>,
-        )]
-    } else {
-        vec![(
+        )],
+        "pf-x-stale" => vec![(
             "Q-X-STALE",
             2,
             1,
             x_stale as fn(&Path, &mut NativePlatform, Instant, &mut CaseResult) -> Result<()>,
-        )]
+        )],
+        _ => return Err("unknown pf worker group".into()),
     } {
         let mut result = CaseResult {
             case: id.into(),
@@ -657,6 +656,7 @@ fn references(
     let mut incomplete = 0_u32;
     let mut subruns = Vec::new();
     let mut coverage_missing = false;
+    let mut small_spare_truncations = 0;
     for (spare, reads) in [(16, 1000), (0, 500), (1, 500)] {
         p.reference_spare_slots(spare);
         let _ = p.reference_copy_decisions();
@@ -679,10 +679,17 @@ fn references(
         let decisions = p.reference_copy_decisions();
         let retries = decisions
             .iter()
-            .filter(|d| **d == Classification::Retry)
+            .filter(|d| **d == pftoken::EnumerationEvent::Copy(Classification::Retry))
             .count();
+        let truncations = decisions
+            .iter()
+            .filter(|d| **d == pftoken::EnumerationEvent::TruncationWitnessed)
+            .count();
+        if spare < 16 {
+            small_spare_truncations += truncations;
+        }
         coverage_missing |= spare < 16 && (retries == 0 || sub_complete == 0);
-        subruns.push(json!({"spare_slots":spare,"reads":reads,"retry":retries,
+        subruns.push(json!({"spare_slots":spare,"reads":reads,"retry":retries,"truncation_witnessed":truncations,
             "complete":sub_complete,"incomplete":sub_incomplete}));
         complete += sub_complete;
         incomplete += sub_incomplete;
@@ -711,7 +718,7 @@ fn references(
         )?;
         counts.push(count);
     }
-    coverage_missing |= complete == 0;
+    coverage_missing |= complete == 0 || small_spare_truncations == 0;
     let capacities = p.reference_capacities();
     ensure(
         !capacities.is_empty()
@@ -732,7 +739,7 @@ fn references(
     }
     if coverage_missing {
         return Err(environment_issue(
-            "small-spare churn requires Retry > 0 and Complete > 0 for each sub-run; inspect pf-churn.json",
+            "small-spare churn requires Retry > 0 and Complete > 0 for each sub-run and truncation witnessed > 0 in at least one small-spare sub-run; inspect pf-churn.json",
         ));
     }
     Ok(())

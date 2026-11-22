@@ -44,8 +44,8 @@ fn root(path: &Path) -> Result<File, Errno> {
     }
     Ok(fd.into())
 }
-fn metadata(file: &File) -> Result<Metadata, SysError> {
-    let m = file.metadata().map_err(|_| FAILED)?;
+fn metadata(file: &File) -> Result<Metadata, std::io::Error> {
+    let m = file.metadata()?;
     Ok(Metadata {
         regular: m.is_file(),
         uid: m.uid(),
@@ -70,7 +70,7 @@ fn read(path: &Path, copy: Copy) -> CopyRead {
         Ok(file) => file,
         Err(result) => return result,
     };
-    read_bytes(metadata(&file), |bytes| {
+    read_bytes(metadata(&file).map_err(|_| FAILED), |bytes| {
         file.read_at(bytes, 0).map_err(|_| FAILED)
     })
 }
@@ -82,10 +82,26 @@ struct DescriptorIo {
     created: bool,
     #[cfg(feature = "qualification")]
     failure: FailureObservation,
+    #[cfg(feature = "qualification")]
+    write_errno: WriteErrno,
+}
+impl DescriptorIo {
+    #[cfg_attr(not(feature = "qualification"), allow(clippy::unused_self))] // The recorder exists only with qualification.
+    fn failed(&self, errno: Option<i32>) -> SysError {
+        #[cfg(feature = "qualification")]
+        if let Ok(mut recorded) = self.write_errno.lock()
+            && recorded.is_none()
+        {
+            *recorded = errno;
+        }
+        #[cfg(not(feature = "qualification"))]
+        let _ = errno;
+        FAILED
+    }
 }
 impl Io for DescriptorIo {
     fn open(&mut self, create: bool) -> Result<(), SysError> {
-        let directory = root(&self.path).map_err(|_| FAILED)?;
+        let directory = root(&self.path).map_err(|e| self.failed(Some(e.raw_os_error())))?;
         let mut flags = OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
         if create {
             flags |= OFlags::CREATE | OFlags::EXCL;
@@ -96,7 +112,7 @@ impl Io for DescriptorIo {
             flags,
             Mode::from_raw_mode(0o600),
         )
-        .map_err(|_| FAILED)?
+        .map_err(|e| self.failed(Some(e.raw_os_error())))?
         .into();
         // Retain ownership before any fallible post-create operation so cleanup
         // also covers fchown/fchmod/stat failures.
@@ -105,9 +121,11 @@ impl Io for DescriptorIo {
         self.created = create;
         let file = self.file.as_ref().ok_or(FAILED)?;
         if create {
-            rustix::fs::fchown(file, Some(rustix::fs::Uid::ROOT), None).map_err(|_| FAILED)?;
-            rustix::fs::fchmod(file, Mode::from_raw_mode(0o600)).map_err(|_| FAILED)?;
-            if !super::valid_created(metadata(file)?) {
+            rustix::fs::fchown(file, Some(rustix::fs::Uid::ROOT), None)
+                .map_err(|e| self.failed(Some(e.raw_os_error())))?;
+            rustix::fs::fchmod(file, Mode::from_raw_mode(0o600))
+                .map_err(|e| self.failed(Some(e.raw_os_error())))?;
+            if !super::valid_created(metadata(file).map_err(|e| self.failed(e.raw_os_error()))?) {
                 return Err(FAILED);
             }
         }
@@ -146,21 +164,21 @@ impl Io for DescriptorIo {
         }
     }
     fn stat(&mut self) -> Result<Metadata, SysError> {
-        metadata(self.file.as_ref().ok_or(FAILED)?)
+        metadata(self.file.as_ref().ok_or(FAILED)?).map_err(|e| self.failed(e.raw_os_error()))
     }
     fn preallocate(&mut self) -> Result<(), SysError> {
         scupper_darwin::preallocate(
             self.file.as_ref().ok_or(FAILED)?,
             i64::try_from(COPY_BYTES).map_err(|_| FAILED)?,
         )
-        .map_err(|_| FAILED)
+        .map_err(|e| self.failed(Some(e.raw_os_error())))
     }
     fn pwrite(&mut self, bytes: &[u8]) -> Result<usize, SysError> {
         self.file
             .as_ref()
             .ok_or(FAILED)?
             .write_at(bytes, 0)
-            .map_err(|_| FAILED)
+            .map_err(|e| self.failed(e.raw_os_error()))
     }
     fn full_sync(&mut self, directory: bool) -> Result<(), SysError> {
         let file = if directory {
@@ -168,9 +186,12 @@ impl Io for DescriptorIo {
         } else {
             &self.file
         };
-        scupper_darwin::full_sync(file.as_ref().ok_or(FAILED)?).map_err(|_| FAILED)
+        scupper_darwin::full_sync(file.as_ref().ok_or(FAILED)?)
+            .map_err(|e| self.failed(Some(e.raw_os_error())))
     }
 }
+#[cfg(feature = "qualification")]
+type WriteErrno = std::sync::Arc<std::sync::Mutex<Option<i32>>>;
 #[cfg(feature = "qualification")]
 type FailureObservation = std::sync::Arc<std::sync::Mutex<Option<(u64, CopyRead)>>>;
 
@@ -186,11 +207,17 @@ pub(crate) struct Storage {
     pub(crate) write_gate: Option<std::sync::mpsc::Receiver<()>>,
     #[cfg(feature = "qualification")]
     failure: FailureObservation,
+    #[cfg(feature = "qualification")]
+    write_errno: WriteErrno,
 }
 fn remaining(deadline: Deadline) -> impl Fn() -> Duration {
     move || Duration::from_secs(deadline.0).saturating_sub(scupper_darwin::monotonic_raw())
 }
 impl Storage {
+    #[cfg(feature = "qualification")]
+    pub(crate) fn write_errno(&self) -> Option<i32> {
+        self.write_errno.lock().ok().and_then(|errno| *errno)
+    }
     #[cfg(feature = "qualification")]
     pub(crate) fn take_failed_create(&mut self) -> Option<(u64, CopyRead)> {
         self.failure.lock().ok()?.take()
@@ -240,11 +267,17 @@ impl Storage {
         let gate = self.write_gate.take();
         #[cfg(feature = "qualification")]
         let failure = self.failure.clone();
+        #[cfg(feature = "qualification")]
+        let write_errno = self.write_errno.clone();
         let bytes = *bytes;
         self.workers.start_write(remaining(deadline), move || {
             #[cfg(feature = "qualification")]
             if let Some(gate) = gate {
                 let _ = gate.recv();
+            }
+            #[cfg(feature = "qualification")]
+            if let Ok(mut errno) = write_errno.lock() {
+                *errno = None;
             }
             write(
                 &mut DescriptorIo {
@@ -255,6 +288,8 @@ impl Storage {
                     created: false,
                     #[cfg(feature = "qualification")]
                     failure,
+                    #[cfg(feature = "qualification")]
+                    write_errno,
                 },
                 create,
                 &bytes,
@@ -296,6 +331,8 @@ mod tests {
                 created,
                 #[cfg(feature = "qualification")]
                 failure: FailureObservation::default(),
+                #[cfg(feature = "qualification")]
+                write_errno: WriteErrno::default(),
             })
         };
         let mut io = make(false)?;

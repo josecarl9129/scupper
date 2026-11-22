@@ -15,6 +15,7 @@ TOKEN = ROOT / 'crates/scupper-mac/src/decode/pftoken.rs'
 TEXT = ROOT / 'crates/scupper-mac/src/decode/pftext.rs'
 ENGINE = ROOT / 'crates/scupper-mac/src/engine/reference.rs'
 RULES = ROOT / 'crates/scupper-darwin/src/rules.rs'
+CORE = ROOT / 'crates/scupper-core/src/mac/parse.rs'
 OUT = ROOT / 'target/r6-mutants'
 ENV = dict(os.environ, CARGO_BUILD_JOBS='2', RUST_TEST_THREADS='2')
 MUTANTS = [
@@ -54,9 +55,9 @@ MUTANTS = [
      '        Ok(token) => ToolOutcome::Ok((token, result.pid)),\n'
      '        Err(_) => ToolOutcome::NotStarted(SysError::Unknown),',
      'scupper-mac', 'portable_outcomes_require_complete_post_spawn_evidence'),
-    ('status-ignores-truncation', TEXT, ' || result.truncated {', ' {',
+    ('status-ignores-truncation', TEXT, '        || result.stdout_truncated\n        || result.stderr_truncated\n', '',
      'scupper-mac', 'portable_outcomes_require_complete_post_spawn_evidence'),
-    ('status-ignores-timeout', TEXT, 'result.timed_out || result.io_failed', 'result.io_failed',
+    ('status-ignores-timeout', TEXT, 'result.timed_out\n        || result.io_failed', 'result.io_failed',
      'scupper-mac', 'portable_outcomes_require_complete_post_spawn_evidence'),
     ('qualification-drops-layout-fingerprints', TOKEN,
      'fingerprints: self.pf_token_layout == Assumption::Established\n                && self.fingerprints',
@@ -77,11 +78,55 @@ MUTANTS = [
      'Err(ReadError::Noent) => return Ok(vec![]), Err(_) => continue };',
      'scupper-mac', 'retry_errors_ignore_size_and_buffers_have_exact_initialized_length'),
 
+    ('release-unknown-notstarted', TEXT,
+     '        Ok(released) => ToolOutcome::Ok(released),\n'
+     '        Err(_) => ToolOutcome::Unknown {\n'
+     '            reaped: result.reap.settled(),\n        },',
+     '        Ok(released) => ToolOutcome::Ok(released),\n'
+     '        Err(_) => ToolOutcome::NotStarted(SysError::Unknown),',
+     'scupper-mac', 'portable_outcomes_require_complete_post_spawn_evidence'),
+    ('status-nochild-is-zero', TEXT, '        _ => Err(SysError::Unknown),\n    }\n}',
+     '        Reap::NoChild => Ok(0),\n        _ => Err(SysError::Unknown),\n    }\n}',
+     'scupper-mac', 'portable_outcomes_require_complete_post_spawn_evidence'),
+    ('status-pending-is-zero', TEXT, '        _ => Err(SysError::Unknown),\n    }\n}',
+     '        Reap::Pending => Ok(0),\n        _ => Err(SysError::Unknown),\n    }\n}',
+     'scupper-mac', 'portable_outcomes_require_complete_post_spawn_evidence'),
+    ('status-ignores-io-failure', TEXT, '        || result.io_failed\n', '',
+     'scupper-mac', 'portable_outcomes_require_complete_post_spawn_evidence'),
+    ('status-ignores-unsent-stdin', TEXT, '        || result.stdin_unsent != 0\n', '',
+     'scupper-mac', 'portable_outcomes_require_complete_post_spawn_evidence'),
+    ('status-ignores-stderr-truncation', TEXT, '        || result.stderr_truncated\n', '',
+     'scupper-mac', 'portable_outcomes_require_complete_post_spawn_evidence'),
+    ('debug-only-accepts-enabled', CORE, '!enabled && valid_debug_level(level)', 'valid_debug_level(level)',
+     'scupper-core', 'source_derived_disabled_info_accepts_only_documented_debug_suffix'),
+    ('debug-only-accepts-any-level', CORE, '!enabled && valid_debug_level(level)', '!enabled',
+     'scupper-core', 'source_derived_disabled_info_accepts_only_documented_debug_suffix'),
+    ('info-ignores-completeness', TEXT, 'info(status(&e)?, e.stdout, e.stderr)', 'info(0, e.stdout, e.stderr)',
+     'scupper-mac', 'info_outcome_requires_complete_evidence'),
+    ('enumerate-ignores-spare', TOKEN,
+     '        spare,\n        |classification|', '        16,\n        |classification|',
+     'scupper-mac', 'small_spare_retries_full_copies_then_completes_without_losing_oldest'),
+    ('retry-alone-claims-truncation', TOKEN,
+     '.is_some_and(|capacity| need > capacity)',
+     '.is_some()',
+     'scupper-mac', 'small_spare_retries_full_copies_then_completes_without_losing_oldest'),
+    ('discard-release-reread', ENGINE,
+     '            lines = match self.platform.references(d) {',
+     '            let _discarded = match self.platform.references(d) {',
+     'scupper-mac', 'each_numeric_release_requires_a_read_after_the_previous_release'),
+    ('drop-release-reread', ENGINE,
+     '            lines = match self.platform.references(d) {\n'
+     '                Enumeration::Complete(lines) => lines,\n'
+     '                Enumeration::Incomplete(error) => return Err(error),\n'
+     '            };', '',
+     'scupper-mac', 'each_numeric_release_requires_a_read_after_the_previous_release'),
+
 ]
 
 
 def run(crate, test):
-    return subprocess.run(['cargo', 'test', '--offline', '-p', crate, '--all-features', '--lib', test],
+    target = ['--test', 'mac'] if crate == 'scupper-core' else ['--lib']
+    return subprocess.run(['cargo', 'test', '--offline', '-p', crate, '--all-features', *target, test],
                           cwd=ROOT, env=ENV, capture_output=True, text=True, timeout=300)
 
 
@@ -89,11 +134,13 @@ if __name__ == '__main__':
     OUT.mkdir(parents=True, exist_ok=True)
     regression_root = ROOT / "crates/scupper-mac/proptest-regressions"
     regressions = {p: p.read_bytes() for p in regression_root.rglob("*") if p.is_file()}
-    originals = {path: path.read_bytes() for path in [TOKEN, TEXT, ENGINE, RULES]}
+    originals = {path: path.read_bytes() for path in [TOKEN, TEXT, ENGINE, RULES, CORE]}
     results = []
     try:
         for crate, test in [('scupper-mac', 'decode::pf'),
                             ('scupper-mac', 'numeric_release_requires_qualified_matching_fingerprint'),
+                            ('scupper-mac', 'each_numeric_release_requires_a_read_after_the_previous_release'),
+                            ('scupper-core', 'source_derived_disabled_info_accepts_only_documented_debug_suffix'),
                             ('scupper-darwin', 'failed_ioctl_never_reads_size')]:
             baseline = run(crate, test)
             (OUT / f'baseline-{test.replace(":", "-")}.log').write_text(baseline.stdout + baseline.stderr)
@@ -116,6 +163,8 @@ if __name__ == '__main__':
                 path.write_bytes(originals[path])
         for crate, test in [('scupper-mac', 'decode::pf'),
                             ('scupper-mac', 'numeric_release_requires_qualified_matching_fingerprint'),
+                            ('scupper-mac', 'each_numeric_release_requires_a_read_after_the_previous_release'),
+                            ('scupper-core', 'source_derived_disabled_info_accepts_only_documented_debug_suffix'),
                             ('scupper-darwin', 'failed_ioctl_never_reads_size')]:
             restored = run(crate, test)
             (OUT / f'restored-{test.replace(":", "-")}.log').write_text(restored.stdout + restored.stderr)

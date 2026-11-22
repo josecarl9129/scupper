@@ -338,6 +338,9 @@ pub struct FakePlatform {
     /// Model status changes between the two enablement observations.
     #[cfg(test)]
     pub pf_info_script: VecDeque<PfInfo>,
+    /// Replace the kernel inventory at each scripted reference read.
+    #[cfg(test)]
+    pub references_script: VecDeque<Vec<RefLine>>,
     /// Model malformed successful acquisition output.
     #[cfg(test)]
     pub acquire_zero: bool,
@@ -575,6 +578,8 @@ impl FakePlatform {
             observation_override: None,
             #[cfg(test)]
             pf_info_script: VecDeque::new(),
+            #[cfg(test)]
+            references_script: VecDeque::new(),
             fingerprints_qualified: true,
             #[cfg(test)]
             acquire_zero: false,
@@ -1989,6 +1994,10 @@ impl Platform for FakePlatform {
         }
     }
     fn references(&mut self, deadline: Deadline) -> Enumeration<Vec<RefLine>> {
+        #[cfg(test)]
+        if let Some(lines) = self.references_script.pop_front() {
+            self.tokens = lines.into_iter().map(|line| (line.token, line)).collect();
+        }
         match self.checked(Call::References, deadline) {
             Ok(()) => Enumeration::Complete(self.tokens.values().cloned().collect()),
             Err(e) => Enumeration::Incomplete(e),

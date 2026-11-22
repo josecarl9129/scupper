@@ -1,5 +1,5 @@
 //! Q-STORE: native error handling only; no crash/power-loss durability claim.
-use super::super::store_check::{Phases, caused_by};
+use super::super::store_check::{Phases, caused_by, valid_race_read};
 use super::{
     CaseResult, Result, Verdict, environment_issue, executable_sha256, require_ack, save_case,
     write_json,
@@ -155,12 +155,10 @@ fn observe(p: &mut NativePlatform, end: u64, old: &[u8], new: &[u8]) -> Result<V
     let mut classes = Vec::new();
     for copy in [Copy::A, Copy::B] {
         let read = p.read_copy(copy, deadline(end, 5));
-        if let CopyClass::V { bytes, .. } = snapshot::classify_copy(read.clone()) {
-            ensure(
-                bytes == old || bytes == new,
-                "racing read classified bytes other than old/new snapshot as valid",
-            )?;
-        }
+        ensure(
+            valid_race_read(&read, old, new),
+            "racing read classified bytes other than old/new snapshot as valid",
+        )?;
         classes.push(class(read));
     }
     Ok(json!(classes))
@@ -318,141 +316,132 @@ fn failed_hook_outcome(
     )?;
     Ok(final_outcome)
 }
-const RECLAIM_SLACK_BYTES: usize = 256 * 1024;
-const RECLAIM_RETRIES: u32 = 5;
-const RECLAIM_RETRY_DELAY: Duration = Duration::from_millis(200);
-
-struct ReclaimFiles {
-    filler: fs::File,
-    slack: Option<fs::File>,
-    reserved_b: PathBuf,
-}
-
-fn fixtures(
-    root: &Path,
-    full: bool,
-    old: &[u8; COPY_BYTES],
-    new: &[u8; COPY_BYTES],
-    end: u64,
-) -> Result<(NativePlatform, ReclaimFiles)> {
+fn fixtures(root: &Path, old: &[u8; COPY_BYTES], end: u64) -> Result<(NativePlatform, fs::File)> {
     let mut p = NativePlatform::new(Paths::qualification(root.into()))?;
     synced(&mut p, root, Copy::A, old, true, end)?;
-    // Reserve B before filling, outside the copy namespace during faulted creates.
-    let reserved_b = root.join("reserved-b");
-    if full {
-        synced(&mut p, root, Copy::B, new, true, end)?;
-        fs::rename(root.join(filename(Copy::B)), &reserved_b)?;
-    }
-    // Allocate actual extents, outside the copy namespace, before filling.
-    let slack = if full {
-        let mut slack = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(root.join("reclaim-slack"))?;
-        slack.write_all(&vec![0x6d; RECLAIM_SLACK_BYTES])?;
-        slack.sync_all()?;
-        Some(slack)
-    } else {
-        None
-    };
+    // B stays absent on both images: the race's Busy check never touches B, and
+    // the fault loops need B absent. Creating it here would force an unlink on
+    // the full image, a namespace change APFS may refuse with ENOSPC.
     let filler = fs::OpenOptions::new()
         .create_new(true)
         .write(true)
         .mode(0o600)
         .open(root.join("filler"))?;
-    Ok((
-        p,
-        ReclaimFiles {
-            filler,
-            slack,
-            reserved_b,
-        },
-    ))
+    Ok((p, filler))
 }
 
-fn reclaim_step(
-    phases: &mut Phases,
+/// One race at the ENOSPC-defined full state, before any destructive fault loop.
+fn full_race(
     out: &Path,
-    name: &str,
+    p: &mut NativePlatform,
+    old: &[u8; COPY_BYTES],
+    new: &[u8; COPY_BYTES],
     end: u64,
-    mut operation: impl FnMut() -> std::io::Result<()>,
+    result: &mut CaseResult,
 ) -> Result<()> {
-    phase(phases, out, name, |_| {
-        for attempt in 0..=RECLAIM_RETRIES {
-            check_budget(end)?;
-            match operation() {
-                Ok(()) => return Ok(()),
-                Err(error)
-                    if error.raw_os_error() == Some(rustix::io::Errno::NOSPC.raw_os_error())
-                        && attempt < RECLAIM_RETRIES
-                        && Duration::from_secs(end)
-                            .saturating_sub(scupper_darwin::monotonic_raw())
-                            >= RECLAIM_RETRY_DELAY =>
-                {
-                    std::thread::sleep(RECLAIM_RETRY_DELAY);
-                }
-                Err(error) => {
-                    return Err(environment_issue(format!(
-                        "{error} after {} attempt(s)",
-                        attempt + 1
-                    )));
-                }
-            }
-        }
-        unreachable!()
-    })
-}
-
-fn reclaim_for_concurrency(
-    phases: &mut Phases,
-    out: &Path,
-    root: &Path,
-    files: ReclaimFiles,
-    end: u64,
-) -> Result<()> {
-    let ReclaimFiles {
-        filler,
-        slack,
-        reserved_b,
-    } = files;
-    let slack = slack.as_ref().ok_or("full-image slack fixture missing")?;
-    let configuration = json!({"phase":"full/concurrency_reset", "event":"configuration",
-        "slack_bytes":RECLAIM_SLACK_BYTES, "enospc_retries":RECLAIM_RETRIES,
-        "retry_delay_ms":RECLAIM_RETRY_DELAY.as_millis()});
-    publish_phase(out, &configuration)?;
-    phases.records.push(configuration);
-    // APFS unlink/rename also need CoW metadata blocks. Free slack first, then
-    // truncate and sync through the held filler fd before any namespace change.
-    reclaim_step(phases, out, "reclaim/truncate_slack", end, || {
-        slack.set_len(0)
-    })?;
-    reclaim_step(phases, out, "reclaim/sync_slack", end, || slack.sync_all())?;
-    reclaim_step(phases, out, "reclaim/truncate_filler", end, || {
-        filler.set_len(0)
-    })?;
-    reclaim_step(phases, out, "reclaim/sync_filler", end, || {
-        filler.sync_all()
-    })?;
-    drop(filler);
-    reclaim_step(phases, out, "reclaim/unlink_filler", end, || {
-        fs::remove_file(root.join("filler"))
-    })?;
-    reclaim_step(
-        phases,
-        out,
-        "reclaim/remove_b",
-        end,
-        || match fs::remove_file(root.join(filename(Copy::B))) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            result => result,
-        },
+    check_budget(end)?;
+    let started = Instant::now();
+    let (tx, rx) = mpsc::channel();
+    p.storage_gate(true, rx);
+    ensure(
+        p.write_copy(Copy::A, new, deadline(end, 1)) == WriteOutcome::TimedOut,
+        "full race overwrite did not remain outstanding",
     )?;
-    reclaim_step(phases, out, "reclaim/rename_reserved_b", end, || {
-        fs::rename(&reserved_b, root.join(filename(Copy::B)))
-    })?;
-    Ok(())
+    ensure(
+        p.create_copy(Copy::B, new, Deadline(0)) == WriteOutcome::Busy,
+        "full race outstanding write did not return Busy",
+    )?;
+    ensure(
+        p.wait_write(deadline(end, 1)) == WriteOutcome::TimedOut,
+        "full race wait lost the outstanding write",
+    )?;
+    let mut reads = Vec::new();
+    let mut valid_racing = 0_u32;
+    let before = p.read_copy(Copy::A, deadline(end, 5));
+    ensure(
+        before == CopyRead::Bytes(old.to_vec()),
+        "gated full race changed A",
+    )?;
+    reads.push(json!({"class":class(before),"exact":"old"}));
+    // Start a reader while the overwrite is outstanding; release both workers
+    // together so their real I/O races. The following reads are bounded too.
+    let (read_tx, read_rx) = mpsc::channel();
+    p.storage_gate(false, read_rx);
+    ensure(
+        p.poll_copy(Copy::A, deadline(end, 1)) == Poll::Pending,
+        "full race reader did not remain outstanding",
+    )?;
+    tx.send(())?;
+    read_tx.send(())?;
+    for _ in 0..8 {
+        check_budget(end)?;
+        let read = p.read_copy(Copy::A, deadline(end, 5));
+        ensure(
+            valid_race_read(&read, old, new),
+            "full race returned a valid third snapshot",
+        )?;
+        if matches!(
+            crate::snapshot::classify_copy(read.clone()),
+            crate::snapshot::CopyClass::V { .. }
+        ) {
+            valid_racing += 1;
+        }
+        reads.push(json!({"class":class(read.clone()), "exact":if read == CopyRead::Bytes(old.to_vec()) {"old"} else if read == CopyRead::Bytes(new.to_vec()) {"new"} else {"neither"}}));
+    }
+    let outcome = p.wait_write(deadline(end, 5));
+    ensure(
+        matches!(outcome, WriteOutcome::Synced | WriteOutcome::Failed(_)),
+        "full race overwrite did not settle",
+    )?;
+    let errno = p.storage_write_errno();
+    let enospc = matches!(outcome, WriteOutcome::Failed(_))
+        && errno == Some(rustix::io::Errno::NOSPC.raw_os_error());
+    let coverage = if enospc { "exercised" } else { "not exercised" };
+    write!(result.detail, "; \"enospc_failure_race\":\"{coverage}\"")?;
+    if valid_racing == 0 {
+        // No racing read classified valid: the old/new-only rule was not exercised.
+        write!(
+            result.detail,
+            "; \"racing_valid_reads\":\"none (coverage gap)\""
+        )?;
+    }
+    ensure(
+        p.wait_write(Deadline(0))
+            == WriteOutcome::Failed(crate::platform::SysError::Failed("no outstanding write")),
+        "full race Busy did not clear after settlement",
+    )?;
+    let after = p.read_copy(Copy::A, deadline(end, 5));
+    ensure(
+        valid_race_read(&after, old, new),
+        "full race settled as a valid third snapshot",
+    )?;
+    if outcome == WriteOutcome::Synced {
+        ensure(
+            after == CopyRead::Bytes(new.to_vec()),
+            "Synced full race did not leave exact new bytes",
+        )?;
+    }
+    let bytes = match &after {
+        CopyRead::Bytes(bytes) | CopyRead::Short(bytes) => Some(bytes),
+        _ => None,
+    };
+    write_json(
+        out,
+        "store-full-race.json",
+        &json!({
+            "image_state":"full: ENOSPC on block write; no reclaim",
+            "overwrite":format!("{outcome:?}"),"errno":errno,
+            "enospc_failure_race":coverage,"elapsed_seconds":started.elapsed().as_secs_f64(),
+            "reads":reads,"racing_valid_reads":valid_racing,"post_class":class(after.clone()),"post_bytes":bytes,
+            "busy_cleared":true
+        }),
+    )?;
+    ensure(
+        p.read_copy(Copy::A, deadline(end, 5)) == after,
+        "fault loops did not start with the bytes left by the full race",
+    )
 }
+
 fn fault_loops(
     out: &Path,
     root: &Path,
@@ -465,16 +454,21 @@ fn fault_loops(
     let label = if full { "full" } else { "unfilled" };
     let old = snapshot::encode(1, &Snapshot::initial(Some(0), None))?;
     let new = snapshot::encode(2, &Snapshot::initial(Some(0), None))?;
-    let (mut p, files) = phase(phases, out, &format!("{label}/fixtures"), |_| {
-        fixtures(root, full, &old, &new, end)
+    let (mut p, filler) = phase(phases, out, &format!("{label}/fixtures"), |_| {
+        fixtures(root, &old, end)
     })?;
     let mut observations = Vec::new();
     let mut offset = 0;
     let mut event_log = event_log(out, full)?;
+    if full {
+        observations.push(phase(phases, out, "full/fill", |_| {
+            fill(&filler, &mut offset, end)
+        })?);
+        phase(phases, out, "full/race", |_| {
+            full_race(out, &mut p, &old, &new, end, result)
+        })?;
+    }
     phase(phases, out, &format!("{label}/fault_loop"), |_| {
-        if full {
-            observations.push(fill(&files.filler, &mut offset, end)?);
-        }
         for fault in [
             Fault::Open,
             Fault::Preallocate,
@@ -486,7 +480,7 @@ fn fault_loops(
                 check_budget(end)?;
                 remove(root, Copy::B)?;
                 if full {
-                    let _ = fill(&files.filler, &mut offset, end)?;
+                    let _ = fill(&filler, &mut offset, end)?;
                 }
                 p.storage_fault(fault);
                 let outcome = p.create_copy(Copy::B, &new, deadline(end, 5));
@@ -536,7 +530,7 @@ fn fault_loops(
     phase(phases, out, &format!("{label}/ordinary_fullness"), |_| {
         remove(root, Copy::B)?;
         if full {
-            let _ = fill(&files.filler, &mut offset, end)?;
+            let _ = fill(&filler, &mut offset, end)?;
         }
         observations.push(ordinary(&mut p, root, &new, end, full)?);
         Ok(())
@@ -550,20 +544,16 @@ fn fault_loops(
                 "store-unfilled.json"
             },
             &observations,
-        )?;
-        Ok(())
+        )
     })?;
-    let reset_phase = format!("{label}/concurrency_reset");
-    phase(phases, out, &reset_phase, |phases| {
-        if full {
-            reclaim_for_concurrency(phases, out, root, files, end)?;
-        }
-        Ok(())
-    })?;
-    phase(phases, out, &format!("{label}/concurrency"), |_| {
-        concurrency(out, &mut p, root, &old, &new, end, full)
-    })
+    if !full {
+        phase(phases, out, "unfilled/concurrency", |_| {
+            concurrency(out, &mut p, root, &old, &new, end)
+        })?;
+    }
+    Ok(())
 }
+
 fn ordinary(
     p: &mut NativePlatform,
     root: &Path,
@@ -624,7 +614,6 @@ fn concurrency(
     old: &[u8; COPY_BYTES],
     new: &[u8; COPY_BYTES],
     end: u64,
-    full: bool,
 ) -> Result<()> {
     synced(p, root, Copy::A, old, false, end)?;
     synced(p, root, Copy::B, new, false, end)?;
@@ -713,12 +702,8 @@ fn concurrency(
     )?;
     write_json(
         out,
-        if full {
-            "store-full-concurrency.json"
-        } else {
-            "store-unfilled-concurrency.json"
-        },
-        &json!({"image_state":if full {"filler reclaimed before deterministic concurrency resets"} else {"unfilled"}, "abandon_expected_sequence":3, "racing_classes":race, "races":50, "write_timeout_busy_wait":true, "read_capacity":2, "third_busy":true, "abandon_discard":true}),
+        "store-unfilled-concurrency.json",
+        &json!({"image_state":"unfilled; comprehensive concurrency suite runs only here", "abandon_expected_sequence":3, "racing_classes":race, "races":50, "write_timeout_busy_wait":true, "read_capacity":2, "third_busy":true, "abandon_discard":true}),
     )
 }
 
@@ -996,7 +981,8 @@ pub(super) fn run(out: &Path) -> Result<()> {
                 "store-image-sizes.json",
                 &json!({"unfilled_bytes":256 * 1024 * 1024,
                 "full_bytes":4 * 1024 * 1024, "evidence_outside_images":true,
-                "full_concurrency":"filler reclaimed before deterministic concurrency resets"}),
+                "image_state":"full: ENOSPC on block write; filler retained until detach; no reclaim",
+                "full_concurrency":"targeted full/race only; comprehensive suite on unfilled image"}),
             )
         })?;
         phase(&mut phases, out, "path_checks", |_| {
@@ -1026,9 +1012,7 @@ pub(super) fn run(out: &Path) -> Result<()> {
         } else {
             Verdict::ContractViolation
         };
-        result.detail = format!(
-            "{error}; error handling only; partial bytes may remain; crash and power-loss durability are not established"
-        );
+        result.detail = format!("{error}; {}", result.detail);
     }
     write!(
         result.detail,

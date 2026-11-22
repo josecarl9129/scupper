@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Kill ten storage protocol mutants on Linux; restore every edited byte.
+"""Kill storage protocol and race classification mutants on Linux; restore every edited byte.
 
 The fsync mutant adds a mock successful fsync operation after failed full-sync.
 It tests the same protocol used by Darwin; it does not execute a Darwin syscall.
@@ -13,10 +13,11 @@ import subprocess
 ROOT = Path(__file__).resolve().parents[3]
 SOURCE = ROOT / 'crates/scupper-mac/src/platform/storage.rs'
 TESTS = ROOT / 'crates/scupper-mac/src/platform/storage/tests.rs'
+RACE = ROOT / 'crates/scupper-mac/src/qual/store_check.rs'
 OUT = ROOT / 'target/r5-mutants'
 OUT.mkdir(parents=True, exist_ok=True)
-original = {path: path.read_bytes() for path in [SOURCE, TESTS]}
-backups = {SOURCE: OUT / 'original-storage.rs', TESTS: OUT / 'original-tests.rs'}
+original = {path: path.read_bytes() for path in [SOURCE, TESTS, RACE]}
+backups = {SOURCE: OUT / 'original-storage.rs', TESTS: OUT / 'original-tests.rs', RACE: OUT / 'original-store-check.rs'}
 for path, backup in backups.items():
     backup.write_bytes(original[path])
 env = dict(os.environ, CARGO_BUILD_JOBS='2', RUST_TEST_THREADS='2')
@@ -32,7 +33,9 @@ def replace(path, before, after):
 
 
 def mutate(name):
-    if name == 'fsync-fallback':
+    if name == 'race-accepts-third-snapshot':
+        replace(RACE, 'bytes == old || bytes == new', 'bytes == old || bytes == new || !bytes.is_empty()')
+    elif name == 'fsync-fallback':
         replace(SOURCE, '    fn full_sync(&mut self, directory: bool) -> Result<(), SysError>;',
                 '    fn full_sync(&mut self, directory: bool) -> Result<(), SysError>;\n'
                 '    fn fsync(&mut self) -> Result<(), SysError> { Ok(()) }')
@@ -71,6 +74,7 @@ try:
     (OUT / 'baseline.log').write_text(baseline.stdout + baseline.stderr)
     assert baseline.returncode == 0, 'baseline did not pass'
     for name, test in [
+        ('race-accepts-third-snapshot', 'racing_valid_reads_reject_every_other_snapshot'),
         ('fsync-fallback', 'full_sync_failure_never_falls_back_or_returns_synced'),
         ('preallocation-is-length', 'preallocation_is_not_length_and_short_pwrite_is_failed_without_sync'),
         ('accept-short-pwrite', 'preallocation_is_not_length_and_short_pwrite_is_failed_without_sync'),
@@ -95,6 +99,9 @@ try:
         finally:
             for path, data in original.items():
                 path.write_bytes(data)
+    race_baseline = subprocess.run(command + ['racing_valid_reads_reject_every_other_snapshot'], cwd=ROOT,
+                                   env=env, capture_output=True, text=True, timeout=300)
+    assert race_baseline.returncode == 0 and '1 passed' in race_baseline.stdout, race_baseline.stdout + race_baseline.stderr
     restored = subprocess.run(command + ['platform::storage::tests'], cwd=ROOT,
                               env=env, capture_output=True, text=True, timeout=300)
     (OUT / 'restored.log').write_text(restored.stdout + restored.stderr)

@@ -249,7 +249,14 @@ mod tests {
                     .find(|line| line.trim_start().starts_with("if:"))
             })
             .ok_or("helper compile step")?;
-        for group in ["tool", "tool-mutants", "pf", "pf-x", "pf-x-stale"] {
+        for group in manifest
+            .cases
+            .iter()
+            .map(|case| case.group.as_str())
+            .filter(|group| {
+                !matches!(*group, "smoke" | "base" | "store") && !group.starts_with("probe")
+            })
+        {
             assert!(
                 helper.contains(&format!("matrix.group == '{group}'")),
                 "{group}"

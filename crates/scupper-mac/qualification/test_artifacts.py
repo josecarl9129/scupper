@@ -85,32 +85,28 @@ class ArtifactTests(unittest.TestCase):
         qualification = (REPO / "crates/scupper-mac/src/qual/store.rs").read_text()
         self.assertIn('abi["F_FULLFSYNC"].as_i64() == Some(i64::from(scupper_darwin::FULLFSYNC_COMMAND))', qualification)
 
-    def test_store_reclaim_records_truncations_before_namespace_changes(self):
-        # Portable wiring guard: skipping either truncate changes the recorded
-        # step list. Actual full-APFS behavior still requires the native cell.
+    def test_store_full_path_never_reclaims_before_detach(self):
         source = (REPO / "crates/scupper-mac/src/qual/store.rs").read_text()
-        body = source.split("fn reclaim_for_concurrency(", 1)[1].split("fn fault_loops(", 1)[0]
-        steps = re.findall(r'reclaim_step\(\s*phases,\s*out,\s*"([^"]+)",(.*?)\)\?;',
-                           body, re.S)
-        expected = [
-            ("reclaim/truncate_slack", "slack.set_len(0)"),
-            ("reclaim/sync_slack", "slack.sync_all()"),
-            ("reclaim/truncate_filler", "filler.set_len(0)"),
-            ("reclaim/sync_filler", "filler.sync_all()"),
-            ("reclaim/unlink_filler", 'fs::remove_file(root.join("filler"))'),
-            ("reclaim/remove_b", "fs::remove_file(root.join(filename(Copy::B)))"),
-            ("reclaim/rename_reserved_b", "fs::rename(&reserved_b, root.join(filename(Copy::B)))"),
-        ]
-        self.assertEqual([name for name, _ in steps], [name for name, _ in expected])
-        for (name, operation), (_, required) in zip(steps, expected):
-            self.assertIn(required, operation, name)
-        self.assertLess(body.index('"reclaim/sync_filler"'), body.index("drop(filler)"))
-        self.assertLess(body.index("drop(filler)"), body.index('"reclaim/unlink_filler"'))
-        self.assertIn("const RECLAIM_SLACK_BYTES: usize = 256 * 1024;", source)
-        self.assertIn('"slack_bytes":RECLAIM_SLACK_BYTES', body)
-        fixture = source.split("fn fixtures(", 1)[1].split("fn reclaim_step(", 1)[0]
-        self.assertIn('root.join("reclaim-slack")', fixture)
-        self.assertLess(fixture.index("slack.write_all("), fixture.index("slack.sync_all()"))
+        # Path checks may resize short fixtures on the unfilled image only.
+        full_path = source.split("fn fixtures(", 1)[1].split("fn path_checks(", 1)[0]
+        self.assertNotIn("set_len(", full_path)
+        self.assertNotIn("fs::rename(", full_path)
+        self.assertNotIn('remove_file(root.join("filler"))', source)
+        for removed in ["reclaim_for_concurrency", "RECLAIM_RETRIES", "reclaim-slack",
+                        "reserved-b", "full/concurrency_reset", "store-full-concurrency.json"]:
+            self.assertNotIn(removed, source)
+        fixtures = full_path.split("fn full_race(", 1)[0]
+        self.assertIn("synced(&mut p, root, Copy::A, old, true, end)", fixtures)
+        # B stays absent: creating it would force an unlink on the full image.
+        self.assertNotIn("Copy::B", fixtures)
+        self.assertIn("racing_valid_reads", source)
+        loops = source.split("fn fault_loops(", 1)[1].split("fn ordinary(", 1)[0]
+        self.assertLess(loops.index('"full/fill"'), loops.index('"full/race"'))
+        self.assertLess(loops.index('"full/race"'), loops.index('"{label}/fault_loop"'))
+        self.assertRegex(loops, r'if !full \{\s*phase\(phases, out, "unfilled/concurrency"')
+        restore = source.split("pub(super) fn restore_tree(", 1)[1]
+        self.assertIn("after all fixture images were detached", source)
+        self.assertIn("fs::remove_dir_all(&entry.path)", restore)
 
     def test_native_mutation_worker_record_is_checked_before_parsing(self):
         driver = runpy.run_path(str(REPO / "crates/scupper-mac/tests/r4_native_mutations.py"))
