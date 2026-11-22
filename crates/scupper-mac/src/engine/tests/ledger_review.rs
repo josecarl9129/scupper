@@ -427,3 +427,49 @@ fn numeric_release_requires_qualified_matching_fingerprint() {
         }
     }
 }
+
+#[test]
+fn each_numeric_release_requires_a_read_after_the_previous_release() {
+    for incomplete in [false, true] {
+        let e = accounted(true, false);
+        let mut snapshot = e.snapshot.clone();
+        snapshot.machine.older_references = vec![902].try_into().unwrap();
+        snapshot.references[1] = Some(RefEvidence {
+            key: ReferenceEntry::Token(902),
+            ..snapshot.references[0].clone().unwrap()
+        });
+        let mut p = fixture(&snapshot);
+        for token in [901, 902] {
+            p.tokens.insert(
+                token,
+                RefLine {
+                    token,
+                    pid: 777,
+                    timestamp: 12,
+                },
+            );
+        }
+        p.enabled = true;
+        let mut e = Engine::start(p).unwrap();
+        if incomplete {
+            e.platform.inject(Call::References, 2, Fault::Incomplete);
+        }
+        e.platform.calls.clear();
+        let outcome = e.reconcile_references();
+        let releases: Vec<_> = e
+            .platform
+            .calls
+            .iter()
+            .enumerate()
+            .filter_map(|(i, call)| matches!(call, Call::Release(_)).then_some(i))
+            .collect();
+        assert_eq!(releases.len(), if incomplete { 1 } else { 2 });
+        if incomplete {
+            assert!(outcome.is_err());
+            assert_eq!(e.platform.tokens.len(), 1);
+        } else {
+            assert!(outcome.is_ok());
+            assert!(e.platform.calls[releases[0] + 1..releases[1]].contains(&Call::References));
+        }
+    }
+}

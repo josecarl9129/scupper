@@ -2,7 +2,7 @@
 use super::{NativePlatform, tool};
 use crate::{
     decode::pftoken::{self, Assumption, ReadError},
-    platform::{Deadline, SysError, Tool, runtime::Reap},
+    platform::{Deadline, SysError, Tool},
 };
 use std::{os::fd::AsFd, path::Path, time::Duration};
 
@@ -19,6 +19,20 @@ impl NativePlatform {
         self.pf_capacities
             .lock()
             .map_or_else(|_| Vec::new(), |mut sizes| std::mem::take(&mut *sizes))
+    }
+    /// Reduce enumeration spares for disposable-runner churn only (default 16).
+    #[cfg(feature = "qualification")]
+    pub fn reference_spare_slots(&mut self, spare: usize) {
+        self.pf_spare_slots = spare;
+    }
+    /// Drain actual adapter copy decisions, including internal full-buffer retries.
+    #[cfg(feature = "qualification")]
+    #[must_use]
+    pub fn reference_copy_decisions(&mut self) -> Vec<pftoken::Classification> {
+        self.pf_copy_decisions.lock().map_or_else(
+            |_| Vec::new(),
+            |mut decisions| std::mem::take(&mut *decisions),
+        )
     }
     pub(super) fn pf_tool(
         &mut self,
@@ -49,28 +63,40 @@ impl NativePlatform {
         let end = Duration::from_secs(deadline.0);
         #[cfg(feature = "qualification")]
         let capacities = self.pf_capacities.clone();
+        #[cfg(feature = "qualification")]
+        let spare = self.pf_spare_slots;
+        #[cfg(feature = "qualification")]
+        let decisions = self.pf_copy_decisions.clone();
         let result = self.pf_reader.read(
             end.saturating_sub(scupper_darwin::monotonic_raw()),
             move || {
                 let fd =
                     scupper_darwin::pf_open().map_err(|_| SysError::Failed("pf token open"))?;
-                pftoken::enumerate(
-                    |bytes| {
-                        #[cfg(feature = "qualification")]
-                        capacities
-                            .lock()
-                            .map_err(|_| ReadError::Other)?
-                            .push(bytes.len());
-                        scupper_darwin::pf_starters(fd.as_fd(), bytes).map_err(|e| {
-                            if e == rustix::io::Errno::NOENT {
-                                ReadError::Noent
-                            } else {
-                                ReadError::Other
-                            }
-                        })
-                    },
-                    || scupper_darwin::monotonic_raw() >= end,
-                )
+                let read = |bytes: &mut [u8]| {
+                    #[cfg(feature = "qualification")]
+                    capacities
+                        .lock()
+                        .map_err(|_| ReadError::Other)?
+                        .push(bytes.len());
+                    scupper_darwin::pf_starters(fd.as_fd(), bytes).map_err(|e| {
+                        if e == rustix::io::Errno::NOENT {
+                            ReadError::Noent
+                        } else {
+                            ReadError::Other
+                        }
+                    })
+                };
+                let expired = || scupper_darwin::monotonic_raw() >= end;
+                #[cfg(feature = "qualification")]
+                {
+                    pftoken::enumerate_with_spare(read, expired, spare, |classification| {
+                        if let Ok(mut decisions) = decisions.lock() {
+                            decisions.push(classification);
+                        }
+                    })
+                }
+                #[cfg(not(feature = "qualification"))]
+                pftoken::enumerate(read, expired)
             },
         );
         if scupper_darwin::monotonic_raw() >= end {
@@ -79,18 +105,26 @@ impl NativePlatform {
         result
     }
 }
-/// Return an exit code only with complete bounded streams and synchronous reap.
-pub(super) fn status(result: &tool::ToolResult) -> Result<i32, SysError> {
-    if result.timed_out
-        || result.io_failed
-        || result.stdin_unsent != 0
-        || result.stdout.truncated
-        || result.stderr.truncated
-    {
-        return Err(SysError::Unknown);
-    }
-    match result.reap {
-        Reap::Status(status) if status.trailing_zeros() >= 7 => Ok((status >> 8) & 0xff),
-        _ => Err(SysError::Unknown),
-    }
+/// Borrow native capture fields without making any outcome decision.
+pub(super) fn evidence(
+    attempt: &Result<(String, tool::ToolResult), SysError>,
+) -> crate::decode::pftext::Attempt<'_> {
+    attempt
+        .as_ref()
+        .map(|(build, result)| {
+            (
+                build.as_str(),
+                crate::decode::pftext::ToolEvidence {
+                    pid: result.pid,
+                    reap: result.reap,
+                    stdout: &result.stdout.bytes,
+                    stderr: &result.stderr.bytes,
+                    truncated: result.stdout.truncated || result.stderr.truncated,
+                    timed_out: result.timed_out,
+                    io_failed: result.io_failed,
+                    stdin_unsent: result.stdin_unsent,
+                },
+            )
+        })
+        .map_err(Clone::clone)
 }

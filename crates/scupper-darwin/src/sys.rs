@@ -1584,7 +1584,8 @@ pub fn pf_starters(fd: BorrowedFd<'_>, bytes: &mut [u8]) -> Result<usize, Errno>
             &raw mut request,
         )
     };
-    let returned =
-        super::rules::successful_size(rc != -1, || request.size).ok_or_else(last_errno)?;
-    usize::try_from(returned).map_err(|_| Errno::INVAL)
+    super::rules::starter_size(rc != -1, || request.size).map_err(|error| match error {
+        super::rules::StarterSizeError::Ioctl => last_errno(),
+        super::rules::StarterSizeError::Invalid => Errno::INVAL,
+    })
 }

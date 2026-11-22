@@ -320,6 +320,30 @@ fn realistic_synthetic_captures_preserve_order_and_absence() {
     assert!(parse::pf_info("Status: Enabled\n").unwrap().enabled);
 }
 #[test]
+fn source_derived_disabled_info_accepts_only_documented_debug_suffix() {
+    assert!(
+        !parse::pf_info(include_str!("fixtures/mac/pf-info-disabled-source.txt"))
+            .unwrap()
+            .enabled
+    );
+    for level in ["None", "Urgent", "Misc", "Loud"] {
+        assert!(
+            !parse::pf_info(&format!("Status: Disabled        Debug: {level}\n"))
+                .unwrap()
+                .enabled
+        );
+    }
+    for text in [
+        "Status: Disabled Debug:",
+        "Status: Disabled Debug: unknown",
+        "Status: Disabled Debug: Urgent extra",
+        "Status: Disabled unknown Debug: Urgent",
+        "Status: Enabled Debug: Urgent",
+    ] {
+        assert!(parse::pf_info(text).is_err(), "{text}");
+    }
+}
+#[test]
 fn unparseable_is_never_a_default() {
     for text in [
         "",

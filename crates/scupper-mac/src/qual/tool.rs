@@ -882,7 +882,7 @@ fn worker_inner(out: &Path, mode: &str) -> Result<()> {
         "qualification job not parented to launchd/group leader",
     )?;
     journal_child(out, incarnation.pid)?;
-    if matches!(mode, "pf" | "pf-x") {
+    if matches!(mode, "pf" | "pf-x" | "pf-x-stale") {
         return super::pf::worker(out, mode);
     }
     if mode == "tools" {
@@ -1086,7 +1086,8 @@ fn gated_bootstrap(out: &Path, plist: &Path) -> Result<Value> {
             plist.to_str().ok_or("plist path")?,
         ],
         &actions,
-    )?);
+    )
+    .map_err(|error| format!("spawn bootstrap helper {}: {error}", helper.display()))?);
     drop(read);
     let record = scupper_darwin::sysctl_kern_proc_pid(child.0.pid())?
         .ok_or("gated bootstrap disappeared")?;
@@ -1140,7 +1141,7 @@ pub(super) fn launch_job(out: &Path, mode: &str, keep_alive: bool) -> Result<(St
     let until = Instant::now()
         + Duration::from_secs(match mode {
             "pf" => 13 * 60,
-            "pf-x" => 5 * 60,
+            "pf-x" | "pf-x-stale" => 5 * 60,
             _ => 45,
         });
     let record = out.join(format!("tool-worker-{mode}.json"));
@@ -1325,6 +1326,7 @@ fn restore_jobs(
             "system/net.scupper.qual.r4-tools"
                 | "system/net.scupper.qual.r4-pf"
                 | "system/net.scupper.qual.r4-pf-x"
+                | "system/net.scupper.qual.r4-pf-x-stale"
                 | "system/net.scupper.qual.r4-bootout"
                 | "system/net.scupper.qual.r4-kill9"
                 | "system/net.scupper.qual.r4-group"

@@ -42,7 +42,7 @@ pub fn pf_info(text: &str) -> Result<PfInfo, Error> {
                 _ => return Err(Error("pf status")),
             };
             let suffix: Vec<_> = status_fields.collect();
-            if !suffix.is_empty() && !valid_status_suffix(&suffix) {
+            if !suffix.is_empty() && !valid_status_suffix(&suffix, value) {
                 return Err(Error("pf status suffix"));
             }
             if enabled.replace(value).is_some() {
@@ -56,7 +56,13 @@ pub fn pf_info(text: &str) -> Result<PfInfo, Error> {
         enabled: enabled.ok_or(Error("missing pf status"))?,
     })
 }
-fn valid_status_suffix(fields: &[&str]) -> bool {
+fn valid_status_suffix(fields: &[&str], enabled: bool) -> bool {
+    // Source-derived no-uptime Disabled form: OpenBSD pfctl_parser.c,
+    // 855d4e832803330fc45a64539854bf8d27180600, print_status().
+    // See the qualification README; this is not a per-build runner capture.
+    if let ["Debug:", level] = fields {
+        return !enabled && valid_debug_level(level);
+    }
     let ["for", days, "days", clock, "Debug:", level] = fields else {
         return false;
     };
@@ -64,7 +70,10 @@ fn valid_status_suffix(fields: &[&str]) -> bool {
     decimal(days).is_ok()
         && time.len() == 3
         && time.iter().all(|n| n.len() == 2 && decimal(n).is_ok())
-        && matches!(*level, "None" | "Urgent" | "Misc" | "Loud")
+        && valid_debug_level(level)
+}
+fn valid_debug_level(level: &str) -> bool {
+    matches!(level, "None" | "Urgent" | "Misc" | "Loud")
 }
 fn info_counter(line: &str) -> bool {
     // Qualified non-policy counters; their values cannot supply enabled evidence.

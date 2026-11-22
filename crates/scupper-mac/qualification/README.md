@@ -216,7 +216,7 @@ compile test. The fallback mutant uses a mock successful fsync after a failed
 full-sync; actual Darwin syscall behavior remains a native-runner observation.
 
 R6 adds `pf` (Q-ENABLE 2 minutes, Q-EEXIST 2 minutes, Q-REFS 8 minutes)
-and `pf-x` (Q-X 4 minutes) on both pinned runners. These cells require pf
+`pf-x` (Q-X 2 minutes) and `pf-x-stale` (Q-X-STALE 2 minutes) on both pinned runners. These cells require pf
 Disabled and no starter references at preflight. They journal global-state
 intent before mutation and run all pf tools and four churn workers inside a
 journaled launchd process group. The existing dead-man/always restore stops
@@ -227,10 +227,19 @@ Q-ENABLE writes full stdout/stderr/status to `pf-text-*.json`; review those
 captures per build against `decode/pftext.rs` before promoting its provisional
 acquisition/release templates. Q-REFS writes raw capacities/copied records,
 500 acquisition fingerprints and value-reuse counts, and 2000 churn reads with
-eight long-lived references including the oldest. Missing worker progress or
-zero complete reads cannot pass. Q-X records disabled-pf stale replies and up
-to 200 enabled-pf recurrence trials in `pf-x-observations.json`. A missing
-recurrence is a measurement limit, never evidence that values are unique.
+eight long-lived references including the oldest. Workers acquire bursts of four.
+The 2000 reads comprise 1000 with the default 16 spare slots and 500 each with
+qualification-only spare 0 and 1. `pf-churn.json` records each sub-run's internal
+Retry count and complete/incomplete observations. Each small-spare sub-run requires
+Retry > 0 and Complete > 0; missing coverage is Inconclusive. Production always
+uses 16 spares; the override method and portable entry point compile only with
+`qualification`, with their absence checked by `r6_no_feature.py`.
+Q-X checks X1, X1-anonymous and X2, saves `pf-x-contract.json`, and returns
+`assumption_holds` or `contract_violation` (incomplete evidence is Inconclusive).
+It alone supports `disable_voids_references`. Q-X-STALE records up to 200
+enabled-pf recurrence trials in `pf-x-observations.json`; successful trials always
+return `measurement` and support no assumptions. A missing recurrence is a
+measurement limit, never evidence that values are unique.
 The harness executable remains covered by the complete built/staged manifests;
 R6 introduces no additional staged executable.
 
@@ -240,3 +249,12 @@ and `python3 crates/scupper-mac/tests/r6_no_feature.py`. The latter requires the
 Darwin Rust target and proves the qualification override API is absent without
 features. Neither Linux checks nor a successful cross-lint substitutes for the
 native campaigns or establishes a production assumption record.
+
+The no-uptime `Status: Disabled` + `Debug:` row is source-derived, not a native
+capture. Upstream pfctl's
+[`print_status` at 855d4e8](https://github.com/openbsd/src/blob/855d4e832803330fc45a64539854bf8d27180600/sbin/pfctl/pfctl_parser.c)
+omits uptime when `since` is zero, then prints the Debug column with one of
+None/Urgent/Misc/Loud. The core fixture `pf-info-disabled-source.txt` pins that
+form; unknown debug levels/suffixes still fail closed. Real disabled info and
+exact acquisition/release captures on both campaign builds remain pending.
+Q-ENABLE's two-minute budget is unchanged until native timing evidence arrives.

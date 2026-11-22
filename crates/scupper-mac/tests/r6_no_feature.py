@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile-time proof: neither a native override method nor its variant exists."""
+"""Compile-time proof: assumption and spare-slot overrides are absent in production."""
 from pathlib import Path
 import json
 import os
@@ -24,6 +24,10 @@ if __name__ == '__main__':
     for name, source in [
         ('method', 'pub fn probe(p: &mut scupper_mac::native::NativePlatform) { '
                    'p.reference_assumptions(Default::default()); }'),
+        ('spare_method', 'pub fn probe(p: &mut scupper_mac::native::NativePlatform) { '
+                          'p.reference_spare_slots(0); }'),
+        ('spare_function', 'pub fn probe() { let _ = '
+                          'scupper_mac::decode::pftoken::enumerate_with_spare; }'),
         ('variant', 'pub fn probe() { let _ = scupper_mac::decode::pftoken::Override::'
                     'Qualification(Default::default()); }'),
     ]:
@@ -36,6 +40,6 @@ if __name__ == '__main__':
                                  str(path), '-o', str(OUT / f'{name}.rmeta')], cwd=ROOT,
                                 env=ENV, capture_output=True, text=True)
         (OUT / f'{name}.log').write_text(result.stdout + result.stderr)
-        assert result.returncode != 0 and 'E0599' in result.stderr, result.stderr
-        assert ('reference_assumptions' if name == 'method' else 'Qualification') in result.stderr
+        assert result.returncode != 0 and ('E0425' if name == 'spare_function' else 'E0599') in result.stderr, result.stderr
+        assert dict(method='reference_assumptions', variant='Qualification', spare_method='reference_spare_slots', spare_function='enumerate_with_spare')[name] in result.stderr
         print(f'PROVED absent in no-feature Darwin build: {name}', flush=True)

@@ -111,12 +111,20 @@ impl Options {
         }
         if !matches!(
             options.group.as_str(),
-            "smoke" | "base" | "tool" | "store" | "pf" | "pf-x" | "probe" | "probe-hijack"
+            "smoke"
+                | "base"
+                | "tool"
+                | "store"
+                | "pf"
+                | "pf-x"
+                | "pf-x-stale"
+                | "probe"
+                | "probe-hijack"
         ) || options.after == 0
             || options.after > MAX_ARM_SECONDS
         {
             return Err(
-                "group must be smoke/base/tool/store/pf/pf-x/probe/probe-hijack; --after must be 1..1080 seconds"
+                "group must be smoke/base/tool/store/pf/pf-x/pf-x-stale/probe/probe-hijack; --after must be 1..1080 seconds"
                     .into(),
             );
         }
@@ -203,7 +211,7 @@ pub(super) fn dispatch(args: &[String]) -> Result<()> {
                 tool::run(&options.out)
             } else if options.group == "store" {
                 store::run(&options.out)
-            } else if matches!(options.group.as_str(), "pf" | "pf-x") {
+            } else if matches!(options.group.as_str(), "pf" | "pf-x" | "pf-x-stale") {
                 pf::run(&options.out, &options.group)
             } else if options.group == "base" {
                 base::run(&options.out)

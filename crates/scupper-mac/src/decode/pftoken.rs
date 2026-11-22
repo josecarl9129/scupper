@@ -4,6 +4,8 @@ use std::collections::BTreeSet;
 
 /// Measured packed record stride, independent of the host C ABI.
 pub const STRIDE: usize = 84;
+#[cfg(target_os = "macos")]
+const _: () = assert!(STRIDE == scupper_darwin::PF_TOKEN_SIZE);
 /// Darwin `_IOWR('D', 5, struct pfioc_tokens)`.
 pub const GETSTARTERS: u32 = super::iowr(b'D', 5, 16);
 /// Evidence state for one independently qualified kernel assumption.
@@ -110,12 +112,33 @@ pub fn enumerate(
     read: impl FnMut(&mut [u8]) -> Result<usize, ReadError>,
     expired: impl FnMut() -> bool,
 ) -> Result<Vec<RefLine>, SysError> {
-    enumerate_buffer(read, expired, |capacity| vec![0_u8; capacity])
+    enumerate_buffer(read, expired, |capacity| vec![0_u8; capacity], 16, |_| {})
+}
+/// Qualification alone may reduce the spare slots and observe copy decisions.
+///
+/// # Errors
+/// The same incomplete/layout/deadline failures as ordinary enumeration.
+#[cfg(feature = "qualification")]
+pub fn enumerate_with_spare(
+    read: impl FnMut(&mut [u8]) -> Result<usize, ReadError>,
+    expired: impl FnMut() -> bool,
+    spare: usize,
+    observe: impl FnMut(Classification),
+) -> Result<Vec<RefLine>, SysError> {
+    enumerate_buffer(
+        read,
+        expired,
+        |capacity| vec![0_u8; capacity],
+        spare,
+        observe,
+    )
 }
 fn enumerate_buffer(
     mut read: impl FnMut(&mut [u8]) -> Result<usize, ReadError>,
     mut expired: impl FnMut() -> bool,
     mut allocate: impl FnMut(usize) -> Vec<u8>,
+    spare: usize,
+    mut observe: impl FnMut(Classification),
 ) -> Result<Vec<RefLine>, SysError> {
     let mut slots = 0_usize;
     for _ in 0..8 {
@@ -128,7 +151,11 @@ fn enumerate_buffer(
             Ok(need) if need.is_multiple_of(STRIDE) => need,
             Ok(_) => return Err(SysError::Failed("pf token layout")),
         };
-        slots = slots.max(need / STRIDE + 16);
+        slots = slots.max(
+            (need / STRIDE)
+                .checked_add(spare)
+                .ok_or(SysError::Failed("pf token bounds"))?,
+        );
         let capacity = slots
             .checked_mul(STRIDE)
             .filter(|c| *c <= 16 * 1024 * 1024)
@@ -140,7 +167,9 @@ fn enumerate_buffer(
         let Ok(returned) = read(&mut bytes) else {
             continue;
         };
-        match classify(capacity, returned, STRIDE) {
+        let classification = classify(capacity, returned, STRIDE);
+        observe(classification);
+        match classification {
             Classification::Complete => return decode(&bytes[..returned]),
             Classification::Layout => return Err(SysError::Failed("pf token layout")),
             Classification::Retry => {
@@ -165,6 +194,98 @@ mod tests {
         b[16..20].copy_from_slice(&42_u32.to_le_bytes());
         b[20..25].copy_from_slice(b"pfctl");
         b
+    }
+    #[test]
+    fn literal_two_record_fixture_pins_byte_84_boundary() {
+        // Literal 168 bytes, independent of STRIDE and record(). Token 9 begins at 84.
+        let bytes: [u8; 168] = [
+            7, 0, 0, 0, 0, 0, 0, 0, 123, 0, 0, 0, 0, 0, 0, 0, 42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 0,
+            0, 0, 0, 0, 0, 0, 124, 0, 0, 0, 0, 0, 0, 0, 43, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        assert_eq!(
+            decode(&bytes),
+            Ok(vec![
+                RefLine {
+                    token: 7,
+                    pid: 42,
+                    timestamp: 123
+                },
+                RefLine {
+                    token: 9,
+                    pid: 43,
+                    timestamp: 124
+                },
+            ])
+        );
+    }
+    #[test]
+    fn mixed_assumptions_require_layout_and_each_individual_gate() {
+        for layout in [
+            Assumption::Unknown,
+            Assumption::Refuted,
+            Assumption::Established,
+        ] {
+            for disable in [
+                Assumption::Unknown,
+                Assumption::Refuted,
+                Assumption::Established,
+            ] {
+                for fingerprints in [
+                    Assumption::Unknown,
+                    Assumption::Refuted,
+                    Assumption::Established,
+                ] {
+                    assert_eq!(
+                        Assumptions {
+                            pf_token_layout: layout,
+                            disable_voids_references: disable,
+                            fingerprints,
+                            ..Assumptions::default()
+                        }
+                        .qualification(),
+                        ReferenceQualification {
+                            disable_voids_references: layout == Assumption::Established
+                                && disable == Assumption::Established,
+                            fingerprints: layout == Assumption::Established
+                                && fingerprints == Assumption::Established,
+                        }
+                    );
+                }
+            }
+        }
+    }
+    #[cfg(feature = "qualification")]
+    #[test]
+    fn small_spare_retries_full_copies_then_completes_without_losing_oldest() {
+        for spare in [0, 1] {
+            let mut copies = 0;
+            let mut decisions = vec![];
+            let result = enumerate_with_spare(
+                |b| {
+                    if b.is_empty() {
+                        return Ok(84);
+                    }
+                    copies += 1;
+                    if copies == 1 {
+                        return Ok(b.len());
+                    }
+                    b[..84].copy_from_slice(&record(7));
+                    Ok(84)
+                },
+                || false,
+                spare,
+                |d| decisions.push(d),
+            );
+            assert_eq!(result, decode(&record(7)));
+            assert_eq!(
+                decisions,
+                vec![Classification::Retry, Classification::Complete]
+            );
+        }
     }
     #[test]
     fn boundary_cases_and_packed_stride() {
@@ -219,7 +340,7 @@ mod tests {
             },
             || false,
         );
-        assert_eq!(result.unwrap()[0].token, 9);
+        assert_eq!(result, decode(&record(9)));
         assert_eq!(calls, 4);
     }
     #[test]
@@ -451,6 +572,22 @@ mod production_tests {
             super::Override::None => (),
         }
         assert_eq!(std::mem::size_of::<super::Override>(), 0);
+        let mut copies = 0;
+        assert_eq!(
+            super::enumerate(
+                |bytes| {
+                    if bytes.is_empty() {
+                        return Ok(0);
+                    }
+                    copies += 1;
+                    assert_eq!(bytes.len(), 16 * 84);
+                    Ok(0)
+                },
+                || false
+            ),
+            Ok(vec![])
+        );
+        assert_eq!(copies, 1);
         assert_eq!(
             super::Override::None.assumptions(),
             super::Assumptions::default()
@@ -482,7 +619,9 @@ mod allocation_tests {
                         let mut bytes = Vec::with_capacity(length + spare);
                         bytes.resize(length, 0);
                         bytes
-                    }
+                    },
+                    16,
+                    |_| {}
                 ),
                 Ok(vec![])
             );

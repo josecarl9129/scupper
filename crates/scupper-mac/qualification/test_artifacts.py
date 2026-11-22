@@ -40,6 +40,27 @@ class ArtifactTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(CHECKER), str(self.root), *arguments],
                               capture_output=True, text=True, env=env, check=False)
 
+    def test_pf_contract_and_stale_measurement_have_separate_artifacts(self):
+        manifest = json.loads((REPO / "crates/scupper-mac/qualification/manifest.json").read_text())
+        cases = {case["id"]: case for case in manifest["cases"]}
+        self.assertEqual(cases["Q-X"]["supported_assumptions"], ["disable_voids_references"])
+        self.assertEqual(cases["Q-X-STALE"]["supported_assumptions"], [])
+        self.assertEqual(cases["Q-X"]["group"], "pf-x")
+        self.assertEqual(cases["Q-X-STALE"]["group"], "pf-x-stale")
+        workflow = (REPO / ".github/workflows/ci.yml").read_text()
+        self.assertIn("pf, pf-x, pf-x-stale, probe", workflow)
+        contract = dict(self.result, case="Q-X", verdict="assumption_holds", iterations=3)
+        stale = dict(self.result, case="Q-X-STALE", verdict="measurement", iterations=1)
+        self.write_json("Q-X.json", contract)
+        self.write_json("Q-X-STALE.json", stale)
+        self.write_json("verdicts.json", [contract, stale])
+        self.assertEqual(self.check().returncode, 0)
+        summary = self.root / "pf-summary.txt"
+        env = dict(os.environ, GITHUB_STEP_SUMMARY=str(summary), QUAL_RUNNER="fixture", QUAL_GROUP="pf-x")
+        self.assertEqual(self.check("--summary", env=env).returncode, 0)
+        self.assertIn("Q-X: **assumption_holds**", summary.read_text())
+        self.assertIn("Q-X-STALE: **measurement**", summary.read_text())
+
     def test_missing_both_complete_manifests_rejects_verdicts(self):
         for name in ["built-binaries-sha256.txt", "executed-binaries-sha256.txt"]:
             (self.root / name).unlink()

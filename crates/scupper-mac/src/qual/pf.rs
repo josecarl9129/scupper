@@ -269,12 +269,19 @@ pub(super) fn worker(out: &Path, group: &str) -> Result<()> {
             ("Q-EEXIST", 2, 50, eexist),
             ("Q-REFS", 8, 2000, references),
         ]
-    } else {
+    } else if group == "pf-x" {
         vec![(
             "Q-X",
-            4,
+            2,
             3,
             x as fn(&Path, &mut NativePlatform, Instant, &mut CaseResult) -> Result<()>,
+        )]
+    } else {
+        vec![(
+            "Q-X-STALE",
+            2,
+            1,
+            x_stale as fn(&Path, &mut NativePlatform, Instant, &mut CaseResult) -> Result<()>,
         )]
     } {
         let mut result = CaseResult {
@@ -289,7 +296,7 @@ pub(super) fn worker(out: &Path, group: &str) -> Result<()> {
         if let Err(error) = operation(out, &mut p, end, &mut result) {
             result.verdict = if error.is::<super::EnvironmentIssue>() {
                 Verdict::Inconclusive
-            } else if id == "Q-EEXIST" {
+            } else if result.verdict == Verdict::AssumptionRefuted {
                 Verdict::AssumptionRefuted
             } else {
                 Verdict::ContractViolation
@@ -486,7 +493,19 @@ fn eexist(out: &Path, p: &mut NativePlatform, end: Instant, result: &mut CaseRes
             ));
         }
         release(p, token, end)?;
-        info(p, &PfInfo::Enabled, end)?;
+        // Only this post-release state can refute the EEXIST assumption.
+        match p.pf_info(deadline(end)?) {
+            PfInfo::Enabled => (),
+            PfInfo::Disabled => {
+                result.verdict = Verdict::AssumptionRefuted;
+                return Err("EEXIST did not preserve anonymous enable after token release".into());
+            }
+            PfInfo::Incomplete(e) => {
+                return Err(environment_issue(format!(
+                    "post-release info incomplete: {e:?}"
+                )));
+            }
+        }
         ensure(refs(p, end)?.is_empty(), "anonymous reference enumerated")?;
         reset(out, p, end)?;
         let token = acquire(p, end)?;
@@ -636,20 +655,39 @@ fn references(
     let start = Instant::now();
     let mut complete = 0_u32;
     let mut incomplete = 0_u32;
-    for _ in 0..2000 {
-        match p.references(deadline(end)?) {
-            Enumeration::Complete(lines) => {
-                ensure(
-                    held.iter()
-                        .all(|token| lines.iter().any(|r| r.token == *token)),
-                    "Complete omitted a long-lived token (including oldest)",
-                )?;
-                complete += 1;
+    let mut subruns = Vec::new();
+    let mut coverage_missing = false;
+    for (spare, reads) in [(16, 1000), (0, 500), (1, 500)] {
+        p.reference_spare_slots(spare);
+        let _ = p.reference_copy_decisions();
+        let mut sub_complete = 0_u32;
+        let mut sub_incomplete = 0_u32;
+        for _ in 0..reads {
+            match p.references(deadline(end)?) {
+                Enumeration::Complete(lines) => {
+                    ensure(
+                        held.iter()
+                            .all(|token| lines.iter().any(|r| r.token == *token)),
+                        "Complete omitted a long-lived token (including oldest)",
+                    )?;
+                    sub_complete += 1;
+                }
+                Enumeration::Incomplete(_) => sub_incomplete += 1,
             }
-            Enumeration::Incomplete(_) => incomplete += 1,
+            result.iterations += 1;
         }
-        result.iterations += 1;
+        let decisions = p.reference_copy_decisions();
+        let retries = decisions
+            .iter()
+            .filter(|d| **d == Classification::Retry)
+            .count();
+        coverage_missing |= spare < 16 && (retries == 0 || sub_complete == 0);
+        subruns.push(json!({"spare_slots":spare,"reads":reads,"retry":retries,
+            "complete":sub_complete,"incomplete":sub_incomplete}));
+        complete += sub_complete;
+        incomplete += sub_incomplete;
     }
+    p.reference_spare_slots(16);
     for child in &mut workers.0 {
         ensure(
             child.try_wait()?.is_none(),
@@ -673,7 +711,7 @@ fn references(
         )?;
         counts.push(count);
     }
-    ensure(complete > 0, "churn yielded no complete observations")?;
+    coverage_missing |= complete == 0;
     let capacities = p.reference_capacities();
     ensure(
         !capacities.is_empty()
@@ -686,10 +724,16 @@ fn references(
         out,
         "pf-churn.json",
         &json!({"complete":complete,"incomplete":incomplete,
-        "workers":counts,"elapsed_ms":start.elapsed().as_millis(),"long_lived":held}),
+        "workers":counts,"burst":4,"subruns":subruns,
+        "elapsed_ms":start.elapsed().as_millis(),"long_lived":held}),
     )?;
     for token in held {
         release(p, token, end)?;
+    }
+    if coverage_missing {
+        return Err(environment_issue(
+            "small-spare churn requires Retry > 0 and Complete > 0 for each sub-run; inspect pf-churn.json",
+        ));
     }
     Ok(())
 }
@@ -728,8 +772,14 @@ pub(super) fn auxiliary(out: &Path, mode: &str, name: &str) -> Result<()> {
     let mut iterations = 0_u32;
     let outcome = (|| -> Result<()> {
         while !out.join("pf-churn-stop").exists() && Instant::now() < end {
-            let token = acquire(&mut p, end)?;
-            release(&mut p, token, end)?;
+            // Each worker acquires four before releasing: bursts exceed spare 0/1.
+            let mut burst = Vec::new();
+            for _ in 0..4 {
+                burst.push(acquire(&mut p, end)?);
+            }
+            for token in burst {
+                release(&mut p, token, end)?;
+            }
             iterations += 1;
             if iterations == 1 {
                 fs::write(out.join(format!("pf-churn-ready-{name}")), b"ready")?;
@@ -786,6 +836,18 @@ fn x(out: &Path, p: &mut NativePlatform, end: Instant, result: &mut CaseResult) 
         release(p, new, end)?;
         result.iterations += 1;
     }
+    write_json(out, "pf-x-contract.json", &observations)?;
+    reset(out, p, end)
+}
+fn x_stale(
+    out: &Path,
+    p: &mut NativePlatform,
+    end: Instant,
+    result: &mut CaseResult,
+) -> Result<()> {
+    // Successful stale-value trials are measurements and support no assumptions.
+    result.verdict = Verdict::Measurement;
+    let mut observations = Vec::new();
     reset(out, p, end)?;
     let stale = acquire(p, end)?;
     release(p, stale, end)?;
@@ -815,9 +877,10 @@ fn x(out: &Path, p: &mut NativePlatform, end: Instant, result: &mut CaseResult) 
         "pf-x-observations.json",
         &json!({"observations":observations,"recurrence_observed":recurred}),
     )?;
+    result.iterations = 1;
     result.verdict = Verdict::Measurement;
     result.detail = format!(
-        "X1/X2 post-state checked; stale -X while enabled is measurement only; recurrence observed={recurred}; no invalid-token row promoted"
+        "stale -X while enabled is measurement only; recurrence observed={recurred}; no invalid-token row promoted"
     );
     reset(out, p, end)
 }

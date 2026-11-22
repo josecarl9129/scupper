@@ -178,7 +178,7 @@ mod tests {
         assert!(manifest.budgets_fit());
         assert_eq!(manifest.cell_budget_minutes - manifest.overhead_minutes, 18);
         assert_eq!(MAX_FINAL_RESTORE_SECONDS, 240);
-        assert_eq!(manifest.cases.len(), 24);
+        assert_eq!(manifest.cases.len(), 25);
         let tools: Vec<_> = manifest
             .cases
             .iter()
@@ -238,8 +238,23 @@ mod tests {
         assert!(manifest.budgets_fit());
         let workflow = include_str!("../../../../.github/workflows/ci.yml");
         assert!(workflow.contains("runner: [macos-15, macos-26]"));
-        assert!(workflow.contains("tool-mutants, store, pf, pf-x, probe"));
+        assert!(workflow.contains("tool-mutants, store, pf, pf-x, pf-x-stale, probe"));
         assert!(workflow.contains("matrix.group == 'store' && 10"));
+        // Every group whose worker starts via launch_job needs the bootstrap helper.
+        let helper = workflow
+            .split("- name: Compile R4 harmless tool helper")
+            .nth(1)
+            .and_then(|rest| {
+                rest.lines()
+                    .find(|line| line.trim_start().starts_with("if:"))
+            })
+            .ok_or("helper compile step")?;
+        for group in ["tool", "tool-mutants", "pf", "pf-x", "pf-x-stale"] {
+            assert!(
+                helper.contains(&format!("matrix.group == '{group}'")),
+                "{group}"
+            );
+        }
         Ok(())
     }
 
@@ -251,7 +266,8 @@ mod tests {
             ("Q-ENABLE", "pf", 50, 2),
             ("Q-EEXIST", "pf", 50, 2),
             ("Q-REFS", "pf", 2000, 8),
-            ("Q-X", "pf-x", 3, 4),
+            ("Q-X", "pf-x", 3, 2),
+            ("Q-X-STALE", "pf-x-stale", 1, 2),
         ] {
             let case = manifest
                 .cases
@@ -268,6 +284,24 @@ mod tests {
             );
         }
         assert!(manifest.budgets_fit());
+        assert_eq!(
+            manifest
+                .cases
+                .iter()
+                .find(|c| c.id == "Q-X")
+                .ok_or("missing Q-X")?
+                .supported_assumptions,
+            ["disable_voids_references"]
+        );
+        assert_eq!(
+            manifest
+                .cases
+                .iter()
+                .find(|c| c.id == "Q-X-STALE")
+                .ok_or("missing Q-X-STALE")?
+                .supported_assumptions,
+            Vec::<String>::new()
+        );
         assert!(!manifest.cases.iter().any(|c| c.id == "Q-FLUSH"));
         Ok(())
     }
@@ -292,7 +326,7 @@ mod tests {
             .ok_or("native CI job")?;
         assert!(native.contains("runner: [macos-15, macos-26]"));
         assert!(native.contains(
-            "group: [smoke, base, tool, tool-mutants, store, pf, pf-x, probe, probe-hijack]"
+            "group: [smoke, base, tool, tool-mutants, store, pf, pf-x, pf-x-stale, probe, probe-hijack]"
         ));
         assert!(native.contains(&format!(
             "matrix.group == 'tool-mutants' && {} || 30",

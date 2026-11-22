@@ -31,7 +31,7 @@ MUTANTS = [
     ('unaligned-less-than-capacity', TOKEN, 'returned <= capacity - stride', 'returned < capacity',
      'scupper-mac', 'classify_matches_xnu_copy_loop'),
     ('stride-88', TOKEN, 'pub const STRIDE: usize = 84;', 'pub const STRIDE: usize = 88;',
-     'scupper-mac', 'fields_decode_little_endian'),
+     'scupper-mac', 'literal_two_record_fixture_pins_byte_84_boundary'),
     ('read-size-after-error', RULES, 'if success { Some(read()) } else { None }',
      'let size = read(); if success { Some(size) } else { None }',
      'scupper-darwin', 'failed_ioctl_never_reads_size'),
@@ -47,6 +47,36 @@ MUTANTS = [
      '        Err(SysError::Unknown)\n    }\n}\n/// Parse all pf-info',
      '        Ok(Release::TokenInvalid)\n    }\n}\n/// Parse all pf-info',
      'scupper-mac', 'unknown_text_status_streams_and_builds_grant_nothing'),
+    ('acquire-unknown-notstarted', TEXT,
+     '        Ok(token) => ToolOutcome::Ok((token, result.pid)),\n'
+     '        Err(_) => ToolOutcome::Unknown {\n'
+     '            reaped: result.reap.settled(),\n        },',
+     '        Ok(token) => ToolOutcome::Ok((token, result.pid)),\n'
+     '        Err(_) => ToolOutcome::NotStarted(SysError::Unknown),',
+     'scupper-mac', 'portable_outcomes_require_complete_post_spawn_evidence'),
+    ('status-ignores-truncation', TEXT, ' || result.truncated {', ' {',
+     'scupper-mac', 'portable_outcomes_require_complete_post_spawn_evidence'),
+    ('status-ignores-timeout', TEXT, 'result.timed_out || result.io_failed', 'result.io_failed',
+     'scupper-mac', 'portable_outcomes_require_complete_post_spawn_evidence'),
+    ('qualification-drops-layout-fingerprints', TOKEN,
+     'fingerprints: self.pf_token_layout == Assumption::Established\n                && self.fingerprints',
+     'fingerprints: self.fingerprints',
+     'scupper-mac', 'mixed_assumptions_require_layout_and_each_individual_gate'),
+    ('qualification-drops-layout-disable', TOKEN,
+     'disable_voids_references: self.pf_token_layout == Assumption::Established\n                && self.disable_voids_references',
+     'disable_voids_references: self.disable_voids_references',
+     'scupper-mac', 'mixed_assumptions_require_layout_and_each_individual_gate'),
+    ('pf-starters-direct-size', RULES,
+     'successful_size(success, read).ok_or(StarterSizeError::Ioctl)?', 'read()',
+     'scupper-darwin', 'starter_decision_requires_success_and_valid_size'),
+    ('duplicate-token-values', TOKEN, '!seen.insert(token)', '!seen.insert(token) && false',
+     'scupper-mac', 'malformed_copy_replies_and_duplicates_never_complete'),
+    ('copy-noent-empty', TOKEN,
+     '        let Ok(returned) = read(&mut bytes) else {\n            continue;\n        };',
+     '        let returned = match read(&mut bytes) { Ok(n) => n, '
+     'Err(ReadError::Noent) => return Ok(vec![]), Err(_) => continue };',
+     'scupper-mac', 'retry_errors_ignore_size_and_buffers_have_exact_initialized_length'),
+
 ]
 
 

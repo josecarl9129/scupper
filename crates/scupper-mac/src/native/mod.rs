@@ -114,6 +114,11 @@ pub struct NativePlatform {
     pf_reader: crate::decode::pftoken::Reader,
     #[cfg(feature = "qualification")]
     pf_capacities: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
+    #[cfg(feature = "qualification")]
+    pf_spare_slots: usize,
+    #[cfg(feature = "qualification")]
+    pf_copy_decisions:
+        std::sync::Arc<std::sync::Mutex<Vec<crate::decode::pftoken::Classification>>>,
 }
 impl NativePlatform {
     /// Construct the adapter for runner qualification only.
@@ -137,6 +142,10 @@ impl NativePlatform {
             pf_reader: crate::decode::pftoken::Reader::default(),
             #[cfg(feature = "qualification")]
             pf_capacities: std::sync::Arc::default(),
+            #[cfg(feature = "qualification")]
+            pf_spare_slots: 16,
+            #[cfg(feature = "qualification")]
+            pf_copy_decisions: std::sync::Arc::default(),
         })
     }
     /// Supply reviewed digests/vnodes for qualification until 5a3 provides them.
@@ -808,58 +817,28 @@ impl Platform for NativePlatform {
         self.storage.wait(deadline)
     }
     fn enable_pf(&mut self, deadline: Deadline) -> Result<PfEnable, SysError> {
-        let build = Self::pf_build()?;
-        let result = self.pf_tool(&[crate::engine::PFCTL, "-e"], deadline)?;
-        crate::decode::pftext::enable(
-            &build,
-            pf::status(&result)?,
-            &result.stdout.bytes,
-            &result.stderr.bytes,
+        let attempt = Self::pf_build().and_then(|build| {
+            self.pf_tool(&[crate::engine::PFCTL, "-e"], deadline)
+                .map(|result| (build, result))
+        });
+        crate::decode::pftext::enable_outcome(
+            pf::evidence(&attempt),
             self.pf_assumptions.assumptions(),
         )
     }
     fn acquire(&mut self, deadline: Deadline) -> ToolOutcome<(u64, u32)> {
-        let build = match Self::pf_build() {
-            Ok(build) => build,
-            Err(e) => return ToolOutcome::NotStarted(e),
-        };
-        let result = match self.pf_tool(&[crate::engine::PFCTL, "-E"], deadline) {
-            Ok(result) => result,
-            Err(e) => return ToolOutcome::NotStarted(e),
-        };
-        match pf::status(&result).and_then(|rc| {
-            crate::decode::pftext::acquire(&build, rc, &result.stdout.bytes, &result.stderr.bytes)
-        }) {
-            Ok(token) => ToolOutcome::Ok((token, result.pid)),
-            Err(_) => ToolOutcome::Unknown {
-                reaped: result.reap.settled(),
-            },
-        }
+        let attempt = Self::pf_build().and_then(|build| {
+            self.pf_tool(&[crate::engine::PFCTL, "-E"], deadline)
+                .map(|result| (build, result))
+        });
+        crate::decode::pftext::acquire_outcome(pf::evidence(&attempt))
     }
     fn release(&mut self, token: u64, deadline: Deadline) -> ToolOutcome<Release> {
-        let build = match Self::pf_build() {
-            Ok(build) => build,
-            Err(e) => return ToolOutcome::NotStarted(e),
-        };
-        let result = match self.pf_tool(&[crate::engine::PFCTL, "-X", &token.to_string()], deadline)
-        {
-            Ok(result) => result,
-            Err(e) => return ToolOutcome::NotStarted(e),
-        };
-        match pf::status(&result).and_then(|rc| {
-            crate::decode::pftext::release(
-                &build,
-                rc,
-                &result.stdout.bytes,
-                &result.stderr.bytes,
-                token,
-            )
-        }) {
-            Ok(released) => ToolOutcome::Ok(released),
-            Err(_) => ToolOutcome::Unknown {
-                reaped: result.reap.settled(),
-            },
-        }
+        let attempt = Self::pf_build().and_then(|build| {
+            self.pf_tool(&[crate::engine::PFCTL, "-X", &token.to_string()], deadline)
+                .map(|result| (build, result))
+        });
+        crate::decode::pftext::release_outcome(pf::evidence(&attempt), token)
     }
     fn references(&mut self, deadline: Deadline) -> Enumeration<Vec<RefLine>> {
         match self.read_references(deadline) {

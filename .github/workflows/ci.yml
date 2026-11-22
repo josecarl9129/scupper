@@ -80,7 +80,8 @@ jobs:
           RUST_TEST_THREADS: 2
         run: |
           timeout 3600 python3 crates/scupper-mac/tests/r6_reference_mutations.py
-          timeout 600 cargo test -p scupper-mac --no-default-features --lib production_override_has_only_none
+          timeout 600 cargo test -p scupper-mac --no-default-features --lib decode::pftoken::production_tests::production_override_has_only_none -- --exact | tee target/r6-production-override.log
+          rg 'test result: ok\. 1 passed;' target/r6-production-override.log
           timeout 600 python3 crates/scupper-mac/tests/r6_no_feature.py
 
       - name: Portable qualification artifact and ABI macro regressions
@@ -252,7 +253,8 @@ jobs:
       fail-fast: false
       matrix:
         runner: [macos-15, macos-26]
-        group: [smoke, base, tool, tool-mutants, store, pf, pf-x, probe, probe-hijack]
+        # pf-x qualifies Q-X; pf-x-stale runs the independent Q-X-STALE measurement.
+        group: [smoke, base, tool, tool-mutants, store, pf, pf-x, pf-x-stale, probe, probe-hijack]
     runs-on: ${{ matrix.runner }}
     # Native mutants: review estimate scaled to five experiments plus margin.
     timeout-minutes: ${{ matrix.group == 'tool-mutants' && 60 || 30 }}
@@ -332,7 +334,8 @@ jobs:
           cc -std=c11 -Wall -Wextra -Werror -arch arm64 -DIMAGE_VARIANT=2 crates/scupper-darwin/probe/base-image.c -o qual-out/base-image-b
           shasum -a 256 qual-out/base-image-a qual-out/base-image-b | tee qual-out/base-image-sha256.txt
       - name: Compile R4 harmless tool helper
-        if: matrix.group == 'tool' || matrix.group == 'tool-mutants'
+        # The pf cells start their worker through the helper's gated launchd bootstrap.
+        if: matrix.group == 'tool' || matrix.group == 'tool-mutants' || matrix.group == 'pf' || matrix.group == 'pf-x' || matrix.group == 'pf-x-stale'
         run: |
           cc -std=c11 -Wall -Wextra -Werror crates/scupper-darwin/probe/tool-child.c -o qual-out/tool-child
           cc -std=c11 -Wall -Wextra -Werror -arch x86_64 crates/scupper-darwin/probe/tool-child.c -o qual-out/tool-child-x86_64
@@ -386,7 +389,7 @@ jobs:
           /usr/bin/sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT /private/var/db/scupper-qual/scupper-mac-qual arm --after "$after" --out /private/var/db/scupper-qual/evidence --disposable-runner
       - name: Run qualification cell
         if: matrix.group != 'tool-mutants'
-        timeout-minutes: ${{ matrix.group == 'tool' && 10 || matrix.group == 'store' && 10 || matrix.group == 'pf' && 14 || matrix.group == 'pf-x' && 5 || 18 }}
+        timeout-minutes: ${{ matrix.group == 'tool' && 10 || matrix.group == 'store' && 10 || matrix.group == 'pf' && 14 || (matrix.group == 'pf-x' || matrix.group == 'pf-x-stale') && 5 || 18 }}
         run: /usr/bin/sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,ImageOS,ImageVersion,RUNNER_NAME,GITHUB_RUN_ID,GITHUB_SHA /private/var/db/scupper-qual/scupper-mac-qual run --group ${{ matrix.group }} --out /private/var/db/scupper-qual/evidence --disposable-runner
       - name: Restore and stop dead-man
         if: always()

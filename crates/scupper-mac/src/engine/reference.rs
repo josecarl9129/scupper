@@ -652,7 +652,7 @@ impl<P: Platform> Engine<P> {
             }
         }
         let d = self.deadline();
-        let lines = match self.platform.references(d) {
+        let mut lines = match self.platform.references(d) {
             Enumeration::Complete(lines) => lines,
             Enumeration::Incomplete(error) => return Err(error),
         };
@@ -729,6 +729,13 @@ impl<P: Platform> Engine<P> {
             if !self.freeing_allowed() {
                 return Err(SysError::Failed("reference mutation fence open"));
             }
+            // Each next release uses a read begun after the preceding mutation
+            // settled and its fence closed. Never reuse a pre-mutation inventory.
+            let d = self.deadline();
+            lines = match self.platform.references(d) {
+                Enumeration::Complete(lines) => lines,
+                Enumeration::Incomplete(error) => return Err(error),
+            };
         }
         if !self.machine.durable().uncertain_acquires.is_empty()
             || matches!(

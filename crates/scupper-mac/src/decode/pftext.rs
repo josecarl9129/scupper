@@ -2,8 +2,79 @@
 //! Enable rows are supplied by R2; acquisition/release templates must be
 //! cross-checked against full Q-ENABLE captures before promotion (R11).
 use super::pftoken::{Assumption, Assumptions};
-use crate::platform::{PfEnable, Release, SysError};
+use crate::platform::{PfEnable, Release, SysError, ToolOutcome, runtime::Reap};
 
+/// Portable bounded tool evidence; constructing this does not interpret it.
+#[derive(Clone, Copy, Debug)]
+pub struct ToolEvidence<'a> {
+    /// Spawned PID, retained independently of parsed text.
+    pub pid: u32,
+    /// Exact wait evidence, including `NoChild` and `Pending`.
+    pub reap: Reap,
+    /// Entire retained stdout.
+    pub stdout: &'a [u8],
+    /// Entire retained stderr.
+    pub stderr: &'a [u8],
+    /// Either bounded stream lost bytes.
+    pub truncated: bool,
+    /// Execution deadline triggered.
+    pub timed_out: bool,
+    /// Pipe/poll failure.
+    pub io_failed: bool,
+    /// Caller input not delivered.
+    pub stdin_unsent: usize,
+}
+/// Return a status only from complete streams and an actual normal wait status.
+///
+/// # Errors
+/// Any missing evidence, signal exit, `NoChild`, timeout or stream failure.
+pub fn status(result: &ToolEvidence<'_>) -> Result<i32, SysError> {
+    if result.timed_out || result.io_failed || result.stdin_unsent != 0 || result.truncated {
+        return Err(SysError::Unknown);
+    }
+    match result.reap {
+        Reap::Status(status) if status.trailing_zeros() >= 7 => Ok((status >> 8) & 0xff),
+        _ => Err(SysError::Unknown),
+    }
+}
+/// A pre-spawn error or the full evidence of an attempted pfctl operation.
+pub type Attempt<'a> = Result<(&'a str, ToolEvidence<'a>), SysError>;
+/// Interpret -e evidence with the build and EEXIST assumption gates.
+///
+/// # Errors
+/// Pre-spawn refusal or any unrecognized/incomplete post-spawn evidence.
+pub fn enable_outcome(attempt: Attempt<'_>, gates: Assumptions) -> Result<PfEnable, SysError> {
+    let (build, result) = attempt?;
+    enable(build, status(&result)?, result.stdout, result.stderr, gates)
+}
+/// Interpret -E evidence. Only a pre-spawn refusal can mean `NotStarted`.
+#[must_use]
+pub fn acquire_outcome(attempt: Attempt<'_>) -> ToolOutcome<(u64, u32)> {
+    let (build, result) = match attempt {
+        Ok(evidence) => evidence,
+        Err(error) => return ToolOutcome::NotStarted(error),
+    };
+    match status(&result).and_then(|rc| acquire(build, rc, result.stdout, result.stderr)) {
+        Ok(token) => ToolOutcome::Ok((token, result.pid)),
+        Err(_) => ToolOutcome::Unknown {
+            reaped: result.reap.settled(),
+        },
+    }
+}
+/// Interpret -X evidence without inferring absence from an error.
+#[must_use]
+pub fn release_outcome(attempt: Attempt<'_>, token: u64) -> ToolOutcome<Release> {
+    let (build, result) = match attempt {
+        Ok(evidence) => evidence,
+        Err(error) => return ToolOutcome::NotStarted(error),
+    };
+    match status(&result).and_then(|rc| release(build, rc, result.stdout, result.stderr, token)) {
+        Ok(released) => ToolOutcome::Ok(released),
+        Err(_) => ToolOutcome::Unknown {
+            reaped: result.reap.settled(),
+        },
+    }
+}
 /// Builds covered by the disposable-runner campaign.
 pub const BUILDS: [&str; 2] = ["24H232", "25G332"];
 fn supported(build: &str) -> bool {
@@ -59,7 +130,7 @@ pub fn acquire(build: &str, rc: i32, stdout: &[u8], stderr: &[u8]) -> Result<u64
 }
 /// Exact successful release only. There is deliberately no invalid-token row:
 /// neither disabled-pf errors nor stale numeric values establish safe absence
-/// in the presence of token recurrence. Q-X records them as measurements.
+/// in the presence of token recurrence. Q-X-STALE records enabled-pf recurrence as measurement.
 ///
 /// # Errors
 /// All nonzero exits and all unrecognized text.
@@ -101,11 +172,124 @@ pub fn info(rc: i32, stdout: &[u8], stderr: &[u8]) -> Result<crate::platform::Pf
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn evidence(stderr: &[u8]) -> ToolEvidence<'_> {
+        ToolEvidence {
+            pid: 123,
+            reap: Reap::Status(0),
+            stdout: b"",
+            stderr,
+            truncated: false,
+            timed_out: false,
+            io_failed: false,
+            stdin_unsent: 0,
+        }
+    }
+    #[test]
+    fn portable_outcomes_require_complete_post_spawn_evidence() {
+        let error = SysError::Unknown;
+        assert_eq!(
+            acquire_outcome(Err(error.clone())),
+            ToolOutcome::NotStarted(error.clone())
+        );
+        assert_eq!(
+            release_outcome(Err(error.clone()), 42),
+            ToolOutcome::NotStarted(error.clone())
+        );
+        assert_eq!(
+            enable_outcome(Err(error), Assumptions::default()),
+            Err(SysError::Unknown)
+        );
+        for build in BUILDS {
+            assert_eq!(
+                acquire_outcome(Ok((build, evidence(b"Token : 42\n")))),
+                ToolOutcome::Ok((42, 123))
+            );
+            assert_eq!(
+                release_outcome(Ok((build, evidence(b"Token : 42 revoked.\n"))), 42),
+                ToolOutcome::Ok(Release::Released)
+            );
+            assert_eq!(
+                enable_outcome(
+                    Ok((build, evidence(b"pf enabled\n"))),
+                    Assumptions::default()
+                ),
+                Ok(PfEnable::Started)
+            );
+            // Each row retains plausible successful text, so missing guards fail.
+            for row in 0..10 {
+                for reap in [Reap::Status(0), Reap::NoChild, Reap::Pending] {
+                    let corrupt = |mut e: ToolEvidence<'static>| {
+                        e.reap = reap;
+                        match row {
+                            0 => e.stderr = b"unknown\n",
+                            1 => e.reap = Reap::Status(2 << 8),
+                            2 => e.truncated = true,
+                            3 => e.timed_out = true,
+                            4 => e.io_failed = true,
+                            5 => e.stdin_unsent = 1,
+                            6 => e.reap = Reap::NoChild,
+                            7 => e.reap = Reap::Pending,
+                            8 => e.reap = Reap::Status(9),
+                            _ => e.stdout = b"unexpected",
+                        }
+                        e
+                    };
+                    let a = corrupt(evidence(b"Token : 42\n"));
+                    let r = corrupt(evidence(b"Token : 42 revoked.\n"));
+                    let e = corrupt(evidence(b"pf enabled\n"));
+                    assert_eq!(
+                        acquire_outcome(Ok((build, a))),
+                        ToolOutcome::Unknown {
+                            reaped: a.reap.settled()
+                        },
+                        "row {row}"
+                    );
+                    assert_eq!(
+                        release_outcome(Ok((build, r)), 42),
+                        ToolOutcome::Unknown {
+                            reaped: r.reap.settled()
+                        },
+                        "row {row}"
+                    );
+                    assert_eq!(
+                        enable_outcome(Ok((build, e)), Assumptions::default()),
+                        Err(SysError::Unknown),
+                        "row {row}"
+                    );
+                    if !matches!(row, 0 | 1 | 9) {
+                        assert_eq!(status(&a), Err(SysError::Unknown), "status row {row}");
+                    }
+                }
+            }
+            assert_eq!(status(&evidence(b"")), Ok(0));
+            assert_eq!(
+                status(&ToolEvidence {
+                    reap: Reap::Status(1 << 8),
+                    ..evidence(b"")
+                }),
+                Ok(1)
+            );
+        }
+        assert_eq!(
+            acquire_outcome(Ok(("unknown", evidence(b"Token : 42\n")))),
+            ToolOutcome::Unknown { reaped: true }
+        );
+    }
     #[test]
     fn info_requires_zero_exit_and_every_line_parsed() {
         use crate::platform::PfInfo;
         assert_eq!(info(0, b"Status: Enabled\n", b""), Ok(PfInfo::Enabled));
         assert_eq!(info(0, b"Status: Disabled\n", b""), Ok(PfInfo::Disabled));
+        assert_eq!(
+            info(
+                0,
+                include_bytes!(
+                    "../../../scupper-core/tests/fixtures/mac/pf-info-disabled-source.txt"
+                ),
+                b""
+            ),
+            Ok(PfInfo::Disabled)
+        );
         for (rc, stdout, stderr) in [
             (1, &b"Status: Disabled\n"[..], &b""[..]),
             (0, b"Status: Disabled\nunknown\n", b""),
@@ -168,6 +352,7 @@ mod tests {
             for text in [
                 "",
                 "Token : 0\n",
+                "Token : 43 revoked.\n",
                 "Token : 01\n",
                 "Token : +1\n",
                 "Token : 1",

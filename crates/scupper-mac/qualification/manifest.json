@@ -173,10 +173,17 @@
       "id": "Q-X",
       "group": "pf-x",
       "minimum_iterations": 3,
-      "budget_minutes": 4,
+      "budget_minutes": 2,
       "supported_assumptions": [
         "disable_voids_references"
       ]
+    },
+    {
+      "id": "Q-X-STALE",
+      "group": "pf-x-stale",
+      "minimum_iterations": 1,
+      "budget_minutes": 2,
+      "supported_assumptions": []
     }
   ],
   "group_budgets": {
