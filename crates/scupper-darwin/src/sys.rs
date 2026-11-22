@@ -1489,6 +1489,9 @@ pub fn preallocate(fd: impl std::os::fd::AsFd, length: i64) -> Result<(), Errno>
     let rc = unsafe { libc::fcntl(fd.as_fd().as_raw_fd(), libc::F_PREALLOCATE, &raw mut store) };
     if rc == -1 { Err(last_errno()) } else { Ok(()) }
 }
+/// fcntl full-sync command, compared with the SDK C probe before Q-STORE.
+pub const FULLFSYNC_COMMAND: i32 = libc::F_FULLFSYNC;
+
 /// Full-sync a file or directory, checking the result without any fallback.
 ///
 /// # Errors

@@ -33,27 +33,40 @@ pub struct Metadata {
     /// Logical byte length.
     pub size: u64,
 }
-/// Require a single root-owned private regular snapshot of the exact length.
+/// Require a single root-owned private regular snapshot, possibly a short stub.
 #[must_use]
 pub fn valid_copy(m: Metadata) -> bool {
-    valid_created(m) && m.size == COPY_BYTES as u64
+    valid_created(m) && m.size <= COPY_BYTES as u64
 }
 fn valid_created(m: Metadata) -> bool {
     m.regular && m.uid == 0 && m.mode & 0o7777 == 0o600 && m.nlink == 1
 }
 
-/// Return bytes only after metadata passes and one exact-length pread succeeds.
+/// Return bytes after metadata passes and one pread matches its length.
+/// Short stubs are zero-padded; snapshot classification rejects their contents.
 /// The closure is never invoked for invalid metadata.
 pub fn read_bytes(
     meta: Result<Metadata, SysError>,
     pread: impl FnOnce(&mut [u8]) -> Result<usize, SysError>,
 ) -> CopyRead {
-    if !meta.is_ok_and(valid_copy) {
+    let Some(meta) = meta.ok() else {
+        return CopyRead::Unreadable;
+    };
+    if !valid_copy(meta) {
         return CopyRead::Unreadable;
     }
     let mut bytes = vec![0; COPY_BYTES];
-    match pread(&mut bytes) {
-        Ok(COPY_BYTES) => CopyRead::Bytes(bytes),
+    let Ok(length) = usize::try_from(meta.size) else {
+        return CopyRead::Unreadable;
+    };
+    match pread(&mut bytes[..length]) {
+        Ok(length) if length as u64 == meta.size => {
+            if length < COPY_BYTES {
+                CopyRead::Short(bytes)
+            } else {
+                CopyRead::Bytes(bytes)
+            }
+        }
         _ => CopyRead::Unreadable,
     }
 }
@@ -113,6 +126,33 @@ impl Fault {
     }
 }
 
+#[cfg(feature = "qualification")]
+impl Fault {
+    /// Unique evidence that this hook fired after its real stage completed.
+    #[must_use]
+    pub fn injected_error(self) -> SysError {
+        SysError::Failed(match self {
+            Self::None => "storage: no injection",
+            Self::Open => "storage: injected Open; partial bytes may remain",
+            Self::Preallocate => "storage: injected Preallocate; partial bytes may remain",
+            Self::HalfWrite => "storage: injected HalfWrite; partial bytes may remain",
+            Self::FileSync => "storage: injected FileSync; partial bytes may remain",
+            Self::DirectorySync => "storage: injected DirectorySync; partial bytes may remain",
+        })
+    }
+    /// Credit exactly one iteration only when this hook actually fired.
+    pub fn credit(self, outcome: &WriteOutcome, iterations: &mut u32) -> bool {
+        let reached = self.reached(outcome);
+        *iterations += u32::from(reached);
+        reached
+    }
+    /// Only a matching injected marker earns a hook iteration.
+    #[must_use]
+    pub fn reached(self, outcome: &WriteOutcome) -> bool {
+        self != Self::None && *outcome == WriteOutcome::Failed(self.injected_error())
+    }
+}
+
 /// Opened and owned descriptors. The implementation must check the root and all
 /// ancestors before opening a copy relative to that root. Only ENOENT after that
 /// check may become Missing. All methods are single attempts, without retries.
@@ -120,6 +160,8 @@ impl Fault {
 pub trait Io {
     /// Open existing or exclusively create; creation establishes root:0600.
     fn open(&mut self, create: bool) -> Result<(), SysError>;
+    /// Best-effort unlink of only the inode created by this call, then directory sync.
+    fn cleanup_failed_create(&mut self);
     /// fstat the opened copy.
     fn stat(&mut self) -> Result<Metadata, SysError>;
     /// `F_PREALLOCATE`, `F_ALLOCATEALL`, `F_PEOFPOSMODE`, `COPY_BYTES` (not ftruncate).
@@ -140,7 +182,12 @@ pub fn write(
 ) -> WriteOutcome {
     match write_inner(io, create, bytes, fault) {
         Ok(()) => WriteOutcome::Synced,
-        Err(error) => WriteOutcome::Failed(error),
+        Err(error) => {
+            if create {
+                io.cleanup_failed_create();
+            }
+            WriteOutcome::Failed(error)
+        }
     }
 }
 fn write_inner(
@@ -152,7 +199,7 @@ fn write_inner(
     io.open(create)?;
     #[cfg(feature = "qualification")]
     if fault == Fault::Open {
-        return Err(FAILED);
+        return Err(fault.injected_error());
     }
     let meta = io.stat()?;
     if !(if create {
@@ -166,31 +213,34 @@ fn write_inner(
         io.preallocate()?;
         #[cfg(feature = "qualification")]
         if fault == Fault::Preallocate {
-            return Err(FAILED);
+            return Err(fault.injected_error());
         }
     }
     #[cfg(feature = "qualification")]
     if fault == Fault::HalfWrite {
-        io.pwrite(&bytes[..COPY_BYTES / 2])?;
-        return Err(FAILED);
+        if io.pwrite(&bytes[..COPY_BYTES / 2])? != COPY_BYTES / 2 {
+            return Err(FAILED);
+        }
+        return Err(fault.injected_error());
     }
     if io.pwrite(bytes)? != COPY_BYTES {
         return Err(FAILED);
     }
     // Preallocation reserves blocks, not length. Verify actual pwrite length.
-    if !valid_copy(io.stat()?) {
+    let final_meta = io.stat()?;
+    if !valid_copy(final_meta) || final_meta.size != COPY_BYTES as u64 {
         return Err(FAILED);
     }
     io.full_sync(false)?;
     #[cfg(feature = "qualification")]
     if fault == Fault::FileSync {
-        return Err(FAILED);
+        return Err(fault.injected_error());
     }
     if create {
         io.full_sync(true)?;
         #[cfg(feature = "qualification")]
         if fault == Fault::DirectorySync {
-            return Err(FAILED);
+            return Err(fault.injected_error());
         }
     }
     let _ = fault;
@@ -234,6 +284,17 @@ fn receive<T>(
     }
 }
 impl Workers {
+    /// All read workers, including abandoned workers, have exited.
+    #[cfg(all(target_os = "macos", feature = "qualification"))]
+    pub(crate) fn readers_idle(&self) -> bool {
+        self.readers.iter().all(thread::JoinHandle::is_finished)
+    }
+    /// Whether the next poll can start a worker (and consume a qualification gate).
+    #[cfg(all(target_os = "macos", feature = "qualification"))]
+    pub(crate) fn can_start_read(&mut self) -> bool {
+        self.readers.retain(|worker| !worker.is_finished());
+        self.read.is_none() && self.readers.len() < 2
+    }
     /// Poll the same copy read until completion or the slice deadline. A different
     /// pending copy fails closed. Capacity/expired calls start no worker.
     pub fn poll_copy(
@@ -310,6 +371,7 @@ impl Workers {
             return WriteOutcome::Failed(FAILED);
         };
         if writer.send((Box::new(job), tx)).is_err() {
+            self.writer = None;
             return WriteOutcome::Failed(FAILED);
         }
         self.outstanding = Some(rx);
@@ -324,7 +386,12 @@ impl Workers {
             Err(mpsc::RecvTimeoutError::Timeout) => WriteOutcome::TimedOut,
             result => {
                 self.outstanding = None;
-                result.unwrap_or(WriteOutcome::Failed(FAILED))
+                if let Ok(outcome) = result {
+                    outcome
+                } else {
+                    self.writer = None;
+                    WriteOutcome::Failed(FAILED)
+                }
             }
         }
     }

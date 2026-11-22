@@ -98,7 +98,9 @@ impl<P: Platform> Engine<P> {
             );
             let repaired = match read {
                 snapshot::CopyRead::Missing => self.storage_write(copy, &bytes, true, overall),
-                snapshot::CopyRead::Bytes(_) => self.storage_write(copy, &bytes, false, overall),
+                snapshot::CopyRead::Bytes(_) | snapshot::CopyRead::Short(_) => {
+                    self.storage_write(copy, &bytes, false, overall)
+                }
                 snapshot::CopyRead::Unreadable => {
                     platform::WriteOutcome::NotStarted(SysError::Failed("pair repair unreadable"))
                 }

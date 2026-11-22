@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Kill six storage protocol mutants on Linux; restore every edited byte.
+"""Kill nine storage protocol mutants on Linux; restore every edited byte.
 
 The fsync mutant adds a mock successful fsync operation after failed full-sync.
 It tests the same protocol used by Darwin; it does not execute a Darwin syscall.
@@ -39,8 +39,8 @@ def mutate(name):
         replace(SOURCE, '    io.full_sync(false)?;',
                 '    io.full_sync(false).or_else(|_| io.fsync())?;')
     elif name == 'preallocation-is-length':
-        replace(SOURCE, '    if !valid_copy(io.stat()?) {',
-                '    if false && !valid_copy(io.stat()?) {')
+        replace(SOURCE, '    if !valid_copy(final_meta) || final_meta.size != COPY_BYTES as u64 {',
+                '    if false && (!valid_copy(final_meta) || final_meta.size != COPY_BYTES as u64) {')
     elif name == 'accept-short-pwrite':
         replace(SOURCE, '    if io.pwrite(bytes)? != COPY_BYTES {',
                 '    if { let _ = io.pwrite(bytes)?; false } {')
@@ -49,6 +49,13 @@ def mutate(name):
     elif name == 'consume-abandoned':
         replace(SOURCE, '    pub fn abandon(&mut self) {\n        self.read = None;\n    }',
                 '    pub fn abandon(&mut self) {}')
+    elif name == 'no-stub-cleanup':
+        replace(SOURCE, '                io.cleanup_failed_create();', '')
+    elif name == 'short-is-unreadable':
+        replace(SOURCE, 'valid_created(m) && m.size <= COPY_BYTES as u64',
+                'valid_created(m) && m.size == COPY_BYTES as u64')
+    elif name == 'credit-unreached':
+        replace(SOURCE, '*iterations += u32::from(reached);', '*iterations += 1;')
     elif name == 'skip-directory-sync':
         replace(SOURCE, '        io.full_sync(true)?;', '')
     else:
@@ -67,6 +74,9 @@ try:
         ('accept-two-links', 'hard_linked_copy_returns_no_bytes_and_starts_no_pread'),
         ('consume-abandoned', 'abandoned_same_copy_result_is_never_consumed_by_the_next_read'),
         ('skip-directory-sync', 'create_requires_both_checked_syncs_in_order'),
+        ('no-stub-cleanup', 'failed_create_cleans_its_stub_but_never_an_existing_file'),
+        ('short-is-unreadable', 'short_stub_is_zero_padded_and_repairable_but_long_files_are_unreadable'),
+        ('credit-unreached', 'unreached_hook_iterations_earn_no_credit'),
     ]:
         try:
             mutate(name)

@@ -65,13 +65,15 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: abi-probe [--process-identity PID]\n");
         return 2;
     }
+    _Static_assert(F_FULLFSYNC == 51, "full-sync command");
+    printf("{\"F_FULLFSYNC\":%d,", F_FULLFSYNC);
     _Static_assert(sizeof(fstore_t) == 32, "fstore size");
     _Static_assert(offsetof(fstore_t, fst_flags) == 0, "fstore flags");
     _Static_assert(offsetof(fstore_t, fst_posmode) == 4, "fstore posmode");
     _Static_assert(offsetof(fstore_t, fst_offset) == 8, "fstore offset");
     _Static_assert(offsetof(fstore_t, fst_length) == 16, "fstore length");
     _Static_assert(offsetof(fstore_t, fst_bytesalloc) == 24, "fstore allocated");
-    printf("{\"fstore_t\":{\"size\":%zu,\"fields\":{\"fst_flags\":%zu,\"fst_posmode\":%zu,\"fst_offset\":%zu,\"fst_length\":%zu,\"fst_bytesalloc\":%zu}},", sizeof(fstore_t), offsetof(fstore_t, fst_flags), offsetof(fstore_t, fst_posmode), offsetof(fstore_t, fst_offset), offsetof(fstore_t, fst_length), offsetof(fstore_t, fst_bytesalloc));
+    printf("\"fstore_t\":{\"size\":%zu,\"fields\":{\"fst_flags\":%zu,\"fst_posmode\":%zu,\"fst_offset\":%zu,\"fst_length\":%zu,\"fst_bytesalloc\":%zu}},", sizeof(fstore_t), offsetof(fstore_t, fst_flags), offsetof(fstore_t, fst_posmode), offsetof(fstore_t, fst_offset), offsetof(fstore_t, fst_length), offsetof(fstore_t, fst_bytesalloc));
     BEGIN(kinfo_proc);
     FIELD(kinfo_proc, kp_proc); NEXT_FIELD(kinfo_proc, kp_eproc);
     NEXT_FIELD(kinfo_proc, kp_proc.p_pid); NEXT_FIELD(kinfo_proc, kp_proc.p_stat);

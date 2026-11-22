@@ -116,6 +116,8 @@ impl NativePlatform {
     ///
     /// # Errors
     /// Refuses inherited SIGCHLD auto-reap or non-default handlers.
+    // TODO(5a3): forbid the qualification feature in the production helper binary
+    // with compile_error! (or check the release binary in CI) when adding its constructor.
     pub fn new(paths: Paths) -> Result<Self, SysError> {
         scupper_darwin::check_sigchld().map_err(|_| SysError::Failed("native: unsafe SIGCHLD"))?;
         Ok(Self {
@@ -142,6 +144,17 @@ impl NativePlatform {
     #[cfg(feature = "qualification")]
     pub fn storage_fault(&mut self, fault: crate::platform::storage::Fault) {
         self.storage.fault = fault;
+    }
+    /// Qualification-only size/bytes just before failed-create cleanup.
+    #[cfg(feature = "qualification")]
+    pub fn storage_failed_create(&mut self) -> Option<(u64, CopyRead)> {
+        self.storage.take_failed_create()
+    }
+    /// Qualification witness that abandoned readers have exited before rewriting.
+    #[cfg(feature = "qualification")]
+    #[must_use]
+    pub fn storage_readers_idle(&self) -> bool {
+        self.storage.readers_idle()
     }
     /// Hold the next read or write worker at entry; release by sending or dropping.
     #[cfg(feature = "qualification")]

@@ -574,6 +574,9 @@ pub enum CopyRead {
     Missing,
     /// Reading remained unsuccessful.
     Unreadable,
+    /// Physically short file, zero-padded to `COPY_BYTES`; always classified torn.
+    /// Retain this provenance because the missing suffix might be all padding.
+    Short(Vec<u8>),
     /// Full read result (length is still untrusted).
     Bytes(Vec<u8>),
 }
@@ -642,6 +645,7 @@ pub fn classify_copy(read: CopyRead) -> CopyClass {
     let bytes = match read {
         CopyRead::Missing => return CopyClass::M,
         CopyRead::Unreadable => return CopyClass::U,
+        CopyRead::Short(_) => return CopyClass::T,
         CopyRead::Bytes(bytes) => bytes,
     };
     let old = bytes.len() == COPY_BYTES

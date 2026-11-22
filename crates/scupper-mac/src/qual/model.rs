@@ -239,7 +239,7 @@ mod tests {
         let workflow = include_str!("../../../../.github/workflows/ci.yml");
         assert!(workflow.contains("runner: [macos-15, macos-26]"));
         assert!(workflow.contains("tool-mutants, store, probe"));
-        assert!(workflow.contains("matrix.group == 'store' && 9"));
+        assert!(workflow.contains("matrix.group == 'store' && 10"));
         Ok(())
     }
 

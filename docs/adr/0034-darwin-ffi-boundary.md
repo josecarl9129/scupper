@@ -155,19 +155,33 @@ The provisional two-copy namespace is `Paths::production().root` with fixed
 never creates or relaxes that root. An fd-relative `O_DIRECTORY|O_NOFOLLOW` walk
 checks the root and every ancestor for root ownership and no group/world write.
 Only ENOENT opening a copy relative to that checked root establishes Missing.
-Copies require regular/root/0600/single-link/exactly 16384-byte metadata before
-read bytes or an existing-copy write are allowed.
+Copies require regular/root/0600/single-link metadata and size at most 16384
+bytes before read bytes or an existing-copy write are allowed. Short files return
+zero-padded bytes with explicit `CopyRead::Short` provenance and always classify
+as torn, so the engine repairs them. Provenance is necessary: a truncated suffix
+can consist entirely of format padding, making padded bytes alone look valid.
+Long files remain Unreadable. A write must leave exactly 16384 bytes before sync.
 
 A persistent single storage thread owns writes and their buffers through timeout.
 Busy starts nothing until the prior result is consumed by `wait_write`; reads
 have an independent bound of two live workers including abandoned workers.
 Abandon drops the receiver and never transfers an old result to a later read.
-A copy read performs one bounded pread; short reads fail closed. Deadlines bound
+A copy read performs one bounded pread matching fstat length; unexpected short
+reads fail closed. Write opens include O_NONBLOCK to reject FIFOs without hanging.
+A panicking storage worker fails its outstanding call and is replaced on retry.
+Deadlines bound
 waiting, not a kernel call on a hung volume; an abandoned worker retains its fd
 and capacity slot until return. There is no cancellation or rollback claim.
 
 `create_copy` exclusively creates and preallocates, checks the full pwrite count
 and final fstat length, then checks file and directory `F_FULLFSYNC` in order.
+Creation explicitly checks fchown and fchmod(0600), independent of umask.
+On a failed create, cleanup compares fstat(fd) with fd-relative nofollow lstat;
+only matching dev/ino may be unlinked, followed by directory F_FULLFSYNC.
+Cleanup is best effort and never changes Failed to Synced. A crash or failed
+cleanup can retain a short stub, which the normal repair path can overwrite.
+The checked root is private; this check is not an atomic conditional unlink
+against a concurrently malicious root process.
 Preallocation reserves blocks and does not set length. `write_copy` never creates
 and checks its full pwrite count and file `F_FULLFSYNC`. There is no fsync fallback.
 Failed writes, failed syncs and timed-out writes may leave partial bytes, or the
@@ -176,8 +190,21 @@ about content. Only a complete protocol can return Synced.
 
 Q-STORE injects per-call failures in qualification builds only and observes APFS
 unfilled/full images; full means ENOSPC on a block write, not zero free blocks.
-Full-volume operations may fail before the selected injection stage. The SDK
-probe pins the local fstore_t binding. The journal and independent dead-man own
+Full-volume operations may fail before the selected injection stage. Only the
+matching per-stage injected marker earns an iteration. Unfilled runs require
+all hooks to fire and check create size/bytes before cleanup (0/0/8192/16384/16384
+bytes, with Short provenance before the full length). Final create post-state is
+Missing after cleanup, and failed
+overwrite bytes must match the completed stage. Evidence records reached and
+unreached counts; the 500 minimum applies only to reached operations. The SDK
+probe pins the local fstore_t binding and F_FULLFSYNC command (51), compared to
+the Rust libc constant before storage operations. Source regression checks pin
+the fcntl call, checked -1 result and absence of fsync fallback. These checks do
+not execute Darwin sync on Linux or prove kernel/media durability.
+Q-STORE's 420-second deadline starts at run entry, includes its at-most-120-second
+setup, and fits in the 600-second CI step with 180 seconds for startup, ABI probe
+and verdict saving (the in-run probe also consumes the case budget). The journal
+and independent dead-man own
 image detachment (30 seconds, then a forced retry), mountpoints and fixture files.
 Image create/attach tools wait on an exec gate until their PID/start identity is
 synced in the resource journal; EOF before a grant starts no mutator. Recovery
@@ -187,3 +214,9 @@ established**. Neither these observations nor F_FULLFSYNC's successful return
 establish that residual. Native construction remains qualification-only. The
 install-record format/writer belongs to 5a3, so both install reads still fail
 closed and tool digests still come only from qualification-supplied pins.
+
+5a3 must prevent building the production helper with `qualification` enabled,
+using a production-bin compile_error or a release-binary CI guard. Hook exclusion
+in no-feature library builds alone is not a production-binary guard. R4 native
+mutations install helpers from qual-out: the top-level built-binaries manifest
+provides their build provenance, while experiment manifests prove installed copies.

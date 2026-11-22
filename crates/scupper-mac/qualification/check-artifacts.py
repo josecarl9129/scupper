@@ -120,6 +120,8 @@ else:
     # Visit nested experiment records even when they have no exported verdict.
     manifest_dirs = {path.parent for pattern in ["built-binaries-sha256.txt", "executed-binaries-sha256.txt"]
                      for path in root.rglob(pattern)}
+    if any(root.rglob("Q-*.json")) or (root / "verdicts.json").exists():
+        manifest_dirs.add(root)
     for directory in sorted(manifest_dirs):
         try:
             built_all = hash_map(directory / "built-binaries-sha256.txt")

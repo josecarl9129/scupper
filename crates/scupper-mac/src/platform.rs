@@ -407,7 +407,9 @@ pub trait Platform {
     /// never fresh installation; read-only and produces no effects.
     fn read_install_record(&mut self, deadline: Deadline) -> Result<InstallRecord, SysError>;
     /// One bounded read attempt. Bytes are untrusted until classified; Missing is
-    /// confirmed absence, Unreadable proves nothing. Read-only, no retry or mutation.
+    /// confirmed absence, Unreadable proves nothing. Native short private regular
+    /// copies are zero-padded to `COPY_BYTES`; longer copies are Unreadable.
+    /// Read-only, no retry or mutation.
     fn read_copy(&mut self, copy: Copy, deadline: Deadline) -> CopyRead;
     /// Continue one install read across deadline slices. Pending retains the same
     /// operation; Ready consumes its result. Pending returns only at the slice
@@ -432,7 +434,8 @@ pub trait Platform {
     /// refers only to that write; `TimedOut` retains it under the storage fence.
     fn wait_write(&mut self, deadline: Deadline) -> WriteOutcome;
     /// pwrite at zero then checked `F_FULLFSYNC`. Only Synced is complete. Errors may
-    /// leave partial bytes; never creates a missing copy. `NotStarted` means an
+    /// leave partial bytes; accepts short private regular stubs and repairs their
+    /// length, but never creates a missing copy. `NotStarted` means an
     /// expired deadline with no effect; Failed has no outstanding worker.
     /// `TimedOut` stays outstanding, Busy starts nothing. Storage
     /// mutation (separate fence), not a mutating tool; late sync may become durable.
@@ -444,7 +447,9 @@ pub trait Platform {
     ) -> WriteOutcome;
     /// Exclusively create with `O_CREAT|O_EXCL|O_NOFOLLOW`, mode 0600/root ownership,
     /// preallocate, sync file then directory with checked `F_FULLFSYNC`. Synced is
-    /// complete; existing copy fails unchanged. Other errors may leave a file;
+    /// complete; existing copy fails unchanged. On failure after exclusive create,
+    /// best-effort unlink only when fd/path dev+ino still match, then directory
+    /// `F_FULLFSYNC`. A crash or failed cleanup may leave a repairable short stub;
     /// timeout/outstanding/Busy obey `write_copy`'s storage fence, not the tool fence.
     fn create_copy(
         &mut self,

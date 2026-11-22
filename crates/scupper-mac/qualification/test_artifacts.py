@@ -23,6 +23,8 @@ class ArtifactTests(unittest.TestCase):
             (self.root / name).write_text(f"{SHA256}  harness\n")
         for name in ["built-abi-sha256.txt", "executed-probe-sha256.txt"]:
             (self.root / name).write_text(f"{SHA256}  abi-probe\n")
+        for name in ["built-binaries-sha256.txt", "executed-binaries-sha256.txt"]:
+            (self.root / name).write_text(f"{SHA256}  harness\n{SHA256}  abi-probe\n")
         self.result = {"case": "Q-SMOKE", "binary_sha256": SHA256,
                        "verdict": "assumption_holds", "iterations": 1000,
                        "detail": "fixture"}
@@ -35,6 +37,29 @@ class ArtifactTests(unittest.TestCase):
     def check(self, *arguments, env=None):
         return subprocess.run([sys.executable, str(CHECKER), str(self.root), *arguments],
                               capture_output=True, text=True, env=env, check=False)
+
+    def test_missing_both_complete_manifests_rejects_verdicts(self):
+        for name in ["built-binaries-sha256.txt", "executed-binaries-sha256.txt"]:
+            (self.root / name).unlink()
+        result = self.check()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("incomplete staged binary manifest", result.stderr)
+
+    def test_native_full_sync_checks_fcntl_without_fallback(self):
+        darwin = REPO / "crates/scupper-darwin/src"
+        source = (darwin / "sys.rs").read_text()
+        body = source.split("pub fn full_sync(", 1)[1]
+        self.assertIn("libc::fcntl(fd.as_fd().as_raw_fd(), libc::F_FULLFSYNC)", body)
+        self.assertIn("if rc == -1 { Err(last_errno()) } else { Ok(()) }", body)
+        self.assertIn("pub const FULLFSYNC_COMMAND: i32 = libc::F_FULLFSYNC;", source)
+        storage = REPO / "crates/scupper-mac/src/platform/storage.rs"
+        for path in [*darwin.rglob("*.rs"), storage, storage.with_suffix("") / "darwin.rs"]:
+            self.assertNotIn("fsync(", path.read_text(), str(path))
+        probe = (REPO / "crates/scupper-darwin/probe/abi.c").read_text()
+        self.assertIn('_Static_assert(F_FULLFSYNC == 51, "full-sync command")', probe)
+        self.assertIn('printf("{\\"F_FULLFSYNC\\":%d,", F_FULLFSYNC)', probe)
+        qualification = (REPO / "crates/scupper-mac/src/qual/store.rs").read_text()
+        self.assertIn('abi["F_FULLFSYNC"].as_i64() == Some(i64::from(scupper_darwin::FULLFSYNC_COMMAND))', qualification)
 
     def test_abi_probe_stringifies_member_before_macro_expansion(self):
         source = (REPO / "crates/scupper-darwin/probe/abi.c").read_text()
@@ -290,7 +315,8 @@ class ArtifactTests(unittest.TestCase):
             staged.write_text(manifest)
             built.unlink()
             self.assertEqual(self.check().returncode, 1)
-            staged.unlink()
+            built.write_text(manifest)
+            staged.write_text(manifest)
 
 
 if __name__ == "__main__":

@@ -2948,6 +2948,37 @@ mod fake_contracts {
         }
         Ok(())
     }
+    #[test]
+    fn create_stub_provenance_survives_pending_write_loss_and_clears_on_repair()
+    -> Result<(), SysError> {
+        let mut p = FakePlatform::new()?;
+        let bytes = snapshot::encode(1, &Snapshot::initial(Some(501), None))
+            .map_err(|_| SysError::Failed("fixture"))?;
+        p.inject(Call::Create(Copy::B), 1, Fault::CreateStub(COPY_BYTES / 2));
+        let d = limit(&mut p);
+        assert!(matches!(
+            p.create_copy(Copy::B, &bytes, d),
+            WriteOutcome::Failed(_)
+        ));
+        let d = limit(&mut p);
+        assert_eq!(p.read_copy(Copy::B, d), CopyRead::Short(bytes.to_vec()));
+        p.inject(Call::Write(Copy::B), 1, Fault::FailedPending);
+        let d = limit(&mut p);
+        assert!(matches!(
+            p.write_copy(Copy::B, &bytes, d),
+            WriteOutcome::Failed(_)
+        ));
+        let d = limit(&mut p);
+        assert_eq!(p.read_copy(Copy::B, d), CopyRead::Bytes(bytes.to_vec()));
+        p.mutate(Mutation::Reboot);
+        let d = limit(&mut p);
+        assert_eq!(p.read_copy(Copy::B, d), CopyRead::Short(bytes.to_vec()));
+        let d = limit(&mut p);
+        assert_eq!(p.write_copy(Copy::B, &bytes, d), WriteOutcome::Synced);
+        let d = limit(&mut p);
+        assert_eq!(p.read_copy(Copy::B, d), CopyRead::Bytes(bytes.to_vec()));
+        Ok(())
+    }
 }
 
 #[cfg(test)]

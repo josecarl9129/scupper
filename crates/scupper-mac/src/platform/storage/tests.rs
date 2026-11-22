@@ -17,12 +17,16 @@ fn meta() -> Metadata {
     }
 }
 #[derive(Default)]
+#[allow(clippy::struct_excessive_bools)] // Independent injected faults and file lifecycle observations.
 struct Model {
     events: Vec<&'static str>,
     short: bool,
     zero_size: bool,
     fail: Option<&'static str>,
     exists: bool,
+    created: bool,
+    cleaned: bool,
+    initial_short: bool,
 }
 impl Model {
     fn event(&mut self, name: &'static str) -> Result<(), SysError> {
@@ -40,12 +44,22 @@ impl Io for Model {
         if create && self.exists {
             return Err(FAILED);
         }
+        if create {
+            self.created = true;
+            self.exists = true;
+        }
         Ok(())
+    }
+    fn cleanup_failed_create(&mut self) {
+        if self.created {
+            self.exists = false;
+            self.cleaned = true;
+        }
     }
     fn stat(&mut self) -> Result<Metadata, SysError> {
         self.event("stat")?;
         let mut m = meta();
-        if self.zero_size {
+        if self.zero_size || (self.initial_short && !self.events.contains(&"pwrite")) {
             m.size = 0;
         }
         Ok(m)
@@ -162,7 +176,7 @@ proptest! {
     #[test]
     fn metadata_and_short_reads_fail_closed(uid in any::<u32>(), permissions in 0u32..0o10000, nlink in 0u64..5, size in 0u64..32768, regular in any::<bool>()) {
         let m = Metadata { uid, mode: permissions, nlink, size, regular };
-        prop_assert_eq!(valid_copy(m), regular && uid == 0 && permissions == 0o600 && nlink == 1 && size == COPY_BYTES as u64);
+        prop_assert_eq!(valid_copy(m), regular && uid == 0 && permissions == 0o600 && nlink == 1 && size <= COPY_BYTES as u64);
     }
     #[test]
     fn exactly_one_complete_read_is_required(length in 0usize..=COPY_BYTES) {
@@ -319,6 +333,8 @@ fn every_hook_fails_after_its_selected_stage() {
             WriteOutcome::Failed(_)
         ));
         assert_eq!(io.events.last(), Some(&last));
+        assert!(fault.reached(&write(&mut Model::default(), true, &[7; COPY_BYTES], fault)));
+        assert!(io.cleaned);
     }
 }
 #[cfg(not(feature = "qualification"))]
@@ -405,4 +421,153 @@ proptest! {
         let mut io = Model { short, zero_size, fail: if file_error {Some("file-sync")} else if directory_error {Some("directory-sync")} else {None}, ..Model::default() };
         prop_assert_eq!(write(&mut io, create, &[7; COPY_BYTES], Fault::None) == WriteOutcome::Synced, !short && !zero_size && !file_error && (!create || !directory_error));
     }
+}
+
+#[test]
+fn failed_create_cleans_its_stub_but_never_an_existing_file() {
+    for failure in [
+        "stat",
+        "preallocate",
+        "pwrite",
+        "file-sync",
+        "directory-sync",
+    ] {
+        let mut io = Model {
+            fail: Some(failure),
+            ..Model::default()
+        };
+        assert!(matches!(
+            write(&mut io, true, &[7; COPY_BYTES], Fault::None),
+            WriteOutcome::Failed(_)
+        ));
+        assert!(io.cleaned);
+        assert!(!io.exists);
+    }
+    let mut io = Model {
+        exists: true,
+        ..Model::default()
+    };
+    assert!(matches!(
+        write(&mut io, true, &[7; COPY_BYTES], Fault::None),
+        WriteOutcome::Failed(_)
+    ));
+    assert!(io.exists);
+    assert!(!io.cleaned);
+}
+
+#[test]
+fn short_stub_is_zero_padded_and_repairable_but_long_files_are_unreadable() {
+    for size in [0, 1, COPY_BYTES / 2, COPY_BYTES - 1] {
+        let mut m = meta();
+        m.size = size as u64;
+        let read = read_bytes(Ok(m), |bytes| {
+            bytes.fill(7);
+            Ok(bytes.len())
+        });
+        let mut padded = vec![0; COPY_BYTES];
+        padded[..size].fill(7);
+        assert_eq!(read, CopyRead::Short(padded));
+        assert!(!matches!(
+            crate::snapshot::classify_copy(read),
+            crate::snapshot::CopyClass::V { .. }
+        ));
+    }
+    let mut io = Model {
+        initial_short: true,
+        ..Model::default()
+    };
+    assert_eq!(
+        write(&mut io, false, &[7; COPY_BYTES], Fault::None),
+        WriteOutcome::Synced
+    );
+    assert!(io.events.contains(&"file-sync"));
+    let mut m = meta();
+    m.size += 1;
+    assert_eq!(read_bytes(Ok(m), |_| unreachable!()), CopyRead::Unreadable);
+}
+
+#[test]
+#[allow(clippy::panic)] // Deliberate worker failure, not a production panic path.
+fn panicking_writer_is_replaced_on_the_next_call() {
+    let mut workers = Workers::default();
+    assert!(matches!(
+        workers.start_write(long(), || panic!("injected worker panic")),
+        WriteOutcome::Failed(_)
+    ));
+    assert_eq!(
+        workers.start_write(long(), || WriteOutcome::Synced),
+        WriteOutcome::Synced
+    );
+    // Also cover an already-dead sender whose result was consumed previously.
+    let (tx, rx) = mpsc::channel();
+    drop(rx);
+    workers.writer = Some(tx);
+    assert!(matches!(
+        workers.start_write(long(), || WriteOutcome::Synced),
+        WriteOutcome::Failed(_)
+    ));
+    assert!(workers.writer.is_none());
+    assert_eq!(
+        workers.start_write(long(), || WriteOutcome::Synced),
+        WriteOutcome::Synced
+    );
+}
+
+#[cfg(feature = "qualification")]
+#[test]
+fn unreached_hook_iterations_earn_no_credit() {
+    let faults = [
+        Fault::Open,
+        Fault::Preallocate,
+        Fault::HalfWrite,
+        Fault::FileSync,
+        Fault::DirectorySync,
+    ];
+    let mut credited = 0;
+    for fault in faults {
+        for outcome in [
+            WriteOutcome::Failed(FAILED),
+            WriteOutcome::TimedOut,
+            WriteOutcome::Synced,
+            WriteOutcome::Failed(Fault::None.injected_error()),
+        ] {
+            assert!(!fault.credit(&outcome, &mut credited));
+        }
+        for other in faults {
+            assert_eq!(
+                fault.reached(&WriteOutcome::Failed(other.injected_error())),
+                fault == other
+            );
+        }
+    }
+    assert_eq!(credited, 0);
+    assert!(Fault::Open.credit(
+        &WriteOutcome::Failed(Fault::Open.injected_error()),
+        &mut credited
+    ));
+    assert_eq!(credited, 1);
+    let mut io = Model {
+        short: true,
+        ..Model::default()
+    };
+    let outcome = write(&mut io, true, &[7; COPY_BYTES], Fault::HalfWrite);
+    assert!(!Fault::HalfWrite.reached(&outcome));
+}
+
+#[test]
+fn truncated_zero_padding_never_classifies_as_a_complete_snapshot() {
+    let encoded = crate::snapshot::encode(1, &crate::snapshot::Snapshot::initial(Some(0), None))
+        .unwrap_or_else(|e| unreachable!("{e:?}"));
+    let mut m = meta();
+    m.size = (COPY_BYTES / 2) as u64;
+    let result = read_bytes(Ok(m), |bytes| {
+        bytes.copy_from_slice(&encoded[..COPY_BYTES / 2]);
+        Ok(bytes.len())
+    });
+    // The actual bytes equal a valid full record: provenance must still reject it.
+    assert_eq!(result, CopyRead::Short(encoded.to_vec()));
+    assert!(matches!(
+        crate::snapshot::classify_copy(result),
+        crate::snapshot::CopyClass::T
+    ));
 }

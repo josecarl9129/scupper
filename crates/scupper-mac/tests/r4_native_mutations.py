@@ -58,6 +58,8 @@ def experiment(name, expected):
     manifests.mkdir()
     built = []
     executed = []
+    # Helper provenance comes from the top-level built-binaries manifest covering
+    # qual-out; these experiment manifests additionally prove each installed copy.
     for binary in [ROOT / "target/debug/scupper-mac-qual", ROOT / "qual-out/abi-probe", ROOT / "qual-out/tool-child", ROOT / "qual-out/tool-child-utun", ROOT / "qual-out/tool-child-utun-stale"]:
         digest = hashlib.sha256(binary.read_bytes()).hexdigest()
         built.append(f"{digest}  {binary.name}\n")

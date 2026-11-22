@@ -134,6 +134,8 @@ pub enum Fault {
     LockUnknown,
     /// Persist this prefix of the new copy, leaving the old suffix.
     TornWrite(usize),
+    /// Failed exclusive create whose cleanup was lost; retain a short crash stub.
+    CreateStub(usize),
     /// New bytes are lost before sync; return failure.
     LostBeforeSync,
     /// pwrite fails before changing bytes.
@@ -261,6 +263,8 @@ pub struct CopyState {
     pub durable: Option<Box<[u8; COPY_BYTES]>>,
     /// Visible page-cache bytes: survive helper death, lost on reboot.
     pub pending: Option<Box<[u8; COPY_BYTES]>>,
+    /// Durable length of a short create stub; pending full writes take precedence.
+    pub stub_len: Option<usize>,
 }
 #[derive(Clone, Debug)]
 struct Injection {
@@ -1112,6 +1116,14 @@ impl FakePlatform {
             return WriteOutcome::Failed(SysError::Failed("copy missing"));
         }
         match fault {
+            Some(Fault::CreateStub(length)) if create => {
+                let length = length.min(COPY_BYTES - 1);
+                let mut stub = Box::new([0; COPY_BYTES]);
+                stub[..length].copy_from_slice(&bytes[..length]);
+                slot.durable = Some(stub);
+                slot.stub_len = Some(length);
+                WriteOutcome::Failed(SysError::Failed("create stub; cleanup lost"))
+            }
             Some(Fault::WriteHang | Fault::StorageDelay(_)) => {
                 slot.pending = Some(Box::new(*bytes));
                 self.outstanding = Some(copy);
@@ -1122,6 +1134,7 @@ impl FakePlatform {
                 self.wait_write(deadline)
             }
             Some(Fault::FailedDurable) => {
+                slot.stub_len = None;
                 slot.durable = Some(Box::new(*bytes));
                 slot.pending = None;
                 WriteOutcome::Failed(SysError::Failed("sync failed after durability"))
@@ -1137,6 +1150,10 @@ impl FakePlatform {
                     .unwrap_or_else(|| Box::new([0; COPY_BYTES]));
                 let prefix = prefix.min(COPY_BYTES);
                 torn[..prefix].copy_from_slice(&bytes[..prefix]);
+                slot.stub_len = slot
+                    .stub_len
+                    .map(|length| length.max(prefix))
+                    .filter(|length| *length < COPY_BYTES);
                 slot.durable = Some(torn);
                 WriteOutcome::Failed(SysError::Failed("torn write"))
             }
@@ -1146,6 +1163,7 @@ impl FakePlatform {
             }
             Some(_) => WriteOutcome::Failed(SysError::Failed("storage failure")),
             None => {
+                slot.stub_len = None;
                 slot.durable = Some(Box::new(*bytes));
                 slot.pending = None;
                 WriteOutcome::Synced
@@ -1162,6 +1180,7 @@ impl FakePlatform {
         let slot = &mut self.copies[index(copy)];
         let pending = slot.pending.take();
         if durable {
+            slot.stub_len = None;
             slot.durable = pending;
         }
         self.outstanding = None;
@@ -1253,6 +1272,9 @@ impl FakePlatform {
         // Inspect synced bytes independently of the engine's commit cache.
         // A is authoritative when valid; B is the fallback after a torn A.
         self.copies.iter().find_map(|copy| {
+            if copy.stub_len.is_some() {
+                return None;
+            }
             let bytes = copy.durable.as_ref()?;
             match classify_copy(CopyRead::Bytes(bytes.to_vec())) {
                 CopyClass::V { snapshot, .. } => Some(snapshot),
@@ -1381,6 +1403,7 @@ impl FakePlatform {
     pub fn writeback(&mut self, copy: Copy) {
         let slot = &mut self.copies[index(copy)];
         if let Some(pending) = slot.pending.take() {
+            slot.stub_len = None;
             slot.durable = Some(pending);
         }
         self.publish_shared_copies();
@@ -1818,7 +1841,15 @@ impl Platform for FakePlatform {
             slot.pending
                 .as_ref()
                 .or(slot.durable.as_ref())
-                .map_or(CopyRead::Missing, |bytes| CopyRead::Bytes(bytes.to_vec()))
+                .map_or(CopyRead::Missing, |bytes| {
+                    let mut bytes = bytes.to_vec();
+                    if let Some(length) = slot.stub_len.filter(|_| slot.pending.is_none()) {
+                        bytes[length..].fill(0);
+                        CopyRead::Short(bytes)
+                    } else {
+                        CopyRead::Bytes(bytes)
+                    }
+                })
         })
     }
     fn abandon_storage_read(&mut self) {
