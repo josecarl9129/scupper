@@ -183,7 +183,15 @@ cleanup can retain a short stub, which the normal repair path can overwrite.
 The checked root is private; this check is not an atomic conditional unlink
 against a concurrently malicious root process.
 Preallocation reserves blocks and does not set length. `write_copy` never creates
-and checks its full pwrite count and file `F_FULLFSYNC`. There is no fsync fallback.
+and checks its full pwrite count and file `F_FULLFSYNC`. When the initial fstat
+is short, repair also requires storage-root directory `F_FULLFSYNC` after the
+file sync. A failed create's surviving name may never have been synced; file
+sync alone cannot certify that repair as Synced. A directory sync failure keeps
+the repair Failed without unlinking the existing copy. The portable model tests
+both sync failures and ordering, and a skip-repair-directory-sync mutant must
+fail. The fake can retain or lose a failed create's name across reboot, and
+startup repairs Short with `write_copy` and Missing with `create_copy`.
+There is no fsync fallback.
 Failed writes, failed syncs and timed-out writes may leave partial bytes, or the
 complete old/new snapshot. A successful sync after a failed write proves nothing
 about content. Only a complete protocol can return Synced.
@@ -203,7 +211,16 @@ the fcntl call, checked -1 result and absence of fsync fallback. These checks do
 not execute Darwin sync on Linux or prove kernel/media durability.
 Q-STORE's 420-second deadline starts at run entry, includes its at-most-120-second
 setup, and fits in the 600-second CI step with 180 seconds for startup, ABI probe
-and verdict saving (the in-run probe also consumes the case budget). The journal
+and verdict saving (the in-run probe also consumes the case budget). Expiry is
+an environment Inconclusive, including through nested phase errors. Every phase
+journals start/end timestamps, elapsed seconds and outcome outside the images;
+completed timings are also included in the hook counts. The unfilled image is
+256 MiB (recorded in image-size evidence), allowing headroom for reset writes
+and APFS CoW metadata; the full image remains 4 MiB. After full-volume checks,
+the harness reclaims filler space before restoring the reserved B name and
+running deterministic concurrency resets. A rename on a full APFS image may
+itself return ENOSPC; a prior file allocation does not reserve rename metadata.
+Concurrency evidence explicitly identifies the reclaimed image state. The journal
 and independent dead-man own
 image detachment (30 seconds, then a forced retry), mountpoints and fixture files.
 Image create/attach tools wait on an exec gate until their PID/start identity is

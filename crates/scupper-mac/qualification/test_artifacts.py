@@ -1,6 +1,7 @@
 """Portable executable-identity and redaction regression checks."""
 import json
 import os
+import runpy
 from pathlib import Path
 import subprocess
 import sys
@@ -52,6 +53,7 @@ class ArtifactTests(unittest.TestCase):
         self.assertIn("libc::fcntl(fd.as_fd().as_raw_fd(), libc::F_FULLFSYNC)", body)
         self.assertIn("if rc == -1 { Err(last_errno()) } else { Ok(()) }", body)
         self.assertIn("pub const FULLFSYNC_COMMAND: i32 = libc::F_FULLFSYNC;", source)
+        self.assertIn("const _: () = assert!(libc::F_FULLFSYNC == 51);", source)
         storage = REPO / "crates/scupper-mac/src/platform/storage.rs"
         for path in [*darwin.rglob("*.rs"), storage, storage.with_suffix("") / "darwin.rs"]:
             self.assertNotIn("fsync(", path.read_text(), str(path))
@@ -60,6 +62,22 @@ class ArtifactTests(unittest.TestCase):
         self.assertIn('printf("{\\"F_FULLFSYNC\\":%d,", F_FULLFSYNC)', probe)
         qualification = (REPO / "crates/scupper-mac/src/qual/store.rs").read_text()
         self.assertIn('abi["F_FULLFSYNC"].as_i64() == Some(i64::from(scupper_darwin::FULLFSYNC_COMMAND))', qualification)
+
+    def test_native_mutation_worker_record_is_checked_before_parsing(self):
+        driver = runpy.run_path(str(REPO / "crates/scupper-mac/tests/r4_native_mutations.py"))
+        parse = driver["parse_worker_record"]
+        diagnostics = "worker stderr: died\nlaunchd job status: last exit code = 9"
+        for code, text in [(1, ""), (0, ""), (0, " \n"), (1, '{"error":"expected"}')]:
+            with self.subTest(returncode=code, stdout=text):
+                failure = subprocess.CompletedProcess([], code, stdout=text)
+                with self.assertRaises(AssertionError) as error:
+                    parse("omit-sigchld-check", failure, diagnostics)
+                message = str(error.exception)
+                self.assertIn("worker record missing, empty or unreadable", message)
+                self.assertIn("omit-sigchld-check", message)
+                self.assertIn(diagnostics, message)
+        failure = subprocess.CompletedProcess([], 0, stdout='{"error":"expected"}')
+        self.assertEqual(parse("fixture", failure, diagnostics), {"error": "expected"})
 
     def test_abi_probe_stringifies_member_before_macro_expansion(self):
         source = (REPO / "crates/scupper-darwin/probe/abi.c").read_text()

@@ -1,4 +1,5 @@
 //! Q-STORE: native error handling only; no crash/power-loss durability claim.
+use super::super::store_check::{Phases, caused_by};
 use super::{
     CaseResult, Result, Verdict, environment_issue, executable_sha256, require_ack, save_case,
     write_json,
@@ -43,10 +44,11 @@ fn deadline(end: u64, seconds: u64) -> Deadline {
     Deadline((scupper_darwin::monotonic_raw().as_secs() + seconds).min(end))
 }
 fn check_budget(end: u64) -> Result<()> {
-    ensure(
-        scupper_darwin::monotonic_raw().as_secs() < end,
-        "Q-STORE seven-minute budget expired",
-    )
+    if scupper_darwin::monotonic_raw().as_secs() < end {
+        Ok(())
+    } else {
+        Err(environment_issue("Q-STORE seven-minute budget expired"))
+    }
 }
 fn invoke(out: &Path, name: &str, args: &[&str], end: Instant) -> Result<()> {
     let evidence = super::super::command::gated_command(
@@ -84,7 +86,7 @@ fn setup_inner(out: &Path, case_end: u64) -> Result<Vec<PathBuf>> {
     append(out, &json!({"kind":"r5-tree", "path":root}))?;
     fs::DirBuilder::new().mode(0o700).create(&root)?;
     let mut roots = Vec::new();
-    for label in ["unfilled", "full"] {
+    for (label, image_size) in [("unfilled", "256m"), ("full", "4m")] {
         let directory = root.join(label);
         fs::DirBuilder::new().mode(0o700).create(&directory)?;
         let image = directory.join("storage.dmg");
@@ -97,7 +99,7 @@ fn setup_inner(out: &Path, case_end: u64) -> Result<Vec<PathBuf>> {
             &[
                 "create",
                 "-size",
-                "4m",
+                image_size,
                 "-fs",
                 "APFS",
                 "-volname",
@@ -133,7 +135,7 @@ fn setup(out: &Path, end: u64) -> Result<Vec<PathBuf>> {
         case: "Q-STORE-SETUP".into(), binary_sha256: executable_sha256()?,
         verdict: if operation.is_ok() { Verdict::Measurement } else { Verdict::Inconclusive },
         iterations: if operation.is_ok() { 2 } else { 0 },
-        detail: operation.as_ref().map_or_else(ToString::to_string, |_| "Two 4 MiB APFS images attached within the two-minute setup budget; journaled for 30-second detach then forced retry".into()),
+        detail: operation.as_ref().map_or_else(ToString::to_string, |_| "256 MiB unfilled and 4 MiB full APFS images attached within the two-minute setup budget; journaled for 30-second detach then forced retry".into()),
         evidence: Vec::new(),
     })?;
     operation
@@ -316,23 +318,19 @@ fn failed_hook_outcome(
     )?;
     Ok(final_outcome)
 }
-fn fault_loops(
-    out: &Path,
+fn fixtures(
     root: &Path,
     full: bool,
+    old: &[u8; COPY_BYTES],
+    new: &[u8; COPY_BYTES],
     end: u64,
-    result: &mut CaseResult,
-    counts: &mut [u32; 2],
-) -> Result<()> {
-    let old = snapshot::encode(1, &Snapshot::initial(Some(0), None))?;
-    let new = snapshot::encode(2, &Snapshot::initial(Some(0), None))?;
+) -> Result<(NativePlatform, fs::File, PathBuf)> {
     let mut p = NativePlatform::new(Paths::qualification(root.into()))?;
-    synced(&mut p, root, Copy::A, &old, true, end)?;
-    // Keep B's allocation out of the copy namespace during full-volume creates.
-    // Renaming it back later permits the same concurrency checks while still full.
+    synced(&mut p, root, Copy::A, old, true, end)?;
+    // Reserve B before filling, outside the copy namespace during faulted creates.
     let reserved_b = root.join("reserved-b");
     if full {
-        synced(&mut p, root, Copy::B, &new, true, end)?;
+        synced(&mut p, root, Copy::B, new, true, end)?;
         fs::rename(root.join(filename(Copy::B)), &reserved_b)?;
     }
     let filler = fs::OpenOptions::new()
@@ -340,90 +338,133 @@ fn fault_loops(
         .write(true)
         .mode(0o600)
         .open(root.join("filler"))?;
-    let mut offset = 0;
+    Ok((p, filler, reserved_b))
+}
+fn reclaim_for_concurrency(root: &Path, filler: fs::File, reserved_b: &Path) -> Result<()> {
+    // The old rename on a still-full image needed APFS metadata space and could
+    // return ENOSPC. Reclaim before the rename and deterministic reset writes.
+    drop(filler);
+    fs::remove_file(root.join("filler"))?;
+    remove(root, Copy::B)?;
+    fs::rename(reserved_b, root.join(filename(Copy::B)))?;
+    Ok(())
+}
+fn fault_loops(
+    out: &Path,
+    root: &Path,
+    full: bool,
+    end: u64,
+    result: &mut CaseResult,
+    counts: &mut [u32; 2],
+    phases: &mut Phases,
+) -> Result<()> {
+    let label = if full { "full" } else { "unfilled" };
+    let old = snapshot::encode(1, &Snapshot::initial(Some(0), None))?;
+    let new = snapshot::encode(2, &Snapshot::initial(Some(0), None))?;
+    let (mut p, filler, reserved_b) = phase(phases, out, &format!("{label}/fixtures"), |_| {
+        fixtures(root, full, &old, &new, end)
+    })?;
     let mut observations = Vec::new();
+    let mut offset = 0;
     let mut event_log = event_log(out, full)?;
-    if full {
-        observations.push(fill(&filler, &mut offset, end)?);
-    }
-    for fault in [
-        Fault::Open,
-        Fault::Preallocate,
-        Fault::HalfWrite,
-        Fault::FileSync,
-        Fault::DirectorySync,
-    ] {
-        for iteration in 0..if full { 50 } else { 100 } {
-            check_budget(end)?;
-            remove(root, Copy::B)?;
-            if full {
-                let _ = fill(&filler, &mut offset, end)?;
-            }
-            p.storage_fault(fault);
-            let outcome = p.create_copy(Copy::B, &new, deadline(end, 5));
-            let final_outcome = failed_hook_outcome(&mut p, &outcome, end)?;
-            let reached = fault.credit(&final_outcome, &mut result.iterations);
-            counts[usize::from(!reached)] += 1;
-            let before_cleanup = p.storage_failed_create();
-            if !full {
-                ensure(reached, "unfilled create did not reach its selected hook")?;
-                check_create_hook(&mut p, root, fault, before_cleanup.as_ref(), &new, end)?;
-            }
-            observations.push(json!({"fault":format!("{fault:?}"), "iteration":iteration, "operation":"create", "reached":reached, "credited":reached, "post_state_policy":"failed create inode removed", "before_cleanup":format!("{:?}",before_cleanup.as_ref().map(|(size,read)| (*size,class(read.clone())))), "outcome":format!("{outcome:?}"), "settled":format!("{final_outcome:?}"), "copies":observe(&mut p, end, &old[..], &new[..])?, "detail":"partial bytes may remain; a full image may fail before the selected hook"}));
-            if let Some(event) = observations.last() {
-                writeln!(event_log, "{event}")?;
-            }
-            if matches!(fault, Fault::Open | Fault::HalfWrite | Fault::FileSync) {
-                if !full {
-                    synced(&mut p, root, Copy::A, &old, false, end)?;
+    phase(phases, out, &format!("{label}/fault_loop"), |_| {
+        if full {
+            observations.push(fill(&filler, &mut offset, end)?);
+        }
+        for fault in [
+            Fault::Open,
+            Fault::Preallocate,
+            Fault::HalfWrite,
+            Fault::FileSync,
+            Fault::DirectorySync,
+        ] {
+            for iteration in 0..if full { 50 } else { 100 } {
+                check_budget(end)?;
+                remove(root, Copy::B)?;
+                if full {
+                    let _ = fill(&filler, &mut offset, end)?;
                 }
                 p.storage_fault(fault);
-                let outcome = p.write_copy(Copy::A, &new, deadline(end, 5));
+                let outcome = p.create_copy(Copy::B, &new, deadline(end, 5));
                 let final_outcome = failed_hook_outcome(&mut p, &outcome, end)?;
                 let reached = fault.credit(&final_outcome, &mut result.iterations);
                 counts[usize::from(!reached)] += 1;
+                let before_cleanup = p.storage_failed_create();
                 if !full {
-                    ensure(
-                        reached,
-                        "unfilled overwrite did not reach its selected hook",
-                    )?;
-                    check_overwrite_hook(&mut p, fault, &old, &new, end)?;
+                    ensure(reached, "unfilled create did not reach its selected hook")?;
+                    check_create_hook(&mut p, root, fault, before_cleanup.as_ref(), &new, end)?;
                 }
-                observations.push(json!({"fault":format!("{fault:?}"), "iteration":iteration, "operation":"overwrite", "reached":reached, "credited":reached, "outcome":format!("{outcome:?}"), "settled":format!("{final_outcome:?}"), "copies":observe(&mut p, end, &old[..], &new[..])?, "detail":"partial bytes may remain"}));
+                observations.push(json!({"fault":format!("{fault:?}"), "iteration":iteration, "operation":"create", "reached":reached, "credited":reached, "post_state_policy":"failed create inode removed", "before_cleanup":format!("{:?}",before_cleanup.as_ref().map(|(size,read)| (*size,class(read.clone())))), "outcome":format!("{outcome:?}"), "settled":format!("{final_outcome:?}"), "copies":observe(&mut p, end, &old[..], &new[..])?, "detail":"partial bytes may remain; a full image may fail before the selected hook"}));
                 if let Some(event) = observations.last() {
                     writeln!(event_log, "{event}")?;
                 }
+                if matches!(fault, Fault::Open | Fault::HalfWrite | Fault::FileSync) {
+                    let reset = if fault == Fault::HalfWrite {
+                        &[0xa5; COPY_BYTES]
+                    } else {
+                        &old
+                    };
+                    if !full {
+                        synced(&mut p, root, Copy::A, reset, false, end)?;
+                    }
+                    p.storage_fault(fault);
+                    let outcome = p.write_copy(Copy::A, &new, deadline(end, 5));
+                    let final_outcome = failed_hook_outcome(&mut p, &outcome, end)?;
+                    let reached = fault.credit(&final_outcome, &mut result.iterations);
+                    counts[usize::from(!reached)] += 1;
+                    if !full {
+                        ensure(
+                            reached,
+                            "unfilled overwrite did not reach its selected hook",
+                        )?;
+                        check_overwrite_hook(&mut p, fault, reset, &new, end)?;
+                    }
+                    observations.push(json!({"fault":format!("{fault:?}"), "iteration":iteration, "operation":"overwrite", "reached":reached, "credited":reached, "outcome":format!("{outcome:?}"), "settled":format!("{final_outcome:?}"), "copies":observe(&mut p, end, &old[..], &new[..])?, "detail":"partial bytes may remain"}));
+                    if let Some(event) = observations.last() {
+                        writeln!(event_log, "{event}")?;
+                    }
+                }
             }
         }
-    }
+        Ok(())
+    })?;
     // Actual full-volume create and overwrite outcomes, without injected errors.
-    remove(root, Copy::B)?;
-    if full {
-        let _ = fill(&filler, &mut offset, end)?;
-    }
-    observations.push(ordinary(&mut p, root, &new, end)?);
-    write_json(
-        out,
-        if full {
-            "store-full.json"
-        } else {
-            "store-unfilled.json"
-        },
-        &observations,
-    )?;
-    if full {
+    phase(phases, out, &format!("{label}/ordinary_fullness"), |_| {
         remove(root, Copy::B)?;
-        fs::rename(reserved_b, root.join(filename(Copy::B))).map_err(environment_issue)?;
-        let _ = fill(&filler, &mut offset, end)?;
-    }
-    concurrency(out, &mut p, root, &old, &new, end, full)?;
-    Ok(())
+        if full {
+            let _ = fill(&filler, &mut offset, end)?;
+        }
+        observations.push(ordinary(&mut p, root, &new, end, full)?);
+        Ok(())
+    })?;
+    phase(phases, out, &format!("{label}/iteration_evidence"), |_| {
+        write_json(
+            out,
+            if full {
+                "store-full.json"
+            } else {
+                "store-unfilled.json"
+            },
+            &observations,
+        )?;
+        Ok(())
+    })?;
+    phase(phases, out, &format!("{label}/concurrency_reset"), |_| {
+        if full {
+            reclaim_for_concurrency(root, filler, &reserved_b)?;
+        }
+        Ok(())
+    })?;
+    phase(phases, out, &format!("{label}/concurrency"), |_| {
+        concurrency(out, &mut p, root, &old, &new, end, full)
+    })
 }
 fn ordinary(
     p: &mut NativePlatform,
     root: &Path,
     new: &[u8; COPY_BYTES],
     end: u64,
+    full: bool,
 ) -> Result<Value> {
     let create = p.create_copy(Copy::B, new, deadline(end, 5));
     let final_create = settle(p, &create, end)?;
@@ -438,14 +479,37 @@ fn ordinary(
     }
     // ENOSPC on a filler block does not freeze APFS reclamation. A natural
     // create may still succeed, but only through the complete checked protocol.
-    synced(p, root, Copy::A, new, false, end)?;
+    let overwrite = p.write_copy(Copy::A, new, deadline(end, 5));
+    let final_overwrite = settle(p, &overwrite, end)?;
+    if full {
+        // Full APFS images may refuse an overwrite as well as a create. Failed
+        // remains a recorded error-handling outcome, never evidence of Synced.
+        ensure(
+            matches!(
+                final_overwrite,
+                WriteOutcome::Synced | WriteOutcome::Failed(_)
+            ),
+            "unexpected full-image overwrite outcome",
+        )?;
+    } else {
+        ensure(
+            final_create == WriteOutcome::Synced && final_overwrite == WriteOutcome::Synced,
+            "ordinary unfilled operation did not return Synced",
+        )?;
+    }
+    if final_overwrite == WriteOutcome::Synced {
+        ensure(
+            fs::metadata(root.join(filename(Copy::A)))?.size() == COPY_BYTES as u64,
+            "Synced overwrite has wrong fstat size",
+        )?;
+    }
     let directory = fs::OpenOptions::new()
         .read(true)
         .custom_flags(i32::try_from(rustix::fs::OFlags::DIRECTORY.bits())?)
         .open(root)?;
     let sync = scupper_darwin::full_sync(&directory);
     Ok(
-        json!({"ordinary_create":format!("{create:?}"), "settled_create":format!("{final_create:?}"), "overwrite":"Synced", "directory_fullfsync_rc":if sync.is_ok() {0} else {-1}, "directory_fullfsync_errno":sync.err().map_or(0, rustix::io::Errno::raw_os_error)}),
+        json!({"ordinary_create":format!("{create:?}"), "settled_create":format!("{final_create:?}"), "overwrite":format!("{overwrite:?}"), "settled_overwrite":format!("{final_overwrite:?}"), "full_image_failure_expected":full, "directory_fullfsync_rc":if sync.is_ok() {0} else {-1}, "directory_fullfsync_errno":sync.err().map_or(0, rustix::io::Errno::raw_os_error)}),
     )
 }
 fn concurrency(
@@ -535,11 +599,11 @@ fn concurrency(
         p.read_copy(Copy::A, deadline(end, 5)) == CopyRead::Bytes(old.to_vec()),
         "reader capacity was not released",
     )?;
-    // Both abandoned workers read the prior B=new before exiting. Returning an
-    // abandoned result after this rewrite is now falsifiable.
-    synced(p, root, Copy::B, old, false, end)?;
+    // Neither abandoned A=old nor B=new can satisfy this third fixture.
+    let third = snapshot::encode(3, &Snapshot::initial(Some(0), None))?;
+    synced(p, root, Copy::B, &third, false, end)?;
     ensure(
-        p.read_copy(Copy::B, deadline(end, 5)) == CopyRead::Bytes(old.to_vec()),
+        p.read_copy(Copy::B, deadline(end, 5)) == CopyRead::Bytes(third.to_vec()),
         "abandoned result was reused by the next read",
     )?;
     write_json(
@@ -549,7 +613,7 @@ fn concurrency(
         } else {
             "store-unfilled-concurrency.json"
         },
-        &json!({"racing_classes":race, "races":50, "write_timeout_busy_wait":true, "read_capacity":2, "third_busy":true, "abandon_discard":true}),
+        &json!({"image_state":if full {"filler reclaimed before deterministic concurrency resets"} else {"unfilled"}, "abandon_expected_sequence":3, "racing_classes":race, "races":50, "write_timeout_busy_wait":true, "read_capacity":2, "third_busy":true, "abandon_discard":true}),
     )
 }
 
@@ -751,50 +815,110 @@ fn root_checks(safe: &Path, bytes: &[u8; COPY_BYTES], end: u64) -> Result<()> {
     Ok(())
 }
 
+// All evidence paths are host-side. Mounted images contain fixtures only.
+fn phase<T>(
+    phases: &mut Phases,
+    out: &Path,
+    name: &str,
+    work: impl FnOnce(&mut Phases) -> Result<T>,
+) -> Result<T> {
+    phases.run(
+        name,
+        |value| {
+            let mut value = value.clone();
+            super::clean_value(&mut value);
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(out.join("store-phases.jsonl"))?;
+            writeln!(file, "{value}")?;
+            file.sync_all()?;
+            Ok(())
+        },
+        work,
+    )
+}
+
+fn check_abi(out: &Path, result: &mut CaseResult, end: u64) -> Result<()> {
+    check_budget(end)?;
+    let probe = super::probe_path()?;
+    let evidence = super::invoke(probe.to_str().ok_or("ABI probe path")?, &[]);
+    ensure(evidence.complete(), "ABI probe incomplete")?;
+    let abi: Value = serde_json::from_str(&evidence.stdout)?;
+    result.evidence.push(evidence);
+    write_json(out, "store-abi.json", &abi)?;
+    ensure(
+        abi["F_FULLFSYNC"].as_i64() == Some(i64::from(scupper_darwin::FULLFSYNC_COMMAND)),
+        "F_FULLFSYNC command differs from SDK",
+    )?;
+    ensure(
+        abi["fstore_t"]["size"].as_u64() == Some(scupper_darwin::FSTORE_SIZE as u64),
+        "fstore_t size mismatch",
+    )?;
+    for (field, offset) in scupper_darwin::FSTORE_FIELDS {
+        ensure(
+            abi["fstore_t"]["fields"][field].as_u64() == Some(offset as u64),
+            "fstore_t field mismatch",
+        )?;
+    }
+    Ok(())
+}
+
 pub(super) fn run(out: &Path) -> Result<()> {
     let end = scupper_darwin::monotonic_raw().as_secs() + 420;
+    let mut phases = Phases::default();
     let mut counts = [0u32; 2]; // reached, unreached, including overwrites
-    require_ack(out)?;
-    let mut result = CaseResult { case:"Q-STORE".into(), binary_sha256:executable_sha256()?, verdict:Verdict::AssumptionHolds, iterations:0, detail:"Error handling only; partial bytes may remain after every failure. Synced creates require checked file and directory F_FULLFSYNC. Crash and power-loss durability are not established.".into(), evidence:Vec::new() };
+    let hash = phase(&mut phases, out, "acknowledgement", |_| {
+        require_ack(out)?;
+        executable_sha256()
+    })?;
+    let mut result = CaseResult { case:"Q-STORE".into(), binary_sha256:hash, verdict:Verdict::AssumptionHolds, iterations:0, detail:"Error handling only; partial bytes may remain after every failure. Synced creates and short-copy repairs require checked file and directory F_FULLFSYNC. Crash and power-loss durability are not established.".into(), evidence:Vec::new() };
     let operation = (|| -> Result<()> {
-        let probe = super::probe_path()?;
-        let evidence = super::invoke(probe.to_str().ok_or("ABI probe path")?, &[]);
-        ensure(evidence.complete(), "ABI probe incomplete")?;
-        let abi: Value = serde_json::from_str(&evidence.stdout)?;
-        result.evidence.push(evidence);
-        write_json(out, "store-abi.json", &abi)?;
-        ensure(
-            abi["F_FULLFSYNC"].as_i64() == Some(i64::from(scupper_darwin::FULLFSYNC_COMMAND)),
-            "F_FULLFSYNC command differs from SDK",
-        )?;
-        ensure(
-            abi["fstore_t"]["size"].as_u64() == Some(scupper_darwin::FSTORE_SIZE as u64),
-            "fstore_t size mismatch",
-        )?;
-        for (field, offset) in scupper_darwin::FSTORE_FIELDS {
-            ensure(
-                abi["fstore_t"]["fields"][field].as_u64() == Some(offset as u64),
-                "fstore_t field mismatch",
+        phase(&mut phases, out, "abi", |_| {
+            check_abi(out, &mut result, end)
+        })?;
+        let roots = phase(&mut phases, out, "setup", |_| setup(out, end))?;
+        phase(&mut phases, out, "evidence_location", |_| {
+            let evidence = out.canonicalize()?;
+            for root in &roots {
+                ensure(
+                    !evidence.starts_with(root.canonicalize()?)
+                        && fs::metadata(out)?.dev() != fs::metadata(root)?.dev(),
+                    "harness evidence must be outside both APFS images",
+                )?;
+            }
+            write_json(
+                out,
+                "store-image-sizes.json",
+                &json!({"unfilled_bytes":256 * 1024 * 1024,
+                "full_bytes":4 * 1024 * 1024, "evidence_outside_images":true,
+                "full_concurrency":"filler reclaimed before deterministic concurrency resets"}),
+            )
+        })?;
+        phase(&mut phases, out, "path_checks", |_| {
+            path_checks(out, &roots[0], end)
+        })?;
+        for (index, root) in roots.iter().enumerate() {
+            phase(
+                &mut phases,
+                out,
+                if index == 0 { "unfilled" } else { "full" },
+                |phases| fault_loops(out, root, index == 1, end, &mut result, &mut counts, phases),
             )?;
         }
-        let roots = setup(out, end)?;
-        path_checks(out, &roots[0], end)?;
-        for (index, root) in roots.iter().enumerate() {
-            fault_loops(out, root, index == 1, end, &mut result, &mut counts)?;
-        }
-        ensure(
-            result.iterations >= 500,
-            "fewer than 500 reached hook iterations",
-        )?;
-        Ok(())
+        phase(&mut phases, out, "minimum_credit", |_| {
+            check_budget(end)?;
+            ensure(
+                result.iterations >= 500,
+                "fewer than 500 reached hook iterations",
+            )
+        })
     })();
-    write_json(
-        out,
-        "store-hook-counts.json",
-        &json!({"reached":counts[0], "unreached":counts[1], "credited":result.iterations, "minimum_reached":500}),
-    )?;
     if let Err(error) = &operation {
-        result.verdict = if error.is::<super::EnvironmentIssue>() {
+        result.verdict = if caused_by::<super::EnvironmentIssue>(&**error)
+            || caused_by::<std::io::Error>(&**error)
+        {
             Verdict::Inconclusive
         } else {
             Verdict::ContractViolation
@@ -808,15 +932,28 @@ pub(super) fn run(out: &Path) -> Result<()> {
         "; hooks reached={}, unreached={}, credited={}",
         counts[0], counts[1], result.iterations
     )?;
-    save_case(out, &result)?;
-    let mut results = Vec::new();
-    if out.join("Q-STORE-SETUP.json").exists() {
-        results.push(super::read_json::<CaseResult>(
-            &out.join("Q-STORE-SETUP.json"),
-        )?);
-    }
-    results.push(result);
-    write_json(out, "verdicts.json", &results)?;
+    phase(&mut phases, out, "hook_counts_evidence", |phases| {
+        write_json(
+            out,
+            "store-hook-counts.json",
+            &json!({"reached":counts[0], "unreached":counts[1],
+            "credited":result.iterations, "minimum_reached":500, "budget_seconds":420,
+            "setup_budget_seconds":120, "ci_step_seconds":600, "phases":phases.records}),
+        )
+    })?;
+    phase(&mut phases, out, "case_evidence", |_| {
+        save_case(out, &result)
+    })?;
+    phase(&mut phases, out, "verdict_evidence", |_| {
+        let mut results = Vec::new();
+        if out.join("Q-STORE-SETUP.json").exists() {
+            results.push(super::read_json::<CaseResult>(
+                &out.join("Q-STORE-SETUP.json"),
+            )?);
+        }
+        results.push(result);
+        write_json(out, "verdicts.json", &results)
+    })?;
     operation
 }
 
@@ -837,5 +974,22 @@ pub(super) fn restore_tree(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => failures.push(e.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn budget_expiry_remains_environment_through_phase_context() {
+        let mut phases = Phases::default();
+        let error = phases
+            .run("unfilled/fault_loop", |_| Ok(()), |_| check_budget(0))
+            .err()
+            .unwrap_or_else(|| unreachable!());
+        assert!(caused_by::<super::super::EnvironmentIssue>(&*error));
+        assert!(error.to_string().contains("phase unfilled/fault_loop"));
+        assert_eq!(phases.records[0]["outcome"], "error");
     }
 }

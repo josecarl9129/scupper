@@ -1491,6 +1491,7 @@ pub fn preallocate(fd: impl std::os::fd::AsFd, length: i64) -> Result<(), Errno>
 }
 /// fcntl full-sync command, compared with the SDK C probe before Q-STORE.
 pub const FULLFSYNC_COMMAND: i32 = libc::F_FULLFSYNC;
+const _: () = assert!(libc::F_FULLFSYNC == 51);
 
 /// Full-sync a file or directory, checking the result without any fallback.
 ///

@@ -2949,12 +2949,65 @@ mod fake_contracts {
         Ok(())
     }
     #[test]
+    fn volatile_stub_name_needs_repair_not_just_data_writeback() -> Result<(), SysError> {
+        for repair in [false, true] {
+            let mut p = FakePlatform::new()?;
+            let bytes = [7; COPY_BYTES];
+            p.inject(
+                Call::Create(Copy::B),
+                1,
+                Fault::CreateStub {
+                    len: COPY_BYTES / 2,
+                    durable_name: false,
+                },
+            );
+            let d = limit(&mut p);
+            assert!(matches!(
+                p.create_copy(Copy::B, &bytes, d),
+                WriteOutcome::Failed(_)
+            ));
+            if repair {
+                let d = limit(&mut p);
+                assert_eq!(p.write_copy(Copy::B, &bytes, d), WriteOutcome::Synced);
+            } else {
+                p.inject(Call::Write(Copy::B), 1, Fault::FailedPending);
+                let d = limit(&mut p);
+                assert!(matches!(
+                    p.write_copy(Copy::B, &bytes, d),
+                    WriteOutcome::Failed(_)
+                ));
+                p.writeback(Copy::B);
+            }
+            let d = limit(&mut p);
+            assert_eq!(p.read_copy(Copy::B, d), CopyRead::Bytes(bytes.to_vec()));
+            p.mutate(Mutation::Reboot);
+            let d = limit(&mut p);
+            assert_eq!(
+                p.read_copy(Copy::B, d),
+                if repair {
+                    CopyRead::Bytes(bytes.to_vec())
+                } else {
+                    CopyRead::Missing
+                }
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn create_stub_provenance_survives_pending_write_loss_and_clears_on_repair()
     -> Result<(), SysError> {
         let mut p = FakePlatform::new()?;
         let bytes = snapshot::encode(1, &Snapshot::initial(Some(501), None))
             .map_err(|_| SysError::Failed("fixture"))?;
-        p.inject(Call::Create(Copy::B), 1, Fault::CreateStub(COPY_BYTES / 2));
+        p.inject(
+            Call::Create(Copy::B),
+            1,
+            Fault::CreateStub {
+                len: COPY_BYTES / 2,
+                durable_name: true,
+            },
+        );
         let d = limit(&mut p);
         assert!(matches!(
             p.create_copy(Copy::B, &bytes, d),

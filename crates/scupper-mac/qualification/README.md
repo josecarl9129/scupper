@@ -172,16 +172,27 @@ The existing `macos` job's `Clippy portable CLI and release tooling` step alread
 runs clippy without features, including the adapter and its Darwin dependency.
 
 R5 adds `run --group store` on both native runners. Image setup has two minutes
-for two 4 MiB APFS images; Q-STORE has seven minutes. The cell selects each of
-five per-call faults 50 times on each image, classifies both copies after every
+for a 256 MiB unfilled image and a 4 MiB full image; Q-STORE has seven minutes,
+including setup. Image sizes and the off-image evidence check are recorded.
+The cell selects each of five create faults 100 times unfilled and 50 times full,
+plus three overwrite faults at the same counts, classifies both copies after every
 operation, and separately checks full-volume create/overwrite, exact fstat size,
 directory F_FULLFSYNC errno, root/copy rejection, read/write races, outstanding
 write Busy/TimedOut/wait, and the two-reader/abandon limit. Full means ENOSPC on a
 16 KiB block write. Full-volume create failures can precede the selected hook;
 that is recorded rather than credited as reaching the hook. Every failure may
 leave partial bytes. Synced requires the complete applicable write/sync protocol.
-These are **error handling checks only; crash and power-loss durability are not
-established**.
+The full-image ordinary overwrite may also fail; it is recorded, with no Synced
+credit. After full-volume checks the filler is reclaimed before renaming the
+reserved B copy and preparing deterministic concurrency fixtures. Concurrency
+evidence names that image state. This prevents expected full-image rename/CoW
+ENOSPC from aborting fixture preparation. No harness evidence is written onto
+either image. Every phase writes start/end timestamps, elapsed seconds and
+outcome to `store-phases.jsonl`, with completed timings in
+`store-hook-counts.json`; unexpected errors name their phase. Budget expiry is
+an environment Inconclusive. Both create and Short-copy repair require file then
+directory F_FULLFSYNC before Synced. These are **error handling checks only;
+crash and power-loss durability are not established**.
 
 The R5 tree, images and mounts have write-ahead journal intents. Image tools
 wait on an exec gate until their PID/start identity is journaled and synced;

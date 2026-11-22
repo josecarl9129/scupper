@@ -44,8 +44,14 @@ fn failed_create_stub_is_repaired_without_manual_action() {
     for length in [0, COPY_BYTES / 2] {
         let mut e = fresh();
         e.platform.mutate(Mutation::MissingCopy(Copy::B));
-        e.platform
-            .inject(Call::Create(Copy::B), 1, Fault::CreateStub(length));
+        e.platform.inject(
+            Call::Create(Copy::B),
+            1,
+            Fault::CreateStub {
+                len: length,
+                durable_name: true,
+            },
+        );
         e.repair_pending = Some((Copy::B, snapshot::encode(e.seq, &e.snapshot).unwrap()));
         e.storage_blocked = true;
         e.next_storage = e.platform.now();
@@ -65,5 +71,59 @@ fn failed_create_stub_is_repaired_without_manual_action() {
         assert_eq!(e.platform.copies[1].stub_len, None);
         assert_eq!(read_snapshot(&mut e.platform, Copy::B), e.snapshot);
         assert!(e.platform.calls.contains(&Call::Write(Copy::B)));
+    }
+}
+
+#[test]
+fn startup_repairs_short_copy_by_overwrite_and_missing_name_by_create() {
+    for length in [0, COPY_BYTES / 2] {
+        for durable_name in [false, true] {
+            let state = Snapshot::initial(Some(501), None);
+            let bytes = snapshot::encode(1, &state).unwrap();
+            let mut p = fixture(&state);
+            p.mutate(Mutation::MissingCopy(Copy::B));
+            p.inject(
+                Call::Create(Copy::B),
+                1,
+                Fault::CreateStub {
+                    len: length,
+                    durable_name,
+                },
+            );
+            let d = Deadline(p.now() + 1);
+            assert!(matches!(
+                p.create_copy(Copy::B, &bytes, d),
+                WriteOutcome::Failed(_)
+            ));
+            let d = Deadline(p.now() + 1);
+            assert!(matches!(p.read_copy(Copy::B, d), CopyRead::Short(_)));
+            p.mutate(Mutation::Reboot);
+            let d = Deadline(p.now() + 1);
+            assert_eq!(
+                matches!(p.read_copy(Copy::B, d), CopyRead::Short(_)),
+                durable_name
+            );
+            p.calls.clear();
+            let mut e = Engine::start(p).unwrap();
+            let first = e
+                .platform
+                .calls
+                .iter()
+                .find(|call| matches!(call, Call::Write(_) | Call::Create(_)))
+                .unwrap();
+            assert_eq!(
+                *first,
+                if durable_name {
+                    Call::Write(Copy::B)
+                } else {
+                    Call::Create(Copy::B)
+                }
+            );
+            if durable_name {
+                assert!(!e.platform.calls.contains(&Call::Create(Copy::B)));
+            }
+            assert_eq!(e.mode, Mode::Normal);
+            assert_eq!(read_snapshot(&mut e.platform, Copy::B), e.snapshot);
+        }
     }
 }

@@ -571,3 +571,89 @@ fn truncated_zero_padding_never_classifies_as_a_complete_snapshot() {
         crate::snapshot::CopyClass::T
     ));
 }
+
+#[test]
+fn short_repair_requires_both_checked_syncs_in_order() {
+    for failure in [None, Some("file-sync"), Some("directory-sync")] {
+        let mut io = Model {
+            initial_short: true,
+            exists: true,
+            fail: failure,
+            ..Model::default()
+        };
+        let outcome = write(&mut io, false, &[7; COPY_BYTES], Fault::None);
+        assert_eq!(outcome == WriteOutcome::Synced, failure.is_none());
+        assert!(!io.cleaned);
+        assert!(io.exists);
+        let mut expected = vec!["open", "stat", "pwrite", "stat", "file-sync"];
+        if failure != Some("file-sync") {
+            expected.push("directory-sync");
+        }
+        assert_eq!(io.events, expected);
+    }
+    // Full-length overwrites retain the file-only sync protocol.
+    let mut io = Model::default();
+    assert_eq!(
+        write(&mut io, false, &[7; COPY_BYTES], Fault::None),
+        WriteOutcome::Synced
+    );
+    assert!(!io.events.contains(&"directory-sync"));
+}
+
+#[test]
+fn read_job_factory_runs_only_after_admission() -> Result<(), Box<dyn std::error::Error>> {
+    let mut workers = Workers::default();
+    let factories = std::cell::Cell::new(0);
+    let (tx, rx) = mpsc::channel();
+    assert_eq!(
+        workers.poll_copy_with(Copy::A, short(), || {
+            factories.set(factories.get() + 1);
+            move || {
+                let _ = rx.recv();
+                CopyRead::Missing
+            }
+        }),
+        Poll::Pending
+    );
+    assert_eq!(factories.get(), 1);
+    assert_eq!(
+        workers.poll_copy_with(Copy::A, short(), || {
+            factories.set(99);
+            || CopyRead::Missing
+        }),
+        Poll::Pending
+    );
+    assert_eq!(
+        workers.poll_copy_with(Copy::B, long(), || {
+            factories.set(99);
+            || CopyRead::Missing
+        }),
+        Poll::Ready(CopyRead::Unreadable)
+    );
+    workers.abandon();
+    assert_eq!(
+        workers.poll_copy_with(
+            Copy::B,
+            || Duration::ZERO,
+            || {
+                factories.set(99);
+                || CopyRead::Missing
+            }
+        ),
+        Poll::Ready(CopyRead::Unreadable)
+    );
+    assert_eq!(factories.get(), 1);
+    tx.send(())?;
+    for handle in workers.readers.drain(..) {
+        assert!(handle.join().is_ok());
+    }
+    assert_eq!(
+        workers.poll_copy_with(Copy::B, long(), || {
+            factories.set(factories.get() + 1);
+            || CopyRead::Missing
+        }),
+        Poll::Ready(CopyRead::Missing)
+    );
+    assert_eq!(factories.get(), 2);
+    Ok(())
+}

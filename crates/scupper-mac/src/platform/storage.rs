@@ -236,7 +236,8 @@ fn write_inner(
     if fault == Fault::FileSync {
         return Err(fault.injected_error());
     }
-    if create {
+    // A repaired stub may have an unsynced directory entry from its failed create.
+    if create || meta.size < COPY_BYTES as u64 {
         io.full_sync(true)?;
         #[cfg(feature = "qualification")]
         if fault == Fault::DirectorySync {
@@ -289,12 +290,6 @@ impl Workers {
     pub(crate) fn readers_idle(&self) -> bool {
         self.readers.iter().all(thread::JoinHandle::is_finished)
     }
-    /// Whether the next poll can start a worker (and consume a qualification gate).
-    #[cfg(all(target_os = "macos", feature = "qualification"))]
-    pub(crate) fn can_start_read(&mut self) -> bool {
-        self.readers.retain(|worker| !worker.is_finished());
-        self.read.is_none() && self.readers.len() < 2
-    }
     /// Poll the same copy read until completion or the slice deadline. A different
     /// pending copy fails closed. Capacity/expired calls start no worker.
     pub fn poll_copy(
@@ -303,6 +298,19 @@ impl Workers {
         remaining: impl Fn() -> Duration,
         job: impl FnOnce() -> CopyRead + Send + 'static,
     ) -> Poll<CopyRead> {
+        self.poll_copy_with(copy, remaining, || job)
+    }
+    /// Construct a read job only in the spawn branch, after pruning and all
+    /// admission checks. Qualification gates are consumed at this same boundary.
+    pub fn poll_copy_with<F>(
+        &mut self,
+        copy: Copy,
+        remaining: impl Fn() -> Duration,
+        make_job: impl FnOnce() -> F,
+    ) -> Poll<CopyRead>
+    where
+        F: FnOnce() -> CopyRead + Send + 'static,
+    {
         self.readers.retain(|worker| !worker.is_finished());
         if self.read.as_ref().is_some_and(|r| r.copy != copy) {
             return Poll::Ready(CopyRead::Unreadable);
@@ -311,6 +319,7 @@ impl Workers {
             if self.readers.len() >= 2 || remaining().is_zero() {
                 return Poll::Ready(CopyRead::Unreadable);
             }
+            let job = make_job();
             let (tx, rx) = mpsc::channel();
             let worker = thread::Builder::new()
                 .name("scupper-read".into())

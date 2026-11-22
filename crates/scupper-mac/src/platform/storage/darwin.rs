@@ -205,20 +205,19 @@ impl Storage {
         copy: Copy,
         deadline: Deadline,
     ) -> std::task::Poll<CopyRead> {
-        #[cfg(feature = "qualification")]
-        let gate = if self.workers.can_start_read() && !remaining(deadline)().is_zero() {
-            self.read_gate.take()
-        } else {
-            None
-        };
-        self.workers.poll_copy(copy, remaining(deadline), move || {
+        self.workers.poll_copy_with(copy, remaining(deadline), || {
             #[cfg(feature = "qualification")]
-            if let Some(gate) = gate {
-                let _ = gate.recv();
+            let gate = self.read_gate.take();
+            move || {
+                #[cfg(feature = "qualification")]
+                if let Some(gate) = gate {
+                    let _ = gate.recv();
+                }
+                read(&path, copy)
             }
-            read(&path, copy)
         })
     }
+
     pub(crate) fn abandon(&mut self) {
         self.workers.abandon();
     }

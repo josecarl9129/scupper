@@ -408,7 +408,8 @@ pub trait Platform {
     fn read_install_record(&mut self, deadline: Deadline) -> Result<InstallRecord, SysError>;
     /// One bounded read attempt. Bytes are untrusted until classified; Missing is
     /// confirmed absence, Unreadable proves nothing. Native short private regular
-    /// copies are zero-padded to `COPY_BYTES`; longer copies are Unreadable.
+    /// copies return `CopyRead::Short` (zero-padded to `COPY_BYTES`, always
+    /// classified torn); longer copies are Unreadable.
     /// Read-only, no retry or mutation.
     fn read_copy(&mut self, copy: Copy, deadline: Deadline) -> CopyRead;
     /// Continue one install read across deadline slices. Pending retains the same

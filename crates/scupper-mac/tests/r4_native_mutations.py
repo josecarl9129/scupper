@@ -44,6 +44,12 @@ def privileged(args, *, check=True):
     return command(SUDO + args, check=check)
 
 
+def parse_worker_record(name, failure, diagnostics):
+    assert failure.returncode == 0 and failure.stdout.strip(), (
+        f"{name}: worker record missing, empty or unreadable; {diagnostics}")
+    return json.loads(failure.stdout)
+
+
 def experiment(name, expected):
     started = time.monotonic()
     build = command(["cargo", "build", "-p", "scupper-mac", "--bin",
@@ -79,11 +85,16 @@ def experiment(name, expected):
         result = privileged([executable, "r4-tools", *args], check=False)
         stderr = privileged(["/bin/cat", str(out / "tool-worker-tools.stderr.log")], check=False)
         failure = privileged(["/bin/cat", str(out / "tool-worker-tools.json")], check=False)
-        (LOGS / f"{name}-assertion.log").write_text(result.stdout + result.stderr + stderr.stdout + failure.stdout)
+        status = privileged(["/bin/launchctl", "print", "system/net.scupper.qual.r4-tools"], check=False)
+        diagnostics = (f"{name}: controller stderr:\n{result.stderr}"
+                       f"\nworker stderr (read rc={stderr.returncode}):\n{stderr.stdout}{stderr.stderr}"
+                       f"\nlaunchd job status (rc={status.returncode}):\n{status.stdout}{status.stderr}"
+                       f"\nworker record (read rc={failure.returncode}):\n{failure.stdout}{failure.stderr}")
+        (LOGS / f"{name}-assertion.log").write_text(result.stdout + diagnostics)
         if expected is None:
             assert result.returncode == 0, result.stderr + stderr.stdout
         else:
-            record = json.loads(failure.stdout)
+            record = parse_worker_record(name, failure, diagnostics)
             assert result.returncode != 0 and expected in record.get("error", ""), (name, result.stderr, record)
             if name == "omit-cloexec-default":
                 # Each path must independently detect BOTH deliberately inheritable

@@ -135,7 +135,12 @@ pub enum Fault {
     /// Persist this prefix of the new copy, leaving the old suffix.
     TornWrite(usize),
     /// Failed exclusive create whose cleanup was lost; retain a short crash stub.
-    CreateStub(usize),
+    CreateStub {
+        /// Visible stub prefix length.
+        len: usize,
+        /// Whether the failed create's name survives reboot.
+        durable_name: bool,
+    },
     /// New bytes are lost before sync; return failure.
     LostBeforeSync,
     /// pwrite fails before changing bytes.
@@ -265,6 +270,8 @@ pub struct CopyState {
     pub pending: Option<Box<[u8; COPY_BYTES]>>,
     /// Durable length of a short create stub; pending full writes take precedence.
     pub stub_len: Option<usize>,
+    /// Failed create name may disappear on reboot until a repair syncs it.
+    pub volatile_name: bool,
 }
 #[derive(Clone, Debug)]
 struct Injection {
@@ -1116,12 +1123,13 @@ impl FakePlatform {
             return WriteOutcome::Failed(SysError::Failed("copy missing"));
         }
         match fault {
-            Some(Fault::CreateStub(length)) if create => {
-                let length = length.min(COPY_BYTES - 1);
+            Some(Fault::CreateStub { len, durable_name }) if create => {
+                let length = len.min(COPY_BYTES - 1);
                 let mut stub = Box::new([0; COPY_BYTES]);
                 stub[..length].copy_from_slice(&bytes[..length]);
                 slot.durable = Some(stub);
                 slot.stub_len = Some(length);
+                slot.volatile_name = !durable_name;
                 WriteOutcome::Failed(SysError::Failed("create stub; cleanup lost"))
             }
             Some(Fault::WriteHang | Fault::StorageDelay(_)) => {
@@ -1135,6 +1143,7 @@ impl FakePlatform {
             }
             Some(Fault::FailedDurable) => {
                 slot.stub_len = None;
+                slot.volatile_name = false;
                 slot.durable = Some(Box::new(*bytes));
                 slot.pending = None;
                 WriteOutcome::Failed(SysError::Failed("sync failed after durability"))
@@ -1164,6 +1173,7 @@ impl FakePlatform {
             Some(_) => WriteOutcome::Failed(SysError::Failed("storage failure")),
             None => {
                 slot.stub_len = None;
+                slot.volatile_name = false;
                 slot.durable = Some(Box::new(*bytes));
                 slot.pending = None;
                 WriteOutcome::Synced
@@ -1181,6 +1191,7 @@ impl FakePlatform {
         let pending = slot.pending.take();
         if durable {
             slot.stub_len = None;
+            slot.volatile_name = false;
             slot.durable = pending;
         }
         self.outstanding = None;
@@ -1404,6 +1415,7 @@ impl FakePlatform {
         let slot = &mut self.copies[index(copy)];
         if let Some(pending) = slot.pending.take() {
             slot.stub_len = None;
+            // Data writeback alone does not establish directory-entry durability.
             slot.durable = Some(pending);
         }
         self.publish_shared_copies();
@@ -1566,6 +1578,9 @@ impl FakePlatform {
                 self.crash();
                 for slot in &mut self.copies {
                     slot.pending = None;
+                    if slot.volatile_name {
+                        *slot = CopyState::default();
+                    }
                 }
                 self.anonymous_enabled = false;
                 self.boot_sequence += 1;
