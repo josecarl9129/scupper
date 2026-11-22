@@ -387,7 +387,7 @@ impl NativePlatform {
             {
                 if let Some(path) = owned
                     .unix_listener(fd)
-                    .map_err(|_| SysError::Failed("native: utun cross-check unavailable"))?
+                    .map_err(|_| SysError::Failed("native: child unix listener unreadable"))?
                 {
                     listeners.push(path);
                 }

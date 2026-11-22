@@ -916,11 +916,13 @@ fn worker_inner(out: &Path, mode: &str) -> Result<()> {
         },
         deadline(5),
     );
-    if mode == "real" {
-        ensure(
-            outcome.is_ok(),
-            "native wireguard spawn did not return complete child identity",
-        )?;
+    if mode == "real"
+        && let Err(error) = &outcome
+    {
+        return Err(format!(
+            "native wireguard spawn did not return complete child identity: {error:?}"
+        )
+        .into());
     }
     let child = p
         .spawned_children()
