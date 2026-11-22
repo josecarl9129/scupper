@@ -28,7 +28,7 @@ MUTANTS = [
      "if false && crate::platform::runtime::utun_crosscheck(protected_socket).is_err() {",
      "utun cross-check assertion: uncorroborated control-unit name accepted"),
     ("accept-socket-without-child-listener", NATIVE,
-     "let child_listening = listeners.len() == 1 && listeners[0] == socket;",
+     "let child_listening = !listeners.is_empty() && listeners.iter().all(|path| *path == socket);",
      "let child_listening = true;",
      "utun cross-check assertion: socket without child listener accepted"),
 ]

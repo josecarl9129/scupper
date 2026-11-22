@@ -43,7 +43,10 @@ fn corroborating_socket(name: &str, listeners: &[PathBuf]) -> bool {
     let socket = Path::new("/var/run/wireguard").join(format!("{name}.sock"));
     let directory = std::fs::symlink_metadata("/var/run/wireguard")
         .is_ok_and(|m| m.is_dir() && m.uid() == 0 && m.mode() & 0o022 == 0);
-    let child_listening = listeners.len() == 1 && listeners[0] == socket;
+    // wireguard-go keeps several descriptors for its one UAPI listener (ListenUnix,
+    // then File() and FileListener() dups), so require every unix listener the
+    // child holds to be the expected path, and at least one to exist.
+    let child_listening = !listeners.is_empty() && listeners.iter().all(|path| *path == socket);
     directory
         && child_listening
         && scupper_darwin::interface_index(name).is_ok()
