@@ -1441,3 +1441,63 @@ pub fn proc_socket_fds(pid: u32) -> Result<Vec<i32>, Errno> {
 pub fn proc_control(pid: u32, fd: i32) -> Result<Option<ControlSocket>, Errno> {
     read_control(pid, fd)
 }
+
+// libc 0.2.191 omits fstore_t. Pin the 64-bit SDK ABI, including all padding.
+#[repr(C)]
+struct Fstore {
+    flags: u32,
+    posmode: i32,
+    offset: i64,
+    length: i64,
+    bytesalloc: i64,
+}
+/// SDK `fstore_t` size.
+pub const FSTORE_SIZE: usize = 32;
+/// SDK `fstore_t` field offsets, compared with the C probe by qualification.
+pub const FSTORE_FIELDS: [(&str, usize); 5] = [
+    ("fst_flags", 0),
+    ("fst_posmode", 4),
+    ("fst_offset", 8),
+    ("fst_length", 16),
+    ("fst_bytesalloc", 24),
+];
+const _: () = {
+    assert!(std::mem::size_of::<Fstore>() == FSTORE_SIZE);
+    assert!(std::mem::offset_of!(Fstore, flags) == 0);
+    assert!(std::mem::offset_of!(Fstore, posmode) == 4);
+    assert!(std::mem::offset_of!(Fstore, offset) == 8);
+    assert!(std::mem::offset_of!(Fstore, length) == 16);
+    assert!(std::mem::offset_of!(Fstore, bytesalloc) == 24);
+};
+/// Reserve all requested blocks at physical EOF. This does not set file length.
+///
+/// # Errors
+/// Returns the checked `F_PREALLOCATE` errno. The caller retains descriptor ownership.
+pub fn preallocate(fd: impl std::os::fd::AsFd, length: i64) -> Result<(), Errno> {
+    use std::os::fd::AsRawFd;
+    let mut store = Fstore {
+        flags: libc::F_ALLOCATEALL,
+        posmode: libc::F_PEOFPOSMODE,
+        offset: 0,
+        length,
+        bytesalloc: 0,
+    };
+    // SAFETY: fd is borrowed and live for this synchronous call. store is an
+    // aligned, fully initialised SDK-compatible record. fcntl may update only its
+    // fields; no padding or returned record bytes are exposed. A timed-out caller
+    // leaves the entire call, buffer and fd owned by its storage worker.
+    let rc = unsafe { libc::fcntl(fd.as_fd().as_raw_fd(), libc::F_PREALLOCATE, &raw mut store) };
+    if rc == -1 { Err(last_errno()) } else { Ok(()) }
+}
+/// Full-sync a file or directory, checking the result without any fallback.
+///
+/// # Errors
+/// Returns the `F_FULLFSYNC` errno; fsync is never a substitute.
+pub fn full_sync(fd: impl std::os::fd::AsFd) -> Result<(), Errno> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: fd remains borrowed and live throughout synchronous fcntl, which
+    // takes no pointer argument for F_FULLFSYNC. Its owning worker retains the
+    // descriptor even after the caller's deadline. Check the return before success.
+    let rc = unsafe { libc::fcntl(fd.as_fd().as_raw_fd(), libc::F_FULLFSYNC) };
+    if rc == -1 { Err(last_errno()) } else { Ok(()) }
+}

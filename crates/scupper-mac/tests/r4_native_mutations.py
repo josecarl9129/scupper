@@ -5,6 +5,7 @@ Run as the runner user after staging /private/var/db/scupper-qual, in the dedica
 fsynced resource journal and independently armed restore. Never run cargo as root.
 """
 from pathlib import Path
+import hashlib
 import json
 import os
 import platform
@@ -53,8 +54,20 @@ def experiment(name, expected):
     assert privileged(["/bin/test", "-e", str(stage)], check=False).returncode != 0
     assert privileged(["/bin/test", "-L", str(stage)], check=False).returncode != 0
     privileged(["/usr/bin/install", "-d", "-o", "root", "-g", "wheel", "-m", "0700", str(stage)])
-    for binary in [ROOT / "target/debug/scupper-mac-qual", STAGE / "abi-probe", STAGE / "tool-child", STAGE / "tool-child-utun", STAGE / "tool-child-utun-stale"]:
+    manifests = LOGS / name
+    manifests.mkdir()
+    built = []
+    executed = []
+    for binary in [ROOT / "target/debug/scupper-mac-qual", ROOT / "qual-out/abi-probe", ROOT / "qual-out/tool-child", ROOT / "qual-out/tool-child-utun", ROOT / "qual-out/tool-child-utun-stale"]:
+        digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+        built.append(f"{digest}  {binary.name}\n")
+        (manifests / "built-binaries-sha256.txt").write_text("".join(built))
         privileged(["/usr/bin/install", "-o", "root", "-g", "wheel", "-m", "0755", str(binary), str(stage / binary.name)])
+        staged = privileged(["/usr/bin/shasum", "-a", "256", str(stage / binary.name)]).stdout
+        executed.append(staged)
+        (manifests / "executed-binaries-sha256.txt").write_text("".join(executed))
+        assert staged.split()[0] == digest, (name, binary.name, "built/staged hash mismatch")
+    command(["python3", "crates/scupper-mac/qualification/check-artifacts.py", str(manifests)])
     executable = str(stage / "scupper-mac-qual")
     out = stage / "evidence"
     args = ["--out", str(out), "--disposable-runner"]

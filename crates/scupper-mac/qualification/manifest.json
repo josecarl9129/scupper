@@ -128,6 +128,20 @@
       "minimum_iterations": 5,
       "budget_minutes": 18,
       "supported_assumptions": []
+    },
+    {
+      "id": "Q-STORE-SETUP",
+      "group": "store",
+      "minimum_iterations": 2,
+      "budget_minutes": 2,
+      "supported_assumptions": []
+    },
+    {
+      "id": "Q-STORE",
+      "group": "store",
+      "minimum_iterations": 500,
+      "budget_minutes": 7,
+      "supported_assumptions": []
     }
   ],
   "group_budgets": {

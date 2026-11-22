@@ -43,6 +43,8 @@ fn restore_service(out: &Path) -> String {
 mod base;
 #[path = "resources.rs"]
 mod resources;
+#[path = "store.rs"]
+mod store;
 #[path = "tool.rs"]
 mod tool;
 
@@ -105,12 +107,12 @@ impl Options {
         }
         if !matches!(
             options.group.as_str(),
-            "smoke" | "base" | "tool" | "probe" | "probe-hijack"
+            "smoke" | "base" | "tool" | "store" | "probe" | "probe-hijack"
         ) || options.after == 0
             || options.after > MAX_ARM_SECONDS
         {
             return Err(
-                "group must be smoke/base/tool/probe/probe-hijack; --after must be 1..1080 seconds"
+                "group must be smoke/base/tool/store/probe/probe-hijack; --after must be 1..1080 seconds"
                     .into(),
             );
         }
@@ -195,6 +197,8 @@ pub(super) fn dispatch(args: &[String]) -> Result<()> {
                 run_smoke(&options.out)
             } else if options.group == "tool" {
                 tool::run(&options.out)
+            } else if options.group == "store" {
+                store::run(&options.out)
             } else if options.group == "base" {
                 base::run(&options.out)
             } else {
@@ -1208,7 +1212,14 @@ fn final_restore_deadline(out: &Path) -> Result<Instant> {
     for (_, scope) in probe_scopes(out)? {
         remaining = remaining.saturating_add(resources::remaining(&scope)?);
     }
-    Ok(Instant::now() + Duration::from_secs(recovery::final_restore_seconds(remaining)))
+    // Two APFS images can each need a 30-second detach and forced retry.
+    // Keep the plan's full four-minute recovery margin, including final capture.
+    let seconds = if resources::entries(out)?.iter().any(|e| e.kind == "r5-tree") {
+        super::model::MAX_FINAL_RESTORE_SECONDS
+    } else {
+        recovery::final_restore_seconds(remaining)
+    };
+    Ok(Instant::now() + Duration::from_secs(seconds))
 }
 
 fn run_probe(out: &Path, name: &str) -> Result<()> {

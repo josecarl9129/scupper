@@ -61,9 +61,18 @@ jobs:
         run: |
           rustup target add aarch64-apple-darwin
           timeout 600 cargo clippy --target aarch64-apple-darwin -p scupper-darwin -p scupper-mac --all-targets --all-features --locked -- -D warnings
+          timeout 600 cargo clippy --target aarch64-apple-darwin -p scupper-darwin -p scupper-mac --all-targets --locked -- -D warnings
 
       - name: Test
         run: timeout 600 cargo test --workspace --all-features --locked
+
+      - name: Storage protocol mutants and production hook exclusion
+        env:
+          CARGO_BUILD_JOBS: 2
+          RUST_TEST_THREADS: 2
+        run: |
+          python3 crates/scupper-mac/tests/r5_storage_mutations.py
+          cargo test -p scupper-mac --no-default-features --lib production_fault_selection_has_only_none
 
       - name: Portable qualification artifact and ABI macro regressions
         run: python3 crates/scupper-mac/qualification/test_artifacts.py
@@ -234,7 +243,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [macos-15, macos-26]
-        group: [smoke, base, tool, tool-mutants, probe, probe-hijack]
+        group: [smoke, base, tool, tool-mutants, store, probe, probe-hijack]
     runs-on: ${{ matrix.runner }}
     # Native mutants: review estimate scaled to five experiments plus margin.
     timeout-minutes: ${{ matrix.group == 'tool-mutants' && 60 || 30 }}
@@ -333,6 +342,8 @@ jobs:
       - name: Stage root-owned qualification files
         timeout-minutes: 1
         run: |
+          shasum -a 256 target/debug/scupper-mac-qual qual-out/abi-probe > qual-out/built-binaries-sha256.txt
+          : > qual-out/executed-binaries-sha256.txt
           # Fail closed on an existing path; never install through a planted link.
           test ! -e /private/var/db/scupper-qual
           test ! -L /private/var/db/scupper-qual
@@ -341,12 +352,13 @@ jobs:
           /usr/bin/sudo /usr/bin/install -o root -g wheel -m 0755 qual-out/abi-probe /private/var/db/scupper-qual/abi-probe
           for binary in qual-out/probe-* qual-out/wireguard-go qual-out/base-churn qual-out/base-image-a qual-out/base-image-b qual-out/tool-child qual-out/tool-child-x86_64 qual-out/tool-child-utun qual-out/tool-child-utun-stale; do
             if [ -f "$binary" ]; then
+              shasum -a 256 "$binary" >> qual-out/built-binaries-sha256.txt
               /usr/bin/sudo /usr/bin/install -o root -g wheel -m 0755 "$binary" "/private/var/db/scupper-qual/$(basename "$binary")"
-              /usr/bin/sudo /usr/bin/shasum -a 256 "/private/var/db/scupper-qual/$(basename "$binary")" >> qual-out/executed-capability-sha256.txt
+              /usr/bin/sudo /usr/bin/shasum -a 256 "/private/var/db/scupper-qual/$(basename "$binary")" | tee -a qual-out/executed-capability-sha256.txt >> qual-out/executed-binaries-sha256.txt
             fi
           done
-          /usr/bin/sudo /usr/bin/shasum -a 256 /private/var/db/scupper-qual/scupper-mac-qual | tee qual-out/executed-harness-sha256.txt
-          /usr/bin/sudo /usr/bin/shasum -a 256 /private/var/db/scupper-qual/abi-probe | tee qual-out/executed-probe-sha256.txt
+          /usr/bin/sudo /usr/bin/shasum -a 256 /private/var/db/scupper-qual/scupper-mac-qual | tee qual-out/executed-harness-sha256.txt >> qual-out/executed-binaries-sha256.txt
+          /usr/bin/sudo /usr/bin/shasum -a 256 /private/var/db/scupper-qual/abi-probe | tee qual-out/executed-probe-sha256.txt >> qual-out/executed-binaries-sha256.txt
           test "$(cut -d ' ' -f 1 qual-out/built-harness-sha256.txt)" = "$(cut -d ' ' -f 1 qual-out/executed-harness-sha256.txt)"
       - name: Kill native R4 spawn mutants and confirm restored baseline
         if: matrix.group == 'tool-mutants'
@@ -365,7 +377,7 @@ jobs:
           /usr/bin/sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT /private/var/db/scupper-qual/scupper-mac-qual arm --after "$after" --out /private/var/db/scupper-qual/evidence --disposable-runner
       - name: Run qualification cell
         if: matrix.group != 'tool-mutants'
-        timeout-minutes: ${{ matrix.group == 'tool' && 10 || 18 }}
+        timeout-minutes: ${{ matrix.group == 'tool' && 10 || matrix.group == 'store' && 9 || 18 }}
         run: /usr/bin/sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,ImageOS,ImageVersion,RUNNER_NAME,GITHUB_RUN_ID,GITHUB_SHA /private/var/db/scupper-qual/scupper-mac-qual run --group ${{ matrix.group }} --out /private/var/db/scupper-qual/evidence --disposable-runner
       - name: Restore and stop dead-man
         if: always()
@@ -391,7 +403,7 @@ jobs:
           # Export only after the worker is gone. Root only reads its protected
           # evidence; the unprivileged tar creates the artifact files.
           if /usr/bin/sudo /bin/test -d /private/var/db/scupper-qual/evidence; then
-            /usr/bin/sudo /usr/bin/tar --exclude=storage.dmg --exclude=storage-mount --exclude=scratch-sleep --exclude=renamed-sleep --exclude=hard-sleep -C /private/var/db/scupper-qual/evidence -cf - . | tar --no-same-owner -C qual-out -xf -
+            /usr/bin/sudo /usr/bin/tar --exclude=storage.dmg --exclude=storage-mount --exclude=r5-fixtures --exclude=scratch-sleep --exclude=renamed-sleep --exclude=hard-sleep -C /private/var/db/scupper-qual/evidence -cf - . | tar --no-same-owner -C qual-out -xf -
           fi
           exit "$restore_status"
       - name: Check artifact redaction and executable identity

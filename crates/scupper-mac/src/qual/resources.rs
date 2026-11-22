@@ -308,6 +308,14 @@ pub(super) fn undo(
         }
         Err(error) => failures.push(error.to_string()),
     }
+    if entries.iter().any(|e| e.kind == "r5-tree") && writers_quiescent(out)? {
+        match attached_devices(out, &paths, deadline) {
+            Ok(devices) if devices.is_empty() => {
+                super::store::restore_tree(out, &entries, &mut actions, &mut failures);
+            }
+            _ => failures.push("R5 images not proven detached; fixture tree retained".into()),
+        }
+    }
     if entries.iter().any(|e| e.kind == "loopback-alias") {
         let interfaces = invoke_before("/sbin/ifconfig", &["lo0"], deadline);
         if interfaces.complete()
@@ -443,7 +451,7 @@ pub(super) fn complete_from_snapshot(out: &Path, post: &Snapshot, deadline: Inst
             "r4-wireguard-sockets" => {
                 fs::read_dir(&entry.path).is_ok_and(|mut entries| entries.next().is_none())
             }
-            "r4-tree" => fs::symlink_metadata(&entry.path)
+            "r4-tree" | "r5-tree" => fs::symlink_metadata(&entry.path)
                 .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
             "r4-job" => {
                 let status = invoke_before("/bin/launchctl", &["print", &entry.path], deadline);

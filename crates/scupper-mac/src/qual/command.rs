@@ -84,11 +84,77 @@ fn spawn_command(
         .spawn()
 }
 
+type Grant<'a> = Box<dyn FnOnce(u32) -> Result<(), String> + 'a>;
+
+// The shell waits on stdin before exec. EOF (including controller death before
+// journal sync) grants nothing. Arguments are positional, never shell source.
+pub(super) fn gated_command(
+    program: &str,
+    args: &[&str],
+    budget: Duration,
+    grant: impl FnOnce(u32) -> Result<(), String>,
+) -> Evidence {
+    command_inner(program, args, None, budget, Some(Box::new(grant)))
+}
+
+fn spawn_for_gate(
+    program: &str,
+    args: &[&str],
+    has_input: bool,
+    gated: bool,
+) -> std::io::Result<std::process::Child> {
+    if gated {
+        let mut gated = vec![
+            "-c",
+            "IFS= read -r grant || exit 125; test \"$grant\" = go || exit 125; exec \"$@\"",
+            "scupper-qual-gate",
+            program,
+        ];
+        gated.extend_from_slice(args);
+        spawn_command("/bin/sh", &gated, true)
+    } else {
+        spawn_command(program, args, has_input)
+    }
+}
+fn open_gate(
+    child: &mut std::process::Child,
+    grant: Option<Grant<'_>>,
+    started: Instant,
+    budget: Duration,
+) -> Result<(), String> {
+    let Some(grant) = grant else {
+        return Ok(());
+    };
+    let result = grant(child.id()).and_then(|()| {
+        if started.elapsed() >= budget {
+            return Err("deadline before exec grant".into());
+        }
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| "missing exec gate".to_owned())?
+            .write_all(b"go\n")
+            .map_err(|e| e.to_string())
+    });
+    drop(child.stdin.take());
+    result
+}
+
 pub(super) fn command(
     program: &str,
     args: &[&str],
     input: Option<&str>,
     budget: Duration,
+) -> Evidence {
+    command_inner(program, args, input, budget, None)
+}
+
+fn command_inner(
+    program: &str,
+    args: &[&str],
+    input: Option<&str>,
+    budget: Duration,
+    grant: Option<Grant<'_>>,
 ) -> Evidence {
     let started = Instant::now();
     let mut evidence = Evidence {
@@ -114,7 +180,7 @@ pub(super) fn command(
         evidence.stderr = "case deadline exhausted before spawning command".into();
         return evidence;
     }
-    let child = spawn_command(program, args, input.is_some());
+    let child = spawn_for_gate(program, args, input.is_some(), grant.is_some());
     let mut child = match child {
         Ok(child) => child,
         Err(error) => {
@@ -124,6 +190,11 @@ pub(super) fn command(
         }
     };
     evidence.pid = Some(child.id());
+    let granted = open_gate(&mut child, grant, started, budget);
+    if let Err(error) = &granted {
+        evidence.stderr = redact(error);
+    }
+    let granted = granted.is_ok();
     let stdout = child.stdout.take().map(reader);
     let stderr = child.stderr.take().map(reader);
     if let Some(input) = input {
@@ -142,7 +213,9 @@ pub(super) fn command(
                 evidence.exit_code = status.code();
                 break;
             }
-            Ok(None) if started.elapsed() < budget => thread::sleep(Duration::from_millis(20)),
+            Ok(None) if granted && started.elapsed() < budget => {
+                thread::sleep(Duration::from_millis(20));
+            }
             result => {
                 evidence.timed_out = started.elapsed() >= budget;
                 if let Err(error) = result {
@@ -185,6 +258,62 @@ pub(super) fn command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exec_gate_grants_only_after_journal_callback_and_preserves_arguments() {
+        let mut journaled = false;
+        let evidence = gated_command(
+            "/bin/echo",
+            &["literal; echo injected", "$HOME"],
+            Duration::from_secs(2),
+            |pid| {
+                assert!(pid > 1);
+                journaled = true;
+                Ok(())
+            },
+        );
+        assert!(journaled);
+        assert!(evidence.complete(), "{evidence:?}");
+        assert_eq!(evidence.stdout, "literal; echo injected $HOME\n");
+    }
+
+    #[test]
+    fn exec_gate_eof_before_grant_starts_no_mutator() -> Result<(), Box<dyn std::error::Error>> {
+        let mut child = spawn_for_gate("/bin/echo", &["must-not-run"], false, true)?;
+        drop(child.stdin.take());
+        let end = Instant::now() + Duration::from_secs(2);
+        let mut status = None;
+        while Instant::now() < end {
+            status = child.try_wait()?;
+            if status.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        if status.is_none() {
+            let _ = child.kill();
+        }
+        assert_eq!(status.and_then(|s| s.code()), Some(125));
+        let mut output = String::new();
+        if let Some(mut pipe) = child.stdout.take() {
+            pipe.read_to_string(&mut output)?;
+        }
+        assert_eq!(output, "");
+        Ok(())
+    }
+
+    #[test]
+    fn denied_exec_gate_starts_no_mutator() {
+        let evidence = gated_command(
+            "/bin/echo",
+            &["must-not-run"],
+            Duration::from_secs(2),
+            |_| Err("journal sync refused".into()),
+        );
+        assert_ne!(evidence.exit_code, Some(0));
+        assert_eq!(evidence.stdout, "");
+        assert!(evidence.stderr.contains("journal sync refused"));
+    }
 
     #[test]
     fn command_evidence_redacts_both_pipes_and_arguments() {

@@ -63,6 +63,7 @@ use crate::snapshot::{
     BootId, COPY_BYTES, Copy, CopyRead, HelperIncarnation, ImageHistory, StartTime,
 };
 pub mod runtime;
+pub mod storage;
 pub mod types;
 use scupper_core::mac::{
     PhysicalInterface, Tunnel, TunnelGeneration, policy::AnchorText, verify::Observations,

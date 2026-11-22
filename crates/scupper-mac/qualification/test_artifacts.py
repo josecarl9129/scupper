@@ -237,6 +237,61 @@ class ArtifactTests(unittest.TestCase):
             f"{SHA256}  qual-out/tool-child\n{'d' * 64}  qual-out/tool-child-x86_64\n")
         self.assertEqual(self.check().returncode, 1)
 
+    def test_store_evidence_requires_built_and_staged_manifests(self):
+        self.write_json("Q-STORE.json", dict(self.result, case="Q-STORE"))
+        result = self.check()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("executed-capability-sha256.txt", result.stderr)
+
+    def test_every_staged_helper_has_a_checked_built_hash(self):
+        manifests = {
+            "base-churn-sha256.txt": ["base-churn"],
+            "base-image-sha256.txt": ["base-image-a", "base-image-b"],
+            "wireguard-sha256.txt": ["wireguard-go"],
+            "tool-sha256.txt": ["tool-child", "tool-child-x86_64", "tool-child-utun", "tool-child-utun-stale"],
+            "built-capability-sha256.txt": ["probe-" + path.stem for path in
+                sorted((REPO / "crates/scupper-mac/qualification/probes").glob("*.c"))],
+        }
+        for name, binaries in manifests.items():
+            (self.root / name).write_text("".join(f"{SHA256}  qual-out/{binary}\n" for binary in binaries))
+        (self.root / "executed-capability-sha256.txt").write_text("".join(
+            f"{SHA256}  /fixture/{binary}\n" for binaries in manifests.values() for binary in binaries))
+        self.assertEqual(self.check().returncode, 0)
+        for name, binaries in manifests.items():
+            for binary in binaries:
+                with self.subTest(binary=binary):
+                    path = self.root / name
+                    original = path.read_text()
+                    path.write_text(original.replace(f"{SHA256}  qual-out/{binary}\n", f"{'b' * 64}  qual-out/{binary}\n"))
+                    self.write_json("Q-SMOKE.json", self.result)
+                    self.write_json("verdicts.json", [self.result])
+                    self.assertEqual(self.check().returncode, 1)
+                    path.write_text(original)
+
+    def test_duplicate_binary_across_built_manifests_is_rejected(self):
+        for name in ["base-churn-sha256.txt", "tool-sha256.txt", "executed-capability-sha256.txt"]:
+            (self.root / name).write_text(f"{SHA256}  /fixture/base-churn\n")
+        self.assertEqual(self.check().returncode, 1)
+
+    def test_complete_staging_manifest_including_nested_experiments(self):
+        for directory in [self.root, self.root / "mutations" / "experiment"]:
+            directory.mkdir(parents=True, exist_ok=True)
+            built = directory / "built-binaries-sha256.txt"
+            staged = directory / "executed-binaries-sha256.txt"
+            manifest = f"{SHA256}  harness\n{'b' * 64}  abi-probe\n"
+            built.write_text(manifest)
+            staged.write_text(manifest)
+            self.write_json("Q-SMOKE.json", self.result)
+            self.write_json("verdicts.json", [self.result])
+            self.assertEqual(self.check().returncode, 0)
+            for wrong in [f"{SHA256}  harness\n", manifest.replace('b' * 64, 'c' * 64), manifest + f"{SHA256}  extra\n"]:
+                staged.write_text(wrong)
+                self.assertEqual(self.check().returncode, 1)
+            staged.write_text(manifest)
+            built.unlink()
+            self.assertEqual(self.check().returncode, 1)
+            staged.unlink()
+
 
 if __name__ == "__main__":
     unittest.main()

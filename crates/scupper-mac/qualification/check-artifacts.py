@@ -116,8 +116,21 @@ else:
             values[name] = digest
         return values
 
+    # Every staging loop emits a complete manifest, including isolated mutants.
+    # Visit nested experiment records even when they have no exported verdict.
+    manifest_dirs = {path.parent for pattern in ["built-binaries-sha256.txt", "executed-binaries-sha256.txt"]
+                     for path in root.rglob(pattern)}
+    for directory in sorted(manifest_dirs):
+        try:
+            built_all = hash_map(directory / "built-binaries-sha256.txt")
+            staged_all = hash_map(directory / "executed-binaries-sha256.txt")
+            if not built_all or built_all != staged_all:
+                identity_errors.append(f"{directory.name}: complete built/staged binary manifests differ")
+        except (OSError, ValueError) as error:
+            identity_errors.append(f"incomplete staged binary manifest: {error}")
+
     identities = sorted(root.glob("probe-identity-*.json"))
-    qproc_patterns = ["Q-TOOL*", "Q-LAUNCHD*", "Q-LOCK*", "tool-*.json", "Q-PROC*", "base-proc*", "proc-churn.json", "base-oracle.json",
+    qproc_patterns = ["Q-STORE*", "store-*.json", "Q-TOOL*", "Q-LAUNCHD*", "Q-LOCK*", "tool-*.json", "Q-PROC*", "base-proc*", "proc-churn.json", "base-oracle.json",
                       "oracle-*.log", "base-stopped*", "base-unlinked*", "base-paths.json",
                       "base-image*.json", "base-pin-images.json", "base-initial-snapshot.*",
                       "path-oracle.log", "pathless-census.json"]
@@ -128,19 +141,24 @@ else:
                 "base-churn-sha256.txt", "base-image-sha256.txt", "tool-sha256.txt"])):
         try:
             built_probes = {}
+            def merge_built(path):
+                values = hash_map(path)
+                if built_probes.keys() & values.keys():
+                    raise ValueError("duplicate binary across built manifests")
+                built_probes.update(values)
             for name in ["built-capability-sha256.txt", "wireguard-sha256.txt"]:
                 if identities or (root / name).exists():
-                    built_probes.update(hash_map(root / name))
+                    merge_built(root / name)
             # Every cell stages the base churn helper next to the probes.
             base_churn = root / "base-churn-sha256.txt"
             if base_churn.exists():
-                built_probes.update(hash_map(base_churn))
+                merge_built(base_churn)
             base_images = root / "base-image-sha256.txt"
             if base_images.exists():
-                built_probes.update(hash_map(base_images))
+                merge_built(base_images)
             tool_helpers = root / "tool-sha256.txt"
             if tool_helpers.exists():
-                built_probes.update(hash_map(tool_helpers))
+                merge_built(tool_helpers)
             staged_probes = hash_map(root / "executed-capability-sha256.txt")
             if built_probes != staged_probes:
                 identity_errors.append("built and staged capability hashes differ")

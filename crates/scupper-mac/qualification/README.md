@@ -170,3 +170,28 @@ directories are created only inside the journaled scratch tree. The provisional
 run path does not settle the 5a3 layout, user traversal or reset/removal policy.
 The existing `macos` job's `Clippy portable CLI and release tooling` step already
 runs clippy without features, including the adapter and its Darwin dependency.
+
+R5 adds `run --group store` on both native runners. Image setup has two minutes
+for two 4 MiB APFS images; Q-STORE has seven minutes. The cell selects each of
+five per-call faults 50 times on each image, classifies both copies after every
+operation, and separately checks full-volume create/overwrite, exact fstat size,
+directory F_FULLFSYNC errno, root/copy rejection, read/write races, outstanding
+write Busy/TimedOut/wait, and the two-reader/abandon limit. Full means ENOSPC on a
+16 KiB block write. Full-volume create failures can precede the selected hook;
+that is recorded rather than credited as reaching the hook. Every failure may
+leave partial bytes. Synced requires the complete applicable write/sync protocol.
+These are **error handling checks only; crash and power-loss durability are not
+established**.
+
+The R5 tree, images and mounts have write-ahead journal intents. Image tools
+wait on an exec gate until their PID/start identity is journaled and synced;
+controller death before the grant closes the gate without executing hdiutil. Recovery stops
+writers, detaches each image with a 30-second deadline and then a forced retry,
+and removes the exact fixture tree only after an attached-image inventory proves
+all images absent. R5 reserves the full 240-second final restore allowance for
+two images plus post-state capture. Evidence export excludes the fixture tree.
+All staged binaries, including isolated R4 mutation builds, have complete built
+and executed SHA256 manifests checked recursively by `check-artifacts.py`.
+Linux runs `tests/r5_storage_mutations.py` and an exhaustive no-feature fault-enum
+compile test. The fallback mutant uses a mock successful fsync after a failed
+full-sync; actual Darwin syscall behavior remains a native-runner observation.

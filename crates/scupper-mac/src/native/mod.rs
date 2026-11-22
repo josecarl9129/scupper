@@ -108,6 +108,7 @@ pub struct NativePlatform {
     records: Records<scupper_darwin::Spawned>,
     pins: Vec<TrustedExecutable>,
     child_pin: PathBuf,
+    storage: crate::platform::storage::darwin::Storage,
 }
 impl NativePlatform {
     /// Construct the adapter for runner qualification only.
@@ -123,10 +124,11 @@ impl NativePlatform {
             control: None,
             records: Records::default(),
             pins: Vec::new(),
+            storage: crate::platform::storage::darwin::Storage::default(),
             child_pin: crate::engine::CHILD_PATH.into(),
         })
     }
-    /// Supply reviewed digests/vnodes for qualification until R5 provides them.
+    /// Supply reviewed digests/vnodes for qualification until 5a3 provides them.
     /// Production pins remain the fixed engine paths. A staged child override is
     /// allowed only in this qualification constructor.
     #[cfg(feature = "qualification")]
@@ -135,6 +137,20 @@ impl NativePlatform {
         self.pins = pins;
         self.child_pin = child;
         self
+    }
+    /// Select the fault for the next storage write call only.
+    #[cfg(feature = "qualification")]
+    pub fn storage_fault(&mut self, fault: crate::platform::storage::Fault) {
+        self.storage.fault = fault;
+    }
+    /// Hold the next read or write worker at entry; release by sending or dropping.
+    #[cfg(feature = "qualification")]
+    pub fn storage_gate(&mut self, write: bool, gate: std::sync::mpsc::Receiver<()>) {
+        if write {
+            self.storage.write_gate = Some(gate);
+        } else {
+            self.storage.read_gate = Some(gate);
+        }
     }
     /// Exercise the common native runner with a harmless pinned qualification tool.
     ///
@@ -552,19 +568,21 @@ fn decode(record: &scupper_darwin::KProc) -> Result<ProcInfo, ProcessError> {
 impl Platform for NativePlatform {
     fn write_copy(
         &mut self,
-        _copy: Copy,
-        _bytes: &[u8; COPY_BYTES],
-        _deadline: Deadline,
+        copy: Copy,
+        bytes: &[u8; COPY_BYTES],
+        deadline: Deadline,
     ) -> WriteOutcome {
-        WriteOutcome::Failed(UNIMPLEMENTED)
+        self.storage
+            .start(self.paths.root.clone(), copy, bytes, false, deadline)
     }
     fn create_copy(
         &mut self,
-        _copy: Copy,
-        _bytes: &[u8; COPY_BYTES],
-        _deadline: Deadline,
+        copy: Copy,
+        bytes: &[u8; COPY_BYTES],
+        deadline: Deadline,
     ) -> WriteOutcome {
-        WriteOutcome::Failed(UNIMPLEMENTED)
+        self.storage
+            .start(self.paths.root.clone(), copy, bytes, true, deadline)
     }
     fn now(&mut self) -> u64 {
         scupper_darwin::monotonic_raw().as_secs()
@@ -743,8 +761,14 @@ impl Platform for NativePlatform {
     fn read_install_record(&mut self, _deadline: Deadline) -> Result<InstallRecord, SysError> {
         Err(UNIMPLEMENTED)
     }
-    fn read_copy(&mut self, _copy: Copy, _deadline: Deadline) -> CopyRead {
-        CopyRead::Unreadable
+    fn read_copy(&mut self, copy: Copy, deadline: Deadline) -> CopyRead {
+        match self.poll_copy(copy, deadline) {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending => {
+                self.abandon_storage_read();
+                CopyRead::Unreadable
+            }
+        }
     }
     fn poll_install_record(
         &mut self,
@@ -752,12 +776,14 @@ impl Platform for NativePlatform {
     ) -> std::task::Poll<Result<InstallRecord, SysError>> {
         std::task::Poll::Ready(Err(UNIMPLEMENTED))
     }
-    fn poll_copy(&mut self, _copy: Copy, _deadline: Deadline) -> std::task::Poll<CopyRead> {
-        std::task::Poll::Ready(CopyRead::Unreadable)
+    fn poll_copy(&mut self, copy: Copy, deadline: Deadline) -> std::task::Poll<CopyRead> {
+        self.storage.poll(self.paths.root.clone(), copy, deadline)
     }
-    fn abandon_storage_read(&mut self) {}
-    fn wait_write(&mut self, _deadline: Deadline) -> WriteOutcome {
-        WriteOutcome::Failed(UNIMPLEMENTED)
+    fn abandon_storage_read(&mut self) {
+        self.storage.abandon();
+    }
+    fn wait_write(&mut self, deadline: Deadline) -> WriteOutcome {
+        self.storage.wait(deadline)
     }
     fn enable_pf(&mut self, _deadline: Deadline) -> Result<PfEnable, SysError> {
         Err(UNIMPLEMENTED)
@@ -1207,7 +1233,7 @@ const CHILD_LAUNCH: scupper_darwin::Launch = scupper_darwin::Launch {
 };
 
 /// Root-owned installation digest and vnode. Only qualification can supply it
-/// until R5 defines the protected install-record storage reader.
+/// until 5a3 defines the protected install-record format and writer.
 #[derive(Clone, Debug)]
 pub struct TrustedExecutable {
     /// Absolute pinned path.

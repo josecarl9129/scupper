@@ -178,7 +178,7 @@ mod tests {
         assert!(manifest.budgets_fit());
         assert_eq!(manifest.cell_budget_minutes - manifest.overhead_minutes, 18);
         assert_eq!(MAX_FINAL_RESTORE_SECONDS, 240);
-        assert_eq!(manifest.cases.len(), 18);
+        assert_eq!(manifest.cases.len(), 20);
         let tools: Vec<_> = manifest
             .cases
             .iter()
@@ -214,6 +214,36 @@ mod tests {
     }
 
     #[test]
+    fn store_cell_has_two_minute_setup_seven_minute_case_and_both_runners()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let manifest = Manifest::bundled()?;
+        let store: Vec<_> = manifest
+            .cases
+            .iter()
+            .filter(|c| c.group == "store")
+            .collect();
+        assert_eq!(store.len(), 2);
+        assert_eq!(
+            (&store[0].id[..], store[0].budget_minutes),
+            ("Q-STORE-SETUP", 2)
+        );
+        assert_eq!(
+            (
+                &store[1].id[..],
+                store[1].budget_minutes,
+                store[1].minimum_iterations
+            ),
+            ("Q-STORE", 7, 500)
+        );
+        assert!(manifest.budgets_fit());
+        let workflow = include_str!("../../../../.github/workflows/ci.yml");
+        assert!(workflow.contains("runner: [macos-15, macos-26]"));
+        assert!(workflow.contains("tool-mutants, store, probe"));
+        assert!(workflow.contains("matrix.group == 'store' && 9"));
+        Ok(())
+    }
+
+    #[test]
     fn native_mutants_have_an_isolated_ci_budget() -> Result<(), Box<dyn std::error::Error>> {
         let manifest = Manifest::bundled()?;
         let budget = manifest
@@ -232,7 +262,9 @@ mod tests {
             .nth(1)
             .ok_or("native CI job")?;
         assert!(native.contains("runner: [macos-15, macos-26]"));
-        assert!(native.contains("group: [smoke, base, tool, tool-mutants, probe, probe-hijack]"));
+        assert!(
+            native.contains("group: [smoke, base, tool, tool-mutants, store, probe, probe-hijack]")
+        );
         assert!(native.contains(&format!(
             "matrix.group == 'tool-mutants' && {} || 30",
             budget.cell_budget_minutes
