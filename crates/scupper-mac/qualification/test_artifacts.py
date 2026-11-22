@@ -1,6 +1,7 @@
 """Portable executable-identity and redaction regression checks."""
 import json
 import os
+import re
 import runpy
 from pathlib import Path
 import subprocess
@@ -62,6 +63,33 @@ class ArtifactTests(unittest.TestCase):
         self.assertIn('printf("{\\"F_FULLFSYNC\\":%d,", F_FULLFSYNC)', probe)
         qualification = (REPO / "crates/scupper-mac/src/qual/store.rs").read_text()
         self.assertIn('abi["F_FULLFSYNC"].as_i64() == Some(i64::from(scupper_darwin::FULLFSYNC_COMMAND))', qualification)
+
+    def test_store_reclaim_records_truncations_before_namespace_changes(self):
+        # Portable wiring guard: skipping either truncate changes the recorded
+        # step list. Actual full-APFS behavior still requires the native cell.
+        source = (REPO / "crates/scupper-mac/src/qual/store.rs").read_text()
+        body = source.split("fn reclaim_for_concurrency(", 1)[1].split("fn fault_loops(", 1)[0]
+        steps = re.findall(r'reclaim_step\(\s*phases,\s*out,\s*"([^"]+)",(.*?)\)\?;',
+                           body, re.S)
+        expected = [
+            ("reclaim/truncate_slack", "slack.set_len(0)"),
+            ("reclaim/sync_slack", "slack.sync_all()"),
+            ("reclaim/truncate_filler", "filler.set_len(0)"),
+            ("reclaim/sync_filler", "filler.sync_all()"),
+            ("reclaim/unlink_filler", 'fs::remove_file(root.join("filler"))'),
+            ("reclaim/remove_b", "fs::remove_file(root.join(filename(Copy::B)))"),
+            ("reclaim/rename_reserved_b", "fs::rename(&reserved_b, root.join(filename(Copy::B)))"),
+        ]
+        self.assertEqual([name for name, _ in steps], [name for name, _ in expected])
+        for (name, operation), (_, required) in zip(steps, expected):
+            self.assertIn(required, operation, name)
+        self.assertLess(body.index('"reclaim/sync_filler"'), body.index("drop(filler)"))
+        self.assertLess(body.index("drop(filler)"), body.index('"reclaim/unlink_filler"'))
+        self.assertIn("const RECLAIM_SLACK_BYTES: usize = 256 * 1024;", source)
+        self.assertIn('"slack_bytes":RECLAIM_SLACK_BYTES', body)
+        fixture = source.split("fn fixtures(", 1)[1].split("fn reclaim_step(", 1)[0]
+        self.assertIn('root.join("reclaim-slack")', fixture)
+        self.assertLess(fixture.index("slack.write_all("), fixture.index("slack.sync_all()"))
 
     def test_native_mutation_worker_record_is_checked_before_parsing(self):
         driver = runpy.run_path(str(REPO / "crates/scupper-mac/tests/r4_native_mutations.py"))

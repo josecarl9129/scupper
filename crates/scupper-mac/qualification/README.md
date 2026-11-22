@@ -183,10 +183,18 @@ write Busy/TimedOut/wait, and the two-reader/abandon limit. Full means ENOSPC on
 that is recorded rather than credited as reaching the hook. Every failure may
 leave partial bytes. Synced requires the complete applicable write/sync protocol.
 The full-image ordinary overwrite may also fail; it is recorded, with no Synced
-credit. After full-volume checks the filler is reclaimed before renaming the
-reserved B copy and preparing deterministic concurrency fixtures. Concurrency
-evidence names that image state. This prevents expected full-image rename/CoW
-ENOSPC from aborting fixture preparation. No harness evidence is written onto
+credit. Before filling, fixtures allocate and sync a 256 KiB slack file outside
+the copy namespace. After full-volume checks, reclaim truncates and syncs the
+held slack fd, then truncates and syncs the held filler fd before dropping and
+unlinking it, removing B and renaming reserved B for deterministic concurrency
+fixtures. Each reclaim step has a named phase (`reclaim/truncate_slack`,
+`reclaim/sync_slack`, `reclaim/truncate_filler`, `reclaim/sync_filler`,
+`reclaim/unlink_filler`, `reclaim/remove_b`, `reclaim/rename_reserved_b`).
+The phase evidence also records a `full/concurrency_reset` configuration event
+with `slack_bytes`, `enospc_retries` and `retry_delay_ms`. ENOSPC gets at most five
+retries spaced 200 ms apart, within the existing case budget; reclaim failure
+is environment Inconclusive and names the step. Concurrency evidence names the
+reclaimed image state. No harness evidence is written onto
 either image. Every phase writes start/end timestamps, elapsed seconds and
 outcome to `store-phases.jsonl`, with completed timings in
 `store-hook-counts.json`; unexpected errors name their phase. Budget expiry is

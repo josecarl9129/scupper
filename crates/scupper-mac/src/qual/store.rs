@@ -318,13 +318,23 @@ fn failed_hook_outcome(
     )?;
     Ok(final_outcome)
 }
+const RECLAIM_SLACK_BYTES: usize = 256 * 1024;
+const RECLAIM_RETRIES: u32 = 5;
+const RECLAIM_RETRY_DELAY: Duration = Duration::from_millis(200);
+
+struct ReclaimFiles {
+    filler: fs::File,
+    slack: Option<fs::File>,
+    reserved_b: PathBuf,
+}
+
 fn fixtures(
     root: &Path,
     full: bool,
     old: &[u8; COPY_BYTES],
     new: &[u8; COPY_BYTES],
     end: u64,
-) -> Result<(NativePlatform, fs::File, PathBuf)> {
+) -> Result<(NativePlatform, ReclaimFiles)> {
     let mut p = NativePlatform::new(Paths::qualification(root.into()))?;
     synced(&mut p, root, Copy::A, old, true, end)?;
     // Reserve B before filling, outside the copy namespace during faulted creates.
@@ -333,20 +343,114 @@ fn fixtures(
         synced(&mut p, root, Copy::B, new, true, end)?;
         fs::rename(root.join(filename(Copy::B)), &reserved_b)?;
     }
+    // Allocate actual extents, outside the copy namespace, before filling.
+    let slack = if full {
+        let mut slack = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(root.join("reclaim-slack"))?;
+        slack.write_all(&vec![0x6d; RECLAIM_SLACK_BYTES])?;
+        slack.sync_all()?;
+        Some(slack)
+    } else {
+        None
+    };
     let filler = fs::OpenOptions::new()
         .create_new(true)
         .write(true)
         .mode(0o600)
         .open(root.join("filler"))?;
-    Ok((p, filler, reserved_b))
+    Ok((
+        p,
+        ReclaimFiles {
+            filler,
+            slack,
+            reserved_b,
+        },
+    ))
 }
-fn reclaim_for_concurrency(root: &Path, filler: fs::File, reserved_b: &Path) -> Result<()> {
-    // The old rename on a still-full image needed APFS metadata space and could
-    // return ENOSPC. Reclaim before the rename and deterministic reset writes.
+
+fn reclaim_step(
+    phases: &mut Phases,
+    out: &Path,
+    name: &str,
+    end: u64,
+    mut operation: impl FnMut() -> std::io::Result<()>,
+) -> Result<()> {
+    phase(phases, out, name, |_| {
+        for attempt in 0..=RECLAIM_RETRIES {
+            check_budget(end)?;
+            match operation() {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if error.raw_os_error() == Some(rustix::io::Errno::NOSPC.raw_os_error())
+                        && attempt < RECLAIM_RETRIES
+                        && Duration::from_secs(end)
+                            .saturating_sub(scupper_darwin::monotonic_raw())
+                            >= RECLAIM_RETRY_DELAY =>
+                {
+                    std::thread::sleep(RECLAIM_RETRY_DELAY);
+                }
+                Err(error) => {
+                    return Err(environment_issue(format!(
+                        "{error} after {} attempt(s)",
+                        attempt + 1
+                    )));
+                }
+            }
+        }
+        unreachable!()
+    })
+}
+
+fn reclaim_for_concurrency(
+    phases: &mut Phases,
+    out: &Path,
+    root: &Path,
+    files: ReclaimFiles,
+    end: u64,
+) -> Result<()> {
+    let ReclaimFiles {
+        filler,
+        slack,
+        reserved_b,
+    } = files;
+    let slack = slack.as_ref().ok_or("full-image slack fixture missing")?;
+    let configuration = json!({"phase":"full/concurrency_reset", "event":"configuration",
+        "slack_bytes":RECLAIM_SLACK_BYTES, "enospc_retries":RECLAIM_RETRIES,
+        "retry_delay_ms":RECLAIM_RETRY_DELAY.as_millis()});
+    publish_phase(out, &configuration)?;
+    phases.records.push(configuration);
+    // APFS unlink/rename also need CoW metadata blocks. Free slack first, then
+    // truncate and sync through the held filler fd before any namespace change.
+    reclaim_step(phases, out, "reclaim/truncate_slack", end, || {
+        slack.set_len(0)
+    })?;
+    reclaim_step(phases, out, "reclaim/sync_slack", end, || slack.sync_all())?;
+    reclaim_step(phases, out, "reclaim/truncate_filler", end, || {
+        filler.set_len(0)
+    })?;
+    reclaim_step(phases, out, "reclaim/sync_filler", end, || {
+        filler.sync_all()
+    })?;
     drop(filler);
-    fs::remove_file(root.join("filler"))?;
-    remove(root, Copy::B)?;
-    fs::rename(reserved_b, root.join(filename(Copy::B)))?;
+    reclaim_step(phases, out, "reclaim/unlink_filler", end, || {
+        fs::remove_file(root.join("filler"))
+    })?;
+    reclaim_step(
+        phases,
+        out,
+        "reclaim/remove_b",
+        end,
+        || match fs::remove_file(root.join(filename(Copy::B))) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            result => result,
+        },
+    )?;
+    reclaim_step(phases, out, "reclaim/rename_reserved_b", end, || {
+        fs::rename(&reserved_b, root.join(filename(Copy::B)))
+    })?;
     Ok(())
 }
 fn fault_loops(
@@ -361,7 +465,7 @@ fn fault_loops(
     let label = if full { "full" } else { "unfilled" };
     let old = snapshot::encode(1, &Snapshot::initial(Some(0), None))?;
     let new = snapshot::encode(2, &Snapshot::initial(Some(0), None))?;
-    let (mut p, filler, reserved_b) = phase(phases, out, &format!("{label}/fixtures"), |_| {
+    let (mut p, files) = phase(phases, out, &format!("{label}/fixtures"), |_| {
         fixtures(root, full, &old, &new, end)
     })?;
     let mut observations = Vec::new();
@@ -369,7 +473,7 @@ fn fault_loops(
     let mut event_log = event_log(out, full)?;
     phase(phases, out, &format!("{label}/fault_loop"), |_| {
         if full {
-            observations.push(fill(&filler, &mut offset, end)?);
+            observations.push(fill(&files.filler, &mut offset, end)?);
         }
         for fault in [
             Fault::Open,
@@ -382,7 +486,7 @@ fn fault_loops(
                 check_budget(end)?;
                 remove(root, Copy::B)?;
                 if full {
-                    let _ = fill(&filler, &mut offset, end)?;
+                    let _ = fill(&files.filler, &mut offset, end)?;
                 }
                 p.storage_fault(fault);
                 let outcome = p.create_copy(Copy::B, &new, deadline(end, 5));
@@ -432,7 +536,7 @@ fn fault_loops(
     phase(phases, out, &format!("{label}/ordinary_fullness"), |_| {
         remove(root, Copy::B)?;
         if full {
-            let _ = fill(&filler, &mut offset, end)?;
+            let _ = fill(&files.filler, &mut offset, end)?;
         }
         observations.push(ordinary(&mut p, root, &new, end, full)?);
         Ok(())
@@ -449,9 +553,10 @@ fn fault_loops(
         )?;
         Ok(())
     })?;
-    phase(phases, out, &format!("{label}/concurrency_reset"), |_| {
+    let reset_phase = format!("{label}/concurrency_reset");
+    phase(phases, out, &reset_phase, |phases| {
         if full {
-            reclaim_for_concurrency(root, filler, &reserved_b)?;
+            reclaim_for_concurrency(phases, out, root, files, end)?;
         }
         Ok(())
     })?;
@@ -816,28 +921,26 @@ fn root_checks(safe: &Path, bytes: &[u8; COPY_BYTES], end: u64) -> Result<()> {
 }
 
 // All evidence paths are host-side. Mounted images contain fixtures only.
+fn publish_phase(out: &Path, value: &Value) -> Result<()> {
+    let mut value = value.clone();
+    super::clean_value(&mut value);
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(out.join("store-phases.jsonl"))?;
+    writeln!(file, "{value}")?;
+    file.sync_all()?;
+    Ok(())
+}
+
 fn phase<T>(
     phases: &mut Phases,
     out: &Path,
     name: &str,
     work: impl FnOnce(&mut Phases) -> Result<T>,
 ) -> Result<T> {
-    phases.run(
-        name,
-        |value| {
-            let mut value = value.clone();
-            super::clean_value(&mut value);
-            let mut file = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .mode(0o600)
-                .open(out.join("store-phases.jsonl"))?;
-            writeln!(file, "{value}")?;
-            file.sync_all()?;
-            Ok(())
-        },
-        work,
-    )
+    phases.run(name, |value| publish_phase(out, value), work)
 }
 
 fn check_abi(out: &Path, result: &mut CaseResult, end: u64) -> Result<()> {
