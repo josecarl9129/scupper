@@ -1110,21 +1110,91 @@ fn release_table_premarks_and_only_confirmed_results_settle() {
     }
 }
 #[test]
-fn invalid_token_response_is_confirmed_absence() {
+fn invalid_token_response_never_confirms_release_or_absence() {
     let mut e = accounted(true, false);
     e.platform
         .inject(Call::Release(901), 1, Fault::TokenGoneBeforeRelease);
-    let event = e.reconcile_references().unwrap();
-    assert!(matches!(
-        event,
-        Event::ReferenceReconciled {
-            current: None,
-            predecessor: None,
-            ..
-        }
-    ));
+    let _ = e.reconcile_references();
     assert!(e.platform.calls.contains(&Call::Release(901)));
-    assert_eq!(e.status().accounting.held, 0);
+    assert_eq!(e.status().accounting.held, 1);
+    assert_eq!(e.status().accounting.release_unknown, 1);
+}
+
+#[test]
+fn release_requires_fresh_complete_post_read_and_never_retries_reissued_number() {
+    for scenario in 0..6 {
+        let mut e = accounted(true, false);
+        let owned = e.platform.tokens[&901].clone();
+        let mut foreign = owned.clone();
+        foreign.pid += 1;
+        match scenario {
+            0 => e.platform.inject(Call::References, 2, Fault::Incomplete),
+            1 => e
+                .platform
+                .references_script
+                .extend([vec![owned.clone()], vec![owned.clone()]]),
+            2 => e
+                .platform
+                .references_script
+                .extend([vec![owned.clone()], vec![foreign.clone()]]),
+            3 => {
+                e.platform
+                    .references_script
+                    .extend([vec![owned.clone(), foreign.clone()], vec![]]);
+                // Different number, so the pre-read inventory remains well formed.
+                e.platform.references_script[0][1].token = 902;
+            }
+            5 => {
+                let mut acquired_after_release = foreign.clone();
+                acquired_after_release.token = 902;
+                e.platform
+                    .references_script
+                    .extend([vec![owned.clone()], vec![acquired_after_release]]);
+            }
+            _ => (),
+        }
+        e.platform.calls.clear();
+        let outcome = e.reconcile_references();
+        let release = e
+            .platform
+            .calls
+            .iter()
+            .position(|c| *c == Call::Release(901))
+            .unwrap();
+        assert!(
+            e.platform.calls[release + 1..].contains(&Call::References),
+            "assertion: release requires a read begun after the call"
+        );
+        if scenario <= 1 {
+            assert_eq!(
+                e.status().accounting.held,
+                1,
+                "assertion: missing/contradictory post-read"
+            );
+            assert_eq!(e.status().accounting.release_unknown, 1);
+            assert!(!e.platform.safety_events.is_empty());
+            assert!(scenario != 0 || outcome.is_err());
+        } else {
+            assert_eq!(e.status().accounting.held, 0);
+        }
+        if scenario == 2 {
+            assert_eq!(e.platform.tokens.get(&901), Some(&foreign));
+        }
+        if scenario == 3 {
+            assert!(e.platform.safety_events.iter().any(|event| matches!(event,
+                platform::SafetyEvent::ForeignReferenceVanished { reference } if reference.token == 902)));
+        }
+        let _ = e.reconcile_references();
+        assert_eq!(
+            e.platform
+                .calls
+                .iter()
+                .filter(|c| **c == Call::Release(901))
+                .count(),
+            1,
+            "assertion: never reuse authorization for a reissued number"
+        );
+    }
 }
 
 #[test]

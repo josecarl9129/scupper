@@ -186,7 +186,8 @@ fn live_tokens(out: &Path, deadline: Instant) -> Result<Vec<journal::Token>> {
     if !evidence.complete() {
         return Err(format!("ioctl: {ioctl_error}; pfctl References unavailable").into());
     }
-    let build = crate::decode::pftext::Build::system()?;
+    let build = crate::decode::pftext::Build::system()
+        .map_err(|e| super::environment_issue(format!("OS build unavailable: {e:?}")))?;
     super::super::journal::live_text_tokens(&build, &evidence, unix_seconds())
         .map_err(|error| format!("ioctl: {ioctl_error}; pfctl References: {error}").into())
 }
@@ -243,21 +244,33 @@ fn undo_pf_state(
     deadline: Instant,
     actions: &mut Vec<String>,
     failures: &mut Vec<String>,
-) -> Result<()> {
+) {
     let info = invoke_before("/sbin/pfctl", &["-s", "info"], deadline);
     let osversion = invoke_before("/usr/sbin/sysctl", &["-n", "kern.osversion"], deadline);
     let current = BTreeMap::from([("pf-info".into(), info), ("osversion".into(), osversion)]);
-    write_json(
+    if let Err(error) = write_json(
         out,
         &format!("{}.json", unique("restore-pf-status")),
         &current,
-    )?;
-    match restore_check::restore_disable(&current) {
-        Ok(true) => action(out, "/sbin/pfctl", &["-d"], deadline, actions, failures)?,
-        Ok(false) => {}
-        Err(reason) => failures.push(reason.into()),
+    ) {
+        failures.push(format!("restore pf status capture failed: {error}"));
     }
-    Ok(())
+    match restore_check::restore_disable(&current) {
+        Ok(true) => {
+            if let Err(error) = action(out, "/sbin/pfctl", &["-d"], deadline, actions, failures) {
+                failures.push(format!("restore disable evidence failed: {error}"));
+            }
+        }
+        Ok(false) => {}
+        Err(reason) => {
+            failures.push(reason.into());
+            // Unknown still permits deliberate restoration toward the disabled baseline.
+            // Only the later complete state check can prove Disabled.
+            if let Err(error) = action(out, "/sbin/pfctl", &["-d"], deadline, actions, failures) {
+                failures.push(format!("restore disable evidence failed: {error}"));
+            }
+        }
+    }
 }
 
 pub(super) fn undo(
@@ -299,7 +312,7 @@ pub(super) fn undo(
         }
     }
     if restore_pf_state && restore_check::pf_status(&before.observations) == Some(false) {
-        undo_pf_state(out, deadline, &mut actions, &mut failures)?;
+        undo_pf_state(out, deadline, &mut actions, &mut failures);
     }
     undo_keys(out, &entries, deadline, &mut actions, &mut failures)?;
     undo_resolver_clone(out, before, &entries, deadline, &mut actions, &mut failures)?;

@@ -343,12 +343,11 @@ fn final_race_read(p: &mut NativePlatform, end: u64) -> Result<CopyRead> {
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-    let readers_idle = p.storage_readers_idle();
     let attempt_deadline = deadline(end, 5);
     let after = p.read_copy(Copy::A, attempt_deadline);
     if after == CopyRead::Unreadable {
         return Err(environment_issue(format!(
-            "full race final read unavailable after reader drain: readers_idle={readers_idle}, attempt=read_copy(A, {attempt_deadline:?}), result={after:?}"
+            "full race final read unavailable after reader drain: attempt=read_copy(A, {attempt_deadline:?}), result={after:?}"
         )));
     }
     Ok(after)

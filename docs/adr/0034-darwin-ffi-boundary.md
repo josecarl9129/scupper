@@ -271,7 +271,11 @@ accepted availability residual prevents release based on a reused number alone;
 it does not claim timestamp monotonicity or uniqueness. The read-to-release race
 is not atomic: concurrent foreign disable/reacquisition can still replace a
 holder after the read, and PID/calendar-second fingerprints are not globally
-unique identifiers.
+unique identifiers. Accepted residual: -X matches only the number. A foreign
+root actor could remove our reference and the kernel could reissue its number
+between the fingerprint read and -X, causing our call to drop a foreign
+reference. A post-read that loses a foreign fingerprint present before the call
+records a safety event; it cannot retrospectively prevent that race.
 
 Each kernel assumption is Unknown, Established or Refuted. Production defaults
 are all Unknown: enumeration remains incomplete, EEXIST is Unknown, and both
@@ -280,8 +284,18 @@ per-instance override; its variant and native setter are absent in no-feature
 builds. A no-feature exhaustive match and negative Darwin compilation checks
 pin that exclusion. The protected record format, build match key and
 SOURCES_DIGEST remain R11/promotion work. Exact enable rows cover 24H232 and
-25G332. Acquisition/release templates require full-stream Q-ENABLE captures on
-both runners before promotion; unknown text/builds remain Unknown. No
+25G332. CI 45067680869 captured the real acquisition and non-last release rows
+on both builds. Only rc 0 with the exact stderr row `disable request successful.
+N more pf enable reference(s) remaining, pf still enabled.\n`, after the qualified
+ALTQ preamble, acknowledges a request. N is decimal, has no leading zero and
+is at least 1; it is never compared with the inventory. The engine settles
+Released only after a complete reference read begun after that call and fence
+closure shows the owned `(token, pid, timestamp)` fingerprint absent. Missing,
+incomplete or contradictory evidence records Unknown and forbids a retry. A
+different fingerprint with the same number is another reference; old authority
+cannot be reused. The last-reference row is capture-only and always Unknown;
+no wording is extrapolated. The old unobserved `Token : N revoked.` rows are
+removed. Unknown text/builds remain Unknown. No
 TokenInvalid text row is promoted: disabled-pf and stale-value replies cannot
 establish safe numeric-release absence against a re-issued holder.
 

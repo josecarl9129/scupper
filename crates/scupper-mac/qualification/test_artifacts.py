@@ -2,7 +2,7 @@
 import json
 import os
 import re
-import runpy
+import ast
 from pathlib import Path
 import subprocess
 import sys
@@ -109,8 +109,14 @@ class ArtifactTests(unittest.TestCase):
         self.assertIn("fs::remove_dir_all(&entry.path)", restore)
 
     def test_native_mutation_worker_record_is_checked_before_parsing(self):
-        driver = runpy.run_path(str(REPO / "crates/scupper-mac/tests/r4_native_mutations.py"))
-        parse = driver["parse_worker_record"]
+        # Extract only the pure function: never execute a mutation driver's module.
+        path = REPO / "crates/scupper-mac/tests/r4_native_mutations.py"
+        tree = ast.parse(path.read_text(), filename=str(path))
+        function = next(node for node in tree.body
+                        if isinstance(node, ast.FunctionDef) and node.name == "parse_worker_record")
+        namespace = {"json": json}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
+        parse = namespace["parse_worker_record"]
         diagnostics = "worker stderr: died\nlaunchd job status: last exit code = 9"
         for code, text in [(1, ""), (0, ""), (0, " \n"), (1, '{"error":"expected"}')]:
             with self.subTest(returncode=code, stdout=text):

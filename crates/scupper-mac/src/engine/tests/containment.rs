@@ -62,7 +62,7 @@ fn anonymous_enable_survives_token_releases_and_is_reset_by_disable_and_reboot()
             }
             assert_eq!(
                 p.release(owned, d),
-                ToolOutcome::Ok(platform::Release::Released)
+                ToolOutcome::Ok(platform::Release::Requested)
             );
             if !owned_last {
                 p.mutate(Mutation::ForeignRelease(foreign));

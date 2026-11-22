@@ -65,8 +65,8 @@ MUTANTS = [
      ', ("osversion".into(), osversion)', '',
      'scupper-mac', 'restore_decision_requires_build_and_disables_enabled_pf'),
     ('restore-skips-disable-action', RESOURCES,
-     'Ok(true) => action(out, "/sbin/pfctl", &["-d"], deadline, actions, failures)?,',
-     'Ok(true) => {},',
+     'Ok(true) => {\n            if let Err(error) = action(out, "/sbin/pfctl", &["-d"], deadline, actions, failures) {',
+     'Ok(true) => {\n            if let Err(error) = Ok::<(), Box<dyn std::error::Error>>(()) {',
      'scupper-mac', 'restore_decision_requires_build_and_disables_enabled_pf'),
     ('restore-skips-disable', RESTORE,
      'pf_status(observations).ok_or("restore pf status unknown (including OS build evidence)")',
@@ -201,11 +201,27 @@ MUTANTS = [
      '            let _discarded = match self.platform.references(d) {',
      'scupper-mac', 'each_numeric_release_requires_a_read_after_the_previous_release'),
     ('drop-release-reread', ENGINE,
-     '            lines = match self.platform.references(d) {\n'
-     '                Enumeration::Complete(lines) => lines,\n'
-     '                Enumeration::Incomplete(error) => return Err(error),\n'
-     '            };', '',
+     '            lines = match self.platform.references(d) {\n                Enumeration::Complete(lines) => lines,\n                Enumeration::Incomplete(error) => {\n                    self.platform.report_safety(\n                        crate::platform::SafetyEvent::ReferenceReleaseUnknown {\n                            token,\n                            reason: "post-release references incomplete",\n                        },\n                    );\n                    return Err(error);\n                }\n            };', '',
      'scupper-mac', 'each_numeric_release_requires_a_read_after_the_previous_release'),
+    ('release-without-post-read', ENGINE,
+     '            lines = match self.platform.references(d) {\n                Enumeration::Complete(lines) => lines,\n                Enumeration::Incomplete(error) => {\n                    self.platform.report_safety(\n                        crate::platform::SafetyEvent::ReferenceReleaseUnknown {\n                            token,\n                            reason: "post-release references incomplete",\n                        },\n                    );\n                    return Err(error);\n                }\n            };', '            lines.clear();',
+     'scupper-mac', 'release_requires_fresh_complete_post_read_and_never_retries_reissued_number'),
+    ('release-ignores-present-fingerprint', ENGINE,
+     'if acknowledged && !lines.iter().any(ours) {', 'if acknowledged {',
+     'scupper-mac', 'release_requires_fresh_complete_post_read_and_never_retries_reissued_number'),
+    ('release-accepts-zero-remaining', TEXT,
+     "!n.is_empty() && !n.starts_with('0') && n.bytes().all(|b| b.is_ascii_digit())",
+     "!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())",
+     'scupper-mac', 'release_real_text_is_only_a_request_acknowledgement'),
+    ('release-accepts-pf-not-enabled', TEXT,
+     'let stderr = self::stderr(build, stderr);\n    let count =',
+     'let stderr = self::stderr(build, stderr);\n    if rc == 1 && stderr == b"pfctl: pf not enabled\\n" { return Ok(Release::Requested); }\n    let count =',
+     'scupper-mac', 'release_real_text_is_only_a_request_acknowledgement'),
+    ('release-reuses-pre-call-read', ENGINE,
+     'Enumeration::Complete(lines) => lines,\n                Enumeration::Incomplete(error) => {',
+     'Enumeration::Complete(_) => before.clone(),\n                Enumeration::Incomplete(error) => {',
+     'scupper-mac', 'release_requires_fresh_complete_post_read_and_never_retries_reissued_number'),
+
 
 ]
 
@@ -227,6 +243,7 @@ if __name__ == '__main__':
                             ('scupper-mac', 'qual::guard::tests'),
                             ('scupper-mac', 'qual::restore_check::tests'),
                             ('scupper-mac', 'qual::journal::tests'),
+                            ('scupper-mac', 'release_requires_fresh_complete_post_read_and_never_retries_reissued_number'),
                             ('scupper-mac', 'numeric_release_requires_qualified_matching_fingerprint'),
                             ('scupper-mac', 'each_numeric_release_requires_a_read_after_the_previous_release'),
                             ('scupper-core', 'source_derived_disabled_info_accepts_only_documented_debug_suffix'),
@@ -254,6 +271,7 @@ if __name__ == '__main__':
                             ('scupper-mac', 'qual::guard::tests'),
                             ('scupper-mac', 'qual::restore_check::tests'),
                             ('scupper-mac', 'qual::journal::tests'),
+                            ('scupper-mac', 'release_requires_fresh_complete_post_read_and_never_retries_reissued_number'),
                             ('scupper-mac', 'numeric_release_requires_qualified_matching_fingerprint'),
                             ('scupper-mac', 'each_numeric_release_requires_a_read_after_the_previous_release'),
                             ('scupper-core', 'source_derived_disabled_info_accepts_only_documented_debug_suffix'),

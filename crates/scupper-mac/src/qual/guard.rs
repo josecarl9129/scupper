@@ -79,6 +79,11 @@ pub(super) fn preflight_conditions(
     binary_is_arm64: bool,
 ) -> Vec<String> {
     let mut inconclusive = Vec::new();
+    if let Some(build) = pf_build(observations)
+        && !crate::decode::pftext::BUILDS.contains(&build.as_str())
+    {
+        inconclusive.push(format!("unqualified OS build {}", build.as_str()));
+    }
     // Optional inventory failures stay in raw evidence. Only prerequisites for
     // safe qualification gate a cell, including missing observations.
     for name in [
@@ -170,6 +175,29 @@ mod tests {
             stdout: stdout.into(),
             stderr: String::new(),
         }
+    }
+
+    #[test]
+    fn unqualified_build_is_named_in_preflight() {
+        let observations = std::collections::BTreeMap::from([(
+            "osversion".into(),
+            super::super::Evidence {
+                command: vec![],
+                stdin: None,
+                pid: Some(1),
+                exit_code: Some(0),
+                started_unix_ms: 0,
+                elapsed_ms: 0,
+                timed_out: false,
+                truncated: false,
+                stdout: "99Z999\n".into(),
+                stderr: String::new(),
+            },
+        )]);
+        assert!(
+            preflight_conditions(&observations, true)
+                .contains(&"unqualified OS build 99Z999".into())
+        );
     }
 
     #[test]

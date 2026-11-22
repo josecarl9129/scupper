@@ -1,6 +1,6 @@
 //! Exact pfctl text rows. Unknown builds, streams and suffixes fail closed.
-//! Enable rows are supplied by R2; acquisition/release templates must be
-//! cross-checked against full Q-ENABLE captures before promotion (R11).
+//! Enable rows are supplied by R2; CI 45067680869 captured acquisition and
+//! non-last release rows on both builds. Production promotion remains R11.
 use super::pftoken::{Assumption, Assumptions};
 use crate::platform::{
     PfEnable, PfInfo, Release, SysError, ToolOutcome,
@@ -267,12 +267,12 @@ pub fn acquire(build: &Build, rc: i32, stdout: &[u8], stderr: &[u8]) -> Result<u
         .and_then(token_line)
         .ok_or(SysError::Unknown)
 }
-/// Exact successful release only. There is deliberately no invalid-token row:
-/// neither disabled-pf errors nor stale numeric values establish safe absence
-/// in the presence of token recurrence. Q-X-STALE records enabled-pf recurrence as measurement.
+/// Qualified request acknowledgement only. No text row proves release or absence.
+/// The engine must obtain a fresh complete post-call fingerprint inventory.
+/// Last-reference text is capture-only, including a zero remaining count.
 ///
 /// # Errors
-/// All nonzero exits and all unrecognized text.
+/// Unsupported builds, nonzero exits, unrecognized text or noncanonical counts.
 pub fn release(
     build: &Build,
     rc: i32,
@@ -281,14 +281,19 @@ pub fn release(
     token: u64,
 ) -> Result<Release, SysError> {
     let stderr = self::stderr(build, stderr);
-    let row = format!("Token : {token} revoked.\n");
+    let count = std::str::from_utf8(stderr).ok().and_then(|text| {
+        text.strip_prefix("disable request successful. ")?
+            .strip_suffix(" more pf enable reference(s) remaining, pf still enabled.\n")
+    });
     if supported(build)
         && token != 0
         && rc == 0
         && stdout.is_empty()
-        && (stderr == row.as_bytes() || stderr == format!("{row}pf disabled\n").as_bytes())
+        && count.is_some_and(|n| {
+            !n.is_empty() && !n.starts_with('0') && n.bytes().all(|b| b.is_ascii_digit())
+        })
     {
-        Ok(Release::Released)
+        Ok(Release::Requested)
     } else {
         Err(SysError::Unknown)
     }
@@ -435,7 +440,7 @@ mod tests {
     }
     #[test]
     fn altq_prefix_is_exact_once_build_qualified_for_every_row() {
-        // Both enable gates and both acquisition/release suffix variants remain exact.
+        // Both enable gates and the captured acquisition/release rows remain exact.
         let rows: &[(&[u8], &[u8])] = &[
             (b"Status: Disabled\n", b""),
             (b"Status: Enabled\n", b""),
@@ -443,8 +448,8 @@ mod tests {
             (b"", b"pfctl: pf already enabled\n"),
             (b"", b"Token : 42\n"),
             (b"", b"pf enabled\nToken : 42\n"),
-            (b"", b"Token : 42 revoked.\n"),
-            (b"", b"Token : 42 revoked.\npf disabled\n"),
+            (b"", b"disable request successful. 1 more pf enable reference(s) remaining, pf still enabled.\n"),
+            (b"", b"disable request successful. 7 more pf enable reference(s) remaining, pf still enabled.\n"),
             (b"", b"pf disabled\n"),
             (b"No pf starter references held\n", b""),
             (b"", b"No pf starter references held\n"),
@@ -466,7 +471,7 @@ mod tests {
                 )
                 .is_ok(),
                 4 | 5 => acquire(build, 0, stdout, bytes) == Ok(42),
-                6 | 7 => release(build, 0, stdout, bytes, 42) == Ok(Release::Released),
+                6 | 7 => release(build, 0, stdout, bytes, 42) == Ok(Release::Requested),
                 8 => disable(build, 0, stdout, bytes).is_ok(),
                 9 | 10 => references_empty(build, stdout, bytes),
                 _ => read(build, 0, stdout, bytes).is_ok(),
@@ -556,8 +561,8 @@ mod tests {
                 ToolOutcome::Ok((42, 123))
             );
             assert_eq!(
-                release_outcome(Ok((build, evidence(b"Token : 42 revoked.\n"))), 42),
-                ToolOutcome::Ok(Release::Released)
+                release_outcome(Ok((build, evidence(b"disable request successful. 1 more pf enable reference(s) remaining, pf still enabled.\n"))), 42),
+                ToolOutcome::Ok(Release::Requested)
             );
             assert_eq!(
                 enable_outcome(
@@ -587,7 +592,7 @@ mod tests {
                         e
                     };
                     let a = corrupt(evidence(b"Token : 42\n"));
-                    let r = corrupt(evidence(b"Token : 42 revoked.\n"));
+                    let r = corrupt(evidence(b"disable request successful. 1 more pf enable reference(s) remaining, pf still enabled.\n"));
                     let e = corrupt(evidence(b"pf enabled\n"));
                     assert_eq!(
                         acquire_outcome(Ok((build, a))),
@@ -626,6 +631,56 @@ mod tests {
             acquire_outcome(Ok((&Build::fixture("unknown"), evidence(b"Token : 42\n")))),
             ToolOutcome::Unknown { reaped: true }
         );
+    }
+    #[test]
+    fn release_real_text_is_only_a_request_acknowledgement() {
+        for name in BUILDS {
+            let build = Build::fixture(name);
+            for n in ["1", "2", "999999999999999999999999999999"] {
+                let row = format!(
+                    "disable request successful. {n} more pf enable reference(s) remaining, pf still enabled.\n"
+                );
+                assert_eq!(
+                    release(&build, 0, b"", row.as_bytes(), 42),
+                    Ok(Release::Requested)
+                );
+                for rc in [1, -1, 256] {
+                    assert!(release(&build, rc, b"", row.as_bytes(), 42).is_err());
+                }
+            }
+            for n in ["0", "01", "", "-1", "+1", "1 ", " 1"] {
+                let row = format!(
+                    "disable request successful. {n} more pf enable reference(s) remaining, pf still enabled.\n"
+                );
+                assert!(
+                    release(&build, 0, b"", row.as_bytes(), 42).is_err(),
+                    "assertion: noncanonical remaining count {n}"
+                );
+            }
+            for row in [
+                "disable request successful. 1 more pf enable reference(s) remaining, pf still enabled.\nextra",
+                "disable request successful. 1 more pf enable reference(s) remaining, pf still enabled.",
+                "Token : 42 revoked.\n",
+                "Token : 42 revoked.\npf disabled\n",
+                "pfctl: pf not enabled\n",
+            ] {
+                for rc in [0, 1] {
+                    assert_eq!(
+                        release_outcome(
+                            Ok((
+                                &build,
+                                ToolEvidence {
+                                    reap: Reap::Status(rc << 8),
+                                    ..evidence(row.as_bytes())
+                                }
+                            )),
+                            42
+                        ),
+                        ToolOutcome::Unknown { reaped: true }
+                    );
+                }
+            }
+        }
     }
     #[test]
     fn info_outcome_requires_complete_evidence() {
@@ -725,16 +780,16 @@ mod tests {
                     Ok(42)
                 );
             }
-            for suffix in ["", "pf disabled\n"] {
+            for count in [1, 7] {
                 assert_eq!(
                     release(
                         build,
                         0,
                         b"",
-                        format!("Token : 42 revoked.\n{suffix}").as_bytes(),
+                        format!("disable request successful. {count} more pf enable reference(s) remaining, pf still enabled.\n").as_bytes(),
                         42
                     ),
-                    Ok(Release::Released)
+                    Ok(Release::Requested)
                 );
             }
         }
@@ -768,7 +823,7 @@ mod tests {
                     &Build::fixture("24H232"),
                     rc,
                     b"",
-                    b"Token : 42 revoked.\n",
+                    b"disable request successful. 1 more pf enable reference(s) remaining, pf still enabled.\n",
                     42
                 )
                 .is_err()
@@ -780,7 +835,7 @@ mod tests {
                 &Build::fixture("24H232"),
                 0,
                 b"extra",
-                b"Token : 42 revoked.\n",
+                b"disable request successful. 1 more pf enable reference(s) remaining, pf still enabled.\n",
                 42
             )
             .is_err()
@@ -811,7 +866,7 @@ mod tests {
                 &Build::fixture("unknown"),
                 0,
                 b"",
-                b"Token : 42 revoked.\n",
+                b"disable request successful. 1 more pf enable reference(s) remaining, pf still enabled.\n",
                 42
             )
             .is_err()

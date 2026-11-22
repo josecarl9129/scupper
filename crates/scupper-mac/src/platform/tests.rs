@@ -97,7 +97,7 @@ pub fn run_contracts<P: Platform, H: ContractHarness<P>>(h: &mut H) -> Result<()
             matches!(references, Enumeration::Complete(ref refs) if refs.iter().any(|r| r.token == token && r.pid == pid))
         );
         let d = limit(p);
-        assert_eq!(p.release(token, d), ToolOutcome::Ok(Release::Released));
+        assert_eq!(p.release(token, d), ToolOutcome::Ok(Release::Requested));
         assert_eq!(p.fence(), Fence::Closed);
         let d = limit(p);
         assert!(
@@ -2072,7 +2072,7 @@ mod fake_contracts {
         let token = acquire(&mut p);
         let old = p.tokens[&token].clone();
         let d = limit(&mut p);
-        assert_eq!(p.release(token, d), ToolOutcome::Ok(Release::Released));
+        assert_eq!(p.release(token, d), ToolOutcome::Ok(Release::Requested));
         p.mutate(Mutation::ForeignEnable);
         let d = limit(&mut p);
         let Enumeration::Complete(refs) = p.references(d) else {
@@ -2099,7 +2099,7 @@ mod fake_contracts {
         p.mutate(Mutation::PfDisable);
         assert_eq!(acquire(&mut p), first);
         let d = limit(&mut p);
-        assert_eq!(p.release(first, d), ToolOutcome::Ok(Release::Released));
+        assert_eq!(p.release(first, d), ToolOutcome::Ok(Release::Requested));
         p.reuse_tokens = false;
         assert!(acquire(&mut p) > second);
         Ok(())

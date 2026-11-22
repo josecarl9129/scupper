@@ -135,20 +135,125 @@ fn acquire_sample(p: &mut NativePlatform, end: Instant) -> Result<(u64, u32, u64
 }
 fn release(p: &mut NativePlatform, token: u64, end: Instant) -> Result<()> {
     ensure(p.fence() == Fence::Closed, "release fence open")?;
-    ensure(
-        refs(p, end)?.iter().any(|r| r.token == token),
-        "release token missing",
+    let before = refs(p, end)?
+        .into_iter()
+        .find(|r| r.token == token)
+        .ok_or_else(|| environment_issue("release token missing"))?;
+    let acknowledged = p.release(token, deadline(end)?) == ToolOutcome::Ok(Release::Requested);
+    let after = refs(p, end)?;
+    ensure_text(
+        acknowledged && !after.contains(&before),
+        "release unconfirmed by text and fresh fingerprint post-read",
+    )
+}
+fn live_build() -> Result<pftext::Build> {
+    pftext::Build::system().map_err(|e| environment_issue(format!("OS build unavailable: {e:?}")))
+}
+// This row is capture-only; no last-reference wording is promoted.
+fn sole_release(out: &Path, p: &mut NativePlatform, token: u64, end: Instant) -> Result<()> {
+    let response = raw(out, p, &["-X", &token.to_string()], end)?;
+    let inventory = raw(out, p, &["-s", "References"], end)?;
+    let state = raw(out, p, &["-s", "info"], end)?;
+    write_json(
+        out,
+        &format!("{}.json", super::unique("pf-last-reference")),
+        &json!({"response":response,"inventory":inventory,"state":state,"capture_only":true}),
     )?;
-    if p.release(token, deadline(end)?) == ToolOutcome::Ok(Release::Released) {
-        Ok(())
-    } else {
-        Err(environment_issue(
-            "release result unrecognized; inspect full Q-ENABLE text",
+    ensure_text(
+        pftext::release(
+            &live_build()?,
+            response.exit_code.unwrap_or(-1),
+            response.stdout.as_bytes(),
+            response.stderr.as_bytes(),
+            token,
+        )
+        .is_err(),
+        "sole-reference row must remain Unknown",
+    )?;
+    // Capture-only row: an unexpected post-state is evidence to inspect, not a
+    // contract violation that stops the remaining pf cases.
+    ensure_text(refs(p, end)?.is_empty(), "sole release inventory not empty")?;
+    info(p, &PfInfo::Disabled, end).map_err(|error| {
+        environment_issue(format!(
+            "sole release post-state not Disabled: {error}; inspect saved pf-text captures"
         ))
-    }
+    })
+}
+// Save every raw capture before evaluating any release verdict.
+fn release_probe(out: &Path, p: &mut NativePlatform, end: Instant) -> Result<()> {
+    reset(out, p, end)?;
+    let first = acquire(p, end)?;
+    let second = acquire(p, end)?;
+    let before = refs(p, end)?;
+    let response = raw(out, p, &["-X", &first.to_string()], end)?;
+    // A separate pfctl process acquires between release and post-read.
+    let foreign = acquire(p, end)?;
+    let inventory = raw(out, p, &["-s", "References"], end)?;
+    let after = refs(p, end)?;
+    write_json(
+        out,
+        &format!("{}.json", super::unique("pf-release-post-read")),
+        &json!({"response":response,"inventory":inventory,"foreign":foreign,
+            "before":before.iter().map(|r|json!({"token":r.token,"pid":r.pid,"timestamp":r.timestamp})).collect::<Vec<_>>(),
+            "after":after.iter().map(|r|json!({"token":r.token,"pid":r.pid,"timestamp":r.timestamp})).collect::<Vec<_>>() }),
+    )?;
+    ensure_text(
+        pftext::release(
+            &live_build()?,
+            response.exit_code.unwrap_or(-1),
+            response.stdout.as_bytes(),
+            response.stderr.as_bytes(),
+            first,
+        ) == Ok(Release::Requested),
+        "two-reference release text unrecognized",
+    )?;
+    let owned = before
+        .iter()
+        .find(|r| r.token == first)
+        .ok_or("first fingerprint missing")?;
+    let survivor = before
+        .iter()
+        .find(|r| r.token == second)
+        .ok_or("second fingerprint missing")?;
+    ensure(
+        !after.contains(owned)
+            && after.contains(survivor)
+            && after.iter().any(|r| r.token == foreign),
+        "post-release fingerprint/survivor mismatch",
+    )?;
+    // Choose an actually absent number, regardless of token recurrence.
+    let absent = (1..=u64::MAX)
+        .find(|n| !after.iter().any(|r| r.token == *n))
+        .ok_or("no absent token")?;
+    let response = raw(out, p, &["-X", &absent.to_string()], end)?;
+    let _inventory = raw(out, p, &["-s", "References"], end)?;
+    let _state = raw(out, p, &["-s", "info"], end)?;
+    // No matching pre-call fingerprint exists: the result is Unknown regardless
+    // of the captured wording or status, even if it resembles an acknowledgement.
+    write_json(
+        out,
+        &format!("{}.json", super::unique("pf-absent-release")),
+        &json!({"response":response,"interpretation":"Unknown: no owned pre-call fingerprint"}),
+    )?;
+    ensure(refs(p, end)? == after, "absent release changed inventory")?;
+    info(p, &PfInfo::Enabled, end)?;
+    reset(out, p, end)?;
+    let _disabled = raw(out, p, &["-X", &absent.to_string()], end)?;
+    let _inventory = raw(out, p, &["-s", "References"], end)?;
+    let _state = raw(out, p, &["-s", "info"], end)?;
+    let sole = acquire(p, end)?;
+    sole_release(out, p, sole, end)
 }
 fn raw(out: &Path, p: &mut NativePlatform, args: &[&str], end: Instant) -> Result<Evidence> {
-    let build = crate::decode::pftext::Build::system()?;
+    let build = match live_build() {
+        Ok(build) => Some(build),
+        Err(error) if args == ["-d"] => {
+            // A missing build withholds interpretation, never baseline restoration.
+            eprintln!("disable capture OS build unavailable: {error}");
+            None
+        }
+        Err(error) => return Err(error),
+    };
     let started = Instant::now();
     let wall = super::super::command::unix_seconds();
     let command_line: Vec<_> = std::iter::once("/sbin/pfctl")
@@ -183,7 +288,11 @@ fn raw(out: &Path, p: &mut NativePlatform, args: &[&str], end: Instant) -> Resul
     write_json(
         out,
         &format!("{}.json", super::unique("pf-text")),
-        &evidence.pf_text_capture(build.as_str(), &result.stdout.bytes, &result.stderr.bytes)?,
+        &evidence.pf_text_capture(
+            build.as_ref().map_or("unavailable", pftext::Build::as_str),
+            &result.stdout.bytes,
+            &result.stderr.bytes,
+        )?,
     )?;
     if evidence.exit_code.is_none()
         || evidence.timed_out
@@ -201,10 +310,14 @@ fn reset(out: &Path, p: &mut NativePlatform, end: Instant) -> Result<()> {
         p.reap(deadline(end)?) == Fence::Closed,
         "reset with outstanding pfctl",
     )?;
-    if p.pf_info(deadline(end)?) == PfInfo::Enabled {
+    let status = p.pf_info(deadline(end)?);
+    if matches!(status, PfInfo::Incomplete(_)) {
+        eprintln!("reset pf status unknown ({status:?}); attempting baseline disable");
+    }
+    if status != PfInfo::Disabled {
         let disabled = raw(out, p, &["-d"], end)?;
         if pftext::disable(
-            &crate::decode::pftext::Build::system()?,
+            &live_build()?,
             disabled.exit_code.unwrap_or(-1),
             disabled.stdout.as_bytes(),
             disabled.stderr.as_bytes(),
@@ -317,7 +430,7 @@ pub(super) fn worker(out: &Path, group: &str) -> Result<()> {
             detail: "Disposable-runner evidence only; no production assumption promotion".into(),
             evidence: vec![],
         };
-        p.capture_pf_text((id == "Q-ENABLE").then(|| out.into()));
+        p.capture_pf_text(Some(out.into()));
         let end = Instant::now() + Duration::from_secs(minutes * 60);
         if let Err(error) = operation(out, &mut p, end, &mut result) {
             result.verdict = if error.is::<super::EnvironmentIssue>() {
@@ -399,10 +512,13 @@ fn compare_layout(abi: &Value) -> Result<()> {
 }
 #[allow(clippy::too_many_lines)] // Preserve full text captures and the anonymous-reference cycle ordering.
 fn enable(out: &Path, p: &mut NativePlatform, end: Instant, result: &mut CaseResult) -> Result<()> {
-    let build = crate::decode::pftext::Build::system()?;
-    for _ in 0..50 {
+    let build = live_build()?;
+    for iteration in 0..50 {
         reset(out, p, end)?;
         let raw_enable = raw(out, p, &["-e"], end)?;
+        if iteration == 0 {
+            let _enabled_info = raw(out, p, &["-s", "info"], end)?;
+        }
         ensure_text(
             pftext::enable(
                 &build,
@@ -413,6 +529,9 @@ fn enable(out: &Path, p: &mut NativePlatform, end: Instant, result: &mut CaseRes
             ) == Ok(PfEnable::Started),
             "enable text table mismatch",
         )?;
+        if iteration == 0 {
+            release_probe(out, p, end)?;
+        }
         reset(out, p, end)?;
         ensure_text(
             p.enable_pf(deadline(end)?) == Ok(PfEnable::Started),
@@ -425,10 +544,14 @@ fn enable(out: &Path, p: &mut NativePlatform, end: Instant, result: &mut CaseRes
             )?;
             let mut unknown = platform(out, false)?;
             unknown.capture_pf_text(Some(out.into()));
-            ensure(
-                unknown.enable_pf(deadline(end)?) == Err(SysError::Unknown),
-                "ungated EEXIST accepted",
-            )?;
+            let outcome = unknown.enable_pf(deadline(end)?);
+            let failures = unknown.take_pf_capture_failures();
+            for failure in &failures {
+                result.detail.push_str("; ");
+                result.detail.push_str(failure);
+            }
+            ensure_text(failures.is_empty(), &failures.join("; "))?;
+            ensure(outcome == Err(SysError::Unknown), "ungated EEXIST accepted")?;
             ensure(
                 matches!(
                     unknown.references(deadline(end)?),
@@ -456,7 +579,17 @@ fn enable(out: &Path, p: &mut NativePlatform, end: Instant, result: &mut CaseRes
             raw_acquire.stderr.as_bytes(),
         )
         .map_err(|_| environment_issue("-E text table mismatch; full capture saved"))?;
+        let before_release = refs(p, end)?;
         let raw_release = raw(out, p, &["-X", &token.to_string()], end)?;
+        let _post_text = raw(out, p, &["-s", "References"], end)?;
+        let post_release = refs(p, end)?;
+        ensure(
+            !before_release
+                .iter()
+                .filter(|r| r.token == token)
+                .any(|r| post_release.contains(r)),
+            "raw release fingerprint still present",
+        )?;
         ensure_text(
             pftext::release(
                 &build,
@@ -464,7 +597,7 @@ fn enable(out: &Path, p: &mut NativePlatform, end: Instant, result: &mut CaseRes
                 raw_release.stdout.as_bytes(),
                 raw_release.stderr.as_bytes(),
                 token,
-            ) == Ok(Release::Released),
+            ) == Ok(Release::Requested),
             "-X text table mismatch",
         )?;
         let token = acquire(p, end)?;
@@ -484,7 +617,10 @@ fn enable(out: &Path, p: &mut NativePlatform, end: Instant, result: &mut CaseRes
             ],
             end,
         );
-        ensure_text(process.complete(), "new adapter process enable failed")?;
+        ensure_text(
+            process.complete(),
+            &format!("new adapter process enable failed; {}", process.stderr),
+        )?;
         ensure(
             refs(p, end)?.is_empty(),
             "anonymous reference appeared in token list",
@@ -498,21 +634,7 @@ fn enable(out: &Path, p: &mut NativePlatform, end: Instant, result: &mut CaseRes
             from_disabled.stderr.as_bytes(),
         )
         .map_err(|_| environment_issue("disabled -E text table mismatch; full capture saved"))?;
-        let last_release = raw(out, p, &["-X", &last_token.to_string()], end)?;
-        ensure_text(
-            pftext::release(
-                &build,
-                last_release.exit_code.unwrap_or(-1),
-                last_release.stdout.as_bytes(),
-                last_release.stderr.as_bytes(),
-                last_token,
-            ) == Ok(Release::Released),
-            "last -X full text table mismatch",
-        )?;
-        info(p, &PfInfo::Disabled, end)?;
-        let token = acquire(p, end)?;
-        release(p, token, end)?;
-        info(p, &PfInfo::Disabled, end)?;
+        sole_release(out, p, last_token, end)?;
         result.iterations += 1;
     }
     Ok(())
@@ -526,7 +648,9 @@ fn eexist(out: &Path, p: &mut NativePlatform, end: Instant, result: &mut CaseRes
                 "EEXIST text unrecognized; assumption remains inconclusive",
             ));
         }
-        release(p, token, end)?;
+        let response = raw(out, p, &["-X", &token.to_string()], end)?;
+        let _inventory = raw(out, p, &["-s", "References"], end)?;
+        let _state = raw(out, p, &["-s", "info"], end)?;
         // Only this post-release state can refute the EEXIST assumption.
         match p.pf_info(deadline(end)?) {
             PfInfo::Enabled => (),
@@ -540,11 +664,20 @@ fn eexist(out: &Path, p: &mut NativePlatform, end: Instant, result: &mut CaseRes
                 )));
             }
         }
+        ensure_text(
+            pftext::release(
+                &live_build()?,
+                response.exit_code.unwrap_or(-1),
+                response.stdout.as_bytes(),
+                response.stderr.as_bytes(),
+                token,
+            ) == Ok(Release::Requested),
+            "EEXIST release text unrecognized",
+        )?;
         ensure(refs(p, end)?.is_empty(), "anonymous reference enumerated")?;
         reset(out, p, end)?;
         let token = acquire(p, end)?;
-        release(p, token, end)?;
-        info(p, &PfInfo::Disabled, end)?;
+        sole_release(out, p, token, end)?;
         result.iterations += 1;
     }
     Ok(())
@@ -557,7 +690,12 @@ fn references(
     end: Instant,
     result: &mut CaseResult,
 ) -> Result<()> {
+    release_probe(out, p, end)?;
     reset(out, p, end)?;
+    ensure_text(
+        p.enable_pf(deadline(end)?) == Ok(PfEnable::Started),
+        "Q-REFS anonymous enable",
+    )?;
     let fd = scupper_darwin::pf_open()?;
     let mut observations = Vec::new();
     for n in [1_usize, 2, 3, 8, 64] {
@@ -803,9 +941,14 @@ pub(super) fn auxiliary(out: &Path, mode: &str, name: &str) -> Result<()> {
     let end = Instant::now() + Duration::from_secs(if mode == "r6-churn" { 120 } else { 8 });
     if mode == "r6-enable" {
         p.capture_pf_text(Some(out.into()));
+        let outcome = p.enable_pf(deadline(end)?);
+        let failures = p.take_pf_capture_failures();
         return ensure_text(
-            p.enable_pf(deadline(end)?) == Ok(PfEnable::AlreadyRunning),
-            "new-process anonymous enable failed",
+            outcome == Ok(PfEnable::AlreadyRunning) && failures.is_empty(),
+            &format!(
+                "new-process anonymous enable failed; {}",
+                failures.join("; ")
+            ),
         );
     }
     ensure(
@@ -853,7 +996,7 @@ fn x(out: &Path, p: &mut NativePlatform, end: Instant, result: &mut CaseResult) 
             }
             reset(out, p, end)?;
         } else {
-            release(p, old, end)?;
+            sole_release(out, p, old, end)?;
         }
         info(p, &PfInfo::Disabled, end)?;
         ensure(
@@ -866,10 +1009,8 @@ fn x(out: &Path, p: &mut NativePlatform, end: Instant, result: &mut CaseResult) 
         ensure(
             invalid.exit_code == Some(1)
                 && invalid.stdout.is_empty()
-                && pftext::stderr(
-                    &crate::decode::pftext::Build::system()?,
-                    invalid.stderr.as_bytes(),
-                ) == b"pfctl: pf not enabled\n",
+                && pftext::stderr(&live_build()?, invalid.stderr.as_bytes())
+                    == b"pfctl: pf not enabled\n",
             "disabled stale -X text differs from R2",
         )?;
         let new = acquire(p, end)?;
@@ -879,7 +1020,7 @@ fn x(out: &Path, p: &mut NativePlatform, end: Instant, result: &mut CaseResult) 
             "new acquisition list differs from singleton",
         )?;
         observations.push(json!({"scenario":scenario,"old":old,"new":new,"recurrence":old==new,"invalid":invalid}));
-        release(p, new, end)?;
+        sole_release(out, p, new, end)?;
         result.iterations += 1;
     }
     write_json(out, "pf-x-contract.json", &observations)?;
@@ -896,7 +1037,11 @@ fn x_stale(
     let mut observations = Vec::new();
     reset(out, p, end)?;
     let stale = acquire(p, end)?;
-    release(p, stale, end)?;
+    sole_release(out, p, stale, end)?;
+    ensure_text(
+        p.enable_pf(deadline(end)?) == Ok(PfEnable::Started),
+        "stale campaign anonymous enable",
+    )?;
     let blocker = acquire(p, end)?;
     // If the blocker itself recurs, it is already a re-issued live holder.
     let mut recurred = blocker == stale;

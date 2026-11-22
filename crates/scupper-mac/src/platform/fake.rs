@@ -1984,7 +1984,7 @@ impl Platform for FakePlatform {
         self.capture_completed(call);
         match outcome {
             ToolOutcome::Ok(()) => ToolOutcome::Ok(if existed {
-                Release::Released
+                Release::Requested
             } else {
                 Release::TokenInvalid
             }),

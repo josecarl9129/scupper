@@ -149,12 +149,12 @@ pub struct RefLine {
     /// Qualified kernel timestamp.
     pub timestamp: u64,
 }
-/// Confirmed release or qualified invalid-token response.
+/// Command acknowledgement only; settlement requires an independent post-read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Release {
-    /// Token released.
-    Released,
-    /// Token was already absent.
+    /// Qualified successful -X text; does not itself prove release.
+    Requested,
+    /// Legacy response only; never authorizes settlement or absence.
     TokenInvalid,
 }
 /// Separately qualified reference-kernel behavior; defaults grant no assumptions.
@@ -341,6 +341,18 @@ pub enum InstanceLockError {
 /// Logs from best-effort startup safety, independent of transport and storage.
 #[derive(Clone, Debug)]
 pub enum SafetyEvent {
+    /// Release remains unknown; no accounting settlement is authorized.
+    ReferenceReleaseUnknown {
+        /// Numeric request target.
+        token: u64,
+        /// Missing or contradictory evidence.
+        reason: &'static str,
+    },
+    /// A foreign fingerprint present before our -X vanished in the post-read.
+    ForeignReferenceVanished {
+        /// Full observed identity, never authorization for another release.
+        reference: RefLine,
+    },
     /// Emergency spawning is paused until own pfctl children can be reaped.
     PfctlCapacity {
         /// Number of own unreaped pfctl children.
@@ -472,9 +484,10 @@ pub trait Platform {
     /// `NotStarted` proves no ioctl; Failed/Unknown may have acquired a reference;
     /// Unknown{reaped:false} is incomplete and keeps the mutation fence open.
     fn acquire(&mut self, deadline: Deadline) -> ToolOutcome<(u64, u32)>;
-    /// **Mutating tool**: pfctl -X token. Ok is complete/reaped; `TokenInvalid` is
-    /// qualified absence. `NotStarted` changes nothing; other errors/timeouts may
-    /// release it. Unknown{reaped:false} keeps the mutation fence open.
+    /// **Mutating tool**: pfctl -X token. Requested is only complete/reaped text
+    /// acknowledgement. Release requires a fresh complete post-call fingerprint
+    /// read; `TokenInvalid` never establishes absence. `NotStarted` changes nothing;
+    /// other errors/timeouts may release it. Unknown{reaped:false} keeps the fence open.
     fn release(&mut self, token: u64, deadline: Deadline) -> ToolOutcome<Release>;
     /// Read-only References enumeration. Complete requires exit 0, bounded output,
     /// every line parsed; Incomplete/error/timeout proves no absence. Only reads

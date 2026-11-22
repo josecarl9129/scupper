@@ -718,24 +718,78 @@ impl<P: Platform> Engine<P> {
                 return Err(SysError::Failed("reference release persistence blocked"));
             }
             let d = self.deadline();
-            let how = match self.platform.release(token, d) {
-                ToolOutcome::Ok(Release::Released) => Some(ReferenceSettlement::Released),
-                ToolOutcome::Ok(Release::TokenInvalid) => Some(ReferenceSettlement::Absent),
-                _ => None,
-            };
-            if let Some(how) = how {
-                self.apply(Event::ReferenceSettled { entry: e.key, how });
-            }
+            let acknowledged =
+                self.platform.release(token, d) == ToolOutcome::Ok(Release::Requested);
             if !self.freeing_allowed() {
+                self.platform.report_safety(
+                    crate::platform::SafetyEvent::ReferenceReleaseUnknown {
+                        token,
+                        reason: "post-release mutation fence open",
+                    },
+                );
                 return Err(SysError::Failed("reference mutation fence open"));
             }
-            // Each next release uses a read begun after the preceding mutation
-            // settled and its fence closed. Never reuse a pre-mutation inventory.
+            // This synchronous read BEGINS after -X returns and its fence closes.
+            // Keep the old inventory solely to detect vanished foreign identities.
+            let before = lines.clone();
             let d = self.deadline();
             lines = match self.platform.references(d) {
                 Enumeration::Complete(lines) => lines,
-                Enumeration::Incomplete(error) => return Err(error),
+                Enumeration::Incomplete(error) => {
+                    self.platform.report_safety(
+                        crate::platform::SafetyEvent::ReferenceReleaseUnknown {
+                            token,
+                            reason: "post-release references incomplete",
+                        },
+                    );
+                    return Err(error);
+                }
             };
+            let ours = |r: &crate::platform::RefLine| {
+                r.token == token
+                    && e.fingerprint
+                        .as_ref()
+                        .is_some_and(|f| f.pid == r.pid && f.timestamp == r.timestamp)
+            };
+            let foreign_before: Vec<_> = before
+                .iter()
+                .filter(|r| {
+                    !self.snapshot.references.iter().flatten().any(|entry| {
+                        entry.key == ReferenceEntry::Token(r.token)
+                            && entry
+                                .fingerprint
+                                .as_ref()
+                                .is_some_and(|f| f.pid == r.pid && f.timestamp == r.timestamp)
+                    })
+                })
+                .cloned()
+                .collect();
+            for foreign in &foreign_before {
+                if !lines.contains(foreign) {
+                    self.platform.report_safety(
+                        crate::platform::SafetyEvent::ForeignReferenceVanished {
+                            reference: foreign.clone(),
+                        },
+                    );
+                }
+            }
+            if acknowledged && !lines.iter().any(ours) {
+                self.apply(Event::ReferenceSettled {
+                    entry: e.key,
+                    how: ReferenceSettlement::Released,
+                });
+            } else {
+                self.platform.report_safety(
+                    crate::platform::SafetyEvent::ReferenceReleaseUnknown {
+                        token,
+                        reason: if acknowledged {
+                            "owned fingerprint still present after release"
+                        } else {
+                            "release result unrecognized or incomplete"
+                        },
+                    },
+                );
+            }
         }
         if !self.machine.durable().uncertain_acquires.is_empty()
             || matches!(

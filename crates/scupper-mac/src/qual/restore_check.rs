@@ -108,7 +108,7 @@ pub(super) fn pf_status(observations: &BTreeMap<String, Evidence>) -> Option<boo
     }
 }
 
-/// Restore disabled baseline only from an explicitly Enabled current observation.
+/// Decide whether the current state is known; Unknown also triggers harness disable.
 /// Missing build/status is a visible restore failure, never a silent skip.
 pub(super) fn restore_disable(
     observations: &BTreeMap<String, Evidence>,
@@ -320,8 +320,25 @@ mod tests {
             "assertion: restore must supply live osversion"
         );
         assert!(resources.contains("match restore_check::restore_disable(&current)"));
-        assert!(resources.contains("undo_pf_state(out, deadline, &mut actions, &mut failures)?;"));
-        assert!(resources.contains("Ok(true) => action(out, \"/sbin/pfctl\", &[\"-d\"]"));
+        assert!(resources.contains("undo_pf_state(out, deadline, &mut actions, &mut failures);"));
+        let enabled = resources
+            .split_once("Ok(true) => {")
+            .expect("enabled restore branch")
+            .1
+            .split("Ok(false)")
+            .next()
+            .expect("enabled body");
+        assert!(enabled.contains("action(out, \"/sbin/pfctl\", &[\"-d\"]"));
+        let unknown = resources
+            .split_once("Err(reason) => {")
+            .expect("unknown restore branch")
+            .1;
+        assert!(unknown.contains("action(out, \"/sbin/pfctl\", &[\"-d\"]"));
+        assert!(resources.contains("restore pf status capture failed"));
+        let pf = include_str!("pf.rs");
+        assert!(pf.contains("if status != PfInfo::Disabled {"));
+        assert!(pf.contains("Err(error) if args == [\"-d\"] => {"));
+        assert!(pf.contains("let _enabled_info = raw(out, p, &[\"-s\", \"info\"], end)?;"));
     }
 
     #[test]
