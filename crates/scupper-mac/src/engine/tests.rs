@@ -1110,7 +1110,7 @@ fn release_table_premarks_and_only_confirmed_results_settle() {
     }
 }
 #[test]
-fn invalid_token_response_never_confirms_release_or_absence() {
+fn unrecognized_release_keeps_debt_until_independent_read() {
     let mut e = accounted(true, false);
     e.platform
         .inject(Call::Release(901), 1, Fault::TokenGoneBeforeRelease);
@@ -1194,6 +1194,80 @@ fn release_requires_fresh_complete_post_read_and_never_retries_reissued_number()
             1,
             "assertion: never reuse authorization for a reissued number"
         );
+    }
+}
+
+#[test]
+fn sole_ack_uses_fingerprints_and_later_enabled_status_is_diagnostic() {
+    use crate::decode::pftext::{self, Build, ToolEvidence};
+    for scenario in 0..7 {
+        let mut e = accounted(true, false);
+        let row = include_bytes!("../../tests/fixtures/pf-sole-release-24H232.stderr");
+        e.platform.release_reply = Some(pftext::release_outcome(
+            Ok((
+                &Build::fixture("24H232"),
+                ToolEvidence {
+                    pid: 42,
+                    reap: platform::runtime::Reap::Status(0),
+                    stdout: b"",
+                    stderr: row,
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                    timed_out: false,
+                    io_failed: false,
+                    stdin_unsent: 0,
+                },
+            )),
+            901,
+        ));
+        let owned = e.platform.tokens[&901].clone();
+        match scenario {
+            0 => {
+                e.snapshot
+                    .references
+                    .iter_mut()
+                    .flatten()
+                    .for_each(|r| r.fingerprint = None);
+            }
+            1 => {
+                e.platform.tokens.get_mut(&901).unwrap().pid += 1;
+            }
+            2 => {
+                e.platform.tokens.get_mut(&901).unwrap().timestamp += 1;
+            }
+            3 => e.platform.inject(Call::References, 2, Fault::Incomplete),
+            4 => {
+                e.platform
+                    .references_script
+                    .extend([vec![owned.clone()], vec![owned]]);
+            }
+            5 => {
+                e.platform
+                    .pf_info_script
+                    .extend([platform::PfInfo::Enabled, platform::PfInfo::Enabled]);
+                let foreign = RefLine {
+                    token: 902,
+                    pid: 778,
+                    timestamp: 13,
+                };
+                e.platform
+                    .references_script
+                    .extend([vec![owned], vec![foreign]]);
+            }
+            _ => (),
+        }
+        e.platform.calls.clear();
+        let _ = e.reconcile_references();
+        if scenario < 5 {
+            assert_eq!(e.status().accounting.held, 1);
+        } else {
+            assert_eq!(e.status().accounting.held, 0);
+            assert!(e.platform.safety_events.iter().any(|event| matches!(event,
+                platform::SafetyEvent::ReferenceReleaseStatus { token: 901, status } if scenario != 5 || *status == platform::PfInfo::Enabled)));
+        }
+        if scenario <= 2 {
+            assert!(!e.platform.calls.contains(&Call::Release(901)));
+        }
     }
 }
 

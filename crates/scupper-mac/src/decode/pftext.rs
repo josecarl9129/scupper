@@ -1,6 +1,6 @@
 //! Exact pfctl text rows. Unknown builds, streams and suffixes fail closed.
 //! Enable rows are supplied by R2; CI 45067680869 captured acquisition and
-//! non-last release rows on both builds. Production promotion remains R11.
+//! release rows on both builds (sole row: CI 45079241070). Production promotion remains R11.
 use super::pftoken::{Assumption, Assumptions};
 use crate::platform::{
     PfEnable, PfInfo, Release, SysError, ToolOutcome,
@@ -129,6 +129,9 @@ pub fn info_outcome(attempt: Attempt<'_>) -> PfInfo {
 /// Pre-spawn refusal or any unrecognized/incomplete post-spawn evidence.
 pub fn enable_outcome(attempt: Attempt<'_>, gates: Assumptions) -> Result<PfEnable, SysError> {
     let (build, result) = attempt?;
+    if result.timed_out {
+        return Err(SysError::TimedOut);
+    }
     enable(build, status(&result)?, result.stdout, result.stderr, gates)
 }
 /// Interpret -E evidence. Only a pre-spawn refusal can mean `NotStarted`.
@@ -269,7 +272,8 @@ pub fn acquire(build: &Build, rc: i32, stdout: &[u8], stderr: &[u8]) -> Result<u
 }
 /// Qualified request acknowledgement only. No text row proves release or absence.
 /// The engine must obtain a fresh complete post-call fingerprint inventory.
-/// Last-reference text is capture-only, including a zero remaining count.
+/// `SoleReleased` is pinned to the full preamble and `pf disabled\n` bytes.
+/// Only the native exact -X invocation supplies this parser; -d is never a fallback.
 ///
 /// # Errors
 /// Unsupported builds, nonzero exits, unrecognized text or noncanonical counts.
@@ -280,6 +284,15 @@ pub fn release(
     stderr: &[u8],
     token: u64,
 ) -> Result<Release, SysError> {
+    // Preserve the raw preamble: the sole-reference row requires it exactly.
+    if supported(build)
+        && token != 0
+        && rc == 0
+        && stdout.is_empty()
+        && stderr == [ALTQ_PREAMBLE, b"pf disabled\n"].concat()
+    {
+        return Ok(Release::Requested);
+    }
     let stderr = self::stderr(build, stderr);
     let count = std::str::from_utf8(stderr).ok().and_then(|text| {
         text.strip_prefix("disable request successful. ")?
@@ -363,6 +376,74 @@ mod tests {
         assert!(!system.contains("String::new()"));
         assert!(Build::osversion("").is_none());
         assert!(Build::osversion(" \n").is_none());
+    }
+
+    #[test]
+    fn sole_release_raw_per_build_rows_fail_closed() {
+        let fixtures: &[(&str, &[u8], &[u8])] = &[
+            (
+                "24H232",
+                include_bytes!("../../tests/fixtures/pf-sole-release-24H232.stdout"),
+                include_bytes!("../../tests/fixtures/pf-sole-release-24H232.stderr"),
+            ),
+            (
+                "25G332",
+                include_bytes!("../../tests/fixtures/pf-sole-release-25G332.stdout"),
+                include_bytes!("../../tests/fixtures/pf-sole-release-25G332.stderr"),
+            ),
+        ];
+        for &(name, stdout, stderr) in fixtures {
+            let build = Build::fixture(name);
+            assert_eq!(
+                release(&build, 0, stdout, stderr, 42),
+                Ok(Release::Requested)
+            );
+            for bad in [
+                b"pf disabled\n".to_vec(),
+                [b"altered\n".as_slice(), b"pf disabled\n"].concat(),
+                [ALTQ_PREAMBLE, b"pf disabled"].concat(),
+                [stderr, b"trailing"].concat(),
+                [ALTQ_PREAMBLE, b"pf enabled\n"].concat(),
+            ] {
+                assert_eq!(
+                    release_outcome(Ok((&build, evidence(&bad))), 42),
+                    ToolOutcome::Unknown { reaped: true }
+                );
+            }
+            let mut e = evidence(stderr);
+            e.stdout = b"unexpected";
+            assert_eq!(
+                release_outcome(Ok((&build, e)), 42),
+                ToolOutcome::Unknown { reaped: true }
+            );
+            e = evidence(stderr);
+            e.reap = Reap::Status(1 << 8);
+            assert_eq!(
+                release_outcome(Ok((&build, e)), 42),
+                ToolOutcome::Unknown { reaped: true }
+            );
+            assert_eq!(
+                release_outcome(Ok((&Build::fixture("unqualified"), evidence(stderr))), 42),
+                ToolOutcome::Unknown { reaped: true }
+            );
+            assert!(release(&build, 0, stdout, stderr, 0).is_err());
+        }
+    }
+    #[test]
+    fn release_invocation_is_exact_x_without_disable_fallback() {
+        let native = include_str!("../native/mod.rs");
+        let body = native
+            .split_once("    fn release(&mut self,")
+            .unwrap()
+            .1
+            .split("    fn references(")
+            .next()
+            .unwrap();
+        assert!(body.contains(
+            "self.pf_attempt(&[crate::engine::PFCTL, \"-X\", &token.to_string()], deadline)"
+        ));
+        assert!(!body.contains("\"-d\""));
+        assert_eq!(body.matches("self.pf_attempt(").count(), 1);
     }
 
     #[test]
@@ -610,7 +691,11 @@ mod tests {
                     );
                     assert_eq!(
                         enable_outcome(Ok((build, e)), Assumptions::default()),
-                        Err(SysError::Unknown),
+                        Err(if e.timed_out {
+                            SysError::TimedOut
+                        } else {
+                            SysError::Unknown
+                        }),
                         "row {row}"
                     );
                     if !matches!(row, 0 | 1 | 9) {

@@ -86,6 +86,27 @@ impl NativePlatform {
     pub fn reference_spare_slots(&mut self, spare: usize) {
         self.pf_spare_slots = spare;
     }
+    /// Arm one scenario; the callback runs once after the first capacity is fixed.
+    #[cfg(feature = "qualification")]
+    pub fn reference_injection(&mut self, inject: pftoken::Injection) {
+        use std::sync::atomic::Ordering;
+        self.pf_injection_quiescent.store(false, Ordering::Release);
+        let quiescent = self.pf_injection_quiescent.clone();
+        self.pf_reference_injection = Some(Box::new(move || {
+            inject()?;
+            quiescent.store(true, Ordering::Release);
+            Ok(())
+        }));
+    }
+    /// Failed/unfinished injected writers must be stopped by group restore first.
+    #[cfg(feature = "qualification")]
+    #[must_use]
+    pub fn reference_injection_quiescent(&self) -> bool {
+        self.pf_reader.idle()
+            && self
+                .pf_injection_quiescent
+                .load(std::sync::atomic::Ordering::Acquire)
+    }
     /// Drain actual adapter copy decisions, including internal full-buffer retries.
     #[cfg(feature = "qualification")]
     #[must_use]
@@ -150,6 +171,8 @@ impl NativePlatform {
         let spare = self.pf_spare_slots;
         #[cfg(feature = "qualification")]
         let decisions = self.pf_copy_decisions.clone();
+        #[cfg(feature = "qualification")]
+        let injection = self.pf_reference_injection.take();
         let result = self.pf_reader.read(
             end.saturating_sub(scupper_darwin::monotonic_raw()),
             move || {
@@ -172,11 +195,17 @@ impl NativePlatform {
                 let expired = || scupper_darwin::monotonic_raw() >= end;
                 #[cfg(feature = "qualification")]
                 {
-                    pftoken::enumerate_with_spare(read, expired, spare, |classification| {
-                        if let Ok(mut decisions) = decisions.lock() {
-                            decisions.push(classification);
-                        }
-                    })
+                    pftoken::enumerate_with_injection(
+                        read,
+                        expired,
+                        spare,
+                        |classification| {
+                            if let Ok(mut decisions) = decisions.lock() {
+                                decisions.push(classification);
+                            }
+                        },
+                        || injection.map_or(Ok(()), |inject| inject()),
+                    )
                 }
                 #[cfg(not(feature = "qualification"))]
                 pftoken::enumerate(read, expired)

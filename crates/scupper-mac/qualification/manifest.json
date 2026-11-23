@@ -147,14 +147,14 @@
       "id": "Q-ENABLE",
       "group": "pf",
       "minimum_iterations": 50,
-      "budget_minutes": 2,
+      "budget_minutes": 4,
       "supported_assumptions": []
     },
     {
       "id": "Q-EEXIST",
       "group": "pf",
       "minimum_iterations": 50,
-      "budget_minutes": 2,
+      "budget_minutes": 3,
       "supported_assumptions": [
         "eexist_establishes_anonymous"
       ]
@@ -163,7 +163,7 @@
       "id": "Q-REFS",
       "group": "pf",
       "minimum_iterations": 2000,
-      "budget_minutes": 8,
+      "budget_minutes": 15,
       "supported_assumptions": [
         "pf_token_layout",
         "fingerprints"
@@ -190,6 +190,10 @@
     "tool-mutants": {
       "cell_budget_minutes": 60,
       "overhead_minutes": 36
+    },
+    "pf": {
+      "cell_budget_minutes": 50,
+      "overhead_minutes": 20
     }
   }
 }

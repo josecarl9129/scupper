@@ -282,7 +282,16 @@ mod tests {
             .parse::<u64>()?;
         assert!(restore_minutes * 60 > super::super::model::MAX_FINAL_RESTORE_SECONDS);
         assert!(arm.contains("--after \"$after\""));
-        assert!(!arm.contains("then after="));
+        let overrides: Vec<_> = arm
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.contains("then after="))
+            .collect();
+        assert_eq!(
+            overrides,
+            [r#"if [ "${{ matrix.group }}" = pf ]; then after=1500; fi"#]
+        );
+        assert_eq!(deadlines[0], 18 * 60);
         Ok(())
     }
 

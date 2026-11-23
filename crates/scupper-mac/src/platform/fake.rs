@@ -338,6 +338,9 @@ pub struct FakePlatform {
     /// Model status changes between the two enablement observations.
     #[cfg(test)]
     pub pf_info_script: VecDeque<PfInfo>,
+    /// Optional raw-adapter reply for release evidence integration tests.
+    #[cfg(test)]
+    pub release_reply: Option<ToolOutcome<Release>>,
     /// Replace the kernel inventory at each scripted reference read.
     #[cfg(test)]
     pub references_script: VecDeque<Vec<RefLine>>,
@@ -578,6 +581,8 @@ impl FakePlatform {
             observation_override: None,
             #[cfg(test)]
             pf_info_script: VecDeque::new(),
+            #[cfg(test)]
+            release_reply: None,
             #[cfg(test)]
             references_script: VecDeque::new(),
             fingerprints_qualified: true,
@@ -1982,12 +1987,13 @@ impl Platform for FakePlatform {
         self.settle_effect(&outcome, immediate, Effect::Release(token));
         #[cfg(test)]
         self.capture_completed(call);
+        #[cfg(test)]
+        if let Some(reply) = self.release_reply.take() {
+            return reply;
+        }
         match outcome {
-            ToolOutcome::Ok(()) => ToolOutcome::Ok(if existed {
-                Release::Requested
-            } else {
-                Release::TokenInvalid
-            }),
+            ToolOutcome::Ok(()) if existed => ToolOutcome::Ok(Release::Requested),
+            ToolOutcome::Ok(()) => ToolOutcome::Unknown { reaped: true },
             ToolOutcome::NotStarted(e) => ToolOutcome::NotStarted(e),
             ToolOutcome::Failed(e) => ToolOutcome::Failed(e),
             ToolOutcome::Unknown { reaped } => ToolOutcome::Unknown { reaped },

@@ -14,6 +14,8 @@ mod guard;
 mod journal;
 mod model;
 #[cfg(any(target_os = "macos", test))]
+mod pf_check;
+#[cfg(any(target_os = "macos", test))]
 mod probe;
 #[cfg(any(target_os = "macos", test))]
 mod recovery;

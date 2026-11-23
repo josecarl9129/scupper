@@ -126,6 +126,7 @@ pub(super) fn run(out: &Path) -> Result<()> {
             return Err("base case already recorded; use a fresh directory".into());
         }
         let mut result = CaseResult {
+            elapsed_ms: 0,
             case: id.into(),
             binary_sha256: executable_sha256()?,
             verdict: Verdict::AssumptionHolds,

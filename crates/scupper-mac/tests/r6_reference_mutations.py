@@ -21,6 +21,7 @@ NATIVE_PF = ROOT / 'crates/scupper-mac/src/native/pf.rs'
 RESOURCES = ROOT / 'crates/scupper-mac/src/qual/resources.rs'
 RESTORE = ROOT / 'crates/scupper-mac/src/qual/restore_check.rs'
 JOURNAL = ROOT / 'crates/scupper-mac/src/qual/journal.rs'
+CHECK = ROOT / 'crates/scupper-mac/src/qual/pf_check.rs'
 CAPTURE = ROOT / 'crates/scupper-mac/src/decode/pfcapture.rs'
 OUT = ROOT / 'target/r6-mutants'
 ENV = dict(os.environ, CARGO_BUILD_JOBS='2', RUST_TEST_THREADS='2',
@@ -130,9 +131,9 @@ MUTANTS = [
      'scupper-mac', 'numeric_release_requires_qualified_matching_fingerprint'),
     ('unqualified-release', ENGINE, 'if !qualification.fingerprints\n                || !e', 'if !e',
      'scupper-mac', 'numeric_release_requires_qualified_matching_fingerprint'),
-    ('unknown-x-is-invalid', TEXT,
+    ('unknown-x-is-acknowledged', TEXT,
      '        Err(SysError::Unknown)\n    }\n}\n/// Parse all pf-info',
-     '        Ok(Release::TokenInvalid)\n    }\n}\n/// Parse all pf-info',
+     '        Ok(Release::Requested)\n    }\n}\n/// Parse all pf-info',
      'scupper-mac', 'unknown_text_status_streams_and_builds_grant_nothing'),
     ('acquire-unknown-notstarted', TEXT,
      '        Ok(token) => ToolOutcome::Ok((token, result.pid)),\n'
@@ -190,7 +191,7 @@ MUTANTS = [
     ('info-ignores-completeness', TEXT, 'info(build, status(&e)?, e.stdout, e.stderr)', 'info(build, 0, e.stdout, e.stderr)',
      'scupper-mac', 'info_outcome_requires_complete_evidence'),
     ('enumerate-ignores-spare', TOKEN,
-     '        spare,\n        |classification|', '        16,\n        |classification|',
+     '        spare,\n        |classification, capacity, bytes|', '        16,\n        |classification, capacity, bytes|',
      'scupper-mac', 'small_spare_retries_full_copies_then_completes_without_losing_oldest'),
     ('retry-alone-claims-growth', TOKEN,
      '.is_some_and(|capacity| need > capacity)',
@@ -223,6 +224,51 @@ MUTANTS = [
      'scupper-mac', 'release_requires_fresh_complete_post_read_and_never_retries_reissued_number'),
 
 
+
+    ('sole-without-post-read', ENGINE,
+     '            lines = match self.platform.references(d) {\n                Enumeration::Complete(lines) => lines,\n                Enumeration::Incomplete(error) => {\n                    self.platform.report_safety(\n                        crate::platform::SafetyEvent::ReferenceReleaseUnknown {\n                            token,\n                            reason: "post-release references incomplete",\n                        },\n                    );\n                    return Err(error);\n                }\n            };',
+     '            lines.clear();',
+     'scupper-mac', 'sole_ack_uses_fingerprints_and_later_enabled_status_is_diagnostic'),
+    ('sole-nonempty-stdout', TEXT,
+     '        && stdout.is_empty()\n        && stderr == [ALTQ_PREAMBLE, b"pf disabled\\n"].concat()',
+     '        && stderr == [ALTQ_PREAMBLE, b"pf disabled\\n"].concat()',
+     'scupper-mac', 'sole_release_raw_per_build_rows_fail_closed'),
+    ('sole-from-disable-argv', NATIVE,
+     'self.pf_attempt(&[crate::engine::PFCTL, "-X", &token.to_string()], deadline)',
+     'self.pf_attempt(&[crate::engine::PFCTL, "-d"], deadline)',
+     'scupper-mac', 'release_invocation_is_exact_x_without_disable_fallback'),
+    ('sole-unqualified-build', TEXT,
+     '    if supported(build)\n        && token != 0\n        && rc == 0\n        && stdout.is_empty()\n        && stderr ==',
+     '    if token != 0\n        && rc == 0\n        && stdout.is_empty()\n        && stderr ==',
+     'scupper-mac', 'sole_release_raw_per_build_rows_fail_closed'),
+    ('injection-exact-fit-complete', TOKEN,
+     'returned <= capacity - stride',
+     'returned <= capacity',
+     'scupper-mac', 'scripted_same_table_injection_covers_every_spare_boundary'),
+    ('injection-hook-noop', TOKEN,
+     '        if let Some(inject) = inject.take() {\n            inject()?;\n        }',
+     '        if let Some(_inject) = inject.take() {}',
+     'scupper-mac', 'scripted_same_table_injection_covers_every_spare_boundary'),
+    ('injection-drops-oldest-check', CHECK,
+     '        require(\n            !records.contains(&held[0]),\n            "first copy must omit oldest held fingerprint",\n        )?;',
+     '        let _ = records;',
+     'scupper-mac', 'injection_checks_require_actual_oldest_omission'),
+    ('injection-release-too-early', CHECK,
+     '    let result = enumerate()?;\n    release()?;',
+     '    release()?;\n    let result = enumerate()?;',
+     'scupper-mac', 'injected_references_are_released_after_enumeration_returns'),
+    ('deadline-expired-again', CHECK,
+     'if left.as_secs() == 0 {',
+     'if left.is_zero() {',
+     'scupper-mac', 'deadline_never_hands_out_expired_seconds_and_timeout_keeps_detail'),
+    ('release-ignores-acknowledgement', ENGINE,
+     'if acknowledged && !lines.iter().any(ours) {',
+     'if !lines.iter().any(ours) {',
+     'scupper-mac', 'unrecognized_release_keeps_debt_until_independent_read'),
+    ('drop-foreign-vanished-event', ENGINE,
+     '                    self.platform.report_safety(\n                        crate::platform::SafetyEvent::ForeignReferenceVanished {\n                            reference: foreign.clone(),\n                        },\n                    );',
+     '                    let _ = foreign;',
+     'scupper-mac', 'release_requires_fresh_complete_post_read_and_never_retries_reissued_number'),
 ]
 
 
@@ -236,10 +282,13 @@ if __name__ == '__main__':
     OUT.mkdir(parents=True, exist_ok=True)
     regression_root = ROOT / "crates/scupper-mac/proptest-regressions"
     regressions = {p: p.read_bytes() for p in regression_root.rglob("*") if p.is_file()}
-    originals = {path: path.read_bytes() for path in [TOKEN, TEXT, ENGINE, RULES, CORE, NATIVE, NATIVE_PF, RESOURCES, RESTORE, JOURNAL, CAPTURE]}
+    originals = {path: path.read_bytes() for path in [TOKEN, TEXT, ENGINE, RULES, CORE, NATIVE, NATIVE_PF, RESOURCES, RESTORE, JOURNAL, CAPTURE, CHECK]}
     results = []
     try:
         for crate, test in [('scupper-mac', 'decode::pf'),
+                            ('scupper-mac', 'qual::pf_check::tests'),
+                            ('scupper-mac', 'sole_ack_uses_fingerprints_and_later_enabled_status_is_diagnostic'),
+                            ('scupper-mac', 'release_invocation_is_exact_x_without_disable_fallback'),
                             ('scupper-mac', 'qual::guard::tests'),
                             ('scupper-mac', 'qual::restore_check::tests'),
                             ('scupper-mac', 'qual::journal::tests'),
@@ -268,6 +317,9 @@ if __name__ == '__main__':
             finally:
                 path.write_bytes(originals[path])
         for crate, test in [('scupper-mac', 'decode::pf'),
+                            ('scupper-mac', 'qual::pf_check::tests'),
+                            ('scupper-mac', 'sole_ack_uses_fingerprints_and_later_enabled_status_is_diagnostic'),
+                            ('scupper-mac', 'release_invocation_is_exact_x_without_disable_fallback'),
                             ('scupper-mac', 'qual::guard::tests'),
                             ('scupper-mac', 'qual::restore_check::tests'),
                             ('scupper-mac', 'qual::journal::tests'),

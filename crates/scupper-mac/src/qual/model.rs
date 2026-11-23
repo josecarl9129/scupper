@@ -77,6 +77,9 @@ pub struct CaseResult {
     pub verdict: Verdict,
     /// Number of completed iterations.
     pub iterations: u32,
+    /// Case wall duration in milliseconds.
+    #[serde(default)]
+    pub elapsed_ms: u128,
     /// Human-readable reason and limitations.
     pub detail: String,
     /// Redacted command observations.
@@ -323,9 +326,9 @@ mod tests {
     {
         let manifest = Manifest::bundled()?;
         for (id, group, iterations, minutes) in [
-            ("Q-ENABLE", "pf", 50, 2),
-            ("Q-EEXIST", "pf", 50, 2),
-            ("Q-REFS", "pf", 2000, 8),
+            ("Q-ENABLE", "pf", 50, 4),
+            ("Q-EEXIST", "pf", 50, 3),
+            ("Q-REFS", "pf", 2000, 15),
             ("Q-X", "pf-x", 3, 2),
             ("Q-X-STALE", "pf-x-stale", 1, 2),
         ] {
@@ -363,6 +366,23 @@ mod tests {
             Vec::<String>::new()
         );
         assert!(!manifest.cases.iter().any(|c| c.id == "Q-FLUSH"));
+        assert_eq!(
+            manifest
+                .cases
+                .iter()
+                .filter(|c| c.group == "pf")
+                .map(|c| c.budget_minutes)
+                .sum::<u32>(),
+            22
+        );
+        const {
+            assert!(super::super::guard::MAX_ARM_SECONDS >= 25 * 60);
+        }
+        let workflow = include_str!("../../../../.github/workflows/ci.yml");
+        assert!(workflow.contains("then after=1500; fi"));
+        assert!(workflow.contains("matrix.group == 'pf' && 25"));
+        let launch = include_str!("tool.rs");
+        assert!(launch.contains("\"pf\" => 24 * 60"));
         Ok(())
     }
 
@@ -389,7 +409,7 @@ mod tests {
             "group: [smoke, base, tool, tool-mutants, store, pf, pf-x, pf-x-stale, probe, probe-hijack]"
         ));
         assert!(native.contains(&format!(
-            "matrix.group == 'tool-mutants' && {} || 30",
+            "matrix.group == 'tool-mutants' && {} || matrix.group == 'pf' && 50 || 30",
             budget.cell_budget_minutes
         )));
         assert!(native.contains("continue-on-error: ${{ matrix.group == 'probe-hijack' }}"));
@@ -426,6 +446,7 @@ mod tests {
         assert!(output.contains("PUBLIC_KEY=public"));
         assert_eq!(redact(&output), output);
         let serialized = serde_json::to_string(&CaseResult {
+            elapsed_ms: 0,
             case: "Q-CAPTURE".into(),
             binary_sha256: "0".repeat(64),
             verdict: Verdict::Inconclusive,

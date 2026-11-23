@@ -106,7 +106,7 @@ pub fn run_contracts<P: Platform, H: ContractHarness<P>>(h: &mut H) -> Result<()
         let d = limit(p);
         // Exclusive pf accounting is required here: a concurrent pf client may
         // acquire the just-freed number, and this second release would release it.
-        assert_eq!(p.release(token, d), ToolOutcome::Ok(Release::TokenInvalid));
+        assert_eq!(p.release(token, d), ToolOutcome::Unknown { reaped: true });
         assert_eq!(p.fence(), Fence::Closed);
         let d = limit(p);
         assert!(
@@ -836,7 +836,7 @@ mod fake_contracts {
         let d = limit(&mut p);
         assert_eq!(p.references(d), Enumeration::Complete(Vec::new()));
         let d = limit(&mut p);
-        assert_eq!(p.release(ours, d), ToolOutcome::Ok(Release::TokenInvalid));
+        assert_eq!(p.release(ours, d), ToolOutcome::Unknown { reaped: true });
         Ok(())
     }
     #[test]

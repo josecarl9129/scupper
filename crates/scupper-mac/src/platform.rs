@@ -154,8 +154,6 @@ pub struct RefLine {
 pub enum Release {
     /// Qualified successful -X text; does not itself prove release.
     Requested,
-    /// Legacy response only; never authorizes settlement or absence.
-    TokenInvalid,
 }
 /// Separately qualified reference-kernel behavior; defaults grant no assumptions.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -341,6 +339,13 @@ pub enum InstanceLockError {
 /// Logs from best-effort startup safety, independent of transport and storage.
 #[derive(Clone, Debug)]
 pub enum SafetyEvent {
+    /// Global state at a later instant; never a release settlement gate.
+    ReferenceReleaseStatus {
+        /// Our numeric request.
+        token: u64,
+        /// Diagnostic status only (foreign -E may already have enabled pf).
+        status: PfInfo,
+    },
     /// Release remains unknown; no accounting settlement is authorized.
     ReferenceReleaseUnknown {
         /// Numeric request target.
@@ -486,7 +491,7 @@ pub trait Platform {
     fn acquire(&mut self, deadline: Deadline) -> ToolOutcome<(u64, u32)>;
     /// **Mutating tool**: pfctl -X token. Requested is only complete/reaped text
     /// acknowledgement. Release requires a fresh complete post-call fingerprint
-    /// read; `TokenInvalid` never establishes absence. `NotStarted` changes nothing;
+    /// read; Unknown text never establishes absence. `NotStarted` changes nothing;
     /// other errors/timeouts may release it. Unknown{reaped:false} keeps the fence open.
     fn release(&mut self, token: u64, deadline: Deadline) -> ToolOutcome<Release>;
     /// Read-only References enumeration. Complete requires exit 0, bounded output,

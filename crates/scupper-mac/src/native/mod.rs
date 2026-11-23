@@ -117,6 +117,10 @@ pub struct NativePlatform {
     #[cfg(feature = "qualification")]
     pf_spare_slots: usize,
     #[cfg(feature = "qualification")]
+    pf_reference_injection: Option<crate::decode::pftoken::Injection>,
+    #[cfg(feature = "qualification")]
+    pf_injection_quiescent: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(feature = "qualification")]
     pf_text_out: Option<PathBuf>,
     #[cfg(feature = "qualification")]
     pf_capture_failures: Vec<String>,
@@ -148,6 +152,10 @@ impl NativePlatform {
             pf_capacities: std::sync::Arc::default(),
             #[cfg(feature = "qualification")]
             pf_spare_slots: 16,
+            #[cfg(feature = "qualification")]
+            pf_reference_injection: None,
+            #[cfg(feature = "qualification")]
+            pf_injection_quiescent: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             #[cfg(feature = "qualification")]
             pf_text_out: None,
             #[cfg(feature = "qualification")]

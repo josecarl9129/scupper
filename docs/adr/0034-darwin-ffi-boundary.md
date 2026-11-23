@@ -276,6 +276,7 @@ root actor could remove our reference and the kernel could reissue its number
 between the fingerprint read and -X, causing our call to drop a foreign
 reference. A post-read that loses a foreign fingerprint present before the call
 records a safety event; it cannot retrospectively prevent that race.
+The event does not detect the residual itself; the dropped holder was never observed.
 
 Each kernel assumption is Unknown, Established or Refuted. Production defaults
 are all Unknown: enumeration remains incomplete, EEXIST is Unknown, and both
@@ -285,18 +286,24 @@ builds. A no-feature exhaustive match and negative Darwin compilation checks
 pin that exclusion. The protected record format, build match key and
 SOURCES_DIGEST remain R11/promotion work. Exact enable rows cover 24H232 and
 25G332. CI 45067680869 captured the real acquisition and non-last release rows
-on both builds. Only rc 0 with the exact stderr row `disable request successful.
-N more pf enable reference(s) remaining, pf still enabled.\n`, after the qualified
-ALTQ preamble, acknowledges a request. N is decimal, has no leading zero and
+on both builds. The non-last acknowledgement requires rc 0, empty stdout and
+the exact stderr remainder `disable request successful.
+N more pf enable reference(s) remaining, pf still enabled.\n`, allowing one
+qualified ALTQ preamble. N is decimal, has no leading zero and
 is at least 1; it is never compared with the inventory. The engine settles
 Released only after a complete reference read begun after that call and fence
 closure shows the owned `(token, pid, timestamp)` fingerprint absent. Missing,
 incomplete or contradictory evidence records Unknown and forbids a retry. A
 different fingerprint with the same number is another reference; old authority
-cannot be reused. The last-reference row is capture-only and always Unknown;
-no wording is extrapolated. The old unobserved `Token : N revoked.` rows are
+cannot be reused. The SoleReleased row is pinned independently on 24H232 and 25G332 by CI
+45079241070: rc 0, empty stdout, stderr exactly the ALTQ preamble plus
+`pf disabled\n`. It uses the same pre-fingerprint, acknowledgement and fresh
+complete post-read gates. Only our exact `[PFCTL, "-X", number]` invocation
+counts; there is no -d fallback. Post-call pf-info is diagnostic only: a foreign
+-E can legitimately re-enable pf before it. Qualification additionally requires
+Disabled in its isolated sole-release step. The old unobserved `Token : N revoked.` rows are
 removed. Unknown text/builds remain Unknown. No
-TokenInvalid text row is promoted: disabled-pf and stale-value replies cannot
+invalid-token text row is promoted: disabled-pf and stale-value replies cannot
 establish safe numeric-release absence against a re-issued holder.
 
 The dedicated pf/pf-x cells require disabled/no-reference preflight and journal

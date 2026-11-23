@@ -85,16 +85,21 @@ fn platform(out: &Path, qualified: bool) -> Result<NativePlatform> {
 }
 fn deadline(end: Instant) -> Result<Deadline> {
     let left = end.saturating_duration_since(Instant::now());
-    if left.is_zero() {
-        return Err(environment_issue("pf case deadline expired"));
-    }
+    let seconds = super::super::pf_check::deadline_seconds(left).map_err(environment_issue)?;
     Ok(Deadline(
-        scupper_darwin::monotonic_raw().as_secs() + left.as_secs().min(8),
+        scupper_darwin::monotonic_raw().as_secs() + seconds,
     ))
+}
+fn enable_expected(p: &mut NativePlatform, end: Instant, expected: PfEnable) -> Result<()> {
+    super::super::pf_check::enable_result(&p.enable_pf(deadline(end)?), expected)
+        .map_err(environment_issue)
 }
 fn refs(p: &mut NativePlatform, end: Instant) -> Result<Vec<RefLine>> {
     match p.references(deadline(end)?) {
         Enumeration::Complete(lines) => Ok(lines),
+        Enumeration::Incomplete(SysError::TimedOut) => Err(environment_issue(
+            "pf case deadline expired: references TimedOut",
+        )),
         Enumeration::Incomplete(e) => {
             Err(environment_issue(format!("references incomplete: {e:?}")))
         }
@@ -102,6 +107,9 @@ fn refs(p: &mut NativePlatform, end: Instant) -> Result<Vec<RefLine>> {
 }
 fn info(p: &mut NativePlatform, expected: &PfInfo, end: Instant) -> Result<()> {
     let actual = p.pf_info(deadline(end)?);
+    if actual == PfInfo::Incomplete(SysError::TimedOut) {
+        return Err(environment_issue("pf case deadline expired: info TimedOut"));
+    }
     if let PfInfo::Incomplete(e) = actual {
         return Err(environment_issue(format!("pf info incomplete: {e:?}")));
     }
@@ -112,10 +120,19 @@ fn acquire(p: &mut NativePlatform, end: Instant) -> Result<u64> {
 }
 fn acquire_sample(p: &mut NativePlatform, end: Instant) -> Result<(u64, u32, u64, u64)> {
     let before = super::super::command::unix_seconds();
-    let ToolOutcome::Ok((token, pid)) = p.acquire(deadline(end)?) else {
-        return Err(environment_issue(
-            "unrecognized/incomplete -E; inspect pf-text captures",
-        ));
+    let outcome = p.acquire(deadline(end)?);
+    let ToolOutcome::Ok((token, pid)) = outcome else {
+        if matches!(
+            outcome,
+            ToolOutcome::NotStarted(SysError::TimedOut) | ToolOutcome::Failed(SysError::TimedOut)
+        ) {
+            return Err(environment_issue(format!(
+                "pf case deadline expired: {outcome:?}"
+            )));
+        }
+        return Err(environment_issue(format!(
+            "unrecognized/incomplete -E: {outcome:?}; inspect pf-text captures"
+        )));
     };
     let after = super::super::command::unix_seconds();
     if after.saturating_add(1) < before.saturating_sub(1) {
@@ -134,30 +151,61 @@ fn acquire_sample(p: &mut NativePlatform, end: Instant) -> Result<(u64, u32, u64
     Ok((token, pid, before, after))
 }
 fn release(p: &mut NativePlatform, token: u64, end: Instant) -> Result<()> {
+    release_owned(p, token, None, end)
+}
+fn release_owned(
+    p: &mut NativePlatform,
+    token: u64,
+    expected: Option<&RefLine>,
+    end: Instant,
+) -> Result<()> {
+    ensure(
+        p.reference_qualification().fingerprints,
+        "release fingerprints unqualified",
+    )?;
     ensure(p.fence() == Fence::Closed, "release fence open")?;
     let before = refs(p, end)?
         .into_iter()
         .find(|r| r.token == token)
         .ok_or_else(|| environment_issue("release token missing"))?;
-    let acknowledged = p.release(token, deadline(end)?) == ToolOutcome::Ok(Release::Requested);
+    ensure_text(
+        expected.is_none_or(|expected| expected == &before),
+        "release pre-fingerprint changed",
+    )?;
+    let outcome = p.release(token, deadline(end)?);
+    if matches!(
+        outcome,
+        ToolOutcome::NotStarted(SysError::TimedOut) | ToolOutcome::Failed(SysError::TimedOut)
+    ) {
+        return Err(environment_issue(format!(
+            "pf case deadline expired: {outcome:?}"
+        )));
+    }
+    let acknowledged = outcome == ToolOutcome::Ok(Release::Requested);
     let after = refs(p, end)?;
     ensure_text(
         acknowledged && !after.contains(&before),
-        "release unconfirmed by text and fresh fingerprint post-read",
+        &format!("release unconfirmed by text and fresh fingerprint post-read: {outcome:?}"),
     )
 }
 fn live_build() -> Result<pftext::Build> {
     pftext::Build::system().map_err(|e| environment_issue(format!("OS build unavailable: {e:?}")))
 }
-// This row is capture-only; no last-reference wording is promoted.
+// Save the isolated sole-release evidence before evaluating the verdict.
 fn sole_release(out: &Path, p: &mut NativePlatform, token: u64, end: Instant) -> Result<()> {
+    let before = refs(p, end)?;
     let response = raw(out, p, &["-X", &token.to_string()], end)?;
     let inventory = raw(out, p, &["-s", "References"], end)?;
     let state = raw(out, p, &["-s", "info"], end)?;
     write_json(
         out,
         &format!("{}.json", super::unique("pf-last-reference")),
-        &json!({"response":response,"inventory":inventory,"state":state,"capture_only":true}),
+        &json!({"response":response,"inventory":inventory,"state":state,"expected_row":"SoleReleased"}),
+    )?;
+    let after = refs(p, end)?;
+    ensure_text(
+        before.iter().any(|r| r.token == token),
+        "sole release pre-fingerprint missing",
     )?;
     ensure_text(
         pftext::release(
@@ -166,18 +214,18 @@ fn sole_release(out: &Path, p: &mut NativePlatform, token: u64, end: Instant) ->
             response.stdout.as_bytes(),
             response.stderr.as_bytes(),
             token,
-        )
-        .is_err(),
-        "sole-reference row must remain Unknown",
+        ) == Ok(Release::Requested),
+        "sole release text unrecognized",
     )?;
-    // Capture-only row: an unexpected post-state is evidence to inspect, not a
-    // contract violation that stops the remaining pf cases.
-    ensure_text(refs(p, end)?.is_empty(), "sole release inventory not empty")?;
-    info(p, &PfInfo::Disabled, end).map_err(|error| {
-        environment_issue(format!(
-            "sole release post-state not Disabled: {error}; inspect saved pf-text captures"
-        ))
-    })
+    ensure_text(
+        after.is_empty()
+            && before
+                .iter()
+                .filter(|r| r.token == token)
+                .all(|r| !after.contains(r)),
+        "sole release not Released with empty inventory",
+    )?;
+    info(p, &PfInfo::Disabled, end)
 }
 // Save every raw capture before evaluating any release verdict.
 fn release_probe(out: &Path, p: &mut NativePlatform, end: Instant) -> Result<()> {
@@ -294,6 +342,11 @@ fn raw(out: &Path, p: &mut NativePlatform, args: &[&str], end: Instant) -> Resul
             &result.stderr.bytes,
         )?,
     )?;
+    if evidence.timed_out {
+        return Err(environment_issue(
+            "pf case deadline expired: raw pfctl timed out",
+        ));
+    }
     if evidence.exit_code.is_none()
         || evidence.timed_out
         || evidence.truncated
@@ -306,6 +359,11 @@ fn raw(out: &Path, p: &mut NativePlatform, args: &[&str], end: Instant) -> Resul
 }
 /// Global disable is exclusive to the disposable harness and journaled restore.
 fn reset(out: &Path, p: &mut NativePlatform, end: Instant) -> Result<()> {
+    if !p.reference_injection_quiescent() {
+        return Err(environment_issue(
+            "injected writer not quiescent; group restore required before reset",
+        ));
+    }
     ensure(
         p.reap(deadline(end)?) == Fence::Closed,
         "reset with outstanding pfctl",
@@ -374,6 +432,7 @@ pub(super) fn run(out: &Path, group: &str) -> Result<()> {
         "pf qualification failed; inspect case verdicts",
     )
 }
+#[allow(clippy::too_many_lines)] // Keep case ordering, budgets and saved verdicts together.
 pub(super) fn worker(out: &Path, group: &str) -> Result<()> {
     baseline(out)?;
     let own =
@@ -401,12 +460,12 @@ pub(super) fn worker(out: &Path, group: &str) -> Result<()> {
         "pf" => vec![
             (
                 "Q-ENABLE",
-                2,
+                4,
                 50,
                 enable as fn(&Path, &mut NativePlatform, Instant, &mut CaseResult) -> Result<()>,
             ),
-            ("Q-EEXIST", 2, 50, eexist),
-            ("Q-REFS", 8, 2000, references),
+            ("Q-EEXIST", 3, 50, eexist),
+            ("Q-REFS", 15, 2000, references),
         ],
         "pf-x" => vec![(
             "Q-X",
@@ -423,6 +482,7 @@ pub(super) fn worker(out: &Path, group: &str) -> Result<()> {
         _ => return Err("unknown pf worker group".into()),
     } {
         let mut result = CaseResult {
+            elapsed_ms: 0,
             case: id.into(),
             binary_sha256: executable_sha256()?,
             verdict: Verdict::AssumptionHolds,
@@ -431,7 +491,8 @@ pub(super) fn worker(out: &Path, group: &str) -> Result<()> {
             evidence: vec![],
         };
         p.capture_pf_text(Some(out.into()));
-        let end = Instant::now() + Duration::from_secs(minutes * 60);
+        let started = Instant::now();
+        let end = started + Duration::from_secs(minutes * 60);
         if let Err(error) = operation(out, &mut p, end, &mut result) {
             result.verdict = if error.is::<super::EnvironmentIssue>() {
                 Verdict::Inconclusive
@@ -445,6 +506,7 @@ pub(super) fn worker(out: &Path, group: &str) -> Result<()> {
             result.verdict = Verdict::Inconclusive;
             result.detail = "required iterations were not reached".into();
         }
+        result.elapsed_ms = started.elapsed().as_millis();
         for failure in p.take_pf_capture_failures() {
             result.detail.push_str("; ");
             result.detail.push_str(&failure);
@@ -533,15 +595,9 @@ fn enable(out: &Path, p: &mut NativePlatform, end: Instant, result: &mut CaseRes
             release_probe(out, p, end)?;
         }
         reset(out, p, end)?;
-        ensure_text(
-            p.enable_pf(deadline(end)?) == Ok(PfEnable::Started),
-            "disabled enable not Started",
-        )?;
+        enable_expected(p, end, PfEnable::Started)?;
         for _ in 0..5 {
-            ensure_text(
-                p.enable_pf(deadline(end)?) == Ok(PfEnable::AlreadyRunning),
-                "qualified EEXIST not AlreadyRunning",
-            )?;
+            enable_expected(p, end, PfEnable::AlreadyRunning)?;
             let mut unknown = platform(out, false)?;
             unknown.capture_pf_text(Some(out.into()));
             let outcome = unknown.enable_pf(deadline(end)?);
@@ -551,14 +607,24 @@ fn enable(out: &Path, p: &mut NativePlatform, end: Instant, result: &mut CaseRes
                 result.detail.push_str(failure);
             }
             ensure_text(failures.is_empty(), &failures.join("; "))?;
-            ensure(outcome == Err(SysError::Unknown), "ungated EEXIST accepted")?;
+            if outcome == Err(SysError::TimedOut) {
+                return Err(environment_issue(format!(
+                    "pf case deadline expired: {outcome:?}"
+                )));
+            }
             ensure(
-                matches!(
-                    unknown.references(deadline(end)?),
-                    Enumeration::Incomplete(_)
-                ),
-                "unknown layout enumerated",
+                outcome == Err(SysError::Unknown),
+                &format!("ungated EEXIST accepted: {outcome:?}"),
             )?;
+            match unknown.references(deadline(end)?) {
+                Enumeration::Incomplete(SysError::TimedOut) => {
+                    return Err(environment_issue(
+                        "pf case deadline expired: unqualified references TimedOut",
+                    ));
+                }
+                Enumeration::Incomplete(_) => (),
+                Enumeration::Complete(_) => return Err("unknown layout enumerated".into()),
+            }
         }
         let raw_eexist = raw(out, p, &["-e"], end)?;
         ensure_text(
@@ -580,6 +646,10 @@ fn enable(out: &Path, p: &mut NativePlatform, end: Instant, result: &mut CaseRes
         )
         .map_err(|_| environment_issue("-E text table mismatch; full capture saved"))?;
         let before_release = refs(p, end)?;
+        ensure_text(
+            before_release.iter().any(|r| r.token == token),
+            "raw release pre-fingerprint missing",
+        )?;
         let raw_release = raw(out, p, &["-X", &token.to_string()], end)?;
         let _post_text = raw(out, p, &["-s", "References"], end)?;
         let post_release = refs(p, end)?;
@@ -643,11 +713,7 @@ fn eexist(out: &Path, p: &mut NativePlatform, end: Instant, result: &mut CaseRes
     for _ in 0..50 {
         reset(out, p, end)?;
         let token = acquire(p, end)?;
-        if p.enable_pf(deadline(end)?) != Ok(PfEnable::AlreadyRunning) {
-            return Err(environment_issue(
-                "EEXIST text unrecognized; assumption remains inconclusive",
-            ));
-        }
+        enable_expected(p, end, PfEnable::AlreadyRunning)?;
         let response = raw(out, p, &["-X", &token.to_string()], end)?;
         let _inventory = raw(out, p, &["-s", "References"], end)?;
         let _state = raw(out, p, &["-s", "info"], end)?;
@@ -657,6 +723,11 @@ fn eexist(out: &Path, p: &mut NativePlatform, end: Instant, result: &mut CaseRes
             PfInfo::Disabled => {
                 result.verdict = Verdict::AssumptionRefuted;
                 return Err("EEXIST did not preserve anonymous enable after token release".into());
+            }
+            PfInfo::Incomplete(SysError::TimedOut) => {
+                return Err(environment_issue(
+                    "pf case deadline expired: post-release info TimedOut",
+                ));
             }
             PfInfo::Incomplete(e) => {
                 return Err(environment_issue(format!(
@@ -690,12 +761,20 @@ fn references(
     end: Instant,
     result: &mut CaseResult,
 ) -> Result<()> {
+    let outcome = references_inner(out, p, end, result);
+    let cleanup = reset(out, p, end.max(Instant::now() + Duration::from_secs(8)));
+    outcome.and(cleanup)
+}
+#[allow(clippy::too_many_lines)]
+fn references_inner(
+    out: &Path,
+    p: &mut NativePlatform,
+    end: Instant,
+    result: &mut CaseResult,
+) -> Result<()> {
     release_probe(out, p, end)?;
     reset(out, p, end)?;
-    ensure_text(
-        p.enable_pf(deadline(end)?) == Ok(PfEnable::Started),
-        "Q-REFS anonymous enable",
-    )?;
+    enable_expected(p, end, PfEnable::Started)?;
     let fd = scupper_darwin::pf_open()?;
     let mut observations = Vec::new();
     for n in [1_usize, 2, 3, 8, 64] {
@@ -797,6 +876,18 @@ fn references(
     for _ in 0..8 {
         held.push(acquire(p, end)?);
     }
+    let held_fingerprints = refs(p, end)?;
+    let held_fingerprints: Vec<_> = held
+        .iter()
+        .map(|token| {
+            held_fingerprints
+                .iter()
+                .find(|r| r.token == *token)
+                .cloned()
+                .ok_or("held fingerprint absent")
+        })
+        .collect::<std::result::Result<_, _>>()?;
+    deterministic_injections(out, p, end, &held_fingerprints)?;
     let mut workers = Workers(vec![]);
     for i in 0..4 {
         workers.0.push(
@@ -821,6 +912,7 @@ fn references(
     for i in 0..4 {
         while !out.join(format!("pf-churn-ready-{i}")).exists() {
             let _ = deadline(end)?;
+            check_worker_records(out)?;
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -828,8 +920,6 @@ fn references(
     let mut complete = 0_u32;
     let mut incomplete = 0_u32;
     let mut subruns = Vec::new();
-    let mut coverage_missing = false;
-    let mut small_spare_growth = 0;
     for (spare, reads) in [(16, 1000), (0, 500), (1, 500)] {
         p.reference_spare_slots(spare);
         let _ = p.reference_copy_decisions();
@@ -839,11 +929,17 @@ fn references(
             match p.references(deadline(end)?) {
                 Enumeration::Complete(lines) => {
                     ensure(
-                        held.iter()
-                            .all(|token| lines.iter().any(|r| r.token == *token)),
-                        "Complete omitted a long-lived token (including oldest)",
+                        held_fingerprints
+                            .iter()
+                            .all(|fingerprint| lines.contains(fingerprint)),
+                        "Complete omitted a long-lived fingerprint (including oldest)",
                     )?;
                     sub_complete += 1;
+                }
+                Enumeration::Incomplete(SysError::TimedOut) => {
+                    return Err(environment_issue(
+                        "pf case deadline expired: references TimedOut",
+                    ));
                 }
                 Enumeration::Incomplete(_) => sub_incomplete += 1,
             }
@@ -858,10 +954,6 @@ fn references(
             .iter()
             .filter(|d| **d == pftoken::EnumerationEvent::GrowthPastCopyCapacity)
             .count();
-        if spare < 16 {
-            small_spare_growth += growth_events;
-        }
-        coverage_missing |= spare < 16 && (retries == 0 || sub_complete == 0);
         subruns.push(json!({"spare_slots":spare,"reads":reads,"retry":retries,"growth_past_copy_capacity":growth_events,
             "complete":sub_complete,"incomplete":sub_incomplete}));
         complete += sub_complete;
@@ -869,10 +961,12 @@ fn references(
     }
     p.reference_spare_slots(16);
     for child in &mut workers.0 {
-        ensure(
-            child.try_wait()?.is_none(),
-            "churn worker exited before all enumerations finished",
-        )?;
+        if child.try_wait()?.is_some() {
+            check_worker_records(out)?;
+            return Err(environment_issue(
+                "churn worker exited before all enumerations finished",
+            ));
+        }
     }
     fs::write(out.join("pf-churn-stop"), b"stop")?;
     let wait_end = end.min(Instant::now() + Duration::from_secs(10));
@@ -885,13 +979,13 @@ fn references(
     let mut counts = Vec::new();
     for i in 0..4 {
         let count: Value = read_json(&out.join(format!("pf-churn-{i}.json")))?;
+        check_worker_error(&count)?;
         ensure(
-            count["iterations"].as_u64().unwrap_or(0) > 0 && count["error"].is_null(),
+            count["iterations"].as_u64().unwrap_or(0) > 0,
             "churn worker made no successful progress",
         )?;
         counts.push(count);
     }
-    coverage_missing |= complete == 0 || small_spare_growth == 0;
     let capacities = p.reference_capacities();
     ensure(
         !capacities.is_empty()
@@ -910,10 +1004,120 @@ fn references(
     for token in held {
         release(p, token, end)?;
     }
-    if coverage_missing {
-        return Err(environment_issue(
-            "small-spare churn requires Retry > 0 and Complete > 0 for each sub-run and growth past copy capacity > 0 in at least one small-spare sub-run; inspect pf-churn.json",
-        ));
+    Ok(())
+}
+// Each callback uses the ordinary native -E adapter and fsyncs its token before
+// any subsequent acquisition/read. The r6-pf intent and restore -d cover even a
+// crash between the tool returning and its token append.
+fn deterministic_injections(
+    out: &Path,
+    p: &mut NativePlatform,
+    end: Instant,
+    held: &[RefLine],
+) -> Result<()> {
+    use std::sync::{Arc, Mutex};
+    let mut observations = Vec::new();
+    for spare in [0, 1, 16] {
+        for k in super::super::pf_check::scenarios(spare) {
+            let injected = Arc::new(Mutex::new(Vec::<RefLine>::new()));
+            let acquired = injected.clone();
+            let dir = out.to_path_buf();
+            let mut injector = platform(out, true)?;
+            injector.capture_pf_text(Some(dir.clone()));
+            p.reference_spare_slots(spare);
+            let _ = p.reference_copy_decisions();
+            p.reference_injection(Box::new(move || {
+                let run = || -> Result<()> {
+                    for sequence in 0..k {
+                        let wall_before = super::super::command::unix_seconds();
+                        let outcome = injector.acquire(deadline(end)?);
+                        let ToolOutcome::Ok((token, pid)) = outcome else {
+                            let prefix = if matches!(outcome, ToolOutcome::NotStarted(SysError::TimedOut) | ToolOutcome::Failed(SysError::TimedOut)) { "pf case deadline expired" } else { "injected -E" };
+                            return Err(environment_issue(format!("{prefix}: {outcome:?}")));
+                        };
+                        let wall_after = super::super::command::unix_seconds();
+                        append(&dir, &json!({"kind":"token","token":token,"pid":pid,"sequence":sequence,"spare":spare,"k":k,"wall_before":wall_before,"wall_after":wall_after}))?;
+                        let fingerprint = refs(&mut injector, end)?.into_iter()
+                            .find(|r| r.token == token && r.pid == pid
+                                && r.timestamp >= wall_before.saturating_sub(1)
+                                && r.timestamp <= wall_after.saturating_add(1))
+                            .ok_or("injected PID/calendar timestamp fingerprint missing")?;
+                        acquired.lock().map_err(|_| "injection lock")?.push(fingerprint);
+                    }
+                    ensure_text(injector.take_pf_capture_failures().is_empty(), "injection capture failed")
+                };
+                let mut run = run;
+                run().map_err(|error| {
+                    eprintln!("pf injection failed: {error}");
+                    if error.to_string().contains("pf case deadline expired") { SysError::TimedOut }
+                    else { SysError::Failed("pf injection environment issue") }
+                })
+            }));
+            let platform = std::cell::RefCell::new(&mut *p);
+            super::super::pf_check::injection_trial(
+                || -> Result<()> {
+                    let complete = refs(&mut platform.borrow_mut(), end)?;
+                    let events = platform.borrow_mut().reference_copy_decisions();
+                    let injected = injected.lock().map_err(|_| "injection lock")?;
+                    let copies: Vec<_> = events.iter().map(|e| match e {
+                    pftoken::EnumerationEvent::Copy(c) => json!({"copy":format!("{c:?}")}),
+                    pftoken::EnumerationEvent::GrowthPastCopyCapacity => json!({"growth_past_copy_capacity":true}),
+                    pftoken::EnumerationEvent::FirstCopy { capacity, records } => json!({"first_capacity":capacity,"records":fingerprints_json(records)}),
+                }).collect();
+                    observations.push(json!({"spare":spare,"k":k,"copies":copies,
+                    "injected":fingerprints_json(&injected),"complete":fingerprints_json(&complete)}));
+                    write_json(out, "pf-injection.json", &observations)?;
+                    super::super::pf_check::check_injection(
+                        spare, k, held, &injected, &events, &complete,
+                    )
+                    .map_err(Into::into)
+                },
+                || -> Result<()> {
+                    // Keep acquisition order; kernel token numbers are not ordered.
+                    let injected = injected.lock().map_err(|_| "injection lock")?;
+                    for fingerprint in injected.iter() {
+                        release_owned(
+                            &mut platform.borrow_mut(),
+                            fingerprint.token,
+                            Some(fingerprint),
+                            end,
+                        )?;
+                        ensure(
+                            !refs(&mut platform.borrow_mut(), end)?.contains(fingerprint),
+                            "injected release fingerprint survived independent read",
+                        )?;
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+    }
+    p.reference_spare_slots(16);
+    Ok(())
+}
+fn fingerprints_json(lines: &[RefLine]) -> Value {
+    json!(
+        lines
+            .iter()
+            .map(|r| json!({"token":r.token,"pid":r.pid,"timestamp":r.timestamp}))
+            .collect::<Vec<_>>()
+    )
+}
+fn check_worker_error(count: &Value) -> Result<()> {
+    super::super::pf_check::worker_error(count).map_err(|(environment, detail)| {
+        if environment {
+            environment_issue(detail)
+        } else {
+            detail.into()
+        }
+    })
+}
+fn check_worker_records(out: &Path) -> Result<()> {
+    for i in 0..4 {
+        let path = out.join(format!("pf-churn-{i}.json"));
+        if path.exists() {
+            check_worker_error(&read_json(&path)?)?;
+        }
     }
     Ok(())
 }
@@ -943,8 +1147,10 @@ pub(super) fn auxiliary(out: &Path, mode: &str, name: &str) -> Result<()> {
         p.capture_pf_text(Some(out.into()));
         let outcome = p.enable_pf(deadline(end)?);
         let failures = p.take_pf_capture_failures();
+        super::super::pf_check::enable_result(&outcome, PfEnable::AlreadyRunning)
+            .map_err(environment_issue)?;
         return ensure_text(
-            outcome == Ok(PfEnable::AlreadyRunning) && failures.is_empty(),
+            failures.is_empty(),
             &format!(
                 "new-process anonymous enable failed; {}",
                 failures.join("; ")
@@ -977,7 +1183,8 @@ pub(super) fn auxiliary(out: &Path, mode: &str, name: &str) -> Result<()> {
         out,
         &format!("pf-churn-{name}.json"),
         &json!({"iterations":iterations,
-        "error":outcome.as_ref().err().map(ToString::to_string)}),
+        "error":outcome.as_ref().err().map(ToString::to_string),
+        "environment_error":outcome.as_ref().err().is_some_and(|e| e.is::<super::EnvironmentIssue>())}),
     )?;
     outcome
 }
@@ -1005,7 +1212,7 @@ fn x(out: &Path, p: &mut NativePlatform, end: Instant, result: &mut CaseResult) 
         )?;
         let invalid = raw(out, p, &["-X", &old.to_string()], end)?;
         // R2 measured this response only while pf is disabled. Never promote it
-        // to TokenInvalid for a numeric release racing a reissued holder.
+        // to an absence acknowledgement for a numeric release racing a reissued holder.
         ensure(
             invalid.exit_code == Some(1)
                 && invalid.stdout.is_empty()
@@ -1038,10 +1245,7 @@ fn x_stale(
     reset(out, p, end)?;
     let stale = acquire(p, end)?;
     sole_release(out, p, stale, end)?;
-    ensure_text(
-        p.enable_pf(deadline(end)?) == Ok(PfEnable::Started),
-        "stale campaign anonymous enable",
-    )?;
+    enable_expected(p, end, PfEnable::Started)?;
     let blocker = acquire(p, end)?;
     // If the blocker itself recurs, it is already a re-issued live holder.
     let mut recurred = blocker == stale;

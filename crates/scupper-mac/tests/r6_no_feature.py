@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile-time proof: assumption and spare-slot overrides are absent in production."""
+"""Compile-time proof: assumption, spare-slot and injection overrides are absent in production."""
 from pathlib import Path
 import json
 import os
@@ -28,6 +28,10 @@ if __name__ == '__main__':
                           'p.reference_spare_slots(0); }'),
         ('spare_function', 'pub fn probe() { let _ = '
                           'scupper_mac::decode::pftoken::enumerate_with_spare; }'),
+        ('injection_field', 'pub fn probe(p: &mut scupper_mac::native::NativePlatform) { let _ = &p.pf_reference_injection; }'),
+        ('injection_method', 'pub fn probe(p: &mut scupper_mac::native::NativePlatform) { p.reference_injection(Box::new(|| Ok(()))); }'),
+        ('injection_function', 'pub fn probe() { let _ = scupper_mac::decode::pftoken::enumerate_with_injection; }'),
+        ('injection_type', 'pub fn probe(_: scupper_mac::decode::pftoken::Injection) {}'),
         ('variant', 'pub fn probe() { let _ = scupper_mac::decode::pftoken::Override::'
                     'Qualification(Default::default()); }'),
     ]:
@@ -40,6 +44,6 @@ if __name__ == '__main__':
                                  str(path), '-o', str(OUT / f'{name}.rmeta')], cwd=ROOT,
                                 env=ENV, capture_output=True, text=True)
         (OUT / f'{name}.log').write_text(result.stdout + result.stderr)
-        assert result.returncode != 0 and ('E0425' if name == 'spare_function' else 'E0599') in result.stderr, result.stderr
-        assert dict(method='reference_assumptions', variant='Qualification', spare_method='reference_spare_slots', spare_function='enumerate_with_spare')[name] in result.stderr
+        assert result.returncode != 0 and ('E0609' if name == 'injection_field' else 'E0425' if name in ('spare_function', 'injection_function', 'injection_type') else 'E0599') in result.stderr, result.stderr
+        assert dict(method='reference_assumptions', variant='Qualification', spare_method='reference_spare_slots', spare_function='enumerate_with_spare', injection_field='pf_reference_injection', injection_method='reference_injection', injection_function='enumerate_with_injection', injection_type='Injection')[name] in result.stderr
         print(f'PROVED absent in no-feature Darwin build: {name}', flush=True)

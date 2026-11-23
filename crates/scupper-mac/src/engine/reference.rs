@@ -774,6 +774,13 @@ impl<P: Platform> Engine<P> {
                 }
             }
             if acknowledged && !lines.iter().any(ours) {
+                let d = self.deadline();
+                let status = self.platform.pf_info(d);
+                self.platform
+                    .report_safety(crate::platform::SafetyEvent::ReferenceReleaseStatus {
+                        token,
+                        status,
+                    });
                 self.apply(Event::ReferenceSettled {
                     entry: e.key,
                     how: ReferenceSettlement::Released,

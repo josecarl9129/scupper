@@ -117,16 +117,25 @@ pub fn enumerate(
         expired,
         |capacity| vec![0_u8; capacity],
         16,
-        |_| {},
+        |_, _, _| {},
         || {},
+        #[cfg(feature = "qualification")]
+        || Ok(()),
     )
 }
 /// Qualification observations from the actual enumeration protocol.
 #[cfg(feature = "qualification")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EnumerationEvent {
     /// Result of a successful copy ioctl.
     Copy(Classification),
+    /// First copy's actual fixed capacity and decoded contents, before any retry.
+    FirstCopy {
+        /// Exact initialized ioctl buffer length.
+        capacity: usize,
+        /// Actual first-copy fingerprints in kernel order.
+        records: Vec<RefLine>,
+    },
     /// The following size query exceeded the previous successful copy capacity.
     GrowthPastCopyCapacity,
 }
@@ -141,14 +150,39 @@ pub fn enumerate_with_spare(
     spare: usize,
     observe: impl FnMut(EnumerationEvent),
 ) -> Result<Vec<RefLine>, SysError> {
+    enumerate_with_injection(read, expired, spare, observe, || Ok(()))
+}
+/// Qualification-only one-shot window after fixed capacity and before first copy.
+///
+/// # Errors
+/// Injection failures and ordinary enumeration failures remain incomplete.
+#[cfg(feature = "qualification")]
+pub fn enumerate_with_injection(
+    read: impl FnMut(&mut [u8]) -> Result<usize, ReadError>,
+    expired: impl FnMut() -> bool,
+    spare: usize,
+    observe: impl FnMut(EnumerationEvent),
+    inject: impl FnOnce() -> Result<(), SysError>,
+) -> Result<Vec<RefLine>, SysError> {
     let observe = std::cell::RefCell::new(observe);
+    let mut first = true;
     enumerate_buffer(
         read,
         expired,
         |capacity| vec![0_u8; capacity],
         spare,
-        |classification| (observe.borrow_mut())(EnumerationEvent::Copy(classification)),
+        |classification, capacity, bytes| {
+            (observe.borrow_mut())(EnumerationEvent::Copy(classification));
+            if first {
+                first = false;
+                (observe.borrow_mut())(EnumerationEvent::FirstCopy {
+                    capacity,
+                    records: decode(bytes).unwrap_or_default(),
+                });
+            }
+        },
         || (observe.borrow_mut())(EnumerationEvent::GrowthPastCopyCapacity),
+        inject,
     )
 }
 fn enumerate_buffer(
@@ -156,9 +190,12 @@ fn enumerate_buffer(
     mut expired: impl FnMut() -> bool,
     mut allocate: impl FnMut(usize) -> Vec<u8>,
     spare: usize,
-    mut observe: impl FnMut(Classification),
+    mut observe: impl FnMut(Classification, usize, &[u8]),
     mut growth: impl FnMut(),
+    #[cfg(feature = "qualification")] inject: impl FnOnce() -> Result<(), SysError>,
 ) -> Result<Vec<RefLine>, SysError> {
+    #[cfg(feature = "qualification")]
+    let mut inject = Some(inject);
     let mut slots = 0_usize;
     let mut previous_copy_capacity = None;
     for _ in 0..8 {
@@ -187,6 +224,10 @@ fn enumerate_buffer(
             .filter(|c| *c <= 16 * 1024 * 1024)
             .ok_or(SysError::Failed("pf token bounds"))?;
         let mut bytes = allocate(capacity);
+        #[cfg(feature = "qualification")]
+        if let Some(inject) = inject.take() {
+            inject()?;
+        }
         if expired() {
             return Err(SysError::TimedOut);
         }
@@ -195,7 +236,11 @@ fn enumerate_buffer(
         };
         previous_copy_capacity = Some(capacity);
         let classification = classify(capacity, returned, STRIDE);
-        observe(classification);
+        observe(
+            classification,
+            capacity,
+            &bytes[..returned.min(bytes.len())],
+        );
         match classification {
             Classification::Complete => return decode(&bytes[..returned]),
             Classification::Layout => return Err(SysError::Failed("pf token layout")),
@@ -318,6 +363,7 @@ mod tests {
                 expected.push(EnumerationEvent::GrowthPastCopyCapacity);
             }
             expected.push(EnumerationEvent::Copy(Classification::Complete));
+            decisions.retain(|e| !matches!(e, EnumerationEvent::FirstCopy { .. }));
             assert_eq!(decisions, expected);
         }
     }
@@ -505,6 +551,12 @@ impl Drop for Slot {
     }
 }
 impl Reader {
+    /// A timed-out operation may still own the reader and mutate through a hook.
+    #[cfg(feature = "qualification")]
+    #[must_use]
+    pub fn idle(&self) -> bool {
+        !self.busy.load(std::sync::atomic::Ordering::Acquire)
+    }
     /// Bound waiting without cancelling or sharing an outstanding syscall buffer.
     ///
     /// # Errors
@@ -655,8 +707,10 @@ mod allocation_tests {
                         bytes
                     },
                     16,
-                    |_| {},
-                    || {}
+                    |_, _, _| {},
+                    || {},
+                    #[cfg(feature = "qualification")]
+                    || Ok(())
                 ),
                 Ok(vec![])
             );
@@ -664,3 +718,7 @@ mod allocation_tests {
         }
     }
 }
+
+/// One disposable scenario's acquisition callback; absent from production.
+#[cfg(feature = "qualification")]
+pub type Injection = Box<dyn FnOnce() -> Result<(), SysError> + Send>;

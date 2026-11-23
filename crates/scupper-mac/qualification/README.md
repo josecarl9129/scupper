@@ -27,6 +27,7 @@ Use one fresh absolute `--out DIR` under that protected directory:
    `system/net.scupper.qual.restore` launchd worker. It acknowledges its own pid,
    microsecond start, process group, parent, boot session and monotonic deadline.
    A live, independent worker must acknowledge before any experiment starts.
+   Use `--after 1500` for the expanded `pf` group.
 3. `run --group smoke|probe|probe-hijack --out DIR --disposable-runner` runs the
    selected cell. Alternatively, `probe --name pf-starters --out DIR
    --disposable-runner` runs one experiment. `dns-default` additionally requires
@@ -95,7 +96,7 @@ Each has a nine-second alarm while keys are owned and a ten-second outer command
 deadline. A gated undo sentinel removes both keys on SIGALRM notification,
 unexpected parent EOF or its 8.5-second deadline, in addition to temporary-session
 teardown. The cell is `continue-on-error` on both pinned runners; the independent
-dead-man uses the same 1080 seconds as other groups. The timing regression test
+dead-man uses 1080 seconds, as do the other groups except `pf` (1500 seconds). The timing regression test
 requires this deadline to exceed both hijack case budgets plus final restore's
 240-second maximum, and to cover the larger probe group plus that maximum.
 Final recovery gets its own budget: 10 seconds plus two seconds per incomplete
@@ -221,7 +222,7 @@ Linux runs `tests/r5_storage_mutations.py` and an exhaustive no-feature fault-en
 compile test. The fallback mutant uses a mock successful fsync after a failed
 full-sync; actual Darwin syscall behavior remains a native-runner observation.
 
-R6 adds `pf` (Q-ENABLE 2 minutes, Q-EEXIST 2 minutes, Q-REFS 8 minutes)
+R6 adds `pf` (Q-ENABLE 4 minutes, Q-EEXIST 3 minutes, Q-REFS 15 minutes)
 `pf-x` (Q-X 2 minutes) and `pf-x-stale` (Q-X-STALE 2 minutes) on both pinned runners. These cells require pf
 Disabled and no starter references at preflight. They journal global-state
 intent before mutation and run all pf tools and four churn workers inside a
@@ -240,10 +241,19 @@ eight long-lived references including the oldest. Workers acquire bursts of four
 The 2000 reads comprise 1000 with the default 16 spare slots and 500 each with
 qualification-only spare 0 and 1. `pf-churn.json` records each sub-run's internal
 Retry count, complete/incomplete observations, and `growth_past_copy_capacity` events
-(the next size query exceeds the previous copy capacity). This proves later
-growth, not truncation at the earlier copy ioctl. Each small-spare
-sub-run requires Retry > 0 and Complete > 0, and at least one small-spare sub-run
-must observe growth past the previous copy capacity; missing coverage is Inconclusive. Production always
+(the next size query exceeds the previous copy capacity). This soak is measurement only; spawn latency does not reliably hit the
+size/copy window. A Complete missing a continuously held fingerprint still fails.
+`pf-injection.json` instead asserts deterministic boundary coverage: with eight
+held fingerprints, spare in {0,1,16}, inject each distinct k in
+{0, spare-1 when nonnegative, spare, spare+1, spare+2, 2*spare+3}. A one-shot
+qualification hook fixes capacity before acquiring k references with ordinary
+native -E, journals each immediately and holds them through enumeration. The
+adapter records actual first-copy capacity and contents. k < spare must first
+Complete; k >= spare must Retry; k > spare must omit the oldest held fingerprint
+in the first copy and observe growth past capacity. The final Complete must
+contain every held/injected fingerprint. Checked releases and independent reads
+follow enumeration, in acquisition order. Incomplete evidence remains Unknown;
+failed/unfinished injection writers require group restore before global reset. Production always
 uses 16 spares; the override method and portable entry point compile only with
 `qualification`, with their absence checked by `r6_no_feature.py`.
 Q-X checks X1, X1-anonymous and X2, saves `pf-x-contract.json`, and returns
@@ -270,10 +280,31 @@ status with Debug but no uptime and unknown counters still fail closed.
 All observed read-only pfctl commands exited zero with the exact stderr prefix
 `No ALTQ support in kernel\nALTQ related functions disabled\n`.
 `decode/pftext.rs` strips this exact prefix once, only for those two builds;
-all existing remainder rules still apply. Mutator captures remain pending.
+all existing remainder rules still apply. Later mutator captures are pinned in
+`decode/pftext.rs`, including the sole-reference row from CI 45079241070.
 
 Original source note: upstream pfctl's
 [`print_status` at 855d4e8](https://github.com/openbsd/src/blob/855d4e832803330fc45a64539854bf8d27180600/sbin/pfctl/pfctl_parser.c)
 omits uptime when `since` is zero, then prints the Debug column with one of
 None/Urgent/Misc/Loud. `pf-info-disabled-source.txt` retains that earlier evidence.
-Q-ENABLE's two-minute budget is unchanged until native timing evidence arrives.
+CI 45079241070 measured 49 Q-ENABLE Started captures spanning 119 seconds on
+24H232 (about 2.4 s/iteration). Q-ENABLE now has 240 s (50*2.4=120 s,
+100% headroom); Q-EEXIST has 180 s using the same conservative 120 s work
+allowance (50% headroom). Q-REFS has 900 s: the previous conservative 480 s
+work allowance plus 118 injected acquire/release pairs at 0.8 s = 574.4 s;
+1.5*574.4=861.6 s fits. Native elapsed_ms records will refine that allowance.
+The pf launchd wait is 24 minutes for 22 minutes of cases plus setup/cleanup;
+the run step and pf dead-man are 25 minutes (other groups remain at 18);
+the CI cell is 50 minutes with 20 minutes overhead,
+leaving room for 10% case slack and the 240 s final restore. Deadlines with less
+than one whole second left are environment errors; adapter timeouts retain the
+actual error instead of becoming text mismatches.
+
+CI 45079241070 also pins the SoleReleased row independently for both builds:
+rc 0, empty stdout and exact preamble + `pf disabled\n` stderr. Text is only
+an acknowledgement of our exact -X invocation. Qualified matching pre-call
+fingerprint and a fresh complete post-read proving its absence are mandatory.
+Later pf-info is diagnostic only; isolated qualification additionally requires
+Disabled and empty inventory. `pf-last-reference-*.json` is saved before verdict.
+Every pf case JSON includes elapsed_ms. Q-REFS resets on exit; incomplete
+injection writers defer reset to the journaled group restore.
