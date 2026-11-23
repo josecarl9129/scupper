@@ -127,6 +127,8 @@ pub fn enumerate(
 #[cfg(feature = "qualification")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EnumerationEvent {
+    /// The actual first copy ioctl failed; no boundary verdict is available.
+    FirstCopyFailed,
     /// Result of a successful copy ioctl.
     Copy(Classification),
     /// First copy's actual fixed capacity and decoded contents, before any retry.
@@ -158,23 +160,28 @@ pub fn enumerate_with_spare(
 /// Injection failures and ordinary enumeration failures remain incomplete.
 #[cfg(feature = "qualification")]
 pub fn enumerate_with_injection(
-    read: impl FnMut(&mut [u8]) -> Result<usize, ReadError>,
+    mut read: impl FnMut(&mut [u8]) -> Result<usize, ReadError>,
     expired: impl FnMut() -> bool,
     spare: usize,
     observe: impl FnMut(EnumerationEvent),
     inject: impl FnOnce() -> Result<(), SysError>,
 ) -> Result<Vec<RefLine>, SysError> {
     let observe = std::cell::RefCell::new(observe);
-    let mut first = true;
+    let first = std::cell::Cell::new(true);
     enumerate_buffer(
-        read,
+        |bytes| {
+            let result = read(bytes);
+            if !bytes.is_empty() && result.is_err() && first.replace(false) {
+                (observe.borrow_mut())(EnumerationEvent::FirstCopyFailed);
+            }
+            result
+        },
         expired,
         |capacity| vec![0_u8; capacity],
         spare,
         |classification, capacity, bytes| {
             (observe.borrow_mut())(EnumerationEvent::Copy(classification));
-            if first {
-                first = false;
+            if first.replace(false) {
                 (observe.borrow_mut())(EnumerationEvent::FirstCopy {
                     capacity,
                     records: decode(bytes).unwrap_or_default(),

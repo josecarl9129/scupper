@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub(super) const MAX_ARM_SECONDS: u64 = 25 * 60;
+pub(super) const MAX_ARM_SECONDS: u64 = 30 * 60;
 
 /// The portable part of the accident guard. Inputs are observations, not trusted
 /// authentication: a local administrator can spoof them.

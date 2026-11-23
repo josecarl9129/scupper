@@ -129,7 +129,7 @@ pub fn info_outcome(attempt: Attempt<'_>) -> PfInfo {
 /// Pre-spawn refusal or any unrecognized/incomplete post-spawn evidence.
 pub fn enable_outcome(attempt: Attempt<'_>, gates: Assumptions) -> Result<PfEnable, SysError> {
     let (build, result) = attempt?;
-    if result.timed_out {
+    if result.timed_out && result.reap.settled() {
         return Err(SysError::TimedOut);
     }
     enable(build, status(&result)?, result.stdout, result.stderr, gates)
@@ -482,6 +482,29 @@ mod tests {
         }
     }
     #[test]
+    fn enable_timeout_requires_settled_reap() {
+        for reap in [Reap::Pending, Reap::Status(0), Reap::NoChild] {
+            let e = ToolEvidence {
+                timed_out: true,
+                reap,
+                ..evidence(b"pf enabled\n")
+            };
+            assert_eq!(
+                enable_outcome(Ok((&Build::fixture("24H232"), e)), Assumptions::default()),
+                Err(if reap.settled() {
+                    SysError::TimedOut
+                } else {
+                    SysError::Unknown
+                })
+            );
+        }
+        assert_eq!(
+            enable_outcome(Err(SysError::TimedOut), Assumptions::default()),
+            Err(SysError::TimedOut)
+        );
+    }
+
+    #[test]
     fn native_output_mapping_preserves_each_stream_truncation_flag() {
         for out_lost in [false, true] {
             for err_lost in [false, true] {
@@ -691,7 +714,7 @@ mod tests {
                     );
                     assert_eq!(
                         enable_outcome(Ok((build, e)), Assumptions::default()),
-                        Err(if e.timed_out {
+                        Err(if e.timed_out && e.reap.settled() {
                             SysError::TimedOut
                         } else {
                             SysError::Unknown

@@ -98,6 +98,30 @@ impl NativePlatform {
             Ok(())
         }));
     }
+    /// Drop an armed callback without claiming a running/failed writer is quiescent.
+    #[cfg(feature = "qualification")]
+    pub fn disarm_reference_injection(&mut self) {
+        if self.pf_reference_injection.take().is_some() {
+            self.pf_injection_quiescent
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+    /// Qualification retains timeout evidence even when the child is unreaped.
+    #[cfg(feature = "qualification")]
+    pub fn enable_pf_observed(
+        &mut self,
+        deadline: Deadline,
+    ) -> (Result<crate::platform::PfEnable, SysError>, bool) {
+        let attempt = self.pf_attempt(&[crate::engine::PFCTL, "-e"], deadline);
+        let timed_out = attempt.as_ref().is_ok_and(|(_, result)| result.timed_out);
+        (
+            crate::decode::pftext::enable_outcome(
+                evidence(&attempt),
+                self.pf_assumptions.assumptions(),
+            ),
+            timed_out,
+        )
+    }
     /// Failed/unfinished injected writers must be stopped by group restore first.
     #[cfg(feature = "qualification")]
     #[must_use]

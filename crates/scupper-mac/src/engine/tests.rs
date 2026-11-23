@@ -1272,6 +1272,65 @@ fn sole_ack_uses_fingerprints_and_later_enabled_status_is_diagnostic() {
 }
 
 #[test]
+fn diagnostic_runs_after_all_releases_and_skips_an_open_pfctl_fence() {
+    let initial = accounted(true, false);
+    let mut snapshot = initial.snapshot.clone();
+    snapshot.machine.older_references.try_push(902).unwrap();
+    let mut second = snapshot.references[0].clone().unwrap();
+    second.key = ReferenceEntry::Token(902);
+    snapshot.references[1] = Some(second);
+    let mut p = fixture(&snapshot);
+    for token in [901, 902] {
+        p.tokens.insert(
+            token,
+            RefLine {
+                token,
+                pid: 777,
+                timestamp: 12,
+            },
+        );
+    }
+    p.enabled = true;
+    let mut e = Engine::start(p).unwrap();
+    e.platform.calls.clear();
+    // A stalled diagnostic opens the fence. It must see both settlements done,
+    // and no subsequent diagnostic may consume another containment slot.
+    e.platform.inject(
+        Call::PfInfo,
+        2,
+        Fault::ToolHang {
+            reaped: false,
+            effect: false,
+        },
+    );
+    e.platform
+        .inject_fence_after(Call::PfInfo, 2, Fault::Incomplete);
+    let _ = e.reconcile_references();
+    assert_eq!(e.status().accounting.held, 0);
+    let calls = &e.platform.calls;
+    let infos: Vec<_> = calls
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| (*c == Call::PfInfo).then_some(i))
+        .collect();
+    assert_eq!(
+        infos.len(),
+        2,
+        "assertion: only initial status and one diagnostic"
+    );
+    for token in [901, 902] {
+        let release = calls
+            .iter()
+            .position(|c| *c == Call::Release(token))
+            .unwrap();
+        assert!(
+            release < infos[1],
+            "assertion: diagnostics must follow all releases"
+        );
+    }
+}
+
+#[test]
 fn incomplete_enumeration_never_frees_or_releases() {
     let mut e = accounted(true, false);
     e.platform.tokens.clear();

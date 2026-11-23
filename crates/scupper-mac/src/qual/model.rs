@@ -77,9 +77,9 @@ pub struct CaseResult {
     pub verdict: Verdict,
     /// Number of completed iterations.
     pub iterations: u32,
-    /// Case wall duration in milliseconds.
-    #[serde(default)]
-    pub elapsed_ms: u128,
+    /// Measured case wall duration in milliseconds; absent when not measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u128>,
     /// Human-readable reason and limitations.
     pub detail: String,
     /// Redacted command observations.
@@ -376,10 +376,10 @@ mod tests {
             22
         );
         const {
-            assert!(super::super::guard::MAX_ARM_SECONDS >= 25 * 60);
+            assert!(super::super::guard::MAX_ARM_SECONDS == 30 * 60);
         }
         let workflow = include_str!("../../../../.github/workflows/ci.yml");
-        assert!(workflow.contains("then after=1500; fi"));
+        assert!(workflow.contains("then after=1800; fi"));
         assert!(workflow.contains("matrix.group == 'pf' && 25"));
         let launch = include_str!("tool.rs");
         assert!(launch.contains("\"pf\" => 24 * 60"));
@@ -446,7 +446,7 @@ mod tests {
         assert!(output.contains("PUBLIC_KEY=public"));
         assert_eq!(redact(&output), output);
         let serialized = serde_json::to_string(&CaseResult {
-            elapsed_ms: 0,
+            elapsed_ms: None,
             case: "Q-CAPTURE".into(),
             binary_sha256: "0".repeat(64),
             verdict: Verdict::Inconclusive,
@@ -456,6 +456,29 @@ mod tests {
         })?;
         assert!(!serialized.contains("fixture-"));
         Ok(())
+    }
+
+    #[test]
+    fn unmeasured_duration_is_absent_and_measured_zero_is_preserved() {
+        let mut value = CaseResult {
+            elapsed_ms: None,
+            case: "Q-CAPTURE".into(),
+            binary_sha256: "0".repeat(64),
+            verdict: Verdict::Inconclusive,
+            iterations: 0,
+            detail: String::new(),
+            evidence: vec![],
+        };
+        let unmeasured = serde_json::to_value(&value).unwrap();
+        assert!(unmeasured.get("elapsed_ms").is_none());
+        assert_eq!(
+            serde_json::from_value::<CaseResult>(unmeasured)
+                .unwrap()
+                .elapsed_ms,
+            None
+        );
+        value.elapsed_ms = Some(0);
+        assert_eq!(serde_json::to_value(&value).unwrap()["elapsed_ms"], 0);
     }
 
     #[test]

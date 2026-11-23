@@ -131,7 +131,7 @@ fn setup_inner(out: &Path, case_end: u64) -> Result<Vec<PathBuf>> {
 }
 fn setup(out: &Path, end: u64) -> Result<Vec<PathBuf>> {
     let operation = setup_inner(out, end);
-    save_case(out, &CaseResult { elapsed_ms: 0,
+    save_case(out, &CaseResult { elapsed_ms: None,
         case: "Q-STORE-SETUP".into(), binary_sha256: executable_sha256()?,
         verdict: if operation.is_ok() { Verdict::Measurement } else { Verdict::Inconclusive },
         iterations: if operation.is_ok() { 2 } else { 0 },
@@ -984,7 +984,7 @@ pub(super) fn run(out: &Path) -> Result<()> {
         require_ack(out)?;
         executable_sha256()
     })?;
-    let mut result = CaseResult { elapsed_ms: 0, case:"Q-STORE".into(), binary_sha256:hash, verdict:Verdict::AssumptionHolds, iterations:0, detail:"Error handling only; partial bytes may remain after every failure. Synced creates and short-copy repairs require checked file and directory F_FULLFSYNC. Crash and power-loss durability are not established.".into(), evidence:Vec::new() };
+    let mut result = CaseResult { elapsed_ms: None, case:"Q-STORE".into(), binary_sha256:hash, verdict:Verdict::AssumptionHolds, iterations:0, detail:"Error handling only; partial bytes may remain after every failure. Synced creates and short-copy repairs require checked file and directory F_FULLFSYNC. Crash and power-loss durability are not established.".into(), evidence:Vec::new() };
     let operation = (|| -> Result<()> {
         phase(&mut phases, out, "abi", |_| {
             check_abi(out, &mut result, end)

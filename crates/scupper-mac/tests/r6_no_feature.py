@@ -31,6 +31,9 @@ if __name__ == '__main__':
         ('injection_field', 'pub fn probe(p: &mut scupper_mac::native::NativePlatform) { let _ = &p.pf_reference_injection; }'),
         ('injection_method', 'pub fn probe(p: &mut scupper_mac::native::NativePlatform) { p.reference_injection(Box::new(|| Ok(()))); }'),
         ('injection_function', 'pub fn probe() { let _ = scupper_mac::decode::pftoken::enumerate_with_injection; }'),
+        ('injection_disarm', 'pub fn probe(p: &mut scupper_mac::native::NativePlatform) { p.disarm_reference_injection(); }'),
+        ('injection_quiescent', 'pub fn probe(p: &scupper_mac::native::NativePlatform) { let _ = p.reference_injection_quiescent(); }'),
+        ('reader_idle', 'pub fn probe(r: &scupper_mac::decode::pftoken::Reader) { let _ = r.idle(); }'),
         ('injection_type', 'pub fn probe(_: scupper_mac::decode::pftoken::Injection) {}'),
         ('variant', 'pub fn probe() { let _ = scupper_mac::decode::pftoken::Override::'
                     'Qualification(Default::default()); }'),
@@ -45,5 +48,5 @@ if __name__ == '__main__':
                                 env=ENV, capture_output=True, text=True)
         (OUT / f'{name}.log').write_text(result.stdout + result.stderr)
         assert result.returncode != 0 and ('E0609' if name == 'injection_field' else 'E0425' if name in ('spare_function', 'injection_function', 'injection_type') else 'E0599') in result.stderr, result.stderr
-        assert dict(method='reference_assumptions', variant='Qualification', spare_method='reference_spare_slots', spare_function='enumerate_with_spare', injection_field='pf_reference_injection', injection_method='reference_injection', injection_function='enumerate_with_injection', injection_type='Injection')[name] in result.stderr
+        assert dict(method='reference_assumptions', variant='Qualification', spare_method='reference_spare_slots', spare_function='enumerate_with_spare', injection_field='pf_reference_injection', injection_method='reference_injection', injection_function='enumerate_with_injection', injection_type='Injection', injection_disarm='disarm_reference_injection', injection_quiescent='reference_injection_quiescent', reader_idle='idle')[name] in result.stderr
         print(f'PROVED absent in no-feature Darwin build: {name}', flush=True)

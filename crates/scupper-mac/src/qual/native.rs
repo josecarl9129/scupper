@@ -124,7 +124,7 @@ impl Options {
             || options.after > MAX_ARM_SECONDS
         {
             return Err(
-                "group must be smoke/base/tool/store/pf/pf-x/pf-x-stale/probe/probe-hijack; --after must be 1..1500 seconds"
+                "group must be smoke/base/tool/store/pf/pf-x/pf-x-stale/probe/probe-hijack; --after must be 1..1800 seconds"
                     .into(),
             );
         }
@@ -932,7 +932,7 @@ fn capture(out: &Path) -> Result<CaseResult> {
     };
     write_json(out, "capture.json", &snapshot)?;
     let result = CaseResult {
-        elapsed_ms: 0,
+        elapsed_ms: None,
         case: "Q-CAPTURE".into(),
         binary_sha256: snapshot.binary_sha256,
         verdict,
@@ -966,7 +966,7 @@ fn run_smoke(out: &Path) -> Result<()> {
     }
     let baseline: Snapshot = read_json(&out.join("preflight.json"))?;
     let started = Instant::now();
-    let mut result = CaseResult { elapsed_ms: 0,
+    let mut result = CaseResult { elapsed_ms: None,
         case: "Q-SMOKE".into(), binary_sha256: executable_sha256()?, verdict: Verdict::AssumptionHolds, iterations: 0,
         detail: "ABI layout evidence, guard refusal, independent dead-man ack, restore actions/available static observations unchanged and 1000 stable boot UUID reads; no native assumptions promoted".into(),
         evidence: Vec::new(),
@@ -1189,7 +1189,7 @@ fn restore_checked(out: &Path) -> Result<()> {
     save_case(
         out,
         &CaseResult {
-            elapsed_ms: started.elapsed().as_millis(),
+            elapsed_ms: Some(started.elapsed().as_millis()),
             case: "Q-RESTORE".into(),
             binary_sha256: executable_sha256()?,
             verdict: if violation {
@@ -1260,7 +1260,7 @@ fn run_probe(out: &Path, name: &str) -> Result<()> {
         return Err("probe already recorded; use a fresh evidence directory for a rerun".into());
     }
     let mut result = CaseResult {
-        elapsed_ms: 0,
+        elapsed_ms: None,
         case,
         binary_sha256: executable_sha256()?,
         verdict: Verdict::Inconclusive,
@@ -1373,7 +1373,7 @@ fn classify_probe(
                     save_case(
                         out,
                         &CaseResult {
-                            elapsed_ms: 0,
+                            elapsed_ms: None,
                             case: id,
                             binary_sha256: executable_sha256()?,
                             verdict,
@@ -1388,11 +1388,11 @@ fn classify_probe(
                 }
                 if name == "pf-starters" {
                     let (verdict, iterations) = super::probe::pf_size_query(value);
-                    save_case(out, &CaseResult { elapsed_ms: 0,
+                    save_case(out, &CaseResult { elapsed_ms: None,
                         case: "Q-REFS-size-query".into(), binary_sha256: executable_sha256()?, verdict, iterations,
                         detail: "zero-capacity size queries recorded separately from token copies; returned allocation size must contain whole records".into(), evidence: Vec::new(),
                     })?;
-                    save_case(out, &CaseResult { elapsed_ms: 0, case: "Q-REFS-layout".into(), binary_sha256: executable_sha256()?, verdict: super::probe::pf_layout(value), iterations: super::probe::pf_read_count(value),
+                    save_case(out, &CaseResult { elapsed_ms: None, case: "Q-REFS-layout".into(), binary_sha256: executable_sha256()?, verdict: super::probe::pf_layout(value), iterations: super::probe::pf_read_count(value),
                         detail: "84-byte stride, 16-byte request, ioctl number and nonzero-capacity size/order observations compared with whole-record newest-first copy-loop hypothesis".into(), evidence: Vec::new() })?;
                 }
             } else {

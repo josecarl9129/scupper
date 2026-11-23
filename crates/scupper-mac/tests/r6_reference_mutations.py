@@ -23,6 +23,8 @@ RESTORE = ROOT / 'crates/scupper-mac/src/qual/restore_check.rs'
 JOURNAL = ROOT / 'crates/scupper-mac/src/qual/journal.rs'
 CHECK = ROOT / 'crates/scupper-mac/src/qual/pf_check.rs'
 CAPTURE = ROOT / 'crates/scupper-mac/src/decode/pfcapture.rs'
+MODEL = ROOT / 'crates/scupper-mac/src/qual/model.rs'
+WORKFLOW = ROOT / '.github/workflows/ci.yml'
 OUT = ROOT / 'target/r6-mutants'
 ENV = dict(os.environ, CARGO_BUILD_JOBS='2', RUST_TEST_THREADS='2',
            CARGO_TARGET_DIR=str(ROOT / 'target'))
@@ -245,6 +247,9 @@ MUTANTS = [
      'returned <= capacity - stride',
      'returned <= capacity',
      'scupper-mac', 'scripted_same_table_injection_covers_every_spare_boundary'),
+    ('injection-checker-exact-fit-complete', CHECK,
+     'let expected = if k < spare {', 'let expected = if k <= spare {',
+     'scupper-mac', 'scripted_same_table_injection_covers_every_spare_boundary'),
     ('injection-hook-noop', TOKEN,
      '        if let Some(inject) = inject.take() {\n            inject()?;\n        }',
      '        if let Some(_inject) = inject.take() {}',
@@ -258,7 +263,7 @@ MUTANTS = [
      '    release()?;\n    let result = enumerate()?;',
      'scupper-mac', 'injected_references_are_released_after_enumeration_returns'),
     ('deadline-expired-again', CHECK,
-     'if left.as_secs() == 0 {',
+     'if left.as_secs() < 2 {',
      'if left.is_zero() {',
      'scupper-mac', 'deadline_never_hands_out_expired_seconds_and_timeout_keeps_detail'),
     ('release-ignores-acknowledgement', ENGINE,
@@ -269,6 +274,68 @@ MUTANTS = [
      '                    self.platform.report_safety(\n                        crate::platform::SafetyEvent::ForeignReferenceVanished {\n                            reference: foreign.clone(),\n                        },\n                    );',
      '                    let _ = foreign;',
      'scupper-mac', 'release_requires_fresh_complete_post_read_and_never_retries_reissued_number'),
+    ('pf-deadman-too-short', WORKFLOW,
+     'then after=1800; fi',
+     'then after=1500; fi',
+     'scupper-mac', 'pf_deadman_exceeds_cases_restore_and_run_step'),
+    ('enable-unreaped-timeout', TEXT,
+     'if result.timed_out && result.reap.settled() {',
+     'if result.timed_out {',
+     'scupper-mac', 'enable_timeout_requires_settled_reap'),
+    ('qualification-drops-timeout-evidence', CHECK,
+     'if timed_out || actual == &Err(SysError::TimedOut) {',
+     'if actual == &Err(SysError::TimedOut) {',
+     'scupper-mac', 'unreaped_enable_timeout_retains_deadline_detail_in_qualification'),
+    ('injection-window-fixed-eight', CHECK,
+     '.min(8 + u64::try_from(k).unwrap_or(u64::MAX - 16).div_ceil(2))',
+     '.min(8)',
+     'scupper-mac', 'injection_windows_scale_cap_and_fit_q_refs'),
+    ('injection-window-mislabels-timeout', CHECK,
+     'Err(format!("{timeout_label}: references TimedOut"))',
+     'Err("pf case deadline expired: references TimedOut".into())',
+     'scupper-mac', 'injection_windows_scale_cap_and_fit_q_refs'),
+    ('deadline-one-second-again', CHECK,
+     'if left.as_secs() < 2 {',
+     'if left.as_secs() == 0 {',
+     'scupper-mac', 'deadline_never_hands_out_expired_seconds_and_timeout_keeps_detail'),
+    ('diagnostic-inside-release-loop', ENGINE,
+     '                released.push(token);',
+     '                let d = self.deadline();\n                let _ = self.platform.pf_info(d);\n                released.push(token);',
+     'scupper-mac', 'diagnostic_runs_after_all_releases_and_skips_an_open_pfctl_fence'),
+    ('diagnostic-ignores-open-fence', ENGINE,
+     '            if self.unreaped_pfctl() > 0 {\n                break;\n            }',
+     '',
+     'scupper-mac', 'diagnostic_runs_after_all_releases_and_skips_an_open_pfctl_fence'),
+    ('sole-runner-accepts-other-release-row', CHECK,
+     '        && stderr == [pftext::ALTQ_PREAMBLE, b"pf disabled\\n"].concat()',
+     '',
+     'scupper-mac', 'sole_runner_requires_exact_bytes_and_inventory_contradictions_are_contract_errors'),
+    ('release-contradiction-inconclusive', CHECK,
+     '            false,\n            "acknowledged release fingerprint/inventory contradiction",',
+     '            true,\n            "acknowledged release fingerprint/inventory contradiction",',
+     'scupper-mac', 'sole_runner_requires_exact_bytes_and_inventory_contradictions_are_contract_errors'),
+    ('injection-scope-leaves-armed-hook', CHECK,
+     '                disarm(self.state);',
+     '                let _ = disarm;',
+     'scupper-mac', 'unfired_injection_disarms_on_deadline_error_and_scope_exit'),
+    ('first-copy-error-becomes-later-copy', TOKEN,
+     'if !bytes.is_empty() && result.is_err() && first.replace(false) {',
+     'if false && !bytes.is_empty() && result.is_err() && first.replace(false) {',
+     'scupper-mac', 'first_copy_failure_never_reports_later_resized_copy_as_first'),
+    ('first-copy-error-is-contract-violation', CHECK,
+     'if events.contains(&EnumerationEvent::FirstCopyFailed) {',
+     'if false && events.contains(&EnumerationEvent::FirstCopyFailed) {',
+     'scupper-mac', 'first_copy_failure_never_reports_later_resized_copy_as_first'),
+    ('unmeasured-duration-serialized', MODEL,
+     '#[serde(default, skip_serializing_if = "Option::is_none")]',
+     '#[serde(default)]',
+     'scupper-mac', 'unmeasured_duration_is_absent_and_measured_zero_is_preserved'),
+
+    ('injection-disarm-keeps-stale-callback', NATIVE_PF,
+     'if self.pf_reference_injection.take().is_some() {',
+     'if self.pf_reference_injection.as_ref().is_some() {',
+     'scupper-mac', 'native_qualification_wires_real_injection_and_budget_checks'),
+
 ]
 
 
@@ -282,10 +349,13 @@ if __name__ == '__main__':
     OUT.mkdir(parents=True, exist_ok=True)
     regression_root = ROOT / "crates/scupper-mac/proptest-regressions"
     regressions = {p: p.read_bytes() for p in regression_root.rglob("*") if p.is_file()}
-    originals = {path: path.read_bytes() for path in [TOKEN, TEXT, ENGINE, RULES, CORE, NATIVE, NATIVE_PF, RESOURCES, RESTORE, JOURNAL, CAPTURE, CHECK]}
+    originals = {path: path.read_bytes() for path in [TOKEN, TEXT, ENGINE, RULES, CORE, NATIVE, NATIVE_PF, RESOURCES, RESTORE, JOURNAL, CAPTURE, CHECK, MODEL, WORKFLOW]}
     results = []
     try:
-        for crate, test in [('scupper-mac', 'decode::pf'),
+        for crate, test in [('scupper-mac', 'pf_deadman_exceeds_cases_restore_and_run_step'),
+                            ('scupper-mac', 'diagnostic_runs_after_all_releases_and_skips_an_open_pfctl_fence'),
+                            ('scupper-mac', 'unmeasured_duration_is_absent_and_measured_zero_is_preserved'),
+                            ('scupper-mac', 'decode::pf'),
                             ('scupper-mac', 'qual::pf_check::tests'),
                             ('scupper-mac', 'sole_ack_uses_fingerprints_and_later_enabled_status_is_diagnostic'),
                             ('scupper-mac', 'release_invocation_is_exact_x_without_disable_fallback'),
@@ -316,7 +386,10 @@ if __name__ == '__main__':
                 print(f'KILLED by assertion: {name} / {test}', flush=True)
             finally:
                 path.write_bytes(originals[path])
-        for crate, test in [('scupper-mac', 'decode::pf'),
+        for crate, test in [('scupper-mac', 'pf_deadman_exceeds_cases_restore_and_run_step'),
+                            ('scupper-mac', 'diagnostic_runs_after_all_releases_and_skips_an_open_pfctl_fence'),
+                            ('scupper-mac', 'unmeasured_duration_is_absent_and_measured_zero_is_preserved'),
+                            ('scupper-mac', 'decode::pf'),
                             ('scupper-mac', 'qual::pf_check::tests'),
                             ('scupper-mac', 'sole_ack_uses_fingerprints_and_later_enabled_status_is_diagnostic'),
                             ('scupper-mac', 'release_invocation_is_exact_x_without_disable_fallback'),

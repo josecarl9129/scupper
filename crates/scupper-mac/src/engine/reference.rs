@@ -674,6 +674,7 @@ impl<P: Platform> Engine<P> {
             .pf_reference
             .or_else(|| self.machine.durable().older_references.first().copied());
         let evidence: Vec<_> = self.snapshot.references.iter().flatten().cloned().collect();
+        let mut released = Vec::new();
         for e in evidence {
             let ReferenceEntry::Token(token) = e.key else {
                 continue;
@@ -774,13 +775,7 @@ impl<P: Platform> Engine<P> {
                 }
             }
             if acknowledged && !lines.iter().any(ours) {
-                let d = self.deadline();
-                let status = self.platform.pf_info(d);
-                self.platform
-                    .report_safety(crate::platform::SafetyEvent::ReferenceReleaseStatus {
-                        token,
-                        status,
-                    });
+                released.push(token);
                 self.apply(Event::ReferenceSettled {
                     entry: e.key,
                     how: ReferenceSettlement::Released,
@@ -797,6 +792,19 @@ impl<P: Platform> Engine<P> {
                     },
                 );
             }
+        }
+        // Diagnostics cannot delay settlement or fence off another numeric release.
+        for token in released {
+            if self.unreaped_pfctl() > 0 {
+                break;
+            }
+            let d = self.deadline();
+            let status = self.platform.pf_info(d);
+            self.platform
+                .report_safety(crate::platform::SafetyEvent::ReferenceReleaseStatus {
+                    token,
+                    status,
+                });
         }
         if !self.machine.durable().uncertain_acquires.is_empty()
             || matches!(

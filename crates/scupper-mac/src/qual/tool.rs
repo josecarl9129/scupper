@@ -165,7 +165,7 @@ pub(super) fn run(out: &Path) -> Result<()> {
         ("Q-LAUNCHD", launchd),
     ] {
         let mut result = CaseResult {
-            elapsed_ms: 0,
+            elapsed_ms: None,
             case: id.into(),
             binary_sha256: executable_sha256()?,
             verdict: Verdict::AssumptionHolds,
@@ -260,7 +260,7 @@ fn production_ancestors(out: &Path) -> Result<()> {
     save_case(
         out,
         &CaseResult {
-            elapsed_ms: 0,
+            elapsed_ms: None,
             case: "Q-LOCK-PRODUCTION-ANCESTORS".into(),
             binary_sha256: executable_sha256()?,
             verdict: Verdict::Measurement,
@@ -284,7 +284,7 @@ pub(super) fn mutation_tools(out: &Path) -> Result<()> {
         .mode(0o700)
         .create(tree.join("valid"))?;
     let mut result = CaseResult {
-        elapsed_ms: 0,
+        elapsed_ms: None,
         case: "Q-TOOL-MUTATION".into(),
         binary_sha256: executable_sha256()?,
         verdict: Verdict::AssumptionHolds,
@@ -889,7 +889,7 @@ fn worker_inner(out: &Path, mode: &str) -> Result<()> {
         return super::pf::worker(out, mode);
     }
     if mode == "tools" {
-        let mut result=CaseResult { elapsed_ms: 0,case:"Q-TOOL".into(),binary_sha256:executable_sha256()?,verdict:Verdict::AssumptionHolds,iterations:0,detail:"signal mask/dispositions, fd table/handoff, lock noninheritance, capped output, stalled-stdin SIGKILL/reap and separate syscall statuses observed".into(),evidence:Vec::new()};
+        let mut result=CaseResult { elapsed_ms: None,case:"Q-TOOL".into(),binary_sha256:executable_sha256()?,verdict:Verdict::AssumptionHolds,iterations:0,detail:"signal mask/dispositions, fd table/handoff, lock noninheritance, capped output, stalled-stdin SIGKILL/reap and separate syscall statuses observed".into(),evidence:Vec::new()};
         tools_worker(out, &mut result)?;
         write_json(
             out,
@@ -1248,7 +1248,7 @@ fn launchd(out: &Path, result: &mut CaseResult) -> Result<()> {
         result.iterations += 1;
     }
     let mut rosetta = CaseResult {
-        elapsed_ms: 0,
+        elapsed_ms: None,
         case: "Q-LAUNCHD-ROSETTA".into(),
         binary_sha256: executable_sha256()?,
         verdict: Verdict::Inconclusive,
@@ -1292,7 +1292,7 @@ fn launchd(out: &Path, result: &mut CaseResult) -> Result<()> {
         "KeepAlive measurement did not observe respawn",
     )?;
     let measurement = CaseResult {
-        elapsed_ms: 0,
+        elapsed_ms: None,
         case: "Q-LAUNCHD-THROTTLE".into(),
         binary_sha256: executable_sha256()?,
         verdict: Verdict::Measurement,

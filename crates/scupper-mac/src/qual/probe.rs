@@ -289,9 +289,50 @@ mod tests {
             .collect();
         assert_eq!(
             overrides,
-            [r#"if [ "${{ matrix.group }}" = pf ]; then after=1500; fi"#]
+            [r#"if [ "${{ matrix.group }}" = pf ]; then after=1800; fi"#]
         );
         assert_eq!(deadlines[0], 18 * 60);
+        Ok(())
+    }
+
+    #[test]
+    fn pf_deadman_exceeds_cases_restore_and_run_step() -> Result<(), Box<dyn std::error::Error>> {
+        let manifest = super::super::Manifest::bundled()?;
+        let case_seconds: u64 = manifest
+            .cases
+            .iter()
+            .filter(|c| c.group == "pf")
+            .map(|c| u64::from(c.budget_minutes) * 60)
+            .sum();
+        let workflow = include_str!("../../../../.github/workflows/ci.yml");
+        let after: u64 = workflow
+            .split("then after=")
+            .nth(1)
+            .ok_or("pf override missing")?
+            .split(';')
+            .next()
+            .ok_or("pf deadline missing")?
+            .parse()?;
+        let run = workflow
+            .split("- name: Run qualification cell")
+            .nth(1)
+            .ok_or("run step missing")?;
+        let run_minutes: u64 = run
+            .split("matrix.group == 'pf' && ")
+            .nth(1)
+            .ok_or("pf run deadline missing")?
+            .split_whitespace()
+            .next()
+            .ok_or("run minutes missing")?
+            .parse()?;
+        assert_eq!(after, super::super::guard::MAX_ARM_SECONDS);
+        assert!(after > case_seconds + super::super::model::MAX_FINAL_RESTORE_SECONDS + 60);
+        assert!(after > run_minutes * 60 + 60);
+        let budget = &manifest.group_budgets["pf"];
+        assert!(
+            u64::from(budget.overhead_minutes) * 60 + after
+                <= u64::from(budget.cell_budget_minutes) * 60
+        );
         Ok(())
     }
 
