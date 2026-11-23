@@ -1143,7 +1143,7 @@ pub(super) fn launch_job(out: &Path, mode: &str, keep_alive: bool) -> Result<(St
     }
     let until = Instant::now()
         + Duration::from_secs(match mode {
-            "pf" => 24 * 60,
+            "pf" => 23 * 60,
             "pf-x" | "pf-x-stale" => 5 * 60,
             _ => 45,
         });

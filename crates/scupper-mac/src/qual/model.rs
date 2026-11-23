@@ -380,9 +380,9 @@ mod tests {
         }
         let workflow = include_str!("../../../../.github/workflows/ci.yml");
         assert!(workflow.contains("then after=1800; fi"));
-        assert!(workflow.contains("matrix.group == 'pf' && 25"));
+        assert!(workflow.contains("matrix.group == 'pf' && 24"));
         let launch = include_str!("tool.rs");
-        assert!(launch.contains("\"pf\" => 24 * 60"));
+        assert!(launch.contains("\"pf\" => 23 * 60"));
         Ok(())
     }
 

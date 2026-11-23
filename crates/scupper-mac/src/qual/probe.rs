@@ -327,7 +327,7 @@ mod tests {
             .parse()?;
         assert_eq!(after, super::super::guard::MAX_ARM_SECONDS);
         assert!(after > case_seconds + super::super::model::MAX_FINAL_RESTORE_SECONDS + 60);
-        assert!(after > run_minutes * 60 + 60);
+        assert!(after > run_minutes * 60 + super::super::model::MAX_FINAL_RESTORE_SECONDS + 60);
         let budget = &manifest.group_budgets["pf"];
         assert!(
             u64::from(budget.overhead_minutes) * 60 + after

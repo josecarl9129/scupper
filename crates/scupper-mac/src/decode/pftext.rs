@@ -336,7 +336,17 @@ mod tests {
     #[test]
     fn every_native_parser_uses_system_build_attempt() {
         let native = include_str!("../native/mod.rs");
-        for method in ["enable_pf", "acquire", "release", "pf_info"] {
+        assert!(native.contains("self.enable_pf_attempt(deadline).0"));
+        let pf = include_str!("../native/pf.rs");
+        let enable = pf
+            .split_once("pub(super) fn enable_pf_attempt(")
+            .expect("shared enable")
+            .1
+            .split("pub fn reference_injection_quiescent(")
+            .next()
+            .expect("enable body");
+        assert!(enable.contains("let attempt = self.pf_attempt("));
+        for method in ["acquire", "release", "pf_info"] {
             let signature = format!("    fn {method}(");
             let body = native
                 .split_once(&signature)

@@ -33,6 +33,19 @@ pub(super) fn references_result(
     }
 }
 
+// Hook failures take priority over the reader's coarse timeout/error category.
+pub(super) fn injection_result(
+    result: crate::platform::Enumeration<Vec<RefLine>>,
+    hook_error: Option<&str>,
+) -> Result<Vec<RefLine>, String> {
+    if matches!(result, crate::platform::Enumeration::Incomplete(_))
+        && let Some(detail) = hook_error
+    {
+        return Err(detail.to_owned());
+    }
+    references_result(result, "injection window exceeded read deadline")
+}
+
 pub(super) fn sole_release_text(
     build: &crate::decode::pftext::Build,
     rc: i32,
@@ -320,7 +333,14 @@ mod tests {
         let campaign = include_str!("pf.rs");
         assert!(campaign.contains("check_release(acknowledged, !after.contains(&before))"));
         assert!(campaign.contains("pf_check::sole_release_text("));
-        assert!(campaign.contains("if environment {"));
+        let release = campaign
+            .split("fn check_release(")
+            .nth(1)
+            .unwrap()
+            .split("fn live_build(")
+            .next()
+            .unwrap();
+        assert!(release.contains("if environment {\n            environment_issue(detail)\n        } else {\n            detail.into()\n        }"));
     }
 
     #[test]
@@ -475,7 +495,15 @@ mod tests {
         assert!(campaign.contains("pf_check::injection_seconds(left, k)"));
         assert!(campaign.contains("pf_check::injection_scope("));
         assert!(campaign.contains("NativePlatform::disarm_reference_injection"));
-        assert!(campaign.contains("enable_pf_observed"));
+        assert!(campaign.contains("unknown.enable_pf_observed(deadline(end)?)"));
+        let unknown = campaign
+            .split("let (outcome, timed_out) = unknown.enable_pf_observed")
+            .nth(1)
+            .unwrap()
+            .split("match unknown.references")
+            .next()
+            .unwrap();
+        assert!(unknown.contains("if timed_out || outcome == Err(SysError::TimedOut) {"));
         assert!(native.contains("attempt.as_ref().is_ok_and(|(_, result)| result.timed_out)"));
         assert!(campaign.contains("p.reference_injection(Box::new(move ||"));
         assert!(campaign.contains("injector.acquire(deadline(end)?)"));
@@ -483,6 +511,69 @@ mod tests {
         assert!(campaign.contains("pf_check::injection_trial("));
         assert!(!campaign.contains("coverage_missing"));
         assert!(campaign.contains("let cleanup = reset(out, p,"));
+    }
+
+    #[test]
+    fn injection_errors_keep_hook_detail_and_save_failed_measurements() {
+        use crate::platform::{Enumeration, ToolOutcome};
+        for outcome in [
+            ToolOutcome::<()>::NotStarted(SysError::TimedOut),
+            ToolOutcome::Failed(SysError::TimedOut),
+        ] {
+            let detail = format!("pf case deadline expired: {outcome:?}");
+            assert_eq!(
+                injection_result(Enumeration::Incomplete(SysError::TimedOut), Some(&detail)),
+                Err(detail)
+            );
+        }
+        assert_eq!(
+            injection_result(Enumeration::Incomplete(SysError::TimedOut), None),
+            Err("injection window exceeded read deadline: references TimedOut".into())
+        );
+        assert_eq!(
+            injection_result(
+                Enumeration::Incomplete(SysError::Unknown),
+                Some("injected -E: Failed(Unknown)")
+            ),
+            Err("injected -E: Failed(Unknown)".into())
+        );
+        assert_eq!(
+            injection_result(Enumeration::Complete(vec![]), None),
+            Ok(vec![])
+        );
+        let campaign = include_str!("pf.rs");
+        assert!(campaign.contains("Mutex::new(None::<String>)"));
+        assert!(campaign.contains("*failure = Some(error.to_string())"));
+        assert!(campaign.contains("pf_check::injection_result("));
+        let read = campaign.split("let read_deadline =").nth(1).unwrap();
+        let saved = read
+            .find("write_json(out, \"pf-injection.json\", &observations)")
+            .unwrap();
+        assert!(read[..saved].contains("\"read_budget_seconds\":seconds"));
+        assert!(read[..saved].contains("\"elapsed_ms\":scenario_started.elapsed().as_millis()"));
+        assert!(read[..saved].contains("\"error\":complete.as_ref().err()"));
+        assert!(
+            saved
+                < read
+                    .find("let complete = complete.map_err(environment_issue)?;")
+                    .unwrap()
+        );
+    }
+
+    #[test]
+    fn production_and_observed_enable_share_decisions_and_x_deadlines_are_environmental() {
+        let native = include_str!("../native/pf.rs");
+        let platform = include_str!("../native/mod.rs");
+        assert!(platform.contains("self.enable_pf_attempt(deadline).0"));
+        assert!(native.contains("self.enable_pf_attempt(deadline)"));
+        assert_eq!(
+            native
+                .matches("crate::decode::pftext::enable_outcome(")
+                .count(),
+            1
+        );
+        assert!(!platform.contains("crate::decode::pftext::enable_outcome("));
+        assert!(include_str!("pf.rs").contains("if scenario == \"X1-anonymous\" {\n                enable_expected(p, end, PfEnable::AlreadyRunning)?;"));
     }
 
     fn packed(r: &RefLine) -> Vec<u8> {

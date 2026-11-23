@@ -839,11 +839,7 @@ impl Platform for NativePlatform {
         self.storage.wait(deadline)
     }
     fn enable_pf(&mut self, deadline: Deadline) -> Result<PfEnable, SysError> {
-        let attempt = self.pf_attempt(&[crate::engine::PFCTL, "-e"], deadline);
-        crate::decode::pftext::enable_outcome(
-            pf::evidence(&attempt),
-            self.pf_assumptions.assumptions(),
-        )
+        self.enable_pf_attempt(deadline).0
     }
     fn acquire(&mut self, deadline: Deadline) -> ToolOutcome<(u64, u32)> {
         let attempt = self.pf_attempt(&[crate::engine::PFCTL, "-E"], deadline);

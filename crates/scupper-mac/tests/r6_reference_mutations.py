@@ -22,6 +22,8 @@ RESOURCES = ROOT / 'crates/scupper-mac/src/qual/resources.rs'
 RESTORE = ROOT / 'crates/scupper-mac/src/qual/restore_check.rs'
 JOURNAL = ROOT / 'crates/scupper-mac/src/qual/journal.rs'
 CHECK = ROOT / 'crates/scupper-mac/src/qual/pf_check.rs'
+CAMPAIGN = ROOT / 'crates/scupper-mac/src/qual/pf.rs'
+LAUNCH = ROOT / 'crates/scupper-mac/src/qual/tool.rs'
 CAPTURE = ROOT / 'crates/scupper-mac/src/decode/pfcapture.rs'
 MODEL = ROOT / 'crates/scupper-mac/src/qual/model.rs'
 WORKFLOW = ROOT / '.github/workflows/ci.yml'
@@ -331,6 +333,48 @@ MUTANTS = [
      '#[serde(default)]',
      'scupper-mac', 'unmeasured_duration_is_absent_and_measured_zero_is_preserved'),
 
+    ('unqualified-enable-drops-observation', CAMPAIGN,
+     'let (outcome, timed_out) = unknown.enable_pf_observed(deadline(end)?);',
+     'let outcome = unknown.enable_pf(deadline(end)?);\n            let timed_out = false;',
+     'scupper-mac', 'native_qualification_wires_real_injection_and_budget_checks'),
+    ('injection-hook-error-loses-detail', CHECK,
+     'return Err(detail.to_owned());',
+     'return Err("injection window exceeded read deadline: references TimedOut".into());',
+     'scupper-mac', 'injection_errors_keep_hook_detail_and_save_failed_measurements'),
+    ('injection-hook-error-not-saved', CAMPAIGN,
+     '*failure = Some(error.to_string());',
+     '*failure = None;',
+     'scupper-mac', 'injection_errors_keep_hook_detail_and_save_failed_measurements'),
+    ('injection-failed-measurement-lost', CAMPAIGN,
+     '"error":complete.as_ref().err()',
+     '"error":null',
+     'scupper-mac', 'injection_errors_keep_hook_detail_and_save_failed_measurements'),
+    ('injection-failed-budget-lost', CAMPAIGN,
+     '"read_budget_seconds":seconds', '"lost_read_budget_seconds":seconds',
+     'scupper-mac', 'injection_errors_keep_hook_detail_and_save_failed_measurements'),
+    ('injection-failed-elapsed-lost', CAMPAIGN,
+     '"elapsed_ms":scenario_started.elapsed().as_millis()',
+     '"lost_elapsed_ms":scenario_started.elapsed().as_millis()',
+     'scupper-mac', 'injection_errors_keep_hook_detail_and_save_failed_measurements'),
+    ('run-timeout-omits-restore-margin', WORKFLOW,
+     "matrix.group == 'pf' && 24", "matrix.group == 'pf' && 25",
+     'scupper-mac', 'pf_deadman_exceeds_cases_restore_and_run_step'),
+    ('launchd-wait-loses-restore-margin', LAUNCH,
+     '"pf" => 23 * 60', '"pf" => 24 * 60',
+     'scupper-mac', 'reference_cells_fit_their_case_and_restore_budgets'),
+    ('release-wiring-contradiction-inconclusive', CAMPAIGN,
+     'fn check_release(acknowledged: bool, absent: bool) -> Result<()> {\n    super::super::pf_check::release_result(acknowledged, absent).map_err(|(environment, detail)| {\n        if environment {\n            environment_issue(detail)\n        } else {\n            detail.into()\n        }\n    })\n}',
+     'fn check_release(acknowledged: bool, absent: bool) -> Result<()> {\n    super::super::pf_check::release_result(acknowledged, absent).map_err(|(environment, detail)| {\n        if environment {\n            environment_issue(detail)\n        } else {\n            environment_issue(detail)\n        }\n    })\n}',
+     'scupper-mac', 'sole_runner_requires_exact_bytes_and_inventory_contradictions_are_contract_errors'),
+    ('observed-enable-copies-production', NATIVE_PF,
+     '        self.enable_pf_attempt(deadline)\n',
+     '        let attempt = self.pf_attempt(&[crate::engine::PFCTL, "-e"], deadline);\n        let timed_out = attempt.as_ref().is_ok_and(|(_, result)| result.timed_out);\n        (crate::decode::pftext::enable_outcome(evidence(&attempt), self.pf_assumptions.assumptions()), timed_out)\n',
+     'scupper-mac', 'production_and_observed_enable_share_decisions_and_x_deadlines_are_environmental'),
+    ('x-anonymous-deadline-contract-violation', CAMPAIGN,
+     'if scenario == "X1-anonymous" {\n                enable_expected(p, end, PfEnable::AlreadyRunning)?;',
+     'if scenario == "X1-anonymous" {\n                ensure(p.enable_pf(deadline(end)?) == Ok(PfEnable::AlreadyRunning), "X1 anonymous enable")?;',
+     'scupper-mac', 'production_and_observed_enable_share_decisions_and_x_deadlines_are_environmental'),
+
     ('injection-disarm-keeps-stale-callback', NATIVE_PF,
      'if self.pf_reference_injection.take().is_some() {',
      'if self.pf_reference_injection.as_ref().is_some() {',
@@ -349,10 +393,11 @@ if __name__ == '__main__':
     OUT.mkdir(parents=True, exist_ok=True)
     regression_root = ROOT / "crates/scupper-mac/proptest-regressions"
     regressions = {p: p.read_bytes() for p in regression_root.rglob("*") if p.is_file()}
-    originals = {path: path.read_bytes() for path in [TOKEN, TEXT, ENGINE, RULES, CORE, NATIVE, NATIVE_PF, RESOURCES, RESTORE, JOURNAL, CAPTURE, CHECK, MODEL, WORKFLOW]}
+    originals = {path: path.read_bytes() for path in [TOKEN, TEXT, ENGINE, RULES, CORE, NATIVE, NATIVE_PF, RESOURCES, RESTORE, JOURNAL, CAPTURE, CHECK, MODEL, WORKFLOW, CAMPAIGN, LAUNCH]}
     results = []
     try:
         for crate, test in [('scupper-mac', 'pf_deadman_exceeds_cases_restore_and_run_step'),
+                            ('scupper-mac', 'reference_cells_fit_their_case_and_restore_budgets'),
                             ('scupper-mac', 'diagnostic_runs_after_all_releases_and_skips_an_open_pfctl_fence'),
                             ('scupper-mac', 'unmeasured_duration_is_absent_and_measured_zero_is_preserved'),
                             ('scupper-mac', 'decode::pf'),
@@ -387,6 +432,7 @@ if __name__ == '__main__':
             finally:
                 path.write_bytes(originals[path])
         for crate, test in [('scupper-mac', 'pf_deadman_exceeds_cases_restore_and_run_step'),
+                            ('scupper-mac', 'reference_cells_fit_their_case_and_restore_budgets'),
                             ('scupper-mac', 'diagnostic_runs_after_all_releases_and_skips_an_open_pfctl_fence'),
                             ('scupper-mac', 'unmeasured_duration_is_absent_and_measured_zero_is_preserved'),
                             ('scupper-mac', 'decode::pf'),

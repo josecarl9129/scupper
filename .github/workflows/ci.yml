@@ -391,7 +391,7 @@ jobs:
           /usr/bin/sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT /private/var/db/scupper-qual/scupper-mac-qual arm --after "$after" --out /private/var/db/scupper-qual/evidence --disposable-runner
       - name: Run qualification cell
         if: matrix.group != 'tool-mutants'
-        timeout-minutes: ${{ matrix.group == 'tool' && 10 || matrix.group == 'store' && 10 || matrix.group == 'pf' && 25 || (matrix.group == 'pf-x' || matrix.group == 'pf-x-stale') && 5 || 18 }}
+        timeout-minutes: ${{ matrix.group == 'tool' && 10 || matrix.group == 'store' && 10 || matrix.group == 'pf' && 24 || (matrix.group == 'pf-x' || matrix.group == 'pf-x-stale') && 5 || 18 }}
         run: /usr/bin/sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,ImageOS,ImageVersion,RUNNER_NAME,GITHUB_RUN_ID,GITHUB_SHA /private/var/db/scupper-qual/scupper-mac-qual run --group ${{ matrix.group }} --out /private/var/db/scupper-qual/evidence --disposable-runner
       - name: Restore and stop dead-man
         if: always()

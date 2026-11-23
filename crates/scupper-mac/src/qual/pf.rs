@@ -604,14 +604,14 @@ fn enable(out: &Path, p: &mut NativePlatform, end: Instant, result: &mut CaseRes
             enable_expected(p, end, PfEnable::AlreadyRunning)?;
             let mut unknown = platform(out, false)?;
             unknown.capture_pf_text(Some(out.into()));
-            let outcome = unknown.enable_pf(deadline(end)?);
+            let (outcome, timed_out) = unknown.enable_pf_observed(deadline(end)?);
             let failures = unknown.take_pf_capture_failures();
             for failure in &failures {
                 result.detail.push_str("; ");
                 result.detail.push_str(failure);
             }
             ensure_text(failures.is_empty(), &failures.join("; "))?;
-            if outcome == Err(SysError::TimedOut) {
+            if timed_out || outcome == Err(SysError::TimedOut) {
                 return Err(environment_issue(format!(
                     "pf case deadline expired: {outcome:?}"
                 )));
@@ -1013,6 +1013,7 @@ fn references_inner(
 // Each callback uses the ordinary native -E adapter and fsyncs its token before
 // any subsequent acquisition/read. The r6-pf intent and restore -d cover even a
 // crash between the tool returning and its token append.
+#[allow(clippy::too_many_lines)] // Keep each hook, saved observation and release scope together.
 fn deterministic_injections(
     out: &Path,
     p: &mut NativePlatform,
@@ -1025,6 +1026,8 @@ fn deterministic_injections(
         for k in super::super::pf_check::scenarios(spare) {
             let injected = Arc::new(Mutex::new(Vec::<RefLine>::new()));
             let acquired = injected.clone();
+            let hook_error = Arc::new(Mutex::new(None::<String>));
+            let failed = hook_error.clone();
             let dir = out.to_path_buf();
             let mut injector = platform(out, true)?;
             injector.capture_pf_text(Some(dir.clone()));
@@ -1052,6 +1055,9 @@ fn deterministic_injections(
                 };
                 let mut run = run;
                 run().map_err(|error| {
+                    if let Ok(mut failure) = failed.lock() {
+                        *failure = Some(error.to_string());
+                    }
                     eprintln!("pf injection failed: {error}");
                     if error.to_string().contains("pf case deadline expired") { SysError::TimedOut }
                     else { SysError::Failed("pf injection environment issue") }
@@ -1069,11 +1075,13 @@ fn deterministic_injections(
                                 .map_err(environment_issue)?;
                             let read_deadline =
                                 Deadline(scupper_darwin::monotonic_raw().as_secs() + seconds);
-                            let complete = super::super::pf_check::references_result(
-                                platform.borrow_mut().references(read_deadline),
-                                "injection window exceeded read deadline",
-                            )
-                            .map_err(environment_issue)?;
+                            let read = platform.borrow_mut().references(read_deadline);
+                            let hook_error =
+                                hook_error.lock().map_err(|_| "injection error lock")?;
+                            let complete = super::super::pf_check::injection_result(
+                                read,
+                                hook_error.as_deref(),
+                            );
                             let events = platform.borrow_mut().reference_copy_decisions();
                             let injected = injected.lock().map_err(|_| "injection lock")?;
                             let copies: Vec<_> = events.iter().map(|e| match e {
@@ -1084,8 +1092,11 @@ fn deterministic_injections(
                             }).collect();
                             observations.push(json!({"spare":spare,"k":k,"copies":copies,
                                 "elapsed_ms":scenario_started.elapsed().as_millis(),"read_budget_seconds":seconds,
-                                "injected":fingerprints_json(&injected),"complete":fingerprints_json(&complete)}));
+                                "injected":fingerprints_json(&injected),
+                                "complete":complete.as_ref().ok().map(|lines| fingerprints_json(lines)),
+                                "error":complete.as_ref().err()}));
                             write_json(out, "pf-injection.json", &observations)?;
+                            let complete = complete.map_err(environment_issue)?;
                             super::super::pf_check::first_copy_result(&events)
                                 .map_err(environment_issue)?;
                             super::super::pf_check::check_injection(
@@ -1220,10 +1231,7 @@ fn x(out: &Path, p: &mut NativePlatform, end: Instant, result: &mut CaseResult) 
         if scenario.starts_with("X1") {
             let _second = acquire(p, end)?;
             if scenario == "X1-anonymous" {
-                ensure(
-                    p.enable_pf(deadline(end)?) == Ok(PfEnable::AlreadyRunning),
-                    "X1 anonymous enable",
-                )?;
+                enable_expected(p, end, PfEnable::AlreadyRunning)?;
             }
             reset(out, p, end)?;
         } else {

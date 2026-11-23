@@ -24,6 +24,8 @@ if __name__ == '__main__':
     for name, source in [
         ('method', 'pub fn probe(p: &mut scupper_mac::native::NativePlatform) { '
                    'p.reference_assumptions(Default::default()); }'),
+        ('enable_observed', 'pub fn probe(p: &mut scupper_mac::native::NativePlatform) { '
+                            'let _ = p.enable_pf_observed(scupper_mac::platform::Deadline(0)); }'),
         ('spare_method', 'pub fn probe(p: &mut scupper_mac::native::NativePlatform) { '
                           'p.reference_spare_slots(0); }'),
         ('spare_function', 'pub fn probe() { let _ = '
@@ -48,5 +50,5 @@ if __name__ == '__main__':
                                 env=ENV, capture_output=True, text=True)
         (OUT / f'{name}.log').write_text(result.stdout + result.stderr)
         assert result.returncode != 0 and ('E0609' if name == 'injection_field' else 'E0425' if name in ('spare_function', 'injection_function', 'injection_type') else 'E0599') in result.stderr, result.stderr
-        assert dict(method='reference_assumptions', variant='Qualification', spare_method='reference_spare_slots', spare_function='enumerate_with_spare', injection_field='pf_reference_injection', injection_method='reference_injection', injection_function='enumerate_with_injection', injection_type='Injection', injection_disarm='disarm_reference_injection', injection_quiescent='reference_injection_quiescent', reader_idle='idle')[name] in result.stderr
+        assert dict(method='reference_assumptions', enable_observed='enable_pf_observed', variant='Qualification', spare_method='reference_spare_slots', spare_function='enumerate_with_spare', injection_field='pf_reference_injection', injection_method='reference_injection', injection_function='enumerate_with_injection', injection_type='Injection', injection_disarm='disarm_reference_injection', injection_quiescent='reference_injection_quiescent', reader_idle='idle')[name] in result.stderr
         print(f'PROVED absent in no-feature Darwin build: {name}', flush=True)

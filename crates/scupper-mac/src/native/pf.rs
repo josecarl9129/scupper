@@ -112,6 +112,13 @@ impl NativePlatform {
         &mut self,
         deadline: Deadline,
     ) -> (Result<crate::platform::PfEnable, SysError>, bool) {
+        self.enable_pf_attempt(deadline)
+    }
+    // One production decision path; qualification only observes the raw timeout.
+    pub(super) fn enable_pf_attempt(
+        &mut self,
+        deadline: Deadline,
+    ) -> (Result<crate::platform::PfEnable, SysError>, bool) {
         let attempt = self.pf_attempt(&[crate::engine::PFCTL, "-e"], deadline);
         let timed_out = attempt.as_ref().is_ok_and(|(_, result)| result.timed_out);
         (
