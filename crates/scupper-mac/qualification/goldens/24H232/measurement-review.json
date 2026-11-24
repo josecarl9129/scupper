@@ -44,6 +44,44 @@
       "exit_code": 1,
       "stdout": "",
       "stderr": "pfctl: Use of -f option, could result in flushing of rules\npresent in the main ruleset added by the system at startup.\nSee /etc/pf.conf for further details.\n\nNo ALTQ support in kernel\nALTQ related functions disabled\nstdin:1: syntax error\npfctl: Syntax error in config file: pf rules not loaded\n"
+    },
+    {
+      "name": "direct-underscore",
+      "reviewed": true,
+      "provenance": "Pass-4 CI 45478867692; identical on 24H232 and 25G332; disposable parent normalized to f00003; 0000 is an example run token",
+      "command": [
+        "/sbin/pfctl",
+        "-o",
+        "none",
+        "-a",
+        "scupper-qual/children/f00003/_x",
+        "-f",
+        "-"
+      ],
+      "stdin": "pass quick on lo0 all no state\n",
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "pfctl: Use of -f option, could result in flushing of rules\npresent in the main ruleset added by the system at startup.\nSee /etc/pf.conf for further details.\n\nNo ALTQ support in kernel\nALTQ related functions disabled\npfctl: anchor names beginning with '_' cannot be modified from the command line\n",
+      "target_after": "Missing in every class read; no anchor created"
+    },
+    {
+      "name": "direct-grandchild-underscore",
+      "reviewed": true,
+      "provenance": "Pass-4 CI 45478867692; identical on 24H232 and 25G332; disposable parent normalized to f00004; 0000 is an example run token",
+      "command": [
+        "/sbin/pfctl",
+        "-o",
+        "none",
+        "-a",
+        "scupper-qual/children/f00004/qchild/_x",
+        "-f",
+        "-"
+      ],
+      "stdin": "pass quick on lo0 all no state\n",
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "pfctl: Use of -f option, could result in flushing of rules\npresent in the main ruleset added by the system at startup.\nSee /etc/pf.conf for further details.\n\nNo ALTQ support in kernel\nALTQ related functions disabled\npfctl: anchor names beginning with '_' cannot be modified from the command line\n",
+      "target_after": "Missing in every class read; no anchor created"
     }
   ],
   "inline_multiline_reviewed": true,

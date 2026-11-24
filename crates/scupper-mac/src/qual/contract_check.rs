@@ -413,25 +413,42 @@ mod tests {
     }
 }
 
-/// Pass-2 pinned userland rejections, reviewed for 24H232 and 25G332.
+/// Pinned pass-2 and pass-4 userland rejections for 24H232 and 25G332.
 pub(super) fn descendant_rejection(build: &str, name: &str, load: &super::Evidence) -> bool {
     let diagnostic: &[u8] = match name {
         "underscore" => b"stdin:1: anchor names beginning with '_' are reserved for internal use\npfctl: Syntax error in config file: pf rules not loaded\n",
         "inline" => b"stdin:1: syntax error\npfctl: Syntax error in config file: pf rules not loaded\n",
+        "direct-underscore" | "direct-grandchild-underscore" => b"pfctl: anchor names beginning with '_' cannot be modified from the command line\n",
         _ => return false,
     };
+    let stderr_matches = load.stderr.as_bytes()
+        == [
+            crate::decode::pfanchor::LOAD_WARNING,
+            crate::decode::pftext::ALTQ_PREAMBLE,
+            diagnostic,
+        ]
+        .concat();
     matches!(build, "24H232" | "25G332")
         && load.exit_code == Some(1)
         && !load.timed_out
         && !load.truncated
         && load.stdout.is_empty()
-        && load.stderr.as_bytes()
-            == [
-                crate::decode::pfanchor::LOAD_WARNING,
-                crate::decode::pftext::ALTQ_PREAMBLE,
-                diagnostic,
-            ]
-            .concat()
+        && stderr_matches
+}
+/// A reviewed rejection exempts only its load; all other evidence must complete.
+pub(super) fn descendant_measurement_complete(
+    build: &str,
+    name: &str,
+    measurement: &serde_json::Value,
+) -> bool {
+    let mut checked = measurement.clone();
+    if serde_json::from_value::<super::Evidence>(checked["load"].clone())
+        .is_ok_and(|load| descendant_rejection(build, name, &load))
+        && let Some(fields) = checked.as_object_mut()
+    {
+        fields.remove("load");
+    }
+    measurement_complete(&checked)
 }
 #[cfg(test)]
 mod rejection_tests {
@@ -460,6 +477,59 @@ mod rejection_tests {
             }
         }
     }
+    #[test]
+    fn direct_underscore_fake_pfctl_rejections_only_exempt_exact_load_rows() {
+        for review in [
+            include_str!("../../qualification/goldens/24H232/measurement-review.json"),
+            include_str!("../../qualification/goldens/25G332/measurement-review.json"),
+        ] {
+            let review: serde_json::Value = serde_json::from_str(review).unwrap();
+            let build = review["build"].as_str().unwrap();
+            for row in review["rejections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|row| row["name"].as_str().unwrap().starts_with("direct-"))
+            {
+                let name = row["name"].as_str().unwrap();
+                let load = serde_json::json!({
+                    "command":row["command"],"stdin":row["stdin"],"pid":1,"exit_code":1,
+                    "started_unix_ms":0,"elapsed_ms":0,"timed_out":false,"truncated":false,
+                    "stdout":"","stderr":row["stderr"]});
+                let target = row["command"][4].as_str().unwrap();
+                let classes = ["-sr", "-sn", "-sT", "-sA", "-sd"].map(|flag| {
+                    serde_json::json!({"command":["/sbin/pfctl","-a",target,flag],
+                        "stdin":null,"pid":2,"exit_code":0,"started_unix_ms":0,"elapsed_ms":0,
+                        "timed_out":false,"truncated":false,"stdout":"",
+                        "stderr":format!("No ALTQ support in kernel\nALTQ related functions disabled\nAnchor '{target}' not found.\n")})
+                });
+                let measurement = serde_json::json!({"load":load,"before":classes,"after":classes});
+                assert!(descendant_measurement_complete(build, name, &measurement));
+                assert!(!measurement_complete(&measurement));
+                assert!(!descendant_measurement_complete(
+                    "unreviewed",
+                    name,
+                    &measurement
+                ));
+                for (field, value) in [
+                    ("stderr", serde_json::json!("some other stderr\n")),
+                    ("stderr", serde_json::json!("")),
+                    ("stdout", serde_json::json!("unexpected output")),
+                    ("exit_code", serde_json::json!(2)),
+                    ("timed_out", serde_json::json!(true)),
+                    ("truncated", serde_json::json!(true)),
+                ] {
+                    let mut changed = measurement.clone();
+                    changed["load"][field] = value;
+                    assert!(!descendant_measurement_complete(build, name, &changed));
+                }
+                let mut changed = measurement.clone();
+                changed["after"][0]["truncated"] = serde_json::json!(true);
+                assert!(!descendant_measurement_complete(build, name, &changed));
+            }
+        }
+    }
+
     #[test]
     fn only_exact_pinned_rejections_count_as_completed_load_measurements() {
         let mut load: super::super::Evidence = serde_json::from_value(serde_json::json!({

@@ -1001,6 +1001,117 @@ pub(super) fn cleanup_measurement(out: &Path, root: &str) -> Result<()> {
         Err(failures.join("; ").into())
     }
 }
+// Length probes know their exact paths; no enumeration or recursive read here.
+pub(super) fn sample_classes_absent(
+    out: &Path,
+    path: &str,
+    deadline: Instant,
+    own_child: Option<&str>,
+) -> Result<bool> {
+    let mut calls = Vec::new();
+    for flag in ["-sr", "-sn", "-sT", "-sA", "-sd"] {
+        let evidence = invoke_before("/sbin/pfctl", &["-a", path, flag], deadline);
+        write_json(
+            out,
+            &format!("{}.json", unique("sample-classes")),
+            &evidence,
+        )?;
+        calls.push(evidence);
+    }
+    super::super::descendant_measure::sample_classes_absent(
+        &crate::decode::pftext::Build::system()?,
+        path,
+        &calls,
+        own_child,
+    )
+    .map_err(Into::into)
+}
+
+pub(super) fn fresh_length_sample(
+    out: &Path,
+    fixture: &super::super::descendant_measure::LengthFixture,
+    deadline: Instant,
+) -> Result<()> {
+    for path in std::iter::once(&fixture.parent)
+        .chain((fixture.parent != fixture.target).then_some(&fixture.target))
+    {
+        let before = scupper_darwin::qual_pf_rulesets(path)?;
+        let text_missing = sample_classes_absent(out, path, deadline, None)?;
+        let after = scupper_darwin::qual_pf_rulesets(path)?;
+        write_json(
+            out,
+            &format!("{}.json", unique("sample-freshness")),
+            &json!({"path":path,"kernel_before":before,"kernel_after":after,"text_missing":text_missing}),
+        )?;
+        if before.is_some() || after.is_some() || !text_missing {
+            return Err(format!("path-length sample target already exists: {path}").into());
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn cleanup_length_sample(
+    out: &Path,
+    fixture: &super::super::descendant_measure::LengthFixture,
+) -> Result<()> {
+    use super::super::descendant_measure::{SampleCleanupIo, cleanup_sample};
+    struct Scoped<'a> {
+        io: AnchorInventory<'a>,
+    }
+    impl SampleCleanupIo for Scoped<'_> {
+        fn present(&mut self, path: &str) -> std::result::Result<bool, String> {
+            scupper_darwin::qual_pf_rulesets(path)
+                .map(|names| names.is_some())
+                .map_err(|error| error.to_string())
+        }
+        fn flush(&mut self, path: &str, class: &str) -> std::result::Result<(), String> {
+            let op = match class {
+                "rules" => Operation::Rules,
+                "nat" => Operation::Nat,
+                "Tables" => Operation::Tables,
+                _ => Operation::Dummynet,
+            };
+            self.io
+                .call(op, &["-a", path, "-F", class], &[])
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        }
+        fn read_absent(
+            &mut self,
+            path: &str,
+            own_child: Option<&str>,
+        ) -> std::result::Result<(), String> {
+            // Reading ROOT requires the full recursive authority check. Samples
+            // must never request it: their exact paths are sufficient here.
+            if path == super::super::desc_inventory::ROOT {
+                return match anchor_read(self.io.out, path, self.io.deadline) {
+                    Ok(None) => Ok(()),
+                    other => Err(format!("measurement tree absence: {other:?}")),
+                };
+            }
+            sample_classes_absent(self.io.out, path, self.io.deadline, own_child)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        }
+    }
+    for path in [&fixture.parent, &fixture.target] {
+        if !super::super::desc_inventory::target_path(path)
+            || super::super::contract_check::unmodifiable_anchor(path)
+        {
+            return Err("invalid path-length cleanup target".into());
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    recheck_foreign_tokens(out, deadline)?;
+    cleanup_sample(
+        &mut Scoped {
+            io: AnchorInventory::new(out, deadline, &fixture.parent),
+        },
+        fixture,
+    )
+    .map_err(Into::into)
+}
+
 pub(super) fn anchor_read(
     out: &Path,
     path: &str,

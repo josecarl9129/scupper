@@ -25,9 +25,35 @@ STATE_MEASURE = ROOT / "crates/scupper-mac/src/qual/state_measure.rs"
 RULESET_CENSUS = ROOT / "crates/scupper-darwin/src/pf_rulesets.rs"
 DESC_INVENTORY = ROOT / "crates/scupper-mac/src/qual/desc_inventory.rs"
 CHILD_STAGE = ROOT / "crates/scupper-mac/src/qual/child_stage.rs"
+DESCENDANT_MEASURE = ROOT / "crates/scupper-mac/src/qual/descendant_measure.rs"
 OUT = ROOT / "target/r7-mutants"
 OUT.mkdir(parents=True, exist_ok=True)
 MUTANTS = [
+    ("path-length-nested-cleanup-accepts-any-child", DESCENDANT_MEASURE,
+     'own_child.is_some_and(|child| call.stdout == format!("  {child}\\n"))',
+     'own_child.is_some()',
+     "qual::descendant_measure::tests::sample_classes_reject_different_or_extra_child"),
+    ("path-length-altq-only-tables-is-missing", DESCENDANT_MEASURE,
+     '"-sT" => "pfctl: Anchor or Ruleset does not exist.\\n".to_owned(),',
+     '"-sT" => String::new(),',
+     "qual::descendant_measure::tests::sample_classes_reject_altq_only_tables_among_missing_rows"),
+    ("path-length-mixed-classes-is-absent", DESCENDANT_MEASURE,
+     'if missing_count > 0 && missing_count < calls.len() {',
+     'if false && missing_count > 0 && missing_count < calls.len() {',
+     "qual::descendant_measure::tests::sample_classes_reject_every_mixed_missing_and_empty_set"),
+    ("path-length-cleanup-rereads-whole-tree", DESCENDANT_MEASURE,
+     'io.read_absent(path, own_child)', '{ io.read_absent(ROOT, None)?; io.read_absent(path, own_child) }',
+     "qual::descendant_measure::tests::sample_cleanup_reads_only_its_own_paths_once"),
+    ("path-length-budget-guard-ignored", DESCENDANT_MEASURE,
+     'io.remaining() >= SAMPLE_MARGIN', 'true || io.remaining() >= SAMPLE_MARGIN',
+     "qual::descendant_measure::tests::sample_budget_stops_before_any_journal_load_or_cleanup"),
+
+    ("direct-underscore-refusal-accepts-any-stderr", CONTRACT_CHECK,
+     '&& stderr_matches', '&& (stderr_matches || name.starts_with("direct-"))',
+     "qual::contract_check::rejection_tests::direct_underscore_fake_pfctl_rejections_only_exempt_exact_load_rows"),
+    ("descendant-fixture-ignores-path-length-bound", DESCENDANT_MEASURE,
+     'if target_length > FIXTURE_PATH_BOUND {', 'if false && target_length > FIXTURE_PATH_BOUND {',
+     "qual::descendant_measure::tests::short_fixture_parents_are_bounded_and_unique"),
     ("flush-selector-drops-connection-in-loop", STATE_MEASURE,
      'connections.push(fresh);', 'connections.push(fresh); connections.clear();',
      "qual::state_measure::tests::selector_connections_survive_all_listings_and_close_on_every_exit"),

@@ -1331,6 +1331,7 @@ fn descendant_measurements(
         .map_err(|e| environment_issue(e.to_string()))?;
     let mut cleanup_failure = None::<String>;
     let mut skipped = Vec::new();
+    let mut next_parent = super::super::descendant_measure::FixtureNames::new();
     r.iterations = 0;
     for (name, source, suffix) in [
         (
@@ -1372,8 +1373,15 @@ fn descendant_measurements(
             )?;
             continue;
         }
-        let parent_name = super::unique(name);
-        let parent = format!("{ROOT}/{parent_name}");
+        let parent = super::super::descendant_measure::fixture_parent(
+            &mut next_parent,
+            "/empty/grandchild".len(),
+        )
+        .map_err(environment_issue)?;
+        let parent_name = parent
+            .rsplit('/')
+            .next()
+            .ok_or_else(|| environment_issue("fixture parent name"))?;
         let mut inventory_findings = Vec::new();
         measurement_attempt(out, &format!("children-{name}"), findings, || {
             env(
@@ -1390,7 +1398,7 @@ fn descendant_measurements(
             env(
                 namespace
                     .as_ref()
-                    .is_none_or(|names| !names.contains(&parent_name)),
+                    .is_none_or(|names| !names.iter().any(|name| name == parent_name)),
                 "fresh descendant parent already exists",
             )?;
             super::resources::journal_measurement_target(out, &parent)
@@ -1479,15 +1487,12 @@ fn descendant_measurements(
                     let measurement = json!({"parent":parent,"target":target,"source":source,"load":load,"grandchild_setup":grandchild_load,
                     "before":before,"scoped_flushes":flushes,"after":after,"measurement_only":true,"rejected_by_pfctl":load.exit_code.is_some_and(|rc| rc != 0) && !load.timed_out && !load.truncated,"reviewed_rejection":reviewed_rejection});
                     write_json(out, &format!("anchor-children-{name}.json"), &measurement)?;
-                    let mut checked = measurement;
-                    if reviewed_rejection {
-                        checked
-                            .as_object_mut()
-                            .ok_or("measurement object")?
-                            .remove("load");
-                    }
                     env(
-                        super::super::contract_check::measurement_complete(&checked),
+                        super::super::contract_check::descendant_measurement_complete(
+                            pftext::Build::system()?.as_str(),
+                            name,
+                            &measurement,
+                        ),
                         &format!(
                             "descendant {name} incomplete load, class, kernel enumeration or flush measurement"
                         ),
@@ -1521,11 +1526,129 @@ fn descendant_measurements(
                 .map(|finding| (true, finding)),
         );
     }
+    let length_detail =
+        path_length_measurements(out, p, findings, &mut next_parent, &mut cleanup_failure)
+            .map_err(environment_issue)?;
     r.detail = format!(
-        "{} descendant fixtures attempted; skipped fixtures: {skipped:?}",
+        "{} descendant fixtures attempted; skipped fixtures: {skipped:?}; {length_detail}",
         r.iterations
     );
     Ok(from_sdk_header)
+}
+
+struct PathLengthIo<'a> {
+    out: &'a Path,
+    platform: &'a mut NativePlatform,
+}
+impl super::super::descendant_measure::LengthIo for PathLengthIo<'_> {
+    type Error = Box<dyn std::error::Error>;
+    fn remaining(&self) -> Duration {
+        CASE_END.with(|limit| {
+            limit.get().map_or(Duration::from_secs(180), |end| {
+                end.saturating_duration_since(Instant::now())
+            })
+        })
+    }
+    fn fresh(&mut self, fixture: &super::super::descendant_measure::LengthFixture) -> Result<()> {
+        super::resources::fresh_length_sample(self.out, fixture, end())
+    }
+    fn journal(&mut self, path: &str) -> Result<()> {
+        super::resources::journal_measurement_target(self.out, path)
+    }
+    fn load(&mut self, path: &str, source: &str) -> Result<Evidence> {
+        raw(
+            self.out,
+            self.platform,
+            &["-o", "none", "-a", path, "-f", "-"],
+            source.as_bytes(),
+        )
+    }
+    fn cleanup(&mut self, fixture: &super::super::descendant_measure::LengthFixture) -> Result<()> {
+        super::resources::cleanup_length_sample(self.out, fixture)
+    }
+}
+
+fn path_length_measurements(
+    out: &Path,
+    p: &mut NativePlatform,
+    findings: &mut Findings,
+    next_parent: &mut super::super::descendant_measure::FixtureNames,
+    cleanup_failure: &mut Option<String>,
+) -> Result<String> {
+    use super::super::descendant_measure::{LENGTHS, length_detail, length_fixture, length_sample};
+    let mut rows = Vec::new();
+    let mut skipped = Vec::new();
+    let mut costs = Vec::new();
+    let mut budget_stopped = false;
+    for nested in [false, true] {
+        for length in LENGTHS {
+            let mode = if nested { "nested" } else { "direct" };
+            let name = format!("children-path-length-{mode}-{length}");
+            if budget_stopped {
+                skipped.push(json!({"length":length,"nested":nested,"reason":"remaining budget below 30-second margin"}));
+                continue;
+            }
+            let started = Instant::now();
+            measurement_attempt(out, &name, findings, || {
+                let fixture =
+                    length_fixture(next_parent, length, nested).map_err(environment_issue)?;
+                env(
+                    cleanup_failure.is_none(),
+                    &format!(
+                        "path-length fixture withheld after cleanup failure: {cleanup_failure:?}"
+                    ),
+                )?;
+                let result = match length_sample(&mut PathLengthIo { out, platform: p }, &fixture) {
+                    Ok(Some(result)) => result,
+                    Ok(None) => {
+                        budget_stopped = true;
+                        skipped.push(json!({"length":length,"nested":nested,"reason":"remaining budget below 30-second margin"}));
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        skipped.push(json!({"length":length,"nested":nested,"reason":error.to_string(),"environment_issue":true}));
+                        return Err(environment_issue(error));
+                    }
+                };
+                if let Err(error) = &result.cleanup {
+                    *cleanup_failure = Some(error.to_string());
+                }
+                let observation_error = result.observation.as_ref().err().map(ToString::to_string);
+                let mut row = result.observation.unwrap_or_else(|_| {
+                    json!({
+                    "parent":fixture.parent,"target":fixture.target,"length":length,
+                    "nested":nested,"measurement_only":true})
+                });
+                let elapsed_ms = started.elapsed().as_millis();
+                row["elapsed_before_evidence_write_ms"] = json!(elapsed_ms);
+                costs.push(format!("{mode}-{length}={elapsed_ms}ms"));
+                row["observation_error"] = json!(observation_error);
+                row["cleanup"] = json!(format!("{:?}", result.cleanup));
+                write_json(out, &format!("anchor-{name}.json"), &row)?;
+                let capture_complete = row["capture_complete"] == true;
+                rows.push(row);
+                result
+                    .cleanup
+                    .map_err(|e| environment_issue(format!("{name} cleanup failure: {e}")))?;
+                env(
+                    observation_error.is_none() && capture_complete,
+                    &format!("{name} capture incomplete: {observation_error:?}"),
+                )
+            })?;
+        }
+    }
+    let detail = format!(
+        "{}; recorded {}/10 samples; skipped lengths: {skipped:?}; per-sample cost (freshness/load/cleanup; excludes sample-row evidence write): {}",
+        length_detail(&rows),
+        rows.len(),
+        costs.join(", ")
+    );
+    write_json(
+        out,
+        "anchor-children-path-length-summary.json",
+        &json!({"samples":rows,"skipped":skipped,"costs":costs,"detail":detail,"measurement_only":true}),
+    )?;
+    Ok(detail)
 }
 
 fn kernel_comparison(

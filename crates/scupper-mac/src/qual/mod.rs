@@ -13,6 +13,8 @@ mod child_stage;
 #[cfg(any(target_os = "macos", test))]
 mod desc_inventory;
 #[cfg(any(target_os = "macos", test))]
+mod descendant_measure;
+#[cfg(any(target_os = "macos", test))]
 mod evidence_path;
 #[cfg(any(target_os = "macos", test))]
 mod guard;

@@ -406,7 +406,13 @@ The independent, journaled `scupper-qual/children` subtree measures each spellin
 in a uniquely named disposable parent, refused if that namespace already exists:
 named-inline, wildcard, nonempty grandchild, direct-path `_x` and `qchild/_x`
 loads first, followed by named, quoted underscore and one-line anonymous controls.
-Direct underscore creation is measured without a predicted rejection pin.
+Pass-4 CI 45478867692 pins both direct `_x` creation refusals for 24H232 and
+25G332: rc 1, empty stdout and exactly LOAD_WARNING + ALTQ + the command-line
+underscore refusal. These complete as reviewed rejection measurements only when
+the remaining class, inventory and flush evidence completes. Other diagnostics
+remain Inconclusive. Fixture parents use a short run token and hexadecimal counter under
+`scupper-qual/children`; the longest ordinary target is bounded to 48 bytes.
+The original root absence authority and individual target journals are retained.
 Reviewed builds never load the multiline anonymous fixture; its pass-3 evidence
 is pinned in each build's measurement review (facts 1, 2 and 4 from
 `anchor-children-inline-multiline.json`). On an unreviewed build it runs last;
@@ -425,7 +431,8 @@ The absence merge requires a matching named text missing-parent result exactly
 when the kernel reports None; an empty present listing cannot substitute for it.
 Deep fixture targets use bounded `anchor-target` journal rows under the original
 root absence authority; the production adapter path remains exactly two components.
-Cleanup skips kernel-proven missing targets and verifies the entire disposable root.
+Fixture cleanup skips kernel-proven missing targets and verifies the entire disposable root.
+Length-sample cleanup reads only its exact paths; Q-RESTORE verifies the whole tree.
 The restore budget counts these distinct targets as well as adapter-anchor rows.
 The Rust ruleset ABI check is a layout pin against XNU-published constants:
 size 1092, nr/path/name offsets 0/4/1028, and ioctl numbers
@@ -457,7 +464,50 @@ stderr rows. The 24H232 pin uses CI 45397408312 attempt 2 supplied in the fix 6
 brief; the rejection rows are byte-identical across both builds. Pass-3 multiline
 acceptance and residue are reviewed measurements, not rejection rows. Exact reviewed parser rejections are
 complete measurements when the remaining inventory/flush evidence completes.
-Other failed command rows remain Inconclusive.
+Other failed fixture command rows remain Inconclusive.
+
+After the descendant fixtures, a measurement-only sweep loads one loopback pass
+rule at total anchor-path lengths 62, 63, 64, 65 and 66 bytes, both directly
+and through a parent containing `anchor "<child>"`. Only the final component is
+padded. Fixture parents use `f<four base36 run characters><hex counter>` (for
+example `f00003`); time and PID supply the run token, and explicit fixture paths
+remain within 48 bytes. Collisions remain possible with a short token and are
+rejected by freshness reads. Before loading a length sample, complete class reads
+and bracketing kernel censuses must show its target (and nested parent) absent.
+On reviewed builds 24H232 and 25G332, absence requires all five rc-0 reads
+with empty stdout and the exact pass-4 stderr (CI 45478867692): the ALTQ preamble
+followed by `pfctl: DIOCGETRULES: Invalid argument\n` for `-sr`, `-sn` and `-sd`,
+`pfctl: Anchor or Ruleset does not exist.\n` for `-sT`, and
+`Anchor '<exact path>' not found.\n` for `-sA`. Five ALTQ-only empty reads mean
+present-empty. Any mixed set or unpinned text is an environment issue.
+A preexisting name or incomplete read skips that sample as an environment issue.
+Every parent/target is journaled before loading. Each sample flushes only its
+kernel-present target and, in nested mode, parent, then reads each path's classes
+once to confirm missing or present-empty status. Only the nested parent's cleanup
+read also accepts `-sA` stdout exactly `  <target full path>\n` with ALTQ-only
+stderr, because Darwin retains its own emptied child. Empty stdout remains valid;
+a different child, extra lines, or any other class content is an environment issue.
+Freshness and the child's cleanup read retain the strict empty-stdout rule.
+A refused direct load that leaves
+its target absent needs no flush; the five exact missing rows complete cleanup.
+No sample cleanup walks the shared tree; Q-RESTORE retains whole-tree verification.
+Before freshness reads and again before journaling, a 30-second remaining-case
+margin gates samples. Falling below the margin stops the sweep and records all
+remaining mode/length pairs as skipped measurements, without a violation.
+The ten samples add at most 15 names; the reviewed eight-fixture layout has 18
+names, giving 34 nodes including ROOT after a full sweep on a fresh machine,
+below the 64-node traversal bound. Persistent names from reused machines still
+count toward that bound. Nonzero exits, including unknown stderr, are retained as
+measurements without contract violations. Capture and cleanup errors remain
+explicit environment findings; cleanup failure withholds subsequent samples.
+`anchor-children-path-length-{direct,nested}-<length>.json` retains setup/load
+status and streams plus cleanup outcome and `elapsed_before_evidence_write_ms`
+(freshness, load and cleanup, excluding the sample-row JSON evidence write);
+`anchor-children-path-length-summary.json`
+and the case detail report successful, failed and incomplete sampled lengths and
+the maximum successful length separately for each mode, skipped lengths, and measured
+per-sample costs with that same exclusion. This describes the
+observed boundary for these samples, without asserting a universal path limit.
 
 Per parent, normalized kernel set K and text set T are compared without ordering.
 K minus T produces a contract finding "text inventory incomplete"; T minus K
@@ -466,8 +516,9 @@ enumeration failure or a detected change is Inconclusive. Traversal within the
 disposable subtree covers the union of observed text and kernel names, including
 incomplete comparisons. Ancestor inventories are compared without traversing
 foreign subtrees.
-Q-DESCENDANTS is assumption_holds only if every optimizer, foreign-fixture and
-descendant measurement completed with no findings; any inventory finding makes
+Q-DESCENDANTS is assumption_holds only if every attempted optimizer, foreign-fixture
+and descendant measurement completed with no findings (budget-skipped length
+samples are listed as measurements); any inventory finding makes
 it contract_violation. Neither verdict promotes native descendant coverage.
 Persistent empty namespace names are allowed only after complete
 configuration-absence reads. Restore deduplicates journal paths, reuses those

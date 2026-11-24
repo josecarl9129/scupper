@@ -114,13 +114,20 @@ class ArtifactTests(unittest.TestCase):
             self.assertEqual(refusal["stderr"], "No ALTQ support in kernel\nALTQ related functions disabled\npfctl: anchor names beginning with '_' cannot be modified from the command line\n")
             self.assertEqual(hashlib.sha256((goldens / build / "states-v.txt").read_bytes()).hexdigest(),
                              review["states_v_sha256"])
-            self.assertEqual({row["name"] for row in review["rejections"]}, {"underscore", "inline"})
+            self.assertEqual({row["name"] for row in review["rejections"]}, {"underscore", "inline", "direct-underscore", "direct-grandchild-underscore"})
             for row in review["rejections"]:
                 self.assertTrue(row["reviewed"])
-                self.assertEqual(row["command"], ["/sbin/pfctl", "-o", "none", "-a", "scupper-qual/children", "-f", "-"])
+                direct = row["name"].startswith("direct-")
+                suffix = ("/f00003/_x" if row["name"] == "direct-underscore" else "/f00004/qchild/_x") if direct else ""
+                self.assertEqual(row["command"], ["/sbin/pfctl", "-o", "none", "-a", "scupper-qual/children" + suffix, "-f", "-"])
                 self.assertEqual(row["exit_code"], 1)
                 self.assertEqual(row["stdout"], "")
-                self.assertTrue(row["stderr"].endswith("pfctl: Syntax error in config file: pf rules not loaded\n"))
+                if direct:
+                    self.assertEqual(row["stdin"], "pass quick on lo0 all no state\n")
+                    self.assertIn("CI 45478867692", row["provenance"])
+                    self.assertEqual(row["stderr"], "pfctl: Use of -f option, could result in flushing of rules\npresent in the main ruleset added by the system at startup.\nSee /etc/pf.conf for further details.\n\nNo ALTQ support in kernel\nALTQ related functions disabled\npfctl: anchor names beginning with '_' cannot be modified from the command line\n")
+                else:
+                    self.assertTrue(row["stderr"].endswith("pfctl: Syntax error in config file: pf rules not loaded\n"))
         a = json.loads((goldens / "24H232/measurement-review.json").read_text())["rejections"]
         b = json.loads((goldens / "25G332/measurement-review.json").read_text())["rejections"]
         self.assertEqual(a, b)
@@ -139,7 +146,10 @@ class ArtifactTests(unittest.TestCase):
                 if name == "MUTANTS":
                     mutants_node = node.value
         expected = {"underscore-refusal-is-success", "foreign-content-labelled-incomplete",
-                    "process-sweep-retries-own-pid", "non-established-tcp-accepted"}
+                    "process-sweep-retries-own-pid", "non-established-tcp-accepted",
+                    "direct-underscore-refusal-accepts-any-stderr", "descendant-fixture-ignores-path-length-bound",
+                    "path-length-cleanup-rereads-whole-tree", "path-length-budget-guard-ignored",
+                    "path-length-altq-only-tables-is-missing", "path-length-mixed-classes-is-absent"}
         found = set()
         for row in mutants_node.elts:
             name = ast.literal_eval(row.elts[0])
@@ -154,7 +164,7 @@ class ArtifactTests(unittest.TestCase):
     def test_pass3_descendant_order_skip_and_read_only_flushes(self):
         native = (REPO / "crates/scupper-mac/src/qual/contracts.rs").read_text()
         start = native.index("for (name, source, suffix) in [")
-        end = native.index("let parent_name = super::unique(name)", start)
+        end = native.index("let parent = super::super::descendant_measure::fixture_parent(", start)
         campaign = native[start:end]
         names = ["named-inline", "wildcard", "grandchild", "direct-underscore",
                  "direct-grandchild-underscore", "named", "underscore", "inline", "inline-multiline"]
@@ -163,10 +173,11 @@ class ArtifactTests(unittest.TestCase):
         self.assertIn('inline_multiline_reviewed', campaign)
         self.assertIn('continue;', campaign)
         self.assertIn('"fixture_loaded":false', campaign)
-        # Direct creation remains observational, outside the reviewed rejection rows.
+        # Pass-4 direct creation refusals are now pinned reviewed rejections.
         for build in ["24H232", "25G332"]:
             review = json.loads((REPO / f"crates/scupper-mac/qualification/goldens/{build}/measurement-review.json").read_text())
-            self.assertFalse(any(row["name"].startswith("direct-") for row in review["rejections"]))
+            self.assertEqual({row["name"] for row in review["rejections"] if row["name"].startswith("direct-")},
+                             {"direct-underscore", "direct-grandchild-underscore"})
         resources = (REPO / "crates/scupper-mac/src/qual/resources.rs").read_text()
         self.assertIn('skip_unmodifiable(&mut io, target, &mut failures)', resources)
         self.assertIn('skip_unmodifiable(&mut io, path, &mut failures)', resources)
@@ -175,6 +186,41 @@ class ArtifactTests(unittest.TestCase):
         self.assertIn('vv_stability(&vv_before)', native)
         self.assertIn('vv_stability(&vv_reused)', native)
         self.assertIn('let reuse_attempt = udp.send_ten()', native)
+
+    def test_path_length_measurements_follow_fixtures_and_remain_observational(self):
+        native = (REPO / "crates/scupper-mac/src/qual/contracts.rs").read_text()
+        campaign = native[native.index("fn descendant_measurements("):native.index("struct PathLengthIo")]
+        self.assertLess(campaign.index("inventory_findings\n"), campaign.index("path_length_measurements(out,"))
+        self.assertIn("&mut next_parent", campaign)
+        helper = native[native.index("fn path_length_measurements("):native.index("fn kernel_comparison(")]
+        self.assertIn("for nested in [false, true]", helper)
+        self.assertIn("for length in LENGTHS", helper)
+        self.assertIn("measurement_attempt(", helper)
+        self.assertIn("cleanup_failure", helper)
+        self.assertNotIn(".complete()", helper)
+        self.assertNotIn("ContractViolation", helper)
+        self.assertIn("anchor-children-path-length-summary.json", helper)
+        self.assertIn("{length_detail}", campaign)
+
+    def test_path_length_cleanup_is_scoped_and_freshness_is_complete(self):
+        native = (REPO / "crates/scupper-mac/src/qual/contracts.rs").read_text()
+        io = native[native.index("struct PathLengthIo"):native.index("fn path_length_measurements(")]
+        self.assertIn("cleanup_length_sample", io)
+        self.assertNotIn("cleanup_measurement(", io)
+        resources = (REPO / "crates/scupper-mac/src/qual/resources.rs").read_text()
+        helper = resources[resources.index("pub(super) fn cleanup_length_sample("):resources.index("pub(super) fn anchor_read(")]
+        self.assertIn("cleanup_sample(", helper)
+        self.assertIn("sample_classes_absent(self.io.out, path, self.io.deadline, own_child)", helper)
+        self.assertNotIn("pfanchor::read", helper)
+        self.assertNotIn("measurement_paths", helper)
+        fresh = resources[resources.index("pub(super) fn fresh_length_sample("):resources.index("pub(super) fn cleanup_length_sample(")]
+        self.assertEqual(fresh.count("qual_pf_rulesets(path)"), 2)
+        self.assertIn("sample_classes_absent(out, path, deadline, None)", fresh)
+        sweep = native[native.index("fn path_length_measurements("):native.index("fn kernel_comparison(")]
+        self.assertIn('"skipped":skipped', sweep)
+        self.assertIn('row["elapsed_before_evidence_write_ms"]', sweep)
+        self.assertIn("excludes sample-row evidence write", sweep)
+        self.assertIn("per-sample cost", sweep)
 
     def test_ruleset_probe_falls_back_and_records_header_provenance(self):
         header = REPO / "crates/scupper-darwin/probe/pf-rulesets-layout.h"
