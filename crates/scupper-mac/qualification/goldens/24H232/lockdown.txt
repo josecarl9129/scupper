@@ -1,0 +1,2 @@
+pass quick on lo0 all no state
+block drop quick all

@@ -52,6 +52,6 @@ mod tests {
 
 #[cfg(all(target_os = "macos", feature = "qualification"))]
 pub use sys::{
-    proc_control, proc_fds, proc_socket_fds, qual_inheritable_fd, qual_sigchld_refusals,
-    qual_signal_kill, spawn_signal_probe,
+    proc_control, proc_fds, proc_socket_fds, qual_inheritable_fd, qual_ipv4_bound_interface,
+    qual_sigchld_refusals, qual_signal_kill, spawn_signal_probe,
 };

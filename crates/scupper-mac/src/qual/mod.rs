@@ -27,8 +27,14 @@ pub use model::{Case, CaseResult, Evidence, Manifest, Verdict, redact};
 
 #[cfg(any(target_os = "macos", test))]
 mod command;
+#[cfg(any(target_os = "macos", test))]
+mod contract_check;
+#[cfg(any(target_os = "macos", test))]
+mod detach;
 #[cfg(target_os = "macos")]
 mod native;
+#[cfg(any(target_os = "macos", test))]
+mod state_measure;
 
 /// Dispatch the qualification CLI, returning an exit code.
 #[must_use]

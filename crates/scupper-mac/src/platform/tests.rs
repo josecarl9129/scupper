@@ -8,10 +8,67 @@ use super::{
 };
 use crate::snapshot::{COPY_BYTES, Copy, CopyRead};
 
+/// Executable vnode identity available from enumeration (spawn still requires it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExeIdentity {
+    /// Every existing identity assertion remains required.
+    Required,
+    /// Every enumerated entry must have `exe == None`.
+    Unavailable,
+}
+/// Read-back comparison uses independent reviewed evidence, never self-capture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Readback {
+    /// Matches the intended policy's independent baseline.
+    Match,
+    /// A different policy or text.
+    Mismatch,
+    /// No reviewed baseline for this build; native run is inconclusive.
+    Unsupported,
+}
+/// Availability of selective interface state removal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectiveInterfaceStates {
+    /// Model/qualified implementation can remove and prove absence.
+    Supported,
+    /// Nonempty calls must return the exact unqualified error without mutation.
+    Unsupported,
+}
+
+/// Stable audit from the fake trusted-Left startup test. Native qualification
+/// must report needs <method> if this list contains an unimplemented method.
+pub const LEFT_METHODS: &[&str] = &[
+    "acquire_instance_lock",
+    "boot_id",
+    "create_control_socket",
+    "executable_id",
+    "fence",
+    "image_uuid",
+    "incarnation",
+    "poll_install_record",
+    "now",
+    "processes",
+    "poll_copy",
+    "read_copy",
+    "reap_children",
+    "spawned_children",
+    "write_copy",
+];
+
 /// Minimal fixture hooks for the same suite on fake and real adapters.
 pub trait ContractHarness<P: Platform> {
     /// Platform using empty scratch copy paths, never production copies.
     fn platform(&mut self) -> &mut P;
+    /// Enumeration capability; unavailability is asserted for every entry.
+    fn enumerated_exe_identity(&self) -> ExeIdentity;
+    /// Compare against an independent reviewed baseline.
+    fn readback(
+        &self,
+        intended: &scupper_core::mac::policy::AnchorText,
+        observed: &str,
+    ) -> Readback;
+    /// Whether nonempty selective state removal is qualified.
+    fn selective_interface_states(&self) -> SelectiveInterfaceStates;
     /// Create a foreground child in the suite helper's process group through the
     /// adapter's `spawn` semantics (and register it for `reap_children`). The
     /// harness must use disposable scratch executables, never production children.
@@ -49,6 +106,18 @@ fn limit(p: &mut impl Platform) -> Deadline {
 /// # Panics
 /// Asserts each platform contract. Tests must isolate copies and pf accounting.
 pub fn run_contracts<P: Platform, H: ContractHarness<P>>(h: &mut H) -> Result<(), SysError> {
+    run_core_contracts(h)?;
+    run_anchor_contracts(h)
+}
+
+/// Run storage, reference and process contracts independently of anchor review.
+///
+/// # Errors
+/// Returns fixture or cleanup errors.
+///
+/// # Panics
+/// Asserts each core platform contract.
+pub fn run_core_contracts<P: Platform, H: ContractHarness<P>>(h: &mut H) -> Result<(), SysError> {
     let p = h.platform();
     assert_eq!(p.incarnation().boot, p.boot_id());
     for copy in [Copy::A, Copy::B] {
@@ -117,6 +186,7 @@ pub fn run_contracts<P: Platform, H: ContractHarness<P>>(h: &mut H) -> Result<()
 }
 
 fn run_process_contracts<P: Platform, H: ContractHarness<P>>(h: &mut H) -> Result<(), SysError> {
+    let mode = h.enumerated_exe_identity();
     let own_path = h.own_executable().to_path_buf();
     let p = h.platform();
     let own = p.incarnation();
@@ -124,7 +194,13 @@ fn run_process_contracts<P: Platform, H: ContractHarness<P>>(h: &mut H) -> Resul
     let own_exe = p.executable_id(&own_path, d)?;
     let d = limit(p);
     assert!(
-        matches!(p.processes(d), Enumeration::Complete(ref procs) if procs.iter().any(|proc| proc.pid == own.pid && proc.start == own.start && proc.pgid == own.pgid && proc.state == super::ProcState::Running && proc.path.is_some() && proc.exe == Some(own_exe)) && !procs.iter().any(|proc| proc.pid == 0))
+        matches!(contract_processes(p.processes(d), mode), Enumeration::Complete(ref procs) if procs.iter().any(|proc| proc.pid == own.pid
+            && proc.start == own.start
+            && proc.pgid == own.pgid
+            && proc.state == super::ProcState::Running
+            && proc.path.is_some()
+            && proc.exe == expected_exe(mode, Some(own_exe)))
+            && !procs.iter().any(|proc| proc.pid == 0))
     );
     assert_eq!(p.fence(), Fence::Closed);
 
@@ -138,7 +214,7 @@ fn run_process_contracts<P: Platform, H: ContractHarness<P>>(h: &mut H) -> Resul
     assert_eq!(child.exe, Some(scratch_exe));
     assert!(p.spawned_children().contains(&child));
     let d = limit(p);
-    let proc = match p.processes(d) {
+    let proc = match contract_processes(p.processes(d), mode) {
         Enumeration::Complete(procs) => procs
             .into_iter()
             .find(|proc| proc.pid == child.pid)
@@ -149,7 +225,7 @@ fn run_process_contracts<P: Platform, H: ContractHarness<P>>(h: &mut H) -> Resul
     assert_eq!(proc.pgid, child.pgid);
     assert_eq!(proc.ppid, own.pid);
     assert_eq!(proc.state, super::ProcState::Running);
-    assert_eq!(proc.exe, child.exe);
+    assert_eq!(proc.exe, expected_exe(mode, child.exe));
     assert_eq!(proc.path.as_deref(), Some(scratch_path.as_path()));
     h.unlink_scratch_executable()?;
     let p = h.platform();
@@ -157,7 +233,14 @@ fn run_process_contracts<P: Platform, H: ContractHarness<P>>(h: &mut H) -> Resul
     assert!(p.executable_id(&scratch_path, d).is_err());
     let d = limit(p);
     assert!(
-        matches!(p.processes(d), Enumeration::Complete(ref procs) if procs.iter().any(|entry| entry.pid == proc.pid && entry.start == proc.start && entry.state == super::ProcState::Running && entry.exe == Some(scratch_exe) && (entry.path.is_none() || entry.path.as_deref() == Some(scratch_path.as_path()))) && procs.iter().any(|entry| entry.pid == own.pid && entry.start == own.start && entry.exe == Some(own_exe)))
+        matches!(contract_processes(p.processes(d), mode), Enumeration::Complete(ref procs) if procs.iter().any(|entry| entry.pid == proc.pid
+            && entry.start == proc.start
+            && entry.state == super::ProcState::Running
+            && entry.exe == expected_exe(mode, Some(scratch_exe))
+            && (entry.path.is_none() || entry.path.as_deref() == Some(scratch_path.as_path())))
+            && procs.iter().any(|entry| entry.pid == own.pid
+                && entry.start == own.start
+                && entry.exe == expected_exe(mode, Some(own_exe))))
     );
     let mut wrong = proc.start;
     wrong.microseconds = (wrong.microseconds + 1) % 1_000_000;
@@ -168,7 +251,10 @@ fn run_process_contracts<P: Platform, H: ContractHarness<P>>(h: &mut H) -> Resul
     );
     let d = limit(p);
     assert!(
-        matches!(p.processes(d), Enumeration::Complete(ref procs) if procs.iter().any(|entry| entry.pid == proc.pid && entry.start == proc.start && entry.exe == proc.exe && entry.state == super::ProcState::Running))
+        matches!(contract_processes(p.processes(d), mode), Enumeration::Complete(ref procs) if procs.iter().any(|entry| entry.pid == proc.pid
+        && entry.start == proc.start
+        && entry.exe == proc.exe
+        && entry.state == super::ProcState::Running))
     );
     let d = limit(p);
     p.kill_process(proc.pid, proc.start, d)?;
@@ -179,7 +265,7 @@ fn run_process_contracts<P: Platform, H: ContractHarness<P>>(h: &mut H) -> Resul
         let d = Deadline(p.now().saturating_add(5).min(overall.0));
         p.reap_children(d)?;
         let d = Deadline(p.now().saturating_add(5).min(overall.0));
-        let procs = p.processes(d);
+        let procs = contract_processes(p.processes(d), mode);
         if matches!(procs, Enumeration::Complete(ref entries) if !entries.iter().any(|entry| entry.pid == proc.pid && entry.start == proc.start))
         {
             break;
@@ -193,6 +279,128 @@ fn run_process_contracts<P: Platform, H: ContractHarness<P>>(h: &mut H) -> Resul
     let d = limit(p);
     assert_eq!(p.reap(d), Fence::Closed);
     assert!(p.spawned_children().contains(&child));
+    Ok(())
+}
+
+fn expected_exe(mode: ExeIdentity, required: Option<super::ExeId>) -> Option<super::ExeId> {
+    match mode {
+        ExeIdentity::Required => required,
+        ExeIdentity::Unavailable => None,
+    }
+}
+fn contract_processes(
+    observed: Enumeration<Vec<super::ProcInfo>, super::ProcessError>,
+    mode: ExeIdentity,
+) -> Enumeration<Vec<super::ProcInfo>, super::ProcessError> {
+    if let Enumeration::Complete(procs) = &observed
+        && mode == ExeIdentity::Unavailable
+    {
+        assert!(
+            procs.iter().all(|entry| entry.exe.is_none()),
+            "unavailable exe identity must be None for EVERY enumerated entry"
+        );
+    }
+    observed
+}
+/// Fixed installed pre-tunnel fixture, independent of any host observations.
+///
+/// # Errors
+/// Invalid fixture constants.
+pub fn pretunnel_fixture() -> Result<scupper_core::mac::policy::AnchorText, SysError> {
+    use scupper_core::mac::{DhcpPhase, HopLimitPolicy, Inputs, Tunnel, TunnelGeneration, policy};
+    let make = || -> Result<_, scupper_core::mac::Error> {
+        let inputs = Inputs::new(
+            "en0".parse()?,
+            "198.51.100.7:51820".parse()?,
+            std::collections::BTreeMap::from([(
+                "en0".parse()?,
+                DhcpPhase::Bound {
+                    server: "192.0.2.1".parse()?,
+                },
+            )]),
+            Tunnel {
+                name: "utun6".parse()?,
+                generation: TunnelGeneration::new(1)?,
+            },
+            HopLimitPolicy::QualifiedLimitation,
+        )?;
+        Ok(policy::render_pre_tunnel(&inputs))
+    };
+    make().map_err(|_| SysError::Failed("contract fixture"))
+}
+fn require_readback(actual: Readback, expected: Readback) -> Result<(), SysError> {
+    if actual == Readback::Unsupported {
+        return Err(SysError::Failed("anchor readback unsupported"));
+    }
+    assert_eq!(actual, expected);
+    Ok(())
+}
+fn observed_anchor(p: &mut impl Platform) -> Result<Option<String>, SysError> {
+    let d = limit(p);
+    let read = p.read_anchor(d);
+    assert_eq!(p.fence(), Fence::Closed);
+    read
+}
+/// Run anchor contracts independently after the core suite.
+///
+/// # Errors
+/// Returns readback, load or cleanup failures.
+///
+/// # Panics
+/// Asserts the anchor platform contracts.
+#[allow(clippy::many_single_char_names)] // The brief names the two contract policies A and B.
+pub fn run_anchor_contracts<P: Platform, H: ContractHarness<P>>(h: &mut H) -> Result<(), SysError> {
+    use scupper_core::mac::policy;
+    assert_eq!(observed_anchor(h.platform())?, None);
+    let a = policy::render_lockdown();
+    let b = pretunnel_fixture()?;
+    assert_ne!(a, b);
+    for intended in [&a, &b] {
+        let p = h.platform();
+        let d = limit(p);
+        let loaded = p.load_anchor(intended, d);
+        assert_eq!(p.fence(), Fence::Closed);
+        loaded?;
+        let observed = observed_anchor(p)?.ok_or(SysError::Failed("anchor missing after load"))?;
+        require_readback(h.readback(intended, &observed), Readback::Match)?;
+        if intended == &b {
+            require_readback(h.readback(&a, &observed), Readback::Mismatch)?;
+        }
+    }
+    for _ in 0..2 {
+        let p = h.platform();
+        let d = limit(p);
+        let removed = p.remove_anchor(d);
+        assert_eq!(p.fence(), Fence::Closed);
+        removed?;
+        assert_eq!(observed_anchor(p)?, None);
+    }
+    let selective = h.selective_interface_states();
+    let p = h.platform();
+    let d = limit(p);
+    let flushed = p.flush_states(d);
+    assert_eq!(p.fence(), Fence::Closed);
+    flushed?;
+    let d = limit(p);
+    assert_eq!(
+        p.remove_interface_states(&std::collections::BTreeSet::new(), d),
+        Ok(())
+    );
+    assert_eq!(p.fence(), Fence::Closed);
+    let interfaces = std::collections::BTreeSet::from(["en9"
+        .parse()
+        .map_err(|_| SysError::Failed("contract interface"))?]);
+    let d = limit(p);
+    let result = p.remove_interface_states(&interfaces, d);
+    assert_eq!(
+        result,
+        match selective {
+            SelectiveInterfaceStates::Supported => Ok(()),
+            SelectiveInterfaceStates::Unsupported =>
+                Err(crate::decode::pfanchor::SELECTIVE_UNQUALIFIED),
+        }
+    );
+    assert_eq!(p.fence(), Fence::Closed);
     Ok(())
 }
 
@@ -306,6 +514,19 @@ mod fake_contracts {
     }
 
     impl ContractHarness<FakePlatform> for FakePlatform {
+        fn enumerated_exe_identity(&self) -> ExeIdentity {
+            ExeIdentity::Required
+        }
+        fn readback(&self, intended: &policy::AnchorText, observed: &str) -> Readback {
+            if intended.as_str() == observed {
+                Readback::Match
+            } else {
+                Readback::Mismatch
+            }
+        }
+        fn selective_interface_states(&self) -> SelectiveInterfaceStates {
+            SelectiveInterfaceStates::Supported
+        }
         fn platform(&mut self) -> &mut Self {
             self
         }
@@ -3092,5 +3313,59 @@ mod run5_contracts {
         assert_eq!(platform::checked_os_pid(platform::OS_PID_MAX + 1), None);
         assert_eq!(p.signals, []);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod r7_hooks {
+    use super::*;
+    #[test]
+    fn process_completeness_remains_an_assertion_in_both_modes() {
+        let mut p = super::super::fake::FakePlatform::new().unwrap();
+        p.inject(
+            super::super::fake::Call::Processes,
+            1,
+            super::super::fake::Fault::Incomplete,
+        );
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_process_contracts(&mut p)
+            }))
+            .is_err()
+        );
+        for mode in [ExeIdentity::Required, ExeIdentity::Unavailable] {
+            let observed = contract_processes(
+                Enumeration::Incomplete(super::super::ProcessError::from(SysError::Unknown)),
+                mode,
+            );
+            assert!(matches!(observed, Enumeration::Incomplete(_)));
+        }
+    }
+
+    #[test]
+    fn unsupported_never_matches() {
+        assert_eq!(
+            require_readback(Readback::Unsupported, Readback::Match),
+            Err(SysError::Failed("anchor readback unsupported"))
+        );
+        assert_eq!(
+            require_readback(Readback::Unsupported, Readback::Mismatch),
+            Err(SysError::Failed("anchor readback unsupported"))
+        );
+    }
+    #[test]
+    #[should_panic(expected = "EVERY enumerated entry")]
+    fn unavailable_asserts_none_on_foreign_entries_too() {
+        let p = super::super::fake::FakePlatform::new().unwrap();
+        let foreign = p
+            .procs
+            .values()
+            .find(|p| p.pid != 100 && p.exe.is_some())
+            .unwrap()
+            .clone();
+        let _ = contract_processes(
+            Enumeration::Complete(vec![foreign]),
+            ExeIdentity::Unavailable,
+        );
     }
 }

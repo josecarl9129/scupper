@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     fs,
+    io::Write,
     os::unix::fs::OpenOptionsExt,
     path::Path,
     thread,
@@ -273,6 +274,7 @@ fn undo_pf_state(
     }
 }
 
+#[allow(clippy::too_many_lines)] // Restore follows the dependency order: stop writers, release, anchors, images, interfaces.
 pub(super) fn undo(
     out: &Path,
     before: &Snapshot,
@@ -289,30 +291,48 @@ pub(super) fn undo(
     let mut failures = Vec::new();
     super::tool::restore(out, &entries, deadline, &mut actions, &mut failures)?;
     undo_tokens(out, &entries, deadline, &mut actions, &mut failures)?;
-    // No R2 probe loads rules. Flush only explicitly journaled fixture anchors,
-    // and never flush a hooked parent or a foreign anchor discovered by name.
+    // Journal authority is granted only after an independent absence check.
+    // Flush all classes even for an empty/unreadable filter ruleset.
     for e in entries.iter().filter(|e| e.kind == "anchor") {
         if !matches!(
             e.path.as_str(),
-            "scupper-qual/scupper" | "com.apple/scupper"
+            "scupper-qual/scupper" | "com.apple/scupper" | "com.apple/scupper-qual"
         ) {
             failures.push("unrecognized fixture anchor".into());
             continue;
         }
-        let rules = invoke_before("/sbin/pfctl", &["-a", &e.path, "-sr"], deadline);
-        if rules.complete() && !rules.stdout.trim().is_empty() {
+        if let Err(error) = recheck_foreign_tokens(out, deadline) {
+            failures.push(format!("anchor restore withheld: {error}"));
+            continue;
+        }
+        for class in ["rules", "nat", "Tables", "dummynet"] {
             action(
                 out,
                 "/sbin/pfctl",
-                &["-a", &e.path, "-F", "all"],
+                &["-a", &e.path, "-F", class],
                 deadline,
                 &mut actions,
                 &mut failures,
             )?;
         }
+        match anchor_read(out, &e.path, deadline) {
+            Ok(None) => {}
+            Ok(Some(_)) => failures.push(format!(
+                "anchor restore absence not established: {} (empty child persists)",
+                e.path
+            )),
+            Err(error) => failures.push(format!(
+                "inconclusive: anchor restore text incomplete/unpinned: {} {error:?}",
+                e.path
+            )),
+        }
     }
     if restore_pf_state && restore_check::pf_status(&before.observations) == Some(false) {
-        undo_pf_state(out, deadline, &mut actions, &mut failures);
+        if let Err(error) = recheck_foreign_tokens(out, deadline) {
+            failures.push(format!("pf disable withheld: {error}"));
+        } else {
+            undo_pf_state(out, deadline, &mut actions, &mut failures);
+        }
     }
     undo_keys(out, &entries, deadline, &mut actions, &mut failures)?;
     undo_resolver_clone(out, before, &entries, deadline, &mut actions, &mut failures)?;
@@ -326,7 +346,7 @@ pub(super) fn undo(
     match attached_devices(out, &paths, deadline) {
         Ok(devices) => {
             for device in devices {
-                detach_device(out, &device, deadline, &mut actions, &mut failures)?;
+                detach_device(out, &device, deadline, &mut actions, &mut failures);
             }
         }
         Err(error) => failures.push(error.to_string()),
@@ -367,6 +387,35 @@ pub(super) fn undo(
         {
             fs::remove_file(&e.path)?;
             actions.push(format!("unlink {}", e.path));
+        }
+    }
+    for e in entries.iter().filter(|e| e.kind == "feth") {
+        if !matches!(e.path.as_str(), "feth0" | "feth1") {
+            failures.push("invalid feth journal entry".into());
+            continue;
+        }
+        if let Err(error) = recheck_foreign_tokens(out, deadline) {
+            failures.push(format!("feth restore withheld: {error}"));
+            continue;
+        }
+        let inventory = invoke_before("/sbin/ifconfig", &["-l"], deadline);
+        if !inventory.complete() {
+            failures.push("feth inventory incomplete".into());
+            continue;
+        }
+        if inventory
+            .stdout
+            .split_whitespace()
+            .any(|name| name == e.path)
+        {
+            action(
+                out,
+                "/sbin/ifconfig",
+                &[&e.path, "destroy"],
+                deadline,
+                &mut actions,
+                &mut failures,
+            )?;
         }
     }
     complete_from_inventory(out, &pending, deadline, &mut failures)?;
@@ -455,6 +504,15 @@ pub(super) fn complete_from_snapshot(
     let mut verified = Vec::new();
     for (index, entry) in pending {
         let absent = match entry.kind.as_str() {
+            "anchor" => anchor_read(out, &entry.path, deadline).is_ok_and(|text| text.is_none()),
+            "feth" => {
+                let list = invoke_before("/sbin/ifconfig", &["-l"], deadline);
+                list.complete()
+                    && !list
+                        .stdout
+                        .split_whitespace()
+                        .any(|name| name == entry.path)
+            }
             "r6-group" => snapshot_quiescent && super::pf::groups_gone(out)?,
             "r6-pf" => {
                 snapshot_quiescent
@@ -521,28 +579,194 @@ fn detach_device(
     deadline: Instant,
     actions: &mut Vec<String>,
     failures: &mut Vec<String>,
-) -> Result<()> {
-    for force in [false, true] {
-        let args = if force {
-            vec!["detach", "-force", device]
-        } else {
-            vec!["detach", device]
-        };
-        let evidence = command(
-            "/usr/bin/hdiutil",
-            &args,
-            None,
-            Duration::from_secs(30).min(deadline.saturating_duration_since(Instant::now())),
-        );
-        actions.push(format!("/usr/bin/hdiutil {}", args.join(" ")));
-        write_json(out, &format!("{}.json", unique("undo-image")), &evidence)?;
-        if evidence.complete() {
-            return Ok(());
+) {
+    struct Detach<'a> {
+        out: &'a Path,
+        device: &'a str,
+        start: Instant,
+        actions: &'a mut Vec<String>,
+        problem: Option<String>,
+    }
+    impl super::super::detach::Io for Detach<'_> {
+        fn elapsed(&self) -> Duration {
+            self.start.elapsed()
+        }
+        fn pause(&mut self, delay: Duration) {
+            thread::sleep(delay);
+        }
+        fn attempt(&mut self, force: bool, budget: Duration) -> super::super::detach::Outcome {
+            let args = if force {
+                vec!["detach", "-force", self.device]
+            } else {
+                vec!["detach", self.device]
+            };
+            let journal = |phase: &str, evidence: Option<&super::Evidence>| -> Result<()> {
+                let mut file = fs::OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .mode(0o600)
+                    .open(self.out.join("resources.jsonl"))?;
+                writeln!(
+                    file,
+                    "{}",
+                    json!({"kind":"detach-attempt","path":self.device,"force":force,"phase":phase,"elapsed_ms":self.start.elapsed().as_millis(),"evidence":evidence})
+                )?;
+                file.sync_all()?;
+                Ok(())
+            };
+            if let Err(error) = journal("before", None) {
+                self.problem = Some(error.to_string());
+                return super::super::detach::Outcome {
+                    success: false,
+                    busy: false,
+                };
+            }
+            let evidence = command("/usr/bin/hdiutil", &args, None, budget.min(TOOL_BUDGET));
+            if let Err(error) = journal("after", Some(&evidence)) {
+                self.problem = Some(error.to_string());
+            }
+            self.actions
+                .push(format!("/usr/bin/hdiutil {}", args.join(" ")));
+            let saved = write_json(
+                self.out,
+                &format!("{}.json", unique("undo-image")),
+                &evidence,
+            );
+            if let Err(error) = saved {
+                self.problem = Some(error.to_string());
+            }
+            super::super::detach::Outcome {
+                success: evidence.complete() && self.problem.is_none(),
+                busy: evidence.exit_code == Some(16) || evidence.stderr.contains("Resource busy"),
+            }
         }
     }
-    failures.push(format!(
-        "fixture image detach and forced retry failed: {device}"
-    ));
+    let mut io = Detach {
+        out,
+        device,
+        start: Instant::now(),
+        actions,
+        problem: None,
+    };
+    let success =
+        super::super::detach::run(&mut io, deadline.saturating_duration_since(Instant::now()));
+    if let Some(error) = io.problem {
+        failures.push(format!("detach journal failed: {error}"));
+    }
+    if !success {
+        failures.push(format!(
+            "fixture image detach exhausted 30s plain and 5s forced retries: {device}"
+        ));
+    }
+}
+
+/// Measurement/restore raw command session. Candidate parsing here grants no
+/// native qualification; captures and final case verdict retain that distinction.
+struct AnchorInventory<'a> {
+    out: &'a Path,
+    deadline: Instant,
+}
+impl crate::decode::pfanchor::Commands for AnchorInventory<'_> {
+    fn call(
+        &mut self,
+        op: crate::decode::pfanchor::Operation,
+        args: &[&str],
+        _: &[u8],
+    ) -> std::result::Result<crate::decode::pfanchor::Text, crate::platform::SysError> {
+        let evidence = invoke_before("/sbin/pfctl", args, self.deadline);
+        write_json(
+            self.out,
+            &format!("{}.json", unique("anchor-inventory")),
+            &evidence,
+        )
+        .map_err(|_| crate::platform::SysError::Unknown)?;
+        if evidence.timed_out || evidence.truncated {
+            return Err(crate::platform::SysError::Unknown);
+        }
+        let build = crate::decode::pftext::Build::system()?;
+        crate::decode::pfanchor::proposed(
+            &build,
+            if op == crate::decode::pfanchor::Operation::Filter {
+                crate::decode::pfanchor::Operation::HarnessFilter
+            } else {
+                op
+            },
+            evidence
+                .exit_code
+                .ok_or(crate::platform::SysError::Unknown)?,
+            evidence.stdout.as_bytes(),
+            evidence.stderr.as_bytes(),
+        )
+    }
+}
+pub(super) fn anchor_read(
+    out: &Path,
+    path: &str,
+    deadline: Instant,
+) -> std::result::Result<Option<String>, crate::platform::SysError> {
+    let path = crate::decode::pfanchor::AnchorPath::new(path)?;
+    crate::decode::pfanchor::read(&mut AnchorInventory { out, deadline }, &path)
+}
+pub(super) fn journal_anchor(out: &Path, path: &str, deadline: Instant) -> Result<()> {
+    let absent = anchor_read(out, path, deadline);
+    super::super::journal::anchor_after_absence(&absent, || {
+        let entry = json!({"kind":"anchor","path":path});
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .open(out.join("resources.jsonl"))?;
+        writeln!(file, "{entry}")?;
+        file.sync_all()?;
+        Ok(())
+    })
+}
+pub(super) fn recheck_foreign_tokens(out: &Path, deadline: Instant) -> Result<()> {
+    let mut entries = entries(out)?;
+    // Native -E attempts persist complete byte captures before interpretation.
+    // Recognize their acquiring PID/time only for this baseline restore check;
+    // this never authorizes numeric -X. A crash/capture failure before persistence
+    // withholds restore rather than treating an unidentified token as ours.
+    for file in fs::read_dir(out)? {
+        let file = file?;
+        let name = file.file_name();
+        if !name
+            .to_string_lossy()
+            .starts_with("pf-text-native-acquire-")
+            || file.path().extension().is_none_or(|e| e != "json")
+        {
+            continue;
+        }
+        protected_path(&file.path(), false)?;
+        let capture: Value = super::read_json(&file.path())?;
+        if capture["command"] != json!(["/sbin/pfctl", "-E"]) {
+            continue;
+        }
+        let pid = u32::try_from(
+            capture["pid"]
+                .as_u64()
+                .ok_or("native acquisition capture PID missing")?,
+        )?;
+        let at = capture["started_unix_ms"]
+            .as_u64()
+            .ok_or("native acquisition capture time missing")?
+            / 1000;
+        entries.push(Entry {
+            kind: "pf-acquire".into(),
+            pid,
+            at,
+            start: String::new(),
+            token: 0,
+            path: String::new(),
+        });
+    }
+    let tokens = live_tokens(out, deadline)?;
+    if tokens
+        .iter()
+        .any(|t| !journal::owns_token(&entries, t.value, t.pid, t.timestamp, unix_seconds()))
+    {
+        return Err("foreign tokens present before destructive restore".into());
+    }
     Ok(())
 }
 
@@ -607,6 +831,10 @@ fn undo_tokens(
         let (tokens, problems) = journal::recovery_tokens(entries, inventory, unix_seconds());
         failures.extend(problems);
         for value in tokens {
+            if let Err(error) = recheck_foreign_tokens(out, deadline) {
+                failures.push(format!("token restore withheld: {error}"));
+                break;
+            }
             action(
                 out,
                 "/sbin/pfctl",

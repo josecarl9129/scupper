@@ -1,0 +1,6 @@
+{
+  "build": "24H232",
+  "reviewed": false,
+  "status": "proposed, unreviewed",
+  "provenance": "Renderer fixture; list expansion, ICMP names and implicit flags are proposals, NOT runner captures. Owner must review exact pfctl readback in pass 1 before pinning."
+}

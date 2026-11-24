@@ -29,8 +29,12 @@ pub mod proc;
 
 pub mod image;
 
+pub mod pfanchor;
 pub mod pftext;
 pub mod pftoken;
 
 #[cfg(all(feature = "qualification", any(target_os = "macos", test)))]
 pub(crate) mod pfcapture;
+
+#[cfg(any(test, feature = "qualification"))]
+pub(crate) mod qualification_trace;

@@ -255,10 +255,10 @@ jobs:
       matrix:
         runner: [macos-15, macos-26]
         # pf-x qualifies Q-X; pf-x-stale runs the independent Q-X-STALE measurement.
-        group: [smoke, base, tool, tool-mutants, store, pf, pf-x, pf-x-stale, probe, probe-hijack]
+        group: [smoke, base, tool, tool-mutants, store, pf, pf-x, pf-x-stale, probe, probe-hijack, contracts]
     runs-on: ${{ matrix.runner }}
     # Native mutants: review estimate scaled to five experiments plus margin.
-    timeout-minutes: ${{ matrix.group == 'tool-mutants' && 60 || matrix.group == 'pf' && 50 || 30 }}
+    timeout-minutes: ${{ matrix.group == 'contracts' && 40 || matrix.group == 'tool-mutants' && 60 || matrix.group == 'pf' && 50 || 30 }}
     continue-on-error: ${{ matrix.group == 'probe-hijack' }}
     env:
       CARGO_BUILD_JOBS: 2
@@ -336,7 +336,7 @@ jobs:
           shasum -a 256 qual-out/base-image-a qual-out/base-image-b | tee qual-out/base-image-sha256.txt
       - name: Compile R4 harmless tool helper
         # The pf cells start their worker through the helper's gated launchd bootstrap.
-        if: matrix.group == 'tool' || matrix.group == 'tool-mutants' || matrix.group == 'pf' || matrix.group == 'pf-x' || matrix.group == 'pf-x-stale'
+        if: matrix.group == 'tool' || matrix.group == 'tool-mutants' || matrix.group == 'pf' || matrix.group == 'pf-x' || matrix.group == 'pf-x-stale' || matrix.group == 'contracts'
         run: |
           cc -std=c11 -Wall -Wextra -Werror crates/scupper-darwin/probe/tool-child.c -o qual-out/tool-child
           cc -std=c11 -Wall -Wextra -Werror -arch x86_64 crates/scupper-darwin/probe/tool-child.c -o qual-out/tool-child-x86_64
@@ -387,11 +387,12 @@ jobs:
         run: |
           after=1080
           if [ "${{ matrix.group }}" = pf ]; then after=1800; fi
+          if [ "${{ matrix.group }}" = contracts ]; then after=1500; fi
           # Independent recovery covers the harness and its restore captures.
           /usr/bin/sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT /private/var/db/scupper-qual/scupper-mac-qual arm --after "$after" --out /private/var/db/scupper-qual/evidence --disposable-runner
       - name: Run qualification cell
         if: matrix.group != 'tool-mutants'
-        timeout-minutes: ${{ matrix.group == 'tool' && 10 || matrix.group == 'store' && 10 || matrix.group == 'pf' && 24 || (matrix.group == 'pf-x' || matrix.group == 'pf-x-stale') && 5 || 18 }}
+        timeout-minutes: ${{ matrix.group == 'contracts' && 15 || matrix.group == 'tool' && 10 || matrix.group == 'store' && 10 || matrix.group == 'pf' && 24 || (matrix.group == 'pf-x' || matrix.group == 'pf-x-stale') && 5 || 18 }}
         run: /usr/bin/sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,ImageOS,ImageVersion,RUNNER_NAME,GITHUB_RUN_ID,GITHUB_SHA /private/var/db/scupper-qual/scupper-mac-qual run --group ${{ matrix.group }} --out /private/var/db/scupper-qual/evidence --disposable-runner
       - name: Restore and stop dead-man
         if: always()

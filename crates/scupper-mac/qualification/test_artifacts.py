@@ -40,6 +40,10 @@ class ArtifactTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(CHECKER), str(self.root), *arguments],
                               capture_output=True, text=True, env=env, check=False)
 
+    def test_qualification_never_uses_production_paths(self):
+        for path in (REPO / "crates/scupper-mac/src/qual").rglob("*.rs"):
+            self.assertNotRegex(path.read_text(), r"Paths\s*::\s*production", str(path))
+
     def test_pf_contract_and_stale_measurement_have_separate_artifacts(self):
         manifest = json.loads((REPO / "crates/scupper-mac/qualification/manifest.json").read_text())
         cases = {case["id"]: case for case in manifest["cases"]}
@@ -146,6 +150,23 @@ class ArtifactTests(unittest.TestCase):
         self.assertNotIn('"kp_proc.p_un.__p_starttime', result.stdout)
         self.assertIn("offsetof(struct kinfo_proc, kp_proc.p_un.__p_starttime)",
                       result.stdout)
+
+    def test_contract_scratch_copy_requires_the_built_source_digest(self):
+        built = self.root / "built-binaries-sha256.txt"
+        staged = self.root / "executed-binaries-sha256.txt"
+        for manifest in [built, staged]:
+            with manifest.open("a") as output:
+                output.write(SHA256 + "  /fixture/wireguard-go\n")
+        copied = dict(source_name="wireguard-go", source_sha256=SHA256, copy_sha256=SHA256)
+        self.write_json("contract-copy-identities.json", copied)
+        self.assertEqual(self.check().returncode, 0)
+        for field in ["source_sha256", "copy_sha256"]:
+            with self.subTest(field=field):
+                self.write_json("contract-copy-identities.json", dict(copied, **{field: "b" * 64}))
+                self.assertEqual(self.check().returncode, 1)
+                self.write_json("contract-copy-identities.json", copied)
+                self.write_json("Q-SMOKE.json", self.result)
+                self.write_json("verdicts.json", [self.result])
 
     def test_matching_identity_passes_and_summary_names_hash(self):
         self.assertEqual(self.check().returncode, 0)

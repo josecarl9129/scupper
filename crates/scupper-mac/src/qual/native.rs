@@ -41,6 +41,8 @@ fn restore_service(out: &Path) -> String {
 }
 #[path = "base.rs"]
 mod base;
+#[path = "contracts.rs"]
+mod contracts;
 #[path = "pf.rs"]
 mod pf;
 #[path = "resources.rs"]
@@ -118,6 +120,7 @@ impl Options {
                 | "pf"
                 | "pf-x"
                 | "pf-x-stale"
+                | "contracts"
                 | "probe"
                 | "probe-hijack"
         ) || options.after == 0
@@ -209,6 +212,8 @@ pub(super) fn dispatch(args: &[String]) -> Result<()> {
                 run_smoke(&options.out)
             } else if options.group == "tool" {
                 tool::run(&options.out)
+            } else if options.group == "contracts" {
+                contracts::run(&options.out)
             } else if options.group == "store" {
                 store::run(&options.out)
             } else if matches!(options.group.as_str(), "pf" | "pf-x" | "pf-x-stale") {
@@ -782,6 +787,8 @@ struct Restore {
     os_drift: Vec<String>,
     post_state: Snapshot,
     violations: Vec<String>,
+    #[serde(default)]
+    inconclusive: Vec<String>,
 }
 
 fn probe_scopes(out: &Path) -> Result<Vec<(&'static str, PathBuf)>> {
@@ -801,6 +808,7 @@ fn restore(out: &Path, deadline: Instant) -> Result<Restore> {
     let before: Snapshot = read_json(&out.join("preflight.json"))?;
     let mut actions = Vec::new();
     let mut violations = Vec::new();
+    let mut inconclusive = Vec::new();
     let mut stopped = Vec::new();
     let scopes = probe_scopes(out)?;
     let mut journaled_keys = Vec::new();
@@ -861,11 +869,13 @@ fn restore(out: &Path, deadline: Instant) -> Result<Restore> {
                 match resources::undo(scope, &before, deadline, scope == out) {
                     Ok((undo, problems)) => {
                         actions.extend(undo);
-                        violations.extend(
-                            problems
-                                .into_iter()
-                                .map(|problem| format!("{name}: {problem}")),
-                        );
+                        for problem in problems {
+                            if let Some(reason) = problem.strip_prefix("inconclusive: ") {
+                                inconclusive.push(format!("{name}: {reason}"));
+                            } else {
+                                violations.push(format!("{name}: {problem}"));
+                            }
+                        }
                     }
                     Err(error) => violations.push(format!("{name}: restore: {error}")),
                 }
@@ -874,8 +884,9 @@ fn restore(out: &Path, deadline: Instant) -> Result<Restore> {
         },
         || snapshot(out, &unique("post"), deadline),
     );
-    let snapshot_quiescent =
-        recovery::snapshot_can_complete(cleanup.as_ref()) && violations.is_empty();
+    let snapshot_quiescent = recovery::snapshot_can_complete(cleanup.as_ref())
+        && violations.is_empty()
+        && inconclusive.is_empty();
     if let Some(Err(error)) = cleanup {
         violations.push(format!("restore: {error}"));
     }
@@ -902,6 +913,7 @@ fn restore(out: &Path, deadline: Instant) -> Result<Restore> {
         os_drift: changed.os_drift,
         post_state: post,
         violations,
+        inconclusive,
     };
     write_json(out, &format!("{}.json", unique("restore")), &result)?;
     write_json(out, "restored.json", &result)?;
@@ -1194,6 +1206,8 @@ fn restore_checked(out: &Path) -> Result<()> {
             binary_sha256: executable_sha256()?,
             verdict: if violation {
                 Verdict::ContractViolation
+            } else if !result.inconclusive.is_empty() {
+                Verdict::Inconclusive
             } else {
                 Verdict::AssumptionHolds
             },
@@ -1203,6 +1217,8 @@ fn restore_checked(out: &Path) -> Result<()> {
                     "earlier_violation={earlier_violation}; {}",
                     result.violations.join("; ")
                 )
+            } else if !result.inconclusive.is_empty() {
+                result.inconclusive.join("; ")
             } else {
                 "restored journaled resources; required post-state equals preflight".into()
             },
@@ -1211,6 +1227,11 @@ fn restore_checked(out: &Path) -> Result<()> {
     )?;
     if violation {
         return Err("restore post-state contract violation; see Q-RESTORE.json".into());
+    }
+    if !result.inconclusive.is_empty() {
+        return Err(environment_issue(
+            "restore inconclusive; unresolved resources retained, see Q-RESTORE.json",
+        ));
     }
     Ok(())
 }
@@ -1242,7 +1263,10 @@ fn final_restore_deadline(out: &Path) -> Result<Instant> {
     }
     // Two APFS images can each need a 30-second detach and forced retry.
     // Keep the plan's full four-minute recovery margin, including final capture.
-    let seconds = if resources::entries(out)?.iter().any(|e| e.kind == "r5-tree") {
+    let seconds = if resources::entries(out)?
+        .iter()
+        .any(|e| matches!(e.kind.as_str(), "r5-tree" | "image"))
+    {
         super::model::MAX_FINAL_RESTORE_SECONDS
     } else {
         recovery::final_restore_seconds(remaining)

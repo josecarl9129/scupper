@@ -308,3 +308,132 @@ Later pf-info is diagnostic only; isolated qualification additionally requires
 Disabled and empty inventory. `pf-last-reference-*.json` is saved before verdict.
 Every pf case JSON includes elapsed_ms. Q-REFS resets on exit; incomplete
 injection writers defer reset to the journaled group restore.
+
+
+R7 adds the `contracts` group on both runners, with a 15-minute run step,
+14-minute launchd worker budget, and 1500-second independent dead-man. Its
+40-minute job reserves 15 minutes for setup/overhead; the remaining 25 minutes
+cover the dead-man, and exceed the 15-minute run plus four-minute final restore. It runs
+Q-CONTRACTS, Q-ANCHOR (20 unhooked lifecycle iterations and 20 hooked removals
+with states and after global state flush), Q-E2E and Q-FLUSH. Every case uses the
+same root-owned harness covered by the complete built/staged hash manifests.
+The disposable scratch executable is a copy of that staged `wireguard-go`;
+`contract-copy-identities.json` is checked against its original build digest.
+
+Pass 1 deliberately cannot qualify the new adapter operations. Candidate pfctl
+rows in `decode/pfanchor.rs` and both builds' `goldens/*/review.json` are marked
+unreviewed. An exact candidate match still returns an error from the adapter;
+readback returns Unsupported. Raw measurements save exact bytes before any
+interpretation. Unknown raw measurement text is inconclusive, never an
+automatically learned success. Core storage/reference/process contracts
+run first and have a separate verdict even if anchor journaling fails. Only
+unreviewed anchor text or Unsupported readback is inconclusive in the anchor
+block; other errors and panics are contract_violation. The owner must review
+runner captures and independently pin text and goldens before pass 2.
+
+`Paths::qualification` fixes `scupper-qual/scupper`, which is unhooked. Its
+Lockdown loads prove no reachability, blocking or evaluation ordering. Harness
+raw measurements alone use the journaled stock-hook child `com.apple/scupper`
+and a separate rule/table sentinel `com.apple/scupper-qual`. No main ruleset,
+parent anchor, pf.conf, or wildcard is changed. Only the explicit F-all raw
+scope experiment uses `-F all`; the adapter and restore use scoped
+rules/nat/Tables/dummynet flushes. Hooked removal uses raw commands and raw reads
+only, with no production-path adapter and no adapter_ok claim.
+Global state flush is irreversible and destroys foreign traffic state. Restore
+can return pf enablement and fixture resources, but cannot return those states.
+
+Q-E2E's exact fake method audit covers Left startup through incarnation commit;
+none of those native methods is a remaining stub. Actual native incompleteness
+still yields inconclusive. Install refusal retains the base engine reference
+protocol: counted `-E` is correct when a fresh Acquire(sequence) reservation has
+reached Synced on both snapshot copies. A reservation permits at most one `-E`.
+The ordered platform trace records both write_copy and create_copy requests,
+their outcomes (including waits), returned token/pfctl PID and complete reference
+reads. Settlement requires a matching complete token/PID read and recorded
+fingerprint; otherwise Acquire debt must remain in both final snapshots. Every
+engine `-X` must target an engine-recorded fingerprint. Without a committable
+reservation only anonymous `-e` is allowed in this fresh-state experiment.
+Once acquisition is reached with known boot and healthy storage, at least one
+reserved `-E` is required. Stopping earlier, for example at unreviewed D-3
+containment text, is inconclusive naming that step, never assumption_holds.
+Join runs at least sixty seconds of ticks and checks Lockdown load/read outcomes,
+no spawn and no Protected after every tick and across every snapshot write
+request. A diagnostic engine hook, compiled only for qualification/tests, also
+records every full verification result offered for publication. A successful
+verification candidate is distinct from an actual Protected status; the latter
+is forbidden, while the engine may mask/reject the former under hold. Durable
+writes must retain hold and no child generation; a recorded
+pf reference is permitted. Transient startup census/ownership failures are
+classified before the expected first-install-failure assertion. Evidence uses
+worker-measured ppid and process group identity.
+
+Returned `-E` tokens are journaled immediately. The interval from `-E` effect to
+returned-token journaling is covered **only by disposable-runner exclusivity
+and restoring the preflight pf state**; the journal cannot close that gap.
+Raw acquire captures aid restore accounting but do not remove this limitation.
+The call trace omits now/pause/fence, hashes stdin and caps entries at 16,384
+(plus one explicit overflow marker), with a 32 KiB per-entry cap. Overflow makes
+the case inconclusive. Native pf-text capture retains R6's original mutation-only
+selection (-e/-E/-X/-d); reads are not added to R6 capture/failure accounting.
+The contracts cell explicitly opts in to full R7 adapter text captures.
+Acquire captures have a separate filename prefix for restore scans.
+
+Q-ANCHOR has a 180-second per-case deadline, clipped command deadlines and an
+elapsed_ms measurement in its saved verdict, including failures and pass 1.
+The unhooked namespace supplies no ordering, reachability or blocking evidence.
+
+Q-FLUSH requires every UDP/TCP IPv4/IPv6 loopback and feth flow to have a printed
+state id/creatorid just before the adapter call. TCP traffic uses quiescent
+sockets; the qualification-only Darwin IP_BOUND_IF wrapper forces the feth
+client onto feth0. Unknown state text, stock loopback skip, unavailable feth or
+missing state identities is inconclusive. Interface and address state selectors
+are raw measurements only; a fresh state with the floating `all` header must
+be positively identified before either selector. The adapter rejects nonempty
+selective removal. The F-all scope case first loads an existing target, captures
+foreign rule and table entries, and compares complete outputs without command
+PID/timing metadata; an unknown result is never treated as an unchanged sentinel.
+
+Run `python3 crates/scupper-mac/tests/r7_mutations.py` for the sixteen portable
+assertion mutants. It restores original bytes on every exit and saves outcomes
+under target/r7-mutants until the task's required final target cleanup.
+
+The proposed absence/inventory rows follow upstream `pfctl_show_anchors` and
+its main dispatch at [855d4e8](https://github.com/openbsd/src/blob/855d4e832803330fc45a64539854bf8d27180600/sbin/pfctl/pfctl.c): immediate children are printed as full paths with two leading
+spaces; a missing parent has a named diagnostic, and ignored show-helper return
+values can leave exit zero. The proposal binds the named diagnostic to the
+queried parent and still requires a complete root inventory and corroborating
+missing-filter result. Apple's exact build output remains a runner question.
+[XNU pf_ioctl](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/net/pf_ioctl.c)
+returns EINVAL for missing rulesets, compares state selectors against the state
+kif, and truncates the cleared-state count through `sa_family_t`. These source
+facts support proposed shapes and the selective-removal refusal; none pins the
+userland output for a runner build. Renderer-derived goldens likewise remain
+proposals (including numeric/named service ports and normalization spelling).
+
+R7 fix 1 caveats and owner questions:
+
+- Dummynet is a fourth required-empty class (`-a PATH -sd`), and removal and
+  restore add `-a PATH -F dummynet` before absence reads. Pass 1 retains those raw
+  show/flush results. These are proposed, unreviewed command/output rows: Apple's
+  released XNU sources expose separate scrub/filter/dummynet classes, but the
+  Apple PacketFilter userland source was not available in the public distribution
+  inspected. Thus exact `-s`/`-F` spelling and whether Apple's `-sr` includes scrub
+  could not be source-confirmed. This is a source/qualification blind spot, not a
+  claim that no command exists. Unknown output fails closed; no row is promoted.
+  Actual scrub rows are rejected by the production filter grammar. Runner review
+  must resolve this coverage question before authorizing support.
+- Production filter grammar accepts only renderer syntax. Harness labels,
+  floating keep-state normalization and anchor declarations have a separate raw
+  harness parser, which the native qualified entry point refuses.
+- Owner question (L6): removal still stops without flushing when readback finds
+  foreign content, including dummynet. Leave can remain stuck. This is the chosen
+  fail-closed behavior; broadening cleanup authority needs an owner decision.
+- Deviation (L8): hooked sentinel measurements exceed the brief's exactly-one-rule
+  limit. The F-all experiment uses a persistent table containing only 192.0.2.123
+  plus its narrow block rule. Q-FLUSH uses three pass-quick rules constrained to
+  ephemeral TCP listener ports on IPv4/IPv6 loopback and the feth0 pair. These
+  rules remain harness-only, absence-journaled and scoped; this deviation is not
+  production policy qualification.
+- Restore (L11) withholds even our own journaled anchor flushes and feth destroy
+  while foreign tokens exist. It records failure and can leave harness rules
+  loaded until the disposable runner is discarded.

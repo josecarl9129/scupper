@@ -64,7 +64,10 @@ impl Completed {
             .enumerate()
             // Read-only census subprocesses journal their identity too; they
             // cannot own resources and need no recovery operation.
-            .filter(|(index, entry)| entry.kind != "inventory" && !self.entries.contains(index))
+            .filter(|(index, entry)| {
+                !matches!(entry.kind.as_str(), "inventory" | "detach-attempt")
+                    && !self.entries.contains(index)
+            })
             .collect()
     }
 

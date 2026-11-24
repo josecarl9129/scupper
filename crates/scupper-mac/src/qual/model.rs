@@ -226,7 +226,7 @@ mod tests {
         assert!(manifest.budgets_fit());
         assert_eq!(manifest.cell_budget_minutes - manifest.overhead_minutes, 18);
         assert_eq!(MAX_FINAL_RESTORE_SECONDS, 240);
-        assert_eq!(manifest.cases.len(), 25);
+        assert_eq!(manifest.cases.len(), 29);
         let tools: Vec<_> = manifest
             .cases
             .iter()
@@ -365,7 +365,12 @@ mod tests {
                 .supported_assumptions,
             Vec::<String>::new()
         );
-        assert!(!manifest.cases.iter().any(|c| c.id == "Q-FLUSH"));
+        assert!(
+            manifest
+                .cases
+                .iter()
+                .any(|c| c.id == "Q-FLUSH" && c.group == "contracts")
+        );
         assert_eq!(
             manifest
                 .cases
@@ -406,7 +411,7 @@ mod tests {
             .ok_or("native CI job")?;
         assert!(native.contains("runner: [macos-15, macos-26]"));
         assert!(native.contains(
-            "group: [smoke, base, tool, tool-mutants, store, pf, pf-x, pf-x-stale, probe, probe-hijack]"
+            "group: [smoke, base, tool, tool-mutants, store, pf, pf-x, pf-x-stale, probe, probe-hijack, contracts]"
         ));
         assert!(native.contains(&format!(
             "matrix.group == 'tool-mutants' && {} || matrix.group == 'pf' && 50 || 30",
@@ -432,6 +437,62 @@ mod tests {
             !insufficient.budgets_fit(),
             "mutants need recovery margin too"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn contracts_budget_covers_worker_run_restore_and_deadman()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let manifest = Manifest::bundled()?;
+        let budget = manifest
+            .group_budgets
+            .get("contracts")
+            .ok_or("contracts budget")?;
+        let cases: u64 = manifest
+            .cases
+            .iter()
+            .filter(|c| c.group == "contracts")
+            .map(|c| u64::from(c.budget_minutes) * 60)
+            .sum();
+        let workflow = include_str!("../../../../.github/workflows/ci.yml");
+        let run_step = workflow
+            .split("- name: Run qualification cell")
+            .nth(1)
+            .ok_or("qualification run step")?;
+        let run: u64 = run_step
+            .split("matrix.group == 'contracts' && ")
+            .nth(1)
+            .ok_or("contracts run timeout")?
+            .split_whitespace()
+            .next()
+            .ok_or("run minutes")?
+            .parse::<u64>()?
+            * 60;
+        let after: u64 = workflow
+            .split("= contracts ]; then after=")
+            .nth(1)
+            .ok_or("contracts deadman")?
+            .split(';')
+            .next()
+            .ok_or("after seconds")?
+            .parse()?;
+        assert!(workflow.contains(&format!(
+            "matrix.group == 'contracts' && {} ||",
+            budget.cell_budget_minutes
+        )));
+        assert_eq!(run, 15 * 60);
+        assert!(include_str!("tool.rs").contains("\"contracts\" => 14 * 60"));
+        assert!(
+            cases + 60 <= 14 * 60,
+            "case budgets and worker completion margin"
+        );
+        assert!(after > run + MAX_FINAL_RESTORE_SECONDS + 60);
+        assert!(after <= super::super::guard::MAX_ARM_SECONDS);
+        assert!(
+            after + u64::from(budget.overhead_minutes) * 60
+                <= u64::from(budget.cell_budget_minutes) * 60
+        );
+        assert!(manifest.budgets_fit());
         Ok(())
     }
 

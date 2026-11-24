@@ -61,12 +61,14 @@ pub struct Paths {
     root: PathBuf,
     lock: PathBuf,
     control: PathBuf,
+    anchor: crate::decode::pfanchor::AnchorPath,
 }
 impl Paths {
     /// Production namespace. This does not make the native platform constructible.
     #[must_use]
     pub fn production() -> Self {
         Self {
+            anchor: fixed_anchor("com.apple/scupper"),
             root: PathBuf::from("/private/var/db/scupper"),
             lock: Path::new(PROVISIONAL_RUN).join("scupper.lock"),
             control: Path::new(PROVISIONAL_RUN).join("scupper.sock"),
@@ -77,6 +79,7 @@ impl Paths {
     #[must_use]
     pub fn qualification(root: PathBuf) -> Self {
         Self {
+            anchor: fixed_anchor("scupper-qual/scupper"),
             lock: root.join("instance.lock"),
             control: root.join("control.sock"),
             root,
@@ -94,6 +97,11 @@ impl Paths {
     pub fn control_path(&self) -> &Path {
         &self.control
     }
+    /// Immutable fixed pf namespace. Qualification is unhooked.
+    #[must_use]
+    pub fn anchor_path(&self) -> &str {
+        self.anchor.as_str()
+    }
     /// Root of this namespace.
     #[must_use]
     pub fn root(&self) -> &Path {
@@ -101,9 +109,17 @@ impl Paths {
     }
 }
 
+// These are source constants, validated through the same portable path parser.
+#[allow(clippy::expect_used)]
+fn fixed_anchor(value: &str) -> crate::decode::pfanchor::AnchorPath {
+    crate::decode::pfanchor::AnchorPath::new(value).expect("fixed native anchor path")
+}
+
 /// Native adapter with no production constructor in this slice.
 pub struct NativePlatform {
     paths: Paths,
+    #[cfg(feature = "qualification")]
+    trace: std::cell::RefCell<Vec<String>>,
     lock: Option<ManuallyDrop<std::fs::File>>,
     control: Option<UnixListener>,
     records: Records<scupper_darwin::Spawned>,
@@ -123,6 +139,8 @@ pub struct NativePlatform {
     #[cfg(feature = "qualification")]
     pf_text_out: Option<PathBuf>,
     #[cfg(feature = "qualification")]
+    pf_contract_capture: bool,
+    #[cfg(feature = "qualification")]
     pf_capture_failures: Vec<String>,
     #[cfg(feature = "qualification")]
     pf_copy_decisions:
@@ -140,6 +158,8 @@ impl NativePlatform {
         scupper_darwin::check_sigchld().map_err(|_| SysError::Failed("native: unsafe SIGCHLD"))?;
         Ok(Self {
             paths,
+            #[cfg(feature = "qualification")]
+            trace: std::cell::RefCell::default(),
             lock: None,
             control: None,
             records: Records::default(),
@@ -159,11 +179,35 @@ impl NativePlatform {
             #[cfg(feature = "qualification")]
             pf_text_out: None,
             #[cfg(feature = "qualification")]
+            pf_contract_capture: false,
+            #[cfg(feature = "qualification")]
             pf_capture_failures: Vec::new(),
             #[cfg(feature = "qualification")]
             pf_copy_decisions: std::sync::Arc::default(),
         })
     }
+    // Keep the same call sites with a no-op implementation outside qualification.
+    #[cfg_attr(
+        not(feature = "qualification"),
+        allow(unused_variables, clippy::unused_self)
+    )]
+    fn trace_call(&self, call: &str) {
+        #[cfg(feature = "qualification")]
+        crate::decode::qualification_trace::record(&mut self.trace.borrow_mut(), call);
+    }
+    /// Complete method/command trace for qualification assertions.
+    #[cfg(feature = "qualification")]
+    #[must_use]
+    pub fn call_trace(&self) -> Vec<String> {
+        self.trace.borrow().clone()
+    }
+    #[cfg(feature = "qualification")]
+    fn trace_snapshot_write(&self, copy: Copy, bytes: &[u8; COPY_BYTES]) {
+        self.trace_call(&crate::decode::qualification_trace::write_request(
+            copy, bytes,
+        ));
+    }
+
     /// Supply reviewed digests/vnodes for qualification until 5a3 provides them.
     /// Production pins remain the fixed engine paths. A staged child override is
     /// allowed only in this qualification constructor.
@@ -619,14 +663,28 @@ fn decode(record: &scupper_darwin::KProc) -> Result<ProcInfo, ProcessError> {
 }
 
 impl Platform for NativePlatform {
+    #[cfg(any(test, feature = "qualification"))]
+    fn trace_verification(&mut self, verdict: &scupper_core::mac::verify::Verdict) {
+        self.trace_call(&format!(
+            "verification_protected:{}",
+            matches!(verdict, scupper_core::mac::verify::Verdict::Protected(_))
+        ));
+    }
+
     fn write_copy(
         &mut self,
         copy: Copy,
         bytes: &[u8; COPY_BYTES],
         deadline: Deadline,
     ) -> WriteOutcome {
-        self.storage
-            .start(self.paths.root.clone(), copy, bytes, false, deadline)
+        self.trace_call("write_copy");
+        #[cfg(feature = "qualification")]
+        self.trace_snapshot_write(copy, bytes);
+        let result = self
+            .storage
+            .start(self.paths.root.clone(), copy, bytes, false, deadline);
+        self.trace_call(&format!("snapshot_result:{result:?}"));
+        result
     }
     fn create_copy(
         &mut self,
@@ -634,13 +692,21 @@ impl Platform for NativePlatform {
         bytes: &[u8; COPY_BYTES],
         deadline: Deadline,
     ) -> WriteOutcome {
-        self.storage
-            .start(self.paths.root.clone(), copy, bytes, true, deadline)
+        self.trace_call("create_copy");
+        #[cfg(feature = "qualification")]
+        self.trace_snapshot_write(copy, bytes);
+        let result = self
+            .storage
+            .start(self.paths.root.clone(), copy, bytes, true, deadline);
+        self.trace_call(&format!("snapshot_result:{result:?}"));
+        result
     }
     fn now(&mut self) -> u64 {
+        self.trace_call("now");
         scupper_darwin::monotonic_raw().as_secs()
     }
     fn pause(&mut self, duration: Duration, deadline: Deadline) {
+        self.trace_call("pause");
         let start = scupper_darwin::monotonic_raw();
         let end = start
             .saturating_add(duration)
@@ -663,10 +729,12 @@ impl Platform for NativePlatform {
         }
     }
     fn boot_id(&mut self) -> Option<BootId> {
+        self.trace_call("boot_id");
         let value = scupper_darwin::sysctl_string("kern.bootsessionuuid").ok()?;
         BootId::try_from(value.as_str()).ok()
     }
     fn incarnation(&mut self) -> HelperIncarnation {
+        self.trace_call("incarnation");
         // Self cannot vanish. Returning an invented start would forge identity;
         // the infallible contract leaves termination as the fail-closed choice.
         let pid = std::process::id();
@@ -684,12 +752,17 @@ impl Platform for NativePlatform {
         }
     }
     fn processes(&mut self, deadline: Deadline) -> Enumeration<Vec<ProcInfo>, ProcessError> {
+        self.trace_call("processes");
         match self.process_list(deadline) {
             Ok(list) => Enumeration::Complete(list),
-            Err(error) => Enumeration::Incomplete(error),
+            Err(error) => {
+                self.trace_call(&format!("failed:processes:{error:?}"));
+                Enumeration::Incomplete(error)
+            }
         }
     }
     fn executable_id(&mut self, path: &Path, deadline: Deadline) -> Result<ExeId, SysError> {
+        self.trace_call("executable_id");
         self.expired(deadline)?;
         let meta = std::fs::symlink_metadata(path)
             .map_err(|_| SysError::Failed("native: executable lstat failed"))?;
@@ -704,6 +777,7 @@ impl Platform for NativePlatform {
     }
     fn image_uuid(&mut self, path: &Path, deadline: Deadline) -> Result<[u8; 16], SysError> {
         use std::os::unix::fs::{FileExt, OpenOptionsExt};
+        self.trace_call("image_uuid");
         self.expired(deadline)?;
         if !cfg!(target_arch = "aarch64") {
             return Err(SysError::Failed("native: image architecture unsupported"));
@@ -746,6 +820,7 @@ impl Platform for NativePlatform {
     }
 
     fn acquire_instance_lock(&mut self) -> Result<(), InstanceLockError> {
+        self.trace_call("acquire_instance_lock");
         if self.lock.is_some() {
             return Ok(());
         }
@@ -779,11 +854,16 @@ impl Platform for NativePlatform {
             }
         };
         // Deliberately never close this descriptor, even if the adapter is dropped.
-        self.lock = Some(ManuallyDrop::new(acquire()?));
+        let acquired = acquire();
+        if let Err(error) = &acquired {
+            self.trace_call(&format!("failed:acquire_instance_lock:{error:?}"));
+        }
+        self.lock = Some(ManuallyDrop::new(acquired?));
         Ok(())
     }
     fn create_control_socket(&mut self) -> Result<(), SysError> {
         use std::os::unix::fs::FileTypeExt;
+        self.trace_call("create_control_socket");
         if self.lock.is_none() {
             return Err(SysError::Failed("native: socket requires lock"));
         }
@@ -809,12 +889,16 @@ impl Platform for NativePlatform {
         Ok(())
     }
     fn reference_qualification(&self) -> ReferenceQualification {
+        self.trace_call("reference_qualification");
         self.pf_assumptions.assumptions().qualification()
     }
     fn read_install_record(&mut self, _deadline: Deadline) -> Result<InstallRecord, SysError> {
-        Err(UNIMPLEMENTED)
+        self.trace_call("read_install_record");
+        self.trace_call("failed:read_install_record:install record: no writer before 5a3");
+        Err(SysError::Failed("install record: no writer before 5a3"))
     }
     fn read_copy(&mut self, copy: Copy, deadline: Deadline) -> CopyRead {
+        self.trace_call("read_copy");
         match self.poll_copy(copy, deadline) {
             std::task::Poll::Ready(result) => result,
             std::task::Poll::Pending => {
@@ -827,35 +911,89 @@ impl Platform for NativePlatform {
         &mut self,
         _deadline: Deadline,
     ) -> std::task::Poll<Result<InstallRecord, SysError>> {
-        std::task::Poll::Ready(Err(UNIMPLEMENTED))
+        self.trace_call("poll_install_record");
+        self.trace_call("failed:poll_install_record:install record: no writer before 5a3");
+        std::task::Poll::Ready(Err(SysError::Failed(
+            "install record: no writer before 5a3",
+        )))
     }
     fn poll_copy(&mut self, copy: Copy, deadline: Deadline) -> std::task::Poll<CopyRead> {
-        self.storage.poll(self.paths.root.clone(), copy, deadline)
+        self.trace_call("poll_copy");
+        let result = self.storage.poll(self.paths.root.clone(), copy, deadline);
+        if matches!(result, std::task::Poll::Ready(CopyRead::Unreadable)) {
+            self.trace_call(&format!("failed:poll_copy:{copy:?}:unreadable"));
+        }
+        result
     }
     fn abandon_storage_read(&mut self) {
+        self.trace_call("abandon_storage_read");
         self.storage.abandon();
     }
     fn wait_write(&mut self, deadline: Deadline) -> WriteOutcome {
-        self.storage.wait(deadline)
+        self.trace_call("wait_write");
+        let result = self.storage.wait(deadline);
+        self.trace_call(&format!("snapshot_result:{result:?}"));
+        result
     }
     fn enable_pf(&mut self, deadline: Deadline) -> Result<PfEnable, SysError> {
+        self.trace_call("enable_pf");
         self.enable_pf_attempt(deadline).0
     }
     fn acquire(&mut self, deadline: Deadline) -> ToolOutcome<(u64, u32)> {
+        self.trace_call("acquire");
         let attempt = self.pf_attempt(&[crate::engine::PFCTL, "-E"], deadline);
-        crate::decode::pftext::acquire_outcome(pf::evidence(&attempt))
+        let result = crate::decode::pftext::acquire_outcome(pf::evidence(&attempt));
+        #[cfg(feature = "qualification")]
+        {
+            let pair = if let ToolOutcome::Ok(pair) = &result {
+                Some(*pair)
+            } else {
+                None
+            };
+            self.trace_call(&format!("acquire_result:{}", serde_json::json!(pair)));
+            if self.pf_contract_capture
+                && let (Some(out), Some((token, pid))) = (&self.pf_text_out, pair)
+            {
+                use std::{io::Write, os::unix::fs::OpenOptionsExt};
+                let save = || -> std::io::Result<()> {
+                    let mut journal = std::fs::OpenOptions::new()
+                        .append(true)
+                        .create(true)
+                        .mode(0o600)
+                        .open(out.join("resources.jsonl"))?;
+                    writeln!(
+                        journal,
+                        "{}",
+                        serde_json::json!({"kind":"token","token":token,"pid":pid,"at":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0,|d|d.as_secs())})
+                    )?;
+                    journal.sync_all()
+                };
+                if let Err(error) = save() {
+                    self.pf_capture_failures
+                        .push(format!("returned -E token journal failed: {error}"));
+                }
+            }
+        }
+        result
     }
     fn release(&mut self, token: u64, deadline: Deadline) -> ToolOutcome<Release> {
+        self.trace_call("release");
         let attempt = self.pf_attempt(&[crate::engine::PFCTL, "-X", &token.to_string()], deadline);
         crate::decode::pftext::release_outcome(pf::evidence(&attempt), token)
     }
     fn references(&mut self, deadline: Deadline) -> Enumeration<Vec<RefLine>> {
+        self.trace_call("references");
         match self.read_references(deadline) {
-            Ok(lines) => Enumeration::Complete(lines),
+            Ok(lines) => {
+                #[cfg(feature = "qualification")]
+                self.trace_call(&crate::decode::qualification_trace::refs_result(&lines));
+                Enumeration::Complete(lines)
+            }
             Err(error) => Enumeration::Incomplete(error),
         }
     }
     fn pf_info(&mut self, deadline: Deadline) -> PfInfo {
+        self.trace_call("pf_info");
         let attempt = self.pf_attempt(&[crate::engine::PFCTL, "-s", "info"], deadline);
         crate::decode::pftext::info_outcome(pf::evidence(&attempt))
     }
@@ -867,6 +1005,7 @@ impl Platform for NativePlatform {
         expect_start: StartTime,
         deadline: Deadline,
     ) -> Result<KillOutcome, SysError> {
+        self.trace_call("kill_group");
         let own = self.incarnation();
         if !crate::platform::group_kill_allowed(pgid, own.pgid)
             || !crate::platform::process_kill_allowed(expect_pid, own.pid)
@@ -912,6 +1051,7 @@ impl Platform for NativePlatform {
         expect_start: StartTime,
         deadline: Deadline,
     ) -> Result<KillOutcome, SysError> {
+        self.trace_call("kill_process");
         if !crate::platform::process_kill_allowed(pid, std::process::id()) {
             return Err(SysError::Failed("native: forbidden process kill"));
         }
@@ -934,6 +1074,7 @@ impl Platform for NativePlatform {
         ))
     }
     fn reap_children(&mut self, deadline: Deadline) -> Result<(), SysError> {
+        self.trace_call("reap_children");
         self.expired(deadline)?;
         let mut error = false;
         let end = Duration::from_secs(deadline.0);
@@ -963,9 +1104,11 @@ impl Platform for NativePlatform {
         }
     }
     fn fence(&mut self) -> Fence {
+        self.trace_call("fence");
         self.records.fence(scupper_darwin::Spawned::pid)
     }
     fn reap(&mut self, deadline: Deadline) -> Fence {
+        self.trace_call("reap");
         while scupper_darwin::monotonic_raw() < Duration::from_secs(deadline.0)
             && !self.records.tools.is_empty()
         {
@@ -983,23 +1126,54 @@ impl Platform for NativePlatform {
         }
         self.fence()
     }
-    fn load_anchor(&mut self, _text: &AnchorText, _deadline: Deadline) -> Result<(), SysError> {
-        Err(UNIMPLEMENTED)
+    fn load_anchor(&mut self, text: &AnchorText, deadline: Deadline) -> Result<(), SysError> {
+        self.trace_call("load_anchor");
+        crate::decode::pfanchor::source(text.as_str())?;
+        let path = self.paths.anchor.clone();
+        self.anchor_command(
+            crate::decode::pfanchor::Operation::Load,
+            &["-a", path.as_str(), "-f", "-"],
+            text.as_str().as_bytes(),
+            deadline,
+        )?;
+        Ok(())
     }
-    fn read_anchor(&mut self, _deadline: Deadline) -> Result<Option<String>, SysError> {
-        Err(UNIMPLEMENTED)
+    fn read_anchor(&mut self, deadline: Deadline) -> Result<Option<String>, SysError> {
+        self.trace_call("read_anchor");
+        let path = self.paths.anchor.clone();
+        crate::decode::pfanchor::read(
+            &mut pf::AnchorSession {
+                platform: self,
+                deadline,
+            },
+            &path,
+        )
     }
-    fn flush_states(&mut self, _deadline: Deadline) -> Result<(), SysError> {
-        Err(UNIMPLEMENTED)
+    /// Global ownership exception: destroys foreign states irreversibly. No
+    /// restore can return them. The numeric count is not a cleanliness proof;
+    /// live traffic can recreate states immediately, so there is no read-back.
+    fn flush_states(&mut self, deadline: Deadline) -> Result<(), SysError> {
+        self.trace_call("flush_states");
+        self.anchor_command(
+            crate::decode::pfanchor::Operation::States,
+            &["-F", "states"],
+            &[],
+            deadline,
+        )?;
+        Ok(())
     }
     fn remove_interface_states(
         &mut self,
-        _interfaces: &BTreeSet<PhysicalInterface>,
+        interfaces: &BTreeSet<PhysicalInterface>,
         _deadline: Deadline,
     ) -> Result<(), SysError> {
-        Err(UNIMPLEMENTED)
+        self.trace_call("remove_interface_states");
+        // Floating states use pfi_all; an interface selector can falsely read clean.
+        // Address killing cannot safely attribute ownership. No tool/fence change.
+        crate::decode::pfanchor::selective(interfaces.is_empty())
     }
     fn check_tools(&mut self, deadline: Deadline) -> Result<(), SysError> {
+        self.trace_call("check_tools");
         for pin in crate::engine::PINNED_TOOLS {
             self.check_pin(Path::new(pin), deadline)?;
         }
@@ -1007,13 +1181,19 @@ impl Platform for NativePlatform {
         self.check_pin(&child, deadline)
     }
     fn check_pfctl(&mut self, deadline: Deadline) -> Result<(), SysError> {
+        self.trace_call("check_pfctl");
         let pfctl = crate::engine::PINNED_TOOLS
             .iter()
             .find(|path| **path == crate::engine::PFCTL)
             .ok_or(SysError::Failed("native: pfctl pin missing"))?;
-        self.check_pin(Path::new(pfctl), deadline)
+        let result = self.check_pin(Path::new(pfctl), deadline);
+        if let Err(error) = &result {
+            self.trace_call(&format!("failed:check_pfctl:{error:?}"));
+        }
+        result
     }
     fn spawned_children(&self) -> &[Child] {
+        self.trace_call("spawned_children");
         &self.records.history
     }
     fn spawn(
@@ -1022,6 +1202,7 @@ impl Platform for NativePlatform {
         attributes: SpawnAttributes,
         deadline: Deadline,
     ) -> Result<Child, SysError> {
+        self.trace_call("spawn");
         self.expired(deadline)?;
         let own = self.incarnation();
         let own_proc = scupper_darwin::sysctl_kern_proc_pid(own.pid)
@@ -1084,33 +1265,54 @@ impl Platform for NativePlatform {
         _value: &Setting,
         _deadline: Deadline,
     ) -> Result<(), SysError> {
-        Err(UNIMPLEMENTED)
+        self.trace_call("configure");
+        {
+            self.trace_call("failed:configure:native: not implemented");
+            Err(UNIMPLEMENTED)
+        }
     }
     fn read_config(
         &mut self,
         _key: ConfigKey,
         _deadline: Deadline,
     ) -> Result<Option<Setting>, SysError> {
-        Err(UNIMPLEMENTED)
+        self.trace_call("read_config");
+        {
+            self.trace_call("failed:read_config:native: not implemented");
+            Err(UNIMPLEMENTED)
+        }
     }
     fn identity(&mut self, _child: &Child, _deadline: Deadline) -> Result<Tunnel, SysError> {
-        Err(UNIMPLEMENTED)
+        self.trace_call("identity");
+        {
+            self.trace_call("failed:identity:native: not implemented");
+            Err(UNIMPLEMENTED)
+        }
     }
     fn cheap_check(
         &mut self,
         _child: Option<&Child>,
         _deadline: Deadline,
     ) -> Result<CheapObservation, SysError> {
-        Err(UNIMPLEMENTED)
+        self.trace_call("cheap_check");
+        {
+            self.trace_call("failed:cheap_check:native: not implemented");
+            Err(UNIMPLEMENTED)
+        }
     }
     fn collect(
         &mut self,
         _collection: &Collection,
         _deadline: Deadline,
     ) -> Result<Observations, SysError> {
-        Err(UNIMPLEMENTED)
+        self.trace_call("collect");
+        {
+            self.trace_call("failed:collect:native: not implemented");
+            Err(UNIMPLEMENTED)
+        }
     }
     fn firewall_qualification(&self) -> Option<scupper_core::mac::verify::Qualification> {
+        self.trace_call("firewall_qualification");
         None
     }
     fn collect_lockdown(
@@ -1119,40 +1321,76 @@ impl Platform for NativePlatform {
         _states: scupper_core::mac::verify::StateEvidence,
         _deadline: Deadline,
     ) -> Result<Observations, SysError> {
-        Err(UNIMPLEMENTED)
+        self.trace_call("collect_lockdown");
+        {
+            self.trace_call("failed:collect_lockdown:native: not implemented");
+            Err(UNIMPLEMENTED)
+        }
     }
     fn leave_routes(
         &mut self,
         _endpoint: Option<SocketAddrV4>,
         _deadline: Deadline,
     ) -> Result<LeaveRoutes, SysError> {
-        Err(UNIMPLEMENTED)
+        self.trace_call("leave_routes");
+        {
+            self.trace_call("failed:leave_routes:native: not implemented");
+            Err(UNIMPLEMENTED)
+        }
     }
     fn cleanup_owned_routes(
         &mut self,
         _endpoint: Option<SocketAddrV4>,
         _deadline: Deadline,
     ) -> Result<(), SysError> {
-        Err(UNIMPLEMENTED)
+        self.trace_call("cleanup_owned_routes");
+        {
+            self.trace_call("failed:cleanup_owned_routes:native: not implemented");
+            Err(UNIMPLEMENTED)
+        }
     }
     fn cleanup_routes(
         &mut self,
         _endpoint: SocketAddrV4,
         _deadline: Deadline,
     ) -> Result<(), SysError> {
-        Err(UNIMPLEMENTED)
+        self.trace_call("cleanup_routes");
+        {
+            self.trace_call("failed:cleanup_routes:native: not implemented");
+            Err(UNIMPLEMENTED)
+        }
     }
     fn cleanup_dns(&mut self, _deadline: Deadline) -> Result<(), SysError> {
-        Err(UNIMPLEMENTED)
+        self.trace_call("cleanup_dns");
+        {
+            self.trace_call("failed:cleanup_dns:native: not implemented");
+            Err(UNIMPLEMENTED)
+        }
     }
     fn managed_artifacts(&mut self, _deadline: Deadline) -> Enumeration<Vec<String>> {
-        Enumeration::Incomplete(UNIMPLEMENTED)
+        self.trace_call("managed_artifacts");
+        {
+            self.trace_call("failed:managed_artifacts:native: not implemented");
+            Enumeration::Incomplete(UNIMPLEMENTED)
+        }
     }
     fn cleanup_artifacts(&mut self, _deadline: Deadline) -> Result<(), SysError> {
-        Err(UNIMPLEMENTED)
+        self.trace_call("cleanup_artifacts");
+        {
+            self.trace_call("failed:cleanup_artifacts:native: not implemented");
+            Err(UNIMPLEMENTED)
+        }
     }
-    fn remove_anchor(&mut self, _deadline: Deadline) -> Result<(), SysError> {
-        Err(UNIMPLEMENTED)
+    fn remove_anchor(&mut self, deadline: Deadline) -> Result<(), SysError> {
+        self.trace_call("remove_anchor");
+        let path = self.paths.anchor.clone();
+        crate::decode::pfanchor::remove(
+            &mut pf::AnchorSession {
+                platform: self,
+                deadline,
+            },
+            &path,
+        )
     }
 }
 
@@ -1270,11 +1508,13 @@ mod tests {
             );
             assert!(matches!(
                 platform.read_install_record(d),
-                Err(UNIMPLEMENTED)
+                Err(SysError::Failed("install record: no writer before 5a3"))
             ));
             assert!(matches!(
                 platform.poll_install_record(d),
-                std::task::Poll::Ready(Err(UNIMPLEMENTED))
+                std::task::Poll::Ready(Err(SysError::Failed(
+                    "install record: no writer before 5a3"
+                )))
             ));
             assert!(platform.firewall_qualification().is_none());
             Ok(())

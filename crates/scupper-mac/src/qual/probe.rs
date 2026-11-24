@@ -289,7 +289,10 @@ mod tests {
             .collect();
         assert_eq!(
             overrides,
-            [r#"if [ "${{ matrix.group }}" = pf ]; then after=1800; fi"#]
+            [
+                r#"if [ "${{ matrix.group }}" = pf ]; then after=1800; fi"#,
+                r#"if [ "${{ matrix.group }}" = contracts ]; then after=1500; fi"#
+            ]
         );
         assert_eq!(deadlines[0], 18 * 60);
         Ok(())

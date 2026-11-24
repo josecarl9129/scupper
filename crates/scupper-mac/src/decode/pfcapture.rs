@@ -1,8 +1,13 @@
 //! Portable selection and failure accounting for native pfctl captures.
 
-pub(crate) fn captured_mutator(args: &[&str]) -> bool {
+pub(crate) fn captures_reference_mutation(args: &[&str]) -> bool {
     args.first() == Some(&crate::engine::PFCTL)
         && matches!(args.get(1), Some(&"-e" | &"-E" | &"-X" | &"-d"))
+}
+
+pub(crate) fn captures_command(args: &[&str], contracts: bool) -> bool {
+    captures_reference_mutation(args)
+        || (contracts && args.first() == Some(&crate::engine::PFCTL) && args.len() > 1)
 }
 
 pub(crate) fn command(args: &[&str]) -> Vec<String> {
@@ -40,7 +45,7 @@ mod tests {
     fn capture_selects_argument_and_preserves_command_once() {
         for flag in ["-e", "-E", "-X", "-d"] {
             let args = [crate::engine::PFCTL, flag, "42"];
-            assert!(captured_mutator(&args));
+            assert!(captures_reference_mutation(&args));
             assert_eq!(command(&args), args);
         }
         for args in [
@@ -50,7 +55,22 @@ mod tests {
             &[crate::engine::PFCTL, "-s", "info"][..],
             &["other", "-E"][..],
         ] {
-            assert!(!captured_mutator(args));
+            assert!(!captures_reference_mutation(args));
+        }
+    }
+
+    #[test]
+    fn r6_capture_scope_does_not_include_contract_reads_or_flushes() {
+        for args in [
+            &[crate::engine::PFCTL, "-s", "info"][..],
+            &[crate::engine::PFCTL, "-a", "scupper-qual/scupper", "-sr"][..],
+            &[crate::engine::PFCTL, "-F", "states"][..],
+        ] {
+            assert!(!captures_command(args, false));
+            assert!(captures_command(args, true));
+        }
+        for flag in ["-e", "-E", "-X", "-d"] {
+            assert!(captures_command(&[crate::engine::PFCTL, flag], false));
         }
     }
 

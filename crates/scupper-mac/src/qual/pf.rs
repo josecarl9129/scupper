@@ -297,6 +297,15 @@ fn release_probe(out: &Path, p: &mut NativePlatform, end: Instant) -> Result<()>
     sole_release(out, p, sole, end)
 }
 fn raw(out: &Path, p: &mut NativePlatform, args: &[&str], end: Instant) -> Result<Evidence> {
+    raw_input(out, p, args, &[], end)
+}
+pub(super) fn raw_input(
+    out: &Path,
+    p: &mut NativePlatform,
+    args: &[&str],
+    input: &[u8],
+    end: Instant,
+) -> Result<Evidence> {
     let build = match live_build() {
         Ok(build) => Some(build),
         Err(error) if args == ["-d"] => {
@@ -315,13 +324,13 @@ fn raw(out: &Path, p: &mut NativePlatform, args: &[&str], end: Instant) -> Resul
         Tool::Pfctl,
         Path::new("/sbin/pfctl"),
         &command_line,
-        &[],
+        input,
         1024 * 1024,
         deadline(end)?,
     )?;
     let evidence = Evidence {
         command: command_line.iter().map(|s| (*s).into()).collect(),
-        stdin: None,
+        stdin: (!input.is_empty()).then(|| String::from_utf8_lossy(input).into_owned()),
         pid: Some(result.pid),
         exit_code: match result.reap {
             Reap::Status(s) if s.trailing_zeros() >= 7 => Some((s >> 8) & 255),
@@ -394,7 +403,7 @@ fn reset(out: &Path, p: &mut NativePlatform, end: Instant) -> Result<()> {
     info(p, &PfInfo::Disabled, end)?;
     ensure(refs(p, end)?.is_empty(), "disable retained tokens")
 }
-fn baseline(out: &Path) -> Result<()> {
+pub(super) fn baseline(out: &Path) -> Result<()> {
     let before: Snapshot = read_json(&out.join("preflight.json"))?;
     ensure(before.inconclusive.is_empty(), "preflight inconclusive")?;
     ensure(

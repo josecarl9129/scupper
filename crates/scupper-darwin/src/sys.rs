@@ -1589,3 +1589,36 @@ pub fn pf_starters(fd: BorrowedFd<'_>, bytes: &mut [u8]) -> Result<usize, Errno>
         super::rules::StarterSizeError::Invalid => Errno::INVAL,
     })
 }
+
+/// Bind a qualification IPv4 socket to an actual interface without transferring
+/// descriptor ownership. This harness-only selector forces traffic through the
+/// feth peer rather than accepting a local-address route as feth evidence.
+///
+/// # Errors
+/// Invalid interface index or the synchronous `setsockopt` errno.
+#[cfg(feature = "qualification")]
+pub fn qual_ipv4_bound_interface(fd: std::os::fd::BorrowedFd<'_>, index: u32) -> Result<(), Errno> {
+    use std::os::fd::AsRawFd;
+    if index == 0 {
+        return Err(Errno::INVAL);
+    }
+    let size =
+        libc::socklen_t::try_from(std::mem::size_of_val(&index)).map_err(|_| Errno::INVAL)?;
+    // SAFETY: fd is borrowed for this synchronous call and remains open. index
+    // is an initialized, aligned u32; IP_BOUND_IF consumes exactly this length.
+    // setsockopt does not retain the pointer or transfer/close the descriptor.
+    let result = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_BOUND_IF,
+            (&raw const index).cast(),
+            size,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(last_errno())
+    }
+}

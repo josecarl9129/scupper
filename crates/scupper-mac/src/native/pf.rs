@@ -4,6 +4,7 @@ use crate::{
     decode::pftoken::{self, Assumption, ReadError},
     platform::{Deadline, SysError, Tool},
 };
+use sha2::Digest;
 use std::{os::fd::AsFd, path::Path, time::Duration};
 
 impl NativePlatform {
@@ -11,6 +12,13 @@ impl NativePlatform {
     #[cfg(feature = "qualification")]
     pub fn capture_pf_text(&mut self, out: Option<std::path::PathBuf>) {
         self.pf_text_out = out;
+        self.pf_contract_capture = false;
+    }
+    /// Opt in to full R7 adapter text capture without widening R6 accounting.
+    #[cfg(feature = "qualification")]
+    pub fn capture_contract_pf_text(&mut self, out: std::path::PathBuf) {
+        self.pf_text_out = Some(out);
+        self.pf_contract_capture = true;
     }
     #[cfg(feature = "qualification")]
     fn save_pf_text(
@@ -18,6 +26,7 @@ impl NativePlatform {
         build: &crate::decode::pftext::Build,
         args: &[&str],
         result: &tool::ToolResult,
+        input: &[u8],
         started_unix_ms: u128,
         started: std::time::Instant,
     ) -> Result<(), String> {
@@ -27,7 +36,7 @@ impl NativePlatform {
         };
         let evidence = crate::qual::Evidence {
             command: crate::decode::pfcapture::command(args),
-            stdin: None,
+            stdin: (!input.is_empty()).then(|| String::from_utf8_lossy(input).into_owned()),
             pid: Some(result.pid),
             exit_code: match result.reap {
                 crate::platform::runtime::Reap::Status(s) if s.trailing_zeros() >= 7 => {
@@ -52,7 +61,12 @@ impl NativePlatform {
                 &result.stderr.bytes,
             )?;
             let name = format!(
-                "pf-text-native-{}-{}.json",
+                "pf-text-native-{}{}-{}.json",
+                if args == [crate::engine::PFCTL, "-E"] {
+                    "acquire-"
+                } else {
+                    ""
+                },
                 result.pid,
                 scupper_darwin::monotonic_raw().as_nanos()
             );
@@ -153,6 +167,14 @@ impl NativePlatform {
         args: &[&str],
         deadline: Deadline,
     ) -> Result<(crate::decode::pftext::Build, tool::ToolResult), SysError> {
+        self.pf_attempt_input(args, &[], deadline)
+    }
+    pub(super) fn pf_attempt_input(
+        &mut self,
+        args: &[&str],
+        input: &[u8],
+        deadline: Deadline,
+    ) -> Result<(crate::decode::pftext::Build, tool::ToolResult), SysError> {
         let build = crate::decode::pftext::Build::system()?;
         self.check_pin(Path::new(crate::engine::PFCTL), deadline)?;
         #[cfg(feature = "qualification")]
@@ -167,13 +189,21 @@ impl NativePlatform {
             Tool::Pfctl,
             Path::new(crate::engine::PFCTL),
             args,
-            &[],
+            input,
             1024 * 1024,
             deadline,
         )?;
+        // run() returns Err only before spawn. Once spawned, it always returns
+        // ToolResult, including unknown/unreaped effects. No engine call can
+        // interleave this synchronous runner, so this records actual dispatches.
+        self.trace_call(&format!(
+            "pfctl:{}:stdin_sha256={:x}",
+            args.join(" "),
+            sha2::Sha256::digest(input)
+        ));
         #[cfg(feature = "qualification")]
-        if crate::decode::pfcapture::captured_mutator(args) {
-            let saved = self.save_pf_text(&build, args, &result, started_unix_ms, started);
+        if crate::decode::pfcapture::captures_command(args, self.pf_contract_capture) {
+            let saved = self.save_pf_text(&build, args, &result, input, started_unix_ms, started);
             crate::decode::pfcapture::record_failure(
                 args,
                 saved,
@@ -269,4 +299,42 @@ pub(super) fn evidence(
             )
         })
         .map_err(Clone::clone)
+}
+
+/// The deadline is shared across all inventory/rules/extra-class reads and flushes.
+pub(super) struct AnchorSession<'a> {
+    pub platform: &'a mut NativePlatform,
+    pub deadline: Deadline,
+}
+impl crate::decode::pfanchor::Commands for AnchorSession<'_> {
+    fn call(
+        &mut self,
+        op: crate::decode::pfanchor::Operation,
+        args: &[&str],
+        input: &[u8],
+    ) -> Result<crate::decode::pfanchor::Text, SysError> {
+        self.platform.anchor_command(op, args, input, self.deadline)
+    }
+}
+impl NativePlatform {
+    pub(super) fn anchor_command(
+        &mut self,
+        op: crate::decode::pfanchor::Operation,
+        args: &[&str],
+        input: &[u8],
+        deadline: Deadline,
+    ) -> Result<crate::decode::pfanchor::Text, SysError> {
+        let command_line: Vec<_> = std::iter::once(crate::engine::PFCTL)
+            .chain(args.iter().copied())
+            .collect();
+        let attempt = self.pf_attempt_input(&command_line, input, deadline);
+        let result = (|| {
+            let (build, raw) = evidence(&attempt)?;
+            self.expired(deadline)?;
+            let rc = crate::decode::pftext::status(&raw)?;
+            crate::decode::pfanchor::qualified(build, op, rc, raw.stdout, raw.stderr)
+        })();
+        self.trace_call(&format!("anchor:{op:?}:{result:?}"));
+        result
+    }
 }

@@ -197,9 +197,10 @@ pub(super) fn run(out: &Path) -> Result<()> {
 // Model absent installer directories only inside the journaled qualification tree.
 // Never create or relax a production ancestor from the helper/qualification code.
 fn production_ancestors(out: &Path) -> Result<()> {
-    let production = Paths::production();
-    let lock = production.lock_path();
-    let control = production.control_path();
+    // Read-only ancestor measurements use explicit provisional path names;
+    // qualification never constructs a production namespace or adapter.
+    let lock = Path::new("/private/var/db/scupper/run/scupper.lock");
+    let control = Path::new("/private/var/db/scupper/run/scupper.sock");
     let model = fixture(out).join("production-run-model");
     fs::DirBuilder::new().mode(0o755).create(&model)?;
     fs::set_permissions(&model, fs::Permissions::from_mode(0o755))?;
@@ -221,8 +222,8 @@ fn production_ancestors(out: &Path) -> Result<()> {
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Only the installer-owned scupper/run chain may be modeled.
-                let planned =
-                    ancestor == production.root() || ancestor == lock.parent().ok_or("parent")?;
+                let planned = ancestor == Path::new("/private/var/db/scupper")
+                    || ancestor == lock.parent().ok_or("parent")?;
                 would_pass &= planned;
                 measurements.push(json!({"path":ancestor,"exists":false,"uid":null,"gid":null,"mode":null,"installer_model":planned,"model_uid":model_meta.uid(),"model_gid":model_meta.gid(),"model_mode":format!("{:04o}", model_meta.mode() & 0o7777)}));
             }
@@ -693,7 +694,7 @@ fn tools_worker(out: &Path, result: &mut CaseResult) -> Result<()> {
     Ok(())
 }
 
-fn prepare_wireguard_directory(out: &Path) -> Result<()> {
+pub(super) fn prepare_wireguard_directory(out: &Path) -> Result<()> {
     let directory = Path::new("/private/var/run/wireguard");
     let existed = match fs::symlink_metadata(directory) {
         Ok(m)
@@ -885,6 +886,9 @@ fn worker_inner(out: &Path, mode: &str) -> Result<()> {
         "qualification job not parented to launchd/group leader",
     )?;
     journal_child(out, incarnation.pid)?;
+    if mode == "contracts" {
+        return super::contracts::worker(out);
+    }
     if matches!(mode, "pf" | "pf-x" | "pf-x-stale") {
         return super::pf::worker(out, mode);
     }
@@ -1144,6 +1148,7 @@ pub(super) fn launch_job(out: &Path, mode: &str, keep_alive: bool) -> Result<(St
     let until = Instant::now()
         + Duration::from_secs(match mode {
             "pf" => 23 * 60,
+            "contracts" => 14 * 60,
             "pf-x" | "pf-x-stale" => 5 * 60,
             _ => 45,
         });

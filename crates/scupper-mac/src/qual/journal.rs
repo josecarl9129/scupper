@@ -334,3 +334,43 @@ mod tests {
         );
     }
 }
+
+/// Only a successful absence observation can grant write-ahead cleanup authority.
+/// A pre-existing or unreadable anchor is never appended and never later flushed.
+pub(super) fn anchor_after_absence<E>(
+    read: &Result<Option<String>, crate::platform::SysError>,
+    append: impl FnOnce() -> Result<(), E>,
+) -> Result<(), E>
+where
+    E: From<Box<dyn std::error::Error>>,
+{
+    match read {
+        Ok(None) => append(),
+        _ => Err(Box::<dyn std::error::Error>::from(
+            "anchor absence not established; not journaled",
+        )
+        .into()),
+    }
+}
+#[cfg(test)]
+mod r7 {
+    #[test]
+    fn preexisting_or_failed_anchor_is_never_journaled() {
+        for read in [
+            Ok(Some(String::new())),
+            Ok(Some("block all\n".into())),
+            Err(crate::platform::SysError::Unknown),
+            Ok(None),
+        ] {
+            let absent = read == Ok(None);
+            let mut appended = false;
+            let result: Result<(), Box<dyn std::error::Error>> =
+                super::anchor_after_absence(&read, || {
+                    appended = true;
+                    Ok(())
+                });
+            assert_eq!(appended, absent);
+            assert_eq!(result.is_ok(), absent);
+        }
+    }
+}

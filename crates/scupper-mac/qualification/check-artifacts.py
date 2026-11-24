@@ -131,6 +131,18 @@ else:
         except (OSError, ValueError) as error:
             identity_errors.append(f"incomplete staged binary manifest: {error}")
 
+    # Contract executables are disposable copies of the built/staged upstream
+    # binary. Bind their digest to that build, not merely to another live copy.
+    for copies in root.rglob("contract-copy-identities.json"):
+        try:
+            copied = json.loads(copies.read_text())
+            built_all = hash_map(root / "built-binaries-sha256.txt")
+            expected = built_all[copied["source_name"]]
+            if copied["source_sha256"] != expected or copied["copy_sha256"] != expected:
+                identity_errors.append("contract scratch copy differs from built executable")
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            identity_errors.append(f"invalid contract copy identity evidence: {error}")
+
     identities = sorted(root.glob("probe-identity-*.json"))
     qproc_patterns = ["Q-STORE*", "store-*.json", "Q-TOOL*", "Q-LAUNCHD*", "Q-LOCK*", "tool-*.json", "Q-PROC*", "base-proc*", "proc-churn.json", "base-oracle.json",
                       "oracle-*.log", "base-stopped*", "base-unlinked*", "base-paths.json",

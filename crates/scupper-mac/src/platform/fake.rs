@@ -310,6 +310,13 @@ impl Drop for InstanceLease {
 #[derive(Clone, Debug)]
 #[allow(clippy::struct_excessive_bools)] // Independent external facts, not lifecycle state.
 pub struct FakePlatform {
+    /// Optional complete method audit, independent of the model's effect log.
+    pub method_trace: Option<std::cell::RefCell<Vec<&'static str>>>,
+    /// Optional ordered snapshot/reference evidence for qualification regression tests.
+    #[cfg(any(test, feature = "qualification"))]
+    pub qualification_trace: Option<Vec<String>>,
+    /// Explicit selective-removal replies, independent of call ordering.
+    pub selective_results: Vec<Result<(), SysError>>,
     /// Record firewall ordering and create states under a permissive anchor.
     #[cfg(test)]
     pub model_firewall: bool,
@@ -405,6 +412,12 @@ pub struct FakePlatform {
     pub helper: HelperIncarnation,
     /// Current readable boot id.
     pub boot: Option<BootId>,
+    /// Additional kernel interfaces for DHCP replacement fixtures.
+    pub additional_interfaces: BTreeSet<mac::Interface>,
+    /// Qualification mirror of the production install writer's explicit refusal.
+    pub install_error: Option<&'static str>,
+    /// Qualification mirror of unsupported native selective state removal.
+    pub selective_unqualified: bool,
     /// Fixed helper anchor.
     pub anchor: Option<String>,
     /// Override only the command read-back, retaining the kernel anchor oracle.
@@ -559,6 +572,10 @@ impl FakePlatform {
             image: None,
         };
         Ok(Self {
+            method_trace: None,
+            #[cfg(any(test, feature = "qualification"))]
+            qualification_trace: None,
+            selective_results: vec![],
             #[cfg(test)]
             model_firewall: false,
             #[cfg(test)]
@@ -708,6 +725,9 @@ impl FakePlatform {
             },
             helper,
             boot,
+            additional_interfaces: BTreeSet::new(),
+            install_error: None,
+            selective_unqualified: false,
             anchor: None,
             anchor_readback: None,
             anchor_readback_absent: false,
@@ -1022,6 +1042,10 @@ impl FakePlatform {
             || matches!(&effect, Effect::Anchor(Some(text)) if text == scupper_core::mac::policy::render_lockdown().as_str());
         let outcome = self.mutation(call, tool, deadline, stateless);
         self.settle_effect(&outcome, immediate, effect);
+        #[cfg(any(test, feature = "qualification"))]
+        if let Some(trace) = &mut self.qualification_trace {
+            trace.push(format!("effect_result:{call:?}:{outcome:?}"));
+        }
         #[cfg(test)]
         {
             self.record_firewall(call, matches!(outcome, ToolOutcome::Ok(())));
@@ -1099,9 +1123,19 @@ impl FakePlatform {
         deadline: Deadline,
         create: bool,
     ) -> WriteOutcome {
+        #[cfg(any(test, feature = "qualification"))]
+        if let Some(trace) = &mut self.qualification_trace {
+            trace.push(crate::decode::qualification_trace::write_request(
+                copy, bytes,
+            ));
+        }
         self.pull_shared_copies();
         let outcome = self.storage_inner(copy, bytes, deadline, create);
         self.publish_shared_copies();
+        #[cfg(any(test, feature = "qualification"))]
+        if let Some(trace) = &mut self.qualification_trace {
+            trace.push(crate::decode::qualification_trace::write_result(&outcome));
+        }
         #[cfg(test)]
         self.capture_completed(if create {
             Call::Create(copy)
@@ -1785,10 +1819,26 @@ impl FakePlatform {
 }
 
 impl Platform for FakePlatform {
+    #[cfg(any(test, feature = "qualification"))]
+    fn trace_verification(&mut self, verdict: &verify::Verdict) {
+        if let Some(trace) = &mut self.qualification_trace {
+            trace.push(format!(
+                "verification_protected:{}",
+                matches!(verdict, verify::Verdict::Protected(_))
+            ));
+        }
+    }
+
     fn report_safety(&mut self, event: super::SafetyEvent) {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("report_safety");
+        }
         self.safety_events.push(event);
     }
     fn acquire_instance_lock(&mut self) -> Result<(), super::InstanceLockError> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("acquire_instance_lock");
+        }
         match self.begin(Call::AcquireInstanceLock) {
             Some(Fault::LockInterrupted) => return Err(super::InstanceLockError::Interrupted),
             Some(Fault::LockTimedOut) => {
@@ -1820,6 +1870,9 @@ impl Platform for FakePlatform {
         Ok(())
     }
     fn create_control_socket(&mut self) -> Result<(), SysError> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("create_control_socket");
+        }
         if !self.instance.held {
             return Err(SysError::Failed("socket without instance lock"));
         }
@@ -1830,24 +1883,39 @@ impl Platform for FakePlatform {
     }
 
     fn reference_qualification(&self) -> super::ReferenceQualification {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("reference_qualification");
+        }
         super::ReferenceQualification {
             disable_voids_references: self.x_qualified,
             fingerprints: self.fingerprints_qualified,
         }
     }
     fn now(&mut self) -> u64 {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("now");
+        }
         self.calls.push(Call::Now);
         self.millis / 1000
     }
     fn boot_id(&mut self) -> Option<BootId> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("boot_id");
+        }
         self.calls.push(Call::BootId);
         self.boot.clone()
     }
     fn incarnation(&mut self) -> HelperIncarnation {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("incarnation");
+        }
         self.calls.push(Call::Incarnation);
         self.helper.clone()
     }
     fn read_install_record(&mut self, deadline: Deadline) -> Result<InstallRecord, SysError> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("read_install_record");
+        }
         match self.poll_install_record(deadline) {
             std::task::Poll::Ready(result) => result,
             std::task::Poll::Pending => {
@@ -1857,6 +1925,9 @@ impl Platform for FakePlatform {
         }
     }
     fn read_copy(&mut self, copy: Copy, deadline: Deadline) -> CopyRead {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("read_copy");
+        }
         match self.poll_copy(copy, deadline) {
             std::task::Poll::Ready(result) => result,
             std::task::Poll::Pending => {
@@ -1869,10 +1940,22 @@ impl Platform for FakePlatform {
         &mut self,
         deadline: Deadline,
     ) -> std::task::Poll<Result<InstallRecord, SysError>> {
-        self.poll_read(Call::Install, deadline)
-            .map(|result| result.map(|()| self.install.clone()))
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("poll_install_record");
+        }
+        self.poll_read(Call::Install, deadline).map(|result| {
+            result.and_then(|()| {
+                self.install_error.map_or_else(
+                    || Ok(self.install.clone()),
+                    |reason| Err(SysError::Failed(reason)),
+                )
+            })
+        })
     }
     fn poll_copy(&mut self, copy: Copy, deadline: Deadline) -> std::task::Poll<CopyRead> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("poll_copy");
+        }
         self.poll_read(Call::Read(copy), deadline).map(|result| {
             if result.is_err() {
                 return CopyRead::Unreadable;
@@ -1894,11 +1977,17 @@ impl Platform for FakePlatform {
         })
     }
     fn abandon_storage_read(&mut self) {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("abandon_storage_read");
+        }
         if let Some((_, ready)) = self.read_pending.take() {
             self.abandoned_reads.push(ready);
         }
     }
     fn wait_write(&mut self, deadline: Deadline) -> WriteOutcome {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("wait_write");
+        }
         let Some(copy) = self.outstanding else {
             return WriteOutcome::Failed(SysError::Failed("no outstanding write"));
         };
@@ -1922,6 +2011,9 @@ impl Platform for FakePlatform {
         bytes: &[u8; COPY_BYTES],
         deadline: Deadline,
     ) -> WriteOutcome {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("write_copy");
+        }
         self.storage(copy, bytes, deadline, false)
     }
     fn create_copy(
@@ -1930,9 +2022,15 @@ impl Platform for FakePlatform {
         bytes: &[u8; COPY_BYTES],
         deadline: Deadline,
     ) -> WriteOutcome {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("create_copy");
+        }
         self.storage(copy, bytes, deadline, true)
     }
     fn enable_pf(&mut self, deadline: Deadline) -> Result<super::PfEnable, SysError> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("enable_pf");
+        }
         let running = self.enabled;
         match self.effect(Call::EnablePf, Tool::Pfctl, deadline, Effect::EnablePf) {
             Ok(()) if running => Ok(super::PfEnable::AlreadyRunning),
@@ -1942,6 +2040,9 @@ impl Platform for FakePlatform {
         }
     }
     fn acquire(&mut self, deadline: Deadline) -> ToolOutcome<(u64, u32)> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("acquire");
+        }
         let immediate = self.effect_injected(&Call::Acquire);
         let outcome = self.mutation(Call::Acquire, Tool::Pfctl, deadline, false);
         let pid = self.next_pid;
@@ -1965,13 +2066,35 @@ impl Platform for FakePlatform {
                 ToolOutcome::Unknown { reaped }
             }
         };
+        #[cfg(any(test, feature = "qualification"))]
+        if !matches!(result, ToolOutcome::NotStarted(_))
+            && let Some(trace) = &mut self.qualification_trace
+        {
+            trace.push("pfctl:/sbin/pfctl -E:stdin_sha256=".into());
+        }
         #[cfg(test)]
         self.capture_completed(Call::Acquire);
+        #[cfg(any(test, feature = "qualification"))]
+        if let Some(trace) = &mut self.qualification_trace {
+            let pair = if let ToolOutcome::Ok(pair) = &result {
+                Some(*pair)
+            } else {
+                None
+            };
+            trace.push(format!("acquire_result:{}", serde_json::json!(pair)));
+        }
         result
     }
     fn release(&mut self, token: u64, deadline: Deadline) -> ToolOutcome<Release> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("release");
+        }
         #[cfg(test)]
         self.check_release(token);
+        #[cfg(any(test, feature = "qualification"))]
+        if let Some(trace) = &mut self.qualification_trace {
+            trace.push(format!("pfctl:/sbin/pfctl -X {token}:stdin_sha256="));
+        }
         let call = Call::Release(token);
         let vanished = self
             .faults
@@ -2000,16 +2123,29 @@ impl Platform for FakePlatform {
         }
     }
     fn references(&mut self, deadline: Deadline) -> Enumeration<Vec<RefLine>> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("references");
+        }
         #[cfg(test)]
         if let Some(lines) = self.references_script.pop_front() {
             self.tokens = lines.into_iter().map(|line| (line.token, line)).collect();
         }
         match self.checked(Call::References, deadline) {
-            Ok(()) => Enumeration::Complete(self.tokens.values().cloned().collect()),
+            Ok(()) => {
+                let lines: Vec<_> = self.tokens.values().cloned().collect();
+                #[cfg(any(test, feature = "qualification"))]
+                if let Some(trace) = &mut self.qualification_trace {
+                    trace.push(crate::decode::qualification_trace::refs_result(&lines));
+                }
+                Enumeration::Complete(lines)
+            }
             Err(e) => Enumeration::Incomplete(e),
         }
     }
     fn pf_info(&mut self, deadline: Deadline) -> PfInfo {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("pf_info");
+        }
         #[cfg(test)]
         if let Some(info) = self.pf_info_script.pop_front() {
             self.calls.push(Call::PfInfo);
@@ -2022,6 +2158,9 @@ impl Platform for FakePlatform {
         }
     }
     fn processes(&mut self, deadline: Deadline) -> Enumeration<Vec<ProcInfo>, ProcessError> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("processes");
+        }
         let fault = self.begin(Call::Processes);
         if self.expired(deadline) {
             return Enumeration::Incomplete(SysError::TimedOut.into());
@@ -2075,6 +2214,9 @@ impl Platform for FakePlatform {
         )
     }
     fn image_uuid(&mut self, path: &Path, deadline: Deadline) -> Result<[u8; 16], SysError> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("image_uuid");
+        }
         self.checked(Call::ImageUuid, deadline)?;
         if self.executable_symlinks.contains(path) {
             return Err(SysError::Failed("symlink executable pin"));
@@ -2091,6 +2233,9 @@ impl Platform for FakePlatform {
             .ok_or(SysError::Failed("pin UUID unknown"))
     }
     fn executable_id(&mut self, path: &Path, deadline: Deadline) -> Result<ExeId, SysError> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("executable_id");
+        }
         self.checked(Call::ExecutableId, deadline)?;
         if self.executable_symlinks.contains(path) {
             return Err(SysError::Failed("symlink executable pin"));
@@ -2107,6 +2252,9 @@ impl Platform for FakePlatform {
         start: StartTime,
         deadline: Deadline,
     ) -> Result<KillOutcome, SysError> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("kill_group");
+        }
         if !super::group_kill_allowed(pgid, self.helper.pgid)
             || super::checked_os_pid(pgid).is_none()
             || !super::process_kill_allowed(expect_pid, self.helper.pid)
@@ -2121,6 +2269,9 @@ impl Platform for FakePlatform {
         start: StartTime,
         deadline: Deadline,
     ) -> Result<KillOutcome, SysError> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("kill_process");
+        }
         if !super::process_kill_allowed(pid, self.helper.pid)
             || super::checked_os_pid(pid).is_none()
         {
@@ -2129,6 +2280,9 @@ impl Platform for FakePlatform {
         self.signal(0, pid, start, deadline, false)
     }
     fn reap_children(&mut self, deadline: Deadline) -> Result<(), SysError> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("reap_children");
+        }
         self.checked(Call::ReapChildren, deadline)?;
         let own = self.helper.pid;
 
@@ -2143,6 +2297,9 @@ impl Platform for FakePlatform {
         Ok(())
     }
     fn fence(&mut self) -> Fence {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("fence");
+        }
         if self.begin(Call::Fence) == Some(Fault::Incomplete) {
             return Fence::Open(vec![
                 Unreaped {
@@ -2175,6 +2332,9 @@ impl Platform for FakePlatform {
         }
     }
     fn reap(&mut self, deadline: Deadline) -> Fence {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("reap");
+        }
         #[cfg(test)]
         self.capture_boundary(Call::Reap, true);
         self.calls.push(Call::Reap);
@@ -2228,6 +2388,9 @@ impl Platform for FakePlatform {
         }
     }
     fn pause(&mut self, duration: Duration, deadline: Deadline) {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("pause");
+        }
         self.calls.push(Call::Pause(duration));
         if !self.pause_advances_clock {
             return;
@@ -2242,6 +2405,9 @@ impl Platform for FakePlatform {
         self.advance(millis % 50);
     }
     fn load_anchor(&mut self, text: &AnchorText, deadline: Deadline) -> Result<(), SysError> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("load_anchor");
+        }
         #[cfg(test)]
         if let Some(between) = self.capture_race.take() {
             if between {
@@ -2258,6 +2424,9 @@ impl Platform for FakePlatform {
         )
     }
     fn read_anchor(&mut self, deadline: Deadline) -> Result<Option<String>, SysError> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("read_anchor");
+        }
         self.checked(Call::ReadAnchor, deadline)?;
         if let Some(text) = self.anchor_write_before_readback.take() {
             self.anchor = Some(text);
@@ -2283,6 +2452,9 @@ impl Platform for FakePlatform {
         Ok(observed)
     }
     fn flush_states(&mut self, deadline: Deadline) -> Result<(), SysError> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("flush_states");
+        }
         self.effect(Call::Flush, Tool::Pfctl, deadline, Effect::Flush)
     }
     fn remove_interface_states(
@@ -2290,6 +2462,19 @@ impl Platform for FakePlatform {
         interfaces: &BTreeSet<PhysicalInterface>,
         deadline: Deadline,
     ) -> Result<(), SysError> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("remove_interface_states");
+        }
+        if self.selective_unqualified && !interfaces.is_empty() {
+            self.checked(Call::InterfaceStates, deadline)?;
+            let result = Err(crate::decode::pfanchor::SELECTIVE_UNQUALIFIED);
+            self.selective_results.push(result.clone());
+            #[cfg(any(test, feature = "qualification"))]
+            if let Some(trace) = &mut self.qualification_trace {
+                trace.push(format!("selective_result:{result:?}"));
+            }
+            return result;
+        }
         self.effect(
             Call::InterfaceStates,
             Tool::Pfctl,
@@ -2298,6 +2483,9 @@ impl Platform for FakePlatform {
         )
     }
     fn check_tools(&mut self, deadline: Deadline) -> Result<(), SysError> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("check_tools");
+        }
         self.checked(Call::CheckTools, deadline)?;
         if !self.executable_symlinks.is_empty() {
             return Err(SysError::Failed("symlink executable pin"));
@@ -2305,6 +2493,9 @@ impl Platform for FakePlatform {
         Ok(())
     }
     fn check_pfctl(&mut self, deadline: Deadline) -> Result<(), SysError> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("check_pfctl");
+        }
         self.checked(Call::CheckPfctl, deadline)?;
         let path = Path::new("/sbin/pfctl");
         if self.executable_symlinks.contains(path) || !self.executables.contains_key(path) {
@@ -2313,6 +2504,9 @@ impl Platform for FakePlatform {
         Ok(())
     }
     fn spawned_children(&self) -> &[Child] {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("spawned_children");
+        }
         &self.spawned_records
     }
     fn spawn(
@@ -2321,6 +2515,9 @@ impl Platform for FakePlatform {
         attributes: SpawnAttributes,
         deadline: Deadline,
     ) -> Result<Child, SysError> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("spawn");
+        }
         let fault = match self.begin(Call::Spawn) {
             Some(Fault::SpawnPinChange { uuid, timeout }) => {
                 self.image_uuids.insert(CHILD_PATH.into(), uuid);
@@ -2400,6 +2597,9 @@ impl Platform for FakePlatform {
         value: &Setting,
         deadline: Deadline,
     ) -> Result<(), SysError> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("configure");
+        }
         let tool = match key {
             ConfigKey::Uapi => {
                 self.checked(Call::Configure(key), deadline)?;
@@ -2424,6 +2624,9 @@ impl Platform for FakePlatform {
         key: ConfigKey,
         deadline: Deadline,
     ) -> Result<Option<Setting>, SysError> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("read_config");
+        }
         let differs = self
             .faults
             .iter()
@@ -2436,6 +2639,9 @@ impl Platform for FakePlatform {
         Ok(self.settings.get(&key).cloned())
     }
     fn identity(&mut self, child: &Child, deadline: Deadline) -> Result<Tunnel, SysError> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("identity");
+        }
         self.checked(Call::Identity, deadline)?;
         if !self.child_alive(child) {
             return Err(SysError::Failed("stale child identity"));
@@ -2451,6 +2657,9 @@ impl Platform for FakePlatform {
         child: Option<&Child>,
         deadline: Deadline,
     ) -> Result<CheapObservation, SysError> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("cheap_check");
+        }
         self.checked(Call::Cheap, deadline)?;
         Ok(CheapObservation {
             pf_enabled: self.enabled,
@@ -2465,6 +2674,9 @@ impl Platform for FakePlatform {
         collection: &Collection,
         deadline: Deadline,
     ) -> Result<Observations, SysError> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("collect");
+        }
         self.checked(Call::Collect, deadline)?;
         #[cfg(test)]
         if let Some(observation) = &self.observation_override {
@@ -2484,13 +2696,14 @@ impl Platform for FakePlatform {
                 },
             )]),
         };
-        let interfaces =
+        let mut interfaces =
             parse::ifconfig_list(if self.children.values().any(|c| self.child_alive(c)) {
                 "lo0 en0 utun6\n"
             } else {
                 "lo0 en0\n"
             })
             .map_err(|_| SysError::Failed("interfaces fixture"))?;
+        interfaces.extend(self.additional_interfaces.iter().cloned());
         Ok(Observations {
             started_at: verify::required_reads(&tree)
                 .into_iter()
@@ -2560,6 +2773,9 @@ impl Platform for FakePlatform {
         })
     }
     fn firewall_qualification(&self) -> Option<verify::Qualification> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("firewall_qualification");
+        }
         self.firewall_qualification.clone()
     }
     fn collect_lockdown(
@@ -2568,6 +2784,9 @@ impl Platform for FakePlatform {
         states: verify::StateEvidence,
         deadline: Deadline,
     ) -> Result<Observations, SysError> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("collect_lockdown");
+        }
         let collection = Collection {
             context,
             states,
@@ -2595,6 +2814,9 @@ impl Platform for FakePlatform {
         endpoint: Option<SocketAddrV4>,
         deadline: Deadline,
     ) -> Result<super::LeaveRoutes, SysError> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("leave_routes");
+        }
         self.checked(Call::LeaveRoutes, deadline)?;
         Ok(super::LeaveRoutes {
             split_owned: self.settings.contains_key(&ConfigKey::SplitRoutes),
@@ -2607,6 +2829,9 @@ impl Platform for FakePlatform {
         endpoint: Option<SocketAddrV4>,
         deadline: Deadline,
     ) -> Result<(), SysError> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("cleanup_owned_routes");
+        }
         if let Some(endpoint) = endpoint {
             return self.cleanup_routes(endpoint, deadline);
         }
@@ -2619,6 +2844,9 @@ impl Platform for FakePlatform {
         endpoint: SocketAddrV4,
         deadline: Deadline,
     ) -> Result<(), SysError> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("cleanup_routes");
+        }
         self.effect(
             Call::CleanupRoutes(endpoint),
             Tool::Route,
@@ -2627,15 +2855,24 @@ impl Platform for FakePlatform {
         )
     }
     fn cleanup_dns(&mut self, deadline: Deadline) -> Result<(), SysError> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("cleanup_dns");
+        }
         self.effect(Call::CleanupDns, Tool::Scutil, deadline, Effect::CleanupDns)
     }
     fn managed_artifacts(&mut self, deadline: Deadline) -> Enumeration<Vec<String>> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("managed_artifacts");
+        }
         match self.checked(Call::Artifacts, deadline) {
             Ok(()) => Enumeration::Complete(self.artifacts.iter().cloned().collect()),
             Err(error) => Enumeration::Incomplete(error),
         }
     }
     fn cleanup_artifacts(&mut self, deadline: Deadline) -> Result<(), SysError> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("cleanup_artifacts");
+        }
         self.checked(Call::CleanupArtifacts, deadline)?;
         self.artifacts.clear();
         #[cfg(test)]
@@ -2643,6 +2880,9 @@ impl Platform for FakePlatform {
         Ok(())
     }
     fn remove_anchor(&mut self, deadline: Deadline) -> Result<(), SysError> {
+        if let Some(trace) = &self.method_trace {
+            trace.borrow_mut().push("remove_anchor");
+        }
         self.effect(
             Call::RemoveAnchor,
             Tool::Pfctl,

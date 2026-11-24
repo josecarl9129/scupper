@@ -385,6 +385,12 @@ pub enum SafetyEvent {
 /// A `proc_pidpath` failure alone proves no exit.
 #[allow(clippy::missing_errors_doc)] // Each method states its uncertainty contract.
 pub trait Platform {
+    /// Qualification/test trace of full verification results offered for publication.
+    #[cfg(any(test, feature = "qualification"))]
+    fn trace_verification(&mut self, verdict: &scupper_core::mac::verify::Verdict) {
+        let _ = verdict;
+    }
+
     /// Log a secret-free safety diagnostic; grants no enforcement/publication claim.
     fn report_safety(&mut self, event: SafetyEvent) {
         eprintln!("scupper safety: {event:?}");
@@ -588,6 +594,9 @@ pub trait Platform {
     fn read_anchor(&mut self, deadline: Deadline) -> Result<Option<String>, SysError>;
     /// **Mutating tool**: flush all states, success complete/reaped. Error/timeout
     /// may have flushed some/all states; Unknown may leave the fence open.
+    /// This global flush is an ownership exception: it destroys foreign states;
+    /// no restore can return them. The truncated numeric count is not asserted.
+    /// No read-back is required because live traffic immediately recreates states.
     fn flush_states(&mut self, deadline: Deadline) -> Result<(), SysError>;
     /// **Mutating tool**: remove states on these vanished interfaces and confirm
     /// absence. Success complete/reaped; error/timeout may partially remove states,
