@@ -121,15 +121,15 @@ pub(super) fn preflight_conditions(
     }) {
         inconclusive.push("foreign pf references present or reference text not recognized".into());
     }
-    if observations
-        .get("pf-anchors")
-        .is_some_and(|e| e.stdout.contains("com.apple/scupper"))
-        || observations.get("pf-apple-anchors").is_some_and(|e| {
-            e.stdout
-                .lines()
-                .any(|line| line.trim().trim_matches('"') == "scupper")
-        })
-    {
+    if observations.get("pf-anchors").is_some_and(|e| {
+        e.stdout
+            .lines()
+            .any(|line| line.trim() == "com.apple/scupper")
+    }) || observations.get("pf-apple-anchors").is_some_and(|e| {
+        e.stdout
+            .lines()
+            .any(|line| line.trim().trim_matches('"') == "scupper")
+    }) {
         inconclusive.push("existing com.apple/scupper anchor".into());
     }
     match observations.get("translated") {
@@ -394,5 +394,36 @@ mod tests {
             "",
             "permission denied"
         ));
+    }
+}
+
+/// Only complete launchd evidence of at least one run establishes early exit.
+pub(super) fn job_exited(status: &super::Evidence) -> bool {
+    status.complete()
+        && status
+            .stdout
+            .lines()
+            .any(|line| line.trim() == "state = not running")
+        && status.stdout.lines().any(|line| {
+            line.trim()
+                .strip_prefix("runs = ")
+                .and_then(|n| n.parse::<u64>().ok())
+                .is_some_and(|runs| runs >= 1)
+        })
+}
+#[cfg(test)]
+mod early_exit_tests {
+    #[test]
+    fn early_exit_requires_a_completed_run_and_complete_status() {
+        let mut status: super::super::Evidence = serde_json::from_value(serde_json::json!({
+            "command":[],"stdin":null,"pid":null,"exit_code":0,"started_unix_ms":0,"elapsed_ms":0,
+            "timed_out":false,"truncated":false,"stdout":"state = not running\nruns = 1\n","stderr":""
+        })).unwrap();
+        assert!(super::job_exited(&status));
+        status.stdout = "state = not running\nruns = 0\n".into();
+        assert!(!super::job_exited(&status));
+        status.stdout = "state = not running\nruns = 1\n".into();
+        status.truncated = true;
+        assert!(!super::job_exited(&status));
     }
 }

@@ -129,7 +129,17 @@ fn child_pin() -> Result<PathBuf> {
     Ok(std::env::current_exe()?.with_file_name("wireguard-go"))
 }
 fn raw(out: &Path, p: &mut NativePlatform, args: &[&str], input: &[u8]) -> Result<Evidence> {
-    within_budget(|| super::pf::raw_input(out, p, args, input, end()))
+    let result = within_budget(|| super::pf::raw_input(out, p, args, input, end()))?;
+    if args == ["-s", "states", "-v"] {
+        let vv =
+            within_budget(|| super::pf::raw_input(out, p, &["-s", "states", "-vv"], &[], end()))?;
+        write_json(
+            out,
+            &format!("{}.json", super::unique("state-formats")),
+            &json!({"build":pftext::Build::system()?.as_str(),"v":result,"vv":vv,"vv_capture_only":true}),
+        )?;
+    }
+    Ok(result)
 }
 fn reviewed_row(e: &Evidence, op: pfanchor::Operation) -> Result<pfanchor::Text> {
     env(
@@ -263,12 +273,7 @@ pub(super) fn worker(out: &Path) -> Result<()> {
         ("Q-FLUSH", flush),
         ("Q-DESCENDANTS", descendants),
     ] {
-        results.push(case(out, id, |r| {
-            if matches!(id, "Q-CONTRACTS" | "Q-E2E") {
-                shared_anchor_clean(out)?;
-            }
-            operation(out, r)
-        })?);
+        results.push(case(out, id, |r| operation(out, r))?);
         let mut p = platform(out, &out.join("r4-fixtures"), &child_pin()?)?;
         let entries = super::resources::entries(out)?;
         for path in [ANCHOR, HOOKED, SENTINEL] {
@@ -385,6 +390,7 @@ fn contracts(out: &Path, r: &mut CaseResult) -> Result<()> {
         Ok(())
     })?;
     let anchors = case(out, "Q-CONTRACTS-anchor", |r| {
+        shared_anchor_clean(out)?;
         super::resources::journal_anchor(out, ANCHOR, end())
             .map_err(|e| environment_issue(e.to_string()))?;
         if let Err(error) = run_anchor_contracts(&mut h) {
@@ -444,7 +450,35 @@ fn seed(p: &mut NativePlatform, join: bool) -> Result<()> {
 fn engine(out: &Path, name: &str, join: bool) -> Result<Engine<NativePlatform>> {
     let root = out.join("r4-fixtures").join(name);
     fs::DirBuilder::new().mode(0o700).create(&root)?;
-    let mut p = platform(out, &root, &child_pin()?)?;
+    let child = Path::new(super::super::child_stage::CHILD);
+    match fs::symlink_metadata(child) {
+        Ok(_) => (),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(environment_issue(format!(
+                "pinned child path absent: {}",
+                child.display()
+            )));
+        }
+        Err(e) => {
+            return Err(environment_issue(format!(
+                "pinned child path inspection failed: {}: {e}",
+                child.display()
+            )));
+        }
+    }
+    let mut p = platform(out, &root, child)?;
+    // Exercise the exact engine child-pin path through both identity methods.
+    let executable = p.executable_id(Path::new(crate::engine::CHILD_PATH), deadline());
+    let image = p.image_uuid(Path::new(crate::engine::CHILD_PATH), deadline());
+    write_json(
+        out,
+        &format!("{name}-child-pin.json"),
+        &json!({"path":child,"executable_id":format!("{executable:?}"),"image_uuid":format!("{image:?}")}),
+    )?;
+    env(
+        executable.is_ok() && image.is_ok(),
+        "Q-E2E engine child pin unavailable: executable_id/image_uuid",
+    )?;
     env(
         p.boot_id().is_some(),
         "Q-E2E stopped at boot identity before acquisition",
@@ -478,8 +512,46 @@ fn snapshot_pair(p: &mut NativePlatform) -> Result<[Snapshot; 2]> {
         .try_into()
         .map_err(|_| "snapshot pair length".into())
 }
-#[allow(clippy::too_many_lines)] // Preserve the two engine scenarios and their positive/negative evidence in order.
 fn e2e(out: &Path, r: &mut CaseResult) -> Result<()> {
+    let path = Path::new(super::super::child_stage::CHILD);
+    let absent = super::super::child_stage::absent(path).map_err(environment_issue)?;
+    write_json(
+        out,
+        "e2e-pinned-child-precheck.json",
+        &json!({"name":format!("pinned child path absent: {}", path.display()),"passed":absent}),
+    )?;
+    env(
+        absent,
+        &format!("pinned child path already exists: {}", path.display()),
+    )?;
+    let source = child_pin()?;
+    protected_path(&source, false)?;
+    let bytes = fs::read(source)?;
+    let (observation, cleanup) = super::super::contract_check::with_cleanup(
+        &mut (),
+        |()| -> Result<()> {
+            super::super::child_stage::stage(&bytes, |row| {
+                append(
+                    out,
+                    &serde_json::to_value(row).map_err(std::io::Error::other)?,
+                )
+                .map_err(|e| std::io::Error::other(e.to_string()))
+            })
+            .map_err(environment_issue)?;
+            e2e_scenarios(out, r)
+        },
+        |()| super::resources::restore_child(out),
+    );
+    write_json(
+        out,
+        "e2e-child-cleanup.json",
+        &json!({"observation_error":observation.as_ref().err().map(ToString::to_string),"cleanup":format!("{cleanup:?}")}),
+    )?;
+    cleanup.map_err(environment_issue)?;
+    observation
+}
+#[allow(clippy::too_many_lines)] // Preserve the two engine scenarios and their positive/negative evidence in order.
+fn e2e_scenarios(out: &Path, r: &mut CaseResult) -> Result<()> {
     let mut left = engine(out, "engine-left", false)?;
     let start = Instant::now();
     while Instant::now() < start + Duration::from_secs(10) {
@@ -528,6 +600,7 @@ fn e2e(out: &Path, r: &mut CaseResult) -> Result<()> {
         .or_else(|| needs.map(|m| format!("needs {m} (R8–R11)")))
         .or_else(|| (!committed || !complete).then(|| "Left startup/census incomplete".into()));
     drop(left);
+    shared_anchor_clean(out)?;
     super::resources::journal_anchor(out, ANCHOR, end())
         .map_err(|e| environment_issue(e.to_string()))?;
     let mut join = engine(out, "engine-join", true)?;
@@ -807,19 +880,27 @@ fn descendants(out: &Path, r: &mut CaseResult) -> Result<()> {
     // Original journal authority is reused only after the between-case absence check.
     optimizer_controls(out, &mut p, &mut findings)?;
     foreign_fixtures(out, &mut p, &mut findings)?;
-    descendant_measurements(out, &mut p, &mut findings)?;
+    let from_sdk_header = descendant_measurements(out, &mut p, &mut findings)?;
     write_json(out, "descendant-outcomes.json", &findings)?;
+    let verdict = super::super::desc_inventory::verdict(&findings);
     ensure(
-        !findings.iter().any(|(v, _)| *v),
+        verdict != Verdict::ContractViolation,
         &format!("Q-DESCENDANTS violations: {findings:?}"),
     )?;
     env(
-        findings.is_empty(),
+        verdict != Verdict::Inconclusive,
         &format!("Q-DESCENDANTS measurements/environment: {findings:?}"),
     )?;
-    r.verdict = Verdict::Measurement;
-    r.detail = "descendant coverage, optimizer controls and foreign fixtures measured; no native coverage granted".into();
-    r.iterations = 5;
+    r.verdict = verdict;
+    let provenance = if from_sdk_header {
+        "SDK header checked against XNU-published layout pins"
+    } else {
+        "XNU-published layout pin, not SDK-verified"
+    };
+    r.detail = format!(
+        "all descendant, optimizer and foreign-fixture measurements completed without inventory findings; ruleset ABI from_sdk_header={from_sdk_header}: {provenance}; no descendant coverage flag promoted"
+    );
+    r.iterations = 9;
     Ok(())
 }
 #[allow(clippy::too_many_lines)] // Keep both lifecycle conditions and measurements together.
@@ -850,6 +931,7 @@ fn anchor_lifecycle(out: &Path, r: &mut CaseResult) -> Result<()> {
     let mut gone_every_time = true;
     let mut adapter_every_time = true;
     let mut states_every_time = true;
+    let mut state_issues = Vec::new();
     let reviewed = pfanchor::reviewed(&pftext::Build::system()?);
     for iteration in 0..20 {
         env(Instant::now() < end(), "Q-ANCHOR case budget exhausted")?;
@@ -908,32 +990,38 @@ fn anchor_lifecycle(out: &Path, r: &mut CaseResult) -> Result<()> {
             traffic.send_ten()?;
         }
         let before = inventory(out, &mut p, HOOKED)?;
-        let states = raw(out, &mut p, &["-s", "states", "-v"], &[])?;
-        let known = known_id(
-            &states,
-            traffic.source,
-            traffic.receiver.local_addr()?,
-            None,
-        );
-        let with_states = measure_remove(out, &mut p, HOOKED)?;
-        let rule = hook_rule(traffic.port);
-        raw(out, &mut p, &["-a", HOOKED, "-f", "-"], rule.as_bytes())?;
-        traffic.send_ten()?;
-        let counters = raw(out, &mut p, &["-a", HOOKED, "-vsr"], &[])?;
-        budget()?;
-        let state_flush = p.flush_states(deadline());
-        budget()?;
-        let after_flush = measure_remove(out, &mut p, HOOKED)?;
-        states_every_time &= known.is_some();
-        gone_every_time &= with_states["gone"] == true && after_flush["gone"] == true;
-        states_every_time &= state_flush.is_ok();
-        write_json(
-            out,
-            &format!("anchor-hooked-{iteration:02}.json"),
-            &json!({"exact_rule":rule,"datagrams_per_load":10,"before":before,"known_state_id":known,"with_states":with_states,"counters_after_second_load":counters,"state_flush":format!("{state_flush:?}"),"after_state_flush":after_flush,"claim":"counter/state measurement only; no ordering or blocking qualification"}),
-        )?;
+        let states = raw(out, &mut p, &["-s", "states", "-v"], &[]).map_err(|e| e.to_string());
+        let destination = traffic.receiver.local_addr()?;
+        let state_read = states
+            .as_ref()
+            .map_err(environment_issue)
+            .and_then(|states| known_id(states, traffic.source, destination, None));
+        super::super::state_measure::continue_after_read(state_read, |known| {
+            if let Err(error) = &known {
+                state_issues.push(format!("hooked iteration {iteration}: {error}"));
+            }
+            let with_states = measure_remove(out, &mut p, HOOKED)?;
+            let rule = hook_rule(traffic.port);
+            raw(out, &mut p, &["-a", HOOKED, "-f", "-"], rule.as_bytes())?;
+            traffic.send_ten()?;
+            let counters = raw(out, &mut p, &["-a", HOOKED, "-vsr"], &[])?;
+            budget()?;
+            let state_flush = p.flush_states(deadline());
+            budget()?;
+            let after_flush = measure_remove(out, &mut p, HOOKED)?;
+            states_every_time &= known.as_ref().is_ok_and(Option::is_some);
+            gone_every_time &= with_states["gone"] == true && after_flush["gone"] == true;
+            states_every_time &= state_flush.is_ok();
+            write_json(
+                out,
+                &format!("anchor-hooked-{iteration:02}.json"),
+                &json!({"exact_rule":rule,"datagrams_per_load":10,"before":before,"states":states,"known_state_tuple":known,"with_states":with_states,"counters_after_second_load":counters,"state_flush":format!("{state_flush:?}"),"after_state_flush":after_flush,"tuple_reused_across_iterations":true,"claim":"counter/state tuple presence measurement only; tuples are not identities; no ordering or blocking qualification"}),
+            )?;
+            Ok(())
+        })?;
     }
-    fall_scope(out, &mut p, &traffic)?;
+    state_issues.extend(fall_scope(out, &mut p, &traffic)?);
+    states_every_time &= state_issues.is_empty();
     env(
         !p.call_trace()
             .iter()
@@ -955,9 +1043,9 @@ fn anchor_lifecycle(out: &Path, r: &mut CaseResult) -> Result<()> {
     write_json(
         out,
         "anchor-removal-all-conditions.json",
-        &json!({"reviewed":reviewed,"gone_every_time":gone_every_time,"adapter_every_time":adapter_every_time,"states_every_time":states_every_time}),
+        &json!({"reviewed":reviewed,"gone_every_time":gone_every_time,"adapter_every_time":adapter_every_time,"states_every_time":states_every_time,"state_measurement_issues":state_issues}),
     )?;
-    Ok(())
+    super::super::state_measure::finish_anchor(r, &state_issues, env)
 }
 fn adapter_measurement_complete(p: &NativePlatform, start: usize) -> Result<()> {
     env(
@@ -995,12 +1083,12 @@ fn fixture<T>(
         });
     let record = json!({"fixture":name,"remove":format!("{removed:?}"),"after":format!("{after:?}"),"observation_error":observation.as_ref().err().map(ToString::to_string)});
     // Record contamination before any fallible final evidence write can return.
-    if removed.is_err() || after != Ok(None) {
+    if after != Ok(None) {
         write_json(out, "shared-anchor-cleanup-failure.json", &record)?;
     }
     write_json(out, &format!("anchor-fixture-{name}-cleanup.json"), &record)?;
     ensure(
-        removed.is_err() || after == Ok(None),
+        removed.is_err() || after.is_err() || after == Ok(None),
         "remove_anchor returned Ok without configuration absence",
     )?;
     // A failed observation must not hide a complete contract violation.
@@ -1186,85 +1274,148 @@ fn measurement_attempt(
     })
 }
 // Disposable, unhooked subtree. Every result here is coverage measurement only.
+#[allow(clippy::too_many_lines)] // Keep per-spelling setup, evidence and unconditional cleanup together.
 fn descendant_measurements(
     out: &Path,
     p: &mut NativePlatform,
     findings: &mut Findings,
-) -> Result<()> {
+) -> Result<bool> {
     const ROOT: &str = "scupper-qual/children";
-    attempt(out, "children-journal", findings, || {
-        super::resources::journal_anchor(out, ROOT, end())
-            .map_err(|e| environment_issue(e.to_string()))
-    })?;
-    // A failed journal check never authorizes a load, but later cases were already measured.
-    if !super::resources::entries(out)?
-        .iter()
-        .any(|e| e.kind == "anchor" && e.path == ROOT)
-    {
-        return Ok(());
-    }
+    let abi = invoke_before(
+        super::probe_path()?.to_str().ok_or("probe path")?,
+        &[],
+        end(),
+    );
+    write_json(out, "descendant-abi-command.json", &abi)?;
+    env(abi.complete(), "descendant ioctl ABI probe incomplete")?;
+    let layout: Value = serde_json::from_str(&abi.stdout)?;
+    write_json(out, "descendant-abi.json", &layout)?;
+    let from_sdk_header = layout["pfioc_ruleset"]["from_sdk_header"]
+        .as_bool()
+        .ok_or_else(|| environment_issue("descendant ABI provenance flag missing"))?;
+    env(
+        layout["pfioc_ruleset"]["size"].as_u64() == Some(scupper_darwin::PF_RULESET_SIZE as u64)
+            && ["nr", "path", "name"]
+                .iter()
+                .zip(scupper_darwin::PF_RULESET_FIELDS)
+                .all(|(field, offset)| {
+                    layout["pfioc_ruleset"]["fields"][field].as_u64() == Some(offset as u64)
+                })
+            && layout["DIOCGETRULESETS"].as_u64()
+                == Some(u64::from(scupper_darwin::DIOCGETRULESETS))
+            && layout["DIOCGETRULESET"].as_u64() == Some(u64::from(scupper_darwin::DIOCGETRULESET)),
+        "descendant XNU layout pin mismatch",
+    )?;
+    super::resources::journal_anchor(out, ROOT, end())
+        .map_err(|e| environment_issue(e.to_string()))?;
     let mut cleanup_failure = None::<String>;
-    for (name, source) in [
-        ("named", "anchor \"qchild\"\n"),
-        ("underscore", "anchor \"_qchild\"\n"),
-        ("inline", "anchor { pass quick on lo0 all no state }\n"),
-        ("wildcard", "anchor \"x/*\"\n"),
-        ("grandchild", "anchor \"empty\"\n"),
+    for (name, source, suffix) in [
+        ("named", "anchor \"qchild\"\n", ""),
+        ("underscore", "anchor \"_qchild\"\n", ""),
+        ("inline", "anchor { pass quick on lo0 all no state }\n", ""),
+        (
+            "inline-multiline",
+            "anchor {\n pass quick on lo0 all no state\n}\n",
+            "",
+        ),
+        (
+            "named-inline",
+            "anchor \"qi\" {\n pass quick on lo0 all no state\n}\n",
+            "",
+        ),
+        ("wildcard", "anchor \"x/*\"\n", ""),
+        ("grandchild", "anchor \"empty\"\n", ""),
+        (
+            "direct-underscore",
+            "pass quick on lo0 all no state\n",
+            "/_x",
+        ),
+        (
+            "direct-grandchild-underscore",
+            "pass quick on lo0 all no state\n",
+            "/qchild/_x",
+        ),
     ] {
+        let parent_name = super::unique(name);
+        let parent = format!("{ROOT}/{parent_name}");
+        let mut inventory_findings = Vec::new();
         measurement_attempt(out, &format!("children-{name}"), findings, || {
             env(
                 cleanup_failure.is_none(),
                 &format!("descendant fixture withheld after cleanup failure: {cleanup_failure:?}"),
             )?;
+            let namespace = scupper_darwin::qual_pf_rulesets(ROOT);
+            write_json(
+                out,
+                &format!("anchor-children-{name}-parent.json"),
+                &json!({"parent":parent,"kernel_before":format!("{namespace:?}")}),
+            )?;
+            let namespace = namespace.map_err(environment_issue)?;
+            env(
+                namespace
+                    .as_ref()
+                    .is_none_or(|names| !names.contains(&parent_name)),
+                "fresh descendant parent already exists",
+            )?;
+            super::resources::journal_measurement_target(out, &parent)
+                .map_err(|e| environment_issue(e.to_string()))?;
+            let target = format!("{parent}{suffix}");
+            if target != parent {
+                super::resources::journal_measurement_target(out, &target)
+                    .map_err(|e| environment_issue(e.to_string()))?;
+            }
             let (observation, cleanup) = super::super::contract_check::with_cleanup(
                 p,
                 |p| -> Result<()> {
+                    if name == "grandchild" {
+                        for path in [
+                            format!("{parent}/empty"),
+                            format!("{parent}/empty/grandchild"),
+                        ] {
+                            super::resources::journal_measurement_target(out, &path)
+                                .map_err(|e| environment_issue(e.to_string()))?;
+                        }
+                    }
                     let load = raw(
                         out,
                         p,
-                        &["-o", "none", "-a", ROOT, "-f", "-"],
+                        &["-o", "none", "-a", &target, "-f", "-"],
                         source.as_bytes(),
                     )?;
+                    let mut explicit = vec![target.clone()];
                     let grandchild_load = if name == "grandchild" {
+                        let child_path = format!("{parent}/empty");
+                        let grandchild_path = format!("{child_path}/grandchild");
+                        explicit.push(grandchild_path.clone());
                         let child = raw(
                             out,
                             p,
-                            &["-o", "none", "-a", "scupper-qual/children/empty", "-f", "-"],
+                            &["-o", "none", "-a", &child_path, "-f", "-"],
                             b"anchor \"grandchild\"\n",
                         )?;
                         let grandchild = raw(
                             out,
                             p,
-                            &[
-                                "-o",
-                                "none",
-                                "-a",
-                                "scupper-qual/children/empty/grandchild",
-                                "-f",
-                                "-",
-                            ],
+                            &["-o", "none", "-a", &grandchild_path, "-f", "-"],
                             b"pass quick on lo0 all no state\n",
                         )?;
-                        // Remove the parent's call, leaving an empty listed child over the nonempty grandchild.
-                        let empty = raw(
-                            out,
-                            p,
-                            &["-a", "scupper-qual/children/empty", "-F", "rules"],
-                            &[],
-                        )?;
+                        let empty = raw(out, p, &["-a", &child_path, "-F", "rules"], &[])?;
                         Some(
                             json!({"child_load":child,"grandchild_load":grandchild,"empty_child":empty}),
                         )
                     } else {
                         None
                     };
-                    let before = measure_children(out, p, ROOT)?;
-                    let paths = before
-                        .iter()
-                        .filter_map(|v| v["path"].as_str())
-                        .collect::<Vec<_>>();
+                    // Explicit target reads cover creation hidden from both enumerators.
+                    let before = measure_children(out, p, &parent, &explicit)?;
+                    inventory_findings
+                        .extend(super::super::desc_inventory::findings(&json!(before)));
                     let mut flushes = vec![];
-                    for path in paths.iter().rev() {
+                    for row in before.iter().rev() {
+                        let path = row["path"].as_str().ok_or("measurement path")?;
+                        if !path.starts_with(&parent) {
+                            continue;
+                        }
                         within_budget(|| super::resources::recheck_foreign_tokens(out, end()))?;
                         for class in ["rules", "nat", "Tables", "dummynet"] {
                             let flush = raw(out, p, &["-a", path, "-F", class], &[])?;
@@ -1274,22 +1425,32 @@ fn descendant_measurements(
                             );
                         }
                     }
-                    let after = measure_children(out, p, ROOT)?;
-                    let measurement = json!({"source":source,"load":load,"grandchild_setup":grandchild_load,
-                "before":before,"scoped_flushes":flushes,"after":after,"measurement_only":true,"rejected":!load.complete()});
+                    let after = measure_children(out, p, &parent, &explicit)?;
+                    inventory_findings
+                        .extend(super::super::desc_inventory::findings(&json!(after)));
+                    let rejected = super::super::contract_check::descendant_rejection(
+                        pftext::Build::system()?.as_str(),
+                        name,
+                        &load,
+                    );
+                    let measurement = json!({"parent":parent,"target":target,"source":source,"load":load,"grandchild_setup":grandchild_load,
+                    "before":before,"scoped_flushes":flushes,"after":after,"measurement_only":true,"rejected_by_pfctl":rejected});
                     write_json(out, &format!("anchor-children-{name}.json"), &measurement)?;
+                    let mut checked = measurement;
+                    if rejected {
+                        checked
+                            .as_object_mut()
+                            .ok_or("measurement object")?
+                            .remove("load");
+                    }
                     env(
-                        super::super::contract_check::measurement_complete(&measurement),
+                        super::super::contract_check::measurement_complete(&checked),
                         &format!(
-                            "descendant {name} rejected spelling/incomplete class or flush measurement"
+                            "descendant {name} incomplete load, class, kernel enumeration or flush measurement"
                         ),
-                    )?;
-                    env(
-                        load.complete(),
-                        &format!("descendant {name} spelling rejected/incomplete"),
                     )
                 },
-                |_| super::resources::cleanup_measurement(out, ROOT),
+                |_| super::resources::cleanup_measurement(out, &parent),
             );
             if let Err(error) = &cleanup {
                 cleanup_failure = Some(error.to_string());
@@ -1297,41 +1458,92 @@ fn descendant_measurements(
             write_json(
                 out,
                 &format!("anchor-children-{name}-cleanup.json"),
-                &json!({"observation_error":observation.as_ref().err().map(ToString::to_string),
-                "cleanup":format!("{cleanup:?}")}),
+                &json!({"observation_error":observation.as_ref().err().map(ToString::to_string),"cleanup":format!("{cleanup:?}")}),
             )?;
-            observation?;
-            cleanup.map_err(|e| environment_issue(format!("children-{name} cleanup failure: {e}")))
+            cleanup
+                .map_err(|e| environment_issue(format!("children-{name} cleanup failure: {e}")))?;
+            observation
         })?;
+        findings.extend(
+            inventory_findings
+                .into_iter()
+                .map(|finding| (true, finding)),
+        );
     }
-    Ok(())
+    Ok(from_sdk_header)
 }
-fn measure_children(out: &Path, p: &mut NativePlatform, root: &str) -> Result<Vec<Value>> {
-    let mut pending = vec![(root.to_owned(), 0)];
+
+fn kernel_comparison(
+    path: &str,
+    listing: &Evidence,
+    before: std::result::Result<Option<Vec<String>>, String>,
+) -> Value {
+    let text = super::super::desc_inventory::text_names(path, listing);
+    let after = scupper_darwin::qual_pf_rulesets(path).map_err(|error| error.to_string());
+    super::super::desc_inventory::compare(path, text, before, after)
+}
+
+fn measure_children(
+    out: &Path,
+    p: &mut NativePlatform,
+    root: &str,
+    explicit: &[String],
+) -> Result<Vec<Value>> {
+    let mut pending = std::collections::BTreeMap::from([(root.to_owned(), 0)]);
+    // Include every ancestor and a direct target even when enumeration omits it.
+    for target in explicit {
+        let mut path = target.as_str();
+        while path.starts_with(root) {
+            let depth = path[root.len()..].bytes().filter(|b| *b == b'/').count();
+            pending.insert(path.to_owned(), depth);
+            let Some((parent, _)) = path.rsplit_once('/') else {
+                break;
+            };
+            path = parent;
+        }
+    }
     let mut reads = vec![];
-    let mut count = 1;
-    while let Some((path, depth)) = pending.pop() {
+    let mut visited = BTreeSet::new();
+    for ancestor in ["", "scupper-qual", "scupper-qual/children"] {
+        let kernel_before = scupper_darwin::qual_pf_rulesets(ancestor).map_err(|e| e.to_string());
+        let listing = if ancestor.is_empty() {
+            raw(out, p, &["-sA"], &[])?
+        } else {
+            raw(out, p, &["-a", ancestor, "-sA"], &[])?
+        };
+        let comparison = kernel_comparison(ancestor, &listing, kernel_before);
+        reads.push(json!({"path":ancestor,"inventory":listing,"kernel":comparison}));
+    }
+    while let Some((path, depth)) = pending.pop_first() {
+        if !visited.insert(path.clone()) {
+            continue;
+        }
+        env(
+            depth <= 8 && visited.len() <= 64,
+            "descendant measurement bound exceeded",
+        )?;
+        let kernel_before = scupper_darwin::qual_pf_rulesets(&path).map_err(|e| e.to_string());
         let classes = path_classes(out, p, &path)?;
-        // Persist exact streams before interpreting an unreviewed inventory.
+        let listing: Evidence = serde_json::from_value(classes[3].clone())?;
+        let comparison = kernel_comparison(&path, &listing, kernel_before);
+        let row = json!({"path":path,"classes":classes,"kernel":comparison});
         write_json(
             out,
             &format!("{}.json", super::unique("children-classes")),
-            &json!({"path":path,"classes":classes}),
+            &row,
         )?;
-        let child_list = classes[3].clone();
-        let e: Evidence = serde_json::from_value(child_list)?;
-        env(e.complete(), "descendant inventory incomplete")?;
-        let children = pfanchor::inventory_at(&e.stdout, &path)
-            .map_err(|e| environment_issue(format!("unreviewed descendant inventory: {e}")))?;
-        for child in children {
-            count += 1;
-            env(
-                depth < 8 && count <= 64,
-                "descendant measurement bound exceeded",
-            )?;
-            pending.push((format!("{path}/{child}"), depth + 1));
+        // Visit the union, retaining the exact difference in the row above.
+        for key in ["text_names", "kernel_names"] {
+            if let Some(names) = comparison[key].as_array() {
+                for name in names.iter().filter_map(Value::as_str) {
+                    let child = format!("{path}/{name}");
+                    if !visited.contains(&child) {
+                        pending.insert(child, depth + 1);
+                    }
+                }
+            }
         }
-        reads.push(json!({"path":path,"classes":classes}));
+        reads.push(row);
     }
     Ok(reads)
 }
@@ -1391,7 +1603,7 @@ fn hooked(out: &Path, p: &mut NativePlatform) -> Result<UdpTraffic> {
     )?;
     Ok(traffic)
 }
-fn fall_scope(out: &Path, p: &mut NativePlatform, traffic: &UdpTraffic) -> Result<()> {
+fn fall_scope(out: &Path, p: &mut NativePlatform, traffic: &UdpTraffic) -> Result<Vec<String>> {
     super::resources::journal_anchor(out, SENTINEL, end())
         .map_err(|e| environment_issue(e.to_string()))?;
     let sentinel=b"table <scupper_qual_sentinel> persist { 192.0.2.123 }\nblock drop quick from <scupper_qual_sentinel> to any\n";
@@ -1416,38 +1628,62 @@ fn fall_scope(out: &Path, p: &mut NativePlatform, traffic: &UdpTraffic) -> Resul
     let table_args = ["-a", SENTINEL, "-t", "scupper_qual_sentinel", "-T", "show"];
     let sentinel_rule_before = raw(out, p, &rule_args, &[])?;
     let sentinel_table_before = raw(out, p, &table_args, &[])?;
-    let states_before = raw(out, p, &["-s", "states", "-v"], &[])?;
-    let known_before = known_id(
-        &states_before,
-        traffic.source,
-        traffic.receiver.local_addr()?,
-        None,
-    );
-    let before = json!({"target":inventory(out,p,ANCHOR)?,"sentinel":inventory(out,p,SENTINEL)?,"sentinel_rule":sentinel_rule_before,"sentinel_table_entries":sentinel_table_before,"states":states_before,"known_state_id":known_before,"info":raw(out,p,&["-s","info"],&[])?,"counters":raw(out,p,&["-a",HOOKED,"-vsr"],&[])?});
-    within_budget(|| super::resources::recheck_foreign_tokens(out, end()))?;
-    let all = raw(out, p, &["-a", ANCHOR, "-F", "all"], &[])?;
-    let sentinel_rule_after = raw(out, p, &rule_args, &[])?;
-    let sentinel_table_after = raw(out, p, &table_args, &[])?;
-    let states_after = raw(out, p, &["-s", "states", "-v"], &[])?;
-    let known_survived = known_before
+    let states_before = raw(out, p, &["-s", "states", "-v"], &[]).map_err(|e| e.to_string());
+    let destination = traffic.receiver.local_addr()?;
+    let before_read = states_before
         .as_ref()
-        .and_then(|id| state_ids(&states_after).ok().map(|ids| ids.contains(id)));
-    let after = json!({"target":inventory(out,p,ANCHOR)?,"sentinel":inventory(out,p,SENTINEL)?,"sentinel_rule":sentinel_rule_after,"sentinel_table_entries":sentinel_table_after,"states":states_after,"known_state_survived":known_survived,"info":raw(out,p,&["-s","info"],&[])?,"counters":raw(out,p,&["-a",HOOKED,"-vsr"],&[])?});
-    let changed_rule =
-        super::super::contract_check::sentinel_changed(&sentinel_rule_before, &sentinel_rule_after);
-    let changed_table = super::super::contract_check::sentinel_changed(
-        &sentinel_table_before,
-        &sentinel_table_after,
-    );
-    write_json(
-        out,
-        "anchor-F-all-scope.json",
-        &json!({"before":before,"command":all,"after":after,"changed":{"foreign_rule":changed_rule,"foreign_table_entries":changed_table,"known_state_removed":known_survived.map(|survived| !survived),"info_output":before["info"]["stdout"]!=after["info"]["stdout"],"hooked_rule_counters":before["counters"]["stdout"]!=after["counters"]["stdout"]},"measurement_only":true}),
-    )?;
-    scoped(out, p, ANCHOR)?;
-    scoped(out, p, SENTINEL)?;
-    scoped(out, p, HOOKED)?;
-    Ok(())
+        .map_err(environment_issue)
+        .and_then(|states| known_id(states, traffic.source, destination, None));
+    super::super::state_measure::continue_after_read(before_read, |known_before| {
+        let before = json!({"target":inventory(out,p,ANCHOR)?,"sentinel":inventory(out,p,SENTINEL)?,"sentinel_rule":sentinel_rule_before,"sentinel_table_entries":sentinel_table_before,"states":states_before,"known_state_tuple":known_before,"info":raw(out,p,&["-s","info"],&[])?,"counters":raw(out,p,&["-a",HOOKED,"-vsr"],&[])?});
+        within_budget(|| super::resources::recheck_foreign_tokens(out, end()))?;
+        let all = raw(out, p, &["-a", ANCHOR, "-F", "all"], &[])?;
+        let sentinel_rule_after = raw(out, p, &rule_args, &[])?;
+        let sentinel_table_after = raw(out, p, &table_args, &[])?;
+        let states_after = raw(out, p, &["-s", "states", "-v"], &[]).map_err(|e| e.to_string());
+        let after_read = states_after
+            .as_ref()
+            .map_err(environment_issue)
+            .and_then(state_ids);
+        super::super::state_measure::continue_after_read(after_read, |after_ids| {
+            let known_survived = known_before
+                .as_ref()
+                .ok()
+                .and_then(Option::as_ref)
+                .and_then(|id| after_ids.as_ref().ok().map(|ids| ids.contains(id)));
+            let state_issues = [
+                known_before
+                    .as_ref()
+                    .err()
+                    .map(|e| format!("F-all before: {e}")),
+                after_ids
+                    .as_ref()
+                    .err()
+                    .map(|e| format!("F-all after: {e}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            let after = json!({"target":inventory(out,p,ANCHOR)?,"sentinel":inventory(out,p,SENTINEL)?,"sentinel_rule":sentinel_rule_after,"sentinel_table_entries":sentinel_table_after,"states":states_after,"parsed_state_tuples":after_ids,"known_state_survived":known_survived,"info":raw(out,p,&["-s","info"],&[])?,"counters":raw(out,p,&["-a",HOOKED,"-vsr"],&[])?});
+            let changed_rule = super::super::contract_check::sentinel_changed(
+                &sentinel_rule_before,
+                &sentinel_rule_after,
+            );
+            let changed_table = super::super::contract_check::sentinel_changed(
+                &sentinel_table_before,
+                &sentinel_table_after,
+            );
+            write_json(
+                out,
+                "anchor-F-all-scope.json",
+                &json!({"before":before,"command":all,"after":after,"state_measurement_issues":state_issues,"changed":{"foreign_rule":changed_rule,"foreign_table_entries":changed_table,"known_state_removed":known_survived.map(|survived| !survived),"info_output":before["info"]["stdout"]!=after["info"]["stdout"],"hooked_rule_counters":before["counters"]["stdout"]!=after["counters"]["stdout"]},"measurement_only":true}),
+            )?;
+            scoped(out, p, ANCHOR)?;
+            scoped(out, p, SENTINEL)?;
+            scoped(out, p, HOOKED)?;
+            Ok(state_issues)
+        })
+    })
 }
 
 struct TcpTraffic {
@@ -1491,6 +1727,7 @@ fn tcp(listener: TcpListener, feth: bool) -> Result<TcpTraffic> {
             Err(error) => return Err(error.into()),
         }
     };
+    server.set_nonblocking(false)?;
     server.set_read_timeout(Some(Duration::from_secs(2)))?;
     let mut server = server;
     let mut bytes = [0_u8; 12];
@@ -1514,7 +1751,7 @@ fn state_rows(e: &Evidence) -> Result<Vec<super::super::state_measure::State>> {
     )?;
     pftext::read(&build, 0, e.stdout.as_bytes(), e.stderr.as_bytes())
         .map_err(|_| environment_issue("unfiltered state listing diagnostics unpinned"))?;
-    super::super::state_measure::parse(&e.stdout).map_err(environment_issue)
+    super::super::state_measure::parse(build.as_str(), &e.stdout).map_err(environment_issue)
 }
 fn state_ids(e: &Evidence) -> Result<BTreeSet<String>> {
     Ok(state_rows(e)?.into_iter().map(|s| s.identity).collect())
@@ -1524,8 +1761,8 @@ fn known_id(
     source: SocketAddr,
     destination: SocketAddr,
     interface: Option<&str>,
-) -> Option<String> {
-    super::super::state_measure::known(&state_rows(e).ok()?, source, destination, interface)
+) -> Result<Option<String>> {
+    super::super::state_measure::known_read(state_rows(e), source, destination, interface)
 }
 fn feth(out: &Path, p: &mut NativePlatform) -> Result<()> {
     let list = invoke_before("/sbin/ifconfig", &["-l"], end());
@@ -1558,11 +1795,63 @@ fn feth(out: &Path, p: &mut NativePlatform) -> Result<()> {
     write_json(out, "feth-pf-before.json", &info)?;
     Ok(())
 }
-#[allow(clippy::too_many_lines)] // Keep socket lifetimes, pre-call identities, flush and post-call inventory together.
 fn flush(out: &Path, r: &mut CaseResult) -> Result<()> {
     let mut p = platform(out, &out.join("r4-fixtures"), &child_pin()?)?;
-    let udp = hooked(out, &mut p)?;
-    feth(out, &mut p)?;
+    let (observation, cleanup) = super::super::contract_check::with_cleanup(
+        &mut p,
+        |p| flush_measurement(out, r, p),
+        |_| flush_cleanup(out),
+    );
+    write_json(
+        out,
+        "flush-cleanup.json",
+        &json!({"observation_error":observation.as_ref().err().map(ToString::to_string),"cleanup":format!("{cleanup:?}")}),
+    )?;
+    cleanup?;
+    observation
+}
+fn flush_cleanup(out: &Path) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    super::resources::recheck_foreign_tokens(out, deadline)?;
+    let entries = super::resources::entries(out)?;
+    let mut failures = Vec::new();
+    for path in [HOOKED, SENTINEL] {
+        if entries.iter().any(|e| e.kind == "anchor" && e.path == path) {
+            for class in ["rules", "nat", "Tables", "dummynet"] {
+                let e = super::invoke_before("/sbin/pfctl", &["-a", path, "-F", class], deadline);
+                write_json(
+                    out,
+                    &format!("{}.json", super::unique("flush-fixture-cleanup")),
+                    &e,
+                )?;
+                if !e.complete() {
+                    failures.push(format!("{path} {class}: incomplete cleanup"));
+                }
+            }
+            let after = super::resources::anchor_read(out, path, deadline);
+            if after != Ok(None) {
+                failures.push(format!("{path} final read: {after:?}"));
+            }
+        }
+    }
+    for name in ["feth0", "feth1"] {
+        if entries.iter().any(|e| e.kind == "feth" && e.path == name) {
+            let e = invoke_before("/sbin/ifconfig", &[name, "destroy"], deadline);
+            write_json(out, &format!("{name}-flush-cleanup.json"), &e)?;
+            if !e.complete() {
+                failures.push(format!("{name}: incomplete cleanup"));
+            }
+        }
+    }
+    env(
+        failures.is_empty(),
+        &format!("Q-FLUSH cleanup: {failures:?}"),
+    )
+}
+#[allow(clippy::too_many_lines)] // Keep socket lifetimes and flush measurements together.
+fn flush_measurement(out: &Path, r: &mut CaseResult, p: &mut NativePlatform) -> Result<()> {
+    let udp = hooked(out, p)?;
+    feth(out, p)?;
     super::resources::journal_anchor(out, SENTINEL, end())
         .map_err(|e| environment_issue(e.to_string()))?;
     let listen4 = TcpListener::bind("127.0.0.1:0")?;
@@ -1574,7 +1863,7 @@ fn flush(out: &Path, r: &mut CaseResult) -> Result<()> {
         listen6.local_addr()?.port(),
         listen_feth.local_addr()?.port()
     );
-    let load = raw(out, &mut p, &["-a", SENTINEL, "-f", "-"], rules.as_bytes())?;
+    let load = raw(out, p, &["-a", SENTINEL, "-f", "-"], rules.as_bytes())?;
     env(load.complete(), "TCP measurement rules failed to load")?;
     let ipv4 = tcp(listen4, false)
         .map_err(|e| environment_issue(format!("IPv4 TCP fixture unavailable: {e}")))?;
@@ -1582,13 +1871,13 @@ fn flush(out: &Path, r: &mut CaseResult) -> Result<()> {
         .map_err(|e| environment_issue(format!("IPv6 TCP fixture unavailable: {e}")))?;
     let feth_traffic = tcp(listen_feth, true)
         .map_err(|e| environment_issue(format!("bound feth TCP fixture unavailable: {e}")))?;
-    let counters = raw(out, &mut p, &["-a", SENTINEL, "-vvsr"], &[])?;
+    let counters = raw(out, p, &["-a", SENTINEL, "-vvsr"], &[])?;
     write_json(
         out,
         "flush-tcp-counters.json",
         &json!({"rules":rules,"counters":counters,"feth_source_bound_interface":"feth0"}),
     )?;
-    let before = raw(out, &mut p, &["-s", "states", "-v"], &[])?;
+    let before = raw(out, p, &["-s", "states", "-v"], &[])?;
     let flows = [
         ("udp-lo0", udp.source, udp.receiver.local_addr()?, None),
         ("tcp-lo0-v4", ipv4.source, ipv4.destination, None),
@@ -1603,7 +1892,7 @@ fn flush(out: &Path, r: &mut CaseResult) -> Result<()> {
     let mut known = BTreeSet::new();
     let mut missing = vec![];
     for (name, source, destination, interface) in flows {
-        if let Some(id) = known_id(&before, source, destination, interface) {
+        if let Some(id) = known_id(&before, source, destination, interface)? {
             known.insert(id);
         } else {
             missing.push(name);
@@ -1631,12 +1920,12 @@ fn flush(out: &Path, r: &mut CaseResult) -> Result<()> {
         ))
     };
     ensure(p.fence() == Fence::Closed, "state flush tool not reaped")?;
-    let after = raw(out, &mut p, &["-s", "states", "-v"], &[])?;
+    let after = raw(out, p, &["-s", "states", "-v"], &[])?;
     let remaining = state_ids(&after)?;
     write_json(
         out,
         "flush-known-states.json",
-        &json!({"known_ids":known,"missing_known_flows":missing,"all_before":all_before,"before":before,"adapter_call_attempted":attempted,"adapter_result":format!("{result:?}"),"after":after,"known_survivors":known.intersection(&remaining).collect::<Vec<_>>(),"all_sockets_quiescent":true,"ownership_exception":"foreign states destroyed irreversibly; restore cannot return them"}),
+        &json!({"known_tuples":known,"missing_known_flows":missing,"all_before":all_before,"before":before,"adapter_call_attempted":attempted,"adapter_result":format!("{result:?}"),"after":after,"known_survivors":known.intersection(&remaining).collect::<Vec<_>>(),"all_sockets_quiescent":true,"ownership_exception":"foreign states destroyed irreversibly; restore cannot return them"}),
     )?;
     // Measurement only, never adapter interface removal. Generate fresh states
     // before each selector, retain both unfiltered listings and raw results.
@@ -1647,8 +1936,8 @@ fn flush(out: &Path, r: &mut CaseResult) -> Result<()> {
         let fresh = tcp(feth_traffic.listener.try_clone()?, true).map_err(|e| {
             environment_issue(format!("fresh bound feth TCP fixture unavailable: {e}"))
         })?;
-        let pre = raw(out, &mut p, &["-s", "states", "-v"], &[])?;
-        let id = known_id(&pre, fresh.source, fresh.destination, Some("all"));
+        let pre = raw(out, p, &["-s", "states", "-v"], &[])?;
+        let id = known_id(&pre, fresh.source, fresh.destination, Some("ALL"))?;
         if id.is_none() {
             write_json(
                 out,
@@ -1659,21 +1948,19 @@ fn flush(out: &Path, r: &mut CaseResult) -> Result<()> {
                 "floating feth state not positively identified before selector measurement",
             ));
         }
-        let effect = raw(out, &mut p, &args, &[])?;
-        let post = raw(out, &mut p, &["-s", "states", "-v"], &[])?;
+        let effect = raw(out, p, &args, &[])?;
+        let post = raw(out, p, &["-s", "states", "-v"], &[])?;
         write_json(
             out,
             &format!("{}.json", super::unique("floating-state-selector")),
-            &json!({"known_feth_id":id,"before":pre,"measurement":effect,"after":post,"measurement_only":true}),
+            &json!({"known_feth_tuple":id,"before":pre,"measurement":effect,"after":post,"measurement_only":true}),
         )?;
         drop(fresh);
     }
     let _ = keep_alive;
-    scoped(out, &mut p, HOOKED)?;
-    scoped(out, &mut p, SENTINEL)?;
     env(
         missing.is_empty() && known.len() == 4,
-        "not every known flow was proven present by state id immediately before flush; no vacuous success",
+        "not every known flow was proven present by state tuple immediately before flush; no vacuous success",
     )?;
     env(
         !p.call_trace()
@@ -1681,9 +1968,9 @@ fn flush(out: &Path, r: &mut CaseResult) -> Result<()> {
             .any(|s| s == "anchor_evidence:States:complete:false"),
         "global flush evidence incomplete",
     )?;
-    ensure(
+    env(
         known.is_disjoint(&remaining),
-        "known states survived global flush",
+        "known tuples present after global flush; tuple recurrence cannot establish state identity",
     )?;
     ensure(
         result.is_ok(),
@@ -1697,6 +1984,6 @@ fn flush(out: &Path, r: &mut CaseResult) -> Result<()> {
             .any(|s| s == crate::decode::qualification_trace::OVERFLOW),
         "Q-FLUSH trace overflow",
     )?;
-    r.detail="reviewed global flush completed; each of four positively identified known states absent in complete post-call inventory; foreign states cannot be restored".into();
+    r.detail="reviewed global flush completed; each of four positively identified known tuples absent in complete post-call inventory; tuple measurement only; foreign states cannot be restored".into();
     Ok(())
 }

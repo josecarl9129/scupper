@@ -1,0 +1,49 @@
+{
+  "build": "25G332",
+  "provenance": "Pass-2 art26 state rows in 25G332/states-v.txt; full rejection rows byte-identical to CI 45397408312 attempt 2 on 24H232",
+  "states_v_reviewed": true,
+  "protocol_allowlist": [
+    "udp"
+  ],
+  "states_vv_reviewed": false,
+  "descendants_reviewed": false,
+  "states_v_sha256": "95a927c594aeab65d93734695cd453e7191f5607bf16195193c66bdc1c0402e5",
+  "claim": "Whole-listing UDP tuple presence measurement only; no kernel state identity. Any unreviewed protocol, extra line, malformed record or truncation invalidates the entire listing.",
+  "rejections": [
+    {
+      "name": "underscore",
+      "reviewed": true,
+      "command": [
+        "/sbin/pfctl",
+        "-o",
+        "none",
+        "-a",
+        "scupper-qual/children",
+        "-f",
+        "-"
+      ],
+      "stdin": "anchor \"_qchild\"\n",
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "pfctl: Use of -f option, could result in flushing of rules\npresent in the main ruleset added by the system at startup.\nSee /etc/pf.conf for further details.\n\nNo ALTQ support in kernel\nALTQ related functions disabled\nstdin:1: anchor names beginning with '_' are reserved for internal use\npfctl: Syntax error in config file: pf rules not loaded\n"
+    },
+    {
+      "name": "inline",
+      "reviewed": true,
+      "command": [
+        "/sbin/pfctl",
+        "-o",
+        "none",
+        "-a",
+        "scupper-qual/children",
+        "-f",
+        "-"
+      ],
+      "stdin": "anchor { pass quick on lo0 all no state }\n",
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "pfctl: Use of -f option, could result in flushing of rules\npresent in the main ruleset added by the system at startup.\nSee /etc/pf.conf for further details.\n\nNo ALTQ support in kernel\nALTQ related functions disabled\nstdin:1: syntax error\npfctl: Syntax error in config file: pf rules not loaded\n"
+    }
+  ],
+  "inline_multiline_reviewed": false
+}

@@ -1622,3 +1622,60 @@ pub fn qual_ipv4_bound_interface(fd: std::os::fd::BorrowedFd<'_>, index: u32) ->
         Err(last_errno())
     }
 }
+
+/// Qualification-only XNU-published layout pin: `pfioc_ruleset` request size.
+#[cfg(feature = "qualification")]
+pub const PF_RULESET_SIZE: usize = crate::pf_rulesets::SIZE;
+/// Qualification-only XNU-published layout pin: nr/path/name offsets.
+#[cfg(feature = "qualification")]
+pub const PF_RULESET_FIELDS: [usize; 3] = crate::pf_rulesets::FIELDS;
+/// Darwin DIOCGETRULESETS (qualification only).
+#[cfg(feature = "qualification")]
+pub const DIOCGETRULESETS: u32 = crate::pf_rulesets::GET_RULESETS;
+/// Darwin DIOCGETRULESET (qualification only).
+#[cfg(feature = "qualification")]
+pub const DIOCGETRULESET: u32 = crate::pf_rulesets::GET_RULESET;
+
+/// Bounded read-only kernel child enumeration, for qualification measurements.
+/// No production adapter decision uses this observation. Counts are rechecked
+/// after enumeration; count changes, duplicate or malformed names are incomplete.
+/// None means only the initial count ioctl reported EINVAL for a missing parent.
+/// EINVAL (Darwin missing-anchor errno) is accepted only on the first count call;
+/// every later error and every other first-call errno remains incomplete.
+///
+/// # Errors
+/// Open/ioctl errno, invalid path/name, changed census, or more than 64 children.
+#[cfg(feature = "qualification")]
+pub fn qual_pf_rulesets(path: &str) -> Result<Option<Vec<String>>, Errno> {
+    use crate::pf_rulesets::{CensusError, enumerate};
+    use std::os::fd::AsFd;
+    let fd = pf_open()?;
+    enumerate(path, |command, request| {
+        ruleset_ioctl(fd.as_fd(), command, request).map_err(Errno::raw_os_error)
+    })
+    .map_err(|error| match error {
+        CensusError::Io(errno) => Errno::from_raw_os_error(errno),
+        CensusError::Invalid => Errno::INVAL,
+        CensusError::Overflow => Errno::OVERFLOW,
+        CensusError::Changed => Errno::AGAIN,
+    })
+}
+#[cfg(feature = "qualification")]
+fn ruleset_ioctl(
+    fd: BorrowedFd<'_>,
+    command: u32,
+    request: &mut crate::pf_rulesets::Request,
+) -> Result<(), Errno> {
+    // SAFETY: fd remains borrowed and live for the synchronous ioctl. The
+    // initialized request matches the 1092-byte XNU-published layout pin, with
+    // bounded NUL-terminated input and writable inline output arrays. Only the
+    // two read-only commands above reach here. Output is read only on success.
+    let rc = unsafe {
+        libc::ioctl(
+            fd.as_raw_fd(),
+            libc::c_ulong::from(command),
+            std::ptr::from_mut(request),
+        )
+    };
+    if rc == -1 { Err(last_errno()) } else { Ok(()) }
+}

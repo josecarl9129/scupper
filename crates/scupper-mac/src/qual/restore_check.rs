@@ -225,11 +225,22 @@ fn normalized(name: &str, text: &str) -> Vec<String> {
     lines
 }
 
+#[cfg(test)]
 pub(super) fn state_changes(
     before: &BTreeMap<String, Evidence>,
     after: &BTreeMap<String, Evidence>,
     journaled_keys: &[String],
     empty_anchor_names: &[String],
+) -> StateChanges {
+    state_changes_with_incomplete(before, after, journaled_keys, empty_anchor_names, &[])
+}
+
+pub(super) fn state_changes_with_incomplete(
+    before: &BTreeMap<String, Evidence>,
+    after: &BTreeMap<String, Evidence>,
+    journaled_keys: &[String],
+    empty_anchor_names: &[String],
+    incomplete_anchor_names: &[String],
 ) -> StateChanges {
     let mut changes = Vec::new();
     let mut os_drift = Vec::new();
@@ -264,7 +275,15 @@ pub(super) fn state_changes(
                     });
                 }
                 if matches!(name, "pf-anchors" | "pf-apple-anchors") {
-                    new.retain(|line| old.contains(line) || !empty_anchor_names.contains(line));
+                    new.retain(|line| {
+                        old.contains(line)
+                            || (!empty_anchor_names.contains(line)
+                                && !incomplete_anchor_names.iter().any(|name| {
+                                    line == name
+                                        || (name != "scupper-qual"
+                                            && line.starts_with(&format!("{name}/")))
+                                }))
+                    });
                 }
                 if old != new || a.stderr != b.stderr {
                     changes.push(format!("{name}: post-state differs from preflight"));
@@ -336,6 +355,48 @@ mod tests {
         before.get_mut("pf-anchors").unwrap().stdout = "  removed-foreign\n".into();
         assert_ne!(
             state_changes(&before, &after, &[], &allowed).violations,
+            baseline
+        );
+    }
+
+    #[test]
+    fn incomplete_anchor_read_keeps_other_allowances_and_does_not_hide_foreign_siblings() {
+        let before = BTreeMap::from([
+            (
+                "osversion".into(),
+                Evidence {
+                    stdout: "25G332".into(),
+                    ..observation()
+                },
+            ),
+            (
+                "pf-anchors".into(),
+                Evidence {
+                    stdout: String::new(),
+                    stderr: String::from_utf8_lossy(crate::decode::pftext::ALTQ_PREAMBLE)
+                        .into_owned(),
+                    ..observation()
+                },
+            ),
+        ]);
+        let mut after = before.clone();
+        after.get_mut("pf-anchors").unwrap().stdout =
+            "scupper-qual\nscupper-qual/ok\nscupper-qual/unknown\n".into();
+        let allowed = vec!["scupper-qual/ok".into()];
+        let incomplete = vec!["scupper-qual".into(), "scupper-qual/unknown".into()];
+        let baseline =
+            state_changes_with_incomplete(&before, &before, &[], &allowed, &incomplete).violations;
+        assert_eq!(
+            state_changes_with_incomplete(&before, &after, &[], &allowed, &incomplete).violations,
+            baseline
+        );
+        after
+            .get_mut("pf-anchors")
+            .unwrap()
+            .stdout
+            .push_str("scupper-qual/foreign\n");
+        assert_ne!(
+            state_changes_with_incomplete(&before, &after, &[], &allowed, &incomplete).violations,
             baseline
         );
     }

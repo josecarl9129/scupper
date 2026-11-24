@@ -6,6 +6,7 @@ use super::{
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
+    fmt::Write as _,
     fs,
     io::Write,
     os::unix::fs::OpenOptionsExt,
@@ -315,14 +316,19 @@ pub(super) fn undo(
                 "tokens" => undo_tokens(out, &entries, deadline, &mut actions, &mut failures),
                 "anchors" => {
                     // Journaled configuration only; a scoped flush creates a missing name.
+                    let mut seen = std::collections::BTreeSet::new();
                     for e in entries.iter().filter(|e| e.kind == "anchor") {
+                        if !seen.insert(e.path.clone()) {
+                            continue;
+                        }
                         if !matches!(
                             e.path.as_str(),
                             "scupper-qual/scupper"
                                 | "com.apple/scupper"
                                 | "com.apple/scupper-qual"
                                 | "scupper-qual/children"
-                        ) {
+                        ) && !e.path.starts_with("scupper-qual/children/")
+                        {
                             failures.push("unrecognized fixture anchor".into());
                             continue;
                         }
@@ -337,7 +343,9 @@ pub(super) fn undo(
                         {
                             continue;
                         }
-                        let targets = if e.path == "scupper-qual/children" {
+                        let mut targets = if e.path == "scupper-qual/children"
+                            || e.path.starts_with("scupper-qual/children/")
+                        {
                             match measurement_paths(&mut io, &e.path) {
                                 Ok(paths) => paths,
                                 Err(error) => {
@@ -350,7 +358,32 @@ pub(super) fn undo(
                         } else {
                             vec![e.path.clone()]
                         };
+                        if e.path == super::super::desc_inventory::ROOT {
+                            targets.extend(
+                                entries
+                                    .iter()
+                                    .filter(|e| {
+                                        e.kind == "anchor-target"
+                                            && super::super::desc_inventory::target_path(&e.path)
+                                    })
+                                    .map(|e| e.path.clone()),
+                            );
+                            targets.sort();
+                            targets.dedup();
+                        }
                         for target in targets.iter().rev() {
+                            if e.path == super::super::desc_inventory::ROOT {
+                                match scupper_darwin::qual_pf_rulesets(target) {
+                                    Ok(None) => continue,
+                                    Ok(Some(_)) => (),
+                                    Err(error) => {
+                                        failures.push(format!(
+                                            "anchor restore census: {target}: {error}"
+                                        ));
+                                        continue;
+                                    }
+                                }
+                            }
                             // Recovery tries every class even when a previous flush failed.
                             for (op, class) in [
                                 (Operation::Rules, "rules"),
@@ -454,6 +487,7 @@ pub(super) fn undo(
                         }
                     }
                 }
+                "child staging" => restore_child(out)?,
                 "sockets" => {
                     for e in entries.iter().filter(|e| e.kind == "socket") {
                         if e.path.starts_with("/var/run/wireguard/utun")
@@ -586,6 +620,7 @@ pub(super) fn complete_from_snapshot(
     post: &Snapshot,
     deadline: Instant,
     snapshot_quiescent: bool,
+    empty_anchor_names: &[String],
 ) -> Result<()> {
     if !writers_quiescent(out)? {
         return Ok(());
@@ -594,9 +629,13 @@ pub(super) fn complete_from_snapshot(
     let mut verified = Vec::new();
     for (index, entry) in pending {
         let absent = match entry.kind.as_str() {
-            "anchor" => {
+            "anchor" => snapshot_quiescent && empty_anchor_names.contains(&entry.path),
+            "anchor-target" => {
                 snapshot_quiescent
-                    && anchor_read(out, &entry.path, deadline).is_ok_and(|text| text.is_none())
+                    && super::super::desc_inventory::target_path(&entry.path)
+                    && empty_anchor_names
+                        .iter()
+                        .any(|name| name == super::super::desc_inventory::ROOT)
             }
             "feth" => {
                 let list = invoke_before("/sbin/ifconfig", &["-l"], deadline);
@@ -641,6 +680,10 @@ pub(super) fn complete_from_snapshot(
                             })
                     })
             }
+            "r7-child-intent"
+            | "r7-child-created"
+            | "r7-child-dir-intent"
+            | "r7-child-dir-created" => super::super::child_stage::absent(Path::new(&entry.path))?,
             "r4-wireguard-created" => fs::symlink_metadata(&entry.path)
                 .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
             "r4-wireguard-sockets" => {
@@ -760,14 +803,17 @@ struct AnchorInventory<'a> {
     deadline: Instant,
     measurement_descendants: bool,
     descendant_paths: std::collections::BTreeSet<String>,
+    last_read: String,
 }
 impl<'a> AnchorInventory<'a> {
     fn new(out: &'a Path, deadline: Instant, path: &str) -> Self {
         Self {
             out,
             deadline,
-            measurement_descendants: path == "scupper-qual/children",
+            measurement_descendants: path == "scupper-qual/children"
+                || path.starts_with("scupper-qual/children/"),
             descendant_paths: std::collections::BTreeSet::default(),
+            last_read: String::new(),
         }
     }
 }
@@ -794,6 +840,7 @@ impl crate::decode::pfanchor::Commands for AnchorInventory<'_> {
         {
             self.descendant_paths.insert(args[1].to_owned());
         }
+        self.last_read = format!("pfctl {}", args.join(" "));
         let evidence = invoke_before("/sbin/pfctl", args, self.deadline);
         write_json(
             self.out,
@@ -805,7 +852,7 @@ impl crate::decode::pfanchor::Commands for AnchorInventory<'_> {
             return Err(crate::platform::SysError::Unknown);
         }
         let build = crate::decode::pftext::Build::system()?;
-        crate::decode::pfanchor::proposed(
+        let text = crate::decode::pfanchor::proposed(
             &build,
             if op == crate::decode::pfanchor::Operation::Filter {
                 crate::decode::pfanchor::Operation::HarnessFilter
@@ -817,7 +864,25 @@ impl crate::decode::pfanchor::Commands for AnchorInventory<'_> {
                 .ok_or(crate::platform::SysError::Unknown)?,
             evidence.stdout.as_bytes(),
             evidence.stderr.as_bytes(),
-        )
+        )?;
+        if self.measurement_descendants && op == Operation::Inventory {
+            let parent = if args.len() == 3 { args[1] } else { "" };
+            write!(
+                &mut self.last_read,
+                "; DIOCGETRULESETS/DIOCGETRULESET {parent}"
+            )
+            .map_err(|_| crate::platform::SysError::Unknown)?;
+            let kernel = scupper_darwin::qual_pf_rulesets(parent);
+            write_json(self.out, &format!("{}.json", unique("anchor-kernel-inventory")),
+                &json!({"path":parent,"kernel":format!("{kernel:?}"),"text":format!("{text:?}"),"qualification_absence_only":true}))
+                .map_err(|_| crate::platform::SysError::Unknown)?;
+            return super::super::desc_inventory::merge(
+                text,
+                kernel.map_err(|_| crate::platform::SysError::Unknown)?,
+                parent,
+            );
+        }
+        Ok(text)
     }
 }
 // Cleanup authority is confined to the independently journaled disposable root.
@@ -826,10 +891,17 @@ fn measurement_paths(io: &mut AnchorInventory<'_>, root: &str) -> Result<Vec<Str
     let mut pending = vec![(root.to_owned(), 0)];
     let mut count = 1;
     while let Some((path, depth)) = pending.pop() {
+        if scupper_darwin::qual_pf_rulesets(&path)?.is_none() {
+            continue;
+        }
         let Text::Present(text) = io.call(Operation::Inventory, &["-a", &path, "-sA"], &[])? else {
             return Err("incomplete measurement subtree inventory".into());
         };
-        for child in crate::decode::pfanchor::inventory_at(&text, &path)? {
+        let children = crate::decode::pfanchor::inventory_at(&text, &path)?
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<std::collections::BTreeSet<_>>();
+        for child in children {
             count += 1;
             if depth >= 8 || count > 64 {
                 return Err("measurement subtree bound exceeded".into());
@@ -842,12 +914,43 @@ fn measurement_paths(io: &mut AnchorInventory<'_>, root: &str) -> Result<Vec<Str
 }
 // Independent cleanup budget, even after the measurement case has expired.
 pub(super) fn cleanup_measurement(out: &Path, root: &str) -> Result<()> {
+    if root != super::super::desc_inventory::ROOT
+        && !super::super::desc_inventory::target_path(root)
+    {
+        return Err("invalid measurement cleanup root".into());
+    }
     let deadline = Instant::now() + Duration::from_secs(30);
     recheck_foreign_tokens(out, deadline)?;
     let mut io = AnchorInventory::new(out, deadline, root);
-    let paths = measurement_paths(&mut io, root)?;
     let mut failures = Vec::new();
+    let mut paths = match measurement_paths(&mut io, root) {
+        Ok(paths) => paths,
+        Err(error) => {
+            failures.push(format!("cleanup enumeration incomplete: {error}"));
+            vec![root.to_owned()]
+        }
+    };
+    paths.extend(
+        entries(out)?
+            .into_iter()
+            .filter(|e| {
+                e.kind == "anchor-target"
+                    && super::super::desc_inventory::target_path(&e.path)
+                    && (e.path == root || e.path.starts_with(&format!("{root}/")))
+            })
+            .map(|e| e.path),
+    );
+    paths.sort();
+    paths.dedup();
     for path in paths.iter().rev() {
+        match scupper_darwin::qual_pf_rulesets(path) {
+            Ok(None) => continue,
+            Ok(Some(_)) => (),
+            Err(error) => {
+                failures.push(format!("{path}: cleanup kernel census: {error}"));
+                continue;
+            }
+        }
         for (op, class) in [
             (Operation::Rules, "rules"),
             (Operation::Nat, "nat"),
@@ -859,8 +962,10 @@ pub(super) fn cleanup_measurement(out: &Path, root: &str) -> Result<()> {
             }
         }
     }
-    let after =
-        crate::decode::pfanchor::read(&mut io, &crate::decode::pfanchor::AnchorPath::new(root)?);
+    let after = crate::decode::pfanchor::read(
+        &mut io,
+        &crate::decode::pfanchor::AnchorPath::new(super::super::desc_inventory::ROOT)?,
+    );
     if after != Ok(None) {
         failures.push(format!("measurement absence: {after:?}"));
     }
@@ -888,43 +993,75 @@ pub(super) fn restored_anchor_names(
     out: &Path,
     before: &Snapshot,
     deadline: Instant,
-) -> Result<Vec<String>> {
-    let mut names = Vec::new();
-    for entry in entries(out)?.iter().filter(|e| e.kind == "anchor") {
-        let mut io = AnchorInventory::new(out, deadline, &entry.path);
-        let path = crate::decode::pfanchor::AnchorPath::new(&entry.path)?;
-        if !crate::decode::pfanchor::read(&mut io, &path).is_ok_and(|text| text.is_none()) {
-            return Err(format!("journaled anchor not empty: {}", entry.path).into());
-        }
-        names.push(entry.path.clone());
-        names.extend(io.descendant_paths);
-        let parent = entry.path.split_once('/').ok_or("anchor path")?.0;
-        if parent != "scupper-qual"
-            || before
-                .observations
-                .get("pf-anchors")
-                .is_some_and(|e| e.complete() && e.stdout.lines().any(|line| line.trim() == parent))
+) -> Result<super::recovery::AnchorReads> {
+    let paths = entries(out)?
+        .into_iter()
+        .filter(|e| e.kind == "anchor")
+        .map(|e| e.path)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut reads = super::recovery::read_anchors(paths, |name| -> Result<Option<Vec<String>>> {
+        let mut io = AnchorInventory::new(out, deadline, name);
+        let path = crate::decode::pfanchor::AnchorPath::new(name)?;
+        if crate::decode::pfanchor::read(&mut io, &path)
+            .map_err(|e| format!("{}: {e:?}", io.last_read))?
+            .is_some()
         {
-            continue;
+            return Ok(None);
         }
-        let mut io = AnchorInventory::new(out, deadline, parent);
-        let filter = io.call(Operation::Filter, &["-a", parent, "-sr"], &[])?;
-        if filter == Text::Missing {
-            continue;
-        }
-        if filter != Text::Present(String::new()) {
-            return Err(format!("anchor parent has foreign content: {parent}").into());
-        }
-        for flag in ["-sn", "-sT", "-sd"] {
-            if io.call(Operation::Extra, &["-a", parent, flag], &[])?
-                != Text::Present(String::new())
-            {
-                return Err(format!("anchor parent has foreign content: {parent}").into());
+        let mut names = vec![name.to_owned()];
+        names.extend(io.descendant_paths);
+        Ok(Some(names))
+    });
+    // Read each created top-level namespace once, independently of its children.
+    if entries(out)?
+        .iter()
+        .any(|e| e.kind == "anchor" && e.path.starts_with("scupper-qual/"))
+        && !before.observations.get("pf-anchors").is_some_and(|e| {
+            e.complete() && e.stdout.lines().any(|line| line.trim() == "scupper-qual")
+        })
+    {
+        let parent = "scupper-qual";
+        let result = (|| -> Result<bool> {
+            let mut io = AnchorInventory::new(out, deadline, parent);
+            for (op, flag) in [
+                (Operation::Filter, "-sr"),
+                (Operation::Extra, "-sn"),
+                (Operation::Extra, "-sT"),
+                (Operation::Extra, "-sd"),
+            ] {
+                match io
+                    .call(op, &["-a", parent, flag], &[])
+                    .map_err(|e| format!("pfctl -a {parent} {flag}: {e:?}"))?
+                {
+                    Text::Missing => return Ok(true),
+                    Text::MissingParent(_) => {
+                        return Err(format!("pfctl -a {parent} {flag}: missing parent").into());
+                    }
+                    Text::Present(text) if text.is_empty() => (),
+                    Text::Present(_) => return Ok(false),
+                }
+            }
+            Ok(true)
+        })();
+        match result {
+            Ok(true) => reads.empty_names.push(parent.into()),
+            Ok(false) => reads
+                .violations
+                .push(format!("anchor parent has foreign content: {parent}")),
+            Err(error) => {
+                reads.incomplete_names.push(parent.into());
+                reads
+                    .inconclusive
+                    .push(format!("anchor parent read incomplete: {parent}: {error}"));
             }
         }
-        names.push(parent.to_owned());
     }
-    Ok(names)
+    write_json(
+        out,
+        &format!("{}.json", unique("restored-anchor-reads")),
+        &reads,
+    )?;
+    Ok(reads)
 }
 pub(super) fn journal_anchor(out: &Path, path: &str, deadline: Instant) -> Result<()> {
     let absent = anchor_read(out, path, deadline);
@@ -939,6 +1076,25 @@ pub(super) fn journal_anchor(out: &Path, path: &str, deadline: Instant) -> Resul
         file.sync_all()?;
         Ok(())
     })
+}
+/// Deep targets inherit only the original, completely absent disposable root's
+/// authority. They are never passed to the two-component adapter path parser.
+pub(super) fn journal_measurement_target(out: &Path, path: &str) -> Result<()> {
+    if !super::super::desc_inventory::target_path(path)
+        || !entries(out)?
+            .iter()
+            .any(|e| e.kind == "anchor" && e.path == super::super::desc_inventory::ROOT)
+    {
+        return Err("measurement target lacks original root absence authority".into());
+    }
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .open(out.join("resources.jsonl"))?;
+    writeln!(file, "{}", json!({"kind":"anchor-target","path":path}))?;
+    file.sync_all()?;
+    Ok(())
 }
 pub(super) fn recheck_foreign_tokens(out: &Path, deadline: Instant) -> Result<()> {
     let mut entries = entries(out)?;
@@ -977,6 +1133,8 @@ pub(super) fn recheck_foreign_tokens(out: &Path, deadline: Instant) -> Result<()
             start: String::new(),
             token: 0,
             path: String::new(),
+            dev: 0,
+            ino: 0,
         });
     }
     let tokens = live_tokens(out, deadline)?;
@@ -1137,5 +1295,20 @@ fn repair_tail(out: &Path) -> Result<()> {
         file.set_len(u64::try_from(complete)?)?;
         file.sync_all()?;
     }
+    Ok(())
+}
+
+pub(super) fn restore_child(out: &Path) -> Result<()> {
+    let records = entries(out)?
+        .into_iter()
+        .filter(|e| e.kind.starts_with("r7-child-"))
+        .map(|e| super::super::child_stage::Record {
+            kind: e.kind,
+            path: e.path,
+            dev: e.dev,
+            ino: e.ino,
+        })
+        .collect::<Vec<_>>();
+    super::super::child_stage::restore(&records)?;
     Ok(())
 }

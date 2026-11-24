@@ -1,0 +1,68 @@
+{
+  "build": "25G332",
+  "provenance": "User-supplied R7 pass-2 diagnosis (art26); not newly measured in this worktree",
+  "descendants_reviewed": false,
+  "states_v_reviewed": true,
+  "states_vv_reviewed": false,
+  "facts": [
+    {
+      "id": 1,
+      "evidence": "pf-text-1795526479-7074-881.json",
+      "fact": "-v has ALL headers, directed endpoints and age/expires/packets/bytes/anchor/rule/flowhash details; no id/creatorid. states-v.txt pins the supplied rows. Tuple measurements are not kernel identity proof. Only UDP is reviewed; TCP and all other protocols invalidate the whole listing."
+    },
+    {
+      "id": 2,
+      "evidence": "anchor-children-underscore.json",
+      "rc": 1,
+      "diagnostic": "stdin:1: anchor names beginning with '_' are reserved for internal use\npfctl: Syntax error in config file: pf rules not loaded\n",
+      "fact": "Quoted underscore anchor spelling rejected by pfctl. This says nothing about direct-path or ioctl creation."
+    },
+    {
+      "id": 3,
+      "evidence": "anchor-children-inline.json",
+      "rc": 1,
+      "diagnostic": "stdin:1: syntax error\npfctl: Syntax error in config file: pf rules not loaded\n",
+      "fact": "The supplied one-line anonymous inline spelling was rejected. Multi-line anonymous and named inline controls are new measurements."
+    },
+    {
+      "id": 4,
+      "evidence": "anchor-children-wildcard.json; anchor-children-named.json",
+      "fact": "Wildcard x/* lists child x; parent rules print anchor \"x/*\" all. Named call prints anchor \"qchild\" all."
+    },
+    {
+      "id": 5,
+      "evidence": "anchor-children-grandchild.json",
+      "fact": "A nonempty grandchild is visible beneath an emptied listed parent."
+    },
+    {
+      "id": 6,
+      "evidence": "anchor-F-all-scope.json",
+      "stderr": "rules cleared\nnat cleared\ndummynet cleared\n0 tables deleted.\n",
+      "fact": "F all did not change the sibling sentinel rule or table entries. Its effect on states remained unmeasured in pass 2."
+    },
+    {
+      "id": 7,
+      "evidence": "hooked-traffic-\u2026-696.json",
+      "fact": "com.apple/scupper rules were evaluated through the stock hook after anonymous enable; counters reported Evaluations 2, Packets 20, States 2."
+    },
+    {
+      "id": 8,
+      "evidence": "restore #1 post-state",
+      "fact": "Empty restored anchor namespaces remained listed. Configuration absence, rather than name removal, is the restore criterion."
+    },
+    {
+      "id": 9,
+      "evidence": "e2e-join.json; e2e-left.json, image 20261118",
+      "fact": "The runner had a long-lived pathless provjobd process with image UUID. An unreadable identity must remain unknown; no process-name exception is introduced."
+    },
+    {
+      "id": 10,
+      "evidence": "deadman launchd logs and bootstrap evidence",
+      "fact": "VM log clock and SystemTime differed by more than 100 ms. Do not order those clock domains."
+    }
+  ],
+  "states_v_protocol_allowlist": [
+    "udp"
+  ],
+  "related_24H232_review": "../24H232/measurement-review.json (adopted R7 fix 6)"
+}

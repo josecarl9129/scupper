@@ -100,7 +100,8 @@ dead-man uses 1080 seconds, as do the other groups except `pf` (1500 seconds). T
 requires this deadline to exceed both hijack case budgets plus final restore's
 240-second maximum, and to cover the larger probe group plus that maximum.
 Final recovery gets its own budget: 10 seconds plus two seconds per incomplete
-journal entry or controller, capped at 240 seconds. Verified completed entries
+journal entry or controller plus three seconds per distinct journaled anchor
+(counted independently in each scope), capped at 240 seconds. Verified completed entries
 are skipped, including identities of stopped writers; every restore still takes
 a post-state snapshot and compares it with preflight. The always-step allows five
 minutes for recovery and stopping the dead-man.
@@ -396,25 +397,77 @@ table and a referenced table. None creates a child in the shared anchor. The
 fixture artifacts together record exact source, streams/status for every class,
 exact adapter error, removal and final read. Load notices are measurements, not reviewed A/B
 load-row assertions. Accepted foreign fixtures must yield any Err before removal;
-an unknown grammar is still fail-closed. Removal Ok without a final complete None
-is a contract violation. Removal Err is an Inconclusive Leave-coverage finding,
+an unknown grammar is still fail-closed. Removal Ok followed by a complete Some is a contract violation. An incomplete
+final read is an environment Inconclusive. Removal Err is an Inconclusive Leave-coverage finding,
 with cleanup failure recorded even if an observation also failed. Every rejected
 spelling is recorded and makes the aggregate Inconclusive.
 
-The independent, journaled `scupper-qual/children` subtree measures named and
-underscore (`_qchild`) children, an inline/anonymous anchor, a wildcard call
-`anchor "x/*"`, and a nonempty grandchild beneath an empty child. It records
-inventories and exact class streams at every discovered level before cleanup,
-and after each scoped class flush at each path. These per-level/per-flush reads
-cover only that path's five classes (`-sr`, `-sn`, `-sT`, `-sA`, `-sd`), without
-repeating parent and root inventories after every flush. Rejected spellings and
-persistent empty names are coverage measurements, never contract violations. Only this
-disposable measurement subtree permits recursive harness cleanup and empty-name
-accounting during restore; native build coverage flags remain false. Inventory
-containment, depth/count bounds and original absence authority apply to that
-cleanup too. Case budget exhaustion remains environmental; descendant cleanup
-uses an independent 30-second deadline and a cleanup failure withholds subsequent
-descendant fixtures.
+The independent, journaled `scupper-qual/children` subtree measures each spelling
+in a uniquely named disposable parent, refused if that namespace already exists:
+named and quoted underscore children, one-line and
+multi-line anonymous inline anchors, a named inline control, wildcard calls, a
+nonempty grandchild beneath an empty child, and direct-path `_x` and `qchild/_x`
+loads with a real no-state rule. Every ancestor inventory and direct target class
+read is retained, including the root ruleset inventory. Bounded qualification-only
+DIOCGETRULESETS/DIOCGETRULESET reads
+are compared with text inventories at every measured level; exact text-only and
+kernel-only differences are saved and the union is traversed. Existence disagreement
+is also a contract finding, including when both child-name sets are empty. Only
+an initial count-query EINVAL means a missing parent; every later error and every other
+first-call errno (including ENOENT) stays incomplete. This is the pass-2 Darwin
+fact cross-checked by pfctl's rc-0 `Anchor '<path>' not found.` row.
+Qualification absence checks also traverse the union before journaling or granting
+restore allowances, so kernel-only configured children cannot authorize cleanup.
+The absence merge requires a matching named text missing-parent result exactly
+when the kernel reports None; an empty present listing cannot substitute for it.
+Deep fixture targets use bounded `anchor-target` journal rows under the original
+root absence authority; the production adapter path remains exactly two components.
+Cleanup skips kernel-proven missing targets and verifies the entire disposable root.
+The restore budget counts these distinct targets as well as adapter-anchor rows.
+The Rust ruleset ABI check is a layout pin against XNU-published constants:
+size 1092, nr/path/name offsets 0/4/1028, and ioctl numbers
+0xC444443A / 0xC444443B. It is not independent SDK verification. The C probe
+uses `net/pfvar.h` when available and otherwise compiles an explicitly labelled
+in-tree mirror of the XNU-published layout. Both branches assert the size, field
+offsets, alignment and ioctl numbers above. A present header with missing ioctls
+or a contradictory layout still fails compilation. The CI `cc -std=c11 -Wall
+-Wextra -Werror -v ... 2>&1 | tee ...` pipeline can therefore compile with public
+SDKs that omit this private header.
+`descendant-abi.json` retains `from_sdk_header:true|false` and `layout_source`.
+Q-DESCENDANTS records the flag in its successful detail instead of requiring true.
+The false branch is an "XNU-published layout pin, not SDK-verified"; compiling the
+mirror never establishes SDK verification.
+Every discovered path gets class reads before and after each scoped flush. Cleanup
+uses an independent 30-second deadline, attempts explicit journaled targets even
+if enumeration fails, and retains cleanup failures. A failure withholds later
+descendant fixtures. Only this disposable subtree permits recursive harness cleanup;
+both native descendant coverage flags remain false.
+
+The supplied pass-2 25G332 facts are pinned in `goldens/25G332/pass2-facts.json`.
+Each build's `measurement-review.json` reviews its exact UDP state golden and the
+full underscore and one-line anonymous inline rejection command/stdin/rc/stdout/
+stderr rows. The 24H232 pin uses CI 45397408312 attempt 2 supplied in the fix 6
+brief; the rejection rows are byte-identical across both builds. Multi-line inline
+rejections remain unpinned and Inconclusive. Exact reviewed parser rejections are
+complete measurements when the remaining inventory/flush evidence completes.
+Other failed command rows remain Inconclusive.
+
+Per parent, normalized kernel set K and text set T are compared without ordering.
+K minus T produces a contract finding "text inventory incomplete"; T minus K
+produces "inventory disagreement". Kernel censuses bracket the text/class read;
+enumeration failure or a detected change is Inconclusive. Traversal within the
+disposable subtree covers the union of observed text and kernel names, including
+incomplete comparisons. Ancestor inventories are compared without traversing
+foreign subtrees.
+Q-DESCENDANTS is assumption_holds only if every optimizer, foreign-fixture and
+descendant measurement completed with no findings; any inventory finding makes
+it contract_violation. Neither verdict promotes native descendant coverage.
+Persistent empty namespace names are allowed only after complete
+configuration-absence reads. Restore deduplicates journal paths, reuses those
+post-state reads for completion, and retains each independently established
+allowance. A failed read names its command and is Inconclusive, rather than
+"not empty"; added names for that incomplete path remain unresolved, while new
+foreign siblings and removed baseline names remain comparison violations.
 
 Twenty unhooked lifecycle iterations and twenty hooked removals (with states
 and after global state flush) remain. Raw harness measurements use journaled
@@ -467,15 +520,44 @@ remain a measured no-op. Production ancestor measurements share native path
 constants, and qualification constructors reject the production anchor outside
 native unit tests; the source guard also scans the shared suite and trace module.
 
-Q-FLUSH requires known UDP/TCP IPv4/IPv6 loopback and feth state id/creatorid
-pairs immediately before the adapter call. Unknown state text, missing identities,
-stock skip or unavailable feth is Inconclusive. Interface/address selectors are
-raw measurements only; nonempty selective removal remains unqualified.
+Q-FLUSH requires known UDP/TCP IPv4/IPv6 loopback and feth tuples immediately
+before the adapter call. The supplied 24H232 and 25G332 `-v` grammar is reviewed
+only for UDP tuple measurement: floating interface `ALL`, a header and one
+age/expiry/counters/anchor/rule/flowhash detail line, and no id/creatorid. The
+protocol allowlist is exactly `udp`; the observed status pairs are
+`SINGLE:NO_TRAFFIC` and `NO_TRAFFIC:SINGLE`. These tuples are not kernel state
+identities. The parser consumes the whole listing: another protocol, any
+extra/unknown line, malformed record or truncation invalidates the entire
+measurement with an explicit error, never partial success or "no state".
+Both `-v` and `-vv` are captured; `-vv` remains capture-only. Q-ANCHOR records
+state read/parse errors per hooked iteration and in the `-F all` scope check,
+continues the remaining lifecycle steps, and aggregates these measurement
+issues as Inconclusive. Its repeated socket tuple measures presence, not identity.
+A tuple present after Q-FLUSH is likewise Inconclusive because it may recur.
+Unknown text, missing tuples, stock skip or unavailable feth is Inconclusive. Accepted TCP sockets are explicitly blocking with a read timeout.
+Q-FLUSH attempts anchor and feth cleanup after errors and observation panics.
+Interface/address selectors remain raw measurements; selective removal is unqualified.
+
+Q-E2E alone stages the pinned child at `/opt/scupper/wireguard-go`. Any existing
+entry, including a dangling symlink, refuses staging. Inspection errors are not
+absence. Parents must be root-owned and not group/other-writable; absent parents
+are created with protected modes. Write-ahead intents precede mkdir and exclusive
+file creation, and successful creations record device/inode identity. The file
+uses O_CREAT|O_EXCL with no replacement or rename-over. Cleanup removes only
+matching created objects, directories only when empty; unresolved intents and
+changed identities are retained as restore issues. The named path-absence precheck
+and both executable_id/image_uuid results precede scenario counts. No process-name
+or unreadable-identity exceptions are added. Production root, lock, control and
+anchor remain refused by qualification constructors. Shared-anchor contamination
+gates Q-CONTRACTS-anchor and Join, after core contracts and Left have run.
 
 Run `python3 crates/scupper-mac/tests/r7_mutations.py` for portable assertion
 mutants. They include listed-empty absence, no flush after a complete first None,
-optimizer mode, restore continuation, the contracts job label and golden mismatch
-classification. Original source bytes are restored on every exit; evidence is
+optimizer mode, restore continuation, the contracts job label, golden mismatch
+classification, vanished evidence entries, incomplete anchor reads, parse errors,
+exclusive child staging, the anchor-only gate, initial missing-anchor EINVAL,
+non-aborting state errors and inventory-difference verdicts. Original source bytes
+are restored on every exit; evidence is
 kept under target/r7-mutants until the required final target cleanup.
 
 R7 verification traces record `verification_kind:Lockdown` or
@@ -493,3 +575,9 @@ record the observed statuses, including whether 113 was reached after settling.
 Anchor snapshot completion requires the same campaign quiescence fence as pf
 group/state completion. Incomplete or out-of-bounds descendant inventory records
 a per-entry restore failure and does not skip later journaled anchors.
+
+Pass-3 status: TCP `-v` grammar has never been observed or reviewed. Q-FLUSH
+creates TCP fixtures, so its state measurement is expected to be Inconclusive
+in pass 3. The `-v` and `-vv` captures are retained for a later grammar review;
+this expected measurement gap is not a new flush-adapter regression. Descendant
+coverage remains unreviewed on both builds.

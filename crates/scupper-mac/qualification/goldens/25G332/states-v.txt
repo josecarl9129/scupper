@@ -1,0 +1,4 @@
+ALL udp 127.0.0.1:55220 -> 127.0.0.1:64402       SINGLE:NO_TRAFFIC
+   age 00:00:01, expires in 00:00:29, 10:0 pkts, 400:0 bytes, anchor 0, rule 0, flowhash 0xb265ecd7
+ALL udp 127.0.0.1:64402 <- 127.0.0.1:55220       NO_TRAFFIC:SINGLE
+   age 00:00:01, expires in 00:00:29, 10:0 pkts, 400:0 bytes, anchor 0, rule 0, flowhash 0xc395ef5b

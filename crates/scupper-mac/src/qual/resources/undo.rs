@@ -36,11 +36,18 @@ mod tests {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     #[test]
     fn journal_undo_retains_entries_when_restartable_job_remains() -> Result<()> {
-        let out = std::env::current_dir()?.join("target").join(format!(
-            "resource-undo-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        let out = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("CARGO_TARGET_DIR")
+                    .map(|path| std::path::PathBuf::from(path).join("tmp"))
+            })
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!(
+                "resource-undo-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
         fs::create_dir_all(&out)?;
         let result = (|| -> Result<()> {
             let journal = concat!(

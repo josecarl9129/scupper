@@ -20,9 +20,52 @@ REVIEW = ROOT / "crates/scupper-mac/qualification/goldens/24H232/review.json"
 JOBS = ROOT / "crates/scupper-mac/src/qual/jobs.rs"
 TRACE = ROOT / "crates/scupper-mac/src/decode/qualification_trace.rs"
 RESOURCE_UNDO = ROOT / "crates/scupper-mac/src/qual/resources/undo.rs"
+EVIDENCE_PATH = ROOT / "crates/scupper-mac/src/qual/evidence_path.rs"
+STATE_MEASURE = ROOT / "crates/scupper-mac/src/qual/state_measure.rs"
+RULESET_CENSUS = ROOT / "crates/scupper-darwin/src/pf_rulesets.rs"
+DESC_INVENTORY = ROOT / "crates/scupper-mac/src/qual/desc_inventory.rs"
+CHILD_STAGE = ROOT / "crates/scupper-mac/src/qual/child_stage.rs"
 OUT = ROOT / "target/r7-mutants"
 OUT.mkdir(parents=True, exist_ok=True)
 MUTANTS = [
+    ("state-issues-hide-removal-refutation", STATE_MEASURE,
+     'if r.verdict != super::Verdict::AssumptionRefuted {', 'if true {',
+     "qual::state_measure::tests::state_issues_preserve_removal_refutation_and_detail"),
+    ("kernel-missing-anchor-EINVAL-to-ENOENT", RULESET_CENSUS,
+     'Err(EINVAL) => return Ok(None),', 'Err(2 /* Darwin ENOENT */) => return Ok(None),',
+     "qual::ruleset_census::tests::missing_anchor_errno_only_on_initial_count"),
+    ("state-read-aborts-first-error", STATE_MEASURE,
+     'next(read.map_err(|e| e.to_string()))', 'next(Ok(read?))',
+     "qual::state_measure::tests::read_errors_do_not_abort_lifecycle_or_scope_measurements"),
+    ("inventory-differences-ignored", DESC_INVENTORY,
+     ['if !kernel_only.is_empty() {', 'if !text_only.is_empty() {'],
+     ['if false && !kernel_only.is_empty() {', 'if false && !text_only.is_empty() {'],
+     "qual::desc_inventory::tests::stable_inventory_differences_are_findings_and_mutation_is_inconclusive"),
+    ("sweep-NotFound-fatal-again", EVIDENCE_PATH,
+     'Err(error) if error.kind() == io::ErrorKind::NotFound => (),',
+     'Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(error),',
+     "qual::evidence_path::tests::sweep_skips_vanished"),
+    ("restore-failed-read-is-not-empty", RECOVERY,
+     ['.inconclusive\n                    .push(format!("journaled anchor read incomplete: {path}: {error}"))',
+      'journaled anchor read incomplete: {path}: {error}'],
+     ['.violations\n                    .push(format!("journaled anchor read incomplete: {path}: {error}"))',
+      'journaled anchor not empty: {path}: {error}'],
+     "qual::recovery::anchor_read_tests::duplicate_failed_read"),
+    ("state-parse-error-is-no-state", STATE_MEASURE,
+     'let states = rows?;', 'let states = rows.unwrap_or_default();',
+     "qual::state_measure::tests::parse_failure_is_explicit"),
+    ("child-staging-overwrites-existing-entry", CHILD_STAGE,
+     ['if !absent(target)? {', '.create_new(true)'],
+     ['if false && !absent(target)? {', '.create(true).truncate(true)'],
+     "qual::child_stage::tests::staging_never_overwrites"),
+    ("child-staging-exclusive-create-lost", CHILD_STAGE,
+     '.create_new(true)', '.create(true).truncate(true)',
+     "qual::child_stage::tests::exclusive_create_closes"),
+    ("shared-anchor-gates-core-and-Left-again", NATIVE_CONTRACTS,
+     'results.push(case(out, id, |r| operation(out, r))?);',
+     'results.push(case(out, id, |r| { if matches!(id, "Q-CONTRACTS" | "Q-E2E") { shared_anchor_clean(out)?; } operation(out, r) })?);',
+     "python:ArtifactTests.test_shared_anchor_gate_only_blocks_anchor_work"),
+
     ("unreviewed-load-accepts-any-payload", ANCHOR,
      'if text != scupper_core::mac::policy::render_lockdown().as_str()',
      'if false && text != scupper_core::mac::policy::render_lockdown().as_str()',

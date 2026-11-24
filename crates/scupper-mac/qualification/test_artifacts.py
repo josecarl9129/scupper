@@ -6,6 +6,7 @@ import re
 import ast
 from pathlib import Path
 import subprocess
+import shlex
 import sys
 import tempfile
 import unittest
@@ -17,8 +18,12 @@ SHA256 = "a" * 64
 
 class ArtifactTests(unittest.TestCase):
     def setUp(self):
-        # Keep all test writes in the worktree, including temporary evidence.
-        self.temporary = tempfile.TemporaryDirectory(prefix=".qual-test-", dir=REPO)
+        target_tmp = os.environ.get("CARGO_TARGET_TMPDIR")
+        if target_tmp is None and os.environ.get("CARGO_TARGET_DIR"):
+            target_tmp = str(Path(os.environ["CARGO_TARGET_DIR"]) / "tmp")
+        if target_tmp is not None:
+            Path(target_tmp).mkdir(parents=True, exist_ok=True)
+        self.temporary = tempfile.TemporaryDirectory(prefix=".qual-test-", dir=target_tmp)
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.write_json("preflight.json", {"binary_sha256": SHA256})
@@ -50,6 +55,119 @@ class ArtifactTests(unittest.TestCase):
                 self.assertEqual(hashlib.sha256((goldens / build / name).read_bytes()).hexdigest(), expected,
                                  f"{build}/{name} golden drift")
 
+    def test_measurement_reviews_pin_exact_udp_rows_and_full_rejections(self):
+        goldens = REPO / "crates/scupper-mac/qualification/goldens"
+        for build in ["24H232", "25G332"]:
+            review = json.loads((goldens / build / "measurement-review.json").read_text())
+            self.assertEqual(review["build"], build)
+            self.assertIs(review["states_v_reviewed"], True)
+            self.assertEqual(review["protocol_allowlist"], ["udp"])
+            self.assertIs(review["states_vv_reviewed"], False)
+            self.assertIs(review["descendants_reviewed"], False)
+            self.assertFalse(review["inline_multiline_reviewed"])
+            self.assertEqual(hashlib.sha256((goldens / build / "states-v.txt").read_bytes()).hexdigest(),
+                             review["states_v_sha256"])
+            self.assertEqual({row["name"] for row in review["rejections"]}, {"underscore", "inline"})
+            for row in review["rejections"]:
+                self.assertTrue(row["reviewed"])
+                self.assertEqual(row["command"], ["/sbin/pfctl", "-o", "none", "-a", "scupper-qual/children", "-f", "-"])
+                self.assertEqual(row["exit_code"], 1)
+                self.assertEqual(row["stdout"], "")
+                self.assertTrue(row["stderr"].endswith("pfctl: Syntax error in config file: pf rules not loaded\n"))
+        a = json.loads((goldens / "24H232/measurement-review.json").read_text())["rejections"]
+        b = json.loads((goldens / "25G332/measurement-review.json").read_text())["rejections"]
+        self.assertEqual(a, b)
+
+    def test_ruleset_probe_falls_back_and_records_header_provenance(self):
+        header = REPO / "crates/scupper-darwin/probe/pf-rulesets-layout.h"
+        # Select the absent branch in a copy without redefining compiler builtins.
+        missing_header = self.root / "missing-layout.h"
+        text = header.read_text()
+        self.assertEqual(text.count("#if __has_include(<net/pfvar.h>)"), 1)
+        missing_header.write_text(text.replace("#if __has_include(<net/pfvar.h>)", "#if 0", 1))
+        net = self.root / "net"
+        net.mkdir()
+        synthetic = ("struct pfioc_ruleset { uint32_t nr; char path[1024]; char name[64]; };\n"
+                     "#define DIOCGETRULESETS 0xC444443AUL\n#define DIOCGETRULESET 0xC444443BUL\n")
+        pfvar = net / "pfvar.h"
+        pfvar.write_text(synthetic)
+        for present in [False, True]:
+            with self.subTest(from_sdk_header=present):
+                # BSD ioctl encoding for this portable synthetic-header test only.
+                # This is not a compile against a macOS SDK.
+                source = ('#include <stdint.h>\n#include <stddef.h>\n#include <stdio.h>\n#include <sys/ioctl.h>\n'
+                          '#if !defined(__APPLE__)\n#undef _IOWR\n'
+                          '#define _IOWR(g,n,t) (0xC0000000UL | (sizeof(t) << 16) | ((g) << 8) | (n))\n#endif\n'
+                          '#include "' + str(header if present else missing_header) + '"\n'
+                          'int main(void) { ruleset_layout(); return 0; }\n')
+                c_file = self.root / "probe.c"
+                c_file.write_text(source)
+                binary = self.root / "probe"
+                log = self.root / "abi-build.log"
+                command = [os.environ.get("CC", "cc"), "-std=c11", "-Wall", "-Wextra", "-Werror", "-v", "-I", str(self.root),
+                           str(c_file), "-o", str(binary)]
+                compiled = subprocess.run(["bash", "-eo", "pipefail", "-c",
+                                           shlex.join(command) + " 2>&1 | tee " + shlex.quote(str(log))],
+                                          capture_output=True, text=True, check=False)
+                self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
+                self.assertIn("checking XNU-published layout pins" if present else
+                              "XNU-published layout pin, not SDK-verified", log.read_text())
+                measured = subprocess.run([str(binary)], capture_output=True, text=True, check=True)
+                layout = json.loads("{" + measured.stdout.rstrip(",") + "}")
+                self.assertIs(layout["pfioc_ruleset"]["from_sdk_header"], present)
+                self.assertEqual(layout["pfioc_ruleset"]["layout_source"],
+                                 "sdk-header" if present else "xnu-published-pin")
+                self.assertEqual(layout["pfioc_ruleset"]["size"], 1092)
+                self.assertEqual(layout["pfioc_ruleset"]["fields"], {"nr": 0, "path": 4, "name": 1028})
+                self.assertEqual(layout["DIOCGETRULESETS"], 0xC444443A)
+                self.assertEqual(layout["DIOCGETRULESET"], 0xC444443B)
+        for broken in [synthetic.replace("#define DIOCGETRULESETS 0xC444443AUL", ""),
+                       synthetic.replace("#define DIOCGETRULESET 0xC444443BUL", ""),
+                       synthetic.replace("path[1024]", "path[1023]"),
+                       synthetic.replace("0xC444443AUL", "0xC444443CUL")]:
+            pfvar.write_text(broken)
+            compiled = subprocess.run(command, capture_output=True, text=True, check=False)
+            self.assertNotEqual(compiled.returncode, 0)
+        native = (REPO / "crates/scupper-mac/src/qual/contracts.rs").read_text()
+        self.assertNotIn('layout["pfioc_ruleset"]["from_sdk_header"] == true', native)
+        self.assertIn('let from_sdk_header = layout["pfioc_ruleset"]["from_sdk_header"]', native)
+        self.assertIn('from_sdk_header={from_sdk_header}', native)
+        self.assertIn('XNU-published layout pin, not SDK-verified', native)
+        if sys.platform == "darwin":
+            # On macOS also compile the entire probe using the CI flags/pipeline.
+            full_command = ["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-v",
+                            str(REPO / "crates/scupper-darwin/probe/abi.c"), "-o", str(binary)]
+            full = subprocess.run(["bash", "-eo", "pipefail", "-c", shlex.join(full_command) +
+                                   " 2>&1 | tee " + shlex.quote(str(log))],
+                                  capture_output=True, text=True, check=False)
+            self.assertEqual(full.returncode, 0, full.stdout + full.stderr)
+            measured = subprocess.run([str(binary)], capture_output=True, text=True, check=True)
+            self.assertIsInstance(json.loads(measured.stdout)["pfioc_ruleset"]["from_sdk_header"], bool)
+
+    def test_anchor_state_issues_cannot_bypass_continuation_or_verdict_guard(self):
+        source = (REPO / "crates/scupper-mac/src/qual/contracts.rs").read_text()
+        lifecycle = source[source.index("fn anchor_lifecycle("):source.index("fn adapter_measurement_complete(")]
+        scope = source[source.index("fn fall_scope("):source.index("fn flush(")]
+        self.assertIn("state_measure::finish_anchor(r, &state_issues, env)", lifecycle)
+        self.assertIn("states_every_time &= state_issues.is_empty()", lifecycle)
+        self.assertEqual(lifecycle.count("state_measure::continue_after_read("), 1)
+        self.assertEqual(scope.count("state_measure::continue_after_read("), 2)
+        self.assertNotRegex(lifecycle + scope, r"known_id\([^;]*?\)\?")
+        self.assertNotIn("state_ids(&states_after)?", scope)
+
+    def test_inventory_findings_reach_case_verdict_and_restore_census_continues(self):
+        source = (REPO / "crates/scupper-mac/src/qual/contracts.rs").read_text()
+        campaign = source[source.index("fn descendant_measurements("):source.index("fn kernel_comparison(")]
+        self.assertRegex(campaign, r"findings\.extend\(\s*inventory_findings\s*\.into_iter\(\)\s*\.map\(\|finding\| \(true, finding\)\),?\s*\)")
+        case = source[source.index("fn descendants("):source.index("fn anchor_lifecycle(")]
+        self.assertIn("desc_inventory::verdict(&findings)", case)
+        self.assertLess(case.index("verdict != Verdict::ContractViolation"), case.index("r.verdict = verdict"))
+        restore = (REPO / "crates/scupper-mac/src/qual/resources.rs").read_text()
+        targets = restore[restore.index("for target in targets.iter().rev()"):restore.index('"pf state" =>')]
+        self.assertNotIn("qual_pf_rulesets(target)?", targets)
+        self.assertIn("anchor restore census: {target}: {error}", targets)
+        self.assertIn("continue;", targets)
+
     def test_anchor_campaign_orders_and_isolates_descendants(self):
         source = (REPO / "crates/scupper-mac/src/qual/contracts.rs").read_text()
         campaign = source[source.index("fn anchors("):source.index("fn descendants(")]
@@ -77,6 +195,43 @@ class ArtifactTests(unittest.TestCase):
         native = (REPO / "crates/scupper-mac/src/native/mod.rs").read_text()
         self.assertIn('cfg(all(feature = "qualification", not(test)))', native)
         self.assertIn('paths.anchor_path() == "com.apple/scupper"', native)
+        self.assertIn("paths.root.starts_with(PRODUCTION_ROOT)", native)
+        self.assertIn("paths.lock == Path::new(PRODUCTION_LOCK)", native)
+        self.assertIn("paths.control == Path::new(PRODUCTION_CONTROL)", native)
+        stage = REPO / "crates/scupper-mac/src/qual/child_stage.rs"
+        self.assertIn('const CHILD: &str = "/opt/scupper/wireguard-go"', stage.read_text())
+        for path in paths:
+            if path != stage and path.parent.name == "qual":
+                self.assertNotIn('"/opt/scupper', path.read_text(), str(path))
+                if path.name != "contracts.rs":
+                    self.assertNotIn("child_stage::stage(", path.read_text(), str(path))
+            self.assertNotRegex(path.read_text(), r'["\']/private/var/db/scupper(?:/|["\'])', str(path))
+        contracts = (REPO / "crates/scupper-mac/src/qual/contracts.rs").read_text()
+        self.assertIn("Path::new(super::super::child_stage::CHILD)", contracts)
+        body = contracts[contracts.index("fn e2e("):contracts.index("fn e2e_scenarios(")]
+        self.assertIn("child_stage::stage(&bytes", body)
+        self.assertEqual(contracts.count("child_stage::stage("), 1)
+
+    def test_shared_anchor_gate_only_blocks_anchor_work(self):
+        source = (REPO / "crates/scupper-mac/src/qual/contracts.rs").read_text()
+        worker = source[source.index("pub(super) fn worker("):source.index("struct Harness")]
+        self.assertNotIn("shared_anchor_clean(out)?", worker)
+        contracts = source[source.index("fn contracts("):source.index("fn seed(")]
+        self.assertLess(contracts.index('"Q-CONTRACTS-core"'), contracts.index('"Q-CONTRACTS-anchor"'))
+        self.assertGreater(contracts.index("shared_anchor_clean(out)?"), contracts.index('"Q-CONTRACTS-anchor"'))
+        e2e = source[source.index("fn e2e_scenarios("):source.index("fn inventory(")]
+        self.assertLess(e2e.index('"e2e-left.json"'), e2e.index("shared_anchor_clean(out)?"))
+        self.assertLess(e2e.index("shared_anchor_clean(out)?"), e2e.index('"engine-join"'))
+
+    def test_deep_descendant_targets_keep_the_adapter_namespace_fixed(self):
+        source = (REPO / "crates/scupper-mac/src/qual/contracts.rs").read_text()
+        campaign = source[source.index("fn descendant_measurements("):source.index("fn kernel_comparison(")]
+        self.assertIn("journal_measurement_target(out, &parent)", campaign)
+        self.assertIn("journal_measurement_target(out, &target)", campaign)
+        self.assertNotIn("journal_anchor(out, &parent", campaign)
+        self.assertNotIn("journal_anchor(out, &target", campaign)
+        adapter = (REPO / "crates/scupper-mac/src/decode/pfanchor.rs").read_text()
+        self.assertIn("components.len() != 2", adapter)
 
     def test_pf_contract_and_stale_measurement_have_separate_artifacts(self):
         manifest = json.loads((REPO / "crates/scupper-mac/qualification/manifest.json").read_text())

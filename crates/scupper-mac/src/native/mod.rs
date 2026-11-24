@@ -158,8 +158,14 @@ impl NativePlatform {
     // with compile_error! (or check the release binary in CI) when adding its constructor.
     pub fn new(paths: Paths) -> Result<Self, SysError> {
         #[cfg(all(feature = "qualification", not(test)))]
-        if paths.anchor_path() == "com.apple/scupper" {
-            return Err(SysError::Failed("qualification requires a scratch anchor"));
+        if paths.anchor_path() == "com.apple/scupper"
+            || paths.root.starts_with(PRODUCTION_ROOT)
+            || paths.lock == Path::new(PRODUCTION_LOCK)
+            || paths.control == Path::new(PRODUCTION_CONTROL)
+        {
+            return Err(SysError::Failed(
+                "qualification requires scratch root, lock, control and anchor",
+            ));
         }
         scupper_darwin::check_sigchld().map_err(|_| SysError::Failed("native: unsafe SIGCHLD"))?;
         Ok(Self {

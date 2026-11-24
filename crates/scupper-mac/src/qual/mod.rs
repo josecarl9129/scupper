@@ -9,6 +9,12 @@
 #[cfg(any(target_os = "macos", test))]
 mod base_check;
 #[cfg(any(target_os = "macos", test))]
+mod child_stage;
+#[cfg(any(target_os = "macos", test))]
+mod desc_inventory;
+#[cfg(any(target_os = "macos", test))]
+mod evidence_path;
+#[cfg(any(target_os = "macos", test))]
 mod guard;
 #[cfg(any(target_os = "macos", test))]
 mod jobs;
@@ -65,3 +71,8 @@ pub fn main_entry() -> u8 {
         1
     }
 }
+
+// Exercise the exact qualification census implementation with portable fake ioctls.
+#[cfg(test)]
+#[path = "../../../scupper-darwin/src/pf_rulesets.rs"]
+mod ruleset_census;

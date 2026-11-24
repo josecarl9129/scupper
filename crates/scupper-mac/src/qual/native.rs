@@ -3,7 +3,7 @@ use std::{
     error::Error,
     fs,
     io::Write,
-    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     thread,
@@ -177,15 +177,7 @@ pub(super) fn dispatch(args: &[String]) -> Result<()> {
     }
     protected_path(&options.out, true)?;
     options.out = options.out.canonicalize()?;
-    for entry in fs::read_dir(&options.out)? {
-        let entry = entry?;
-        // A mounted APFS root has filesystem-selected ownership/mode. Validate
-        // its protected mountpoint parent, then detach by journaled image path.
-        if entry.file_name() == "storage-mount" && entry.file_type()?.is_dir() {
-            continue;
-        }
-        protected_path(&entry.path(), entry.file_type()?.is_dir())?;
-    }
+    super::evidence_path::sweep(&options.out)?;
     if options.out.join("preflight.json").exists() {
         let baseline: Snapshot = read_json(&options.out.join("preflight.json"))?;
         if baseline.binary_sha256 != executable_sha256()? {
@@ -247,35 +239,8 @@ pub(super) fn dispatch(args: &[String]) -> Result<()> {
     }
 }
 
-// lstat each component, including ancestors: a protected file inside a writable
-// directory can still be replaced. Never follow a caller-planted symlink.
 fn protected_path(path: &Path, directory: bool) -> Result<()> {
-    if !path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::ParentDir | std::path::Component::CurDir
-            )
-        })
-    {
-        return Err("protected paths must be absolute without dot components".into());
-    }
-    for component in path.ancestors() {
-        let meta = fs::symlink_metadata(component)?;
-        let needs_directory = component != path || directory;
-        if meta.uid() != 0
-            || meta.mode() & 0o022 != 0
-            || (needs_directory && !meta.is_dir())
-            || (!needs_directory && !meta.is_file())
-        {
-            return Err(format!(
-                "{} must be root-owned, non-writable by other users, and a regular {}",
-                component.display(),
-                if needs_directory { "directory" } else { "file" }
-            )
-            .into());
-        }
-    }
+    super::evidence_path::protected_path(path, directory)?;
     Ok(())
 }
 
@@ -640,6 +605,20 @@ fn arm(options: &Options) -> Result<()> {
             require_ack(&options.out)?;
             return Ok(());
         }
+        let status = invoke_before(
+            "/bin/launchctl",
+            &["print", &service],
+            wait + Duration::from_secs(10),
+        );
+        write_json(
+            &options.out,
+            &format!("{}.json", unique("deadman-arm-status")),
+            &status,
+        )?;
+        if super::guard::job_exited(&status) {
+            arm_diagnostics(&options.out)?;
+            return Err("dead-man exited before acknowledgement; see deadman-failed-status.json and worker logs".into());
+        }
         thread::sleep(Duration::from_millis(100));
     }
     arm_diagnostics(&options.out)?;
@@ -931,33 +910,40 @@ fn restore(out: &Path, deadline: Instant) -> Result<Restore> {
         violations.push(format!("restore: {error}"));
     }
     let post = post?;
-    for directory in scopes
-        .iter()
-        .map(|(_, scope)| scope.as_path())
-        .chain(std::iter::once(out))
-    {
-        if let Err(error) =
-            resources::complete_from_snapshot(directory, &post, deadline, snapshot_quiescent)
-        {
-            violations.push(format!("record completion: {error}"));
-        }
-    }
     let mut empty_anchor_names = Vec::new();
+    let mut incomplete_anchor_names = Vec::new();
     for directory in scopes
         .iter()
         .map(|(_, scope)| scope.as_path())
         .chain(std::iter::once(out))
     {
         match resources::restored_anchor_names(directory, &before, deadline) {
-            Ok(names) => empty_anchor_names.extend(names),
-            Err(error) => violations.push(format!("post-state anchor inventory: {error}")),
+            Ok(reads) => {
+                if let Err(error) = resources::complete_from_snapshot(
+                    directory,
+                    &post,
+                    deadline,
+                    snapshot_quiescent,
+                    &reads.empty_names,
+                ) {
+                    violations.push(format!("record completion: {error}"));
+                }
+                empty_anchor_names.extend(reads.empty_names);
+                incomplete_anchor_names.extend(reads.incomplete_names);
+                violations.extend(reads.violations);
+                inconclusive.extend(reads.inconclusive);
+            }
+            Err(error) => {
+                inconclusive.push(format!("post-state anchor inventory incomplete: {error}"));
+            }
         }
     }
-    let changed = restore_check::state_changes(
+    let changed = restore_check::state_changes_with_incomplete(
         &before.observations,
         &post.observations,
         &journaled_keys,
         &empty_anchor_names,
+        &incomplete_anchor_names,
     );
     violations.extend(changed.violations.iter().cloned());
     let result = Restore {
@@ -1313,6 +1299,19 @@ fn run_probes(out: &Path, group: &str) -> Result<()> {
 
 fn final_restore_deadline(out: &Path) -> Result<Instant> {
     let mut remaining = resources::remaining(out)?;
+    let mut anchors = std::collections::BTreeSet::new();
+    for directory in probe_scopes(out)?
+        .into_iter()
+        .map(|(_, scope)| scope)
+        .chain(std::iter::once(out.to_owned()))
+    {
+        anchors.extend(
+            resources::entries(&directory)?
+                .into_iter()
+                .filter(|e| matches!(e.kind.as_str(), "anchor" | "anchor-target"))
+                .map(|e| (directory.clone(), e.path)),
+        );
+    }
     for (_, scope) in probe_scopes(out)? {
         remaining = remaining.saturating_add(resources::remaining(&scope)?);
     }
@@ -1324,7 +1323,7 @@ fn final_restore_deadline(out: &Path) -> Result<Instant> {
     {
         super::model::MAX_FINAL_RESTORE_SECONDS
     } else {
-        recovery::final_restore_seconds(remaining)
+        recovery::final_restore_seconds(remaining, anchors.len())
     };
     Ok(Instant::now() + Duration::from_secs(seconds))
 }

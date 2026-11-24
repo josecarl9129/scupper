@@ -5,13 +5,14 @@ use serde::{Deserialize, Serialize};
 
 use super::{Evidence, journal::Entry, model::MAX_FINAL_RESTORE_SECONDS};
 
-pub(super) fn final_restore_seconds(remaining: usize) -> u64 {
+pub(super) fn final_restore_seconds(remaining: usize, anchors: usize) -> u64 {
     10_u64
         .saturating_add(
             u64::try_from(remaining)
                 .unwrap_or(u64::MAX)
                 .saturating_mul(2),
         )
+        .saturating_add(u64::try_from(anchors).unwrap_or(u64::MAX).saturating_mul(3))
         .min(MAX_FINAL_RESTORE_SECONDS)
 }
 
@@ -152,10 +153,13 @@ mod tests {
 
     #[test]
     fn final_budget_is_sized_and_bounded() {
-        assert_eq!(final_restore_seconds(0), 10);
-        assert_eq!(final_restore_seconds(64), 138);
-        assert_eq!(final_restore_seconds(115), MAX_FINAL_RESTORE_SECONDS);
-        assert_eq!(final_restore_seconds(usize::MAX), MAX_FINAL_RESTORE_SECONDS);
+        assert_eq!(final_restore_seconds(0, 4), 22);
+        assert_eq!(final_restore_seconds(64, 0), 138);
+        assert_eq!(final_restore_seconds(115, 0), MAX_FINAL_RESTORE_SECONDS);
+        assert_eq!(
+            final_restore_seconds(usize::MAX, usize::MAX),
+            MAX_FINAL_RESTORE_SECONDS
+        );
     }
 
     #[test]
@@ -261,6 +265,7 @@ pub(super) fn undo<E: std::fmt::Display>(
         "store tree",
         "loopback",
         "sockets",
+        "child staging",
         "feth",
         "completion",
     ] {
@@ -364,5 +369,66 @@ mod undo_tests {
         assert!(visited.contains(&"anchors".into()));
         assert!(visited.contains(&"completion".into()));
         assert_eq!(failures, ["tools failed"]);
+    }
+}
+
+/// Keep independent allowances when another anchor read is incomplete.
+#[derive(Default, serde::Serialize)]
+pub(super) struct AnchorReads {
+    pub empty_names: Vec<String>,
+    pub incomplete_names: Vec<String>,
+    pub violations: Vec<String>,
+    pub inconclusive: Vec<String>,
+}
+pub(super) fn read_anchors<E: std::fmt::Display>(
+    paths: impl IntoIterator<Item = String>,
+    mut read: impl FnMut(&str) -> Result<Option<Vec<String>>, E>,
+) -> AnchorReads {
+    let mut result = AnchorReads::default();
+    for path in paths.into_iter().collect::<BTreeSet<_>>() {
+        match read(&path) {
+            Ok(None) => result
+                .violations
+                .push(format!("journaled anchor has configuration: {path}")),
+            Ok(Some(names)) => result.empty_names.extend(names),
+            Err(error) => {
+                result
+                    .inconclusive
+                    .push(format!("journaled anchor read incomplete: {path}: {error}"));
+                result.incomplete_names.push(path);
+            }
+        }
+    }
+    result
+}
+#[cfg(test)]
+mod anchor_read_tests {
+    #[test]
+    fn duplicate_failed_read_is_inconclusive_and_keeps_other_allowances() {
+        let mut calls = Vec::new();
+        let result = super::read_anchors(["a", "b", "a", "c"].map(str::to_owned), |path| {
+            calls.push(path.to_owned());
+            match path {
+                "a" => Ok(Some(vec![path.to_owned()])),
+                "b" => Err("-sd timed out"),
+                _ => Ok(None),
+            }
+        });
+        assert_eq!(calls, ["a", "b", "c"]);
+        assert_eq!(result.empty_names, ["a"]);
+        assert_eq!(result.incomplete_names, ["b"]);
+        assert_eq!(
+            result.inconclusive,
+            ["journaled anchor read incomplete: b: -sd timed out"]
+        );
+        assert_eq!(result.violations, ["journaled anchor has configuration: c"]);
+        assert!(
+            !result
+                .violations
+                .iter()
+                .any(|s| s.contains("b:") || s.contains("not empty"))
+        );
+        assert_eq!(super::final_restore_seconds(0, 0), 10);
+        assert_eq!(super::final_restore_seconds(0, 9), 37);
     }
 }

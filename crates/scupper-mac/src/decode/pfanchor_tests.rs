@@ -746,3 +746,18 @@ fn descendant_depth_bound_precedes_component_limit() {
     );
     assert!(!io.calls.iter().any(|args| args[1].ends_with("/child")));
 }
+
+#[test]
+fn nonempty_descendant_each_configuration_class_is_err_with_review_flag_true() {
+    for (flag, value) in [
+        ("-sr", "pass quick on lo0 all no state\n"),
+        ("-sn", "nat on lo0 from any to any -> 127.0.0.1\n"),
+        ("-sT", "qtable\n"),
+        ("-sd", "dummynet in all pipe 1\n"),
+    ] {
+        let mut io = tree(true, 1);
+        io.bad = Some((flag, Ok(Text::Present(value.into()))));
+        assert!(read(&mut io, &path()).is_err(), "{flag}");
+        assert!(remove(&mut io, &path()).is_err(), "{flag}");
+    }
+}

@@ -115,7 +115,7 @@ provenance state. A persistent runtime history fault, including durable-write
 failure, is paged only by the monitor timeout, not immediately by `/3`. The
 on-host `client-session-history-alert` event still fires. `ok_only` never pages
 immediately anyway. The timeout bounds the continuous absence of success;
-brief recoveries to 0 can reset it repeatedly. A real serving failure visible
+short recoveries to 0 can reset it repeatedly. A real serving failure visible
 only as stale client handshakes remains exit 0 after reconstruction: the existing
 Protected-with-stale policy is unchanged.
 
@@ -371,8 +371,8 @@ observation. A superseded PersistIntent must re-plan the admitted Join and
 commit its intent before exposing any later D effect. Failed Stuck ClearIntent
 rechecks revoke Left publication and name the remaining cleanup item.
 
-Mutants never run in the implementation worktree. Run mutation scripts only in
-a disposable copy (a separate git worktree at the same commit), so a killed
+Mutants never run in the implementation checkout. Run mutation scripts only in
+a disposable copy (a separate git checkout at the same commit), so a killed
 script cannot leave a mutant in code that will be committed (review
 05a2r6-fix1 S-E, run 6 M-1).
 
@@ -430,7 +430,7 @@ SF-6 is deferred to run 7: a stray helper with an invalid identity can still
 attempt the internal_error commit without an exclusive single-instance lock.
 Concurrent incarnations can interfere with the snapshot pair. Run 7 must cover
 two writers and decide the lock/commit ownership boundary. No mutation scripts
-were run in this worktree or in this round.
+were run in this checkout or in this round.
 
 ## 5a2 emergency lockdown: pf enable and unreserved references; Leave under a failed invariant (2026-11-17)
 
@@ -517,7 +517,7 @@ the same 1–60 s schedule to bound snapshot writes if both commands keep failin
 Run 7a covers these decisions, typed capture errors, generated emergency and Stuck
 fault tables, and Leave/reference rows. Crash boundaries, two-incarnation and
 single-instance behavior, and post-exit requests are run 7b. Mutants run only in
-the coordinator’s disposable run-7c worktree. Real-adapter contracts (EEXIST,
+the coordinator’s disposable run-7c checkout. Real-adapter contracts (EEXIST,
 NotStarted versus Unknown, and tool pinning across OS updates) remain run 8/5a2c.
 
 ## 5a2 emergency reload recovery and known storage failure (2026-11-17)
@@ -895,7 +895,7 @@ runner using `prlimit --as` (4 GiB by default, configurable in bytes). Cargo and
 rustc are outside that test-only limit. Controls pre-build with `--locked`, and
 each named test has its own timeout. After an abnormal stop, re-invoke the harness
 immediately to recover its journal and stop orphaned sessions; confirm a clean
-worktree before using a disposable tree for gates. Simultaneous SIGKILL of both
+checkout before using a disposable tree for gates. Simultaneous SIGKILL of both
 controller and watchdog still needs that recovery, although binary memory remains
 bounded by the runner.
 
@@ -1290,14 +1290,14 @@ Support and qualify macOS 15 and 26 on Apple Silicon using the pinned
 `macos-15` and `macos-26` GitHub runner labels. macOS 14 is unsupported; its
 GitHub runner image was retired on 2026-11-02. Never select `macos-latest` for
 qualification. Runner evidence applies only to the exact observed build and
-architecture; it does not automatically qualify another Mac. With the owner's
+architecture; it does not automatically qualify another Mac. With the maintainer's
 consent and timing, later on-device qualification may collect a separate record
 under the dead-man restore, using inert test anchors for non-network groups.
 
 
 ## 2026-11-24 — 5a2c R7: fix 3 binding decisions
 
-The owner accepts fix 2's `engine/protocol.rs` ClearIntent change: only `None`
+The maintainer accepts fix 2's `engine/protocol.rs` ClearIntent change: only `None`
 clears anchor intent. `Some("")` and `Some(" \n")` from a nonconforming adapter
 must refuse to clear. Keep the `.is_some()` check; do not restore whitespace
 normalization in the engine.
@@ -1354,3 +1354,40 @@ coverage, optimizer controls and foreign fixtures. Case durations are recorded;
 native pass-2 timing must confirm the split against the pass-1 sizing evidence.
 Cleanup runs independently of case budgets. Failed cleanup retains journal
 obligations and withholds later dependent uses with its recorded reason.
+
+## 2026-11-24 — 5a2c R7 fix 6: adopted measurement pins and inventory verdict
+
+The fix 6 plan adopts the 24H232 UDP `pfctl -s states -v` bytes from
+CI 45397408312 attempt 2 and the byte-identical full underscore and one-line
+inline rejection rows on 24H232 and 25G332. Each build's measurement review pins
+its own state golden. Only UDP is reviewed; the parser must consume the entire
+listing and reject any other protocol, extra/unknown line, malformed record or
+truncation with an explicit measurement error. A state read/parse error records
+an Inconclusive issue and does not stop Q-ANCHOR's remaining lifecycle/scope
+steps. `-vv` and TCP remain capture-only; Q-FLUSH Inconclusive is expected in
+pass 3 pending review of the TCP captures. Tuples do not establish identity.
+Both builds retain `descendants_reviewed = false`.
+
+Per parent, compare normalized order-insensitive kernel K and text T sets.
+K minus T is a contract finding "text inventory incomplete"; T minus K is
+"inventory disagreement". Enumeration failure or detected concurrent mutation
+is Inconclusive, and traversal covers the observed union. Q-DESCENDANTS cannot
+be assumption_holds with any finding. Multi-line inline rejections remain
+unpinned. These are adopted maintainer decisions, so no further pin approval is
+required in this checkout.
+
+## 2026-11-24 — 5a2c R7 fix 7: private-header ABI fallback
+
+The probe uses `net/pfvar.h` when present. When public SDKs omit this private
+header, an in-tree mirror pins the XNU-published ruleset size 1092, offsets
+0/4/1028 and ioctl numbers 0xC444443A / 0xC444443B. This supersedes the earlier
+requirement to fail compilation when the header is absent. Missing ruleset ioctls
+in a present header, or a contradiction with the pins, still fail compilation.
+Evidence records `from_sdk_header:true|false` and `layout_source`; false means
+"XNU-published layout pin, not SDK-verified" and cannot claim SDK verification.
+Q-DESCENDANTS records this provenance and checks the pins without requiring true.
+
+Q-ANCHOR preserves AssumptionRefuted when removal fails despite state measurement
+issues, retaining those issues in its detail. Stable K/T existence disagreements
+are contract findings even if both child-name sets are empty. These measurements
+do not promote production descendant coverage flags.

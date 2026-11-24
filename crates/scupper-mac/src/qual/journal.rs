@@ -14,6 +14,10 @@ pub(super) struct Entry {
     pub token: u64,
     #[serde(default)]
     pub path: String,
+    #[serde(default)]
+    pub dev: u64,
+    #[serde(default)]
+    pub ino: u64,
 }
 
 // A partial final append cannot grant a child permission to mutate. The writer
@@ -373,5 +377,17 @@ mod r7 {
             assert_eq!(appended, absent);
             assert_eq!(result.is_ok(), absent);
         }
+    }
+}
+
+#[cfg(test)]
+mod child_identity_tests {
+    #[test]
+    fn created_entry_retains_deletion_identity() {
+        let entries = super::committed(
+            "{\"kind\":\"r7-child-created\",\"path\":\"fixture\",\"dev\":5,\"ino\":7}\n",
+        )
+        .unwrap();
+        assert_eq!((entries[0].dev, entries[0].ino), (5, 7));
     }
 }

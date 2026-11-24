@@ -1,4 +1,4 @@
-/* SDK layout evidence. Rust layout comparisons follow with each binding. */
+/* ABI evidence: public SDK layouts and explicitly labelled private XNU pins. */
 #define _DARWIN_C_SOURCE 1
 #include <errno.h>
 #include <fcntl.h>
@@ -16,6 +16,7 @@
 #include <sys/proc_info.h>
 #include <net/route.h>
 #include <sys/ioctl.h>
+#include "pf-rulesets-layout.h"
 /* Private XNU wire declaration: not an independent SDK oracle. */
 struct pfioc_token {
     uint64_t token, timestamp;
@@ -87,6 +88,7 @@ int main(int argc, char **argv) {
     }
     _Static_assert(F_FULLFSYNC == 51, "full-sync command");
     printf("{\"F_FULLFSYNC\":%d,", F_FULLFSYNC);
+    ruleset_layout();
     _Static_assert(sizeof(fstore_t) == 32, "fstore size");
     _Static_assert(offsetof(fstore_t, fst_flags) == 0, "fstore flags");
     _Static_assert(offsetof(fstore_t, fst_posmode) == 4, "fstore posmode");

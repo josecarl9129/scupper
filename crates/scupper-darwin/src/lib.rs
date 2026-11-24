@@ -4,6 +4,9 @@
 #[cfg(any(target_os = "macos", test))]
 mod rules;
 
+#[cfg(all(feature = "qualification", any(target_os = "macos", test)))]
+mod pf_rulesets;
+
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 mod sys;
@@ -52,6 +55,7 @@ mod tests {
 
 #[cfg(all(target_os = "macos", feature = "qualification"))]
 pub use sys::{
-    proc_control, proc_fds, proc_socket_fds, qual_inheritable_fd, qual_ipv4_bound_interface,
+    DIOCGETRULESET, DIOCGETRULESETS, PF_RULESET_FIELDS, PF_RULESET_SIZE, proc_control, proc_fds,
+    proc_socket_fds, qual_inheritable_fd, qual_ipv4_bound_interface, qual_pf_rulesets,
     qual_sigchld_refusals, qual_signal_kill, spawn_signal_probe,
 };

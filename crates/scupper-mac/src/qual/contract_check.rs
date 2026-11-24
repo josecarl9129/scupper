@@ -45,9 +45,12 @@ pub(super) fn with_cleanup<I, T, C, E>(
     observe: impl FnOnce(&mut I) -> Result<T, E>,
     cleanup: impl FnOnce(&mut I) -> C,
 ) -> (Result<T, E>, C) {
-    let observation = observe(io);
+    let observation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observe(io)));
     let cleaned = cleanup(io);
-    (observation, cleaned)
+    match observation {
+        Ok(result) => (result, cleaned),
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
 }
 
 // Measurements accept any text, including nonempty foreign classes, but every
@@ -57,7 +60,10 @@ pub(super) fn measurement_complete(value: &serde_json::Value) -> bool {
         serde_json::Value::Object(fields) if fields.contains_key("command") => {
             serde_json::from_value::<super::Evidence>(value.clone()).is_ok_and(|e| e.complete())
         }
-        serde_json::Value::Object(fields) => fields.values().all(measurement_complete),
+        serde_json::Value::Object(fields) => {
+            fields.get("kernel_complete").is_none_or(|v| v == true)
+                && fields.values().all(measurement_complete)
+        }
         serde_json::Value::Array(values) => values.iter().all(measurement_complete),
         _ => true,
     }
@@ -163,6 +169,22 @@ mod tests {
                 ["load", "record observation", "cleanup", "record cleanup"]
             );
         }
+    }
+
+    #[test]
+    fn fixture_cleanup_runs_before_resuming_an_observation_panic() {
+        let mut cleaned = false;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::with_cleanup(
+                &mut cleaned,
+                |_| -> Result<(), ()> {
+                    panic!("fixture observation");
+                },
+                |cleaned| *cleaned = true,
+            )
+        }));
+        assert!(result.is_err());
+        assert!(cleaned);
     }
 
     #[test]
@@ -388,5 +410,81 @@ mod tests {
                 .unwrap();
             assert!(!body.contains("UNIMPLEMENTED"), "needs {method} (R8–R11)");
         }
+    }
+}
+
+/// Pass-2 pinned userland rejections, reviewed for 24H232 and 25G332.
+pub(super) fn descendant_rejection(build: &str, name: &str, load: &super::Evidence) -> bool {
+    let diagnostic: &[u8] = match name {
+        "underscore" => b"stdin:1: anchor names beginning with '_' are reserved for internal use\npfctl: Syntax error in config file: pf rules not loaded\n",
+        "inline" => b"stdin:1: syntax error\npfctl: Syntax error in config file: pf rules not loaded\n",
+        _ => return false,
+    };
+    matches!(build, "24H232" | "25G332")
+        && load.exit_code == Some(1)
+        && !load.timed_out
+        && !load.truncated
+        && load.stdout.is_empty()
+        && load.stderr.as_bytes()
+            == [
+                crate::decode::pfanchor::LOAD_WARNING,
+                crate::decode::pftext::ALTQ_PREAMBLE,
+                diagnostic,
+            ]
+            .concat()
+}
+#[cfg(test)]
+mod rejection_tests {
+    use super::*;
+    #[test]
+    fn full_reviewed_rejection_rows_match_both_builds() {
+        for review in [
+            include_str!("../../qualification/goldens/24H232/measurement-review.json"),
+            include_str!("../../qualification/goldens/25G332/measurement-review.json"),
+        ] {
+            let review: serde_json::Value = serde_json::from_str(review).unwrap();
+            let build = review["build"].as_str().unwrap();
+            for row in review["rejections"].as_array().unwrap() {
+                let name = row["name"].as_str().unwrap();
+                let mut load: super::super::Evidence = serde_json::from_value(serde_json::json!({
+                    "command":row["command"],"stdin":row["stdin"],"pid":1,"exit_code":row["exit_code"],
+                    "started_unix_ms":0,"elapsed_ms":0,"timed_out":false,"truncated":false,
+                    "stdout":row["stdout"],"stderr":row["stderr"]
+                })).unwrap();
+                assert!(descendant_rejection(build, name, &load));
+                load.truncated = true;
+                assert!(!descendant_rejection(build, name, &load));
+                load.truncated = false;
+                load.stderr.push('x');
+                assert!(!descendant_rejection(build, name, &load));
+            }
+        }
+    }
+    #[test]
+    fn only_exact_pinned_rejections_count_as_completed_load_measurements() {
+        let mut load: super::super::Evidence = serde_json::from_value(serde_json::json!({
+            "command":[],"stdin":null,"pid":null,"exit_code":1,"started_unix_ms":0,"elapsed_ms":0,
+            "timed_out":false,"truncated":false,"stdout":"","stderr":""
+        }))
+        .unwrap();
+        load.stderr = String::from_utf8([crate::decode::pfanchor::LOAD_WARNING, crate::decode::pftext::ALTQ_PREAMBLE,
+            b"stdin:1: anchor names beginning with '_' are reserved for internal use\npfctl: Syntax error in config file: pf rules not loaded\n"].concat()).unwrap();
+        assert!(descendant_rejection("25G332", "underscore", &load));
+        assert!(descendant_rejection("24H232", "underscore", &load));
+        for build in ["24H232", "25G332"] {
+            load.stderr = [
+                crate::decode::pfanchor::LOAD_WARNING,
+                crate::decode::pftext::ALTQ_PREAMBLE,
+                b"stdin:1: syntax error\npfctl: Syntax error in config file: pf rules not loaded\n",
+            ]
+            .concat()
+            .iter()
+            .map(|b| char::from(*b))
+            .collect();
+            assert!(descendant_rejection(build, "inline", &load));
+            assert!(!descendant_rejection(build, "inline-multiline", &load));
+        }
+        load.stderr.push('x');
+        assert!(!descendant_rejection("25G332", "underscore", &load));
     }
 }

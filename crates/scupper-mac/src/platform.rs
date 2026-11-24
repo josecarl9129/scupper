@@ -592,8 +592,9 @@ pub trait Platform {
     fn pause(&mut self, duration: Duration, deadline: Deadline);
     /// **Mutating tool**: load fixed helper anchor; success complete/reaped.
     /// Error/timeout may leave old, partial or new rules; Unknown may keep fence open.
-    /// A build outside the reviewed anchor table returns the distinct unsupported
-    /// build error before spawning any pfctl command.
+    /// On unreviewed builds, only canonical Lockdown at an owned native or
+    /// qualification anchor may spawn; that best-effort load still returns Unknown.
+    /// Every other payload returns the distinct unsupported-build error before spawn.
     fn load_anchor(&mut self, text: &AnchorText, deadline: Deadline) -> Result<(), SysError>;
     /// Read-only bounded independent anchor read. `None` proves absence of active
     /// configuration in the owned anchor: either not listed (complete parent
