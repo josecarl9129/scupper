@@ -3,12 +3,13 @@
   "provenance": "CI 45397408312 attempt 2; 24H232 states-v.txt and full rejection rows",
   "states_v_reviewed": true,
   "protocol_allowlist": [
-    "udp"
+    "udp",
+    "tcp"
   ],
   "states_vv_reviewed": false,
   "descendants_reviewed": false,
   "states_v_sha256": "39960b615de05b2c4f0b0a45fdd80b8e3ccd424fa278dd437972273263503611",
-  "claim": "Whole-listing UDP tuple presence measurement only; no kernel state identity. Any unreviewed protocol, extra line, malformed record or truncation invalidates the entire listing.",
+  "claim": "Whole-listing UDP and ESTABLISHED:ESTABLISHED TCP -v tuple presence measurement only; no kernel state identity. Exact TCP sequence line required; every other variant invalidates the listing. -vv is measurement only.",
   "rejections": [
     {
       "name": "underscore",
@@ -45,5 +46,70 @@
       "stderr": "pfctl: Use of -f option, could result in flushing of rules\npresent in the main ruleset added by the system at startup.\nSee /etc/pf.conf for further details.\n\nNo ALTQ support in kernel\nALTQ related functions disabled\nstdin:1: syntax error\npfctl: Syntax error in config file: pf rules not loaded\n"
     }
   ],
-  "inline_multiline_reviewed": false
+  "inline_multiline_reviewed": true,
+  "inline_multiline": {
+    "provenance": "Pass-3 24H232/anchor-children-inline-multiline.json; embedded fix-8 diagnosis facts 1, 2 and 4",
+    "facts": [
+      "Multi-line anonymous inline load: rc 0, empty stdout, LOAD_WARNING + ALTQ only. Parent -sr is anchor all {\\n  pass quick on lo0 all no state\\n}\\n; creates rule-bearing <parent>/_1 and an empty doubled <parent>/<parent full path>/_1 chain.",
+      "Underscore descendants are visible to -sA and DIOCGETRULESETS (K=T at every level); all five class reads return rc 0.",
+      "Parent rule flush removes the call; rule-bearing _1 survives with content. Empty unreferenced doubled _1 disappears; empty intermediate names persist."
+    ],
+    "normalized_observations": {
+      "source": "anchor {\n pass quick on lo0 all no state\n}\n",
+      "load": {
+        "exit_code": 0,
+        "stdout": "",
+        "stderr": "pfctl: Use of -f option, could result in flushing of rules\npresent in the main ruleset added by the system at startup.\nSee /etc/pf.conf for further details.\n\nNo ALTQ support in kernel\nALTQ related functions disabled\n"
+      },
+      "parent_filter_stdout": "anchor all {\n  pass quick on lo0 all no state\n}\n",
+      "rule_bearing_child": "<parent>/_1",
+      "child_filter_stdout_before_and_after_parent_flush": "pass quick on lo0 all no state\n",
+      "empty_doubled_chain": "<parent>/<parent full path>/_1",
+      "inventory_agreement": "K=T at every level before and after",
+      "underscore_class_reads": {
+        "flags": [
+          "-sr",
+          "-sn",
+          "-sT",
+          "-sA",
+          "-sd"
+        ],
+        "exit_code": 0
+      },
+      "after_parent_flush": {
+        "parent_filter_stdout": "",
+        "rule_bearing_child_survives": true,
+        "empty_doubled_leaf_survives": false,
+        "empty_intermediate_names_persist": true
+      }
+    }
+  },
+  "underscore_flush_refusal": {
+    "reviewed": true,
+    "provenance": "Pass-3 24H232/anchor-children-inline-multiline.json; fact 3",
+    "path_condition": "any component begins with _",
+    "classes": [
+      "rules",
+      "nat",
+      "Tables",
+      "dummynet"
+    ],
+    "exit_code": 1,
+    "stdout": "",
+    "stderr": "No ALTQ support in kernel\nALTQ related functions disabled\npfctl: anchor names beginning with '_' cannot be modified from the command line\n",
+    "command_template": [
+      "/sbin/pfctl",
+      "-a",
+      "<path with _ component>",
+      "-F",
+      "<class>"
+    ]
+  },
+  "states_v_tcp": {
+    "provenance": "Pass-3 state-formats-1795542226-6076-2169.json",
+    "fixture": "states-v-tcp.txt",
+    "sha256": "1dc58091f05eba2fa5c48d803300c67ce0a15c18de9874f59dd66df7e8aa7d4c",
+    "header_state": "ESTABLISHED:ESTABLISHED",
+    "sequence_shape": "   [<u32> + <u32>] wscale <0..14>  [<u32> + <u32>] wscale <0..14>"
+  }
 }

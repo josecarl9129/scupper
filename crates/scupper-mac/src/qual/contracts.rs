@@ -160,6 +160,10 @@ fn scoped(out: &Path, p: &mut NativePlatform, path: &str) -> Result<()> {
     if super::resources::anchor_read(out, path, end()).is_ok_and(|text| text.is_none()) {
         return Ok(());
     }
+    env(
+        !super::super::contract_check::unmodifiable_anchor(path),
+        &format!("unremovable _-anchor content: {path}"),
+    )?;
     for (op, class) in [
         (pfanchor::Operation::Rules, "rules"),
         (pfanchor::Operation::Nat, "nat"),
@@ -375,7 +379,7 @@ fn contracts(out: &Path, r: &mut CaseResult) -> Result<()> {
         scratch,
         build: pftext::Build::system()?.as_str().into(),
     };
-    let core = case(out, "Q-CONTRACTS-core", |r| {
+    let mut core = case(out, "Q-CONTRACTS-core", |r| {
         run_core_contracts(&mut h)?;
         env(
             !h.p.call_trace()
@@ -389,6 +393,19 @@ fn contracts(out: &Path, r: &mut CaseResult) -> Result<()> {
         r.iterations = 1;
         Ok(())
     })?;
+    let sweep_failures =
+        h.p.call_trace()
+            .iter()
+            .filter(|row| row.starts_with("failed:processes:"))
+            .cloned()
+            .collect::<Vec<_>>();
+    if !sweep_failures.is_empty() {
+        write!(
+            core.detail,
+            "; process sweep failed attempts: {sweep_failures:?}"
+        )?;
+        save_case(out, &core)?;
+    }
     let anchors = case(out, "Q-CONTRACTS-anchor", |r| {
         shared_anchor_clean(out)?;
         super::resources::journal_anchor(out, ANCHOR, end())
@@ -880,27 +897,30 @@ fn descendants(out: &Path, r: &mut CaseResult) -> Result<()> {
     // Original journal authority is reused only after the between-case absence check.
     optimizer_controls(out, &mut p, &mut findings)?;
     foreign_fixtures(out, &mut p, &mut findings)?;
-    let from_sdk_header = descendant_measurements(out, &mut p, &mut findings)?;
+    let from_sdk_header = descendant_measurements(out, &mut p, &mut findings, r)?;
     write_json(out, "descendant-outcomes.json", &findings)?;
-    let verdict = super::super::desc_inventory::verdict(&findings);
-    ensure(
-        verdict != Verdict::ContractViolation,
-        &format!("Q-DESCENDANTS violations: {findings:?}"),
-    )?;
-    env(
-        verdict != Verdict::Inconclusive,
-        &format!("Q-DESCENDANTS measurements/environment: {findings:?}"),
-    )?;
-    r.verdict = verdict;
     let provenance = if from_sdk_header {
         "SDK header checked against XNU-published layout pins"
     } else {
         "XNU-published layout pin, not SDK-verified"
     };
-    r.detail = format!(
-        "all descendant, optimizer and foreign-fixture measurements completed without inventory findings; ruleset ABI from_sdk_header={from_sdk_header}: {provenance}; no descendant coverage flag promoted"
-    );
-    r.iterations = 9;
+    write!(
+        &mut r.detail,
+        "; optimizer and foreign-fixture outcomes recorded; ruleset ABI from_sdk_header={from_sdk_header}: {provenance}; no descendant coverage flag promoted"
+    )?;
+    let verdict = super::super::desc_inventory::verdict(&findings);
+    ensure(
+        verdict != Verdict::ContractViolation,
+        &format!("Q-DESCENDANTS violations: {findings:?}; {}", r.detail),
+    )?;
+    env(
+        verdict != Verdict::Inconclusive,
+        &format!(
+            "Q-DESCENDANTS measurements/environment: {findings:?}; {}",
+            r.detail
+        ),
+    )?;
+    r.verdict = verdict;
     Ok(())
 }
 #[allow(clippy::too_many_lines)] // Keep both lifecycle conditions and measurements together.
@@ -1279,6 +1299,7 @@ fn descendant_measurements(
     out: &Path,
     p: &mut NativePlatform,
     findings: &mut Findings,
+    r: &mut CaseResult,
 ) -> Result<bool> {
     const ROOT: &str = "scupper-qual/children";
     let abi = invoke_before(
@@ -1309,15 +1330,9 @@ fn descendant_measurements(
     super::resources::journal_anchor(out, ROOT, end())
         .map_err(|e| environment_issue(e.to_string()))?;
     let mut cleanup_failure = None::<String>;
+    let mut skipped = Vec::new();
+    r.iterations = 0;
     for (name, source, suffix) in [
-        ("named", "anchor \"qchild\"\n", ""),
-        ("underscore", "anchor \"_qchild\"\n", ""),
-        ("inline", "anchor { pass quick on lo0 all no state }\n", ""),
-        (
-            "inline-multiline",
-            "anchor {\n pass quick on lo0 all no state\n}\n",
-            "",
-        ),
         (
             "named-inline",
             "anchor \"qi\" {\n pass quick on lo0 all no state\n}\n",
@@ -1335,7 +1350,28 @@ fn descendant_measurements(
             "pass quick on lo0 all no state\n",
             "/qchild/_x",
         ),
+        ("named", "anchor \"qchild\"\n", ""),
+        ("underscore", "anchor \"_qchild\"\n", ""),
+        ("inline", "anchor { pass quick on lo0 all no state }\n", ""),
+        (
+            "inline-multiline",
+            "anchor {\n pass quick on lo0 all no state\n}\n",
+            "",
+        ),
     ] {
+        if name == "inline-multiline"
+            && super::super::contract_check::inline_multiline_reviewed(
+                pftext::Build::system()?.as_str(),
+            )
+        {
+            skipped.push(name);
+            write_json(
+                out,
+                "anchor-children-inline-multiline-reviewed.json",
+                &json!({"fixture_loaded":false,"reviewed":true,"provenance":"measurement-review.json: inline_multiline; pass-3 facts 1, 2, 4"}),
+            )?;
+            continue;
+        }
         let parent_name = super::unique(name);
         let parent = format!("{ROOT}/{parent_name}");
         let mut inventory_findings = Vec::new();
@@ -1376,6 +1412,7 @@ fn descendant_measurements(
                                 .map_err(|e| environment_issue(e.to_string()))?;
                         }
                     }
+                    r.iterations += 1;
                     let load = raw(
                         out,
                         p,
@@ -1417,6 +1454,12 @@ fn descendant_measurements(
                             continue;
                         }
                         within_budget(|| super::resources::recheck_foreign_tokens(out, end()))?;
+                        if super::super::contract_check::unmodifiable_anchor(path) {
+                            flushes.push(json!({"path":path,"flush_skipped":true,
+                                "reason":"pfctl refuses _-anchor modification",
+                                "after":path_classes(out, p, path)?}));
+                            continue;
+                        }
                         for class in ["rules", "nat", "Tables", "dummynet"] {
                             let flush = raw(out, p, &["-a", path, "-F", class], &[])?;
                             let classes = path_classes(out, p, path)?;
@@ -1428,16 +1471,16 @@ fn descendant_measurements(
                     let after = measure_children(out, p, &parent, &explicit)?;
                     inventory_findings
                         .extend(super::super::desc_inventory::findings(&json!(after)));
-                    let rejected = super::super::contract_check::descendant_rejection(
+                    let reviewed_rejection = super::super::contract_check::descendant_rejection(
                         pftext::Build::system()?.as_str(),
                         name,
                         &load,
                     );
                     let measurement = json!({"parent":parent,"target":target,"source":source,"load":load,"grandchild_setup":grandchild_load,
-                    "before":before,"scoped_flushes":flushes,"after":after,"measurement_only":true,"rejected_by_pfctl":rejected});
+                    "before":before,"scoped_flushes":flushes,"after":after,"measurement_only":true,"rejected_by_pfctl":load.exit_code.is_some_and(|rc| rc != 0) && !load.timed_out && !load.truncated,"reviewed_rejection":reviewed_rejection});
                     write_json(out, &format!("anchor-children-{name}.json"), &measurement)?;
                     let mut checked = measurement;
-                    if rejected {
+                    if reviewed_rejection {
                         checked
                             .as_object_mut()
                             .ok_or("measurement object")?
@@ -1454,6 +1497,14 @@ fn descendant_measurements(
             );
             if let Err(error) = &cleanup {
                 cleanup_failure = Some(error.to_string());
+                if name == "inline-multiline" {
+                    write_json(
+                        out,
+                        "inline-multiline-declared-restore-failure.json",
+                        &json!({"path":parent,
+                        "declared_restore_failure":format!("unreviewed inline-multiline cleanup failed; configuration absence not established: {error}")}),
+                    )?;
+                }
             }
             write_json(
                 out,
@@ -1470,6 +1521,10 @@ fn descendant_measurements(
                 .map(|finding| (true, finding)),
         );
     }
+    r.detail = format!(
+        "{} descendant fixtures attempted; skipped fixtures: {skipped:?}",
+        r.iterations
+    );
     Ok(from_sdk_header)
 }
 
@@ -1753,6 +1808,54 @@ fn state_rows(e: &Evidence) -> Result<Vec<super::super::state_measure::State>> {
         .map_err(|_| environment_issue("unfiltered state listing diagnostics unpinned"))?;
     super::super::state_measure::parse(build.as_str(), &e.stdout).map_err(environment_issue)
 }
+// -vv identities are observed separately from the tuple-based verdict.
+fn vv_measurement(out: &Path, p: &mut NativePlatform) -> Value {
+    match within_budget(|| super::pf::raw_input(out, p, &["-s", "states", "-vv"], &[], end())) {
+        Err(error) => json!({"error":error.to_string(),"parsed":false}),
+        Ok(evidence) => {
+            let observed = (|| -> std::result::Result<_, String> {
+                if !evidence.complete() {
+                    return Err("incomplete -vv listing".into());
+                }
+                let build = pftext::Build::system().map_err(|e| e.to_string())?;
+                pftext::read(
+                    &build,
+                    0,
+                    evidence.stdout.as_bytes(),
+                    evidence.stderr.as_bytes(),
+                )
+                .map_err(|e| e.to_string())?;
+                super::super::state_measure::measure_vv(build.as_str(), &evidence.stdout)
+                    .map_err(str::to_owned)
+            })();
+            match observed {
+                Ok(tuples) => json!({"raw":evidence,"parsed":true,"tuples":tuples}),
+                Err(error) => json!({"raw":evidence,"parsed":false,"error":error}),
+            }
+        }
+    }
+}
+fn vv_stability(samples: &[Value]) -> Value {
+    let keys = samples
+        .iter()
+        .filter_map(|s| s["tuples"].as_object())
+        .flat_map(|map| map.keys().cloned())
+        .collect::<BTreeSet<_>>();
+    let complete = samples.iter().all(|s| s["parsed"] == true);
+    json!(
+        keys.into_iter()
+            .map(|tuple| {
+                let ids = samples
+                    .iter()
+                    .map(|s| s["tuples"][&tuple].clone())
+                    .collect::<Vec<_>>();
+                let stable = complete.then(|| ids.iter().all(|id| !id.is_null() && *id == ids[0]));
+                json!({"tuple":tuple,"id_creatorid_samples":ids,"stable":stable})
+            })
+            .collect::<Vec<_>>()
+    )
+}
+
 fn state_ids(e: &Evidence) -> Result<BTreeSet<String>> {
     Ok(state_rows(e)?.into_iter().map(|s| s.identity).collect())
 }
@@ -1877,6 +1980,13 @@ fn flush_measurement(out: &Path, r: &mut CaseResult, p: &mut NativePlatform) -> 
         "flush-tcp-counters.json",
         &json!({"rules":rules,"counters":counters,"feth_source_bound_interface":"feth0"}),
     )?;
+    let vv_before = (0..3).map(|_| vv_measurement(out, p)).collect::<Vec<_>>();
+    write_json(
+        out,
+        "flush-vv-before.json",
+        &json!({"samples":vv_before,
+        "stability_per_tuple":vv_stability(&vv_before),"measurement_only":true}),
+    )?;
     let before = raw(out, p, &["-s", "states", "-v"], &[])?;
     let flows = [
         ("udp-lo0", udp.source, udp.receiver.local_addr()?, None),
@@ -1927,36 +2037,64 @@ fn flush_measurement(out: &Path, r: &mut CaseResult, p: &mut NativePlatform) -> 
         "flush-known-states.json",
         &json!({"known_tuples":known,"missing_known_flows":missing,"all_before":all_before,"before":before,"adapter_call_attempted":attempted,"adapter_result":format!("{result:?}"),"after":after,"known_survivors":known.intersection(&remaining).collect::<Vec<_>>(),"all_sockets_quiescent":true,"ownership_exception":"foreign states destroyed irreversibly; restore cannot return them"}),
     )?;
+    let vv_deleted = vv_measurement(out, p);
+    // Re-send on the same UDP sockets after deletion to measure tuple reuse.
+    // A failed attempt or unsupported dump is retained without changing verdicts.
+    let reuse_attempt = udp.send_ten().map_err(|error| error.to_string());
+    let vv_reused = (0..3).map(|_| vv_measurement(out, p)).collect::<Vec<_>>();
+    let mut reuse = Vec::new();
+    if let Some(first) = vv_before.first().and_then(|s| s["tuples"].as_object()) {
+        for (tuple, original) in first {
+            let later = &vv_reused[0]["tuples"][tuple];
+            let absent_after_deletion =
+                (vv_deleted["parsed"] == true).then(|| vv_deleted["tuples"][tuple].is_null());
+            reuse.push(json!({"tuple":tuple,"before":original,"absent_after_deletion":absent_after_deletion,
+                "after_reuse_attempt":later,"tuple_seen_again":(vv_reused[0]["parsed"] == true).then(|| !later.is_null()),
+                "id_creatorid_changed":(!later.is_null()).then(|| later != original)}));
+        }
+    }
+    write_json(
+        out,
+        "flush-vv-identity-measurement.json",
+        &json!({"before":vv_before,
+        "before_stability_per_tuple":vv_stability(&vv_before),"adapter_call_attempted":attempted,
+            "adapter_result":format!("{result:?}"),"after_deletion":vv_deleted,
+        "reuse_attempt":format!("{reuse_attempt:?}"),"reuse_protocol":"udp; same sockets and tuple",
+        "after_reuse_samples":vv_reused,"reuse_stability_per_tuple":vv_stability(&vv_reused),
+        "tuple_reuse":reuse,"measurement_only":true,"verdict_identity":"directed tuple from -v"}),
+    )?;
     // Measurement only, never adapter interface removal. Generate fresh states
     // before each selector, retain both unfiltered listings and raw results.
-    for args in [
-        vec!["-i", "feth0", "-F", "states"],
-        vec!["-k", "198.18.0.1"],
-    ] {
-        let fresh = tcp(feth_traffic.listener.try_clone()?, true).map_err(|e| {
-            environment_issue(format!("fresh bound feth TCP fixture unavailable: {e}"))
-        })?;
-        let pre = raw(out, p, &["-s", "states", "-v"], &[])?;
-        let id = known_id(&pre, fresh.source, fresh.destination, Some("ALL"))?;
-        if id.is_none() {
+    super::super::state_measure::selector_measurements(
+        p,
+        |_| {
+            tcp(feth_traffic.listener.try_clone()?, true).map_err(|e| {
+                environment_issue(format!("fresh bound feth TCP fixture unavailable: {e}"))
+            })
+        },
+        |p, args, fresh| {
+            let pre = raw(out, p, &["-s", "states", "-v"], &[])?;
+            let id = known_id(&pre, fresh.source, fresh.destination, Some("ALL"))?;
+            if id.is_none() {
+                write_json(
+                    out,
+                    "floating-state-unproven.json",
+                    &json!({"before":pre,"source":fresh.source,"destination":fresh.destination,"selector":args}),
+                )?;
+                return Err(environment_issue(
+                    "floating feth state not positively identified before selector measurement",
+                ));
+            }
+            let effect = raw(out, p, args, &[])?;
+            let post = raw(out, p, &["-s", "states", "-v"], &[])?;
             write_json(
                 out,
-                "floating-state-unproven.json",
-                &json!({"before":pre,"source":fresh.source,"destination":fresh.destination,"selector":args}),
+                &format!("{}.json", super::unique("floating-state-selector")),
+                &json!({"known_feth_tuple":id,"before":pre,"measurement":effect,"after":post,"measurement_only":true}),
             )?;
-            return Err(environment_issue(
-                "floating feth state not positively identified before selector measurement",
-            ));
-        }
-        let effect = raw(out, p, &args, &[])?;
-        let post = raw(out, p, &["-s", "states", "-v"], &[])?;
-        write_json(
-            out,
-            &format!("{}.json", super::unique("floating-state-selector")),
-            &json!({"known_feth_tuple":id,"before":pre,"measurement":effect,"after":post,"measurement_only":true}),
-        )?;
-        drop(fresh);
-    }
+            Ok(())
+        },
+    )?;
     let _ = keep_alive;
     env(
         missing.is_empty() && known.len() == 4,

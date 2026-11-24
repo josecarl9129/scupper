@@ -1391,3 +1391,27 @@ Q-ANCHOR preserves AssumptionRefuted when removal fails despite state measuremen
 issues, retaining those issues in its detail. Stable K/T existence disagreements
 are contract findings even if both child-name sets are empty. These measurements
 do not promote production descendant coverage flags.
+
+
+### 2026-11-24 — R7 fix 8 pass-3 harness review
+
+For 24H232 and 25G332, review the supplied pass-3 multiline inline evidence
+(`anchor-children-inline-multiline.json`, facts 1, 2, 4) as measurement only.
+The harness must not load that fixture on reviewed builds. It runs last on an
+unreviewed build, with residue declared as restore failure. `_`-component flush
+refusals (fact 3) are distinct errors; harness cleanup reads those paths and skips
+modification. Foreign content is a configuration-present restore violation with
+its path. Timeout, unknown and truncated reads remain incomplete.
+
+Pin TCP `-v` only for `ESTABLISHED:ESTABLISHED`, the captured sequence-line shape
+and whole-listing numeric/order/multiplicity checks. Both exact supplied listings
+are kept beside the measurement reviews. Keep directed tuple identity for verdicts.
+Repeated `-vv` `(id, creatorid)` stability and UDP tuple reuse after deletion are
+measurements only. Core process contracts retry only named foreign-pid Incomplete
+sweeps, excluding spawned scratch children, up to three sweeps one second apart
+inside the original deadline. Kill confirmation retries every Incomplete until its
+original overall deadline.
+
+`descendants_reviewed` stays false. `_N` children are visible but not modifiable
+through pfctl; foreign inline content cannot be removed through the adapter's currently qualified operations. Absolute-call reachability of orphan `_N` is unmeasured.
+No new write ioctl or enforcement qualification is introduced.

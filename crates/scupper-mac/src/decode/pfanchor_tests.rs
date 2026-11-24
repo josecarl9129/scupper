@@ -761,3 +761,84 @@ fn nonempty_descendant_each_configuration_class_is_err_with_review_flag_true() {
         assert!(remove(&mut io, &path()).is_err(), "{flag}");
     }
 }
+
+const UNDERSCORE_FLUSH_REFUSAL: &[u8] =
+    b"pfctl: anchor names beginning with '_' cannot be modified from the command line\n";
+
+#[test]
+fn underscore_flush_refusal_is_distinct_error_never_success() {
+    for name in ["24H232", "25G332"] {
+        let build = Build::fixture(name);
+        let stderr = [pftext::ALTQ_PREAMBLE, UNDERSCORE_FLUSH_REFUSAL].concat();
+        for op in [
+            Operation::Rules,
+            Operation::Nat,
+            Operation::Tables,
+            Operation::Dummynet,
+        ] {
+            assert_eq!(
+                proposed(&build, op, 1, b"", &stderr),
+                Err(SysError::Failed("pfctl refuses _-anchor modification"))
+            );
+            for (rc, stdout, err) in [
+                (0, b"".as_slice(), stderr.clone()),
+                (1, b"extra".as_slice(), stderr.clone()),
+                (1, b"".as_slice(), [stderr.as_slice(), b"extra\n"].concat()),
+            ] {
+                assert_eq!(
+                    proposed(&build, op, rc, stdout, &err),
+                    Err(SysError::Unknown)
+                );
+            }
+        }
+        assert_eq!(
+            proposed(&build, Operation::Load, 1, b"", &stderr),
+            Err(SysError::Unknown)
+        );
+        assert_eq!(
+            proposed(
+                &Build::fixture("unreviewed"),
+                Operation::Rules,
+                1,
+                b"",
+                &stderr
+            ),
+            Err(SysError::Unknown)
+        );
+    }
+}
+
+#[test]
+fn underscore_refusal_literal_matches_both_reviewed_rows() {
+    for review in [
+        include_str!("../../qualification/goldens/24H232/measurement-review.json"),
+        include_str!("../../qualification/goldens/25G332/measurement-review.json"),
+    ] {
+        let review: serde_json::Value = serde_json::from_str(review).unwrap();
+        let build = Build::fixture(review["build"].as_str().unwrap());
+        let row = &review["underscore_flush_refusal"];
+        assert_eq!(row["reviewed"], true);
+        assert_eq!(
+            row["stderr"].as_str().unwrap().as_bytes(),
+            [pftext::ALTQ_PREAMBLE, UNDERSCORE_FLUSH_REFUSAL].concat()
+        );
+        for op in [
+            Operation::Rules,
+            Operation::Nat,
+            Operation::Tables,
+            Operation::Dummynet,
+        ] {
+            // Acceptance requires equality with proposed's Rust refusal literal.
+            assert_eq!(
+                proposed(
+                    &build,
+                    op,
+                    i32::try_from(row["exit_code"].as_i64().unwrap()).unwrap(),
+                    row["stdout"].as_str().unwrap().as_bytes(),
+                    row["stderr"].as_str().unwrap().as_bytes()
+                ),
+                Err(SysError::Failed("pfctl refuses _-anchor modification"))
+            );
+        }
+    }
+}

@@ -488,3 +488,204 @@ mod rejection_tests {
         assert!(!descendant_rejection("25G332", "underscore", &load));
     }
 }
+
+/// Pass-3 multiline evidence is reviewed independently of descendant coverage.
+pub(super) fn inline_multiline_reviewed(build: &str) -> bool {
+    let text = match build {
+        "24H232" => include_str!("../../qualification/goldens/24H232/measurement-review.json"),
+        "25G332" => include_str!("../../qualification/goldens/25G332/measurement-review.json"),
+        _ => return false,
+    };
+    serde_json::from_str::<serde_json::Value>(text)
+        .is_ok_and(|review| review["inline_multiline_reviewed"] == true)
+}
+
+/// Readable underscore paths cannot be modified with pfctl.
+pub(super) fn unmodifiable_anchor(path: &str) -> bool {
+    path.split('/').any(|component| component.starts_with('_'))
+}
+/// Complete, nonempty underscore filter output is configuration even when the
+/// harness filter grammar cannot render it. Incomplete reads stay read failures.
+pub(super) fn underscore_read_error(
+    path: &str,
+    op: crate::decode::pfanchor::Operation,
+    evidence: &super::Evidence,
+    error: SysError,
+) -> SysError {
+    if unmodifiable_anchor(path)
+        && op == crate::decode::pfanchor::Operation::Filter
+        && evidence.complete()
+        && !evidence.stdout.is_empty()
+        && evidence.stderr.as_bytes() == crate::decode::pftext::ALTQ_PREAMBLE
+        && error == SysError::Unknown
+    {
+        SysError::Failed("foreign content in owned anchor")
+    } else {
+        error
+    }
+}
+/// A skipped underscore flush still reads all five classes. Persistent names
+/// alone are not configuration; a failed read never proves them empty.
+pub(super) fn read_only_underscore(
+    path: &str,
+    mut read: impl FnMut(
+        crate::decode::pfanchor::Operation,
+        &str,
+    ) -> Result<crate::decode::pfanchor::Text, SysError>,
+) -> Option<Vec<String>> {
+    use crate::decode::pfanchor::{Operation, Text};
+    if !unmodifiable_anchor(path) {
+        return None;
+    }
+    let mut failures = Vec::new();
+    let mut content = false;
+    for (op, flag) in [
+        (Operation::Filter, "-sr"),
+        (Operation::Extra, "-sn"),
+        (Operation::Extra, "-sT"),
+        (Operation::Inventory, "-sA"),
+        (Operation::Extra, "-sd"),
+    ] {
+        match read(op, flag) {
+            Ok(Text::Present(text)) => content |= flag != "-sA" && !text.is_empty(),
+            Ok(Text::Missing) => (),
+            Err(SysError::Failed("foreign content in owned anchor")) => content = true,
+            other => failures.push(format!(
+                "underscore anchor read failed: {path} {flag}: {other:?}"
+            )),
+        }
+    }
+    if content {
+        failures.push(format!("unremovable _-anchor content: {path}"));
+    }
+    Some(failures)
+}
+#[cfg(test)]
+mod pass3_tests {
+    #[test]
+    fn underscore_cleanup_reads_every_class_and_never_flushes() {
+        use crate::decode::pfanchor::{Operation, Text};
+        for configured in [false, true] {
+            let mut calls = Vec::new();
+            let failures = super::read_only_underscore("a/q/_1", |op, flag| {
+                assert!(matches!(
+                    op,
+                    Operation::Filter | Operation::Extra | Operation::Inventory
+                ));
+                calls.push(flag.to_owned());
+                Ok(Text::Present(if configured && flag == "-sr" {
+                    "pass all\n".into()
+                } else if flag == "-sA" {
+                    "  a/q/_1/empty\n".into()
+                } else {
+                    String::new()
+                }))
+            })
+            .unwrap();
+            assert_eq!(calls, ["-sr", "-sn", "-sT", "-sA", "-sd"]);
+            assert_eq!(
+                failures,
+                if configured {
+                    vec!["unremovable _-anchor content: a/q/_1"]
+                } else {
+                    vec![]
+                }
+            );
+        }
+        let mut calls = 0;
+        let failures = super::read_only_underscore("a/_x", |_, _| {
+            calls += 1;
+            Err(crate::platform::SysError::Unknown)
+        })
+        .unwrap();
+        assert_eq!(calls, 5);
+        assert_eq!(failures.len(), 5);
+        assert!(
+            super::read_only_underscore("a/ordinary", |_, _| {
+                panic!("ordinary path is handled by flush caller")
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn underscore_content_errors_and_unparsed_complete_filter_have_content_label() {
+        use crate::{
+            decode::pfanchor::{Operation, Text},
+            platform::SysError,
+        };
+        let mut evidence: super::super::Evidence = serde_json::from_value(serde_json::json!({
+            "command":[],"stdin":null,"pid":1,"exit_code":0,"started_unix_ms":0,"elapsed_ms":0,
+            "timed_out":false,"truncated":false,"stdout":"anchor all {\n  pass all\n}\n",
+            "stderr":String::from_utf8(crate::decode::pftext::ALTQ_PREAMBLE.to_vec()).unwrap()
+        }))
+        .unwrap();
+        for flag in ["-sr", "-sn", "-sT", "-sd"] {
+            let mut calls = Vec::new();
+            let failures = super::read_only_underscore("a/_x", |op, actual| {
+                calls.push(actual.to_owned());
+                if actual != flag {
+                    return Ok(Text::Present(String::new()));
+                }
+                Err(if actual == "-sr" {
+                    super::underscore_read_error("a/_x", op, &evidence, SysError::Unknown)
+                } else {
+                    SysError::Failed("foreign content in owned anchor")
+                })
+            })
+            .unwrap();
+            assert_eq!(calls, ["-sr", "-sn", "-sT", "-sA", "-sd"]);
+            assert_eq!(failures, ["unremovable _-anchor content: a/_x"]);
+        }
+        for kind in [
+            "timeout",
+            "truncated",
+            "rc",
+            "empty",
+            "diagnostic",
+            "ordinary",
+            "inventory",
+        ] {
+            let mut changed = evidence.clone();
+            match kind {
+                "timeout" => changed.timed_out = true,
+                "truncated" => changed.truncated = true,
+                "rc" => changed.exit_code = Some(1),
+                "empty" => changed.stdout.clear(),
+                "diagnostic" => changed.stderr.push('x'),
+                _ => (),
+            }
+            assert_eq!(
+                super::underscore_read_error(
+                    if kind == "ordinary" { "a/x" } else { "a/_x" },
+                    if kind == "inventory" {
+                        Operation::Inventory
+                    } else {
+                        Operation::Filter
+                    },
+                    &changed,
+                    SysError::Unknown
+                ),
+                SysError::Unknown,
+                "{kind}"
+            );
+        }
+        evidence.stdout.clear();
+        assert_eq!(
+            super::underscore_read_error("a/_x", Operation::Filter, &evidence, SysError::Unknown),
+            SysError::Unknown
+        );
+    }
+
+    #[test]
+    fn reviewed_multiline_is_skipped_and_underscore_paths_are_read_only() {
+        for build in ["24H232", "25G332"] {
+            assert!(super::inline_multiline_reviewed(build));
+        }
+        assert!(!super::inline_multiline_reviewed("unreviewed"));
+        for path in ["a/_x", "a/qchild/_x", "_parent/a", "a/_1/qchild"] {
+            assert!(super::unmodifiable_anchor(path));
+        }
+        assert!(!super::unmodifiable_anchor("a/q_child"));
+    }
+}

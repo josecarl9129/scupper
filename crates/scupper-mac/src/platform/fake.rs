@@ -126,6 +126,8 @@ pub enum Call {
 /// One-shot fault, selected by named call and occurrence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fault {
+    /// Process sweep failure carrying a precise failing PID (contract tests).
+    ProcessIncomplete(Option<u32>),
     /// Interrupted lock syscall.
     LockInterrupted,
     /// Structural lock error with a bounded diagnostic kind.
@@ -2185,6 +2187,12 @@ impl Platform for FakePlatform {
             return Enumeration::Incomplete(SysError::TimedOut.into());
         }
         match fault {
+            Some(Fault::ProcessIncomplete(pid)) => {
+                return Enumeration::Incomplete(ProcessError {
+                    pid,
+                    error: SysError::Failed("process sweep transition"),
+                });
+            }
             Some(Fault::ToolHang { .. } | Fault::WriteHang) => {
                 self.wait_to(deadline);
                 return Enumeration::Incomplete(SysError::TimedOut.into());

@@ -612,7 +612,8 @@ impl NativePlatform {
             }
             let path = scupper_darwin::proc_pidpath(entry.pid);
             let resolved = if path.as_ref().is_err_and(|e| e.raw_os_error() == 2) {
-                observe_image(entry)
+                observe_image_detail_traced(entry, |line| self.trace_lazy(|| line))
+                    .map(|(entry, _)| entry)
             } else {
                 // ESRCH alone proves no exit; bracket successful paths too.
                 let current =
@@ -633,6 +634,14 @@ fn observe_image(entry: ProcInfo) -> Result<Option<ProcInfo>, ProcessError> {
     observe_image_detail(entry).map(|(entry, _)| entry)
 }
 fn observe_image_detail(entry: ProcInfo) -> Result<(Option<ProcInfo>, Option<i32>), ProcessError> {
+    observe_image_detail_traced(entry, |_| {})
+}
+fn observe_image_detail_traced(
+    entry: ProcInfo,
+    mut trace: impl FnMut(String),
+) -> Result<(Option<ProcInfo>, Option<i32>), ProcessError> {
+    let listed_fields = (entry.name.clone(), entry.ppid, entry.pgid);
+    let mut relooked_fields = None;
     let pid = entry.pid;
     let mut version = None;
     let result = proc::observe_image(
@@ -645,14 +654,23 @@ fn observe_image_detail(entry: ProcInfo) -> Result<(Option<ProcInfo>, Option<i32
             id
         },
         || {
-            scupper_darwin::sysctl_kern_proc_pid(pid)
+            let current = scupper_darwin::sysctl_kern_proc_pid(pid)
                 .map_err(process_error)?
                 .as_ref()
                 .map(decode)
-                .transpose()
+                .transpose()?;
+            relooked_fields = current.as_ref().map(|p| (p.name.clone(), p.ppid, p.pgid));
+            Ok(current)
         },
-    )?;
-    Ok((result, version))
+    );
+    if let Err(error) = &result
+        && error.error == SysError::Failed("native: image fields changed")
+    {
+        trace(format!(
+            "failed:processes:{error:?}:listed(name,ppid,pgid)={listed_fields:?}:relooked(name,ppid,pgid)={relooked_fields:?}"
+        ));
+    }
+    Ok((result?, version))
 }
 fn process_error(error: scupper_darwin::ProcError) -> ProcessError {
     ProcessError::from(SysError::Failed(match error {
@@ -782,7 +800,9 @@ impl Platform for NativePlatform {
         match self.process_list(deadline) {
             Ok(list) => Enumeration::Complete(list),
             Err(error) => {
-                self.trace_lazy(|| format!("failed:processes:{error:?}"));
+                if error.error != SysError::Failed("native: image fields changed") {
+                    self.trace_lazy(|| format!("failed:processes:{error:?}"));
+                }
                 Enumeration::Incomplete(error)
             }
         }

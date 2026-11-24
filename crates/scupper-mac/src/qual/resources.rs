@@ -384,6 +384,9 @@ pub(super) fn undo(
                                     }
                                 }
                             }
+                            if skip_unmodifiable(&mut io, target, &mut failures) {
+                                continue;
+                            }
                             // Recovery tries every class even when a previous flush failed.
                             for (op, class) in [
                                 (Operation::Rules, "rules"),
@@ -864,7 +867,15 @@ impl crate::decode::pfanchor::Commands for AnchorInventory<'_> {
                 .ok_or(crate::platform::SysError::Unknown)?,
             evidence.stdout.as_bytes(),
             evidence.stderr.as_bytes(),
-        )?;
+        )
+        .map_err(|error| {
+            super::super::contract_check::underscore_read_error(
+                args.get(1).copied().unwrap_or_default(),
+                op,
+                &evidence,
+                error,
+            )
+        })?;
         if self.measurement_descendants && op == Operation::Inventory {
             let parent = if args.len() == 3 { args[1] } else { "" };
             write!(
@@ -912,6 +923,18 @@ fn measurement_paths(io: &mut AnchorInventory<'_>, root: &str) -> Result<Vec<Str
     }
     Ok(paths)
 }
+// Never issue modifying commands on underscore paths. Read every class even
+// after a read failure, and distinguish actual configuration from persistent names.
+fn skip_unmodifiable(io: &mut AnchorInventory<'_>, path: &str, failures: &mut Vec<String>) -> bool {
+    if let Some(issues) = super::super::contract_check::read_only_underscore(path, |op, flag| {
+        io.call(op, &["-a", path, flag], &[])
+    }) {
+        failures.extend(issues);
+        true
+    } else {
+        false
+    }
+}
 // Independent cleanup budget, even after the measurement case has expired.
 pub(super) fn cleanup_measurement(out: &Path, root: &str) -> Result<()> {
     if root != super::super::desc_inventory::ROOT
@@ -950,6 +973,9 @@ pub(super) fn cleanup_measurement(out: &Path, root: &str) -> Result<()> {
                 failures.push(format!("{path}: cleanup kernel census: {error}"));
                 continue;
             }
+        }
+        if skip_unmodifiable(&mut io, path, &mut failures) {
+            continue;
         }
         for (op, class) in [
             (Operation::Rules, "rules"),
@@ -999,19 +1025,25 @@ pub(super) fn restored_anchor_names(
         .filter(|e| e.kind == "anchor")
         .map(|e| e.path)
         .collect::<std::collections::BTreeSet<_>>();
-    let mut reads = super::recovery::read_anchors(paths, |name| -> Result<Option<Vec<String>>> {
-        let mut io = AnchorInventory::new(out, deadline, name);
-        let path = crate::decode::pfanchor::AnchorPath::new(name)?;
-        if crate::decode::pfanchor::read(&mut io, &path)
-            .map_err(|e| format!("{}: {e:?}", io.last_read))?
-            .is_some()
-        {
-            return Ok(None);
-        }
-        let mut names = vec![name.to_owned()];
-        names.extend(io.descendant_paths);
-        Ok(Some(names))
-    });
+    let mut reads = super::recovery::read_anchors(
+        paths,
+        |name| -> std::result::Result<Option<Vec<String>>, super::recovery::AnchorReadError> {
+            let mut io = AnchorInventory::new(out, deadline, name);
+            let path = crate::decode::pfanchor::AnchorPath::new(name)?;
+            if crate::decode::pfanchor::read(&mut io, &path)
+                .map_err(|error| super::recovery::AnchorReadError {
+                    detail: format!("{}: {error:?}", io.last_read),
+                    error,
+                })?
+                .is_some()
+            {
+                return Ok(None);
+            }
+            let mut names = vec![name.to_owned()];
+            names.extend(io.descendant_paths);
+            Ok(Some(names))
+        },
+    );
     // Read each created top-level namespace once, independently of its children.
     if entries(out)?
         .iter()
@@ -1021,7 +1053,7 @@ pub(super) fn restored_anchor_names(
         })
     {
         let parent = "scupper-qual";
-        let result = (|| -> Result<bool> {
+        let result = (|| -> std::result::Result<bool, super::recovery::AnchorReadError> {
             let mut io = AnchorInventory::new(out, deadline, parent);
             for (op, flag) in [
                 (Operation::Filter, "-sr"),
@@ -1029,13 +1061,18 @@ pub(super) fn restored_anchor_names(
                 (Operation::Extra, "-sT"),
                 (Operation::Extra, "-sd"),
             ] {
-                match io
-                    .call(op, &["-a", parent, flag], &[])
-                    .map_err(|e| format!("pfctl -a {parent} {flag}: {e:?}"))?
-                {
+                match io.call(op, &["-a", parent, flag], &[]).map_err(|error| {
+                    super::recovery::AnchorReadError {
+                        detail: format!("pfctl -a {parent} {flag}: {error:?}"),
+                        error,
+                    }
+                })? {
                     Text::Missing => return Ok(true),
                     Text::MissingParent(_) => {
-                        return Err(format!("pfctl -a {parent} {flag}: missing parent").into());
+                        return Err(super::recovery::AnchorReadError {
+                            error: crate::platform::SysError::Unknown,
+                            detail: format!("pfctl -a {parent} {flag}: missing parent"),
+                        });
                     }
                     Text::Present(text) if text.is_empty() => (),
                     Text::Present(_) => return Ok(false),
@@ -1048,6 +1085,11 @@ pub(super) fn restored_anchor_names(
             Ok(false) => reads
                 .violations
                 .push(format!("anchor parent has foreign content: {parent}")),
+            Err(error) if matches!(error.error, crate::platform::SysError::Failed(_)) => {
+                reads
+                    .violations
+                    .push(format!("anchor parent read failed: {parent}: {error}"));
+            }
             Err(error) => {
                 reads.incomplete_names.push(parent.into());
                 reads

@@ -185,6 +185,59 @@ pub fn run_core_contracts<P: Platform, H: ContractHarness<P>>(h: &mut H) -> Resu
     run_process_contracts(h)
 }
 
+// Three sweeps share the caller's original deadline; only a named foreign PID
+// other than a spawned scratch child may be transient. The adapter still
+// returns Incomplete without product retries.
+fn contract_sweep(
+    p: &mut impl Platform,
+    mode: ExeIdentity,
+    own_pid: u32,
+    deadline: Deadline,
+) -> Vec<super::ProcInfo> {
+    let mut failed = Vec::new();
+    for attempt in 1..=3 {
+        match contract_processes(p.processes(deadline), mode) {
+            Enumeration::Complete(procs) => return procs,
+            Enumeration::Incomplete(error) => {
+                let retry = error.pid.is_some_and(|pid| {
+                    pid != own_pid && !p.spawned_children().iter().any(|child| child.pid == pid)
+                });
+                failed.push(format!("attempt {attempt}: {error:?}"));
+                assert!(
+                    retry && attempt < 3 && p.now() < deadline.0,
+                    "process enumeration incomplete: {failed:?}"
+                );
+                p.pause(std::time::Duration::from_secs(1), deadline);
+            }
+        }
+    }
+    unreachable!("bounded process sweep returns or asserts")
+}
+#[allow(clippy::panic)] // Missing process records are contract assertion failures.
+fn process_record(procs: &[super::ProcInfo], pid: u32) -> &super::ProcInfo {
+    procs
+        .iter()
+        .find(|entry| entry.pid == pid)
+        .unwrap_or_else(|| panic!("process pid {pid} missing from complete sweep: {procs:?}"))
+}
+fn assert_own_process(
+    procs: &[super::ProcInfo],
+    own: &crate::snapshot::HelperIncarnation,
+    mode: ExeIdentity,
+    exe: super::ExeId,
+) {
+    assert!(
+        !procs.iter().any(|proc| proc.pid == 0),
+        "pid 0 in complete sweep: {procs:?}"
+    );
+    let proc = process_record(procs, own.pid);
+    assert_eq!(proc.start, own.start, "own start: {proc:?}");
+    assert_eq!(proc.pgid, own.pgid, "own pgid: {proc:?}");
+    assert_eq!(proc.state, super::ProcState::Running, "own state: {proc:?}");
+    assert!(proc.path.is_some(), "own path: {proc:?}");
+    assert_eq!(proc.exe, expected_exe(mode, Some(exe)), "own exe: {proc:?}");
+}
+#[allow(clippy::too_many_lines)] // Keep process lifecycle contracts and field diagnostics together.
 fn run_process_contracts<P: Platform, H: ContractHarness<P>>(h: &mut H) -> Result<(), SysError> {
     let mode = h.enumerated_exe_identity();
     let own_path = h.own_executable().to_path_buf();
@@ -193,15 +246,8 @@ fn run_process_contracts<P: Platform, H: ContractHarness<P>>(h: &mut H) -> Resul
     let d = limit(p);
     let own_exe = p.executable_id(&own_path, d)?;
     let d = limit(p);
-    assert!(
-        matches!(contract_processes(p.processes(d), mode), Enumeration::Complete(ref procs) if procs.iter().any(|proc| proc.pid == own.pid
-            && proc.start == own.start
-            && proc.pgid == own.pgid
-            && proc.state == super::ProcState::Running
-            && proc.path.is_some()
-            && proc.exe == expected_exe(mode, Some(own_exe)))
-            && !procs.iter().any(|proc| proc.pid == 0))
-    );
+    let procs = contract_sweep(p, mode, own.pid, d);
+    assert_own_process(&procs, &own, mode, own_exe);
     assert_eq!(p.fence(), Fence::Closed);
 
     let child = h.scratch_child()?;
@@ -214,33 +260,48 @@ fn run_process_contracts<P: Platform, H: ContractHarness<P>>(h: &mut H) -> Resul
     assert_eq!(child.exe, Some(scratch_exe));
     assert!(p.spawned_children().contains(&child));
     let d = limit(p);
-    let proc = match contract_processes(p.processes(d), mode) {
-        Enumeration::Complete(procs) => procs
-            .into_iter()
-            .find(|proc| proc.pid == child.pid)
-            .ok_or(SysError::Failed("spawn record missing from process list"))?,
-        Enumeration::Incomplete(error) => return Err(error.error),
-    };
-    assert_eq!(proc.start, child.start_time);
-    assert_eq!(proc.pgid, child.pgid);
-    assert_eq!(proc.ppid, own.pid);
-    assert_eq!(proc.state, super::ProcState::Running);
-    assert_eq!(proc.exe, expected_exe(mode, child.exe));
-    assert_eq!(proc.path.as_deref(), Some(scratch_path.as_path()));
+    let procs = contract_sweep(p, mode, own.pid, d);
+    let proc = process_record(&procs, child.pid).clone();
+    assert_eq!(proc.start, child.start_time, "child start: {proc:?}");
+    assert_eq!(proc.pgid, child.pgid, "child pgid: {proc:?}");
+    assert_eq!(proc.ppid, own.pid, "child ppid: {proc:?}");
+    assert_eq!(
+        proc.state,
+        super::ProcState::Running,
+        "child state: {proc:?}"
+    );
+    assert_eq!(
+        proc.exe,
+        expected_exe(mode, child.exe),
+        "child exe: {proc:?}"
+    );
+    assert_eq!(
+        proc.path.as_deref(),
+        Some(scratch_path.as_path()),
+        "child path: {proc:?}"
+    );
     h.unlink_scratch_executable()?;
     let p = h.platform();
     let d = limit(p);
     assert!(p.executable_id(&scratch_path, d).is_err());
     let d = limit(p);
+    let procs = contract_sweep(p, mode, own.pid, d);
+    assert_own_process(&procs, &own, mode, own_exe);
+    let entry = process_record(&procs, proc.pid);
+    assert_eq!(entry.start, proc.start, "unlinked child start: {entry:?}");
+    assert_eq!(
+        entry.state,
+        super::ProcState::Running,
+        "unlinked child state: {entry:?}"
+    );
+    assert_eq!(
+        entry.exe,
+        expected_exe(mode, Some(scratch_exe)),
+        "unlinked child exe: {entry:?}"
+    );
     assert!(
-        matches!(contract_processes(p.processes(d), mode), Enumeration::Complete(ref procs) if procs.iter().any(|entry| entry.pid == proc.pid
-            && entry.start == proc.start
-            && entry.state == super::ProcState::Running
-            && entry.exe == expected_exe(mode, Some(scratch_exe))
-            && (entry.path.is_none() || entry.path.as_deref() == Some(scratch_path.as_path())))
-            && procs.iter().any(|entry| entry.pid == own.pid
-                && entry.start == own.start
-                && entry.exe == expected_exe(mode, Some(own_exe))))
+        entry.path.is_none() || entry.path.as_deref() == Some(scratch_path.as_path()),
+        "unlinked child path: {entry:?}"
     );
     let mut wrong = proc.start;
     wrong.microseconds = (wrong.microseconds + 1) % 1_000_000;
@@ -250,11 +311,17 @@ fn run_process_contracts<P: Platform, H: ContractHarness<P>>(h: &mut H) -> Resul
         KillOutcome::StartChanged
     );
     let d = limit(p);
-    assert!(
-        matches!(contract_processes(p.processes(d), mode), Enumeration::Complete(ref procs) if procs.iter().any(|entry| entry.pid == proc.pid
-        && entry.start == proc.start
-        && entry.exe == proc.exe
-        && entry.state == super::ProcState::Running))
+    let procs = contract_sweep(p, mode, own.pid, d);
+    let entry = process_record(&procs, proc.pid);
+    assert_eq!(
+        entry.start, proc.start,
+        "start-guard child start: {entry:?}"
+    );
+    assert_eq!(entry.exe, proc.exe, "start-guard child exe: {entry:?}");
+    assert_eq!(
+        entry.state,
+        super::ProcState::Running,
+        "start-guard child state: {entry:?}"
     );
     let d = limit(p);
     p.kill_process(proc.pid, proc.start, d)?;
@@ -262,24 +329,38 @@ fn run_process_contracts<P: Platform, H: ContractHarness<P>>(h: &mut H) -> Resul
     // at most five sleep-counting seconds, including reaping our own zombies.
     let overall = limit(p);
     loop {
-        let d = Deadline(p.now().saturating_add(5).min(overall.0));
-        p.reap_children(d)?;
-        let d = Deadline(p.now().saturating_add(5).min(overall.0));
-        let procs = contract_processes(p.processes(d), mode);
-        if matches!(procs, Enumeration::Complete(ref entries) if !entries.iter().any(|entry| entry.pid == proc.pid && entry.start == proc.start))
-        {
+        p.reap_children(overall)?;
+        if killed_child_absent(p, mode, proc.pid, proc.start, overall) {
             break;
         }
-        assert!(
-            p.now() < overall.0,
-            "killed scratch process did not disappear within five seconds: {procs:?}"
-        );
         p.pause(std::time::Duration::from_millis(50), overall);
     }
     let d = limit(p);
     assert_eq!(p.reap(d), Fence::Closed);
     assert!(p.spawned_children().contains(&child));
     Ok(())
+}
+
+// Kill confirmation tolerates every Incomplete until the original deadline,
+// including own-PID and unnamed process-churn failures.
+fn killed_child_absent(
+    p: &mut impl Platform,
+    mode: ExeIdentity,
+    pid: u32,
+    start: super::StartTime,
+    overall: Deadline,
+) -> bool {
+    let procs = contract_processes(p.processes(overall), mode);
+    if matches!(&procs, Enumeration::Complete(procs)
+        if !procs.iter().any(|entry| entry.pid == pid && entry.start == start))
+    {
+        return true;
+    }
+    assert!(
+        p.now() < overall.0,
+        "killed scratch process did not disappear within five seconds: {procs:?}"
+    );
+    false
 }
 
 fn expected_exe(mode: ExeIdentity, required: Option<super::ExeId>) -> Option<super::ExeId> {
@@ -3370,6 +3451,125 @@ mod r7_hooks {
                 .unwrap()
                 .starts_with("snapshot_result:Failed(")
         );
+    }
+
+    #[test]
+    fn process_sweep_retries_only_foreign_pid_and_is_bounded() {
+        use super::super::fake::{Call, FakePlatform, Fault};
+        for pid in [Some(99999), Some(100), None] {
+            for count in [1, 2, 3] {
+                let mut p = FakePlatform::new().unwrap();
+                for _ in 1..=count {
+                    p.inject(Call::Processes, 1, Fault::ProcessIncomplete(pid));
+                }
+                let d = limit(&mut p);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    contract_sweep(&mut p, ExeIdentity::Required, 100, d)
+                }));
+                assert_eq!(result.is_ok(), pid == Some(99999) && count < 3);
+                let sweeps = p.calls.iter().filter(|c| **c == Call::Processes).count();
+                let pauses = p
+                    .calls
+                    .iter()
+                    .filter(|c| matches!(c, Call::Pause(_)))
+                    .count();
+                assert_eq!(
+                    sweeps,
+                    if pid == Some(99999) {
+                        (count + 1).min(3)
+                    } else {
+                        1
+                    }
+                );
+                assert_eq!(pauses, sweeps - 1);
+                if let Err(panic) = result {
+                    let text = panic.downcast_ref::<String>().unwrap();
+                    assert!(text.contains("attempt 1"));
+                    if count == 3 && pid == Some(99999) {
+                        assert!(text.contains("attempt 3"));
+                    }
+                }
+            }
+        }
+        // The full contract also survives one transient foreign sweep.
+        let mut p = FakePlatform::new().unwrap();
+        p.inject(Call::Processes, 1, Fault::ProcessIncomplete(Some(99999)));
+        run_process_contracts(&mut p).unwrap();
+    }
+
+    #[test]
+    fn process_sweep_never_retries_spawned_scratch_child() {
+        use super::super::fake::{Call, FakePlatform, Fault};
+        for mode in [ExeIdentity::Required, ExeIdentity::Unavailable] {
+            let mut p = FakePlatform::new().unwrap();
+            let child = p.scratch_child().unwrap();
+            p.calls.clear();
+            p.inject(
+                Call::Processes,
+                1,
+                Fault::ProcessIncomplete(Some(child.pid)),
+            );
+            let d = limit(&mut p);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                contract_sweep(&mut p, mode, 100, d)
+            }));
+            assert!(result.is_err());
+            assert_eq!(
+                p.calls
+                    .iter()
+                    .filter(|call| **call == Call::Processes)
+                    .count(),
+                1
+            );
+            assert!(!p.calls.iter().any(|call| matches!(call, Call::Pause(_))));
+        }
+    }
+
+    #[test]
+    fn kill_confirmation_retries_all_incomplete_until_deadline() {
+        use super::super::fake::{Call, FakePlatform, Fault};
+        for mode in [ExeIdentity::Required, ExeIdentity::Unavailable] {
+            for pid in [None, Some(100), Some(99999)] {
+                for persistent in [false, true] {
+                    let mut p = FakePlatform::new().unwrap();
+                    let child = p.scratch_child().unwrap();
+                    // Model the killed/reaped child already absent: failed
+                    // sweeps must delay confirmation, never establish absence.
+                    p.procs.remove(&child.pid);
+                    if mode == ExeIdentity::Unavailable {
+                        for proc in p.procs.values_mut() {
+                            proc.exe = None;
+                        }
+                    }
+                    for _ in 0..if persistent { 200 } else { 5 } {
+                        p.inject(Call::Processes, 1, Fault::ProcessIncomplete(pid));
+                    }
+                    let overall = limit(&mut p);
+                    let started = p.now();
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        loop {
+                            if killed_child_absent(
+                                &mut p,
+                                mode,
+                                child.pid,
+                                child.start_time,
+                                overall,
+                            ) {
+                                break;
+                            }
+                            p.pause(std::time::Duration::from_millis(50), overall);
+                        }
+                    }));
+                    assert_eq!(result.is_err(), persistent, "{pid:?}");
+                    if persistent {
+                        assert_eq!(p.now(), overall.0);
+                    } else {
+                        assert!(p.now() < overall.0);
+                        assert!(p.now() - started < 5);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

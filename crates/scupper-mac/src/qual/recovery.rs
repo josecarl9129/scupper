@@ -380,9 +380,27 @@ pub(super) struct AnchorReads {
     pub violations: Vec<String>,
     pub inconclusive: Vec<String>,
 }
-pub(super) fn read_anchors<E: std::fmt::Display>(
+/// Preserve the adapter error class alongside the failing descendant command.
+pub(super) struct AnchorReadError {
+    pub error: crate::platform::SysError,
+    pub detail: String,
+}
+impl From<crate::platform::SysError> for AnchorReadError {
+    fn from(error: crate::platform::SysError) -> Self {
+        Self {
+            detail: format!("{error:?}"),
+            error,
+        }
+    }
+}
+impl std::fmt::Display for AnchorReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+pub(super) fn read_anchors(
     paths: impl IntoIterator<Item = String>,
-    mut read: impl FnMut(&str) -> Result<Option<Vec<String>>, E>,
+    mut read: impl FnMut(&str) -> Result<Option<Vec<String>>, AnchorReadError>,
 ) -> AnchorReads {
     let mut result = AnchorReads::default();
     for path in paths.into_iter().collect::<BTreeSet<_>>() {
@@ -391,6 +409,19 @@ pub(super) fn read_anchors<E: std::fmt::Display>(
                 .violations
                 .push(format!("journaled anchor has configuration: {path}")),
             Ok(Some(names)) => result.empty_names.extend(names),
+            Err(error) if matches!(error.error, crate::platform::SysError::Failed(_)) => {
+                if error.error
+                    == crate::platform::SysError::Failed("foreign content in owned anchor")
+                {
+                    result.violations.push(format!(
+                        "journaled anchor has configuration: {path}: {error}"
+                    ));
+                } else {
+                    result
+                        .violations
+                        .push(format!("journaled anchor read failed: {path}: {error}"));
+                }
+            }
             Err(error) => {
                 result
                     .inconclusive
@@ -404,13 +435,42 @@ pub(super) fn read_anchors<E: std::fmt::Display>(
 #[cfg(test)]
 mod anchor_read_tests {
     #[test]
+    fn foreign_content_is_configuration_violation_with_descendant_path() {
+        use crate::platform::SysError;
+        let result = super::read_anchors(["scupper-qual/children".into()], |_| {
+            Err(super::AnchorReadError {
+                error: SysError::Failed("foreign content in owned anchor"),
+                detail: "pfctl -a scupper-qual/children/X/_1 -sr: foreign content in owned anchor"
+                    .into(),
+            })
+        });
+        assert_eq!(result.inconclusive, [] as [String; 0]);
+        assert_eq!(result.incomplete_names, [] as [String; 0]);
+        assert_eq!(result.empty_names, [] as [String; 0]);
+        assert_eq!(
+            result.violations,
+            [
+                "journaled anchor has configuration: scupper-qual/children: pfctl -a scupper-qual/children/X/_1 -sr: foreign content in owned anchor"
+            ]
+        );
+        for error in [SysError::TimedOut, SysError::Unknown] {
+            let result = super::read_anchors(["a/b".into()], |_| Err(error.clone().into()));
+            assert_eq!(result.incomplete_names, ["a/b"]);
+            assert_eq!(result.violations, [] as [String; 0]);
+            assert_eq!(result.inconclusive.len(), 1);
+        }
+    }
+    #[test]
     fn duplicate_failed_read_is_inconclusive_and_keeps_other_allowances() {
         let mut calls = Vec::new();
         let result = super::read_anchors(["a", "b", "a", "c"].map(str::to_owned), |path| {
             calls.push(path.to_owned());
             match path {
                 "a" => Ok(Some(vec![path.to_owned()])),
-                "b" => Err("-sd timed out"),
+                "b" => Err(super::AnchorReadError {
+                    error: crate::platform::SysError::TimedOut,
+                    detail: "-sd timed out".into(),
+                }),
                 _ => Ok(None),
             }
         });

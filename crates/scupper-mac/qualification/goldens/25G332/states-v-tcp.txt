@@ -1,0 +1,19 @@
+ALL udp 127.0.0.1:51229 -> 127.0.0.1:53288       SINGLE:NO_TRAFFIC
+   age 00:00:02, expires in 00:00:28, 10:0 pkts, 400:0 bytes, anchor 0, rule 0, flowhash 0xa3e6afea
+ALL udp 127.0.0.1:53288 <- 127.0.0.1:51229       NO_TRAFFIC:SINGLE
+   age 00:00:02, expires in 00:00:28, 10:0 pkts, 400:0 bytes, anchor 0, rule 0, flowhash 0xf568af7d
+ALL tcp 127.0.0.1:49253 -> 127.0.0.1:49250       ESTABLISHED:ESTABLISHED
+   [1326206169 + 408320] wscale 6  [2595854975 + 408320] wscale 6
+   age 00:00:01, expires in 23:59:59, 3:3 pkts, 180:168 bytes, anchor 0, rule 0, flowhash 0xa1cace52
+ALL tcp 127.0.0.1:49250 <- 127.0.0.1:49253       ESTABLISHED:ESTABLISHED
+   [2595854975 + 408320] wscale 6  [1326206169 + 408320] wscale 6
+   age 00:00:01, expires in 23:59:59, 3:3 pkts, 180:168 bytes, anchor 0, rule 0, flowhash 0xe6bb8d56
+ALL tcp ::1[49254] -> ::1[49251]       ESTABLISHED:ESTABLISHED
+   [3448784931 + 407808] wscale 6  [507379732 + 407808] wscale 6
+   age 00:00:00, expires in 24:00:00, 3:3 pkts, 240:228 bytes, anchor 0, rule 1, flowhash 0x8aa4dd1b
+ALL tcp ::1[49251] <- ::1[49254]       ESTABLISHED:ESTABLISHED
+   [507379732 + 407808] wscale 6  [3448784931 + 407808] wscale 6
+   age 00:00:00, expires in 24:00:00, 3:3 pkts, 240:228 bytes, anchor 0, rule 1, flowhash 0xd7f887f6
+ALL tcp 198.18.0.1:49255 -> 198.18.0.2:49252       ESTABLISHED:ESTABLISHED
+   [3336623169 + 131072] wscale 6  [4162767275 + 131776] wscale 6
+   age 00:00:00, expires in 24:00:00, 3:3 pkts, 180:168 bytes, anchor 0, rule 2, flowhash 0x8177f92d

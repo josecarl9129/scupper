@@ -46,6 +46,32 @@ class ArtifactTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(CHECKER), str(self.root), *arguments],
                               capture_output=True, text=True, env=env, check=False)
 
+    def test_flush_selectors_use_retaining_measurement_loop(self):
+        contracts = (REPO / "crates/scupper-mac/src/qual/contracts.rs").read_text()
+        flush = contracts[contracts.index("fn flush_measurement("):]
+        self.assertEqual(flush.count("super::super::state_measure::selector_measurements("), 1)
+        self.assertNotIn("drop(fresh)", flush)
+        helper = (REPO / "crates/scupper-mac/src/qual/state_measure.rs").read_text()
+        helper = helper[helper.index("pub(super) fn selector_measurements<"):]
+        helper = helper[:helper.index("/// A state read")]
+        self.assertEqual(helper.count("connections.push(fresh);"), 1)
+        self.assertIn("with_cleanup(", helper)
+        self.assertIn("Vec::clear", helper)
+
+    def test_descendant_count_tracks_load_attempts_and_names_reviewed_skip(self):
+        contracts = (REPO / "crates/scupper-mac/src/qual/contracts.rs").read_text()
+        descendants = contracts[contracts.index("fn descendants("):contracts.index("fn anchor_lifecycle(")]
+        self.assertNotIn("r.iterations = 9", descendants)
+        self.assertNotIn("all descendant", descendants)
+        measurements = contracts[contracts.index("fn descendant_measurements("):contracts.index("fn kernel_comparison(")]
+        self.assertEqual(measurements.count("r.iterations += 1;"), 1)
+        self.assertIn("r.iterations += 1;\n                    let load = raw(", measurements)
+        self.assertLess(measurements.index("continue;"), measurements.index("r.iterations += 1;"))
+        self.assertIn("skipped.push(name);", measurements)
+        self.assertIn('"inline-multiline"', measurements)
+        self.assertIn('skipped fixtures: {skipped:?}', measurements)
+        self.assertIn('r.iterations = 0;', measurements)
+
     def test_review_sha256_matches_exact_golden_bytes(self):
         goldens = REPO / "crates/scupper-mac/qualification/goldens"
         for build in ["24H232", "25G332"]:
@@ -55,16 +81,37 @@ class ArtifactTests(unittest.TestCase):
                 self.assertEqual(hashlib.sha256((goldens / build / name).read_bytes()).hexdigest(), expected,
                                  f"{build}/{name} golden drift")
 
-    def test_measurement_reviews_pin_exact_udp_rows_and_full_rejections(self):
+    def test_measurement_reviews_pin_udp_tcp_multiline_and_full_rejections(self):
         goldens = REPO / "crates/scupper-mac/qualification/goldens"
         for build in ["24H232", "25G332"]:
             review = json.loads((goldens / build / "measurement-review.json").read_text())
             self.assertEqual(review["build"], build)
             self.assertIs(review["states_v_reviewed"], True)
-            self.assertEqual(review["protocol_allowlist"], ["udp"])
+            self.assertEqual(review["protocol_allowlist"], ["udp", "tcp"])
             self.assertIs(review["states_vv_reviewed"], False)
             self.assertIs(review["descendants_reviewed"], False)
-            self.assertFalse(review["inline_multiline_reviewed"])
+            self.assertTrue(review["inline_multiline_reviewed"])
+            self.assertIn(f"{build}/anchor-children-inline-multiline.json", review["inline_multiline"]["provenance"])
+            self.assertEqual(len(review["inline_multiline"]["facts"]), 3)
+            observations = review["inline_multiline"]["normalized_observations"]
+            self.assertEqual(observations["load"]["exit_code"], 0)
+            self.assertEqual(observations["load"]["stdout"], "")
+            self.assertEqual(observations["source"], "anchor {\n pass quick on lo0 all no state\n}\n")
+            self.assertEqual(observations["parent_filter_stdout"], "anchor all {\n  pass quick on lo0 all no state\n}\n")
+            self.assertEqual(observations["inventory_agreement"], "K=T at every level before and after")
+            self.assertTrue(observations["after_parent_flush"]["rule_bearing_child_survives"])
+            self.assertFalse(observations["after_parent_flush"]["empty_doubled_leaf_survives"])
+            tcp = review["states_v_tcp"]
+            self.assertEqual(hashlib.sha256((goldens / build / tcp["fixture"]).read_bytes()).hexdigest(), tcp["sha256"])
+            text = (goldens / build / tcp["fixture"]).read_text()
+            self.assertEqual(text.count("ALL tcp "), 5)
+            self.assertEqual(text.count("ESTABLISHED:ESTABLISHED"), 5)
+            refusal = review["underscore_flush_refusal"]
+            self.assertTrue(refusal["reviewed"])
+            self.assertEqual(refusal["classes"], ["rules", "nat", "Tables", "dummynet"])
+            self.assertEqual(refusal["exit_code"], 1)
+            self.assertEqual(refusal["stdout"], "")
+            self.assertEqual(refusal["stderr"], "No ALTQ support in kernel\nALTQ related functions disabled\npfctl: anchor names beginning with '_' cannot be modified from the command line\n")
             self.assertEqual(hashlib.sha256((goldens / build / "states-v.txt").read_bytes()).hexdigest(),
                              review["states_v_sha256"])
             self.assertEqual({row["name"] for row in review["rejections"]}, {"underscore", "inline"})
@@ -77,6 +124,57 @@ class ArtifactTests(unittest.TestCase):
         a = json.loads((goldens / "24H232/measurement-review.json").read_text())["rejections"]
         b = json.loads((goldens / "25G332/measurement-review.json").read_text())["rejections"]
         self.assertEqual(a, b)
+
+    def test_fix8_mutants_have_exactly_one_source_site(self):
+        # Inspect the literal assignments only: never import/run the mutation driver.
+        tree = ast.parse((REPO / "crates/scupper-mac/tests/r7_mutations.py").read_text())
+        paths = {}
+        mutants_node = None
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
+                name = node.targets[0].id
+                if (isinstance(node.value, ast.BinOp) and isinstance(node.value.left, ast.Name)
+                        and node.value.left.id == "ROOT" and isinstance(node.value.right, ast.Constant)):
+                    paths[name] = REPO / node.value.right.value
+                if name == "MUTANTS":
+                    mutants_node = node.value
+        expected = {"underscore-refusal-is-success", "foreign-content-labelled-incomplete",
+                    "process-sweep-retries-own-pid", "non-established-tcp-accepted"}
+        found = set()
+        for row in mutants_node.elts:
+            name = ast.literal_eval(row.elts[0])
+            if name not in expected:
+                continue
+            found.add(name)
+            path = paths[row.elts[1].id]
+            site = ast.literal_eval(row.elts[2])
+            self.assertEqual(path.read_text().count(site), 1, name)
+        self.assertEqual(found, expected)
+
+    def test_pass3_descendant_order_skip_and_read_only_flushes(self):
+        native = (REPO / "crates/scupper-mac/src/qual/contracts.rs").read_text()
+        start = native.index("for (name, source, suffix) in [")
+        end = native.index("let parent_name = super::unique(name)", start)
+        campaign = native[start:end]
+        names = ["named-inline", "wildcard", "grandchild", "direct-underscore",
+                 "direct-grandchild-underscore", "named", "underscore", "inline", "inline-multiline"]
+        positions = [campaign.index(f'"{name}"') for name in names]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn('inline_multiline_reviewed', campaign)
+        self.assertIn('continue;', campaign)
+        self.assertIn('"fixture_loaded":false', campaign)
+        # Direct creation remains observational, outside the reviewed rejection rows.
+        for build in ["24H232", "25G332"]:
+            review = json.loads((REPO / f"crates/scupper-mac/qualification/goldens/{build}/measurement-review.json").read_text())
+            self.assertFalse(any(row["name"].startswith("direct-") for row in review["rejections"]))
+        resources = (REPO / "crates/scupper-mac/src/qual/resources.rs").read_text()
+        self.assertIn('skip_unmodifiable(&mut io, target, &mut failures)', resources)
+        self.assertIn('skip_unmodifiable(&mut io, path, &mut failures)', resources)
+        self.assertIn('read_only_underscore', resources)
+        self.assertIn('flush-vv-identity-measurement.json', native)
+        self.assertIn('vv_stability(&vv_before)', native)
+        self.assertIn('vv_stability(&vv_reused)', native)
+        self.assertIn('let reuse_attempt = udp.send_ten()', native)
 
     def test_ruleset_probe_falls_back_and_records_header_provenance(self):
         header = REPO / "crates/scupper-darwin/probe/pf-rulesets-layout.h"

@@ -122,6 +122,7 @@ fn known(build: &Build) -> bool {
 ///
 /// # Errors
 /// Unknown build, exit, diagnostic, malformed/truncated/extra line or foreign class.
+#[allow(clippy::too_many_lines)] // Keep the complete per-operation reviewed rows together.
 pub fn proposed(
     build: &Build,
     op: Operation,
@@ -157,6 +158,17 @@ pub fn proposed(
                 }
             }
         }
+    }
+    if rc == 1
+        && stdout.is_empty()
+        && matches!(
+            op,
+            Operation::Rules | Operation::Nat | Operation::Tables | Operation::Dummynet
+        )
+        && stderr
+            == b"pfctl: anchor names beginning with '_' cannot be modified from the command line\n"
+    {
+        return Err(SysError::Failed("pfctl refuses _-anchor modification"));
     }
     if rc != 0 {
         return Err(SysError::Unknown);
