@@ -15,64 +15,113 @@ fn paths_accept_exactly_two_safe_components() {
     }
 }
 #[test]
-fn every_proposed_row_is_build_pinned_and_unreviewed() {
-    for build in pftext::BUILDS {
-        let build = Build::fixture(build);
+#[allow(clippy::too_many_lines)] // Keep the reviewed operation rows and their common rejection checks together.
+fn every_proposed_row_is_build_pinned_and_reviewed() {
+    for name in pftext::BUILDS {
+        let build = Build::fixture(name);
         let rows = [
-            (Operation::Load, 0, b"".as_slice(), b"".as_slice()),
-            (Operation::Load, 0, b"", LOAD_WARNING),
-            (Operation::Inventory, 0, b"  scupper\n  foreign\n", b""),
-            (Operation::Inventory, 0, b"", b""),
-            (Operation::Inventory, 0, b"  scupper-qual/scupper\n", b""),
             (
-                Operation::Inventory,
-                0,
-                b"",
-                b"Anchor 'com.apple' not found.\n",
+                Operation::Load,
+                b"".as_slice(),
+                [LOAD_WARNING, pftext::ALTQ_PREAMBLE].concat(),
             ),
             (
                 Operation::Inventory,
-                0,
-                b"",
-                b"Anchor 'scupper-qual' not found.\n",
+                b"  scupper-qual/scupper\n",
+                pftext::ALTQ_PREAMBLE.to_vec(),
             ),
-            (Operation::Filter, 0, b"block drop all\n", b""),
-            (Operation::Filter, 0, b"", b""),
+            (
+                Operation::Inventory,
+                b"  com.apple\n",
+                pftext::ALTQ_PREAMBLE.to_vec(),
+            ),
+            (
+                Operation::Inventory,
+                b"  com.apple/child\n",
+                pftext::ALTQ_PREAMBLE.to_vec(),
+            ),
+            (
+                Operation::Inventory,
+                b"",
+                [pftext::ALTQ_PREAMBLE, b"Anchor 'scupper-qual' not found.\n"].concat(),
+            ),
             (
                 Operation::Filter,
-                0,
-                b"",
-                b"pfctl: DIOCGETRULES: Invalid argument\n",
+                b"block drop all\n",
+                pftext::ALTQ_PREAMBLE.to_vec(),
             ),
-            (Operation::Extra, 0, b"", b""),
-            (Operation::Rules, 0, b"", b"rules cleared\n"),
-            (Operation::Nat, 0, b"", b"nat cleared\n"),
-            (Operation::Dummynet, 0, b"", b"dummynet cleared\n"),
-            (Operation::Tables, 0, b"", b"0 tables deleted.\n"),
-            (Operation::Tables, 0, b"", b"4294967295 tables deleted.\n"),
-            (Operation::States, 0, b"", b"0 states cleared\n"),
-            (Operation::States, 0, b"", b"65535 states cleared\n"),
+            (
+                Operation::Filter,
+                b"",
+                [
+                    pftext::ALTQ_PREAMBLE,
+                    b"pfctl: DIOCGETRULES: Invalid argument\n",
+                ]
+                .concat(),
+            ),
+            (
+                Operation::Rules,
+                b"",
+                [pftext::ALTQ_PREAMBLE, b"rules cleared\n"].concat(),
+            ),
+            (
+                Operation::Nat,
+                b"",
+                [pftext::ALTQ_PREAMBLE, b"nat cleared\n"].concat(),
+            ),
+            (
+                Operation::Dummynet,
+                b"",
+                [pftext::ALTQ_PREAMBLE, b"dummynet cleared\n"].concat(),
+            ),
+            (
+                Operation::Tables,
+                b"",
+                [pftext::ALTQ_PREAMBLE, b"0 tables deleted.\n"].concat(),
+            ),
+            (
+                Operation::Tables,
+                b"",
+                [pftext::ALTQ_PREAMBLE, b"4294967295 tables deleted.\n"].concat(),
+            ),
+            (
+                Operation::States,
+                b"",
+                [pftext::ALTQ_PREAMBLE, b"0 states cleared\n"].concat(),
+            ),
+            (
+                Operation::States,
+                b"",
+                [pftext::ALTQ_PREAMBLE, b"65535 states cleared\n"].concat(),
+            ),
+            (Operation::Filter, b"", pftext::ALTQ_PREAMBLE.to_vec()),
+            (Operation::DummynetShow, b"", pftext::ALTQ_PREAMBLE.to_vec()),
+            (
+                Operation::DummynetShow,
+                b"",
+                [
+                    pftext::ALTQ_PREAMBLE,
+                    b"pfctl: DIOCGETRULES: Invalid argument\n",
+                ]
+                .concat(),
+            ),
+            (Operation::Extra, b"", pftext::ALTQ_PREAMBLE.to_vec()),
+            (Operation::Inventory, b"", pftext::ALTQ_PREAMBLE.to_vec()),
         ];
-        for (op, rc, out, err) in rows {
-            for err in [err.to_vec(), [pftext::ALTQ_PREAMBLE, err].concat()] {
-                assert!(
-                    proposed(&build, op, rc, out, &err).is_ok(),
-                    "{op:?} {err:?}"
-                );
-                assert_eq!(qualified(&build, op, rc, out, &err), Err(UNREVIEWED));
-                assert!(proposed(&Build::fixture("unknown"), op, rc, out, &err).is_err());
-                for extra in [b"unexpected\n".as_slice(), b"\0", b"\n"] {
-                    assert!(
-                        proposed(&build, op, rc, out, &[err.as_slice(), extra].concat()).is_err()
-                    );
-                }
-                if !err.is_empty() {
-                    assert!(proposed(&build, op, rc, out, &err[..err.len() - 1]).is_err());
-                }
-                if !out.is_empty() {
-                    assert!(proposed(&build, op, rc, &out[..out.len() - 1], &err).is_err());
-                }
-                assert!(proposed(&build, op, 2, out, &err).is_err());
+        for (op, out, err) in rows {
+            assert!(
+                qualified(&build, op, 0, out, &err).is_ok(),
+                "{op:?} {err:?}"
+            );
+            assert!(qualified(&Build::fixture("unknown"), op, 0, out, &err).is_err());
+            assert!(qualified(&build, op, 1, out, &err).is_err());
+            assert!(qualified(&build, op, 0, out, b"").is_err());
+            assert!(qualified(&build, op, 0, out, &err[..err.len() - 1]).is_err());
+            for extra in [b"unexpected\n".as_slice(), b"\0", b"\n"] {
+                assert!(qualified(&build, op, 0, out, &[err.as_slice(), extra].concat()).is_err());
+            }
+            if !out.is_empty() {
+                assert!(qualified(&build, op, 0, &out[..out.len() - 1], &err).is_err());
             }
         }
     }
@@ -87,7 +136,12 @@ fn unknown_counts_inventories_and_foreign_classes_fail() {
                 Operation::States,
                 0,
                 b"",
-                format!("{count} states cleared\n").as_bytes()
+                [
+                    pftext::ALTQ_PREAMBLE,
+                    format!("{count} states cleared\n").as_bytes()
+                ]
+                .concat()
+                .as_slice()
             )
             .is_err()
         );
@@ -95,18 +149,33 @@ fn unknown_counts_inventories_and_foreign_classes_fail() {
     for text in [
         "scupper\n",
         "  a\n  a\n",
-        "  a/b/c\n",
+        "  a/b/c/d/e/f/g/h/i/j/k\n",
         "  *\n",
         "  ..\n",
         "  a\n\n",
         "    a\n",
         "  a\0\n",
     ] {
-        assert!(proposed(&b, Operation::Inventory, 0, text.as_bytes(), b"").is_err());
+        assert!(
+            proposed(
+                &b,
+                Operation::Inventory,
+                0,
+                text.as_bytes(),
+                pftext::ALTQ_PREAMBLE
+            )
+            .is_err()
+        );
     }
     for text in ["nat on en0\n", "foreign\n", "  child\n", "\n"] {
         assert_eq!(
-            proposed(&b, Operation::Extra, 0, text.as_bytes(), b""),
+            proposed(
+                &b,
+                Operation::Extra,
+                0,
+                text.as_bytes(),
+                pftext::ALTQ_PREAMBLE
+            ),
             Err(SysError::Failed("foreign content in owned anchor"))
         );
     }
@@ -118,11 +187,15 @@ fn unknown_counts_inventories_and_foreign_classes_fail() {
     assert_eq!(selective(false), Err(SELECTIVE_UNQUALIFIED));
 }
 struct Script {
+    recursive: bool,
+    build: &'static str,
     rows: VecDeque<(Vec<String>, Result<Text, SysError>)>,
 }
 impl Script {
     fn new(rows: Vec<(&[&str], Result<Text, SysError>)>) -> Self {
         Self {
+            recursive: false,
+            build: "24H232",
             rows: rows
                 .into_iter()
                 .map(|(a, r)| (a.iter().map(|s| (*s).into()).collect(), r))
@@ -139,6 +212,13 @@ impl Script {
     }
 }
 impl Commands for Script {
+    fn build(&self) -> Result<Build, SysError> {
+        Ok(Build::fixture(self.build))
+    }
+    fn descendants_reviewed(&self) -> Result<bool, SysError> {
+        Ok(self.recursive)
+    }
+
     fn call(&mut self, _: Operation, args: &[&str], input: &[u8]) -> Result<Text, SysError> {
         assert_eq!(input, &[] as &[u8]);
         assert!(!self.rows.is_empty());
@@ -221,10 +301,13 @@ fn present_rows(filter: &str) -> Vec<(&'static [&'static str], Result<Text, SysE
     ]
 }
 #[test]
-fn present_empty_is_some_and_every_extra_class_is_checked() {
+fn present_empty_is_none_and_every_extra_class_is_checked() {
     for filter in ["", "block all\n"] {
         let mut io = Script::new(present_rows(filter));
-        assert_eq!(read(&mut io, &path()), Ok(Some(filter.into())));
+        assert_eq!(
+            read(&mut io, &path()),
+            Ok((!filter.is_empty()).then(|| filter.into()))
+        );
         io.done();
     }
     for index in 2..6 {
@@ -263,7 +346,7 @@ fn removal_uses_only_scoped_flushes_and_proves_absence() {
             ]);
         }
         let mut io = Script::new(rows);
-        assert_eq!(remove(&mut io, &path()).is_ok(), !persists);
+        assert_eq!(remove(&mut io, &path()), Ok(()));
         io.done();
     }
     let mut io = Script::new(vec![
@@ -275,33 +358,57 @@ fn removal_uses_only_scoped_flushes_and_proves_absence() {
 }
 
 #[test]
-fn load_notices_each_occur_at_most_once_in_either_proposed_order() {
+fn load_requires_exact_warning_then_altq_and_optimizer_none() {
+    assert_eq!(
+        load_args(&path()).as_slice(),
+        ["-o", "none", "-a", "scupper-qual/scupper", "-f", "-"]
+    );
     for name in pftext::BUILDS {
         let build = Build::fixture(name);
-        let reversed = [LOAD_WARNING, pftext::ALTQ_PREAMBLE].concat();
         assert_eq!(
-            proposed(&build, Operation::Load, 0, b"", &reversed),
+            qualified(
+                &build,
+                Operation::Load,
+                0,
+                b"",
+                &[LOAD_WARNING, pftext::ALTQ_PREAMBLE].concat()
+            ),
             text("")
         );
-        for duplicate in [
-            [LOAD_WARNING, LOAD_WARNING].concat(),
-            [pftext::ALTQ_PREAMBLE, pftext::ALTQ_PREAMBLE].concat(),
-            [pftext::ALTQ_PREAMBLE, LOAD_WARNING, pftext::ALTQ_PREAMBLE].concat(),
+        for bad in [
+            vec![],
+            LOAD_WARNING.to_vec(),
+            pftext::ALTQ_PREAMBLE.to_vec(),
+            [pftext::ALTQ_PREAMBLE, LOAD_WARNING].concat(),
+            [LOAD_WARNING, LOAD_WARNING, pftext::ALTQ_PREAMBLE].concat(),
         ] {
-            assert!(proposed(&build, Operation::Load, 0, b"", &duplicate).is_err());
+            assert!(qualified(&build, Operation::Load, 0, b"", &bad).is_err());
         }
-        assert!(proposed(&build, Operation::Filter, 0, b"unexpected\n", b"").is_err());
-        assert!(
-            proposed(
-                &build,
-                Operation::Filter,
-                0,
-                b"block all\n# unexpected\n",
-                b""
-            )
-            .is_err()
-        );
-        assert!(proposed(&build, Operation::Filter, 0, b"block all\n\n", b"").is_err());
+    }
+}
+
+#[test]
+fn removal_skips_flush_only_after_complete_configuration_absence() {
+    let mut io = Script::new(present_rows(""));
+    assert_eq!(remove(&mut io, &path()), Ok(()));
+    io.done();
+    for first in [
+        Err(SysError::Unknown),
+        Err(SysError::Failed("foreign content in owned anchor")),
+    ] {
+        let mut rows = vec![(&["-a", "scupper-qual", "-sA"][..], first)];
+        for args in [
+            &["-a", "scupper-qual/scupper", "-F", "rules"][..],
+            &["-a", "scupper-qual/scupper", "-F", "nat"],
+            &["-a", "scupper-qual/scupper", "-F", "Tables"],
+            &["-a", "scupper-qual/scupper", "-F", "dummynet"],
+        ] {
+            rows.push((args, text("")));
+        }
+        rows.extend(present_rows(""));
+        let mut io = Script::new(rows);
+        assert_eq!(remove(&mut io, &path()), Ok(()));
+        io.done();
     }
 }
 
@@ -325,7 +432,12 @@ fn parent_scope_and_named_absence_must_agree() {
                 Operation::Inventory,
                 0,
                 b"",
-                format!("Anchor '{parent}' not found.\n").as_bytes()
+                [
+                    pftext::ALTQ_PREAMBLE,
+                    format!("Anchor '{parent}' not found.\n").as_bytes()
+                ]
+                .concat()
+                .as_slice()
             ),
             Ok(Text::MissingParent(parent.into()))
         );
@@ -351,12 +463,286 @@ fn production_grammar_excludes_harness_syntax() {
         "pass quick on lo0 inet proto udp from 127.0.0.1 to 127.0.0.1 port = 45678 keep state\n",
     ] {
         assert!(
-            proposed(&build, Operation::Filter, 0, row.as_bytes(), b"").is_err(),
+            proposed(
+                &build,
+                Operation::Filter,
+                0,
+                row.as_bytes(),
+                pftext::ALTQ_PREAMBLE
+            )
+            .is_err(),
             "{row}"
         );
         assert!(
-            proposed(&build, Operation::HarnessFilter, 0, row.as_bytes(), b"").is_ok(),
+            proposed(
+                &build,
+                Operation::HarnessFilter,
+                0,
+                row.as_bytes(),
+                pftext::ALTQ_PREAMBLE
+            )
+            .is_ok(),
             "{row}"
         );
     }
+}
+
+#[test]
+fn filter_foreign_classes_have_exact_error() {
+    for name in pftext::BUILDS {
+        for line in [
+            "scrub in all\n",
+            "scrub-anchor \"x\" all\n",
+            "anchor \"x\" all\n",
+            "block from <q> to any\n",
+        ] {
+            assert_eq!(
+                proposed(
+                    &Build::fixture(name),
+                    Operation::Filter,
+                    0,
+                    line.as_bytes(),
+                    pftext::ALTQ_PREAMBLE
+                ),
+                Err(SysError::Failed("foreign content in owned anchor"))
+            );
+        }
+    }
+}
+
+#[test]
+fn unsupported_build_load_and_remove_spawn_no_commands() {
+    let mut io = Script::new(vec![]);
+    io.build = "unreviewed";
+    assert_eq!(
+        load(&mut io, &path(), "block all\n"),
+        Err(UNSUPPORTED_BUILD)
+    );
+    assert_eq!(remove(&mut io, &path()), Err(UNSUPPORTED_BUILD));
+    io.done();
+    for name in pftext::BUILDS {
+        assert!(reviewed(&Build::fixture(name)));
+        assert!(!descendants_reviewed(&Build::fixture(name)));
+    }
+}
+
+#[derive(Default)]
+struct Tree {
+    recursive: bool,
+    nodes: std::collections::BTreeMap<String, (String, Vec<String>)>,
+    calls: Vec<Vec<String>>,
+    bad: Option<(&'static str, Result<Text, SysError>)>,
+}
+impl Commands for Tree {
+    fn build(&self) -> Result<Build, SysError> {
+        Ok(Build::fixture("24H232"))
+    }
+    fn descendants_reviewed(&self) -> Result<bool, SysError> {
+        Ok(self.recursive)
+    }
+    fn call(&mut self, op: Operation, args: &[&str], _: &[u8]) -> Result<Text, SysError> {
+        self.calls.push(args.iter().map(|s| (*s).into()).collect());
+        let path = args[1];
+        let flag = args[2];
+        if path == "scupper-qual" {
+            return text("  scupper-qual/scupper\n");
+        }
+        if path.ends_with("/child")
+            && let Some((bad_flag, result)) = &self.bad
+            && flag == *bad_flag
+        {
+            return result.clone();
+        }
+        let (filter, children) = self.nodes.get(path).cloned().unwrap_or_default();
+        let out = match flag {
+            "-sA" => children.iter().fold(String::new(), |mut text, child| {
+                text.push_str("  ");
+                text.push_str(child);
+                text.push('\n');
+                text
+            }),
+            "-sr" => filter,
+            "-F" => {
+                self.nodes.entry(path.into()).or_default().0.clear();
+                return text("");
+            }
+            _ => String::new(),
+        };
+        proposed(
+            &Build::fixture("24H232"),
+            op,
+            0,
+            out.as_bytes(),
+            pftext::ALTQ_PREAMBLE,
+        )
+    }
+}
+fn tree(recursive: bool, chain: usize) -> Tree {
+    let mut io = Tree {
+        recursive,
+        ..Tree::default()
+    };
+    let mut parent = path().as_str().to_owned();
+    for _ in 0..chain {
+        let child = format!("{parent}/child");
+        io.nodes.entry(parent).or_default().1.push(child.clone());
+        parent = child;
+    }
+    io
+}
+#[test]
+fn descendant_absence_requires_review_and_complete_empty_subtree() {
+    for recursive in [false, true] {
+        for length in [1, 2, 8] {
+            let mut io = tree(recursive, length);
+            assert_eq!(read(&mut io, &path()).is_ok(), recursive);
+            io.nodes.entry(path().as_str().into()).or_default().0 = "block all\n".into();
+            assert_eq!(
+                read(&mut io, &path()).is_ok(),
+                recursive,
+                "own policy also checks children"
+            );
+        }
+        let mut io = tree(recursive, 2);
+        io.nodes
+            .entry("scupper-qual/scupper/child/child".into())
+            .or_default()
+            .0 = "block all\n".into();
+        assert!(read(&mut io, &path()).is_err());
+        assert!(remove(&mut io, &path()).is_err());
+        assert!(
+            io.calls
+                .iter()
+                .filter(|a| a.contains(&"-F".into()))
+                .all(|a| a[1] == path().as_str())
+        );
+        for escape in [
+            "scupper-qual/scupper2/child",
+            "scupper-qual/foreign",
+            "scupper-qual/scupper/../escape",
+            "scupper-qual/scupper/child/grandchild",
+        ] {
+            let mut io = tree(recursive, 0);
+            io.nodes
+                .entry(path().as_str().into())
+                .or_default()
+                .1
+                .push(escape.into());
+            assert!(read(&mut io, &path()).is_err());
+            assert!(!io.calls.iter().any(|a| a[1] == escape));
+        }
+        let mut io = tree(recursive, 9);
+        assert!(read(&mut io, &path()).is_err());
+        for count in [63, 64] {
+            let mut io = tree(recursive, 0);
+            io.nodes.entry(path().as_str().into()).or_default().1 = (0..count)
+                .map(|n| format!("scupper-qual/scupper/c{n}"))
+                .collect();
+            assert_eq!(read(&mut io, &path()).is_ok(), recursive && count == 63);
+        }
+    }
+    for policy in ["", "block all\n"] {
+        let mut io = tree(true, 2);
+        io.nodes.entry(path().as_str().into()).or_default().0 = policy.into();
+        assert_eq!(remove(&mut io, &path()), Ok(()));
+        let flushes = io
+            .calls
+            .iter()
+            .filter(|a| a.contains(&"-F".into()))
+            .collect::<Vec<_>>();
+        assert_eq!(flushes.len(), if policy.is_empty() { 0 } else { 4 });
+        assert!(flushes.iter().all(|a| a[1] == path().as_str()));
+    }
+    for flag in ["-sr", "-sn", "-sd", "-sT", "-sA"] {
+        for bad in [
+            text("foreign\n"),
+            Err(SysError::TimedOut),
+            Err(SysError::Unknown),
+            Ok(Text::Missing),
+        ] {
+            let mut io = tree(true, 1);
+            io.bad = Some((flag, bad));
+            assert!(read(&mut io, &path()).is_err(), "{flag}");
+        }
+    }
+}
+
+#[test]
+fn unsupported_build_only_canonical_owned_lockdown_attempts_one_load() {
+    struct LoadIo {
+        calls: usize,
+        status: Result<i32, SysError>,
+    }
+    impl Commands for LoadIo {
+        fn build(&self) -> Result<Build, SysError> {
+            Ok(Build::fixture("unreviewed"))
+        }
+        fn call(&mut self, _: Operation, _: &[&str], _: &[u8]) -> Result<Text, SysError> {
+            panic!("unexpected qualified command");
+        }
+        fn emergency_load(&mut self, args: &[&str], input: &[u8]) -> Result<i32, SysError> {
+            self.calls += 1;
+            assert_eq!(
+                args,
+                ["-o", "none", "-a", "scupper-qual/scupper", "-f", "-"]
+            );
+            assert_eq!(
+                input,
+                scupper_core::mac::policy::render_lockdown()
+                    .as_str()
+                    .as_bytes()
+            );
+            self.status.clone()
+        }
+    }
+    for status in [
+        Ok(0),
+        Ok(1),
+        Err(SysError::Unknown),
+        Err(SysError::TimedOut),
+    ] {
+        let mut io = LoadIo { calls: 0, status };
+        assert_eq!(
+            load(
+                &mut io,
+                &path(),
+                scupper_core::mac::policy::render_lockdown().as_str()
+            ),
+            Err(SysError::Unknown)
+        );
+        assert_eq!(io.calls, 1);
+        assert_eq!(
+            load(
+                &mut io,
+                &path(),
+                crate::platform::tests::pretunnel_fixture()
+                    .unwrap()
+                    .as_str()
+            ),
+            Err(UNSUPPORTED_BUILD)
+        );
+        assert_eq!(
+            load(
+                &mut io,
+                &AnchorPath::new("other/anchor").unwrap(),
+                scupper_core::mac::policy::render_lockdown().as_str()
+            ),
+            Err(UNSUPPORTED_BUILD)
+        );
+        assert_eq!(remove(&mut io, &path()), Err(UNSUPPORTED_BUILD));
+        assert_eq!(io.calls, 1);
+    }
+}
+
+#[test]
+fn descendant_depth_bound_precedes_component_limit() {
+    // Start at depth eight on a short path: the inventory parser accepts every
+    // component, so only the recursion bound can reject this next child.
+    let mut io = tree(true, 1);
+    let mut count = 1;
+    assert_eq!(
+        empty_classes(&mut io, path().as_str(), 8, &mut count, true),
+        Err(SysError::Failed("descendant bound exceeded"))
+    );
+    assert!(!io.calls.iter().any(|args| args[1].ends_with("/child")));
 }

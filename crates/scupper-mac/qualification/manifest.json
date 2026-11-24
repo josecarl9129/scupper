@@ -207,6 +207,13 @@
       "supported_assumptions": []
     },
     {
+      "id": "Q-DESCENDANTS",
+      "group": "contracts",
+      "minimum_iterations": 5,
+      "budget_minutes": 3,
+      "supported_assumptions": []
+    },
+    {
       "id": "Q-FLUSH",
       "group": "contracts",
       "minimum_iterations": 1,

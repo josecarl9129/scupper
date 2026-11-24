@@ -1293,3 +1293,64 @@ qualification. Runner evidence applies only to the exact observed build and
 architecture; it does not automatically qualify another Mac. With the owner's
 consent and timing, later on-device qualification may collect a separate record
 under the dead-man restore, using inert test anchors for non-network groups.
+
+
+## 2026-11-24 — 5a2c R7: fix 3 binding decisions
+
+The owner accepts fix 2's `engine/protocol.rs` ClearIntent change: only `None`
+clears anchor intent. `Some("")` and `Some(" \n")` from a nonconforming adapter
+must refuse to clear. Keep the `.is_some()` check; do not restore whitespace
+normalization in the engine.
+
+Descendant absence is separately gated per reviewed build. Both 24H232 and
+25G332 retain `descendants_reviewed = false`: every listed child remains foreign
+content. A future reviewed true row requires complete empty classes at every
+exact descendant path, strict owned-subtree containment, depth at most 8 and at
+most 64 anchors including the owned root. This also applies to `Some(own_policy)`;
+removal never flushes descendant paths. Unknown/unreviewed builds reject load
+and removal with a distinct unsupported-build error before any pfctl spawn.
+
+Q-ANCHOR runs lifecycle, hooked removals and F-all first, optimizer controls next,
+foreign fixtures next and descendant coverage measurements last. Descendant
+fixtures use only the independently journaled `scupper-qual/children` subtree.
+Unreviewed optimizer/overlap text and descendant spellings are measurements;
+reviewed A/B golden mismatches remain violations. Every control/fixture records
+its outcome and continues; violations take precedence over Inconclusive issues.
+Qualification restore may clean and prove emptiness recursively in that disposable
+measurement subtree; this never promotes native descendant coverage.
+
+Anchor cleanup, token release and pf-state restoration require proven writer
+quiescence. This implementation takes fresh launchctl absence evidence for every
+journaled service and checks writers/groups across all campaign scopes before
+each dependent step. Otherwise those steps and completion are withheld, journal
+entries remain pending, independent diagnostics continue and restore fails.
+
+Under install-failure hold, neither qualified nor unqualified firewalls may
+publish Protected status or an Installed-form Protected candidate. Qualified
+PreTunnel Lockdown verification may be Protected while status remains masked.
+
+
+## 2026-11-24 — 5a2c R7: emergency containment and deferred flush obligation
+
+This entry supersedes fix 3's unsupported-build load refusal. Outside the
+reviewed build table, the adapter attempts only the byte-exact canonical Lockdown
+rendering at its owned anchor, using `pfctl -o none -a <anchor> -f -`. Its result is
+always Unknown, regardless of rc or stderr; rc 0 never establishes success.
+Every other payload/path and removal remain refused before spawning with the
+distinct unsupported-build error. Emergency guard reloads retain best-effort
+containment without claiming verification. No engine logic changes are required.
+
+The global `flush_states` operation remains unchanged in this slice. Its flush
+obligation stays unresolved across repeated Unknown results and guard reloads.
+A later slice will add bounded backoff instead of per-tick retries; suppressing
+a retry never clears the obligation or enables Protected. A one-shot cap was
+rejected because states created before a later successful Lockdown would survive.
+Unsupported-build state flushes remain an unresolved review/gating gap; the later
+slice must address that gap together with bounded retries.
+
+Q-ANCHOR retains 180 seconds for lifecycle, hooked removals and F-all.
+Q-DESCENDANTS runs after Q-FLUSH with its own 180-second budget for descendant
+coverage, optimizer controls and foreign fixtures. Case durations are recorded;
+native pass-2 timing must confirm the split against the pass-1 sizing evidence.
+Cleanup runs independently of case budgets. Failed cleanup retains journal
+obligations and withholds later dependent uses with its recorded reason.

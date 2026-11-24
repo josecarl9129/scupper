@@ -199,8 +199,8 @@ pub(super) fn run(out: &Path) -> Result<()> {
 fn production_ancestors(out: &Path) -> Result<()> {
     // Read-only ancestor measurements use explicit provisional path names;
     // qualification never constructs a production namespace or adapter.
-    let lock = Path::new("/private/var/db/scupper/run/scupper.lock");
-    let control = Path::new("/private/var/db/scupper/run/scupper.sock");
+    let lock = Path::new(crate::native::PRODUCTION_LOCK);
+    let control = Path::new(crate::native::PRODUCTION_CONTROL);
     let model = fixture(out).join("production-run-model");
     fs::DirBuilder::new().mode(0o755).create(&model)?;
     fs::set_permissions(&model, fs::Permissions::from_mode(0o755))?;
@@ -222,7 +222,7 @@ fn production_ancestors(out: &Path) -> Result<()> {
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Only the installer-owned scupper/run chain may be modeled.
-                let planned = ancestor == Path::new("/private/var/db/scupper")
+                let planned = ancestor == Path::new(crate::native::PRODUCTION_ROOT)
                     || ancestor == lock.parent().ok_or("parent")?;
                 would_pass &= planned;
                 measurements.push(json!({"path":ancestor,"exists":false,"uid":null,"gid":null,"mode":null,"installer_model":planned,"model_uid":model_meta.uid(),"model_gid":model_meta.gid(),"model_mode":format!("{:04o}", model_meta.mode() & 0o7777)}));
@@ -1121,8 +1121,10 @@ fn gated_bootstrap(out: &Path, plist: &Path) -> Result<Value> {
     Ok(value)
 }
 pub(super) fn launch_job(out: &Path, mode: &str, keep_alive: bool) -> Result<(String, Value)> {
-    let label = format!("net.scupper.qual.r4-{mode}");
-    let service = format!("system/{label}");
+    let service = super::super::jobs::service(mode).ok_or("unknown launchd mode")?;
+    let label = service
+        .strip_prefix("system/")
+        .ok_or("launchd service domain")?;
     append(out, &json!({"kind":"r4-job","path":service}))?;
     let exe = super::xml(std::env::current_exe()?.to_str().ok_or("exe path")?);
     let output = super::xml(out.to_str().ok_or("out path")?);
@@ -1148,7 +1150,7 @@ pub(super) fn launch_job(out: &Path, mode: &str, keep_alive: bool) -> Result<(St
     let until = Instant::now()
         + Duration::from_secs(match mode {
             "pf" => 23 * 60,
-            "contracts" => 14 * 60,
+            "contracts" => 15 * 60,
             "pf-x" | "pf-x-stale" => 5 * 60,
             _ => 45,
         });
@@ -1317,11 +1319,47 @@ pub(super) fn stop_jobs(out: &Path, deadline: Instant) -> Result<()> {
     let mut actions = Vec::new();
     let mut failures = Vec::new();
     let entries = super::resources::entries(out)?;
-    restore_jobs(out, &entries, deadline, &mut actions, &mut failures)?;
+    restore_jobs(out, &entries, deadline, &mut actions, &mut failures);
     ensure(
         failures.is_empty(),
         &format!("R4 job restore: {failures:?}"),
     )
+}
+/// Fresh absence evidence also excludes `KeepAlive` respawns after failed bootout.
+pub(super) fn jobs_absent(out: &Path, deadline: Instant) -> Result<bool> {
+    for entry in super::resources::entries(out)?
+        .iter()
+        .filter(|e| e.kind == "r4-job")
+    {
+        if !super::super::jobs::restorable(&entry.path) {
+            return Ok(false);
+        }
+        let settle_end = deadline.min(Instant::now() + Duration::from_secs(5));
+        let mut absent = false;
+        for sample in 0..5 {
+            let status =
+                super::invoke_before("/bin/launchctl", &["print", &entry.path], settle_end);
+            write_json(
+                out,
+                &format!("{}.json", unique("restore-service-absence")),
+                &status,
+            )?;
+            if super::super::jobs::absent(&status) {
+                absent = true;
+                break;
+            }
+            if sample == 4 || Instant::now() >= settle_end {
+                break;
+            }
+            thread::sleep(
+                Duration::from_secs(1).min(settle_end.saturating_duration_since(Instant::now())),
+            );
+        }
+        if !absent {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 fn restore_jobs(
     out: &Path,
@@ -1329,27 +1367,14 @@ fn restore_jobs(
     deadline: Instant,
     actions: &mut Vec<String>,
     failures: &mut Vec<String>,
-) -> Result<()> {
+) {
     for entry in entries.iter().filter(|e| e.kind == "r4-job") {
-        if !matches!(
-            entry.path.as_str(),
-            "system/net.scupper.qual.r4-tools"
-                | "system/net.scupper.qual.r4-pf"
-                | "system/net.scupper.qual.r4-pf-x"
-                | "system/net.scupper.qual.r4-pf-x-stale"
-                | "system/net.scupper.qual.r4-bootout"
-                | "system/net.scupper.qual.r4-kill9"
-                | "system/net.scupper.qual.r4-group"
-                | "system/net.scupper.qual.r4-process"
-                | "system/net.scupper.qual.r4-real"
-                | "system/net.scupper.qual.r4-rosetta"
-                | "system/net.scupper.qual.r4-exit"
-        ) {
+        if !super::super::jobs::restorable(&entry.path) {
             failures.push("unknown R4 job intent".into());
             continue;
         }
         let status = super::invoke_before("/bin/launchctl", &["print", &entry.path], deadline);
-        if status.exit_code == Some(113) && !status.timed_out && !status.truncated {
+        if super::super::jobs::absent(&status) {
             continue;
         }
         if !status.complete() {
@@ -1357,14 +1382,16 @@ fn restore_jobs(
             continue;
         }
         let stop = super::invoke_before("/bin/launchctl", &["bootout", &entry.path], deadline);
-        write_json(out, &format!("{}.json", unique("tool-restore-job")), &stop)?;
+        if let Err(error) = write_json(out, &format!("{}.json", unique("tool-restore-job")), &stop)
+        {
+            failures.push(format!("R4 bootout evidence: {error}"));
+        }
         if stop.complete() {
             actions.push(format!("bootout {}", entry.path));
         } else {
             failures.push(format!("R4 bootout failed: {}", entry.path));
         }
     }
-    Ok(())
 }
 pub(super) fn restore(
     out: &Path,
@@ -1372,46 +1399,58 @@ pub(super) fn restore(
     deadline: Instant,
     actions: &mut Vec<String>,
     failures: &mut Vec<String>,
-) -> Result<()> {
-    restore_jobs(out, entries, deadline, actions, failures)?;
+) {
+    restore_jobs(out, entries, deadline, actions, failures);
     for entry in entries.iter().filter(|e| {
         matches!(
             e.kind.as_str(),
             "r4-wireguard-sockets" | "r4-wireguard-created"
         )
     }) {
-        let directory = Path::new("/private/var/run/wireguard");
-        if Path::new(&entry.path) != directory {
-            failures.push("invalid R4 wireguard scope".into());
-            continue;
-        }
-        match fs::symlink_metadata(directory) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Ok(m) if m.is_dir() && m.uid() == 0 && m.mode() & 0o022 == 0 => {}
-            _ => {
-                failures.push("unsafe R4 wireguard runtime directory".into());
-                continue;
+        let restored = (|| -> Result<()> {
+            let directory = Path::new("/private/var/run/wireguard");
+            if Path::new(&entry.path) != directory {
+                failures.push("invalid R4 wireguard scope".into());
+                return Ok(());
             }
-        }
-        for item in fs::read_dir(directory)? {
-            let item = item?;
-            let meta = fs::symlink_metadata(item.path())?;
-            let name = item.file_name();
-            let name = name.to_string_lossy();
-            let valid = name
-                .strip_prefix("utun")
-                .and_then(|s| s.strip_suffix(".sock"))
-                .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
-            if valid && meta.file_type().is_socket() && meta.uid() == 0 {
-                fs::remove_file(item.path())?;
-                actions.push(format!("remove fixture socket {name}"));
-            } else {
-                failures.push(format!("unexpected R4 wireguard artifact: {name}"));
+            match fs::symlink_metadata(directory) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Ok(m) if m.is_dir() && m.uid() == 0 && m.mode() & 0o022 == 0 => {}
+                _ => {
+                    failures.push("unsafe R4 wireguard runtime directory".into());
+                    return Ok(());
+                }
             }
-        }
-        if entry.kind == "r4-wireguard-created" && fs::read_dir(directory)?.next().is_none() {
-            fs::remove_dir(directory)?;
-            actions.push("remove fixture wireguard directory".into());
+            for item in fs::read_dir(directory)? {
+                let removed = (|| -> Result<()> {
+                    let item = item?;
+                    let meta = fs::symlink_metadata(item.path())?;
+                    let name = item.file_name();
+                    let name = name.to_string_lossy();
+                    let valid = name
+                        .strip_prefix("utun")
+                        .and_then(|s| s.strip_suffix(".sock"))
+                        .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
+                    if valid && meta.file_type().is_socket() && meta.uid() == 0 {
+                        fs::remove_file(item.path())?;
+                        actions.push(format!("remove fixture socket {name}"));
+                    } else {
+                        failures.push(format!("unexpected R4 wireguard artifact: {name}"));
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = removed {
+                    failures.push(format!("R4 socket restore: {error}"));
+                }
+            }
+            if entry.kind == "r4-wireguard-created" && fs::read_dir(directory)?.next().is_none() {
+                fs::remove_dir(directory)?;
+                actions.push("remove fixture wireguard directory".into());
+            }
+            Ok(())
+        })();
+        if let Err(error) = restored {
+            failures.push(format!("R4 wireguard restore: {error}"));
         }
     }
     for entry in entries.iter().filter(|e| e.kind == "r4-tree") {
@@ -1425,5 +1464,4 @@ pub(super) fn restore(
             Err(e) => failures.push(e.to_string()),
         }
     }
-    Ok(())
 }

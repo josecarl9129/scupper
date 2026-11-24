@@ -8,6 +8,14 @@ use scupper_core::mac::lifecycle::ReferenceEntry;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
+// Check every candidate, including one masked before the end of its tick.
+pub(crate) fn installed_candidates_safe(trace: &[String]) -> bool {
+    !trace.iter().any(|row| {
+        row.starts_with("verification_kind:Installed(")
+            && row.ends_with(":verification_protected:true")
+    })
+}
+
 pub(crate) const OVERFLOW: &str = "trace_overflow";
 pub(crate) fn record(trace: &mut Vec<String>, call: &str) {
     if matches!(call, "now" | "pause" | "fence") || trace.last().is_some_and(|s| s == OVERFLOW) {
@@ -53,6 +61,56 @@ fn reservations(s: &Snapshot) -> BTreeSet<u64> {
             ReferenceEntry::Token(_) => None,
         })
         .collect()
+}
+
+/// Planning `AcquireReference` is insufficient: only two completed reservation
+/// syncs (or an actual acquire boundary call) establish that it was reached.
+pub(crate) fn acquisition_reached(trace: &[String]) -> bool {
+    let mut request = None;
+    let mut outstanding = None;
+    let mut synced = [BTreeSet::new(), BTreeSet::new()];
+    for line in trace {
+        if line == "acquire" {
+            return true;
+        }
+        if let Some(body) = line.strip_prefix("snapshot_write:") {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+                return false;
+            };
+            let Ok(snapshot) = serde_json::from_value::<Snapshot>(value["snapshot"].clone()) else {
+                return false;
+            };
+            let index = match value["copy"].as_str() {
+                Some("A") => 0,
+                Some("B") => 1,
+                _ => return false,
+            };
+            request = Some((index, reservations(&snapshot)));
+        } else if line == "snapshot_result:Synced" {
+            if let Some((index, reservations)) = request.take().or_else(|| outstanding.take()) {
+                synced[index] = reservations;
+                if !synced[0].is_disjoint(&synced[1]) {
+                    return true;
+                }
+            }
+        } else if line == "snapshot_result:TimedOut" {
+            if let Some((index, reservations)) = request.take() {
+                synced[index].clear();
+                outstanding = Some((index, reservations));
+            }
+        } else if line.starts_with("snapshot_result:") {
+            if let Some((index, _)) = request.take() {
+                if !line.starts_with("snapshot_result:Busy")
+                    && !line.starts_with("snapshot_result:NotStarted")
+                {
+                    synced[index].clear();
+                }
+            } else if let Some((index, _)) = outstanding.take() {
+                synced[index].clear();
+            }
+        }
+    }
+    false
 }
 
 /// Validate reservation-before-dispatch, independent matching before settlement,
@@ -259,6 +317,26 @@ mod tests {
         trace.push("acquire_result:[42,123]".into());
         (s, trace)
     }
+    #[test]
+    fn planned_acquisition_with_failed_storage_is_not_reached() {
+        let s = reserved();
+        let mut trace = Vec::new();
+        write(&mut trace, Copy::A, &s, &WriteOutcome::Synced);
+        write(
+            &mut trace,
+            Copy::B,
+            &s,
+            &WriteOutcome::Failed(crate::platform::SysError::Unknown),
+        );
+        assert!(!acquisition_reached(&trace));
+        assert_eq!(acquisitions(&trace, &[s.clone(), s.clone()]), Ok(0));
+        write(&mut trace, Copy::B, &s, &WriteOutcome::TimedOut);
+        assert!(!acquisition_reached(&trace));
+        trace.push(write_result(&WriteOutcome::Synced));
+        assert!(acquisition_reached(&trace));
+        assert!(acquisition_reached(&["acquire".into()]));
+    }
+
     #[test]
     fn acquisition_requires_two_syncs_and_consumes_reservation_once() {
         let (s, trace) = dispatched();

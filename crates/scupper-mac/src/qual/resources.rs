@@ -16,6 +16,7 @@ use std::{
 
 use super::super::journal::{self, Entry};
 use super::super::recovery::Completed;
+use crate::decode::pfanchor::{Commands, Operation, Text};
 
 fn completed(out: &Path) -> Result<Completed> {
     let path = out.join("completed-resources.json");
@@ -73,6 +74,12 @@ fn writers_quiescent(out: &Path) -> Result<bool> {
     Ok(writers
         .iter()
         .all(|writer| writer.pid == std::process::id() || state.writers.contains(writer)))
+}
+
+pub(super) fn quiescent(out: &Path, deadline: Instant) -> Result<bool> {
+    Ok(super::tool::jobs_absent(out, deadline)?
+        && super::pf::groups_gone(out)?
+        && writers_quiescent(out)?)
 }
 
 pub(super) fn entries(out: &Path) -> Result<Vec<Entry>> {
@@ -140,7 +147,7 @@ fn action(
     deadline: Instant,
     actions: &mut Vec<String>,
     failures: &mut Vec<String>,
-) -> Result<()> {
+) {
     let evidence = invoke_before(program, args, deadline);
     let label = std::iter::once(program)
         .chain(args.iter().copied())
@@ -150,7 +157,9 @@ fn action(
     if !evidence.complete() {
         failures.push(format!("restore action failed: {label}"));
     }
-    write_json(out, &format!("{}.json", unique("undo")), &evidence)
+    if let Err(error) = write_json(out, &format!("{}.json", unique("undo")), &evidence) {
+        failures.push(format!("restore evidence failed: {label}: {error}"));
+    }
 }
 
 fn ioctl_inventory(out: &Path, deadline: Instant) -> Result<Vec<journal::Token>> {
@@ -258,18 +267,14 @@ fn undo_pf_state(
     }
     match restore_check::restore_disable(&current) {
         Ok(true) => {
-            if let Err(error) = action(out, "/sbin/pfctl", &["-d"], deadline, actions, failures) {
-                failures.push(format!("restore disable evidence failed: {error}"));
-            }
+            action(out, "/sbin/pfctl", &["-d"], deadline, actions, failures);
         }
         Ok(false) => {}
         Err(reason) => {
             failures.push(reason.into());
             // Unknown still permits deliberate restoration toward the disabled baseline.
             // Only the later complete state check can prove Disabled.
-            if let Err(error) = action(out, "/sbin/pfctl", &["-d"], deadline, actions, failures) {
-                failures.push(format!("restore disable evidence failed: {error}"));
-            }
+            action(out, "/sbin/pfctl", &["-d"], deadline, actions, failures);
         }
     }
 }
@@ -280,145 +285,230 @@ pub(super) fn undo(
     before: &Snapshot,
     deadline: Instant,
     restore_pf_state: bool,
+    mut campaign_quiescent: impl FnMut() -> Result<bool>,
 ) -> Result<(Vec<String>, Vec<String>)> {
     repair_tail(out)?;
     let pending = completed(out)?.pending(entries(out)?);
     if pending.is_empty() && !restore_pf_state {
         return Ok((Vec::new(), Vec::new()));
     }
-    let entries: Vec<_> = pending.iter().map(|(_, e)| e.clone()).collect();
     let mut actions = Vec::new();
     let mut failures = Vec::new();
-    super::tool::restore(out, &entries, deadline, &mut actions, &mut failures)?;
-    undo_tokens(out, &entries, deadline, &mut actions, &mut failures)?;
-    // Journal authority is granted only after an independent absence check.
-    // Flush all classes even for an empty/unreadable filter ruleset.
-    for e in entries.iter().filter(|e| e.kind == "anchor") {
-        if !matches!(
-            e.path.as_str(),
-            "scupper-qual/scupper" | "com.apple/scupper" | "com.apple/scupper-qual"
-        ) {
-            failures.push("unrecognized fixture anchor".into());
-            continue;
-        }
-        if let Err(error) = recheck_foreign_tokens(out, deadline) {
-            failures.push(format!("anchor restore withheld: {error}"));
-            continue;
-        }
-        for class in ["rules", "nat", "Tables", "dummynet"] {
-            action(
-                out,
-                "/sbin/pfctl",
-                &["-a", &e.path, "-F", class],
-                deadline,
-                &mut actions,
-                &mut failures,
-            )?;
-        }
-        match anchor_read(out, &e.path, deadline) {
-            Ok(None) => {}
-            Ok(Some(_)) => failures.push(format!(
-                "anchor restore absence not established: {} (empty child persists)",
-                e.path
-            )),
-            Err(error) => failures.push(format!(
-                "inconclusive: anchor restore text incomplete/unpinned: {} {error:?}",
-                e.path
-            )),
-        }
-    }
-    if restore_pf_state && restore_check::pf_status(&before.observations) == Some(false) {
-        if let Err(error) = recheck_foreign_tokens(out, deadline) {
-            failures.push(format!("pf disable withheld: {error}"));
-        } else {
-            undo_pf_state(out, deadline, &mut actions, &mut failures);
-        }
-    }
-    undo_keys(out, &entries, deadline, &mut actions, &mut failures)?;
-    undo_resolver_clone(out, before, &entries, deadline, &mut actions, &mut failures)?;
-    // Holder processes were killed by exact pid/start before any cleanup.
-    // Images are matched by their recorded path, never a guessed disk number.
-    let paths: Vec<_> = entries
-        .iter()
-        .filter(|e| e.kind == "image")
-        .map(|e| e.path.as_str())
-        .collect();
-    match attached_devices(out, &paths, deadline) {
-        Ok(devices) => {
-            for device in devices {
-                detach_device(out, &device, deadline, &mut actions, &mut failures);
+    // Validate the protected native journal before the portable boundary reads it.
+    entries(out)?;
+    let step_failures = super::super::resources::undo(
+        out,
+        &mut campaign_quiescent,
+        || super::tool::jobs_absent(out, deadline),
+        || Ok(super::pf::groups_gone(out)? && writers_quiescent(out)?),
+        |step, pending| -> Result<()> {
+            let entries: Vec<_> = pending.iter().map(|(_, e)| e.clone()).collect();
+            // Stop failures are recorded by the caller; a fresh census still
+            // controls destructive work. Independent steps are always visited.
+            if !super::pf::groups_gone(out)? || !writers_quiescent(out)? {
+                return Err(format!("{step}: writers not quiescent; cleanup withheld").into());
             }
-        }
-        Err(error) => failures.push(error.to_string()),
-    }
-    if entries.iter().any(|e| e.kind == "r5-tree") && writers_quiescent(out)? {
-        match attached_devices(out, &paths, deadline) {
-            Ok(devices) if devices.is_empty() => {
-                super::store::restore_tree(out, &entries, &mut actions, &mut failures);
+            match step {
+                "tools" => {
+                    super::tool::restore(out, &entries, deadline, &mut actions, &mut failures);
+                }
+                "tokens" => undo_tokens(out, &entries, deadline, &mut actions, &mut failures),
+                "anchors" => {
+                    // Journaled configuration only; a scoped flush creates a missing name.
+                    for e in entries.iter().filter(|e| e.kind == "anchor") {
+                        if !matches!(
+                            e.path.as_str(),
+                            "scupper-qual/scupper"
+                                | "com.apple/scupper"
+                                | "com.apple/scupper-qual"
+                                | "scupper-qual/children"
+                        ) {
+                            failures.push("unrecognized fixture anchor".into());
+                            continue;
+                        }
+                        let path = crate::decode::pfanchor::AnchorPath::new(&e.path)?;
+                        if let Err(error) = recheck_foreign_tokens(out, deadline) {
+                            failures.push(format!("anchor restore withheld: {error}"));
+                            continue;
+                        }
+                        let mut io = AnchorInventory::new(out, deadline, &e.path);
+                        if crate::decode::pfanchor::read(&mut io, &path)
+                            .is_ok_and(|text| text.is_none())
+                        {
+                            continue;
+                        }
+                        let targets = if e.path == "scupper-qual/children" {
+                            match measurement_paths(&mut io, &e.path) {
+                                Ok(paths) => paths,
+                                Err(error) => {
+                                    failures.push(format!(
+                                        "measurement subtree restore withheld: {error}"
+                                    ));
+                                    continue;
+                                }
+                            }
+                        } else {
+                            vec![e.path.clone()]
+                        };
+                        for target in targets.iter().rev() {
+                            // Recovery tries every class even when a previous flush failed.
+                            for (op, class) in [
+                                (Operation::Rules, "rules"),
+                                (Operation::Nat, "nat"),
+                                (Operation::Tables, "Tables"),
+                                (Operation::Dummynet, "dummynet"),
+                            ] {
+                                actions.push(format!("/sbin/pfctl -a {target} -F {class}"));
+                                if let Err(error) = io.call(op, &["-a", target, "-F", class], &[]) {
+                                    failures.push(format!(
+                                        "anchor restore {class}: {target} {error:?}"
+                                    ));
+                                }
+                            }
+                        }
+                        if !crate::decode::pfanchor::read(&mut io, &path)
+                            .is_ok_and(|text| text.is_none())
+                        {
+                            failures.push(format!(
+                                "anchor configuration absence not established: {}",
+                                e.path
+                            ));
+                        }
+                    }
+                }
+                "pf state" => {
+                    if restore_pf_state
+                        && restore_check::pf_status(&before.observations) == Some(false)
+                    {
+                        if let Err(error) = recheck_foreign_tokens(out, deadline) {
+                            failures.push(format!("pf disable withheld: {error}"));
+                        } else {
+                            undo_pf_state(out, deadline, &mut actions, &mut failures);
+                        }
+                    }
+                }
+                "keys" => undo_keys(out, &entries, deadline, &mut actions, &mut failures)?,
+                "resolver" => undo_resolver_clone(
+                    out,
+                    before,
+                    &entries,
+                    deadline,
+                    &mut actions,
+                    &mut failures,
+                )?,
+                "images" => {
+                    // Holder processes were killed by exact pid/start before any cleanup.
+                    // Images are matched by their recorded path, never a guessed disk number.
+                    let paths: Vec<_> = entries
+                        .iter()
+                        .filter(|e| e.kind == "image")
+                        .map(|e| e.path.as_str())
+                        .collect();
+                    match attached_devices(out, &paths, deadline) {
+                        Ok(devices) => {
+                            for device in devices {
+                                detach_device(out, &device, deadline, &mut actions, &mut failures);
+                            }
+                        }
+                        Err(error) => failures.push(error.to_string()),
+                    }
+                }
+                "store tree" => {
+                    let paths: Vec<_> = entries
+                        .iter()
+                        .filter(|e| e.kind == "image")
+                        .map(|e| e.path.as_str())
+                        .collect();
+                    if entries.iter().any(|e| e.kind == "r5-tree") && writers_quiescent(out)? {
+                        match attached_devices(out, &paths, deadline) {
+                            Ok(devices) if devices.is_empty() => {
+                                super::store::restore_tree(
+                                    out,
+                                    &entries,
+                                    &mut actions,
+                                    &mut failures,
+                                );
+                            }
+                            _ => failures.push(
+                                "R5 images not proven detached; fixture tree retained".into(),
+                            ),
+                        }
+                    }
+                }
+                "loopback" => {
+                    if entries.iter().any(|e| e.kind == "loopback-alias") {
+                        let interfaces = invoke_before("/sbin/ifconfig", &["lo0"], deadline);
+                        if interfaces.complete()
+                            && interfaces.stdout.lines().any(|line| {
+                                line.split_whitespace().take(2).eq(["inet", "127.0.0.53"])
+                            })
+                        {
+                            action(
+                                out,
+                                "/sbin/ifconfig",
+                                &["lo0", "-alias", "127.0.0.53"],
+                                deadline,
+                                &mut actions,
+                                &mut failures,
+                            );
+                        }
+                    }
+                }
+                "sockets" => {
+                    for e in entries.iter().filter(|e| e.kind == "socket") {
+                        if e.path.starts_with("/var/run/wireguard/utun")
+                            && Path::new(&e.path)
+                                .extension()
+                                .is_some_and(|ext| ext == "sock")
+                            && !e.path.contains("..")
+                            && Path::new(&e.path).exists()
+                        {
+                            match fs::remove_file(&e.path) {
+                                Ok(()) => actions.push(format!("unlink {}", e.path)),
+                                Err(error) => {
+                                    failures.push(format!("socket restore {}: {error}", e.path));
+                                }
+                            }
+                        }
+                    }
+                }
+                "feth" => {
+                    for e in entries.iter().filter(|e| e.kind == "feth") {
+                        if !matches!(e.path.as_str(), "feth0" | "feth1") {
+                            failures.push("invalid feth journal entry".into());
+                            continue;
+                        }
+                        if let Err(error) = recheck_foreign_tokens(out, deadline) {
+                            failures.push(format!("feth restore withheld: {error}"));
+                            continue;
+                        }
+                        let inventory = invoke_before("/sbin/ifconfig", &["-l"], deadline);
+                        if !inventory.complete() {
+                            failures.push("feth inventory incomplete".into());
+                            continue;
+                        }
+                        if inventory
+                            .stdout
+                            .split_whitespace()
+                            .any(|name| name == e.path)
+                        {
+                            action(
+                                out,
+                                "/sbin/ifconfig",
+                                &[&e.path, "destroy"],
+                                deadline,
+                                &mut actions,
+                                &mut failures,
+                            );
+                        }
+                    }
+                }
+                _ => complete_from_inventory(out, pending, deadline, &mut failures)?,
             }
-            _ => failures.push("R5 images not proven detached; fixture tree retained".into()),
-        }
-    }
-    if entries.iter().any(|e| e.kind == "loopback-alias") {
-        let interfaces = invoke_before("/sbin/ifconfig", &["lo0"], deadline);
-        if interfaces.complete()
-            && interfaces
-                .stdout
-                .lines()
-                .any(|line| line.split_whitespace().take(2).eq(["inet", "127.0.0.53"]))
-        {
-            action(
-                out,
-                "/sbin/ifconfig",
-                &["lo0", "-alias", "127.0.0.53"],
-                deadline,
-                &mut actions,
-                &mut failures,
-            )?;
-        }
-    }
-    for e in entries.iter().filter(|e| e.kind == "socket") {
-        if e.path.starts_with("/var/run/wireguard/utun")
-            && Path::new(&e.path)
-                .extension()
-                .is_some_and(|ext| ext == "sock")
-            && !e.path.contains("..")
-            && Path::new(&e.path).exists()
-        {
-            fs::remove_file(&e.path)?;
-            actions.push(format!("unlink {}", e.path));
-        }
-    }
-    for e in entries.iter().filter(|e| e.kind == "feth") {
-        if !matches!(e.path.as_str(), "feth0" | "feth1") {
-            failures.push("invalid feth journal entry".into());
-            continue;
-        }
-        if let Err(error) = recheck_foreign_tokens(out, deadline) {
-            failures.push(format!("feth restore withheld: {error}"));
-            continue;
-        }
-        let inventory = invoke_before("/sbin/ifconfig", &["-l"], deadline);
-        if !inventory.complete() {
-            failures.push("feth inventory incomplete".into());
-            continue;
-        }
-        if inventory
-            .stdout
-            .split_whitespace()
-            .any(|name| name == e.path)
-        {
-            action(
-                out,
-                "/sbin/ifconfig",
-                &[&e.path, "destroy"],
-                deadline,
-                &mut actions,
-                &mut failures,
-            )?;
-        }
-    }
-    complete_from_inventory(out, &pending, deadline, &mut failures)?;
+            Ok(())
+        },
+    )?;
+    failures.extend(step_failures);
     Ok((actions, failures))
 }
 
@@ -504,7 +594,10 @@ pub(super) fn complete_from_snapshot(
     let mut verified = Vec::new();
     for (index, entry) in pending {
         let absent = match entry.kind.as_str() {
-            "anchor" => anchor_read(out, &entry.path, deadline).is_ok_and(|text| text.is_none()),
+            "anchor" => {
+                snapshot_quiescent
+                    && anchor_read(out, &entry.path, deadline).is_ok_and(|text| text.is_none())
+            }
             "feth" => {
                 let list = invoke_before("/sbin/ifconfig", &["-l"], deadline);
                 list.complete()
@@ -557,7 +650,7 @@ pub(super) fn complete_from_snapshot(
                 .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
             "r4-job" => {
                 let status = invoke_before("/bin/launchctl", &["print", &entry.path], deadline);
-                status.exit_code == Some(113) && !status.timed_out && !status.truncated
+                super::super::jobs::absent(&status)
             }
             "socket" => fs::symlink_metadata(&entry.path)
                 .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
@@ -665,14 +758,42 @@ fn detach_device(
 struct AnchorInventory<'a> {
     out: &'a Path,
     deadline: Instant,
+    measurement_descendants: bool,
+    descendant_paths: std::collections::BTreeSet<String>,
+}
+impl<'a> AnchorInventory<'a> {
+    fn new(out: &'a Path, deadline: Instant, path: &str) -> Self {
+        Self {
+            out,
+            deadline,
+            measurement_descendants: path == "scupper-qual/children",
+            descendant_paths: std::collections::BTreeSet::default(),
+        }
+    }
 }
 impl crate::decode::pfanchor::Commands for AnchorInventory<'_> {
+    fn build(
+        &self,
+    ) -> std::result::Result<crate::decode::pftext::Build, crate::platform::SysError> {
+        crate::decode::pftext::Build::system()
+    }
+    fn descendants_reviewed(&self) -> std::result::Result<bool, crate::platform::SysError> {
+        // Harness-only absence/restore measurement; never native qualification.
+        Ok(self.measurement_descendants
+            || crate::decode::pfanchor::descendants_reviewed(&self.build()?))
+    }
     fn call(
         &mut self,
         op: crate::decode::pfanchor::Operation,
         args: &[&str],
         _: &[u8],
     ) -> std::result::Result<crate::decode::pfanchor::Text, crate::platform::SysError> {
+        if op == Operation::Inventory
+            && args.len() == 3
+            && args[1].starts_with("scupper-qual/children/")
+        {
+            self.descendant_paths.insert(args[1].to_owned());
+        }
         let evidence = invoke_before("/sbin/pfctl", args, self.deadline);
         write_json(
             self.out,
@@ -699,13 +820,111 @@ impl crate::decode::pfanchor::Commands for AnchorInventory<'_> {
         )
     }
 }
+// Cleanup authority is confined to the independently journaled disposable root.
+fn measurement_paths(io: &mut AnchorInventory<'_>, root: &str) -> Result<Vec<String>> {
+    let mut paths = Vec::new();
+    let mut pending = vec![(root.to_owned(), 0)];
+    let mut count = 1;
+    while let Some((path, depth)) = pending.pop() {
+        let Text::Present(text) = io.call(Operation::Inventory, &["-a", &path, "-sA"], &[])? else {
+            return Err("incomplete measurement subtree inventory".into());
+        };
+        for child in crate::decode::pfanchor::inventory_at(&text, &path)? {
+            count += 1;
+            if depth >= 8 || count > 64 {
+                return Err("measurement subtree bound exceeded".into());
+            }
+            pending.push((format!("{path}/{child}"), depth + 1));
+        }
+        paths.push(path);
+    }
+    Ok(paths)
+}
+// Independent cleanup budget, even after the measurement case has expired.
+pub(super) fn cleanup_measurement(out: &Path, root: &str) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    recheck_foreign_tokens(out, deadline)?;
+    let mut io = AnchorInventory::new(out, deadline, root);
+    let paths = measurement_paths(&mut io, root)?;
+    let mut failures = Vec::new();
+    for path in paths.iter().rev() {
+        for (op, class) in [
+            (Operation::Rules, "rules"),
+            (Operation::Nat, "nat"),
+            (Operation::Tables, "Tables"),
+            (Operation::Dummynet, "dummynet"),
+        ] {
+            if let Err(error) = io.call(op, &["-a", path, "-F", class], &[]) {
+                failures.push(format!("{path} {class}: {error}"));
+            }
+        }
+    }
+    let after =
+        crate::decode::pfanchor::read(&mut io, &crate::decode::pfanchor::AnchorPath::new(root)?);
+    if after != Ok(None) {
+        failures.push(format!("measurement absence: {after:?}"));
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; ").into())
+    }
+}
 pub(super) fn anchor_read(
     out: &Path,
     path: &str,
     deadline: Instant,
 ) -> std::result::Result<Option<String>, crate::platform::SysError> {
     let path = crate::decode::pfanchor::AnchorPath::new(path)?;
-    crate::decode::pfanchor::read(&mut AnchorInventory { out, deadline }, &path)
+    crate::decode::pfanchor::read(
+        &mut AnchorInventory::new(out, deadline, path.as_str()),
+        &path,
+    )
+}
+/// Names allowed to persist in post-state inventories, only after complete
+/// configuration reads. Parent namespaces created by a journaled child need
+/// empty classes too; new siblings are still detected by the full inventory.
+pub(super) fn restored_anchor_names(
+    out: &Path,
+    before: &Snapshot,
+    deadline: Instant,
+) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in entries(out)?.iter().filter(|e| e.kind == "anchor") {
+        let mut io = AnchorInventory::new(out, deadline, &entry.path);
+        let path = crate::decode::pfanchor::AnchorPath::new(&entry.path)?;
+        if !crate::decode::pfanchor::read(&mut io, &path).is_ok_and(|text| text.is_none()) {
+            return Err(format!("journaled anchor not empty: {}", entry.path).into());
+        }
+        names.push(entry.path.clone());
+        names.extend(io.descendant_paths);
+        let parent = entry.path.split_once('/').ok_or("anchor path")?.0;
+        if parent != "scupper-qual"
+            || before
+                .observations
+                .get("pf-anchors")
+                .is_some_and(|e| e.complete() && e.stdout.lines().any(|line| line.trim() == parent))
+        {
+            continue;
+        }
+        let mut io = AnchorInventory::new(out, deadline, parent);
+        let filter = io.call(Operation::Filter, &["-a", parent, "-sr"], &[])?;
+        if filter == Text::Missing {
+            continue;
+        }
+        if filter != Text::Present(String::new()) {
+            return Err(format!("anchor parent has foreign content: {parent}").into());
+        }
+        for flag in ["-sn", "-sT", "-sd"] {
+            if io.call(Operation::Extra, &["-a", parent, flag], &[])?
+                != Text::Present(String::new())
+            {
+                return Err(format!("anchor parent has foreign content: {parent}").into());
+            }
+        }
+        names.push(parent.to_owned());
+    }
+    Ok(names)
 }
 pub(super) fn journal_anchor(out: &Path, path: &str, deadline: Instant) -> Result<()> {
     let absent = anchor_read(out, path, deadline);
@@ -810,7 +1029,7 @@ fn undo_resolver_clone(
                 deadline,
                 actions,
                 failures,
-            )?;
+            );
         }
     }
     Ok(())
@@ -822,7 +1041,7 @@ fn undo_tokens(
     deadline: Instant,
     actions: &mut Vec<String>,
     failures: &mut Vec<String>,
-) -> Result<()> {
+) {
     if entries
         .iter()
         .any(|e| matches!(e.kind.as_str(), "pf-acquire" | "token"))
@@ -842,10 +1061,9 @@ fn undo_tokens(
                 deadline,
                 actions,
                 failures,
-            )?;
+            );
         }
     }
-    Ok(())
 }
 
 fn undo_keys(

@@ -5,6 +5,64 @@ pub(super) fn anchor_error_is_inconclusive(error: &SysError) -> bool {
         || matches!(error, SysError::Failed("anchor readback unsupported"))
 }
 
+// Classify the first failed adapter row itself; later incomplete calls must not
+// hide an earlier complete mismatch of a reviewed row.
+pub(super) fn first_anchor_failure_complete(trace: &[String]) -> Option<bool> {
+    let (index, row) = trace
+        .iter()
+        .enumerate()
+        .find(|(_, row)| row.starts_with("anchor:") && row.contains(":Err("))?;
+    let op = row.strip_prefix("anchor:")?.split_once(':')?.0;
+    let prefix = format!("anchor_evidence:{op}:complete:");
+    Some(
+        trace[..index]
+            .iter()
+            .rev()
+            .find_map(|s| s.strip_prefix(&prefix))
+            == Some("true"),
+    )
+}
+
+pub(super) fn startup_environment_failed(trace: &[String]) -> bool {
+    trace
+        .iter()
+        .find(|row| row.starts_with("failed:"))
+        .is_some_and(|row| {
+            [
+                "failed:check_pfctl:",
+                "failed:acquire_instance_lock:",
+                "failed:poll_copy:",
+            ]
+            .iter()
+            .any(|prefix| row.starts_with(prefix))
+        })
+}
+
+// The cleanup runs after every returned observation error, including a load
+// whose post-call budget check failed after it changed the anchor.
+pub(super) fn with_cleanup<I, T, C, E>(
+    io: &mut I,
+    observe: impl FnOnce(&mut I) -> Result<T, E>,
+    cleanup: impl FnOnce(&mut I) -> C,
+) -> (Result<T, E>, C) {
+    let observation = observe(io);
+    let cleaned = cleanup(io);
+    (observation, cleaned)
+}
+
+// Measurements accept any text, including nonempty foreign classes, but every
+// nested command still needs complete streams and a successful exit.
+pub(super) fn measurement_complete(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(fields) if fields.contains_key("command") => {
+            serde_json::from_value::<super::Evidence>(value.clone()).is_ok_and(|e| e.complete())
+        }
+        serde_json::Value::Object(fields) => fields.values().all(measurement_complete),
+        serde_json::Value::Array(values) => values.iter().all(measurement_complete),
+        _ => true,
+    }
+}
+
 // Portable independent golden gate for the native contract harness.
 use crate::platform::tests::{Readback, pretunnel_fixture};
 use scupper_core::mac::policy::{self, AnchorText};
@@ -56,7 +114,7 @@ pub(super) fn readback(build: &str, intended: &AnchorText, observed: &str) -> Re
         _ => return Readback::Unsupported,
     };
     let reviewed = serde_json::from_str::<serde_json::Value>(review)
-        .is_ok_and(|r| r["reviewed"] == true && r["build"] == build);
+        .is_ok_and(|r| r["reviewed"] == true && r["build"] == build && r["optimizer"] == "none");
     if !reviewed {
         return Readback::Unsupported;
     }
@@ -80,6 +138,89 @@ use crate::platform::tests::LEFT_METHODS;
 #[cfg(test)]
 mod tests {
     #[test]
+    fn fixture_cleanup_runs_after_budget_and_capture_errors() {
+        for failure in [
+            "post-load budget exhausted",
+            "inventory capture failed",
+            "record failed",
+        ] {
+            let mut calls = Vec::new();
+            let (observed, cleaned) = super::with_cleanup(
+                &mut calls,
+                |calls| {
+                    calls.extend(["load", "record observation"]);
+                    Err::<(), _>(failure)
+                },
+                |calls| {
+                    calls.extend(["cleanup", "record cleanup"]);
+                    "cleanup result"
+                },
+            );
+            assert_eq!(observed, Err(failure));
+            assert_eq!(cleaned, "cleanup result");
+            assert_eq!(
+                calls,
+                ["load", "record observation", "cleanup", "record cleanup"]
+            );
+        }
+    }
+
+    #[test]
+    fn reviewed_failures_keep_complete_mismatches_distinct_from_incomplete_reads() {
+        for complete in [false, true] {
+            let mut trace = vec![
+                format!("anchor_evidence:Load:complete:{complete}"),
+                "anchor:Load:Err(Unknown)".into(),
+            ];
+            assert_eq!(super::first_anchor_failure_complete(&trace), Some(complete));
+            trace.extend([
+                "anchor_evidence:Filter:complete:false".into(),
+                "anchor:Filter:Err(Unknown)".into(),
+            ]);
+            assert_eq!(super::first_anchor_failure_complete(&trace), Some(complete));
+        }
+        assert_eq!(super::first_anchor_failure_complete(&[]), None);
+        assert_eq!(
+            super::first_anchor_failure_complete(&["anchor:Load:Err(Unknown)".into()]),
+            Some(false)
+        );
+        for row in [
+            "failed:check_pfctl:unknown",
+            "failed:acquire_instance_lock:busy",
+            "failed:poll_copy:unreadable",
+        ] {
+            assert!(super::startup_environment_failed(&[row.into()]));
+        }
+        assert!(!super::startup_environment_failed(&[
+            "failed:poll_install_record:install record: no writer before 5a3".into(),
+            "failed:poll_copy:late failure".into(),
+            "failed:check_pfctl:late failure".into(),
+        ]));
+    }
+
+    #[test]
+    fn nested_measurement_requires_every_stream_but_accepts_foreign_text() {
+        let evidence = serde_json::json!({"command":["pfctl"],"stdin":null,"pid":1,"exit_code":0,
+            "started_unix_ms":0,"elapsed_ms":0,"timed_out":false,"truncated":false,
+            "stdout":"anchor \"child\"\n","stderr":"unreviewed spelling\n"});
+        assert!(super::measurement_complete(
+            &serde_json::json!({"classes":[evidence.clone()]})
+        ));
+        for (key, bad) in [
+            ("timed_out", serde_json::json!(true)),
+            ("truncated", serde_json::json!(true)),
+            ("exit_code", serde_json::json!(1)),
+            ("exit_code", serde_json::Value::Null),
+        ] {
+            let mut incomplete = evidence.clone();
+            incomplete[key] = bad;
+            assert!(!super::measurement_complete(
+                &serde_json::json!({"before":[evidence.clone()],"after":[incomplete]})
+            ));
+        }
+    }
+
+    #[test]
     fn anchor_errors_only_review_gaps_are_inconclusive() {
         use super::*;
         assert!(anchor_error_is_inconclusive(
@@ -92,7 +233,7 @@ mod tests {
             SysError::Unknown,
             SysError::Failed("anchor missing after load"),
             SysError::Failed("foreign content in owned anchor"),
-            SysError::Failed("empty anchor persists"),
+            SysError::Failed("anchor configuration persists"),
         ] {
             assert!(!anchor_error_is_inconclusive(&error));
         }
@@ -100,7 +241,7 @@ mod tests {
 
     use super::*;
     #[test]
-    fn proposed_goldens_preserve_the_renderer_policy_without_qualifying_the_build() {
+    fn reviewed_optimizer_none_goldens_preserve_source_order() {
         use scupper_core::mac::parse::{Rule, pf_rules};
         let expanded = |text: &str| {
             pf_rules(text)
@@ -135,8 +276,32 @@ mod tests {
             );
             assert_eq!(
                 readback(build, &policy::render_lockdown(), lockdown),
-                Readback::Unsupported
+                Readback::Match
             );
+            assert_eq!(
+                readback(build, &pretunnel_fixture().unwrap(), pretunnel),
+                Readback::Match
+            );
+            let mut rows: Vec<_> = pretunnel.lines().collect();
+            rows.swap(1, 2);
+            assert_eq!(
+                readback(
+                    build,
+                    &pretunnel_fixture().unwrap(),
+                    &(rows.join("\n") + "\n")
+                ),
+                Readback::Mismatch
+            );
+            for bad in [
+                String::new(),
+                format!("{lockdown}\n"),
+                lockdown.replace("block drop", "block return"),
+            ] {
+                assert_eq!(
+                    readback(build, &policy::render_lockdown(), &bad),
+                    Readback::Mismatch
+                );
+            }
         }
     }
 
@@ -190,8 +355,8 @@ mod tests {
     }
 
     #[test]
-    fn proposed_and_unknown_goldens_never_match_even_themselves() {
-        for build in ["24H232", "25G332", "future"] {
+    fn unknown_goldens_never_match_even_themselves() {
+        for build in ["future", "24H233", "25G333"] {
             assert_eq!(
                 readback(
                     build,

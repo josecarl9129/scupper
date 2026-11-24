@@ -1,5 +1,6 @@
 """Portable executable-identity and redaction regression checks."""
 import json
+import hashlib
 import os
 import re
 import ast
@@ -40,9 +41,42 @@ class ArtifactTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(CHECKER), str(self.root), *arguments],
                               capture_output=True, text=True, env=env, check=False)
 
+    def test_review_sha256_matches_exact_golden_bytes(self):
+        goldens = REPO / "crates/scupper-mac/qualification/goldens"
+        for build in ["24H232", "25G332"]:
+            review = json.loads((goldens / build / "review.json").read_text())
+            self.assertEqual(set(review["sha256"]), {"lockdown.txt", "pretunnel-fixture.txt"})
+            for name, expected in review["sha256"].items():
+                self.assertEqual(hashlib.sha256((goldens / build / name).read_bytes()).hexdigest(), expected,
+                                 f"{build}/{name} golden drift")
+
+    def test_anchor_campaign_orders_and_isolates_descendants(self):
+        source = (REPO / "crates/scupper-mac/src/qual/contracts.rs").read_text()
+        campaign = source[source.index("fn anchors("):source.index("fn descendants(")]
+        self.assertNotIn("optimizer_controls(", campaign)
+        worker = source[source.index("pub(super) fn worker("):source.index("struct Harness")]
+        self.assertLess(worker.index('("Q-FLUSH", flush)'), worker.index('("Q-DESCENDANTS", descendants)'))
+        campaign = source[source.index("fn descendants("):source.index("fn anchor_lifecycle(")]
+        self.assertLess(campaign.index("optimizer_controls("), campaign.index("foreign_fixtures("))
+        self.assertLess(campaign.index("foreign_fixtures("), campaign.index("descendant_measurements("))
+        foreign = source[source.index("fn foreign_fixtures("):source.index("fn descendant_measurements(")]
+        self.assertNotIn('anchor \"', foreign)
+        self.assertIn("read.is_err()", foreign)
+        self.assertIn('const ROOT: &str = "scupper-qual/children"', source)
+        self.assertIn('"measurement_only":true', source)
+        recovery = (REPO / "crates/scupper-mac/src/qual/resources.rs").read_text()
+        self.assertIn("super::super::resources::undo(", recovery)
+        self.assertIn("|| super::tool::jobs_absent(out, deadline)", recovery)
+
     def test_qualification_never_uses_production_paths(self):
-        for path in (REPO / "crates/scupper-mac/src/qual").rglob("*.rs"):
+        paths = list((REPO / "crates/scupper-mac/src/qual").rglob("*.rs"))
+        paths += [REPO / "crates/scupper-mac/src/platform/tests.rs",
+                  REPO / "crates/scupper-mac/src/decode/qualification_trace.rs"]
+        for path in paths:
             self.assertNotRegex(path.read_text(), r"Paths\s*::\s*production", str(path))
+        native = (REPO / "crates/scupper-mac/src/native/mod.rs").read_text()
+        self.assertIn('cfg(all(feature = "qualification", not(test)))', native)
+        self.assertIn('paths.anchor_path() == "com.apple/scupper"', native)
 
     def test_pf_contract_and_stale_measurement_have_separate_artifacts(self):
         manifest = json.loads((REPO / "crates/scupper-mac/qualification/manifest.json").read_text())

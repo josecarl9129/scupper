@@ -707,24 +707,40 @@ fn deadman(options: &Options) -> Result<()> {
 }
 
 fn stop_writers(out: &Path, deadline: Instant) -> Result<Vec<Evidence>> {
-    let controllers: Vec<Writer> = read_json(&out.join("writers.json"))?;
-    let mut stopped = stop_writer_list(out, controllers, deadline)?;
-    // Stop probe controllers before the final child census. Their exec gates
-    // close on death, so an uncommitted child cannot become a late writer.
-    stopped.extend(stop_writer_list(
+    let mut stopped = Vec::new();
+    let failures = recovery::run_steps(
+        ["controllers", "probes", "jobs", "groups", "workers"],
+        |step| -> Result<()> {
+            match step {
+                "controllers" => stopped.extend(stop_writer_list(
+                    out,
+                    read_json(&out.join("writers.json"))?,
+                    deadline,
+                )?),
+                "probes" => stopped.extend(stop_writer_list(
+                    out,
+                    resources::writers(out, true)?,
+                    deadline,
+                )?),
+                "jobs" => tool::stop_jobs(out, deadline)?,
+                "groups" => pf::stop_groups(out, deadline)?,
+                _ => stopped.extend(stop_writer_list(
+                    out,
+                    resources::writers(out, false)?,
+                    deadline,
+                )?),
+            }
+            Ok(())
+        },
+    );
+    write_json(
         out,
-        resources::writers(out, true)?,
-        deadline,
-    )?);
-    // Bootstrap exec gates are journaled as probes. Stop them before bootout,
-    // then stop the ordinary workers after restartable jobs are disabled.
-    tool::stop_jobs(out, deadline)?;
-    pf::stop_groups(out, deadline)?;
-    stopped.extend(stop_writer_list(
-        out,
-        resources::writers(out, false)?,
-        deadline,
-    )?);
+        &format!("{}.json", unique("writer-stop-failures")),
+        &failures,
+    )?;
+    if !failures.is_empty() {
+        return Err(format!("writer stop failures: {failures:?}").into());
+    }
     Ok(stopped)
 }
 
@@ -736,19 +752,19 @@ fn stop_writer_list(
     writers.sort_by_key(|writer| writer.pid);
     writers.dedup_by(|a, b| a.pid == b.pid && a.start == b.start);
     let mut stopped = Vec::new();
-    for writer in writers {
+    let failures = recovery::run_steps(writers, |writer| -> Result<()> {
         // An in-process smoke restore excludes its own controller. An external
         // restore/dead-man stops that controller before inspecting post-state.
         if writer.pid == std::process::id() || resources::writer_completed(out, &writer)? {
-            continue;
+            return Ok(());
         }
         let Some(identity) = lookup_identity_before(out, writer.pid, deadline)? else {
             resources::complete_writer(out, writer, deadline)?;
-            continue;
+            return Ok(());
         };
         if identity.start != writer.start || identity.status == 5 {
             resources::complete_writer(out, writer, deadline)?;
-            continue;
+            return Ok(());
         }
         let kill = invoke_before("/bin/kill", &["-KILL", &writer.pid.to_string()], deadline);
         let complete = kill.complete();
@@ -774,6 +790,10 @@ fn stop_writer_list(
             thread::sleep(Duration::from_millis(20));
         }
         resources::complete_writer(out, writer, deadline)?;
+        Ok(())
+    });
+    if !failures.is_empty() {
+        return Err(format!("writer list stop failures: {failures:?}").into());
     }
     Ok(stopped)
 }
@@ -839,8 +859,17 @@ fn restore(out: &Path, deadline: Instant) -> Result<Restore> {
     let (cleanup, post) = recovery::recover_then_snapshot(
         has_pending,
         || -> Result<()> {
-            stopped.extend(stop_writers(out, deadline)?);
-            lock = Some(resources::restore_lock(out, deadline)?);
+            match stop_writers(out, deadline) {
+                Ok(evidence) => stopped.extend(evidence),
+                Err(error) => violations.push(format!("campaign: stop writers: {error}")),
+            }
+            match resources::restore_lock(out, deadline) {
+                Ok(held) => lock = Some(held),
+                Err(error) => {
+                    violations.push(format!("campaign: restore lock: {error}"));
+                    return Ok(());
+                }
+            }
             // Stop every scoped writer before any network cleanup. Closing exec
             // gates prevents an uncommitted child from becoming a late writer.
             for (name, scope) in &scopes {
@@ -866,7 +895,18 @@ fn restore(out: &Path, deadline: Instant) -> Result<Restore> {
                         }
                     }
                 };
-                match resources::undo(scope, &before, deadline, scope == out) {
+                match resources::undo(scope, &before, deadline, scope == out, || {
+                    for directory in scopes
+                        .iter()
+                        .map(|(_, scope)| scope.as_path())
+                        .chain(std::iter::once(out))
+                    {
+                        if !resources::quiescent(directory, deadline)? {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                }) {
                     Ok((undo, problems)) => {
                         actions.extend(undo);
                         for problem in problems {
@@ -902,8 +942,23 @@ fn restore(out: &Path, deadline: Instant) -> Result<Restore> {
             violations.push(format!("record completion: {error}"));
         }
     }
-    let changed =
-        restore_check::state_changes(&before.observations, &post.observations, &journaled_keys);
+    let mut empty_anchor_names = Vec::new();
+    for directory in scopes
+        .iter()
+        .map(|(_, scope)| scope.as_path())
+        .chain(std::iter::once(out))
+    {
+        match resources::restored_anchor_names(directory, &before, deadline) {
+            Ok(names) => empty_anchor_names.extend(names),
+            Err(error) => violations.push(format!("post-state anchor inventory: {error}")),
+        }
+    }
+    let changed = restore_check::state_changes(
+        &before.observations,
+        &post.observations,
+        &journaled_keys,
+        &empty_anchor_names,
+    );
     violations.extend(changed.violations.iter().cloned());
     let result = Restore {
         already_restored: out.join("restored.json").exists(),

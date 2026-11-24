@@ -1140,8 +1140,8 @@ fn generated_unqualified_readback_product() {
                 1,
                 "{row:?}"
             );
-            let gaps = if variant == 9 {
-                [1; 8] // Positive absence never backs off.
+            let gaps = if matches!(variant, 6 | 9) {
+                [1; 8] // Empty listed configuration and missing anchors are both positive absence.
             } else {
                 [1, 2, 4, 8, 16, 32, 60, 60]
             };

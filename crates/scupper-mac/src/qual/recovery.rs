@@ -26,6 +26,20 @@ pub(super) fn recover_then_snapshot<R, S>(
     (recovered, snapshot())
 }
 
+/// Try every independent recovery step and retain failures in execution order.
+pub(super) fn run_steps<T, E: std::fmt::Display>(
+    steps: impl IntoIterator<Item = T>,
+    mut run: impl FnMut(T) -> Result<(), E>,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    for step in steps {
+        if let Err(error) = run(step) {
+            failures.push(error.to_string());
+        }
+    }
+    failures
+}
+
 // A diagnostic snapshot after failed cleanup cannot retroactively gain a fence
 // merely because the remaining writer exits after that snapshot started.
 pub(super) fn snapshot_can_complete<T, E>(cleanup: Option<&Result<T, E>>) -> bool {
@@ -175,6 +189,20 @@ mod tests {
     }
 
     #[test]
+    fn failed_step_does_not_skip_remaining_restore_steps() {
+        let mut called = Vec::new();
+        let failures = run_steps(["jobs", "anchors", "tokens", "pf state"], |step| {
+            called.push(step);
+            match step {
+                "jobs" | "tokens" => Err(step),
+                _ => Ok(()),
+            }
+        });
+        assert_eq!(called, ["jobs", "anchors", "tokens", "pf state"]);
+        assert_eq!(failures, ["jobs", "tokens"]);
+    }
+
+    #[test]
     fn failed_recovery_still_takes_post_state_snapshot() {
         let calls = std::cell::RefCell::new(Vec::new());
         let (recovery, ()) = recover_then_snapshot(
@@ -212,5 +240,129 @@ mod tests {
         listing.timed_out = true;
         assert!(!process_absent(99, &listing));
         Ok(())
+    }
+}
+
+/// Shared journal undo scheduler: dependent mutations need fresh quiescence;
+/// failures never skip independent steps or complete withheld journal entries.
+pub(super) fn undo<E: std::fmt::Display>(
+    mut quiescent: impl FnMut() -> Result<bool, E>,
+    mut run: impl FnMut(&str) -> Result<(), E>,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    for step in [
+        "tools",
+        "tokens",
+        "anchors",
+        "pf state",
+        "keys",
+        "resolver",
+        "images",
+        "store tree",
+        "loopback",
+        "sockets",
+        "feth",
+        "completion",
+    ] {
+        let result = (|| -> Result<(), String> {
+            if matches!(step, "tokens" | "anchors" | "pf state" | "completion")
+                && !quiescent().map_err(|e| format!("{step}: quiescence unknown; withheld: {e}"))?
+            {
+                return Err(format!("{step}: writers/services not quiescent; withheld"));
+            }
+            run(step).map_err(|e| e.to_string())
+        })();
+        if let Err(error) = result {
+            failures.push(error);
+        }
+    }
+    failures
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)] // Literal fake journals are part of each test.
+mod undo_tests {
+    use super::*;
+
+    #[test]
+    fn fake_journal_undo_withholds_mutations_after_failed_job_stop() {
+        let entries = super::super::journal::committed(concat!(
+            "{\"kind\":\"r4-job\",\"path\":\"system/net.scupper.qual.r4-exit\"}\n",
+            "{\"kind\":\"anchor\",\"path\":\"scupper-qual/scupper\"}\n",
+            "{\"kind\":\"token\",\"token\":7}\n",
+            "{\"kind\":\"r6-pf\"}\n",
+        ))
+        .expect("fake journal");
+        // The fake stop failed, old writer identities/groups are already gone,
+        // but the KeepAlive service remains: precisely the respawn gap.
+        let stop_jobs = || Err::<(), _>("bootout failed");
+        let mut report = vec![stop_jobs().expect_err("fake job stop must fail").to_owned()];
+        let service: super::super::Evidence = serde_json::from_value(serde_json::json!({
+            "command":["launchctl","print","system/net.scupper.qual.r4-exit"],
+            "stdin":null,"pid":1,"exit_code":0,"started_unix_ms":0,"elapsed_ms":0,
+            "timed_out":false,"truncated":false,"stdout":"state = running\n","stderr":""
+        }))
+        .expect("fake service evidence");
+        let mut commands = Vec::new();
+        let mut diagnostics = Vec::new();
+        let failures = undo(
+            || Ok::<_, &str>(super::super::jobs::absent(&service)),
+            |step| {
+                match step {
+                    "anchors" => commands.push("pfctl -F rules"),
+                    "tokens" => commands.push("pfctl -X 7"),
+                    "pf state" => commands.push("pfctl -d"),
+                    _ => diagnostics.push(step.to_owned()),
+                }
+                Ok::<_, &str>(())
+            },
+        );
+        assert!(
+            commands.is_empty(),
+            "assertion failed: failed job stop must withhold all dependent mutations"
+        );
+        for step in ["anchors", "tokens", "pf state", "completion"] {
+            assert!(
+                failures
+                    .iter()
+                    .any(|s| s.starts_with(step) && s.contains("withheld"))
+            );
+        }
+        report.extend(failures);
+        assert!(report.iter().any(|s| s == "bootout failed"));
+        assert!(diagnostics.contains(&"images".into()));
+        assert_eq!(entries.len(), 4);
+        let mut absent = service;
+        absent.exit_code = Some(113);
+        assert!(super::super::jobs::absent(&absent));
+        absent.timed_out = true;
+        assert!(!super::super::jobs::absent(&absent));
+        absent.timed_out = false;
+        absent.truncated = true;
+        assert!(!super::super::jobs::absent(&absent));
+    }
+
+    #[test]
+    fn fake_journal_undo_tools_failure_still_runs_anchors() {
+        let entries = super::super::journal::committed(
+            "{\"kind\":\"anchor\",\"path\":\"scupper-qual/scupper\"}\n",
+        )
+        .expect("fake journal");
+        let mut visited = Vec::new();
+        let failures = undo(
+            || Ok::<_, &str>(true),
+            |step| {
+                visited.push(step.to_owned());
+                if step == "tools" {
+                    Err("tools failed")
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(entries[0].kind, "anchor");
+        assert!(visited.contains(&"anchors".into()));
+        assert!(visited.contains(&"completion".into()));
+        assert_eq!(failures, ["tools failed"]);
     }
 }

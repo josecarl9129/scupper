@@ -14,9 +14,33 @@ DETACH = ROOT / "crates/scupper-mac/src/qual/detach.rs"
 REFERENCE = ROOT / "crates/scupper-mac/src/engine/reference.rs"
 CONTRACT_CHECK = ROOT / "crates/scupper-mac/src/qual/contract_check.rs"
 NATIVE_CONTRACTS = ROOT / "crates/scupper-mac/src/qual/contracts.rs"
+RECOVERY = ROOT / "crates/scupper-mac/src/qual/recovery.rs"
+PROTOCOL = ROOT / "crates/scupper-mac/src/engine/protocol.rs"
+REVIEW = ROOT / "crates/scupper-mac/qualification/goldens/24H232/review.json"
+JOBS = ROOT / "crates/scupper-mac/src/qual/jobs.rs"
+TRACE = ROOT / "crates/scupper-mac/src/decode/qualification_trace.rs"
+RESOURCE_UNDO = ROOT / "crates/scupper-mac/src/qual/resources/undo.rs"
 OUT = ROOT / "target/r7-mutants"
 OUT.mkdir(parents=True, exist_ok=True)
 MUTANTS = [
+    ("unreviewed-load-accepts-any-payload", ANCHOR,
+     'if text != scupper_core::mac::policy::render_lockdown().as_str()',
+     'if false && text != scupper_core::mac::policy::render_lockdown().as_str()',
+     "decode::pfanchor::tests::unsupported_build_only"),
+    ("unreviewed-load-returns-ok", ANCHOR,
+     'let _attempt = io.emergency_load(&load_args(path), text.as_bytes());',
+     'let _attempt = io.emergency_load(&load_args(path), text.as_bytes()); if _attempt == Ok(0) { return Ok(()); }',
+     "decode::pfanchor::tests::unsupported_build_only"),
+    ("drop-installed-protected-check", TRACE,
+     '!trace.iter().any(|row| {', 'true || !trace.iter().any(|row| {',
+     "engine::tests::r7::installed_protected_candidate"),
+    ("drop-descendant-depth-bound", ANCHOR,
+     'if depth >= 8 || *count > 64 {', 'if *count > 64 {',
+     "decode::pfanchor::tests::descendant_depth_bound"),
+    ("native-undo-quiescence-always-true", RESOURCE_UNDO,
+     'Ok(campaign_quiescent()? && jobs_absent()? && writers_quiescent()?)',
+     'Ok(true)',
+     "qual::resources::tests::journal_undo_retains"),
     ("inventory-error-is-empty", ANCHOR,
      'let parent = io.call(Operation::Inventory, &["-a", path.parent(), "-sA"], &[])?;',
      'let parent = io.call(Operation::Inventory, &["-a", path.parent(), "-sA"], &[]).unwrap_or(Text::Present(String::new()));',
@@ -76,10 +100,62 @@ MUTANTS = [
      'for flag in ["-sn", "-sT", "-sA", "-sd"] {',
      'for flag in ["-sn", "-sT", "-sA"] {',
      "decode::pfanchor::tests::present_empty"),
+    ("empty-listed-anchor-is-Some", ANCHOR,
+     'Ok((!text.is_empty()).then_some(text))', 'Ok(Some(text))',
+     "decode::pfanchor::tests::present_empty"),
+    ("empty-listed-anchor-is-Err", ANCHOR,
+     'Ok((!text.is_empty()).then_some(text))', 'if text.is_empty() { return Err(SysError::Unknown); } Ok(Some(text))',
+     "decode::pfanchor::tests::present_empty"),
+    ("flush-on-first-read-absence", ANCHOR,
+     'if read(io, path).is_ok_and(|text| text.is_none()) {',
+     'if false && read(io, path).is_ok_and(|text| text.is_none()) {',
+     "decode::pfanchor::tests::removal_skips_flush"),
+    ("drop-optimizer-none", ANCHOR,
+     ['pub(crate) fn load_args(path: &AnchorPath) -> [&str; 6]', '["-o", "none", "-a", path.as_str(), "-f", "-"]'],
+     ['pub(crate) fn load_args(path: &AnchorPath) -> [&str; 4]', '["-a", path.as_str(), "-f", "-"]'],
+     "decode::pfanchor::tests::load_requires"),
+    ("restore-aborts-on-first-failed-step", RECOVERY,
+     'failures.push(error.to_string());', 'failures.push(error.to_string()); break;',
+     "qual::recovery::tests::failed_step_does_not_skip"),
+    ("contracts-job-missing-from-allowlist", JOBS,
+     '    "contracts",', '',
+     "qual::jobs::tests::every_journaled_job"),
+    ("golden-Mismatch-is-Inconclusive", CONTRACT_CHECK,
+     '    } else {\n        Readback::Mismatch\n    }\n}', '    } else {\n        Readback::Unsupported\n    }\n}',
+     "qual::contract_check::tests::reviewed_optimizer_none"),
+    ("descendant-review-flag-ignored", ANCHOR,
+     'let recursive = io.descendants_reviewed()?;', 'let recursive = true;',
+     "decode::pfanchor::tests::descendant_absence"),
+    ("nonempty-grandchild-accepted", ANCHOR,
+     'if io.call(Operation::Filter, &["-a", &child, "-sr"], &[])? != Text::Present(String::new())',
+     'if depth != 1 && io.call(Operation::Filter, &["-a", &child, "-sr"], &[])? != Text::Present(String::new())',
+     "decode::pfanchor::tests::descendant_absence"),
+    ("unsupported-build-spawns-pfctl", ANCHOR,
+     'fn require_review(io: &impl Commands) -> Result<(), SysError> {\n    if !reviewed(&io.build()?) {',
+     'fn require_review(io: &impl Commands) -> Result<(), SysError> {\n    if false && !reviewed(&io.build()?) {',
+     "decode::pfanchor::tests::unsupported_build"),
+    ("restore-without-writer-quiescence", RECOVERY,
+     'if matches!(step, "tokens" | "anchors" | "pf state" | "completion")',
+     'if false && matches!(step, "tokens" | "anchors" | "pf state" | "completion")',
+     "qual::recovery::undo_tests::fake_journal_undo_withholds"),
+    ("filter-foreign-becomes-unknown", ANCHOR,
+     'if op == Operation::Filter\n                && (',
+     'if false && op == Operation::Filter\n                && (',
+     "decode::pfanchor::tests::filter_foreign_classes"),
+    ("undo-aborts-after-tools-failure", RECOVERY,
+     'failures.push(error);', 'failures.push(error); break;',
+     "qual::recovery::undo_tests::fake_journal_undo_tools_failure"),
+    ("review-golden-hash-drift", REVIEW,
+     '8d88ce6bb28645b35bb0440868c44712057d98be24165187f343227b058923f8', '0' * 64,
+     "python:ArtifactTests.test_review_sha256_matches_exact_golden_bytes"),
+    ("clear-intent-whitespace-clears", PROTOCOL,
+     'if self.platform.read_anchor(d)?.is_some() {',
+     'if self.platform.read_anchor(d)?.is_some_and(|text| !text.trim().is_empty()) {',
+     "engine::tests::r7::clear_intent_only_none"),
 ]
 temporary = OUT / "tmp"
 temporary.mkdir(exist_ok=True)
-env = dict(os.environ, CARGO_BUILD_JOBS="2", RUST_TEST_THREADS="2", TMPDIR=str(temporary))
+env = dict(os.environ, CARGO_BUILD_JOBS="2", RUST_TEST_THREADS="2", CARGO_NET_OFFLINE="true", TMPDIR=str(temporary))
 originals = {path: path.read_bytes() for _, path, *_ in MUTANTS}
 results = []
 try:

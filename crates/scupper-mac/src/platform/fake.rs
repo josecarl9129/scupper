@@ -310,6 +310,10 @@ impl Drop for InstanceLease {
 #[derive(Clone, Debug)]
 #[allow(clippy::struct_excessive_bools)] // Independent external facts, not lifecycle state.
 pub struct FakePlatform {
+    /// Deliberately nonconforming adapter response for `ClearIntent` regression tests.
+    #[cfg(test)]
+    pub anchor_readback_raw: Option<String>,
+
     /// Optional complete method audit, independent of the model's effect log.
     pub method_trace: Option<std::cell::RefCell<Vec<&'static str>>>,
     /// Optional ordered snapshot/reference evidence for qualification regression tests.
@@ -572,6 +576,9 @@ impl FakePlatform {
             image: None,
         };
         Ok(Self {
+            #[cfg(test)]
+            anchor_readback_raw: None,
+
             method_trace: None,
             #[cfg(any(test, feature = "qualification"))]
             qualification_trace: None,
@@ -1820,10 +1827,14 @@ impl FakePlatform {
 
 impl Platform for FakePlatform {
     #[cfg(any(test, feature = "qualification"))]
-    fn trace_verification(&mut self, verdict: &verify::Verdict) {
+    fn trace_verification(
+        &mut self,
+        kind: scupper_core::mac::policy::Kind,
+        verdict: &verify::Verdict,
+    ) {
         if let Some(trace) = &mut self.qualification_trace {
             trace.push(format!(
-                "verification_protected:{}",
+                "verification_kind:{kind:?}:verification_protected:{}",
                 matches!(verdict, verify::Verdict::Protected(_))
             ));
         }
@@ -1988,23 +1999,31 @@ impl Platform for FakePlatform {
         if let Some(trace) = &self.method_trace {
             trace.borrow_mut().push("wait_write");
         }
-        let Some(copy) = self.outstanding else {
-            return WriteOutcome::Failed(SysError::Failed("no outstanding write"));
-        };
-        while self.millis / 1000 < deadline.0 {
+        let outcome = (|| {
+            let Some(copy) = self.outstanding else {
+                return WriteOutcome::Failed(SysError::Failed("no outstanding write"));
+            };
+            while self.millis / 1000 < deadline.0 {
+                if self.write_ready_at.is_some_and(|at| self.tick >= at) {
+                    self.complete_late(copy, true);
+                    return WriteOutcome::Synced;
+                }
+                self.tick();
+            }
             if self.write_ready_at.is_some_and(|at| self.tick >= at) {
                 self.complete_late(copy, true);
-                return WriteOutcome::Synced;
+                WriteOutcome::Synced
+            } else {
+                WriteOutcome::TimedOut
             }
-            self.tick();
+        })();
+        #[cfg(any(test, feature = "qualification"))]
+        if let Some(trace) = &mut self.qualification_trace {
+            trace.push(crate::decode::qualification_trace::write_result(&outcome));
         }
-        if self.write_ready_at.is_some_and(|at| self.tick >= at) {
-            self.complete_late(copy, true);
-            WriteOutcome::Synced
-        } else {
-            WriteOutcome::TimedOut
-        }
+        outcome
     }
+
     fn write_copy(
         &mut self,
         copy: Copy,
@@ -2449,7 +2468,11 @@ impl Platform for FakePlatform {
                 self.record_firewall(Call::Mutation(Mutation::AnchorChange), true);
             }
         }
-        Ok(observed)
+        #[cfg(test)]
+        if let Some(raw) = &self.anchor_readback_raw {
+            return Ok(Some(raw.clone()));
+        }
+        Ok(observed.filter(|text| !text.is_empty()))
     }
     fn flush_states(&mut self, deadline: Deadline) -> Result<(), SysError> {
         if let Some(trace) = &self.method_trace {

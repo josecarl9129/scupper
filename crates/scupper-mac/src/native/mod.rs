@@ -35,7 +35,9 @@ use std::{
 };
 
 // provisional; final layout decided in 5a3, see Q-LOCK ancestor measurement
-const PROVISIONAL_RUN: &str = "/private/var/db/scupper/run";
+pub(crate) const PRODUCTION_ROOT: &str = "/private/var/db/scupper";
+pub(crate) const PRODUCTION_LOCK: &str = "/private/var/db/scupper/run/scupper.lock";
+pub(crate) const PRODUCTION_CONTROL: &str = "/private/var/db/scupper/run/scupper.sock";
 
 const UNIMPLEMENTED: SysError = SysError::Failed("native: not implemented");
 
@@ -69,9 +71,9 @@ impl Paths {
     pub fn production() -> Self {
         Self {
             anchor: fixed_anchor("com.apple/scupper"),
-            root: PathBuf::from("/private/var/db/scupper"),
-            lock: Path::new(PROVISIONAL_RUN).join("scupper.lock"),
-            control: Path::new(PROVISIONAL_RUN).join("scupper.sock"),
+            root: PathBuf::from(PRODUCTION_ROOT),
+            lock: PathBuf::from(PRODUCTION_LOCK),
+            control: PathBuf::from(PRODUCTION_CONTROL),
         }
     }
     /// Scratch namespace available only to qualification builds.
@@ -155,6 +157,10 @@ impl NativePlatform {
     // TODO(5a3): forbid the qualification feature in the production helper binary
     // with compile_error! (or check the release binary in CI) when adding its constructor.
     pub fn new(paths: Paths) -> Result<Self, SysError> {
+        #[cfg(all(feature = "qualification", not(test)))]
+        if paths.anchor_path() == "com.apple/scupper" {
+            return Err(SysError::Failed("qualification requires a scratch anchor"));
+        }
         scupper_darwin::check_sigchld().map_err(|_| SysError::Failed("native: unsafe SIGCHLD"))?;
         Ok(Self {
             paths,
@@ -194,6 +200,14 @@ impl NativePlatform {
     fn trace_call(&self, call: &str) {
         #[cfg(feature = "qualification")]
         crate::decode::qualification_trace::record(&mut self.trace.borrow_mut(), call);
+    }
+    #[cfg_attr(
+        not(feature = "qualification"),
+        allow(unused_variables, clippy::unused_self)
+    )]
+    fn trace_lazy(&self, call: impl FnOnce() -> String) {
+        #[cfg(feature = "qualification")]
+        self.trace_call(&call());
     }
     /// Complete method/command trace for qualification assertions.
     #[cfg(feature = "qualification")]
@@ -664,11 +678,17 @@ fn decode(record: &scupper_darwin::KProc) -> Result<ProcInfo, ProcessError> {
 
 impl Platform for NativePlatform {
     #[cfg(any(test, feature = "qualification"))]
-    fn trace_verification(&mut self, verdict: &scupper_core::mac::verify::Verdict) {
-        self.trace_call(&format!(
-            "verification_protected:{}",
-            matches!(verdict, scupper_core::mac::verify::Verdict::Protected(_))
-        ));
+    fn trace_verification(
+        &mut self,
+        kind: scupper_core::mac::policy::Kind,
+        verdict: &scupper_core::mac::verify::Verdict,
+    ) {
+        self.trace_lazy(|| {
+            format!(
+                "verification_kind:{kind:?}:verification_protected:{}",
+                matches!(verdict, scupper_core::mac::verify::Verdict::Protected(_))
+            )
+        });
     }
 
     fn write_copy(
@@ -683,7 +703,7 @@ impl Platform for NativePlatform {
         let result = self
             .storage
             .start(self.paths.root.clone(), copy, bytes, false, deadline);
-        self.trace_call(&format!("snapshot_result:{result:?}"));
+        self.trace_lazy(|| format!("snapshot_result:{result:?}"));
         result
     }
     fn create_copy(
@@ -698,7 +718,7 @@ impl Platform for NativePlatform {
         let result = self
             .storage
             .start(self.paths.root.clone(), copy, bytes, true, deadline);
-        self.trace_call(&format!("snapshot_result:{result:?}"));
+        self.trace_lazy(|| format!("snapshot_result:{result:?}"));
         result
     }
     fn now(&mut self) -> u64 {
@@ -756,7 +776,7 @@ impl Platform for NativePlatform {
         match self.process_list(deadline) {
             Ok(list) => Enumeration::Complete(list),
             Err(error) => {
-                self.trace_call(&format!("failed:processes:{error:?}"));
+                self.trace_lazy(|| format!("failed:processes:{error:?}"));
                 Enumeration::Incomplete(error)
             }
         }
@@ -856,7 +876,7 @@ impl Platform for NativePlatform {
         // Deliberately never close this descriptor, even if the adapter is dropped.
         let acquired = acquire();
         if let Err(error) = &acquired {
-            self.trace_call(&format!("failed:acquire_instance_lock:{error:?}"));
+            self.trace_lazy(|| format!("failed:acquire_instance_lock:{error:?}"));
         }
         self.lock = Some(ManuallyDrop::new(acquired?));
         Ok(())
@@ -921,7 +941,7 @@ impl Platform for NativePlatform {
         self.trace_call("poll_copy");
         let result = self.storage.poll(self.paths.root.clone(), copy, deadline);
         if matches!(result, std::task::Poll::Ready(CopyRead::Unreadable)) {
-            self.trace_call(&format!("failed:poll_copy:{copy:?}:unreadable"));
+            self.trace_lazy(|| format!("failed:poll_copy:{copy:?}:unreadable"));
         }
         result
     }
@@ -932,7 +952,7 @@ impl Platform for NativePlatform {
     fn wait_write(&mut self, deadline: Deadline) -> WriteOutcome {
         self.trace_call("wait_write");
         let result = self.storage.wait(deadline);
-        self.trace_call(&format!("snapshot_result:{result:?}"));
+        self.trace_lazy(|| format!("snapshot_result:{result:?}"));
         result
     }
     fn enable_pf(&mut self, deadline: Deadline) -> Result<PfEnable, SysError> {
@@ -950,7 +970,7 @@ impl Platform for NativePlatform {
             } else {
                 None
             };
-            self.trace_call(&format!("acquire_result:{}", serde_json::json!(pair)));
+            self.trace_lazy(|| format!("acquire_result:{}", serde_json::json!(pair)));
             if self.pf_contract_capture
                 && let (Some(out), Some((token, pid))) = (&self.pf_text_out, pair)
             {
@@ -1128,15 +1148,15 @@ impl Platform for NativePlatform {
     }
     fn load_anchor(&mut self, text: &AnchorText, deadline: Deadline) -> Result<(), SysError> {
         self.trace_call("load_anchor");
-        crate::decode::pfanchor::source(text.as_str())?;
         let path = self.paths.anchor.clone();
-        self.anchor_command(
-            crate::decode::pfanchor::Operation::Load,
-            &["-a", path.as_str(), "-f", "-"],
-            text.as_str().as_bytes(),
-            deadline,
-        )?;
-        Ok(())
+        crate::decode::pfanchor::load(
+            &mut pf::AnchorSession {
+                platform: self,
+                deadline,
+            },
+            &path,
+            text.as_str(),
+        )
     }
     fn read_anchor(&mut self, deadline: Deadline) -> Result<Option<String>, SysError> {
         self.trace_call("read_anchor");
@@ -1188,7 +1208,7 @@ impl Platform for NativePlatform {
             .ok_or(SysError::Failed("native: pfctl pin missing"))?;
         let result = self.check_pin(Path::new(pfctl), deadline);
         if let Err(error) = &result {
-            self.trace_call(&format!("failed:check_pfctl:{error:?}"));
+            self.trace_lazy(|| format!("failed:check_pfctl:{error:?}"));
         }
         result
     }

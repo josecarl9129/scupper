@@ -24,6 +24,7 @@ use crate::{
 use scupper_core::mac::{TunnelGeneration, policy, verify};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 use std::{
     collections::BTreeSet,
     fs,
@@ -67,6 +68,22 @@ thread_local! { static CASE_END: std::cell::Cell<Option<Instant>> = const { std:
 fn end() -> Instant {
     let end = Instant::now() + Duration::from_secs(8);
     CASE_END.with(|limit| limit.get().map_or(end, |limit| limit.min(end)))
+}
+fn budget() -> Result<()> {
+    env(
+        CASE_END.with(|limit| {
+            limit
+                .get()
+                .is_none_or(|limit| Instant::now() + Duration::from_secs(1) < limit)
+        }),
+        "qualification case deadline/budget exhausted",
+    )
+}
+fn within_budget<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    budget()?;
+    let result = operation();
+    budget()?;
+    result
 }
 fn append(out: &Path, value: &Value) -> Result<()> {
     let mut file = fs::OpenOptions::new()
@@ -112,20 +129,50 @@ fn child_pin() -> Result<PathBuf> {
     Ok(std::env::current_exe()?.with_file_name("wireguard-go"))
 }
 fn raw(out: &Path, p: &mut NativePlatform, args: &[&str], input: &[u8]) -> Result<Evidence> {
-    super::pf::raw_input(out, p, args, input, end())
+    within_budget(|| super::pf::raw_input(out, p, args, input, end()))
+}
+fn reviewed_row(e: &Evidence, op: pfanchor::Operation) -> Result<pfanchor::Text> {
+    env(
+        !e.timed_out && !e.truncated,
+        "incomplete pfctl control evidence",
+    )?;
+    pfanchor::proposed(
+        &pftext::Build::system()?,
+        op,
+        e.exit_code.ok_or("missing pfctl exit")?,
+        e.stdout.as_bytes(),
+        e.stderr.as_bytes(),
+    )
+    .map_err(|error| format!("pfctl control row mismatch: {op:?} {error:?}").into())
 }
 fn scoped(out: &Path, p: &mut NativePlatform, path: &str) -> Result<()> {
-    super::resources::recheck_foreign_tokens(out, end())?;
-    for class in ["rules", "nat", "Tables", "dummynet"] {
+    within_budget(|| super::resources::recheck_foreign_tokens(out, end()))?;
+    if super::resources::anchor_read(out, path, end()).is_ok_and(|text| text.is_none()) {
+        return Ok(());
+    }
+    for (op, class) in [
+        (pfanchor::Operation::Rules, "rules"),
+        (pfanchor::Operation::Nat, "nat"),
+        (pfanchor::Operation::Tables, "Tables"),
+        (pfanchor::Operation::Dummynet, "dummynet"),
+    ] {
         let e = raw(out, p, &["-a", path, "-F", class], &[])?;
-        env(e.complete(), "scoped flush incomplete; inspect raw capture")?;
+        reviewed_row(&e, op)?;
     }
     Ok(())
 }
 fn case(out: &Path, id: &str, f: impl FnOnce(&mut CaseResult) -> Result<()>) -> Result<CaseResult> {
-    let mut result=CaseResult {case:id.into(),binary_sha256:executable_sha256()?,verdict:Verdict::Inconclusive,iterations:0,elapsed_ms:None,detail:"pass 1: R7 rows and readback goldens are proposed/unreviewed; no qualification promoted".into(),evidence:vec![]};
+    let mut result = CaseResult {
+        case: id.into(),
+        binary_sha256: executable_sha256()?,
+        verdict: Verdict::Inconclusive,
+        iterations: 0,
+        elapsed_ms: None,
+        detail: "R7 reviewed per-build rows and optimizer-none goldens; case incomplete".into(),
+        evidence: vec![],
+    };
     let start = Instant::now();
-    if id == "Q-ANCHOR" {
+    if matches!(id, "Q-ANCHOR" | "Q-DESCENDANTS") {
         CASE_END.with(|limit| limit.set(Some(start + Duration::from_secs(180))));
     }
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut result))) {
@@ -152,13 +199,16 @@ fn case(out: &Path, id: &str, f: impl FnOnce(&mut CaseResult) -> Result<()>) -> 
             );
         }
     }
-    if id == "Q-ANCHOR" {
+    if matches!(id, "Q-ANCHOR" | "Q-DESCENDANTS") {
         CASE_END.with(|limit| limit.set(None));
         if start.elapsed() >= Duration::from_secs(180)
             && result.verdict != Verdict::ContractViolation
         {
             result.verdict = Verdict::Inconclusive;
-            result.detail = "Q-ANCHOR stopped at its measured 180-second case budget".into();
+            write!(
+                &mut result.detail,
+                "; {id} stopped at its 180-second case budget"
+            )?;
         }
     }
     result.elapsed_ms = Some(start.elapsed().as_millis());
@@ -211,8 +261,14 @@ pub(super) fn worker(out: &Path) -> Result<()> {
         ("Q-CONTRACTS", contracts),
         ("Q-E2E", e2e),
         ("Q-FLUSH", flush),
+        ("Q-DESCENDANTS", descendants),
     ] {
-        results.push(case(out, id, |r| operation(out, r))?);
+        results.push(case(out, id, |r| {
+            if matches!(id, "Q-CONTRACTS" | "Q-E2E") {
+                shared_anchor_clean(out)?;
+            }
+            operation(out, r)
+        })?);
         let mut p = platform(out, &out.join("r4-fixtures"), &child_pin()?)?;
         let entries = super::resources::entries(out)?;
         for path in [ANCHOR, HOOKED, SENTINEL] {
@@ -220,11 +276,16 @@ pub(super) fn worker(out: &Path) -> Result<()> {
                 // Cleanup authority comes only from the original absence check.
                 // Preserve failed cleanup as evidence; independent restore retries.
                 let cleanup = scoped(out, &mut p, path);
+                let absence = super::resources::anchor_read(out, path, end());
+                let record = json!({"case":id,"anchor":path,"cleanup":format!("{cleanup:?}"),"absence":format!("{absence:?}")});
                 write_json(
                     out,
                     &format!("{}.json", super::unique("contracts-between-cases")),
-                    &json!({"case":id,"anchor":path,"cleanup":format!("{cleanup:?}"),"absence":format!("{:?}",super::resources::anchor_read(out,path,end()))}),
+                    &record,
                 )?;
+                if path == ANCHOR && (cleanup.is_err() || absence != Ok(None)) {
+                    write_json(out, "shared-anchor-cleanup-failure.json", &record)?;
+                }
             }
         }
     }
@@ -291,7 +352,7 @@ impl ContractHarness<NativePlatform> for Harness {
     }
 }
 fn contracts(out: &Path, r: &mut CaseResult) -> Result<()> {
-    super::resources::recheck_foreign_tokens(out, end())?;
+    within_budget(|| super::resources::recheck_foreign_tokens(out, end()))?;
     let root = out.join("r4-fixtures/contract-storage");
     fs::DirBuilder::new().mode(0o700).create(&root)?;
     let scratch = root.join("contract-executable");
@@ -324,7 +385,8 @@ fn contracts(out: &Path, r: &mut CaseResult) -> Result<()> {
         Ok(())
     })?;
     let anchors = case(out, "Q-CONTRACTS-anchor", |r| {
-        super::resources::journal_anchor(out, ANCHOR, end())?;
+        super::resources::journal_anchor(out, ANCHOR, end())
+            .map_err(|e| environment_issue(e.to_string()))?;
         if let Err(error) = run_anchor_contracts(&mut h) {
             if super::super::contract_check::anchor_error_is_inconclusive(&error) {
                 return Err(environment_issue(format!("anchor suite stopped: {error}")));
@@ -473,13 +535,10 @@ fn e2e(out: &Path, r: &mut CaseResult) -> Result<()> {
     let ticking_started = Instant::now();
     let bounded = ticking_started + Duration::from_secs(110);
     let mut ticks = 0_u64;
-    let mut acquisition_step_reached = false;
     while (join.platform_mut().now() < started + 60
         || ticking_started.elapsed() < Duration::from_secs(60))
         && Instant::now() < bounded
     {
-        acquisition_step_reached |=
-            join.machine().pending() == Some(scupper_core::mac::lifecycle::Step::AcquireReference);
         join.run_until_quiescent(1);
         ensure(
             !matches!(join.status().enforcement, verify::Verdict::Protected(_)),
@@ -496,32 +555,21 @@ fn e2e(out: &Path, r: &mut CaseResult) -> Result<()> {
     }
     let seconds = join.platform_mut().now().saturating_sub(started);
     let trace = join.platform().call_trace();
+    let acquisition_step_reached = crate::decode::qualification_trace::acquisition_reached(&trace);
     write_json(
         out,
         "e2e-join-precheck.json",
         &json!({"trace":trace,"mode":format!("{:?}",join.mode()),"restore_limitation":"-E-to-journal gap relies only on runner exclusivity and restoring the preflight pf state"}),
     )?;
     ensure(!trace.iter().any(|c| c == "spawn"), "Q-E2E spawned")?;
-    env(
-        !trace
-            .iter()
-            .any(|s| s == crate::decode::qualification_trace::OVERFLOW),
-        "Q-E2E stopped at trace overflow",
+    ensure(
+        crate::decode::qualification_trace::installed_candidates_safe(&trace),
+        "install-failed engine offered Installed Protected verification",
     )?;
     ensure(
         super::super::contract_check::join_snapshot_writes_held(&trace),
         "Q-E2E durable write escaped hold before environment classification",
     )?;
-    if join.mode() == crate::engine::Mode::Starting {
-        return Err(environment_issue(
-            "startup ownership/census incomplete; input-free Lockdown decision not established",
-        ));
-    }
-    env(
-        !trace.iter().any(|s| s.starts_with("failed:processes:")),
-        "Q-E2E stopped at incomplete process census",
-    )?;
-
     let first_stub = trace.iter().find(|c| c.starts_with("failed:"));
     let first = trace
         .iter()
@@ -530,7 +578,7 @@ fn e2e(out: &Path, r: &mut CaseResult) -> Result<()> {
         !trace.iter().any(|c| c == "spawn"),
         "install-failed engine spawned",
     )?;
-    let lockdown_load = format!("/sbin/pfctl -a {ANCHOR} -f -");
+    let lockdown_load = format!("/sbin/pfctl -o none -a {ANCHOR} -f -");
     for command in mutations(&trace) {
         ensure(
             command == lockdown_load
@@ -553,6 +601,18 @@ fn e2e(out: &Path, r: &mut CaseResult) -> Result<()> {
             .filter(|s| s.starts_with(&load_prefix))
             .all(|s| *s == expected_load),
         "install-failed engine loaded a policy other than input-free Lockdown",
+    )?;
+    env(
+        !super::super::contract_check::startup_environment_failed(&trace),
+        "Q-E2E startup tool/lock/storage environment incomplete",
+    )?;
+    ensure(
+        first_stub.is_none_or(|c| {
+            c.starts_with("failed:processes:")
+                || c == "failed:poll_install_record:install record: no writer before 5a3"
+                || c == "failed:read_install_record:install record: no writer before 5a3"
+        }),
+        "an earlier stub failure replaced the expected install refusal",
     )?;
     let copies = snapshot_pair(join.platform_mut())?;
     let durable_held = copies
@@ -579,9 +639,27 @@ fn e2e(out: &Path, r: &mut CaseResult) -> Result<()> {
         capture_failures.is_empty(),
         &format!("Q-E2E capture/journal failures: {capture_failures:?}"),
     )?;
+    ensure(
+        durable_held && every_write_held,
+        "durable snapshot escaped install-failure hold",
+    )?;
+    if join.mode() != crate::engine::Mode::Starting {
+        ensure(
+            join.machine().pre_tunnel_policy() == policy::Kind::Lockdown,
+            "install failure did not select input-free Lockdown",
+        )?;
+    }
+    env(
+        !trace
+            .iter()
+            .any(|s| s == crate::decode::qualification_trace::OVERFLOW),
+        &format!(
+            "Q-E2E trace overflow at pending step {:?}",
+            join.machine().pending()
+        ),
+    )?;
     let acquisitions =
         acquisition_audit.map_err(|e| format!("reference acquisition contract: {e}"))?;
-    acquisition_step_reached |= trace.iter().any(|c| c == "acquire");
     if acquisition_step_reached {
         ensure(
             acquisitions > 0,
@@ -589,18 +667,32 @@ fn e2e(out: &Path, r: &mut CaseResult) -> Result<()> {
         )?;
     }
     env(
-        acquisitions > 0,
+        join.mode() != crate::engine::Mode::Starting,
         &format!(
-            "Q-E2E stopped before acquisition at {first:?}; fresh-state counted acquisition not observed"
+            "startup ownership/census incomplete at pending step {:?}",
+            join.machine().pending()
         ),
     )?;
-    ensure(
-        durable_held && every_write_held,
-        "durable snapshot escaped install-failure hold",
+    env(
+        !trace.iter().any(|s| s.starts_with("failed:processes:")),
+        &format!(
+            "incomplete process census at pending step {:?}",
+            join.machine().pending()
+        ),
     )?;
-    ensure(
-        join.machine().pre_tunnel_policy() == policy::Kind::Lockdown,
-        "install failure did not select input-free Lockdown",
+    env(
+        first_stub.is_some(),
+        &format!(
+            "install refusal not reached at pending step {:?}",
+            join.machine().pending()
+        ),
+    )?;
+    env(
+        acquisitions > 0,
+        &format!(
+            "Q-E2E stopped before acquisition at pending step {:?}; fresh-state counted acquisition not observed",
+            join.machine().pending()
+        ),
     )?;
     env(
         seconds >= 60 && ticks > 0 && ticking_started.elapsed() >= Duration::from_secs(60),
@@ -608,25 +700,23 @@ fn e2e(out: &Path, r: &mut CaseResult) -> Result<()> {
     )?;
     env(
         !load.is_empty() && !read.is_empty(),
-        "Lockdown load/readback not both reached; unreviewed rows or later native stubs prevent complete Q-E2E",
+        "Lockdown load/readback not both reached; inspect pending step and native stubs",
     )?;
     r.iterations = 1;
     env(
-        first == first_stub,
-        "the startup D-3 containment load failed on proposed/unpinned text before install refusal; exact first-failure condition unqualified (contract requires early containment)",
+        first == first_stub
+            || super::super::contract_check::first_anchor_failure_complete(&trace) == Some(true),
+        "Q-E2E incomplete anchor command evidence",
     )?;
     ensure(
-        first_stub.is_some_and(|c| {
-            c == "failed:poll_install_record:install record: no writer before 5a3"
-                || c == "failed:read_install_record:install record: no writer before 5a3"
-        }),
-        "an earlier stub failure replaced the expected install refusal",
+        first == first_stub,
+        "startup D-3 containment failed before install refusal; inspect reviewed rows and pending step (contract requires early containment)",
     )?;
     if left_problem.is_none() && pfanchor::reviewed(&pftext::Build::system()?) {
         r.verdict = Verdict::AssumptionHolds;
     }
     r.detail = format!(
-        "Left: {}; Join: install refusal and input-free Lockdown positively observed for {seconds}s; reserved counted acquisition audited; no spawn/Protected; proposed load/read outcomes retained. Unhooked path supplies no blocking claim.",
+        "Left: {}; Join: install refusal and input-free Lockdown positively observed for {seconds}s; reserved counted acquisition audited; no spawn/Protected; reviewed load/read outcomes retained. Unhooked path supplies no blocking claim.",
         left_problem
             .unwrap_or_else(|| "committed, zero pf mutations/spawn, complete owned absence".into())
     );
@@ -649,10 +739,16 @@ fn inventory(out: &Path, p: &mut NativePlatform, path: &str) -> Result<Value> {
     }
     Ok(serde_json::to_value(reads)?)
 }
+fn path_classes(out: &Path, p: &mut NativePlatform, path: &str) -> Result<Value> {
+    let mut reads = vec![];
+    for flag in ["-sr", "-sn", "-sT", "-sA", "-sd"] {
+        reads.push(raw(out, p, &["-a", path, flag], &[])?);
+    }
+    Ok(serde_json::to_value(reads)?)
+}
 fn measure_remove(out: &Path, p: &mut NativePlatform, path: &str) -> Result<Value> {
-    // Pass 1 adapter removal refuses unreviewed rows. The harness separately
-    // measures exactly the adapter's four scoped flushes, never substitutes
-    // that measurement for an adapter success.
+    // Keep adapter success separate from raw harness cleanup measurements.
+    // Both paths skip flushing after complete configuration absence.
     if path != ANCHOR {
         scoped(out, p, path)?;
         let absence = super::resources::anchor_read(out, path, end());
@@ -660,15 +756,74 @@ fn measure_remove(out: &Path, p: &mut NativePlatform, path: &str) -> Result<Valu
             json!({"absence":format!("{absence:?}"),"gone":absence.is_ok_and(|a|a.is_none()),"inventory":inventory(out,p,path)?}),
         );
     }
+    budget()?;
     let adapter = p.remove_anchor(deadline());
+    budget()?;
     scoped(out, p, path)?;
     let absence = super::resources::anchor_read(out, path, end());
     Ok(
         json!({"adapter_ok":adapter.is_ok(),"adapter_result":format!("{adapter:?}"),"absence":format!("{absence:?}"),"gone":absence.is_ok_and(|a|a.is_none()),"inventory":inventory(out,p,path)?}),
     )
 }
-#[allow(clippy::too_many_lines)] // Keep both lifecycle conditions, their counters and qualification gates together.
+type Findings = Vec<(bool, String)>;
+fn attempt(
+    out: &Path,
+    name: &str,
+    findings: &mut Findings,
+    operation: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let outcome = operation();
+    let detail = outcome.as_ref().err().map(ToString::to_string);
+    let violation = outcome
+        .as_ref()
+        .err()
+        .is_some_and(|e| !e.is::<super::EnvironmentIssue>());
+    write_json(
+        out,
+        &format!("anchor-outcome-{name}.json"),
+        &json!({"outcome":detail,"contract_violation":violation}),
+    )?;
+    if let Some(detail) = detail {
+        findings.push((violation, format!("{name}: {detail}")));
+    }
+    Ok(())
+}
 fn anchors(out: &Path, r: &mut CaseResult) -> Result<()> {
+    let mut findings = Findings::new();
+    attempt(out, "lifecycle", &mut findings, || anchor_lifecycle(out, r))?;
+    write_json(out, "anchor-outcomes.json", &findings)?;
+    ensure(
+        !findings.iter().any(|(violation, _)| *violation),
+        &format!("Q-ANCHOR violations: {findings:?}"),
+    )?;
+    env(
+        findings.is_empty(),
+        &format!("Q-ANCHOR measurements/environment: {findings:?}"),
+    )
+}
+fn descendants(out: &Path, r: &mut CaseResult) -> Result<()> {
+    let mut findings = Findings::new();
+    let mut p = platform(out, &out.join("r4-fixtures"), &child_pin()?)?;
+    // Original journal authority is reused only after the between-case absence check.
+    optimizer_controls(out, &mut p, &mut findings)?;
+    foreign_fixtures(out, &mut p, &mut findings)?;
+    descendant_measurements(out, &mut p, &mut findings)?;
+    write_json(out, "descendant-outcomes.json", &findings)?;
+    ensure(
+        !findings.iter().any(|(v, _)| *v),
+        &format!("Q-DESCENDANTS violations: {findings:?}"),
+    )?;
+    env(
+        findings.is_empty(),
+        &format!("Q-DESCENDANTS measurements/environment: {findings:?}"),
+    )?;
+    r.verdict = Verdict::Measurement;
+    r.detail = "descendant coverage, optimizer controls and foreign fixtures measured; no native coverage granted".into();
+    r.iterations = 5;
+    Ok(())
+}
+#[allow(clippy::too_many_lines)] // Keep both lifecycle conditions and measurements together.
+fn anchor_lifecycle(out: &Path, r: &mut CaseResult) -> Result<()> {
     let mut p = platform(out, &out.join("r4-fixtures"), &child_pin()?)?;
     // Capture dummynet even if the later absence/journal step stops pass 1.
     for path in [ANCHOR, HOOKED] {
@@ -676,7 +831,7 @@ fn anchors(out: &Path, r: &mut CaseResult) -> Result<()> {
         write_json(
             out,
             &format!("{}.json", super::unique("anchor-dummynet-prejournal")),
-            &json!({"anchor":path,"proposed_unreviewed":true,"evidence":dummynet}),
+            &json!({"anchor":path,"reviewed_text_rows":true,"evidence":dummynet}),
         )?;
     }
     let missing_parent = vec![
@@ -686,7 +841,7 @@ fn anchors(out: &Path, r: &mut CaseResult) -> Result<()> {
     write_json(
         out,
         "anchor-missing-parent.json",
-        &json!({"proposed_unreviewed":true,"evidence":missing_parent}),
+        &json!({"reviewed_text_rows":true,"evidence":missing_parent}),
     )?;
     super::resources::journal_anchor(out, ANCHOR, end())
         .map_err(|e| environment_issue(e.to_string()))?;
@@ -698,12 +853,30 @@ fn anchors(out: &Path, r: &mut CaseResult) -> Result<()> {
     let reviewed = pfanchor::reviewed(&pftext::Build::system()?);
     for iteration in 0..20 {
         env(Instant::now() < end(), "Q-ANCHOR case budget exhausted")?;
+        budget()?;
         let a = p.load_anchor(&first, deadline());
+        budget()?;
         let a_read = p.read_anchor(deadline());
+        budget()?;
         let a_raw = inventory(out, &mut p, ANCHOR)?;
+        budget()?;
         let b = p.load_anchor(&second, deadline());
+        budget()?;
         let b_read = p.read_anchor(deadline());
+        budget()?;
         let b_raw = inventory(out, &mut p, ANCHOR)?;
+        for (intended, observed) in [(&first, &a_read), (&second, &b_read)] {
+            if let Ok(Some(observed)) = observed {
+                ensure(
+                    super::super::contract_check::readback(
+                        pftext::Build::system()?.as_str(),
+                        intended,
+                        observed,
+                    ) == Readback::Match,
+                    "reviewed -o none golden Mismatch",
+                )?;
+            }
+        }
         let remove = measure_remove(out, &mut p, ANCHOR)?;
         gone_every_time &= remove["gone"] == true;
         adapter_every_time &= a.is_ok()
@@ -714,19 +887,17 @@ fn anchors(out: &Path, r: &mut CaseResult) -> Result<()> {
         write_json(
             out,
             &format!("anchor-lifecycle-{iteration:02}.json"),
-            &json!({"a_source":first.as_str(),"a_load":format!("{a:?}"),"a_read":format!("{a_read:?}"),"a_read_raw":a_raw,"b_source":second.as_str(),"b_load":format!("{b:?}"),"b_read":format!("{b_read:?}"),"b_read_raw":b_raw,"remove":remove,"unhooked":true,"proposed_unreviewed":true}),
+            &json!({"a_source":first.as_str(),"a_load":format!("{a:?}"),"a_read":format!("{a_read:?}"),"a_read_raw":a_raw,"b_source":second.as_str(),"b_load":format!("{b:?}"),"b_read":format!("{b_read:?}"),"b_read_raw":b_raw,"remove":remove,"unhooked":true,"reviewed_text_rows":true}),
         )?;
+        budget()?;
         ensure(p.fence() == Fence::Closed, "lifecycle tool not reaped")?;
         r.iterations += 1;
     }
     write_json(
         out,
         "anchor-lifecycle-summary.json",
-        &json!({"gone_after_every_remove":gone_every_time,"qualification_eligible":false,"reason":"proposed unreviewed rows; raw measurement cannot stand in for adapter success"}),
+        &json!({"gone_after_every_remove":gone_every_time,"qualification_eligible":reviewed,"reason":"configuration absence; namespace names may persist"}),
     )?;
-    if !gone_every_time {
-        r.detail.push_str("; emptied child persisted at least once (contract change would be required; none made)");
-    }
     // The hooked case creates the only harness pass rule reached via stock hook.
     let traffic = hooked(out, &mut p)?;
     for iteration in 0..20 {
@@ -749,7 +920,9 @@ fn anchors(out: &Path, r: &mut CaseResult) -> Result<()> {
         raw(out, &mut p, &["-a", HOOKED, "-f", "-"], rule.as_bytes())?;
         traffic.send_ten()?;
         let counters = raw(out, &mut p, &["-a", HOOKED, "-vsr"], &[])?;
+        budget()?;
         let state_flush = p.flush_states(deadline());
+        budget()?;
         let after_flush = measure_remove(out, &mut p, HOOKED)?;
         states_every_time &= known.is_some();
         gone_every_time &= with_states["gone"] == true && after_flush["gone"] == true;
@@ -786,6 +959,383 @@ fn anchors(out: &Path, r: &mut CaseResult) -> Result<()> {
     )?;
     Ok(())
 }
+fn adapter_measurement_complete(p: &NativePlatform, start: usize) -> Result<()> {
+    env(
+        !p.call_trace()
+            .iter()
+            .skip(start)
+            .any(|row| row.starts_with("anchor_evidence:") && row.ends_with(":complete:false")),
+        "fixture/control adapter cleanup evidence incomplete",
+    )
+}
+fn shared_anchor_clean(out: &Path) -> Result<()> {
+    let path = out.join("shared-anchor-cleanup-failure.json");
+    env(
+        !path.exists(),
+        &format!(
+            "shared anchor withheld after cleanup failure: {}",
+            fs::read_to_string(path).unwrap_or_default()
+        ),
+    )
+}
+// Observe within the case budget, then clean with an independent adapter deadline
+// even if a load completed as the case budget expired or a later capture failed.
+fn fixture<T>(
+    out: &Path,
+    p: &mut NativePlatform,
+    name: &str,
+    observe: impl FnOnce(&mut NativePlatform) -> Result<T>,
+) -> Result<T> {
+    let (observation, (removed, after)) =
+        super::super::contract_check::with_cleanup(p, observe, |p| {
+            let d = Deadline(scupper_darwin::monotonic_raw().as_secs() + 8);
+            let removed = p.remove_anchor(d);
+            let after = p.read_anchor(Deadline(scupper_darwin::monotonic_raw().as_secs() + 8));
+            (removed, after)
+        });
+    let record = json!({"fixture":name,"remove":format!("{removed:?}"),"after":format!("{after:?}"),"observation_error":observation.as_ref().err().map(ToString::to_string)});
+    // Record contamination before any fallible final evidence write can return.
+    if removed.is_err() || after != Ok(None) {
+        write_json(out, "shared-anchor-cleanup-failure.json", &record)?;
+    }
+    write_json(out, &format!("anchor-fixture-{name}-cleanup.json"), &record)?;
+    ensure(
+        removed.is_err() || after == Ok(None),
+        "remove_anchor returned Ok without configuration absence",
+    )?;
+    // A failed observation must not hide a complete contract violation.
+    let value = observation?;
+    env(
+        removed.is_ok() && after == Ok(None),
+        &format!("{name} Leave-coverage gap / cleanup failure: {record}"),
+    )?;
+    Ok(value)
+}
+fn shared_anchor_authorized(out: &Path) -> Result<()> {
+    shared_anchor_clean(out)?;
+    env(
+        super::resources::entries(out)?
+            .iter()
+            .any(|e| e.kind == "anchor" && e.path == ANCHOR),
+        "shared anchor lacks original absence journal; fixture withheld",
+    )
+}
+/// Each unreviewed control is retained even if an earlier control is rejected.
+fn optimizer_controls(out: &Path, p: &mut NativePlatform, findings: &mut Findings) -> Result<()> {
+    let addresses = (1..=10).map(|n| format!("192.0.2.{n}")).collect::<Vec<_>>();
+    let source = format!(
+        "block drop quick inet from any to {{ {} }}\n",
+        addresses.join(", ")
+    );
+    let mut expected = String::new();
+    for address in &addresses {
+        writeln!(&mut expected, "block drop quick inet from any to {address}")?;
+    }
+    for optimizer in ["basic", "none"] {
+        attempt(out, optimizer, findings, || {
+            shared_anchor_authorized(out)?;
+            fixture(out, p, optimizer, |p| {
+                let trace_start = p.call_trace().len();
+                let load = raw(
+                    out,
+                    p,
+                    &["-o", optimizer, "-a", ANCHOR, "-f", "-"],
+                    source.as_bytes(),
+                )?;
+                let filter = raw(out, p, &["-a", ANCHOR, "-sr"], &[])?;
+                let tables = raw(out, p, &["-a", ANCHOR, "-sT"], &[])?;
+                write_json(
+                    out,
+                    &format!("anchor-optimizer-{optimizer}.json"),
+                    &json!({"source":source,"load":load,"filter":filter,"tables":tables,
+                    "table_appeared":!tables.stdout.is_empty(),"expected_none_filter":expected,
+                    "text_matches":filter.stdout == expected,"measurement_only":true,
+                    "cleanup":"see fixture cleanup artifact"}),
+                )?;
+                env(
+                    load.complete() && filter.complete() && tables.complete(),
+                    "optimizer control incomplete/rejected",
+                )?;
+                adapter_measurement_complete(p, trace_start)?;
+                env(
+                    filter.stderr.as_bytes() == pftext::ALTQ_PREAMBLE
+                        && tables.stderr.as_bytes() == pftext::ALTQ_PREAMBLE,
+                    "optimizer show diagnostic measurement mismatch",
+                )?;
+                if optimizer == "none" {
+                    env(
+                        tables.stdout.is_empty() && filter.stdout == expected,
+                        "optimizer unreviewed text measurement mismatch",
+                    )?;
+                }
+                Ok(())
+            })
+        })?;
+    }
+    attempt(out, "overlap", findings, || {
+        shared_anchor_authorized(out)?;
+        fixture(out, p, "overlap", |p| {
+            let trace_start = p.call_trace().len();
+            let source = "pass in quick on lo0 inet proto tcp from 192.0.2.1 to 192.0.2.9 port 51820 no state\npass in quick on lo0 inet proto tcp from 192.0.2.0/24 to 192.0.2.9 port 51820 keep state (if-bound)\n";
+            let expected = "pass in quick on lo0 inet proto tcp from 192.0.2.1 to 192.0.2.9 port = 51820 no state\npass in quick on lo0 inet proto tcp from 192.0.2.0/24 to 192.0.2.9 port = 51820 flags S/SA keep state (if-bound)\n";
+            let load = raw(
+                out,
+                p,
+                &["-o", "none", "-a", ANCHOR, "-f", "-"],
+                source.as_bytes(),
+            )?;
+            let filter = raw(out, p, &["-a", ANCHOR, "-sr"], &[])?;
+            write_json(
+                out,
+                "anchor-optimizer-overlap.json",
+                &json!({"source":source,"expected":expected,"load":load,"filter":filter,
+            "text_matches":filter.stdout == expected,"measurement_only":true}),
+            )?;
+            env(
+                load.complete() && filter.complete(),
+                "overlap control incomplete/rejected",
+            )?;
+            adapter_measurement_complete(p, trace_start)?;
+            env(
+                filter.stderr.as_bytes() == pftext::ALTQ_PREAMBLE && filter.stdout == expected,
+                "overlap unreviewed text measurement mismatch",
+            )
+        })
+    })
+}
+
+fn foreign_fixtures(out: &Path, p: &mut NativePlatform, findings: &mut Findings) -> Result<()> {
+    let fixtures = [
+        ("scrub", "scrub in all fragment reassemble\n"),
+        (
+            "nat",
+            "nat on lo0 inet from 192.0.2.0/24 to any -> 198.51.100.9\n",
+        ),
+        (
+            "rdr",
+            "rdr on lo0 inet proto tcp from any to 192.0.2.9 port 80 -> 127.0.0.1 port 18080\n",
+        ),
+        (
+            "binat",
+            "binat on lo0 inet from 192.0.2.9 to any -> 198.51.100.9\n",
+        ),
+        (
+            "nat64",
+            "nat64 on lo0 inet6 from 2001:db8::/96 to any -> 192.0.2.9\n",
+        ),
+        (
+            "dummynet",
+            "dummynet in quick proto tcp to 192.0.2.9 pipe 1\n",
+        ),
+        ("empty-table", "table <q> persist\n"),
+        (
+            "referenced-table",
+            "table <q> persist { 192.0.2.9 }\nblock drop quick from <q> to any\n",
+        ),
+    ];
+    for (name, source) in fixtures {
+        attempt(out, name, findings, || {
+            shared_anchor_authorized(out)?;
+            fixture(out, p, name, |p| {
+                let trace_start = p.call_trace().len();
+                let load = raw(
+                    out,
+                    p,
+                    &["-o", "none", "-a", ANCHOR, "-f", "-"],
+                    source.as_bytes(),
+                )?;
+                let raw_classes = inventory(out, p, ANCHOR)?;
+                let read = p.read_anchor(deadline());
+                write_json(
+                    out,
+                    &format!("anchor-foreign-{name}.json"),
+                    &json!({"source":source,"load":load,"classes":raw_classes,"adapter_read":format!("{read:?}"),
+                    "cleanup":"see fixture cleanup artifact","rejected":!load.complete()}),
+                )?;
+                env(
+                    load.complete(),
+                    &format!("{name} fixture spelling rejected/incomplete"),
+                )?;
+                adapter_measurement_complete(p, trace_start)?;
+                env(
+                    super::super::contract_check::measurement_complete(&raw_classes),
+                    "foreign fixture raw class evidence incomplete",
+                )?;
+                env(
+                    load.complete(),
+                    "foreign load row measurement incomplete/rejected",
+                )?;
+                ensure(
+                    read.is_err(),
+                    &format!("{name} foreign content was not rejected"),
+                )
+            })
+        })?;
+    }
+    Ok(())
+}
+
+fn measurement_attempt(
+    out: &Path,
+    name: &str,
+    findings: &mut Findings,
+    operation: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    attempt(out, name, findings, || {
+        operation().map_err(|e| environment_issue(e.to_string()))
+    })
+}
+// Disposable, unhooked subtree. Every result here is coverage measurement only.
+fn descendant_measurements(
+    out: &Path,
+    p: &mut NativePlatform,
+    findings: &mut Findings,
+) -> Result<()> {
+    const ROOT: &str = "scupper-qual/children";
+    attempt(out, "children-journal", findings, || {
+        super::resources::journal_anchor(out, ROOT, end())
+            .map_err(|e| environment_issue(e.to_string()))
+    })?;
+    // A failed journal check never authorizes a load, but later cases were already measured.
+    if !super::resources::entries(out)?
+        .iter()
+        .any(|e| e.kind == "anchor" && e.path == ROOT)
+    {
+        return Ok(());
+    }
+    let mut cleanup_failure = None::<String>;
+    for (name, source) in [
+        ("named", "anchor \"qchild\"\n"),
+        ("underscore", "anchor \"_qchild\"\n"),
+        ("inline", "anchor { pass quick on lo0 all no state }\n"),
+        ("wildcard", "anchor \"x/*\"\n"),
+        ("grandchild", "anchor \"empty\"\n"),
+    ] {
+        measurement_attempt(out, &format!("children-{name}"), findings, || {
+            env(
+                cleanup_failure.is_none(),
+                &format!("descendant fixture withheld after cleanup failure: {cleanup_failure:?}"),
+            )?;
+            let (observation, cleanup) = super::super::contract_check::with_cleanup(
+                p,
+                |p| -> Result<()> {
+                    let load = raw(
+                        out,
+                        p,
+                        &["-o", "none", "-a", ROOT, "-f", "-"],
+                        source.as_bytes(),
+                    )?;
+                    let grandchild_load = if name == "grandchild" {
+                        let child = raw(
+                            out,
+                            p,
+                            &["-o", "none", "-a", "scupper-qual/children/empty", "-f", "-"],
+                            b"anchor \"grandchild\"\n",
+                        )?;
+                        let grandchild = raw(
+                            out,
+                            p,
+                            &[
+                                "-o",
+                                "none",
+                                "-a",
+                                "scupper-qual/children/empty/grandchild",
+                                "-f",
+                                "-",
+                            ],
+                            b"pass quick on lo0 all no state\n",
+                        )?;
+                        // Remove the parent's call, leaving an empty listed child over the nonempty grandchild.
+                        let empty = raw(
+                            out,
+                            p,
+                            &["-a", "scupper-qual/children/empty", "-F", "rules"],
+                            &[],
+                        )?;
+                        Some(
+                            json!({"child_load":child,"grandchild_load":grandchild,"empty_child":empty}),
+                        )
+                    } else {
+                        None
+                    };
+                    let before = measure_children(out, p, ROOT)?;
+                    let paths = before
+                        .iter()
+                        .filter_map(|v| v["path"].as_str())
+                        .collect::<Vec<_>>();
+                    let mut flushes = vec![];
+                    for path in paths.iter().rev() {
+                        within_budget(|| super::resources::recheck_foreign_tokens(out, end()))?;
+                        for class in ["rules", "nat", "Tables", "dummynet"] {
+                            let flush = raw(out, p, &["-a", path, "-F", class], &[])?;
+                            let classes = path_classes(out, p, path)?;
+                            flushes.push(
+                                json!({"path":path,"class":class,"flush":flush,"after":classes}),
+                            );
+                        }
+                    }
+                    let after = measure_children(out, p, ROOT)?;
+                    let measurement = json!({"source":source,"load":load,"grandchild_setup":grandchild_load,
+                "before":before,"scoped_flushes":flushes,"after":after,"measurement_only":true,"rejected":!load.complete()});
+                    write_json(out, &format!("anchor-children-{name}.json"), &measurement)?;
+                    env(
+                        super::super::contract_check::measurement_complete(&measurement),
+                        &format!(
+                            "descendant {name} rejected spelling/incomplete class or flush measurement"
+                        ),
+                    )?;
+                    env(
+                        load.complete(),
+                        &format!("descendant {name} spelling rejected/incomplete"),
+                    )
+                },
+                |_| super::resources::cleanup_measurement(out, ROOT),
+            );
+            if let Err(error) = &cleanup {
+                cleanup_failure = Some(error.to_string());
+            }
+            write_json(
+                out,
+                &format!("anchor-children-{name}-cleanup.json"),
+                &json!({"observation_error":observation.as_ref().err().map(ToString::to_string),
+                "cleanup":format!("{cleanup:?}")}),
+            )?;
+            observation?;
+            cleanup.map_err(|e| environment_issue(format!("children-{name} cleanup failure: {e}")))
+        })?;
+    }
+    Ok(())
+}
+fn measure_children(out: &Path, p: &mut NativePlatform, root: &str) -> Result<Vec<Value>> {
+    let mut pending = vec![(root.to_owned(), 0)];
+    let mut reads = vec![];
+    let mut count = 1;
+    while let Some((path, depth)) = pending.pop() {
+        let classes = path_classes(out, p, &path)?;
+        // Persist exact streams before interpreting an unreviewed inventory.
+        write_json(
+            out,
+            &format!("{}.json", super::unique("children-classes")),
+            &json!({"path":path,"classes":classes}),
+        )?;
+        let child_list = classes[3].clone();
+        let e: Evidence = serde_json::from_value(child_list)?;
+        env(e.complete(), "descendant inventory incomplete")?;
+        let children = pfanchor::inventory_at(&e.stdout, &path)
+            .map_err(|e| environment_issue(format!("unreviewed descendant inventory: {e}")))?;
+        for child in children {
+            count += 1;
+            env(
+                depth < 8 && count <= 64,
+                "descendant measurement bound exceeded",
+            )?;
+            pending.push((format!("{path}/{child}"), depth + 1));
+        }
+        reads.push(json!({"path":path,"classes":classes}));
+    }
+    Ok(reads)
+}
+
 struct UdpTraffic {
     sender: UdpSocket,
     receiver: UdpSocket,
@@ -822,7 +1372,9 @@ fn hooked(out: &Path, p: &mut NativePlatform) -> Result<UdpTraffic> {
     let rule = hook_rule(port);
     let load = raw(out, p, &["-a", HOOKED, "-f", "-"], rule.as_bytes())?;
     env(load.complete(), "hooked raw rule load incomplete")?;
+    budget()?;
     let enabled = p.enable_pf(deadline());
+    budget()?;
     let traffic = UdpTraffic {
         sender,
         receiver,
@@ -872,7 +1424,7 @@ fn fall_scope(out: &Path, p: &mut NativePlatform, traffic: &UdpTraffic) -> Resul
         None,
     );
     let before = json!({"target":inventory(out,p,ANCHOR)?,"sentinel":inventory(out,p,SENTINEL)?,"sentinel_rule":sentinel_rule_before,"sentinel_table_entries":sentinel_table_before,"states":states_before,"known_state_id":known_before,"info":raw(out,p,&["-s","info"],&[])?,"counters":raw(out,p,&["-a",HOOKED,"-vsr"],&[])?});
-    super::resources::recheck_foreign_tokens(out, end())?;
+    within_budget(|| super::resources::recheck_foreign_tokens(out, end()))?;
     let all = raw(out, p, &["-a", ANCHOR, "-F", "all"], &[])?;
     let sentinel_rule_after = raw(out, p, &rule_args, &[])?;
     let sentinel_table_after = raw(out, p, &table_args, &[])?;
@@ -1124,12 +1676,18 @@ fn flush(out: &Path, r: &mut CaseResult) -> Result<()> {
         "not every known flow was proven present by state id immediately before flush; no vacuous success",
     )?;
     env(
+        !p.call_trace()
+            .iter()
+            .any(|s| s == "anchor_evidence:States:complete:false"),
+        "global flush evidence incomplete",
+    )?;
+    ensure(
         known.is_disjoint(&remaining),
         "known states survived global flush",
     )?;
-    env(
+    ensure(
         result.is_ok(),
-        "global flush row proposed/unreviewed; capture retained, pass 2 required",
+        "reviewed global flush failed; inspect complete adapter capture",
     )?;
     r.iterations = 1;
     r.verdict = Verdict::AssumptionHolds;

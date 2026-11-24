@@ -458,7 +458,8 @@ impl<P: Platform> Engine<P> {
             let verdict =
                 verify::verify_lockdown(&observations, &expected, &Clock(self.platform.now()));
             #[cfg(any(test, feature = "qualification"))]
-            self.platform.trace_verification(&verdict);
+            self.platform
+                .trace_verification(super::Kind::Lockdown, &verdict);
             return Ok(Event::Observed {
                 context,
                 form,
@@ -490,7 +491,8 @@ impl<P: Platform> Engine<P> {
         let clock = Clock(self.platform.now());
         let verdict = verify::verify(&observation, &expected, &clock);
         #[cfg(any(test, feature = "qualification"))]
-        self.platform.trace_verification(&verdict);
+        self.platform
+            .trace_verification(super::Kind::Installed(form), &verdict);
         Ok(Event::Observed {
             context: collection.context,
             form,

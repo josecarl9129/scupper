@@ -196,11 +196,13 @@ impl NativePlatform {
         // run() returns Err only before spawn. Once spawned, it always returns
         // ToolResult, including unknown/unreaped effects. No engine call can
         // interleave this synchronous runner, so this records actual dispatches.
-        self.trace_call(&format!(
-            "pfctl:{}:stdin_sha256={:x}",
-            args.join(" "),
-            sha2::Sha256::digest(input)
-        ));
+        self.trace_lazy(|| {
+            format!(
+                "pfctl:{}:stdin_sha256={:x}",
+                args.join(" "),
+                sha2::Sha256::digest(input)
+            )
+        });
         #[cfg(feature = "qualification")]
         if crate::decode::pfcapture::captures_command(args, self.pf_contract_capture) {
             let saved = self.save_pf_text(&build, args, &result, input, started_unix_ms, started);
@@ -307,6 +309,25 @@ pub(super) struct AnchorSession<'a> {
     pub deadline: Deadline,
 }
 impl crate::decode::pfanchor::Commands for AnchorSession<'_> {
+    fn build(&self) -> Result<crate::decode::pftext::Build, SysError> {
+        crate::decode::pftext::Build::system()
+    }
+    fn emergency_load(&mut self, args: &[&str], input: &[u8]) -> Result<i32, SysError> {
+        let command_line: Vec<_> = std::iter::once(crate::engine::PFCTL)
+            .chain(args.iter().copied())
+            .collect();
+        let attempt = self
+            .platform
+            .pf_attempt_input(&command_line, input, self.deadline);
+        let status = (|| {
+            let (_, raw) = evidence(&attempt)?;
+            self.platform.expired(self.deadline)?;
+            crate::decode::pftext::status(&raw)
+        })();
+        self.platform
+            .trace_lazy(|| format!("anchor_emergency_load:status:{status:?}:result:Unknown"));
+        status
+    }
     fn call(
         &mut self,
         op: crate::decode::pfanchor::Operation,
@@ -334,7 +355,16 @@ impl NativePlatform {
             let rc = crate::decode::pftext::status(&raw)?;
             crate::decode::pfanchor::qualified(build, op, rc, raw.stdout, raw.stderr)
         })();
-        self.trace_call(&format!("anchor:{op:?}:{result:?}"));
+        #[cfg(feature = "qualification")]
+        self.trace_lazy(|| {
+            format!(
+                "anchor_evidence:{op:?}:complete:{}",
+                evidence(&attempt)
+                    .is_ok_and(|(_, raw)| crate::decode::pftext::status(&raw).is_ok())
+                    && !matches!(&result, Err(SysError::TimedOut))
+            )
+        });
+        self.trace_lazy(|| format!("anchor:{op:?}:{result:?}"));
         result
     }
 }

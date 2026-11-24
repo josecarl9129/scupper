@@ -226,7 +226,7 @@ mod tests {
         assert!(manifest.budgets_fit());
         assert_eq!(manifest.cell_budget_minutes - manifest.overhead_minutes, 18);
         assert_eq!(MAX_FINAL_RESTORE_SECONDS, 240);
-        assert_eq!(manifest.cases.len(), 29);
+        assert_eq!(manifest.cases.len(), 30);
         let tools: Vec<_> = manifest
             .cases
             .iter()
@@ -480,10 +480,10 @@ mod tests {
             "matrix.group == 'contracts' && {} ||",
             budget.cell_budget_minutes
         )));
-        assert_eq!(run, 15 * 60);
-        assert!(include_str!("tool.rs").contains("\"contracts\" => 14 * 60"));
+        assert_eq!(run, 16 * 60);
+        assert!(include_str!("tool.rs").contains("\"contracts\" => 15 * 60"));
         assert!(
-            cases + 60 <= 14 * 60,
+            cases + 60 <= 15 * 60,
             "case budgets and worker completion margin"
         );
         assert!(after > run + MAX_FINAL_RESTORE_SECONDS + 60);

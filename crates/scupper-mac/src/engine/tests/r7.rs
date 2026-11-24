@@ -75,6 +75,11 @@ fn r7_left_commits_incarnation_without_pf_mutation_or_spawn_and_lists_calls() {
 
 #[test]
 fn r7_install_no_writer_selects_lockdown_for_sixty_seconds_without_protected() {
+    for qualified in [false, true] {
+        install_no_writer(qualified);
+    }
+}
+fn install_no_writer(qualified: bool) {
     let p = FakePlatform::new().unwrap();
     let mut snapshot = Snapshot::initial(Some(501), p.boot.clone());
     snapshot.machine.join_intended = true;
@@ -82,6 +87,10 @@ fn r7_install_no_writer_selects_lockdown_for_sixty_seconds_without_protected() {
     let mut p = fixture(&snapshot);
     p.install_error = Some("install record: no writer before 5a3");
     p.qualification_trace = Some(vec![]);
+    // Exercise current native support and the future qualified-firewall path.
+    if !qualified {
+        p.firewall_qualification = None;
+    }
     let mut e = Engine::start(p).unwrap();
     assert!(e.platform.calls.contains(&Call::Install));
     assert_eq!(e.machine.pre_tunnel_policy(), Kind::Lockdown);
@@ -103,6 +112,13 @@ fn r7_install_no_writer_selects_lockdown_for_sixty_seconds_without_protected() {
     ];
     let trace = e.platform.qualification_trace.as_ref().unwrap();
     assert!(crate::decode::qualification_trace::acquisitions(trace, &copies).unwrap() > 0);
+    assert!(crate::decode::qualification_trace::installed_candidates_safe(trace));
+    assert_eq!(
+        trace
+            .iter()
+            .any(|s| s == "verification_kind:Lockdown:verification_protected:true"),
+        qualified
+    );
     for line in trace
         .iter()
         .filter_map(|s| s.strip_prefix("snapshot_write:"))
@@ -226,12 +242,12 @@ fn r7_selective_failure_repairs_with_reload_and_global_flush_before_protected() 
     assert!(
         trace[selective + 1..repair_flush]
             .iter()
-            .all(|s| s != "verification_protected:true")
+            .all(|s| !s.ends_with("verification_protected:true"))
     );
     assert!(
         trace[repair_flush + 1..]
             .iter()
-            .any(|s| s == "verification_protected:true")
+            .any(|s| s.ends_with("verification_protected:true"))
     );
     for body in trace
         .iter()
@@ -252,4 +268,57 @@ fn r7_selective_failure_repairs_with_reload_and_global_flush_before_protected() 
     let flush = later.iter().position(|c| *c == Call::Flush).unwrap();
     assert!(load < flush);
     assert!(matches!(e.status().enforcement, Verdict::Protected(_)));
+}
+
+#[test]
+fn clear_intent_only_none_clears_even_for_nonconforming_adapter() {
+    for text in ["", " \n"] {
+        let mut e = joined();
+        leave(&mut e, 2);
+        before_pending(&mut e, Step::ClearIntent);
+        e.platform.anchor_readback_raw = Some(text.into());
+        assert_eq!(e.verify_clear_intent(), Err(SysError::Failed("anchor")));
+        tick(&mut e);
+        assert!(e.machine.durable().leaving);
+        assert!(!e.left_verified);
+        e.platform.anchor_readback_raw = None;
+        elapse(&mut e, 4);
+        assert_eq!(e.status().text, "left");
+    }
+}
+
+#[test]
+fn installed_protected_candidate_under_hold_fails_trace_check() {
+    // Obtain an actual qualified verdict through the fake Lockdown collector.
+    let p = FakePlatform::new().unwrap();
+    let mut snapshot = Snapshot::initial(Some(501), p.boot.clone());
+    snapshot.machine.join_intended = true;
+    snapshot.machine.hold = true;
+    let mut p = fixture(&snapshot);
+    p.install_error = Some("install record: no writer before 5a3");
+    p.qualification_trace = Some(vec![]);
+    let mut e = Engine::start(p).unwrap();
+    drive(&mut e, 400);
+    assert!(e.machine.durable().hold);
+    let event = e.collect_verdict(Form::PreTunnel).unwrap();
+    let Event::Observed { verdict, .. } = event else {
+        panic!("expected observation")
+    };
+    assert!(matches!(verdict, Verdict::Protected(_)));
+    for form in [Form::PreTunnel, Form::Joined] {
+        e.platform.qualification_trace = Some(vec![]);
+        e.platform.trace_verification(Kind::Lockdown, &verdict);
+        assert!(
+            crate::decode::qualification_trace::installed_candidates_safe(
+                e.platform.qualification_trace.as_ref().unwrap()
+            )
+        );
+        e.platform
+            .trace_verification(Kind::Installed(form), &verdict);
+        assert!(
+            !crate::decode::qualification_trace::installed_candidates_safe(
+                e.platform.qualification_trace.as_ref().unwrap()
+            )
+        );
+    }
 }

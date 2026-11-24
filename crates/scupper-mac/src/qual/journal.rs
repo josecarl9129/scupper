@@ -336,7 +336,8 @@ mod tests {
 }
 
 /// Only a successful absence observation can grant write-ahead cleanup authority.
-/// A pre-existing or unreadable anchor is never appended and never later flushed.
+/// Configured or unreadable anchors never grant authority. A listed empty
+/// namespace may be journaled after a complete configuration-absence read.
 pub(super) fn anchor_after_absence<E>(
     read: &Result<Option<String>, crate::platform::SysError>,
     append: impl FnOnce() -> Result<(), E>,
@@ -355,7 +356,7 @@ where
 #[cfg(test)]
 mod r7 {
     #[test]
-    fn preexisting_or_failed_anchor_is_never_journaled() {
+    fn preexisting_configuration_or_failed_anchor_is_never_journaled() {
         for read in [
             Ok(Some(String::new())),
             Ok(Some("block all\n".into())),

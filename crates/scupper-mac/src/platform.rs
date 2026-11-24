@@ -385,10 +385,14 @@ pub enum SafetyEvent {
 /// A `proc_pidpath` failure alone proves no exit.
 #[allow(clippy::missing_errors_doc)] // Each method states its uncertainty contract.
 pub trait Platform {
-    /// Qualification/test trace of full verification results offered for publication.
+    /// Qualification/test trace of verification kind and result offered for publication.
     #[cfg(any(test, feature = "qualification"))]
-    fn trace_verification(&mut self, verdict: &scupper_core::mac::verify::Verdict) {
-        let _ = verdict;
+    fn trace_verification(
+        &mut self,
+        kind: scupper_core::mac::policy::Kind,
+        verdict: &scupper_core::mac::verify::Verdict,
+    ) {
+        let _ = (kind, verdict);
     }
 
     /// Log a secret-free safety diagnostic; grants no enforcement/publication claim.
@@ -588,9 +592,28 @@ pub trait Platform {
     fn pause(&mut self, duration: Duration, deadline: Deadline);
     /// **Mutating tool**: load fixed helper anchor; success complete/reaped.
     /// Error/timeout may leave old, partial or new rules; Unknown may keep fence open.
+    /// A build outside the reviewed anchor table returns the distinct unsupported
+    /// build error before spawning any pfctl command.
     fn load_anchor(&mut self, text: &AnchorText, deadline: Deadline) -> Result<(), SysError>;
-    /// Read-only bounded independent anchor read. Success complete, None confirms
-    /// absence; error/timeout is incomplete and proves neither contents nor absence.
+    /// Read-only bounded independent anchor read. `None` proves absence of active
+    /// configuration in the owned anchor: either not listed (complete parent
+    /// inventory lacking it, agreeing with the pinned missing-anchor `-sr` result;
+    /// missing parent via the root list), or listed with complete, parsed, empty
+    /// `-sr` (filter and scrub), `-sn` (nat/rdr/binat), `-sT` and `-sd`, plus a
+    /// complete `-sA` inventory whose listed descendants qualify as below.
+    /// Listed descendants are foreign content unless the build's separate
+    /// descendant coverage flag is reviewed (false for 24H232 and 25G332).
+    /// With that flag, each exact descendant path must have complete, empty
+    /// `-sr`, `-sn`, `-sd`, `-sT` and recursively checked `-sA` classes, also
+    /// when returning `Some(own_policy)`. Every discovered path must stay strictly
+    /// below the owned path plus `/`; depth is at most 8 below the owned anchor,
+    /// with at most 64 anchors total including the owned anchor. Exceeded bounds,
+    /// incomplete reads, unexpected text and nonempty descendant classes are Err.
+    /// Existing per-call time/output bounds and the shared caller deadline apply.
+    /// This does not prove namespace reclamation or absence of runtime state
+    /// (states, src nodes). `Some("")` never occurs; nonempty classes other than
+    /// supported owned filter text return Err (foreign content). Error/timeout
+    /// proves neither contents nor absence.
     fn read_anchor(&mut self, deadline: Deadline) -> Result<Option<String>, SysError>;
     /// **Mutating tool**: flush all states, success complete/reaped. Error/timeout
     /// may have flushed some/all states; Unknown may leave the fence open.
@@ -730,8 +753,16 @@ pub trait Platform {
     /// Filesystem mutation, no tool child. Error/timeout may partially remove files;
     /// never implies complete cleanup or rollback.
     fn cleanup_artifacts(&mut self, deadline: Deadline) -> Result<(), SysError>;
-    /// **Mutating tool**: flush fixed anchor and confirm absence, already absent
-    /// counts as complete. Error/timeout may remove rules; Unknown may open fence.
+    /// **Mutating tool**: remove active configuration in the fixed owned anchor.
+    /// A build outside the reviewed anchor table returns the distinct unsupported
+    /// build error before spawning any pfctl command. Otherwise the first complete
+    /// read `None` returns `Ok(())` with no flush (a flush would create the anchor).
+    /// Otherwise perform four scoped flushes (rules, nat, Tables, dummynet), then
+    /// succeed only if the final read is `None`. An incomplete first read never
+    /// takes the shortcut. Descendant paths are never flushed; a nonempty
+    /// descendant makes removal fail. Empty anchor names may remain; runtime
+    /// states and src nodes are outside this absence claim.
+    /// Error/timeout may remove rules; Unknown may open the fence.
     fn remove_anchor(&mut self, deadline: Deadline) -> Result<(), SysError>;
 }
 

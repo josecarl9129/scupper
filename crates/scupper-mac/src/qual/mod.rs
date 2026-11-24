@@ -11,6 +11,8 @@ mod base_check;
 #[cfg(any(target_os = "macos", test))]
 mod guard;
 #[cfg(any(target_os = "macos", test))]
+mod jobs;
+#[cfg(any(target_os = "macos", test))]
 mod journal;
 mod model;
 #[cfg(any(target_os = "macos", test))]
@@ -19,6 +21,9 @@ mod pf_check;
 mod probe;
 #[cfg(any(target_os = "macos", test))]
 mod recovery;
+#[cfg(any(target_os = "macos", test))]
+#[path = "resources/undo.rs"]
+mod resources;
 #[cfg(any(target_os = "macos", test))]
 mod restore_check;
 #[cfg(any(target_os = "macos", test))]

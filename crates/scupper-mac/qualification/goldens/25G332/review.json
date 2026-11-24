@@ -1,6 +1,11 @@
 {
   "build": "25G332",
-  "reviewed": false,
-  "status": "proposed, unreviewed",
-  "provenance": "Renderer fixture; list expansion, ICMP names and implicit flags are proposals, NOT runner captures. Owner must review exact pfctl readback in pass 1 before pinning."
+  "reviewed": true,
+  "optimizer": "none",
+  "status": "reviewed for optimizer none; runner confirmation required",
+  "provenance": "Binding R7 fix 2 decision; CI 45355500636 pass-1 load/show evidence on 24H232 and 25G332. Readbacks re-derived from renderer in source order, with source-order list expansion, named ICMPv6 types, implicit TCP flags S/SA and numeric port equality. These are reviewed expectations, not new -o none runner captures. Any mismatch is contract_violation.",
+  "sha256": {
+    "lockdown.txt": "8d88ce6bb28645b35bb0440868c44712057d98be24165187f343227b058923f8",
+    "pretunnel-fixture.txt": "c5af99caf165b2362f8db75591a23d80fe045db492717b4982f7d96fdbd3b619"
+  }
 }

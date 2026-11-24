@@ -382,11 +382,7 @@ impl<P: Platform> Engine<P> {
         }
         self.leave_item = Some("anchor");
         let d = self.deadline();
-        if self
-            .platform
-            .read_anchor(d)?
-            .is_some_and(|text| !text.trim().is_empty())
-        {
+        if self.platform.read_anchor(d)?.is_some() {
             return Err(SysError::Failed("anchor"));
         }
         self.leave_item = Some("DNS key");

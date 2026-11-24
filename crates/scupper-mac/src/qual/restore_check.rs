@@ -229,6 +229,7 @@ pub(super) fn state_changes(
     before: &BTreeMap<String, Evidence>,
     after: &BTreeMap<String, Evidence>,
     journaled_keys: &[String],
+    empty_anchor_names: &[String],
 ) -> StateChanges {
     let mut changes = Vec::new();
     let mut os_drift = Vec::new();
@@ -262,6 +263,9 @@ pub(super) fn state_changes(
                         }
                     });
                 }
+                if matches!(name, "pf-anchors" | "pf-apple-anchors") {
+                    new.retain(|line| old.contains(line) || !empty_anchor_names.contains(line));
+                }
                 if old != new || a.stderr != b.stderr {
                     changes.push(format!("{name}: post-state differs from preflight"));
                 }
@@ -284,7 +288,56 @@ mod tests {
         before: &BTreeMap<String, Evidence>,
         after: &BTreeMap<String, Evidence>,
     ) -> Vec<String> {
-        state_changes(before, after, &[]).violations
+        state_changes(before, after, &[], &[]).violations
+    }
+
+    #[test]
+    fn post_state_only_allows_proven_empty_journaled_anchor_names() {
+        let mut before = BTreeMap::from([
+            (
+                "osversion".into(),
+                Evidence {
+                    stdout: "25G332".into(),
+                    ..observation()
+                },
+            ),
+            (
+                "pf-anchors".into(),
+                Evidence {
+                    stdout: String::new(),
+                    stderr: String::from_utf8_lossy(crate::decode::pftext::ALTQ_PREAMBLE)
+                        .into_owned(),
+                    ..observation()
+                },
+            ),
+        ]);
+        let mut after = before.clone();
+        after.get_mut("pf-anchors").unwrap().stdout =
+            "  scupper-qual\n  scupper-qual/scupper\n".into();
+        let allowed = vec!["scupper-qual".into(), "scupper-qual/scupper".into()];
+        let baseline = state_changes(&before, &before, &[], &allowed).violations;
+        assert_eq!(
+            state_changes(&before, &after, &[], &allowed).violations,
+            baseline
+        );
+        assert_ne!(
+            state_changes(&before, &after, &[], &[]).violations,
+            baseline
+        );
+        after
+            .get_mut("pf-anchors")
+            .unwrap()
+            .stdout
+            .push_str("  scupper-qual/foreign\n");
+        assert_ne!(
+            state_changes(&before, &after, &[], &allowed).violations,
+            baseline
+        );
+        before.get_mut("pf-anchors").unwrap().stdout = "  removed-foreign\n".into();
+        assert_ne!(
+            state_changes(&before, &after, &[], &allowed).violations,
+            baseline
+        );
     }
 
     #[test]
@@ -377,8 +430,8 @@ mod tests {
             .ok_or("missing fixture keys")?
             .stdout
             .push_str("subKey [1] = State:/Network/NetBIOS\n");
-        let baseline = state_changes(&before, &before, &[]).violations;
-        let added = state_changes(&before, &after, &[]);
+        let baseline = state_changes(&before, &before, &[], &[]).violations;
+        let added = state_changes(&before, &after, &[], &[]);
         assert_eq!(added.violations, baseline);
         assert_eq!(added.os_drift, ["State:/Network/NetBIOS"]);
         for key in [
@@ -395,7 +448,7 @@ mod tests {
                 "subKey [2] = {key}"
             )?;
             assert_ne!(
-                state_changes(&before, &owned, &["State:/journaled".into()]).violations,
+                state_changes(&before, &owned, &["State:/journaled".into()], &[]).violations,
                 baseline
             );
         }
@@ -403,7 +456,10 @@ mod tests {
             .get_mut("scutil-keys")
             .ok_or("missing fixture keys")?
             .stdout = "subKey [0] = State:/Network/NetBIOS\n".into();
-        assert_ne!(state_changes(&before, &after, &[]).violations, baseline);
+        assert_ne!(
+            state_changes(&before, &after, &[], &[]).violations,
+            baseline
+        );
         Ok(())
     }
 

@@ -310,130 +310,186 @@ Every pf case JSON includes elapsed_ms. Q-REFS resets on exit; incomplete
 injection writers defer reset to the journaled group restore.
 
 
-R7 adds the `contracts` group on both runners, with a 15-minute run step,
-14-minute launchd worker budget, and 1500-second independent dead-man. Its
-40-minute job reserves 15 minutes for setup/overhead; the remaining 25 minutes
-cover the dead-man, and exceed the 15-minute run plus four-minute final restore. It runs
-Q-CONTRACTS, Q-ANCHOR (20 unhooked lifecycle iterations and 20 hooked removals
-with states and after global state flush), Q-E2E and Q-FLUSH. Every case uses the
-same root-owned harness covered by the complete built/staged hash manifests.
-The disposable scratch executable is a copy of that staged `wireguard-go`;
-`contract-copy-identities.json` is checked against its original build digest.
+R7 uses the `contracts` group on both runners, with a 16-minute run step,
+15-minute launchd worker budget, and 1500-second independent dead-man. Its
+40-minute job reserves setup and final restoration time. It runs Q-ANCHOR,
+Q-CONTRACTS (core and anchor verdicts separately), Q-E2E, Q-FLUSH and then
+Q-DESCENDANTS. All cases use the root-owned harness covered by complete built/staged hash manifests;
+`contract-copy-identities.json` binds the scratch executable to staged wireguard-go.
 
-Pass 1 deliberately cannot qualify the new adapter operations. Candidate pfctl
-rows in `decode/pfanchor.rs` and both builds' `goldens/*/review.json` are marked
-unreviewed. An exact candidate match still returns an error from the adapter;
-readback returns Unsupported. Raw measurements save exact bytes before any
-interpretation. Unknown raw measurement text is inconclusive, never an
-automatically learned success. Core storage/reference/process contracts
-run first and have a separate verdict even if anchor journaling fails. Only
-unreviewed anchor text or Unsupported readback is inconclusive in the anchor
-block; other errors and panics are contract_violation. The owner must review
-runner captures and independently pin text and goldens before pass 2.
+CI 45355500636 pass-1 evidence is reviewed for 24H232 and 25G332. Both builds
+have identical load, show, inventory, missing-anchor/parent and scoped/global
+flush text rows. Every accepted operation requires rc 0 and its exact stderr:
+show commands require the ALTQ preamble; load requires the warning block,
+including its blank line, before ALTQ; flushes require ALTQ followed by the exact
+class message (decimal counts for tables and states). Missing-anchor `-sr` and
+`-sd` also return rc 0, with ALTQ plus DIOCGETRULES Invalid argument. That result
+is distinct from an empty existing ruleset. Extra/unknown lines, missing ALTQ,
+unknown builds and incomplete evidence remain errors. R6 enable/token rows
+remain unchanged. Reviewing text does not qualify production enforcement.
 
-`Paths::qualification` fixes `scupper-qual/scupper`, which is unhooked. Its
-Lockdown loads prove no reachability, blocking or evaluation ordering. Harness
-raw measurements alone use the journaled stock-hook child `com.apple/scupper`
-and a separate rule/table sentinel `com.apple/scupper-qual`. No main ruleset,
-parent anchor, pf.conf, or wildcard is changed. Only the explicit F-all raw
-scope experiment uses `-F all`; the adapter and restore use scoped
-rules/nat/Tables/dummynet flushes. Hooked removal uses raw commands and raw reads
-only, with no production-path adapter and no adapter_ok claim.
-Global state flush is irreversible and destroys foreign traffic state. Restore
-can return pf enablement and fixture resources, but cannot return those states.
+`read_anchor` returns `None` for absence of active configuration: either a
+complete parent inventory lacks the owned child and agrees with the pinned
+missing-anchor filter result (a missing parent also requires a complete root
+inventory lacking that parent), or all configuration classes are completely
+empty. Listed descendants remain foreign content on 24H232 and 25G332: both
+reviewed rows explicitly set `descendants_reviewed = false`. With a future true
+row, every exact descendant must have complete, empty `-sr`, `-sn`, `-sd`, `-sT`
+and recursively checked `-sA` classes. Paths must stay strictly below the owned
+root plus `/`; depth is bounded at 8 below the root and count at 64 including
+that root. Existing time/output bounds and the shared deadline still apply.
+Exceeded bounds, incomplete reads, unexpected text and any nonempty descendant
+class return Err. `Some(own_policy)` requires the same empty descendant proof.
+`Some("")` never occurs. Configuration absence does not prove namespace
+reclamation or absence of runtime states or src nodes. Empty anchor names,
+including the qualification parent, can remain until reboot on both builds.
 
-Q-E2E's exact fake method audit covers Left startup through incarnation commit;
-none of those native methods is a remaining stub. Actual native incompleteness
-still yields inconclusive. Install refusal retains the base engine reference
-protocol: counted `-E` is correct when a fresh Acquire(sequence) reservation has
-reached Synced on both snapshot copies. A reservation permits at most one `-E`.
-The ordered platform trace records both write_copy and create_copy requests,
-their outcomes (including waits), returned token/pfctl PID and complete reference
-reads. Settlement requires a matching complete token/PID read and recorded
-fingerprint; otherwise Acquire debt must remain in both final snapshots. Every
-engine `-X` must target an engine-recorded fingerprint. Without a committable
-reservation only anonymous `-e` is allowed in this fresh-state experiment.
-Once acquisition is reached with known boot and healthy storage, at least one
-reserved `-E` is required. Stopping earlier, for example at unreviewed D-3
-containment text, is inconclusive naming that step, never assumption_holds.
-Join runs at least sixty seconds of ticks and checks Lockdown load/read outcomes,
-no spawn and no Protected after every tick and across every snapshot write
-request. A diagnostic engine hook, compiled only for qualification/tests, also
-records every full verification result offered for publication. A successful
-verification candidate is distinct from an actual Protected status; the latter
-is forbidden, while the engine may mask/reject the former under hold. Durable
-writes must retain hold and no child generation; a recorded
-pf reference is permitted. Transient startup census/ownership failures are
-classified before the expected first-install-failure assertion. Evidence uses
-worker-measured ppid and process group identity.
+On builds outside the reviewed table, `load_anchor` attempts only byte-exact
+canonical Lockdown at the owned `com.apple/scupper` (or qualification
+`scupper-qual/scupper`) path, using `pfctl -o none -a PATH -f -`. It returns
+`Unknown` regardless of exit status or stderr, including rc 0. Every other
+payload/path and every `remove_anchor` is refused before spawning with
+`Failed("unsupported pf anchor build")`. On reviewed builds, removal first reads
+independently. Complete `None` returns success without any flush, since flushing
+a missing anchor creates it. Otherwise it
+flushes only the owned path's rules, nat, Tables and dummynet, and succeeds only
+after a complete final `None`. An incomplete or foreign first read cannot take
+the shortcut. It never flushes descendant paths; a nonempty descendant makes
+removal fail. Leave removes configuration, without reclaiming the namespace or
+asserting runtime-state absence. The owner accepts fix 2's ClearIntent change:
+only `None` clears; even a nonconforming adapter's `Some("")` or `Some(" \n")`
+must refuse to clear. All other engine absence branches retain their behavior.
 
-Returned `-E` tokens are journaled immediately. The interval from `-E` effect to
-returned-token journaling is covered **only by disposable-runner exclusivity
-and restoring the preflight pf state**; the journal cannot close that gap.
-Raw acquire captures aid restore accounting but do not remove this limitation.
-The call trace omits now/pause/fence, hashes stdin and caps entries at 16,384
-(plus one explicit overflow marker), with a 32 KiB per-entry cap. Overflow makes
-the case inconclusive. Native pf-text capture retains R6's original mutation-only
-selection (-e/-E/-X/-d); reads are not added to R6 capture/failure accounting.
-The contracts cell explicitly opts in to full R7 adapter text captures.
-Acquire captures have a separate filename prefix for restore scans.
+Native loads use `pfctl -o none -a PATH -f -`. Both A (Lockdown) and B goldens
+are reviewed expectations re-derived for this mode: source order, address-list
+expansion in source order, ICMPv6 names routersol/routeradv/neighbrsol/neighbradv,
+implicit TCP `flags S/SA`, and numeric `port = 51820`. The re-derived text equals
+the previous proposed text; review metadata records optimizer mode and hashes.
+These are not new optimizer-none runner captures. The next native run must
+confirm them; Mismatch is always contract_violation, never Inconclusive.
+Unsupported builds remain Inconclusive. Journal-authority failures are harness
+preconditions and Inconclusive consistently in all three anchor campaigns.
 
-Q-ANCHOR has a 180-second per-case deadline, clipped command deadlines and an
-elapsed_ms measurement in its saved verdict, including failures and pass 1.
-The unhooked namespace supplies no ordering, reachability or blocking evidence.
+`Paths::qualification` fixes the unhooked `scupper-qual/scupper`. Q-ANCHOR
+runs lifecycle iterations, hooked removals and F-all measurements within its
+180-second budget. Q-DESCENDANTS runs after Q-FLUSH, with a separate 180-second
+budget for optimizer controls, foreign fixtures and descendant measurements.
+These limits use the pass-1 lifecycle durations (90.8–96.0 seconds) and observed
+roughly 75 ms per captured pfctl call as the sizing evidence; the new split still
+requires native timing confirmation. Each case records its measured `elapsed_ms`.
+Each control/fixture records observations, always attempts cleanup outside the
+case budget using independent adapter deadlines, and records the cleanup result,
+including after budget exhaustion or capture errors. Cleanup failure withholds
+later users of that shared anchor as Inconclusive with the recorded reason.
+At the end, any contract violation wins; otherwise rejected spellings/environment
+issues are Inconclusive. Every shared-anchor raw load still requires the original
+absence journal.
 
-Q-FLUSH requires every UDP/TCP IPv4/IPv6 loopback and feth flow to have a printed
-state id/creatorid just before the adapter call. TCP traffic uses quiescent
-sockets; the qualification-only Darwin IP_BOUND_IF wrapper forces the feth
-client onto feth0. Unknown state text, stock loopback skip, unavailable feth or
-missing state identities is inconclusive. Interface and address state selectors
-are raw measurements only; a fresh state with the floating `all` header must
-be positively identified before either selector. The adapter rejects nonempty
-selective removal. The F-all scope case first loads an existing target, captures
-foreign rule and table entries, and compares complete outputs without command
-PID/timing metadata; an unknown result is never treated as an unchanged sentinel.
+Optimizer controls load ten destination addresses with `-o basic` and `-o none`,
+recording generated tables and source-order expansion. The overlapping TCP
+no-state/state fixture records exact text and source order. These unreviewed
+text expectations are measurements: mismatches are recorded as Inconclusive,
+never contract violations. Reviewed A/B goldens remain violations on mismatch.
 
-Run `python3 crates/scupper-mac/tests/r7_mutations.py` for the sixteen portable
-assertion mutants. It restores original bytes on every exit and saves outcomes
-under target/r7-mutants until the task's required final target cleanup.
+Foreign fixtures cover scrub, nat, rdr, binat, nat64, dummynet, an empty persistent
+table and a referenced table. None creates a child in the shared anchor. The
+fixture artifacts together record exact source, streams/status for every class,
+exact adapter error, removal and final read. Load notices are measurements, not reviewed A/B
+load-row assertions. Accepted foreign fixtures must yield any Err before removal;
+an unknown grammar is still fail-closed. Removal Ok without a final complete None
+is a contract violation. Removal Err is an Inconclusive Leave-coverage finding,
+with cleanup failure recorded even if an observation also failed. Every rejected
+spelling is recorded and makes the aggregate Inconclusive.
 
-The proposed absence/inventory rows follow upstream `pfctl_show_anchors` and
-its main dispatch at [855d4e8](https://github.com/openbsd/src/blob/855d4e832803330fc45a64539854bf8d27180600/sbin/pfctl/pfctl.c): immediate children are printed as full paths with two leading
-spaces; a missing parent has a named diagnostic, and ignored show-helper return
-values can leave exit zero. The proposal binds the named diagnostic to the
-queried parent and still requires a complete root inventory and corroborating
-missing-filter result. Apple's exact build output remains a runner question.
-[XNU pf_ioctl](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/net/pf_ioctl.c)
-returns EINVAL for missing rulesets, compares state selectors against the state
-kif, and truncates the cleared-state count through `sa_family_t`. These source
-facts support proposed shapes and the selective-removal refusal; none pins the
-userland output for a runner build. Renderer-derived goldens likewise remain
-proposals (including numeric/named service ports and normalization spelling).
+The independent, journaled `scupper-qual/children` subtree measures named and
+underscore (`_qchild`) children, an inline/anonymous anchor, a wildcard call
+`anchor "x/*"`, and a nonempty grandchild beneath an empty child. It records
+inventories and exact class streams at every discovered level before cleanup,
+and after each scoped class flush at each path. These per-level/per-flush reads
+cover only that path's five classes (`-sr`, `-sn`, `-sT`, `-sA`, `-sd`), without
+repeating parent and root inventories after every flush. Rejected spellings and
+persistent empty names are coverage measurements, never contract violations. Only this
+disposable measurement subtree permits recursive harness cleanup and empty-name
+accounting during restore; native build coverage flags remain false. Inventory
+containment, depth/count bounds and original absence authority apply to that
+cleanup too. Case budget exhaustion remains environmental; descendant cleanup
+uses an independent 30-second deadline and a cleanup failure withholds subsequent
+descendant fixtures.
 
-R7 fix 1 caveats and owner questions:
+Twenty unhooked lifecycle iterations and twenty hooked removals (with states
+and after global state flush) remain. Raw harness measurements use journaled
+`com.apple/scupper` and sentinel `com.apple/scupper-qual`, without constructing
+a production-path adapter. The explicit F-all experiment alone uses `-F all`;
+ordinary cleanup uses the four scoped classes. No main ruleset, parent ruleset or pf.conf is changed. Wildcard calls occur only
+inside the disposable descendant measurement subtree. Global state flush destroys foreign states
+irreversibly; restoration cannot return them. The sentinel persistent table and
+narrow rule, and the three ephemeral-port Q-FLUSH passes, remain the previously
+recorded harness-only scope deviations. Foreign tokens still withhold destructive
+cleanup and record failure.
 
-- Dummynet is a fourth required-empty class (`-a PATH -sd`), and removal and
-  restore add `-a PATH -F dummynet` before absence reads. Pass 1 retains those raw
-  show/flush results. These are proposed, unreviewed command/output rows: Apple's
-  released XNU sources expose separate scrub/filter/dummynet classes, but the
-  Apple PacketFilter userland source was not available in the public distribution
-  inspected. Thus exact `-s`/`-F` spelling and whether Apple's `-sr` includes scrub
-  could not be source-confirmed. This is a source/qualification blind spot, not a
-  claim that no command exists. Unknown output fails closed; no row is promoted.
-  Actual scrub rows are rejected by the production filter grammar. Runner review
-  must resolve this coverage question before authorizing support.
-- Production filter grammar accepts only renderer syntax. Harness labels,
-  floating keep-state normalization and anchor declarations have a separate raw
-  harness parser, which the native qualified entry point refuses.
-- Owner question (L6): removal still stops without flushing when readback finds
-  foreign content, including dummynet. Leave can remain stuck. This is the chosen
-  fail-closed behavior; broadening cleanup authority needs an owner decision.
-- Deviation (L8): hooked sentinel measurements exceed the brief's exactly-one-rule
-  limit. The F-all experiment uses a persistent table containing only 192.0.2.123
-  plus its narrow block rule. Q-FLUSH uses three pass-quick rules constrained to
-  ephemeral TCP listener ports on IPv4/IPv6 loopback and the feth0 pair. These
-  rules remain harness-only, absence-journaled and scoped; this deviation is not
-  production policy qualification.
-- Restore (L11) withholds even our own journaled anchor flushes and feth destroy
-  while foreign tokens exist. It records failure and can leave harness rules
-  loaded until the disposable runner is discarded.
+Q-E2E retains the exact Left method audit, committed incarnation, zero pf
+mutations/spawn and a complete owned-process census. Join observes at least
+sixty seconds with input-free Lockdown, durable hold, no child generation, no
+spawn, no Protected status and no Installed-form Protected candidate, including
+candidates that disappear within a tick. Trace lines include the verification
+form. Both qualified and unqualified fake firewalls exercise install failure;
+a qualified PreTunnel Lockdown candidate may be Protected while hold masks
+status. Native collection stubs remain unqualified.
+Trace requests include write/create/wait outcomes, returned token/PID and complete
+reference reads. AcquireReference is reached only after a reservation is Synced
+on both copies or an acquire boundary call occurs. Merely planned but uncommitted
+acquisition is environmental and names `join.machine().pending()`. Acquisition-
+independent violation checks precede the acquisition environment checks.
+Each reservation permits one counted `-E`; matching complete reference reads and
+recorded fingerprints precede settlement/release. Unresolved debt remains durable.
+Returned tokens are journaled immediately; the effect-to-journal gap still relies
+only on runner exclusivity and restoring baseline pf state. Trace overflow is
+Inconclusive; production builds do not format or hash qualification traces.
+
+Restoration derives launchd setup and its allowlist from `qual/jobs.rs`, including
+`system/net.scupper.qual.r4-contracts`. Tests require every journaled mode to be
+restorable. A failed stop/cleanup step is recorded while subsequent independent
+steps and journals are attempted. Before each dependent cleanup step, fresh
+`launchctl print <service>` evidence must show every journaled service absent,
+and journaled writers/groups must be gone across all scopes. Otherwise anchor
+cleanup, token release, pf-state restoration and completion are `withheld`,
+their journal entries remain pending and restore fails. Independent diagnostics
+continue. Exec gates alone never establish this dependency. Each anchor first
+receives the same complete configuration-absence check,
+so an already-empty or missing anchor is never flushed. Recovery attempts all four
+classes even if one flush fails, then requires complete configuration absence.
+The dummynet row is now reviewed on both builds; its failure is therefore a restore
+failure rather than the old unreviewed-row Inconclusive note. Post-state comparison
+allows only independently proven empty journaled anchor names and their empty
+created qualification parent. Any nonempty class, removed baseline anchor or
+un-journaled new sibling/name still fails comparison. The second restore must
+remain a measured no-op. Production ancestor measurements share native path
+constants, and qualification constructors reject the production anchor outside
+native unit tests; the source guard also scans the shared suite and trace module.
+
+Q-FLUSH requires known UDP/TCP IPv4/IPv6 loopback and feth state id/creatorid
+pairs immediately before the adapter call. Unknown state text, missing identities,
+stock skip or unavailable feth is Inconclusive. Interface/address selectors are
+raw measurements only; nonempty selective removal remains unqualified.
+
+Run `python3 crates/scupper-mac/tests/r7_mutations.py` for portable assertion
+mutants. They include listed-empty absence, no flush after a complete first None,
+optimizer mode, restore continuation, the contracts job label and golden mismatch
+classification. Original source bytes are restored on every exit; evidence is
+kept under target/r7-mutants until the required final target cleanup.
+
+R7 verification traces record `verification_kind:Lockdown` or
+`verification_kind:Installed(PreTunnel)` / `Installed(Joined)`, followed by
+`:verification_protected:true` or `false`. Q-E2E rejects every Installed Protected
+candidate, including one masked before the end of a tick; Lockdown Protected
+candidates remain distinguishable. Only the first failed stub is eligible for
+startup tool/lock/storage environment classification; a later failure cannot hide
+an earlier install refusal or subsequent contract checks.
+
+Restore samples each journaled launchd service up to five times within a
+five-second settle window and the caller deadline, saving every status. Only the
+shared complete exit-113 predicate establishes absence. Native pass-2 review must
+record the observed statuses, including whether 113 was reached after settling.
+Anchor snapshot completion requires the same campaign quiescence fence as pf
+group/state completion. Incomplete or out-of-bounds descendant inventory records
+a per-entry restore failure and does not skip later journaled anchors.

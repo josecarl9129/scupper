@@ -3320,6 +3320,59 @@ mod run5_contracts {
 mod r7_hooks {
     use super::*;
     #[test]
+    fn empty_listed_fake_anchor_is_configuration_absence() {
+        let mut p = super::super::fake::FakePlatform::new().unwrap();
+        p.anchor = Some(String::new());
+        let d = Deadline(p.now() + 5);
+        assert_eq!(p.read_anchor(d), Ok(None));
+        p.anchor_readback = Some(String::new());
+        assert_eq!(p.read_anchor(d), Ok(None));
+    }
+
+    #[test]
+    fn fake_wait_records_timeout_sync_and_failure_results() {
+        use super::super::fake::{Call, FakePlatform, Fault};
+        let mut p = FakePlatform::new().unwrap();
+        p.qualification_trace = Some(vec![]);
+        let bytes = crate::snapshot::encode(
+            1,
+            &crate::snapshot::Snapshot::initial(Some(501), p.boot.clone()),
+        )
+        .unwrap();
+        p.inject(Call::Create(Copy::A), 1, Fault::StorageDelay(60));
+        let short = Deadline(p.now() + 1);
+        assert_eq!(
+            p.create_copy(Copy::A, &bytes, short),
+            WriteOutcome::TimedOut
+        );
+        let short = Deadline(p.now());
+        assert_eq!(p.wait_write(short), WriteOutcome::TimedOut);
+        let long = Deadline(p.now() + 10);
+        assert_eq!(p.wait_write(long), WriteOutcome::Synced);
+        let trace = p.qualification_trace.as_ref().unwrap();
+        assert_eq!(
+            trace.last().map(String::as_str),
+            Some("snapshot_result:Synced")
+        );
+        assert!(
+            trace
+                .iter()
+                .filter(|s| s.as_str() == "snapshot_result:TimedOut")
+                .count()
+                >= 2
+        );
+        assert!(matches!(p.wait_write(long), WriteOutcome::Failed(_)));
+        assert!(
+            p.qualification_trace
+                .as_ref()
+                .unwrap()
+                .last()
+                .unwrap()
+                .starts_with("snapshot_result:Failed(")
+        );
+    }
+
+    #[test]
     fn process_completeness_remains_an_assertion_in_both_modes() {
         let mut p = super::super::fake::FakePlatform::new().unwrap();
         p.inject(
